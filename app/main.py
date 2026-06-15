@@ -1,7 +1,7 @@
 import re
 import logging
 from pathlib import Path
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from app.agent.planner import build_diagnosis
@@ -10,6 +10,19 @@ from app.agent.result_analyzer import generate_result_guide
 from app.agent.router import check_scope
 from app.services.knowledge_loader import search_knowledge, load_knowledge, KnowledgeLoadError, get_knowledge_status
 from app.config import APP_NAME, APP_VERSION, READONLY_MODE, KNOWLEDGE_MD_PATH, TEMPLATES_DIR
+from app.schemas.workflow import (
+    WorkflowAnalyzeRequest,
+    WorkflowAnalyzeResponse,
+    WorkflowErrorResponse,
+    WorkflowRouteRequest,
+    WorkflowRouteResponse,
+)
+from app.workflows.local_access_guard import check_local_access
+from app.workflows.scope_guard import validate_request_scope, validate_records_scope
+from app.workflows.router import route_workflow
+from app.workflows.base import WORKFLOW_REGISTRY
+from app.workflows.human_approval_guard import enforce_recommendation_only
+from app.services.workflow_knowledge_adapter import get_workflow_knowledge_files
 
 logger = logging.getLogger(__name__)
 
@@ -246,3 +259,100 @@ async def diagnose(req: DiagnoseRequest):
         missing_params=all_missing,
         risk_notice=risk_notice,
     )
+
+
+def _get_client_host(request: Request) -> str | None:
+    if request.client:
+        return request.client.host
+    return None
+
+
+def _check_workflow_access(request: Request):
+    client_host = _get_client_host(request)
+    token_header = request.headers.get("X-Local-Workflow-Token")
+    result = check_local_access(client_host, token_header)
+    if not result.allowed:
+        raise HTTPException(
+            status_code=403,
+            detail={"error_code": result.error_code, "message": result.message},
+        )
+
+
+@app.post("/workflows/route", response_model=WorkflowRouteResponse)
+async def workflow_route(req: WorkflowRouteRequest, request: Request):
+    _check_workflow_access(request)
+    scope_result = validate_request_scope(req.scope)
+    if not scope_result.allowed:
+        raise HTTPException(
+            status_code=400,
+            detail={"error_code": scope_result.error_code, "message": scope_result.message},
+        )
+    return route_workflow(req.question)
+
+
+@app.post("/workflows/same-product-approval/analyze", response_model=WorkflowAnalyzeResponse)
+async def workflow_same_product_approval_analyze(req: WorkflowAnalyzeRequest, request: Request):
+    _check_workflow_access(request)
+    scope_result = validate_request_scope(req.scope)
+    if not scope_result.allowed:
+        raise HTTPException(
+            status_code=400,
+            detail={"error_code": scope_result.error_code, "message": scope_result.message},
+        )
+    records_scope_result = validate_records_scope(req.scope, req.records)
+    if not records_scope_result.allowed:
+        raise HTTPException(
+            status_code=400,
+            detail={"error_code": records_scope_result.error_code, "message": records_scope_result.message},
+        )
+    wf = WORKFLOW_REGISTRY.get("work_01_same_product_approval")
+    if not wf:
+        raise HTTPException(
+            status_code=404,
+            detail={"error_code": "WORKFLOW_NOT_FOUND", "message": "work_01_same_product_approval 不存在"},
+        )
+    response = wf.analyze(req.records)
+    response = enforce_recommendation_only(response)
+    return response
+
+
+@app.post("/workflows/price-index-feedback/analyze", response_model=WorkflowAnalyzeResponse)
+async def workflow_price_index_feedback_analyze(req: WorkflowAnalyzeRequest, request: Request):
+    _check_workflow_access(request)
+    scope_result = validate_request_scope(req.scope)
+    if not scope_result.allowed:
+        raise HTTPException(
+            status_code=400,
+            detail={"error_code": scope_result.error_code, "message": scope_result.message},
+        )
+    records_scope_result = validate_records_scope(req.scope, req.records)
+    if not records_scope_result.allowed:
+        raise HTTPException(
+            status_code=400,
+            detail={"error_code": records_scope_result.error_code, "message": records_scope_result.message},
+        )
+    wf = WORKFLOW_REGISTRY.get("work_02_price_index_feedback")
+    if not wf:
+        raise HTTPException(
+            status_code=404,
+            detail={"error_code": "WORKFLOW_NOT_FOUND", "message": "work_02_price_index_feedback 不存在"},
+        )
+    response = wf.analyze(req.records)
+    response = enforce_recommendation_only(response)
+    return response
+
+
+@app.get("/workflows/{workflow_name}/knowledge")
+async def workflow_knowledge(workflow_name: str, request: Request):
+    _check_workflow_access(request)
+    knowledge_files = get_workflow_knowledge_files(workflow_name)
+    if not knowledge_files:
+        raise HTTPException(
+            status_code=404,
+            detail={"error_code": "WORKFLOW_NOT_FOUND", "message": f"workflow {workflow_name} 无知识文件映射"},
+        )
+    return {
+        "workflow_name": workflow_name,
+        "knowledge_files": knowledge_files,
+        "snippets": [],
+    }
