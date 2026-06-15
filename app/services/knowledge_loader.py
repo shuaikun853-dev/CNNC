@@ -1,4 +1,5 @@
 import re
+import html
 from pathlib import Path
 from app.config import KNOWLEDGE_MD_PATH
 
@@ -7,7 +8,7 @@ WRITE_SQL_KEYWORDS = [
     "CREATE", "REPLACE", "MERGE", "CALL", "EXEC",
 ]
 
-_FENCED_CODE_BLOCK_RE = re.compile(r"(```[a-zA-Z0-9]*\s*\n)(.*?)(```)", re.DOTALL)
+_FENCED_CODE_BLOCK_RE = re.compile(r"(```\s*[a-zA-Z0-9]*\s*\n)(.*?)(```)", re.DOTALL)
 
 _HTML_PRE_CODE_RE = re.compile(r"<pre><code>(.*?)</code></pre>", re.DOTALL | re.IGNORECASE)
 
@@ -15,15 +16,23 @@ _HTML_PRE_RE = re.compile(r"<pre>(.*?)</pre>", re.DOTALL | re.IGNORECASE)
 
 _INDENT_CODE_LINE_RE = re.compile(r"^( {4,}|\t)(\S.*)$")
 
+_HTML_ENTITY_RE = re.compile(r"&(?:#\d+|#x[0-9a-fA-F]+|[a-zA-Z]+);")
+
 _WRITE_SQL_NOTICE = (
     "【高风险写库 SQL 已脱敏：第一阶段不展示具体 SQL，需人工确认后处理】"
 )
 
 _sections: list[dict] | None = None
+_load_error: str | None = None
+
+
+def _decode_html_entities(text: str) -> str:
+    return html.unescape(text)
 
 
 def _contains_write_sql(text: str) -> bool:
-    upper = text.upper()
+    decoded = _decode_html_entities(text)
+    upper = decoded.upper()
     tokens = re.findall(r"[A-Z_]+", upper)
     for kw in WRITE_SQL_KEYWORDS:
         if kw in tokens:
@@ -143,18 +152,48 @@ def _parse_markdown(text: str) -> list[dict]:
     return sections
 
 
+class KnowledgeLoadError(Exception):
+    pass
+
+
 def load_knowledge(path: str | Path | None = None) -> list[dict]:
-    global _sections
+    global _sections, _load_error
     if _sections is not None:
         return _sections
 
     md_path = Path(path) if path else KNOWLEDGE_MD_PATH
     if not md_path.exists():
-        return []
+        _load_error = "知识库文件不存在"
+        raise KnowledgeLoadError(_load_error)
 
-    text = md_path.read_text(encoding="utf-8")
+    try:
+        text = md_path.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        _load_error = "知识库文件编码错误"
+        raise KnowledgeLoadError(_load_error)
+    except OSError as e:
+        _load_error = "知识库文件读取失败"
+        raise KnowledgeLoadError(_load_error)
+
     _sections = _parse_markdown(text)
+    _load_error = None
     return _sections
+
+
+def get_knowledge_status() -> tuple[str, str]:
+    global _sections, _load_error
+    if _sections is not None:
+        return "ok", ""
+    if _load_error:
+        return "error", _load_error
+    md_path = KNOWLEDGE_MD_PATH
+    if not md_path.exists():
+        return "degraded", "知识库文件不存在"
+    try:
+        md_path.read_text(encoding="utf-8")
+        return "ok", ""
+    except Exception:
+        return "degraded", "知识库文件不可读"
 
 
 def _extract_substrings(text: str, min_len: int = 2, max_len: int = 4) -> list[str]:
@@ -188,3 +227,9 @@ def search_knowledge(keyword: str, top_k: int = 3) -> list[dict]:
 
     scored.sort(key=lambda x: x[0], reverse=True)
     return [s for score, s in scored if score > 0][:top_k]
+
+
+def reset_knowledge_cache():
+    global _sections, _load_error
+    _sections = None
+    _load_error = None

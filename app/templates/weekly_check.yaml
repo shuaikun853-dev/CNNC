@@ -3,6 +3,7 @@ description: 每周巡检与统计 SQL 模板（只读，中核范围限定版�
 templates:
   - name: pool_total_count
     purpose: 统计中核商品池 222 的商品总数与启用数
+    description: 统计商品池 222 中商品总数和启用数，用于计算启用率
     params: []
     sql: |
       SELECT
@@ -15,10 +16,17 @@ templates:
 
   - name: monitor_status_distribution
     purpose: 统计中核商品池 222 监控价格 STATUS 分布（最近 7 天）
+    description: 按时间范围统计监控价格各 STATUS 分布，识别采集中/异常/正常占比
     params:
       - name: start_time
+        required: true
+        type: string
+        description: 查询起始时间
         example: "2026-06-08 00:00:00"
       - name: end_time
+        required: true
+        type: string
+        description: 查询结束时间
         example: "2026-06-15 00:00:00"
     sql: |
       SELECT STATUS, COUNT(*) AS cnt
@@ -33,9 +41,16 @@ templates:
 
   - name: task_execute_state_summary
     purpose: 中核租户 188605 商品池 222 最近 7 天任务 STATE 分布
+    description: 按时间范围统计任务各 STATE 分布，识别失败/积压占比
     params:
       - name: start_time
+        required: true
+        type: string
+        description: 查询起始时间
       - name: end_time
+        required: true
+        type: string
+        description: 查询结束时间
     sql: |
       SELECT STATE, COUNT(*) AS cnt
       FROM onecode_base3.task_execute

@@ -3,8 +3,12 @@ description: 爬虫/采集链路排查 SQL 模板（只读，中核范围限定�
 templates:
   - name: long_running_crawl
     purpose: 查找中核商品池 222 中长时间处于"采集中"状态的记录
+    description: 查询超过 N 小时仍处于采集中的监控记录
     params:
       - name: hours
+        required: true
+        type: string
+        description: 超时判定阈值（小时）
         example: "24"
     sql: |
       SELECT ID, commodity_id, STATUS, update_time
@@ -18,8 +22,12 @@ templates:
 
   - name: crawl_fail_rate
     purpose: 中核商品池 222 最近 N 小时采集失败率
+    description: 统计最近 N 小时的采集总数和失败数，计算失败率
     params:
       - name: hours
+        required: true
+        type: string
+        description: 查询时间范围（小时）
         example: "24"
     sql: |
       SELECT

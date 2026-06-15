@@ -40,6 +40,8 @@ CNNC_ALLOWED_FQ_TABLES = {
 
 _ALL_ALLOWED = CNNC_ALLOWED_TABLES | CNNC_ALLOWED_FQ_TABLES
 
+_TASK_EXECUTE_NAMES = {"task_execute", "onecode_base3.task_execute"}
+
 _SQL_KEYWORDS_NO_TABLE = {
     "SELECT", "FROM", "WHERE", "AND", "OR", "NOT", "IN", "IS", "NULL",
     "AS", "ON", "JOIN", "INNER", "LEFT", "RIGHT", "OUTER", "CROSS",
@@ -56,14 +58,22 @@ _MYSQL_EXEC_COMMENT_RE = re.compile(r"/\*!\s*.*?\*/", re.DOTALL)
 _BLOCK_COMMENT_RE = re.compile(r"/\*.*?\*/", re.DOTALL)
 _LINE_COMMENT_RE = re.compile(r"(--|#).*$", re.MULTILINE)
 
-_TABLE_RE = re.compile(
-    r"\b(?:FROM|JOIN)\s+"
-    r"((?:[a-zA-Z_][a-zA-Z0-9_]*\.)*[a-zA-Z_][a-zA-Z0-9_]*)",
+_WITH_CTE_NAMES_RE = re.compile(
+    r"\bWITH\s+([a-zA-Z_][a-zA-Z0-9_]*)\s+AS\s*\(",
     re.IGNORECASE,
 )
 
-_WITH_CTE_NAMES_RE = re.compile(
-    r"\bWITH\s+([a-zA-Z_][a-zA-Z0-9_]*)\s+AS\s*\(",
+_TABLE_REF_PATTERN = re.compile(
+    r"(?:FROM|JOIN)\s+"
+    r"((?:`[^`]+`\.)*`[^`]+`"
+    r"|(?:[a-zA-Z_][a-zA-Z0-9_]*\.)*[a-zA-Z_][a-zA-Z0-9_]*)",
+    re.IGNORECASE,
+)
+
+_COMMA_TABLE_PATTERN = re.compile(
+    r",\s*"
+    r"((?:`[^`]+`\.)*`[^`]+`"
+    r"|(?:[a-zA-Z_][a-zA-Z0-9_]*\.)*[a-zA-Z_][a-zA-Z0-9_]*)",
     re.IGNORECASE,
 )
 
@@ -81,23 +91,58 @@ def _has_multi_statement(sql: str) -> bool:
     return len(parts) > 1
 
 
+def _normalize_table_name(raw: str) -> str:
+    name = raw.strip()
+    if name.startswith("`") and name.endswith("`"):
+        name = name[1:-1]
+    parts = []
+    for segment in name.split("."):
+        if segment.startswith("`") and segment.endswith("`"):
+            segment = segment[1:-1]
+        parts.append(segment)
+    return ".".join(parts)
+
+
 def _extract_table_names(sql: str) -> list[str]:
     cleaned = _strip_all_comments(sql)
     cte_names = set()
     for m in _WITH_CTE_NAMES_RE.finditer(cleaned):
         cte_names.add(m.group(1).lower())
 
+    raw_names = []
+    for m in _TABLE_REF_PATTERN.finditer(cleaned):
+        raw_names.append(m.group(1))
+
+    from_clause_text = ""
+    for m in re.finditer(r"\bFROM\b\s+(.*?)(?:\b(?:WHERE|GROUP|ORDER|HAVING|LIMIT|JOIN|LEFT|RIGHT|INNER|OUTER|CROSS|UNION)\b|$)", cleaned, re.IGNORECASE | re.DOTALL):
+        from_clause_text += " " + m.group(1)
+
+    for m in _COMMA_TABLE_PATTERN.finditer(from_clause_text):
+        candidate = m.group(1)
+        normalized = _normalize_table_name(candidate)
+        if normalized.lower() in cte_names:
+            continue
+        if normalized.lower() in _SQL_KEYWORDS_NO_TABLE:
+            continue
+        already = False
+        for rn in raw_names:
+            if _normalize_table_name(rn).lower() == normalized.lower():
+                already = True
+                break
+        if not already:
+            raw_names.append(candidate)
+
     tables = []
     seen = set()
-    for m in _TABLE_RE.finditer(cleaned):
-        name = m.group(1)
-        if name.lower() in cte_names:
+    for raw in raw_names:
+        normalized = _normalize_table_name(raw)
+        if normalized.lower() in cte_names:
             continue
-        if name.lower() in _SQL_KEYWORDS_NO_TABLE:
+        if normalized.lower() in _SQL_KEYWORDS_NO_TABLE:
             continue
-        if name.lower() not in seen:
-            seen.add(name.lower())
-            tables.append(name)
+        if normalized.lower() not in seen:
+            seen.add(normalized.lower())
+            tables.append(normalized)
 
     return tables
 
@@ -113,6 +158,34 @@ def _check_table_whitelist(tables: list[str]) -> tuple[bool, str]:
         else:
             return False, f"表 {t} 不在中核允许表白名单中"
     return True, ""
+
+
+def _has_task_execute(tables: list[str]) -> bool:
+    for t in tables:
+        if t.lower() in {n.lower() for n in _TASK_EXECUTE_NAMES}:
+            return True
+    return False
+
+
+def _check_task_execute_scope(sql: str) -> tuple[bool, str]:
+    upper = sql.upper()
+    has_tenant_188605 = bool(re.search(r"TENANT_ID\s*=?\s*'?\s*188605\s*'?", sql, re.IGNORECASE))
+    has_pool_222 = bool(re.search(r"COMMODITY_POOL_ID\s*=?\s*'?222'?", sql, re.IGNORECASE))
+    has_ref_subquery = (
+        "REFERENCE_ID" in upper
+        and "commodity_pool_188605" in upper
+        and "COMMODITY_POOL_ID" in upper
+        and "222" in sql
+    )
+
+    if has_tenant_188605 and (has_pool_222 or has_ref_subquery):
+        return True, ""
+
+    if not has_tenant_188605:
+        return False, "task_execute 是多租户共享表，必须包含 TENANT_ID='188605'"
+    if not has_pool_222 and not has_ref_subquery:
+        return False, "task_execute 查询必须同时包含 COMMODITY_POOL_ID=222 或通过 reference_id 子查询关联商品池 222"
+    return False, "task_execute 查询范围不足，必须限定中核租户和商品池"
 
 
 def validate_sql(sql: str) -> tuple[bool, str]:
@@ -154,6 +227,11 @@ def validate_sql(sql: str) -> tuple[bool, str]:
             return False, reason
     else:
         return False, "未检测到表名，默认拒绝。请确保 SQL 中 FROM/JOIN 后包含明确的中核表名"
+
+    if _has_task_execute(tables):
+        ok, reason = _check_task_execute_scope(cleaned)
+        if not ok:
+            return False, reason
 
     return True, "安全检查通过"
 

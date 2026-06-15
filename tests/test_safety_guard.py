@@ -210,12 +210,6 @@ class TestTableWhitelist:
         )
         assert ok is True
 
-    def test_task_execute_allowed(self):
-        ok, reason = validate_sql(
-            "SELECT * FROM onecode_base3.task_execute WHERE TENANT_ID='188605' AND COMMODITY_POOL_ID=222"
-        )
-        assert ok is True
-
     def test_with_cte_cnnc_allowed(self):
         ok, reason = validate_sql(
             "WITH x AS (SELECT * FROM commodity_pool_188605 WHERE COMMODITY_POOL_ID = 222) SELECT * FROM x"
@@ -231,17 +225,118 @@ class TestTableWhitelist:
         ok, reason = validate_sql("SELECT 1 FROM dual")
         assert ok is False
 
-    def test_join_with_non_cnnc_rejected(self):
-        ok, reason = validate_sql(
-            "SELECT * FROM commodity_pool_188605 cp JOIN other_table ot ON cp.id = ot.id"
-        )
-        assert ok is False
-
     def test_multiple_cnnc_tables_allowed(self):
         ok, reason = validate_sql(
             "SELECT * FROM commodity_pool_188605 cp "
             "JOIN standard_commodity_relation_188605 scr ON cp.ID = scr.commodity_id "
             "WHERE cp.COMMODITY_POOL_ID = 222"
+        )
+        assert ok is True
+
+
+class TestCommaAndBacktickTables:
+    def test_comma_other_tenant_table_rejected(self):
+        ok, reason = validate_sql(
+            "SELECT * FROM commodity_pool_188605 cp, other_tenant_table ot "
+            "WHERE cp.ID=ot.id AND cp.COMMODITY_POOL_ID=222"
+        )
+        assert ok is False
+
+    def test_backtick_other_tenant_table_rejected(self):
+        ok, reason = validate_sql(
+            "SELECT * FROM commodity_pool_188605 cp "
+            "JOIN `other_tenant_table` ot ON cp.ID=ot.id "
+            "WHERE cp.COMMODITY_POOL_ID=222"
+        )
+        assert ok is False
+
+    def test_backtick_non_cnnc_table_rejected(self):
+        ok, reason = validate_sql("SELECT * FROM `commodity_pool_874649`")
+        assert ok is False
+
+    def test_backtick_fq_non_cnnc_table_rejected(self):
+        ok, reason = validate_sql("SELECT * FROM `saas_onecode_price`.`commodity_pool_874649`")
+        assert ok is False
+
+    def test_comma_non_cnnc_table_rejected(self):
+        ok, reason = validate_sql(
+            "SELECT * FROM commodity_pool_188605 cp, commodity_pool_874649 ot WHERE cp.ID=ot.id"
+        )
+        assert ok is False
+
+    def test_cte_with_non_cnnc_table_rejected(self):
+        ok, reason = validate_sql(
+            "WITH x AS (SELECT * FROM commodity_pool_188605), "
+            "y AS (SELECT * FROM other_tenant_table) "
+            "SELECT * FROM x JOIN y ON x.id=y.id"
+        )
+        assert ok is False
+
+    def test_backtick_cnnc_table_allowed(self):
+        ok, reason = validate_sql(
+            "SELECT * FROM `commodity_pool_188605` WHERE COMMODITY_POOL_ID=222"
+        )
+        assert ok is True
+
+    def test_backtick_fq_cnnc_table_allowed(self):
+        ok, reason = validate_sql(
+            "SELECT * FROM `saas_onecode_price`.`commodity_pool_188605` WHERE COMMODITY_POOL_ID=222"
+        )
+        assert ok is True
+
+    def test_join_cnnc_tables_allowed(self):
+        ok, reason = validate_sql(
+            "SELECT * FROM commodity_pool_188605 cp "
+            "JOIN commodity_pool_relation_188605 r ON cp.MY_COMMODITY_ID=r.SRC_MY_COMMODITY_ID "
+            "WHERE cp.COMMODITY_POOL_ID=222 AND r.SRC_COMMODITY_POOL_ID=222"
+        )
+        assert ok is True
+
+
+class TestTaskExecuteScope:
+    def test_task_execute_no_condition_rejected(self):
+        ok, reason = validate_sql("SELECT * FROM onecode_base3.task_execute")
+        assert ok is False
+        assert "TENANT_ID" in reason or "task_execute" in reason
+
+    def test_task_execute_short_no_condition_rejected(self):
+        ok, reason = validate_sql("SELECT * FROM task_execute")
+        assert ok is False
+
+    def test_task_execute_only_tenant_rejected(self):
+        ok, reason = validate_sql(
+            "SELECT * FROM onecode_base3.task_execute WHERE TENANT_ID='188605'"
+        )
+        assert ok is False
+
+    def test_task_execute_only_pool_rejected(self):
+        ok, reason = validate_sql(
+            "SELECT * FROM onecode_base3.task_execute WHERE COMMODITY_POOL_ID=222"
+        )
+        assert ok is False
+
+    def test_task_execute_wrong_tenant_rejected(self):
+        ok, reason = validate_sql(
+            "SELECT * FROM onecode_base3.task_execute WHERE TENANT_ID='874649' AND COMMODITY_POOL_ID=222"
+        )
+        assert ok is False
+
+    def test_task_execute_full_condition_allowed(self):
+        ok, reason = validate_sql(
+            "SELECT * FROM onecode_base3.task_execute WHERE TENANT_ID='188605' AND COMMODITY_POOL_ID=222"
+        )
+        assert ok is True
+
+    def test_task_execute_short_full_condition_allowed(self):
+        ok, reason = validate_sql(
+            "SELECT * FROM task_execute WHERE TENANT_ID = '188605' AND COMMODITY_POOL_ID = 222"
+        )
+        assert ok is True
+
+    def test_task_execute_ref_subquery_allowed(self):
+        ok, reason = validate_sql(
+            "SELECT * FROM onecode_base3.task_execute WHERE TENANT_ID='188605' "
+            "AND reference_id IN (SELECT CONCAT(id,'') FROM commodity_pool_188605 WHERE COMMODITY_POOL_ID=222)"
         )
         assert ok is True
 

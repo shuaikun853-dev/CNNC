@@ -3,8 +3,12 @@ description: 推送/任务链路排查 SQL 模板（只读，中核范围限定�
 templates:
   - name: failed_tasks
     purpose: 中核租户 188605 商品池 222 最近 N 小时失败的任务
+    description: 查询最近 N 小时内失败或取消的任务列表
     params:
       - name: hours
+        required: true
+        type: string
+        description: 查询时间范围（小时）
         example: "24"
     sql: |
       SELECT ID, STATE, TASK_TYPE, ERROR_MSG, create_time
@@ -19,8 +23,12 @@ templates:
 
   - name: task_backlog
     purpose: 查中核租户 188605 商品池 222 积压中（未执行）的任务数
+    description: 统计积压超过 N 小时仍未执行的任务数量
     params:
       - name: hours
+        required: true
+        type: string
+        description: 积压判定阈值（小时）
         example: "2"
     sql: |
       SELECT COUNT(*) AS pending_cnt
@@ -34,8 +42,12 @@ templates:
 
   - name: failed_tasks_by_reference
     purpose: 中核租户 188605 通过 reference_id 关联商品池 222 的失败任务（适用于 COMMODITY_POOL_ID 字段缺失的场景）
+    description: 通过 reference_id 子查询关联商品池 222 的失败任务
     params:
       - name: hours
+        required: true
+        type: string
+        description: 查询时间范围（小时）
         example: "24"
     sql: |
       SELECT te.ID, te.STATE, te.TASK_TYPE, te.ERROR_MSG, te.create_time

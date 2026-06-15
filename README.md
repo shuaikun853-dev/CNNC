@@ -1,24 +1,33 @@
-# 中核 SaaS 运维诊断 Agent（MVP - 离线只读版）
+# 中核 SaaS 运维诊断 Agent
 
-## 当前版本限制
+## 第一阶段：离线只读诊断版
 
-| 限制项 | 说明 |
-|--------|------|
+**当前版本为第一阶段 MVP，严格限制为离线只读诊断，不具备任何写库或自动运维能力。**
+
+### 核心约束
+
+| 约束 | 说明 |
+|------|------|
 | **只读** | 仅生成 SELECT 查询模板，禁止 UPDATE/DELETE/INSERT 等写操作 |
 | **离线** | 不连接生产数据库，不执行任何 SQL |
 | **不连生产库** | db 模块为 mock_client，仅返回提示信息 |
 | **不执行写库** | safety_guard 强制拦截所有非 SELECT/WITH 语句 |
+| **中核专属** | 仅支持 tenant_id=188605、commodity_pool_id=222 |
+| **拒绝非中核** | 宏伟/南水北调/华盛/非 188605 租户问题会被拒绝 |
+
+### 不支持的功能
+
+- 自动重推、自动 UPDATE/DELETE/INSERT
+- 连接生产数据库执行 SQL
+- 定时任务、自动巡检
+- 跨租户查询
 
 ## 安装依赖
 
 ```bash
 cd cnnc-ops-agent
 python -m venv .venv
-# Windows:
-.venv\Scripts\activate
-# Linux/Mac:
-# source .venv/bin/activate
-
+.venv\Scripts\activate   # Windows
 pip install -r requirements.txt
 ```
 
@@ -28,7 +37,6 @@ pip install -r requirements.txt
 uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 ```
 
-启动后访问：
 - API 文档：http://localhost:8000/docs
 - 健康检查：http://localhost:8000/health
 
@@ -39,47 +47,32 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 ```bash
 curl -X POST http://localhost:8000/diagnose \
   -H "Content-Type: application/json" \
-  -d "{\"question\": \"最近一周巡检数据怎么样\"}"
+  -d "{\"question\": \"中核本周巡检\", \"params\": {\"start_time\": \"2026-06-08\", \"end_time\": \"2026-06-15\"}}"
 ```
 
 ### 请求体
 
-```json
-{
-  "question": "你的问题"
-}
-```
+| 字段 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| question | string | 是 | 用户问题 |
+| params | object | 否 | SQL 模板参数，如 commodity_id、start_time 等 |
 
 ### 响应体
 
-```json
-{
-  "scenario": "weekly_check",
-  "confidence": 0.95,
-  "reason": "命中关键词: 每周巡检",
-  "diagnosis_steps": ["1. 确认巡检时间范围...", "..."],
-  "related_tables": ["commodity_pool_188605", "..."],
-  "sql_templates": [
-    {
-      "name": "pool_total_count",
-      "purpose": "统计商品总数与启用数",
-      "params": [],
-      "sql": "SELECT COUNT(*) ...",
-      "safe": true,
-      "safety_reason": "安全检查通过",
-      "result_hint": "关注 enabled_cnt / total_cnt 占比..."
-    }
-  ],
-  "result_guide": {
-    "interpretation": "巡检结果关注...",
-    "per_sql_hints": [...]
-  },
-  "knowledge_snippets": [...],
-  "risk_notice": "【只读安全提示】..."
-}
-```
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| scenario | string | 识别的场景类型 |
+| confidence | float | 识别置信度 |
+| reason | string | 识别原因 |
+| diagnosis_steps | list[string] | 排查步骤 |
+| related_tables | list[string] | 涉及的中核表 |
+| sql_templates | list[object] | SQL 模板列表（含 safe/blocked/pending_params 状态） |
+| result_guide | object | 结果解读提示 |
+| knowledge_snippets | list[object] | 知识库检索片段（写库 SQL 已脱敏） |
+| missing_params | list[string] | 缺失的必要参数 |
+| risk_notice | string | 只读安全提示 |
 
-## 支持的场景
+### 场景列表
 
 | 场景 | 关键词示例 |
 |------|-----------|
@@ -89,6 +82,14 @@ curl -X POST http://localhost:8000/diagnose \
 | relation_check | 无同款、同款不足、同款重复 |
 | task_check | 推送失败、客户没收到、任务积压 |
 | knowledge_qa | 其他运维知识问题 |
+
+### 错误响应
+
+非中核问题返回 HTTP 400：
+
+```json
+{"detail": {"error_code": "OUT_OF_SCOPE", "message": "当前 Agent 只支持中核 SaaS 运维..."}}
+```
 
 ## 运行测试
 
@@ -101,19 +102,19 @@ pytest tests/ -v
 ```
 cnnc-ops-agent/
 ├── app/
-│   ├── main.py              # FastAPI 入口
+│   ├── main.py              # FastAPI 入口 + 响应模型
 │   ├── config.py             # 配置
 │   ├── agent/
-│   │   ├── router.py         # 场景识别
+│   │   ├── router.py         # 场景识别 + scope_guard
 │   │   ├── planner.py        # 诊断计划生成
-│   │   ├── sql_selector.py   # SQL 模板选择 + 安全校验
+│   │   ├── sql_selector.py   # SQL 模板选择 + 缺参检测
 │   │   ├── result_analyzer.py # 结果解读提示
-│   │   └── safety_guard.py   # SQL 安全守卫
+│   │   └── safety_guard.py   # SQL 安全守卫（表白名单 + task_execute 条件）
 │   ├── db/
 │   │   └── mock_client.py    # 离线 Mock 客户端
 │   ├── services/
-│   │   └── knowledge_loader.py # 知识库加载
-│   └── templates/            # SQL 模板 YAML
+│   │   └── knowledge_loader.py # 知识库加载 + 写库 SQL 脱敏
+│   └── templates/            # SQL 模板 YAML（中核范围限定）
 ├── data/docs/                # 知识库 Markdown
 ├── tests/
 ├── outputs/

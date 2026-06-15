@@ -10,15 +10,11 @@ CNNC_POSITIVE_SIGNALS = ["中核", "188605"]
 
 NON_CNNC_PROJECT_NAMES = ["宏伟", "南水北调", "华盛"]
 
-_SIX_DIGIT_SUFFIX_RE = re.compile(r"_(\d{6})")
-
-_SIX_DIGIT_STANDALONE_RE = re.compile(r"(?:tenant_id\s*=?\s*'?|租户\s*'?)(\d{6})('?)?", re.IGNORECASE)
-
-_EXPLICIT_TENANT_RE = re.compile(
-    r"(?:tenant_id|TENANT_ID)\s*=?\s*'?(\d{6})'?", re.IGNORECASE
+_TENANT_CONTEXT_BEFORE = re.compile(
+    r"(?:tenant_id|TENANT_ID)\s*=?\s*'?(\d{6})'?"
+    r"|(?:租户|租户编码)\s*'?(\d{6})'?",
+    re.IGNORECASE,
 )
-
-_ANY_SIX_DIGIT_RE = re.compile(r"(?<!\d)(\d{6})(?!\d)")
 
 _TABLE_SUFFIX_RE = re.compile(r"[a-zA-Z_]+_(\d{6})")
 
@@ -31,22 +27,10 @@ class ScopeCheckResult:
 
 
 def _has_explicit_non_cnnc_tenant(question: str) -> bool:
-    for m in _EXPLICIT_TENANT_RE.finditer(question):
-        tid = m.group(1)
-        if tid != "188605":
-            return True
-    for m in _SIX_DIGIT_STANDALONE_RE.finditer(question):
-        tid = m.group(1)
-        if tid != "188605":
-            return True
-    return False
-
-
-def _has_non_cnnc_six_digit(question: str) -> bool:
-    for m in _ANY_SIX_DIGIT_RE.finditer(question):
-        num = m.group(1)
-        if num != "188605":
-            return True
+    for m in _TENANT_CONTEXT_BEFORE.finditer(question):
+        for g in m.groups():
+            if g and g != "188605":
+                return True
     return False
 
 
@@ -73,9 +57,6 @@ def check_scope(question: str) -> ScopeCheckResult:
         return ScopeCheckResult(False, "OUT_OF_SCOPE", OUT_OF_SCOPE_MESSAGE)
 
     if _has_explicit_non_cnnc_tenant(question):
-        return ScopeCheckResult(False, "OUT_OF_SCOPE", OUT_OF_SCOPE_MESSAGE)
-
-    if _has_non_cnnc_six_digit(question):
         return ScopeCheckResult(False, "OUT_OF_SCOPE", OUT_OF_SCOPE_MESSAGE)
 
     if _has_non_cnnc_table_suffix(question):

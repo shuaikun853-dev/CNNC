@@ -3,6 +3,7 @@ description: 同款关系排查 SQL 模板（只读，中核范围限定版）
 templates:
   - name: no_relation_count
     purpose: 统计中核商品池 222 中无同款的商品数量
+    description: 统计商品池 222 中启用但未绑定同款标品的商品数量
     params: []
     sql: |
       SELECT COUNT(*) AS no_relation_cnt
@@ -18,6 +19,7 @@ templates:
 
   - name: duplicate_relation
     purpose: 查中核商品池 222 同款重复绑定（同一商品绑定多个标品）
+    description: 查找同一商品绑定多个标品的情况，重复绑定会导致价格比对混乱
     params: []
     sql: |
       SELECT scr.commodity_id, COUNT(*) AS rel_cnt

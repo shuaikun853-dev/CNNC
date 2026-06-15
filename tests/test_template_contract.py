@@ -100,3 +100,8 @@ class TestTemplateContract:
             for kw in ["UPDATE", "DELETE", "INSERT", "TRUNCATE", "DROP", "ALTER", "CREATE", "REPLACE"]:
                 tokens = __import__("re").findall(r"[A-Z_]+", sql)
                 assert kw not in tokens, f"{tpl['file']}/{tpl['name']} 包含写库关键字 {kw}"
+
+    def test_all_templates_have_description(self, all_templates):
+        for tpl in all_templates:
+            desc = tpl.get("description", "")
+            assert desc.strip() != "", f"{tpl['file']}/{tpl['name']} 缺少 description"
