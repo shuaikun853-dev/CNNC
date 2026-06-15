@@ -1,0 +1,49 @@
+scenario: weekly_check
+description: 每周巡检与统计 SQL 模板（只读，中核范围限定版）
+templates:
+  - name: pool_total_count
+    purpose: 统计中核商品池 222 的商品总数与启用数
+    params: []
+    sql: |
+      SELECT
+        COUNT(*) AS total_cnt,
+        SUM(CASE WHEN STATUS = 1 THEN 1 ELSE 0 END) AS enabled_cnt
+      FROM commodity_pool_188605
+      WHERE COMMODITY_POOL_ID = 222
+      LIMIT 1;
+    result_hint: 关注 enabled_cnt / total_cnt 占比，环比看是否有大批下架。
+
+  - name: monitor_status_distribution
+    purpose: 统计中核商品池 222 监控价格 STATUS 分布（最近 7 天）
+    params:
+      - name: start_time
+        example: "2026-06-08 00:00:00"
+      - name: end_time
+        example: "2026-06-15 00:00:00"
+    sql: |
+      SELECT STATUS, COUNT(*) AS cnt
+      FROM monitor_commodity_price_188605
+      WHERE COMMODITY_POOL_ID = 222
+        AND update_time >= :start_time
+        AND update_time <  :end_time
+      GROUP BY STATUS
+      ORDER BY cnt DESC
+      LIMIT 100;
+    result_hint: 长期停留在"采集中"的占比异常上升提示爬虫链路问题。
+
+  - name: task_execute_state_summary
+    purpose: 中核租户 188605 商品池 222 最近 7 天任务 STATE 分布
+    params:
+      - name: start_time
+      - name: end_time
+    sql: |
+      SELECT STATE, COUNT(*) AS cnt
+      FROM onecode_base3.task_execute
+      WHERE TENANT_ID = '188605'
+        AND COMMODITY_POOL_ID = 222
+        AND create_time >= :start_time
+        AND create_time <  :end_time
+      GROUP BY STATE
+      ORDER BY cnt DESC
+      LIMIT 100;
+    result_hint: 失败/积压占比明显升高时需要进入 task_check 场景细查。

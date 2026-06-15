@@ -1,0 +1,53 @@
+scenario: task_check
+description: 推送/任务链路排查 SQL 模板（只读，中核范围限定版）
+templates:
+  - name: failed_tasks
+    purpose: 中核租户 188605 商品池 222 最近 N 小时失败的任务
+    params:
+      - name: hours
+        example: "24"
+    sql: |
+      SELECT ID, STATE, TASK_TYPE, ERROR_MSG, create_time
+      FROM onecode_base3.task_execute
+      WHERE TENANT_ID = '188605'
+        AND COMMODITY_POOL_ID = 222
+        AND STATE IN (3, 4)
+        AND create_time >= DATE_SUB(NOW(), INTERVAL :hours HOUR)
+      ORDER BY create_time DESC
+      LIMIT 50;
+    result_hint: STATE=3 为失败，STATE=4 为取消；ERROR_MSG 含关键线索。
+
+  - name: task_backlog
+    purpose: 查中核租户 188605 商品池 222 积压中（未执行）的任务数
+    params:
+      - name: hours
+        example: "2"
+    sql: |
+      SELECT COUNT(*) AS pending_cnt
+      FROM onecode_base3.task_execute
+      WHERE TENANT_ID = '188605'
+        AND COMMODITY_POOL_ID = 222
+        AND STATE = 0
+        AND create_time < DATE_SUB(NOW(), INTERVAL :hours HOUR)
+      LIMIT 1;
+    result_hint: pending_cnt 持续增长意味着消费速度跟不上生产速度。
+
+  - name: failed_tasks_by_reference
+    purpose: 中核租户 188605 通过 reference_id 关联商品池 222 的失败任务（适用于 COMMODITY_POOL_ID 字段缺失的场景）
+    params:
+      - name: hours
+        example: "24"
+    sql: |
+      SELECT te.ID, te.STATE, te.TASK_TYPE, te.ERROR_MSG, te.create_time
+      FROM onecode_base3.task_execute te
+      WHERE te.TENANT_ID = '188605'
+        AND te.STATE IN (3, 4)
+        AND te.create_time >= DATE_SUB(NOW(), INTERVAL :hours HOUR)
+        AND te.REFERENCE_ID IN (
+          SELECT CONCAT(cp.ID, '')
+          FROM commodity_pool_188605 cp
+          WHERE cp.COMMODITY_POOL_ID = 222
+        )
+      ORDER BY te.create_time DESC
+      LIMIT 50;
+    result_hint: 通过 reference_id 子查询确保只查中核商品池 222 关联的任务。

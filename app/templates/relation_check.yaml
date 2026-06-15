@@ -1,0 +1,31 @@
+scenario: relation_check
+description: 同款关系排查 SQL 模板（只读，中核范围限定版）
+templates:
+  - name: no_relation_count
+    purpose: 统计中核商品池 222 中无同款的商品数量
+    params: []
+    sql: |
+      SELECT COUNT(*) AS no_relation_cnt
+      FROM commodity_pool_188605 cp
+      WHERE cp.COMMODITY_POOL_ID = 222
+        AND cp.STATUS = 1
+        AND NOT EXISTS (
+          SELECT 1 FROM standard_commodity_relation_188605 scr
+          WHERE scr.commodity_id = cp.ID
+        )
+      LIMIT 1;
+    result_hint: 无同款商品过多意味着标品匹配链路可能有问题。
+
+  - name: duplicate_relation
+    purpose: 查中核商品池 222 同款重复绑定（同一商品绑定多个标品）
+    params: []
+    sql: |
+      SELECT scr.commodity_id, COUNT(*) AS rel_cnt
+      FROM standard_commodity_relation_188605 scr
+      INNER JOIN commodity_pool_188605 cp
+        ON cp.ID = scr.commodity_id AND cp.COMMODITY_POOL_ID = 222
+      GROUP BY scr.commodity_id
+      HAVING rel_cnt > 1
+      ORDER BY rel_cnt DESC
+      LIMIT 50;
+    result_hint: 同一商品绑定多个标品会导致价格比对混乱，需要人工核实。

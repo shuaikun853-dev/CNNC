@@ -1,0 +1,28 @@
+scenario: single_item_check
+description: 单商品异常排查 SQL 模板（只读，中核范围限定版）
+templates:
+  - name: pool_item_by_id
+    purpose: 按商品 ID 查中核商品池 222 基本信息
+    params:
+      - name: commodity_id
+        example: "123456"
+    sql: |
+      SELECT ID, TITLE, STATUS, PRICE, create_time, update_time
+      FROM commodity_pool_188605
+      WHERE COMMODITY_POOL_ID = 222
+        AND ID = :commodity_id
+      LIMIT 1;
+    result_hint: STATUS=1 为启用；价格为 0 或 NULL 需进一步查看 monitor 表。
+
+  - name: monitor_price_history
+    purpose: 查中核商品池 222 监控价格最近更新记录
+    params:
+      - name: commodity_id
+    sql: |
+      SELECT ID, STATUS, NEW_PRICE, OLD_PRICE, update_time
+      FROM monitor_commodity_price_188605
+      WHERE COMMODITY_POOL_ID = 222
+        AND commodity_id = :commodity_id
+      ORDER BY update_time DESC
+      LIMIT 20;
+    result_hint: 长期 STATUS=0（采集中）说明爬虫未回调；频繁 STATUS=2（异常）说明价格源不稳定。
