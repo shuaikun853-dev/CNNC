@@ -53,6 +53,19 @@ class ExportFileInfo(StrictModel):
     record_count: int = 0
 
 
+class ManualOperationNode(StrictModel):
+    step: int
+    title: str
+    description: str
+    prerequisite: str = ""
+    expected_outcome: str = ""
+    safety_notice: str = ""
+    related_action: WorkflowAction | None = None
+    is_executable_by_agent: bool = False
+    execution_allowed: bool = False
+    executed: bool = False
+
+
 class WorkflowRecordResult(StrictModel):
     standard_commodity_code: str = ""
     primary_action: WorkflowAction
@@ -66,6 +79,7 @@ class WorkflowRecordResult(StrictModel):
     executed: bool = False
     rule_id: str = ""
     evidence: list[str] = []
+    manual_operation_nodes: list[ManualOperationNode] = Field(default_factory=list)
 
 
 class WorkflowAnalyzeResponse(StrictModel):
@@ -131,6 +145,43 @@ class CustomerLinkRecord(StrictModel):
     issue: str | None = None
 
 
+class BrandInfo(StrictModel):
+    original_brand: str = ""
+    cleaned_brand: str = ""
+    brand_source: str = ""
+    model: str = ""
+    specification: str = ""
+
+
+class SearchTermConfig(StrictModel):
+    full_search_term: str = ""
+    concise_search_term: str = ""
+    fallback_search_term: str = ""
+    primary_term: str = ""
+
+
+class CollectionConfig(StrictModel):
+    data_source: str = ""
+    recall_count: int = 60
+    recall_threshold: int = 60
+    suggest_enable_platform_model_matching: bool = True
+    mall_scope: str = ""
+
+
+class ImportTemplateField(StrictModel):
+    standard_commodity_code: str = ""
+    commodity_name: str = ""
+    document_id: str = ""
+    internet_title: str = ""
+    url: str = ""
+    sku_id: str = ""
+    supplier_code: str = ""
+    supplier_name: str = ""
+    shop_name: str = ""
+    price: Decimal | None = None
+    comment_count: int = 0
+
+
 class PriceFeedbackRecord(StrictModel):
     scope: WorkflowScope
     standard_commodity_code: str = ""
@@ -141,6 +192,8 @@ class PriceFeedbackRecord(StrictModel):
     feedback_source: str = ""
     feedback_type: str = ""
     feedback_detail: str = ""
+    feedback_date: str = ""
+    feedback_reason: str = ""
     customer_links: list[CustomerLinkRecord] = []
     current_same_products: list[SameProductRecord] = []
     current_index_price: Decimal | None = None
@@ -168,6 +221,30 @@ class PriceFeedbackAnalyzeRequest(StrictModel):
     scope: WorkflowScope
     records: list[PriceFeedbackRecord] = Field(..., min_length=1)
     export_format: ExportFormat = ExportFormat.XLSX
+
+
+class SupplementSameProductRecord(StrictModel):
+    scope: WorkflowScope
+    sars_monitor_code: str = ""
+    standard_commodity_code: str = ""
+    variant_code: str = ""
+    commodity_name: str = ""
+    current_same_count: int = 0
+    current_valid_same_count: int = 0
+    current_same_products: list[SameProductCandidate] = Field(default_factory=list)
+    reference_price: Decimal | None = None
+    current_index_price: Decimal | None = None
+    brand_info: BrandInfo | None = None
+    existing_mall_codes: list[str] = Field(default_factory=list)
+    need_code_mapping: bool = False
+    mapped_sars_monitor_code: str = ""
+    current_status: str = ""
+
+
+class SupplementSameProductAnalyzeRequest(StrictModel):
+    scope: WorkflowScope
+    records: list[SupplementSameProductRecord] = Field(..., min_length=1)
+    export_format: ExportFormat | None = None
 
 
 class WorkflowErrorResponse(StrictModel):

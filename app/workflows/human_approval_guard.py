@@ -1,4 +1,5 @@
 from app.schemas.workflow import (
+    ManualOperationNode,
     WorkflowAction,
     WorkflowAnalyzeResponse,
     WorkflowRecordResult,
@@ -48,6 +49,23 @@ def enforce_recommendation_only(
         if r.primary_action not in suggested:
             suggested.insert(0, r.primary_action)
 
+        sanitized_nodes = []
+        for node in r.manual_operation_nodes:
+            sanitized_nodes.append(
+                ManualOperationNode(
+                    step=node.step,
+                    title=node.title,
+                    description=node.description,
+                    prerequisite=node.prerequisite,
+                    expected_outcome=node.expected_outcome,
+                    safety_notice=node.safety_notice,
+                    related_action=node.related_action,
+                    is_executable_by_agent=False,
+                    execution_allowed=False,
+                    executed=False,
+                )
+            )
+
         updated_results.append(
             WorkflowRecordResult(
                 standard_commodity_code=r.standard_commodity_code,
@@ -62,6 +80,7 @@ def enforce_recommendation_only(
                 executed=False,
                 rule_id=r.rule_id,
                 evidence=r.evidence,
+                manual_operation_nodes=sanitized_nodes,
             )
         )
 

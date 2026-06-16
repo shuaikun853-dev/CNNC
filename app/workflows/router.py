@@ -4,7 +4,7 @@ from app.schemas.workflow import WorkflowRouteResponse
 _ROUTE_RULES: list[tuple[list[str], str, float]] = [
     (["同款审批", "新增监控", "同款匹配"], "work_01_same_product_approval", 0.9),
     (["价格异常", "勘误", "反馈", "价格偏高", "价格偏低", "客户反馈"], "work_02_price_index_feedback", 0.9),
-    (["同款不足", "补同款", "无同款"], "work_03_same_product_shortage", 0.85),
+    (["同款不足", "补同款", "无同款", "补同款流程", "同款不足筛查", "周一补同款", "周三前补同款"], "work_03_same_product_shortage", 0.9),
     (["失败班车", "处理失败"], "work_04_failed_bus", 0.85),
     (["价格指数更新", "周度计算"], "work_05_weekly_index_update", 0.85),
     (["波动", "正负10%", "异常波动"], "work_06_index_fluctuation", 0.85),

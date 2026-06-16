@@ -103,7 +103,69 @@ class PriceIndexFeedbackWorkflow(WorkflowBase):
         ]
 
 
+class SupplementSameProductWorkflow(WorkflowBase):
+    workflow_name = "work_03_same_product_shortage"
+    display_name = "中核监控商品同款不足数据筛查和线下流程补同款"
+    required_inputs = ["commodity_name"]
+    optional_inputs = [
+        "sars_monitor_code",
+        "standard_commodity_code",
+        "variant_code",
+        "mapped_sars_monitor_code",
+        "current_same_products",
+        "reference_price",
+    ]
+    possible_actions = [
+        WorkflowAction.SUPPLEMENT_SAME_PRODUCT,
+        WorkflowAction.IMPORT_CUSTOMER_LINKS,
+        WorkflowAction.UNBIND_WRONG_RELATIONS,
+        WorkflowAction.EXPORT,
+        WorkflowAction.QUERY,
+        WorkflowAction.MANUAL_CHECK,
+    ]
+
+    def analyze(self, records: list[Any]) -> WorkflowAnalyzeResponse:
+        results = []
+        for rec in records:
+            code = ""
+            if isinstance(rec, dict):
+                code = rec.get("standard_commodity_code", "") or rec.get("sars_monitor_code", "")
+            results.append(
+                WorkflowRecordResult(
+                    standard_commodity_code=code,
+                    primary_action=WorkflowAction.MANUAL_CHECK,
+                    suggested_actions=[WorkflowAction.MANUAL_CHECK],
+                    action=WorkflowAction.MANUAL_CHECK,
+                    reason="R3.5 only: work_03_same_product_shortage placeholder, business rules will be implemented in R4.5",
+                    pushable=False,
+                    ready_to_push=False,
+                    needs_human_approval=True,
+                    execution_allowed=False,
+                    executed=False,
+                    rule_id="R35_PLACEHOLDER",
+                    evidence=["R3.5 placeholder only", "work_03 true rules will be implemented in R4.5"],
+                )
+            )
+        return WorkflowAnalyzeResponse(
+            workflow_name=self.workflow_name,
+            total_records=len(results),
+            summary={"status": "PLACEHOLDER", "message": "R3.5: work_03 placeholder; rules in R4.5"},
+            record_results=results,
+            execution_allowed=False,
+            executed=False,
+        )
+
+    def get_knowledge_refs(self) -> list[str]:
+        return [
+            "cnnc_work_03_supplement_same_product.md",
+            "cnnc_sars_import_rules.md",
+            "cnnc_base_scope.md",
+            "cnnc_forbidden_actions.md",
+        ]
+
+
 WORKFLOW_REGISTRY: dict[str, WorkflowBase] = {
     "work_01_same_product_approval": SameProductApprovalWorkflow(),
     "work_02_price_index_feedback": PriceIndexFeedbackWorkflow(),
+    "work_03_same_product_shortage": SupplementSameProductWorkflow(),
 }

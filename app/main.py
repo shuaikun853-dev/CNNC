@@ -13,6 +13,7 @@ from app.config import APP_NAME, APP_VERSION, READONLY_MODE, KNOWLEDGE_MD_PATH, 
 from app.schemas.workflow import (
     SameProductAnalyzeRequest,
     PriceFeedbackAnalyzeRequest,
+    SupplementSameProductAnalyzeRequest,
     WorkflowAnalyzeResponse,
     WorkflowErrorResponse,
     WorkflowRouteRequest,
@@ -351,6 +352,36 @@ async def workflow_price_index_feedback_analyze(req: PriceFeedbackAnalyzeRequest
         raise HTTPException(
             status_code=404,
             detail={"error_code": "WORKFLOW_NOT_FOUND", "message": "work_02_price_index_feedback 不存在"},
+        )
+    response = wf.analyze([r.model_dump() for r in req.records])
+    response = enforce_recommendation_only(response)
+    return response
+
+
+@app.post("/workflows/same-product-shortage/analyze", response_model=WorkflowAnalyzeResponse)
+async def workflow_same_product_shortage_analyze(req: SupplementSameProductAnalyzeRequest, request: Request):
+    _check_workflow_access(request)
+    scope_result = validate_request_scope(req.scope)
+    if not scope_result.allowed:
+        raise HTTPException(
+            status_code=400,
+            detail={"error_code": scope_result.error_code, "message": scope_result.message},
+        )
+    for i, rec in enumerate(req.records):
+        if (
+            rec.scope.project != req.scope.project
+            or rec.scope.tenant_id != req.scope.tenant_id
+            or rec.scope.commodity_pool_id != req.scope.commodity_pool_id
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail={"error_code": "OUT_OF_SCOPE", "message": f"记录 {i} scope 与请求级 scope 不一致"},
+            )
+    wf = WORKFLOW_REGISTRY.get("work_03_same_product_shortage")
+    if not wf:
+        raise HTTPException(
+            status_code=404,
+            detail={"error_code": "WORKFLOW_NOT_FOUND", "message": "work_03_same_product_shortage 不存在"},
         )
     response = wf.analyze([r.model_dump() for r in req.records])
     response = enforce_recommendation_only(response)

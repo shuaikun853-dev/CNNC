@@ -26,6 +26,12 @@ _WORKFLOW_KNOWLEDGE_MAP: dict[str, list[str]] = {
         "cnnc_base_scope.md",
         "cnnc_forbidden_actions.md",
     ],
+    "work_03_same_product_shortage": [
+        "cnnc_work_03_supplement_same_product.md",
+        "cnnc_sars_import_rules.md",
+        "cnnc_base_scope.md",
+        "cnnc_forbidden_actions.md",
+    ],
     "diagnose": [
         "cnnc_sql_diagnosis_knowledge.md",
         "cnnc_base_scope.md",
