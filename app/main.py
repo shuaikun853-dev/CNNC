@@ -11,7 +11,8 @@ from app.agent.router import check_scope
 from app.services.knowledge_loader import search_knowledge, load_knowledge, KnowledgeLoadError, get_knowledge_status
 from app.config import APP_NAME, APP_VERSION, READONLY_MODE, KNOWLEDGE_MD_PATH, TEMPLATES_DIR
 from app.schemas.workflow import (
-    WorkflowAnalyzeRequest,
+    SameProductAnalyzeRequest,
+    PriceFeedbackAnalyzeRequest,
     WorkflowAnalyzeResponse,
     WorkflowErrorResponse,
     WorkflowRouteRequest,
@@ -287,11 +288,17 @@ async def workflow_route(req: WorkflowRouteRequest, request: Request):
             status_code=400,
             detail={"error_code": scope_result.error_code, "message": scope_result.message},
         )
+    nl_scope = check_scope(req.question)
+    if not nl_scope.in_scope:
+        raise HTTPException(
+            status_code=400,
+            detail={"error_code": "OUT_OF_SCOPE", "message": "workflow 仅允许处理中核 CNNC / tenant_id=188605 / commodity_pool_id=222 范围内的数据"},
+        )
     return route_workflow(req.question)
 
 
 @app.post("/workflows/same-product-approval/analyze", response_model=WorkflowAnalyzeResponse)
-async def workflow_same_product_approval_analyze(req: WorkflowAnalyzeRequest, request: Request):
+async def workflow_same_product_approval_analyze(req: SameProductAnalyzeRequest, request: Request):
     _check_workflow_access(request)
     scope_result = validate_request_scope(req.scope)
     if not scope_result.allowed:
@@ -299,25 +306,29 @@ async def workflow_same_product_approval_analyze(req: WorkflowAnalyzeRequest, re
             status_code=400,
             detail={"error_code": scope_result.error_code, "message": scope_result.message},
         )
-    records_scope_result = validate_records_scope(req.scope, req.records)
-    if not records_scope_result.allowed:
-        raise HTTPException(
-            status_code=400,
-            detail={"error_code": records_scope_result.error_code, "message": records_scope_result.message},
-        )
+    for i, rec in enumerate(req.records):
+        if (
+            rec.scope.project != req.scope.project
+            or rec.scope.tenant_id != req.scope.tenant_id
+            or rec.scope.commodity_pool_id != req.scope.commodity_pool_id
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail={"error_code": "OUT_OF_SCOPE", "message": f"记录 {i} scope 与请求级 scope 不一致"},
+            )
     wf = WORKFLOW_REGISTRY.get("work_01_same_product_approval")
     if not wf:
         raise HTTPException(
             status_code=404,
             detail={"error_code": "WORKFLOW_NOT_FOUND", "message": "work_01_same_product_approval 不存在"},
         )
-    response = wf.analyze(req.records)
+    response = wf.analyze([r.model_dump() for r in req.records])
     response = enforce_recommendation_only(response)
     return response
 
 
 @app.post("/workflows/price-index-feedback/analyze", response_model=WorkflowAnalyzeResponse)
-async def workflow_price_index_feedback_analyze(req: WorkflowAnalyzeRequest, request: Request):
+async def workflow_price_index_feedback_analyze(req: PriceFeedbackAnalyzeRequest, request: Request):
     _check_workflow_access(request)
     scope_result = validate_request_scope(req.scope)
     if not scope_result.allowed:
@@ -325,19 +336,23 @@ async def workflow_price_index_feedback_analyze(req: WorkflowAnalyzeRequest, req
             status_code=400,
             detail={"error_code": scope_result.error_code, "message": scope_result.message},
         )
-    records_scope_result = validate_records_scope(req.scope, req.records)
-    if not records_scope_result.allowed:
-        raise HTTPException(
-            status_code=400,
-            detail={"error_code": records_scope_result.error_code, "message": records_scope_result.message},
-        )
+    for i, rec in enumerate(req.records):
+        if (
+            rec.scope.project != req.scope.project
+            or rec.scope.tenant_id != req.scope.tenant_id
+            or rec.scope.commodity_pool_id != req.scope.commodity_pool_id
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail={"error_code": "OUT_OF_SCOPE", "message": f"记录 {i} scope 与请求级 scope 不一致"},
+            )
     wf = WORKFLOW_REGISTRY.get("work_02_price_index_feedback")
     if not wf:
         raise HTTPException(
             status_code=404,
             detail={"error_code": "WORKFLOW_NOT_FOUND", "message": "work_02_price_index_feedback 不存在"},
         )
-    response = wf.analyze(req.records)
+    response = wf.analyze([r.model_dump() for r in req.records])
     response = enforce_recommendation_only(response)
     return response
 

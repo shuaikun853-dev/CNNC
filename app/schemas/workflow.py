@@ -154,7 +154,19 @@ class PriceFeedbackRecord(StrictModel):
 
 class WorkflowAnalyzeRequest(StrictModel):
     scope: WorkflowScope
-    records: list[dict]
+    records: list[dict] = Field(..., min_length=1)
+    export_format: ExportFormat = ExportFormat.XLSX
+
+
+class SameProductAnalyzeRequest(StrictModel):
+    scope: WorkflowScope
+    records: list[SameProductRecord] = Field(..., min_length=1)
+    export_format: ExportFormat = ExportFormat.XLSX
+
+
+class PriceFeedbackAnalyzeRequest(StrictModel):
+    scope: WorkflowScope
+    records: list[PriceFeedbackRecord] = Field(..., min_length=1)
     export_format: ExportFormat = ExportFormat.XLSX
 
 

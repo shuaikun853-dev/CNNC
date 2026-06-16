@@ -4,7 +4,7 @@ import os
 LOCAL_WORKFLOW_TOKEN_ENV = "LOCAL_WORKFLOW_TOKEN"
 WORKFLOW_TOKEN_HEADER = "X-Local-Workflow-Token"
 
-LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1", "testclient"})
 
 
 class LocalAccessResult:
