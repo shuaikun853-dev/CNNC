@@ -151,8 +151,11 @@ def test_analyze_work_01_placeholder():
     assert data["execution_allowed"] is False
     assert data["executed"] is False
     assert data["total_records"] == 1
-    assert data["record_results"][0]["primary_action"] == "MANUAL_CHECK"
+    assert data["record_results"][0]["primary_action"] == "SUPPLEMENT_SAME_PRODUCT"
+    assert data["record_results"][0]["rule_id"] == "R02_NO_CANDIDATES"
     assert data["record_results"][0]["execution_allowed"] is False
+    assert data["record_results"][0]["executed"] is False
+    assert data["record_results"][0]["needs_human_approval"] is True
 
 
 def test_analyze_work_02_placeholder():

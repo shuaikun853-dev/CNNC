@@ -36,32 +36,9 @@ class SameProductApprovalWorkflow(WorkflowBase):
     ]
 
     def analyze(self, records: list[Any]) -> WorkflowAnalyzeResponse:
-        results = []
-        for rec in records:
-            code = rec.get("standard_commodity_code", "") if isinstance(rec, dict) else ""
-            results.append(
-                WorkflowRecordResult(
-                    standard_commodity_code=code,
-                    primary_action=WorkflowAction.MANUAL_CHECK,
-                    suggested_actions=[WorkflowAction.MANUAL_CHECK],
-                    action=WorkflowAction.MANUAL_CHECK,
-                    reason="R2 only: work_01 business rules not implemented yet",
-                    pushable=False,
-                    ready_to_push=False,
-                    needs_human_approval=True,
-                    execution_allowed=False,
-                    executed=False,
-                    rule_id="R2_PLACEHOLDER",
-                )
-            )
-        return WorkflowAnalyzeResponse(
-            workflow_name=self.workflow_name,
-            total_records=len(results),
-            summary={"status": "NOT_IMPLEMENTED", "message": "R2 only: workflow base layer created; work_01 rules will be implemented in R3"},
-            record_results=results,
-            execution_allowed=False,
-            executed=False,
-        )
+        from app.workflows.work_01_same_product_approval import analyze_records
+
+        return analyze_records(records)
 
     def get_knowledge_refs(self) -> list[str]:
         return [
