@@ -144,6 +144,8 @@ def test_model_unavailable_does_not_interrupt(monkeypatch):
 def test_model_same_participates_in_approve():
     model = TitleMatchModelResult(match_result="SAME", confidence=0.91, model_match="exact")
     result = audit_saas_approval_item(_item(
+        queryStr="阀门 DN20 1套",
+        skuName="某品牌阀门 DN20 1套",
         skuId="100237336261",
         extLink="https://item.jd.com/100237336261.html",
         price="10.00",
@@ -152,6 +154,65 @@ def test_model_same_participates_in_approve():
     assert result.title_match_result == "SAME"
     assert result.title_match_confidence == 0.91
     assert result.primary_action == WorkflowAction.APPROVE
+
+
+def test_risk_word_downgrades_model_same_to_manual_check():
+    model = TitleMatchModelResult(match_result="SAME", confidence=0.91, model_match="exact")
+    result = audit_saas_approval_item(_item(
+        skuId="100237336261",
+        extLink="https://item.jd.com/100237336261.html",
+        price="347.48",
+        pageActualPrice="347.48",
+    ), title_model_result=model)
+    assert result.primary_action == WorkflowAction.MANUAL_CHECK
+    assert result.execution_allowed is False
+    assert result.executed is False
+    assert result.needs_human_approval is True
+    assert "替代款" in " ".join(result.evidence)
+
+
+@pytest.mark.parametrize("field,value,word", [
+    ("skuName", "某品牌阀门 DN20 替代款", "替代款"),
+    ("queryStr", "通用阀门 DN20", "通用"),
+    ("skuName", "某品牌阀门 DN20 适用", "适用"),
+    ("skuName", "某品牌阀门 DN20 升级款", "升级款"),
+])
+def test_risk_words_block_approval(field, value, word):
+    model = TitleMatchModelResult(match_result="SAME", confidence=0.91, model_match="exact")
+    overrides = {
+        "queryStr": "阀门 DN20",
+        "skuName": "某品牌阀门 DN20",
+        "price": "10.00",
+        "pageActualPrice": "10.00",
+    }
+    overrides[field] = value
+    result = audit_saas_approval_item(_item(**overrides), title_model_result=model)
+    assert result.primary_action == WorkflowAction.MANUAL_CHECK
+    assert word in " ".join(result.evidence)
+
+
+def test_risk_word_does_not_downgrade_sku_mismatch_reject():
+    model = TitleMatchModelResult(match_result="SAME", confidence=0.91, model_match="exact")
+    result = audit_saas_approval_item(_item(
+        queryStr="阀门 DN20",
+        skuName="某品牌阀门 DN20 替代款",
+        skuId="1",
+        extLink="https://item.jd.com/2.html",
+        price="10.00",
+        pageActualPrice="10.00",
+    ), title_model_result=model)
+    assert result.primary_action == WorkflowAction.REJECT
+
+
+def test_risk_word_does_not_downgrade_price_mismatch_reject():
+    model = TitleMatchModelResult(match_result="SAME", confidence=0.91, model_match="exact")
+    result = audit_saas_approval_item(_item(
+        queryStr="阀门 DN20",
+        skuName="某品牌阀门 DN20 替代款",
+        price="10.00",
+        pageActualPrice="11.00",
+    ), title_model_result=model)
+    assert result.primary_action == WorkflowAction.REJECT
 
 
 def test_model_not_same_rejects():

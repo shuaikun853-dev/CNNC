@@ -20,7 +20,8 @@ from app.services.title_match_model_adapter import (
 )
 
 
-REVIEW_TERMS = ("替代款", "升级款", "通用", "适用")
+RISK_WORDS = ("替代款", "通用", "适用", "升级款")
+REVIEW_TERMS = RISK_WORDS
 SPEC_RE = re.compile(r"\d+\s*(?:件套|件|套)")
 MODEL_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9\-_/]*")
 
@@ -49,6 +50,11 @@ def get_page_actual_price(item: SaasSameProductApprovalItem) -> Decimal | None:
     if item.pageActualPrice is not None:
         return item.pageActualPrice
     return item.page_actual_price
+
+
+def detect_title_risk_words(query_str: str, sku_name: str) -> list[str]:
+    text = f"{query_str or ''} {sku_name or ''}"
+    return [word for word in RISK_WORDS if word in text]
 
 
 def _extract_models(text: str) -> list[str]:
@@ -246,6 +252,15 @@ def audit_saas_approval_item(
         link_result.reachable,
         link_result.off_shelf,
     )
+    risk_words = detect_title_risk_words(item.queryStr, item.skuName)
+    if risk_words:
+        evidence.append(f"命中标题风险词：{','.join(risk_words)}")
+        if action == WorkflowAction.APPROVE:
+            action = WorkflowAction.MANUAL_CHECK
+            suggested = [WorkflowAction.MANUAL_CHECK]
+    reason = _reason(title_result, link_result.sku_link_check, link_result.price_check, link_result.reachable, link_result.off_shelf, evidence)
+    if risk_words and action == WorkflowAction.MANUAL_CHECK:
+        reason = "标题包含替代款/通用/适用/升级款等风险词，需人工确认是否为原型号同款"
     return SaasSameProductApprovalAuditResult(
         vCommodityId=item.vCommodityId,
         skuId=item.skuId,
@@ -264,7 +279,7 @@ def audit_saas_approval_item(
         off_shelf=link_result.off_shelf,
         primary_action=action,
         suggested_actions=suggested,
-        reason=_reason(title_result, link_result.sku_link_check, link_result.price_check, link_result.reachable, link_result.off_shelf, evidence),
+        reason=reason,
         evidence=evidence,
         needs_human_approval=True,
         execution_allowed=False,
