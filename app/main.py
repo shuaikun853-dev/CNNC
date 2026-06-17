@@ -341,7 +341,7 @@ async def workflow_same_product_approval_audit_saas_json(req: SaasSameProductApp
         )
     from app.workflows.work_01_saas_approval_json_audit import audit_saas_approval_records
 
-    return audit_saas_approval_records(req.records)
+    return audit_saas_approval_records(req.records, use_model=req.use_model, use_link_audit=req.use_link_audit)
 
 
 @app.post("/workflows/price-index-feedback/analyze", response_model=WorkflowAnalyzeResponse)

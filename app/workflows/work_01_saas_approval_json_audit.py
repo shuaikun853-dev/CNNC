@@ -1,6 +1,5 @@
 import re
 from decimal import Decimal
-from urllib.parse import urlparse
 
 from app.schemas.workflow import (
     SaasSameProductApprovalAuditResponse,
@@ -8,13 +7,22 @@ from app.schemas.workflow import (
     SaasSameProductApprovalItem,
     WorkflowAction,
 )
+from app.services.link_audit_worker import (
+    LinkAuditRequest,
+    check_price_consistency,
+    check_sku_link_consistency,
+    audit_link,
+)
+from app.services.title_match_model_adapter import (
+    TitleMatchModelRequest,
+    TitleMatchModelResult,
+    call_title_match_model,
+)
 
 
-PRICE_TOLERANCE = Decimal("0.01")
 REVIEW_TERMS = ("替代款", "升级款", "通用", "适用")
 SPEC_RE = re.compile(r"\d+\s*(?:件套|件|套)")
 MODEL_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9\-_/]*")
-JD_SKU_RE = re.compile(r"/([0-9]+)\.html(?:$|[?#])")
 
 
 def normalize_mall_name(mall_name: str | None) -> str:
@@ -41,35 +49,6 @@ def get_page_actual_price(item: SaasSameProductApprovalItem) -> Decimal | None:
     if item.pageActualPrice is not None:
         return item.pageActualPrice
     return item.page_actual_price
-
-
-def check_sku_link_consistency(sku_id: str, ext_link: str) -> tuple[str, list[str]]:
-    sku = (sku_id or "").strip()
-    link = (ext_link or "").strip()
-    if not sku or not link:
-        return "UNKNOWN", ["缺少 skuId 或 extLink，无法核验"]
-
-    host = urlparse(link).netloc.lower()
-    if "jd.com" in host:
-        match = JD_SKU_RE.search(link)
-        if not match:
-            return "UNKNOWN", ["京东链接未识别到 SKU，需人工核验"]
-        link_sku = match.group(1)
-        if link_sku == sku:
-            return "MATCH", ["京东链接 SKU 与 skuId 一致"]
-        return "MISMATCH", ["京东链接 SKU 与 skuId 不一致"]
-
-    return "UNKNOWN", ["暂不支持该商城链接 SKU 解析，需人工核验"]
-
-
-def check_price_consistency(json_price: Decimal | None, page_actual_price: Decimal | None) -> tuple[str, list[str]]:
-    if json_price is None:
-        return "JSON_PRICE_MISSING", ["SaaS JSON 价格为空"]
-    if page_actual_price is None:
-        return "WAIT_PAGE_PRICE_CHECK", ["缺少页面实际价格，需人工打开链接核验"]
-    if abs(json_price - page_actual_price) <= PRICE_TOLERANCE:
-        return "MATCH", ["SaaS JSON 价格与页面实际价格一致"]
-    return "MISMATCH", ["SaaS JSON 价格与页面实际价格不一致"]
 
 
 def _extract_models(text: str) -> list[str]:
@@ -99,7 +78,7 @@ def audit_title_similarity(
     query = (query_str or "").strip()
     sku = (sku_name or "").strip()
     if not query or not sku:
-        return "UNKNOWN", ["缺少标准商品描述或 SKU 标题"]
+        return "MANUAL_REVIEW", ["缺少标准商品描述或 SKU 标题"]
 
     evidence: list[str] = []
     if model_audit_result == "1" and is_match == "1":
@@ -127,53 +106,146 @@ def audit_title_similarity(
         return "MANUAL_REVIEW", evidence
 
     if matched_models:
-        return "LIKELY_MATCH", evidence
+        return "SAME", evidence
     if query_models:
         return "MANUAL_REVIEW", evidence
-    if model_audit_result == "1" and is_match == "1":
-        return "MANUAL_REVIEW", evidence
-    return "UNKNOWN", evidence
+    return "MANUAL_REVIEW", evidence
 
 
-def _decide_action(title_result: str, sku_check: str, price_check: str) -> tuple[WorkflowAction, list[WorkflowAction]]:
-    if sku_check == "MISMATCH" or price_check == "MISMATCH" or title_result == "LIKELY_NOT_MATCH":
+def _title_result_from_model_or_rule(
+    item: SaasSameProductApprovalItem,
+    use_model: bool,
+) -> tuple[str, float, list[str]]:
+    rule_result, rule_evidence = audit_title_similarity(
+        item.queryStr,
+        item.skuName,
+        item.modelAuditResult,
+        item.isMatch,
+    )
+    if not use_model:
+        return rule_result, 0.0, rule_evidence
+
+    model_result = call_title_match_model(
+        TitleMatchModelRequest(
+            query_str=item.queryStr,
+            sku_name=item.skuName,
+            model_audit_result=item.modelAuditResult,
+            is_match=item.isMatch,
+        )
+    )
+    evidence = [
+        f"title_model.match_result={model_result.match_result}",
+        f"title_model.confidence={model_result.confidence}",
+    ]
+    if model_result.reason:
+        evidence.append(f"title_model.reason={model_result.reason}")
+    evidence.extend([f"title_model.risk={risk}" for risk in model_result.risk_points])
+    evidence.extend(rule_evidence)
+
+    if model_result.match_result == "MODEL_UNAVAILABLE":
+        return "MODEL_UNAVAILABLE", model_result.confidence, evidence
+    return model_result.match_result, model_result.confidence, evidence
+
+
+def _decide_action(
+    title_result: str,
+    sku_check: str,
+    price_check: str,
+    reachable: bool | None,
+    off_shelf: bool | None,
+) -> tuple[WorkflowAction, list[WorkflowAction]]:
+    if title_result == "NOT_SAME" or sku_check == "MISMATCH" or price_check == "MISMATCH" or reachable is False or off_shelf is True:
         return WorkflowAction.REJECT, [WorkflowAction.REJECT, WorkflowAction.MANUAL_CHECK]
-    if title_result == "LIKELY_MATCH" and sku_check in {"MATCH", "UNKNOWN"} and price_check == "MATCH":
+    if (
+        title_result == "SAME"
+        and sku_check in {"MATCH", "UNKNOWN"}
+        and price_check == "MATCH"
+        and reachable is not False
+        and off_shelf is not True
+    ):
         return WorkflowAction.APPROVE, [WorkflowAction.APPROVE]
     return WorkflowAction.MANUAL_CHECK, [WorkflowAction.MANUAL_CHECK]
 
 
-def _reason(title_result: str, sku_check: str, price_check: str, evidence: list[str]) -> str:
+def _reason(
+    title_result: str,
+    sku_check: str,
+    price_check: str,
+    reachable: bool | None,
+    off_shelf: bool | None,
+    evidence: list[str],
+) -> str:
     if title_result == "MANUAL_REVIEW" and any("替代款" in item for item in evidence):
         return "型号命中，但标题含“替代款”，需人工确认是否为原型号同款"
+    if title_result == "NOT_SAME":
+        return "标题模型判断非同款，建议人工驳回前复核"
+    if reachable is False:
+        return "候选链接不可访问，建议人工驳回前复核"
+    if off_shelf is True:
+        return "候选商品疑似下架，建议人工驳回前复核"
     if sku_check == "MISMATCH":
         return "SKU 与链接不一致，建议人工驳回前复核"
     if price_check == "MISMATCH":
         return "SaaS JSON 价格与页面实际价格不一致，建议人工驳回前复核"
     if price_check == "WAIT_PAGE_PRICE_CHECK":
         return "缺少页面实际价格，待页面价格核验"
-    if title_result == "LIKELY_MATCH" and price_check == "MATCH":
-        return "疑似同款且价格一致，建议人工审批通过"
+    if title_result == "SAME" and price_check == "MATCH":
+        return "标题模型判断同款且价格一致，建议人工审批通过"
     return "需人工核查同款关系、SKU 链接和价格一致性"
 
 
-def audit_saas_approval_item(item: SaasSameProductApprovalItem) -> SaasSameProductApprovalAuditResult:
-    title_result, title_evidence = audit_title_similarity(
-        item.queryStr,
-        item.skuName,
-        item.modelAuditResult,
-        item.isMatch,
-    )
-    sku_check, sku_evidence = check_sku_link_consistency(item.skuId, item.extLink)
+def audit_saas_approval_item(
+    item: SaasSameProductApprovalItem,
+    use_model: bool = False,
+    use_link_audit: bool = True,
+    title_model_result: TitleMatchModelResult | None = None,
+) -> SaasSameProductApprovalAuditResult:
+    if title_model_result is not None:
+        title_result = title_model_result.match_result
+        title_confidence = title_model_result.confidence
+        title_evidence = [
+            f"title_model.match_result={title_model_result.match_result}",
+            f"title_model.confidence={title_model_result.confidence}",
+        ]
+        if title_model_result.reason:
+            title_evidence.append(f"title_model.reason={title_model_result.reason}")
+        title_evidence.extend([f"title_model.risk={risk}" for risk in title_model_result.risk_points])
+    else:
+        title_result, title_confidence, title_evidence = _title_result_from_model_or_rule(item, use_model)
+
     page_price = get_page_actual_price(item)
-    price_check, price_evidence = check_price_consistency(item.price, page_price)
+    if use_link_audit:
+        link_result = audit_link(LinkAuditRequest(
+            ext_link=item.extLink,
+            sku_id=item.skuId,
+            vendor_name=item.vendorName,
+            shop_name=item.shopName,
+            json_price=item.price,
+            page_actual_price=page_price,
+        ))
+    else:
+        sku_check, sku_evidence = check_sku_link_consistency(item.skuId, item.extLink)
+        price_check, price_evidence = check_price_consistency(item.price, page_price)
+        from app.services.link_audit_worker import LinkAuditResult
+        link_result = LinkAuditResult(
+            sku_link_check=sku_check,
+            page_price=page_price,
+            price_check=price_check,
+            evidence=[*sku_evidence, *price_evidence],
+        )
+
     evidence = [
         f"vendor={normalize_mall_name(item.vendorName) or normalize_mall_name(item.shopName)}",
         *title_evidence,
-        *sku_evidence,
-        *price_evidence,
+        *link_result.evidence,
     ]
-    action, suggested = _decide_action(title_result, sku_check, price_check)
+    action, suggested = _decide_action(
+        title_result,
+        link_result.sku_link_check,
+        link_result.price_check,
+        link_result.reachable,
+        link_result.off_shelf,
+    )
     return SaasSameProductApprovalAuditResult(
         vCommodityId=item.vCommodityId,
         skuId=item.skuId,
@@ -183,13 +255,16 @@ def audit_saas_approval_item(item: SaasSameProductApprovalItem) -> SaasSameProdu
         vendorName=item.vendorName,
         shopName=item.shopName,
         json_price=item.price,
-        page_actual_price=page_price,
+        page_actual_price=link_result.page_price,
         title_match_result=title_result,
-        sku_link_check=sku_check,
-        price_check=price_check,
+        title_match_confidence=title_confidence,
+        sku_link_check=link_result.sku_link_check,
+        price_check=link_result.price_check,
+        reachable=link_result.reachable,
+        off_shelf=link_result.off_shelf,
         primary_action=action,
         suggested_actions=suggested,
-        reason=_reason(title_result, sku_check, price_check, evidence),
+        reason=_reason(title_result, link_result.sku_link_check, link_result.price_check, link_result.reachable, link_result.off_shelf, evidence),
         evidence=evidence,
         needs_human_approval=True,
         execution_allowed=False,
@@ -216,8 +291,10 @@ def enforce_saas_audit_recommendation_only(
 
 def audit_saas_approval_records(
     records: list[SaasSameProductApprovalItem],
+    use_model: bool = True,
+    use_link_audit: bool = True,
 ) -> SaasSameProductApprovalAuditResponse:
-    results = [audit_saas_approval_item(record) for record in records]
+    results = [audit_saas_approval_item(record, use_model=use_model, use_link_audit=use_link_audit) for record in records]
     groups: dict[str, list[SaasSameProductApprovalAuditResult]] = {}
     for result in results:
         groups.setdefault(result.vCommodityId, []).append(result)
@@ -231,6 +308,7 @@ def audit_saas_approval_records(
         "wait_page_price_check_count": len([r for r in results if r.price_check == "WAIT_PAGE_PRICE_CHECK"]),
         "price_mismatch_count": len([r for r in results if r.price_check == "MISMATCH"]),
         "sku_mismatch_count": len([r for r in results if r.sku_link_check == "MISMATCH"]),
+        "model_unavailable_count": len([r for r in results if r.title_match_result == "MODEL_UNAVAILABLE"]),
     }
     for v_commodity_id, group_results in groups.items():
         prefix = f"group.{v_commodity_id}"

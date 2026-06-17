@@ -5,12 +5,12 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.schemas.workflow import SaasSameProductApprovalItem, WorkflowAction
+from app.services.link_audit_worker import LinkAuditResult, check_price_consistency, check_sku_link_consistency
+from app.services.title_match_model_adapter import TitleMatchModelRequest, TitleMatchModelResult, call_title_match_model
 from app.workflows.work_01_saas_approval_json_audit import (
     audit_saas_approval_item,
     audit_saas_approval_records,
     audit_title_similarity,
-    check_price_consistency,
-    check_sku_link_consistency,
 )
 
 
@@ -63,7 +63,7 @@ def _item(**overrides) -> SaasSameProductApprovalItem:
 
 
 def test_parse_sample_json_and_manual_review_replacement_reason():
-    result = audit_saas_approval_item(_item())
+    result = audit_saas_approval_item(_item(), use_model=False)
     assert result.vCommodityId == "679416640600166400"
     assert result.json_price == Decimal("347.48")
     assert result.title_match_result == "MANUAL_REVIEW"
@@ -119,7 +119,7 @@ def test_page_actual_price_mismatch():
 
 def test_title_model_match_likely_match():
     result, evidence = audit_title_similarity("阀门 DN20 1套", "某品牌 DN20 阀门 1套", "", "")
-    assert result == "LIKELY_MATCH"
+    assert result == "SAME"
     assert any("核心型号命中" in item for item in evidence)
 
 
@@ -134,6 +134,38 @@ def test_model_flags_add_evidence():
     assert "SaaS模型判断为同款" in evidence
 
 
+def test_model_unavailable_does_not_interrupt(monkeypatch):
+    monkeypatch.delenv("TITLE_MATCH_MODEL_API_KEY", raising=False)
+    monkeypatch.delenv("TITLE_MATCH_MODEL_BASE_URL", raising=False)
+    result = call_title_match_model(TitleMatchModelRequest(query_str="阀门 DN20", sku_name="阀门 DN20"))
+    assert result.match_result == "MODEL_UNAVAILABLE"
+
+
+def test_model_same_participates_in_approve():
+    model = TitleMatchModelResult(match_result="SAME", confidence=0.91, model_match="exact")
+    result = audit_saas_approval_item(_item(
+        skuId="100237336261",
+        extLink="https://item.jd.com/100237336261.html",
+        price="10.00",
+        pageActualPrice="10.00",
+    ), title_model_result=model)
+    assert result.title_match_result == "SAME"
+    assert result.title_match_confidence == 0.91
+    assert result.primary_action == WorkflowAction.APPROVE
+
+
+def test_model_not_same_rejects():
+    model = TitleMatchModelResult(match_result="NOT_SAME", confidence=0.88, model_match="mismatch")
+    result = audit_saas_approval_item(_item(price="10.00", pageActualPrice="10.00"), title_model_result=model)
+    assert result.primary_action == WorkflowAction.REJECT
+
+
+def test_model_manual_review_manual_check():
+    model = TitleMatchModelResult(match_result="MANUAL_REVIEW", confidence=0.5, model_match="partial")
+    result = audit_saas_approval_item(_item(price="10.00", pageActualPrice="10.00"), title_model_result=model)
+    assert result.primary_action == WorkflowAction.MANUAL_CHECK
+
+
 def test_likely_match_sku_match_price_match_approve():
     result = audit_saas_approval_item(_item(
         queryStr="阀门 DN20 1套",
@@ -142,8 +174,8 @@ def test_likely_match_sku_match_price_match_approve():
         extLink="https://item.jd.com/100237336261.html",
         price="10.00",
         pageActualPrice="10.00",
-    ))
-    assert result.title_match_result == "LIKELY_MATCH"
+    ), use_model=False)
+    assert result.title_match_result == "SAME"
     assert result.sku_link_check == "MATCH"
     assert result.price_check == "MATCH"
     assert result.primary_action == WorkflowAction.APPROVE
@@ -155,7 +187,7 @@ def test_price_mismatch_reject():
         skuName="阀门 DN20",
         price="10.00",
         pageActualPrice="11.00",
-    ))
+    ), use_model=False)
     assert result.price_check == "MISMATCH"
     assert result.primary_action == WorkflowAction.REJECT
 
@@ -168,19 +200,57 @@ def test_sku_mismatch_reject():
         extLink="https://item.jd.com/2.html",
         price="10.00",
         pageActualPrice="10.00",
-    ))
+    ), use_model=False)
     assert result.sku_link_check == "MISMATCH"
     assert result.primary_action == WorkflowAction.REJECT
 
 
 def test_wait_page_price_check_manual_check():
-    result = audit_saas_approval_item(_item(queryStr="阀门 DN20", skuName="阀门 DN20", pageActualPrice=None))
+    result = audit_saas_approval_item(_item(queryStr="阀门 DN20", skuName="阀门 DN20", pageActualPrice=None), use_model=False)
     assert result.price_check == "WAIT_PAGE_PRICE_CHECK"
     assert result.primary_action == WorkflowAction.MANUAL_CHECK
 
 
+def test_reachable_false_reject(monkeypatch):
+    import app.workflows.work_01_saas_approval_json_audit as mod
+
+    def fake_audit_link(_request):
+        return LinkAuditResult(
+            reachable=False,
+            off_shelf=None,
+            sku_link_check="MATCH",
+            page_price=Decimal("10.00"),
+            price_check="MATCH",
+            evidence=["链接不可访问"],
+        )
+
+    monkeypatch.setattr(mod, "audit_link", fake_audit_link)
+    result = audit_saas_approval_item(_item(queryStr="阀门 DN20", skuName="阀门 DN20", price="10.00", pageActualPrice="10.00"), use_model=False)
+    assert result.reachable is False
+    assert result.primary_action == WorkflowAction.REJECT
+
+
+def test_off_shelf_true_reject(monkeypatch):
+    import app.workflows.work_01_saas_approval_json_audit as mod
+
+    def fake_audit_link(_request):
+        return LinkAuditResult(
+            reachable=True,
+            off_shelf=True,
+            sku_link_check="MATCH",
+            page_price=Decimal("10.00"),
+            price_check="MATCH",
+            evidence=["商品疑似下架"],
+        )
+
+    monkeypatch.setattr(mod, "audit_link", fake_audit_link)
+    result = audit_saas_approval_item(_item(queryStr="阀门 DN20", skuName="阀门 DN20", price="10.00", pageActualPrice="10.00"), use_model=False)
+    assert result.off_shelf is True
+    assert result.primary_action == WorkflowAction.REJECT
+
+
 def test_output_is_recommendation_only():
-    response = audit_saas_approval_records([_item(), _item(vCommodityId="v2")])
+    response = audit_saas_approval_records([_item(), _item(vCommodityId="v2")], use_model=False)
     assert response.execution_allowed is False
     assert response.executed is False
     for result in response.record_results:
@@ -193,7 +263,7 @@ def test_summary_group_counts():
     response = audit_saas_approval_records([
         _item(vCommodityId="v1", pageActualPrice="347.48"),
         _item(vCommodityId="v1", skuId="1", extLink="https://item.jd.com/2.html", pageActualPrice="347.48"),
-    ])
+    ], use_model=False)
     assert response.summary["total_records"] == 2
     assert response.summary["total_v_commodities"] == 1
     assert response.summary["sku_mismatch_count"] == 1

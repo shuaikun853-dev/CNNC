@@ -282,6 +282,8 @@ class SaasSameProductApprovalItem(StrictModel):
 class SaasSameProductApprovalAuditRequest(StrictModel):
     scope: WorkflowScope
     records: list[SaasSameProductApprovalItem] = Field(..., min_length=1)
+    use_model: bool = True
+    use_link_audit: bool = True
 
 
 class SaasSameProductApprovalAuditResult(StrictModel):
@@ -295,8 +297,11 @@ class SaasSameProductApprovalAuditResult(StrictModel):
     json_price: Decimal | None = None
     page_actual_price: Decimal | None = None
     title_match_result: str = ""
+    title_match_confidence: float = 0.0
     sku_link_check: str = ""
     price_check: str = ""
+    reachable: bool | None = None
+    off_shelf: bool | None = None
     primary_action: WorkflowAction
     suggested_actions: list[WorkflowAction] = Field(default_factory=list)
     reason: str = ""
