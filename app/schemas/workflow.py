@@ -140,7 +140,7 @@ class CustomerLinkRecord(StrictModel):
     price: Decimal | None = None
     page_actual_price: Decimal | None = None
     is_valid_link: bool = False
-    is_same_product: bool = False
+    is_same_product: bool | None = False
     comment_count: int = 0
     issue: str | None = None
 
@@ -194,6 +194,9 @@ class PriceFeedbackRecord(StrictModel):
     feedback_detail: str = ""
     feedback_date: str = ""
     feedback_reason: str = ""
+    feedback_price: Decimal | None = None
+    code_mapping_status: str = ""
+    customer_reply_draft: str = ""
     customer_links: list[CustomerLinkRecord] = []
     current_same_products: list[SameProductRecord] = []
     current_index_price: Decimal | None = None

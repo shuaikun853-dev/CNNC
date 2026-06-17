@@ -158,7 +158,7 @@ def test_analyze_work_01_placeholder():
     assert data["record_results"][0]["needs_human_approval"] is True
 
 
-def test_analyze_work_02_placeholder():
+def test_analyze_work_02_framework():
     _set_token("correct-token")
     from app.main import app
     client = TestClient(app)
@@ -179,7 +179,12 @@ def test_analyze_work_02_placeholder():
     assert resp.status_code == 200
     data = resp.json()
     assert data["execution_allowed"] is False
+    assert data["executed"] is False
     assert data["record_results"][0]["primary_action"] == "MANUAL_VERIFY"
+    assert data["record_results"][0]["rule_id"] == "R40_FRAMEWORK_PLACEHOLDER"
+    assert data["record_results"][0]["execution_allowed"] is False
+    assert data["record_results"][0]["executed"] is False
+    assert data["record_results"][0]["needs_human_approval"] is True
 
 
 def test_knowledge_endpoint():

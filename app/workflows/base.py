@@ -67,32 +67,9 @@ class PriceIndexFeedbackWorkflow(WorkflowBase):
     ]
 
     def analyze(self, records: list[Any]) -> WorkflowAnalyzeResponse:
-        results = []
-        for rec in records:
-            code = rec.get("standard_commodity_code", "") if isinstance(rec, dict) else ""
-            results.append(
-                WorkflowRecordResult(
-                    standard_commodity_code=code,
-                    primary_action=WorkflowAction.MANUAL_VERIFY,
-                    suggested_actions=[WorkflowAction.MANUAL_VERIFY],
-                    action=WorkflowAction.MANUAL_VERIFY,
-                    reason="R2 only: work_02 business rules not implemented yet",
-                    pushable=False,
-                    ready_to_push=False,
-                    needs_human_approval=True,
-                    execution_allowed=False,
-                    executed=False,
-                    rule_id="R2_PLACEHOLDER",
-                )
-            )
-        return WorkflowAnalyzeResponse(
-            workflow_name=self.workflow_name,
-            total_records=len(results),
-            summary={"status": "NOT_IMPLEMENTED", "message": "R2 only: workflow base layer created; work_02 rules will be implemented in R4"},
-            record_results=results,
-            execution_allowed=False,
-            executed=False,
-        )
+        from app.workflows.work_02_price_index_feedback import analyze_records
+
+        return analyze_records(records)
 
     def get_knowledge_refs(self) -> list[str]:
         return [
