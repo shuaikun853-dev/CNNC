@@ -30,6 +30,11 @@ class LinkAuditResult(StrictModel):
     price_check: str = ""
     screenshot_path: str = ""
     error_code: str = ""
+    page_status: str = ""
+    crawl_status: str = ""
+    error_message: str = ""
+    price_source: str = ""
+    raw_price_candidates: list[str] = Field(default_factory=list)
     evidence: list[str] = Field(default_factory=list)
 
 

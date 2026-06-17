@@ -1,7 +1,9 @@
 import re
+from datetime import datetime
 from decimal import Decimal
 
 from app.schemas.workflow import (
+    InternalCrawlResult,
     SaasSameProductApprovalAuditResponse,
     SaasSameProductApprovalAuditResult,
     SaasSameProductApprovalItem,
@@ -9,6 +11,7 @@ from app.schemas.workflow import (
 )
 from app.services.link_audit_worker import (
     LinkAuditRequest,
+    LinkAuditResult,
     check_price_consistency,
     check_sku_link_consistency,
     audit_link,
@@ -67,6 +70,195 @@ def get_candidate_price(record: SaasSameProductApprovalItem, page_actual_price: 
     if page_actual_price is not None:
         return page_actual_price
     return record.price
+
+
+def _normalize_key(value: str | None) -> str:
+    return (value or "").strip()
+
+
+def _parse_crawl_time(value: str) -> datetime | None:
+    text = (value or "").strip()
+    if not text:
+        return None
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(text.replace("Z", ""), fmt)
+        except ValueError:
+            continue
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _latest_crawl_result(results: list[InternalCrawlResult]) -> InternalCrawlResult | None:
+    if not results:
+        return None
+    latest_index = 0
+    latest_time = _parse_crawl_time(results[0].crawl_time)
+    for index, result in enumerate(results[1:], start=1):
+        parsed_time = _parse_crawl_time(result.crawl_time)
+        if parsed_time is None and latest_time is None:
+            latest_index = index
+            continue
+        if parsed_time is not None and (latest_time is None or parsed_time >= latest_time):
+            latest_time = parsed_time
+            latest_index = index
+    return results[latest_index]
+
+
+def match_crawl_result(
+    record: SaasSameProductApprovalItem,
+    crawl_results: list[InternalCrawlResult],
+) -> InternalCrawlResult | None:
+    ext_link = _normalize_key(record.extLink)
+    sku_id = _normalize_key(record.skuId)
+    vendor_name = normalize_mall_name(record.vendorName)
+    if ext_link:
+        matched = [result for result in crawl_results if _normalize_key(result.extLink) == ext_link]
+        found = _latest_crawl_result(matched)
+        if found is not None:
+            return found
+    if sku_id:
+        matched = [result for result in crawl_results if _normalize_key(result.skuId) == sku_id]
+        found = _latest_crawl_result(matched)
+        if found is not None:
+            return found
+    if vendor_name and sku_id:
+        matched = [
+            result for result in crawl_results
+            if normalize_mall_name(result.vendorName) == vendor_name and _normalize_key(result.skuId) == sku_id
+        ]
+        return _latest_crawl_result(matched)
+    return None
+
+
+def match_crawl_result_with_evidence(
+    record: SaasSameProductApprovalItem,
+    crawl_results: list[InternalCrawlResult],
+) -> tuple[InternalCrawlResult | None, list[str]]:
+    result = match_crawl_result(record, crawl_results)
+    if result is None:
+        return None, ["缺少内部爬取结果，需人工核验页面价格"]
+    if _normalize_key(result.extLink) and _normalize_key(result.extLink) == _normalize_key(record.extLink):
+        return result, ["命中内部爬取结果：extLink"]
+    if _normalize_key(result.skuId) and _normalize_key(result.skuId) == _normalize_key(record.skuId):
+        if normalize_mall_name(result.vendorName) == normalize_mall_name(record.vendorName):
+            return result, ["命中内部爬取结果：vendorName+skuId"]
+        return result, ["命中内部爬取结果：skuId"]
+    return result, ["命中内部爬取结果：vendorName+skuId"]
+
+
+def sanitize_screenshot_path(screenshot_path: str) -> tuple[str, list[str]]:
+    path = (screenshot_path or "").strip()
+    if not path:
+        return "", []
+    lower = path.lower()
+    if (
+        ".." in path
+        or path.startswith("/")
+        or path.startswith("\\")
+        or re.match(r"^[a-zA-Z]:", path)
+        or lower.startswith(("file://", "http://", "https://"))
+    ):
+        return "", ["截图路径疑似不安全，已忽略"]
+    return path, [f"内部爬取截图路径={path}"]
+
+
+def _is_crawl_status(crawl_result: InternalCrawlResult | None, *statuses: str) -> bool:
+    if crawl_result is None:
+        return False
+    values = {crawl_result.crawl_status.upper(), crawl_result.page_status.upper()}
+    return any(status in values for status in statuses)
+
+
+def _crawl_link_result(
+    item: SaasSameProductApprovalItem,
+    crawl_result: InternalCrawlResult | None,
+    crawl_evidence: list[str],
+) -> LinkAuditResult:
+    sku_check, sku_evidence = check_sku_link_consistency(item.skuId, item.extLink)
+    if crawl_result is None:
+        return LinkAuditResult(
+            reachable=None,
+            off_shelf=None,
+            sku_link_check=sku_check,
+            page_price=None,
+            price_check="WAIT_PAGE_PRICE_CHECK",
+            evidence=[*sku_evidence, *crawl_evidence],
+        )
+    screenshot_path, screenshot_evidence = sanitize_screenshot_path(crawl_result.screenshot_path)
+    status = crawl_result.crawl_status.upper() or crawl_result.page_status.upper()
+    page_status = crawl_result.page_status.upper()
+    evidence = [
+        *sku_evidence,
+        *crawl_evidence,
+        f"内部爬取状态={crawl_result.crawl_status or crawl_result.page_status or 'UNKNOWN'}",
+        *screenshot_evidence,
+    ]
+    if crawl_result.error_code:
+        evidence.append(f"内部爬取错误码={crawl_result.error_code}")
+    if crawl_result.error_message:
+        evidence.append(f"内部爬取错误信息={crawl_result.error_message}")
+    if crawl_result.page_title:
+        evidence.append(f"内部爬取页面标题={crawl_result.page_title}")
+    if crawl_result.raw_price_candidates:
+        evidence.append(f"内部爬取价格候选={','.join(crawl_result.raw_price_candidates)}")
+    if _is_crawl_status(crawl_result, "OFF_SHELF"):
+        price_check, price_evidence = check_price_consistency(item.price, crawl_result.page_price)
+        return LinkAuditResult(
+            reachable=True,
+            off_shelf=True,
+            sku_link_check=sku_check,
+            page_title=crawl_result.page_title,
+            page_price=crawl_result.page_price,
+            price_check=price_check,
+            screenshot_path=screenshot_path,
+            error_code=crawl_result.error_code,
+            page_status=page_status,
+            crawl_status=status,
+            error_message=crawl_result.error_message,
+            price_source=crawl_result.price_source,
+            raw_price_candidates=crawl_result.raw_price_candidates,
+            evidence=[*evidence, *price_evidence, "内部爬取结果显示商品疑似下架"],
+        )
+    if _is_crawl_status(crawl_result, "SOLD_OUT", "PRICE_MISSING", "CAPTCHA", "ACCESS_DENIED", "TIMEOUT", "FAILED", "UNKNOWN"):
+        price_check, price_evidence = check_price_consistency(item.price, crawl_result.page_price)
+        if _is_crawl_status(crawl_result, "PRICE_MISSING"):
+            price_check = "WAIT_PAGE_PRICE_CHECK"
+        return LinkAuditResult(
+            reachable=None,
+            off_shelf=None,
+            sku_link_check=sku_check,
+            page_title=crawl_result.page_title,
+            page_price=crawl_result.page_price,
+            price_check=price_check,
+            screenshot_path=screenshot_path,
+            error_code=crawl_result.error_code,
+            page_status=page_status,
+            crawl_status=status,
+            error_message=crawl_result.error_message,
+            price_source=crawl_result.price_source,
+            raw_price_candidates=crawl_result.raw_price_candidates,
+            evidence=[*evidence, *price_evidence, "内部爬取结果需人工核验"],
+        )
+    price_check, price_evidence = check_price_consistency(item.price, crawl_result.page_price)
+    return LinkAuditResult(
+        reachable=True,
+        off_shelf=False,
+        sku_link_check=sku_check,
+        page_title=crawl_result.page_title,
+        page_price=crawl_result.page_price,
+        price_check=price_check,
+        screenshot_path=screenshot_path,
+        error_code=crawl_result.error_code,
+        page_status=page_status or "NORMAL",
+        crawl_status=status or "SUCCESS",
+        error_message=crawl_result.error_message,
+        price_source=crawl_result.price_source,
+        raw_price_candidates=crawl_result.raw_price_candidates,
+        evidence=[*evidence, *price_evidence],
+    )
 
 
 def check_candidate_price_against_customer_price(
@@ -256,6 +448,8 @@ def audit_saas_approval_item(
     use_model: bool = False,
     use_link_audit: bool = True,
     title_model_result: TitleMatchModelResult | None = None,
+    crawl_results: list[InternalCrawlResult] | None = None,
+    use_crawl_result: bool = False,
 ) -> SaasSameProductApprovalAuditResult:
     if title_model_result is not None:
         title_result = title_model_result.match_result
@@ -271,7 +465,12 @@ def audit_saas_approval_item(
         title_result, title_confidence, title_evidence = _title_result_from_model_or_rule(item, use_model)
 
     page_price = get_page_actual_price(item)
-    if use_link_audit:
+    crawl_result: InternalCrawlResult | None = None
+    crawl_evidence: list[str] = []
+    if use_crawl_result:
+        crawl_result, crawl_evidence = match_crawl_result_with_evidence(item, crawl_results or [])
+        link_result = _crawl_link_result(item, crawl_result, crawl_evidence)
+    elif use_link_audit:
         link_result = audit_link(LinkAuditRequest(
             ext_link=item.extLink,
             sku_id=item.skuId,
@@ -283,7 +482,6 @@ def audit_saas_approval_item(
     else:
         sku_check, sku_evidence = check_sku_link_consistency(item.skuId, item.extLink)
         price_check, price_evidence = check_price_consistency(item.price, page_price)
-        from app.services.link_audit_worker import LinkAuditResult
         link_result = LinkAuditResult(
             sku_link_check=sku_check,
             page_price=page_price,
@@ -308,6 +506,26 @@ def audit_saas_approval_item(
         link_result.reachable,
         link_result.off_shelf,
     )
+    if use_crawl_result and crawl_result is None:
+        action = WorkflowAction.MANUAL_CHECK
+        suggested = [WorkflowAction.MANUAL_CHECK]
+    if use_crawl_result and crawl_result is not None and _is_crawl_status(
+        crawl_result,
+        "SOLD_OUT",
+        "PRICE_MISSING",
+        "CAPTCHA",
+        "ACCESS_DENIED",
+        "TIMEOUT",
+        "FAILED",
+        "UNKNOWN",
+    ):
+        if action == WorkflowAction.APPROVE:
+            action = WorkflowAction.MANUAL_CHECK
+            suggested = [WorkflowAction.MANUAL_CHECK]
+    if use_crawl_result and crawl_result is not None and link_result.price_source.upper() == "OCR" and action == WorkflowAction.APPROVE:
+        action = WorkflowAction.MANUAL_CHECK
+        suggested = [WorkflowAction.MANUAL_CHECK]
+        evidence.append("价格仅来自 OCR，不能作为自动通过依据，需人工复核")
     risk_words = detect_title_risk_words(item.queryStr, item.skuName)
     if risk_words:
         evidence.append(f"命中标题风险词：{','.join(risk_words)}")
@@ -329,6 +547,14 @@ def audit_saas_approval_item(
         page_actual_price=link_result.page_price,
         customer_price=customer_price,
         price_vs_customer_check=price_vs_customer_check,
+        crawl_status=link_result.crawl_status,
+        page_status=link_result.page_status,
+        page_title=link_result.page_title,
+        page_price=link_result.page_price,
+        crawl_error_code=link_result.error_code,
+        crawl_error_message=link_result.error_message,
+        screenshot_path=link_result.screenshot_path,
+        crawl_matched=crawl_result is not None,
         title_match_result=title_result,
         title_match_confidence=title_confidence,
         sku_link_check=link_result.sku_link_check,
@@ -366,8 +592,19 @@ def audit_saas_approval_records(
     records: list[SaasSameProductApprovalItem],
     use_model: bool = True,
     use_link_audit: bool = True,
+    crawl_results: list[InternalCrawlResult] | None = None,
+    use_crawl_result: bool = True,
 ) -> SaasSameProductApprovalAuditResponse:
-    results = [audit_saas_approval_item(record, use_model=use_model, use_link_audit=use_link_audit) for record in records]
+    results = [
+        audit_saas_approval_item(
+            record,
+            use_model=use_model,
+            use_link_audit=use_link_audit,
+            crawl_results=crawl_results,
+            use_crawl_result=use_crawl_result,
+        )
+        for record in records
+    ]
     groups: dict[str, list[SaasSameProductApprovalAuditResult]] = {}
     for result in results:
         groups.setdefault(result.vCommodityId, []).append(result)
@@ -383,6 +620,13 @@ def audit_saas_approval_records(
         "sku_mismatch_count": len([r for r in results if r.sku_link_check == "MISMATCH"]),
         "higher_than_customer_price_30_count": len([r for r in results if r.price_vs_customer_check == "HIGHER_THAN_CUSTOMER_PRICE_30"]),
         "customer_price_missing_count": len([r for r in results if r.price_vs_customer_check == "CUSTOMER_PRICE_MISSING"]),
+        "crawl_result_matched_count": len([r for r in results if r.crawl_matched]),
+        "crawl_result_missing_count": len([r for r in results if not r.crawl_matched]),
+        "crawl_off_shelf_count": len([r for r in results if r.crawl_status == "OFF_SHELF" or r.page_status == "OFF_SHELF"]),
+        "crawl_sold_out_count": len([r for r in results if r.crawl_status == "SOLD_OUT" or r.page_status == "SOLD_OUT"]),
+        "crawl_price_missing_count": len([r for r in results if r.crawl_status == "PRICE_MISSING" or r.price_check == "WAIT_PAGE_PRICE_CHECK"]),
+        "crawl_failed_count": len([r for r in results if r.crawl_status in {"FAILED", "TIMEOUT", "CAPTCHA", "ACCESS_DENIED"}]),
+        "crawl_price_mismatch_count": len([r for r in results if r.price_check == "MISMATCH" and r.crawl_matched]),
         "model_unavailable_count": len([r for r in results if r.title_match_result == "MODEL_UNAVAILABLE"]),
     }
     for v_commodity_id, group_results in groups.items():

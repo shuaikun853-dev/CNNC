@@ -283,11 +283,39 @@ class SaasSameProductApprovalItem(StrictModel):
         return value
 
 
+class InternalCrawlResult(StrictModel):
+    extLink: str = ""
+    skuId: str = ""
+    vendorName: str = ""
+    shopName: str = ""
+    crawl_status: str = ""
+    page_title: str = ""
+    page_price: Decimal | None = None
+    page_status: str = ""
+    screenshot_path: str = ""
+    crawl_time: str = ""
+    error_code: str = ""
+    error_message: str = ""
+    raw_price_candidates: list[str] = Field(default_factory=list)
+    price_source: str = ""
+
+    @field_validator("page_price", mode="before")
+    @classmethod
+    def _empty_price_to_none(cls, value):
+        if value is None:
+            return None
+        if isinstance(value, str) and not value.strip():
+            return None
+        return value
+
+
 class SaasSameProductApprovalAuditRequest(StrictModel):
     scope: WorkflowScope
     records: list[SaasSameProductApprovalItem] = Field(..., min_length=1)
+    crawl_results: list[InternalCrawlResult] = Field(default_factory=list)
     use_model: bool = True
     use_link_audit: bool = True
+    use_crawl_result: bool = True
 
 
 class SaasSameProductApprovalAuditResult(StrictModel):
@@ -302,6 +330,14 @@ class SaasSameProductApprovalAuditResult(StrictModel):
     page_actual_price: Decimal | None = None
     customer_price: Decimal | None = None
     price_vs_customer_check: str = ""
+    crawl_status: str = ""
+    page_status: str = ""
+    page_title: str = ""
+    page_price: Decimal | None = None
+    crawl_error_code: str = ""
+    crawl_error_message: str = ""
+    screenshot_path: str = ""
+    crawl_matched: bool = False
     title_match_result: str = ""
     title_match_confidence: float = 0.0
     sku_link_check: str = ""

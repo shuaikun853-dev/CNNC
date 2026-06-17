@@ -4,7 +4,7 @@ from decimal import Decimal
 import pytest
 from fastapi.testclient import TestClient
 
-from app.schemas.workflow import SaasSameProductApprovalItem, WorkflowAction
+from app.schemas.workflow import InternalCrawlResult, SaasSameProductApprovalItem, WorkflowAction
 from app.services.link_audit_worker import LinkAuditResult, check_price_consistency, check_sku_link_consistency
 from app.services.title_match_model_adapter import TitleMatchModelRequest, TitleMatchModelResult, call_title_match_model
 from app.workflows.work_01_saas_approval_json_audit import (
@@ -14,6 +14,8 @@ from app.workflows.work_01_saas_approval_json_audit import (
     check_candidate_price_against_customer_price,
     get_candidate_price,
     get_customer_price,
+    match_crawl_result,
+    sanitize_screenshot_path,
 )
 
 
@@ -63,6 +65,24 @@ def _item(**overrides) -> SaasSameProductApprovalItem:
     data = dict(SAMPLE)
     data.update(overrides)
     return SaasSameProductApprovalItem(**data)
+
+
+def _crawl(**overrides) -> InternalCrawlResult:
+    data = {
+        "extLink": SAMPLE["extLink"],
+        "skuId": SAMPLE["skuId"],
+        "vendorName": SAMPLE["vendorName"],
+        "shopName": SAMPLE["shopName"],
+        "crawl_status": "SUCCESS",
+        "page_title": "阀门 DN20",
+        "page_price": "10.00",
+        "page_status": "NORMAL",
+        "screenshot_path": "runtime/screenshots/link_audit/a.png",
+        "crawl_time": "2026-06-17 10:00:00",
+        "price_source": "INTERNAL_CRAWLER",
+    }
+    data.update(overrides)
+    return InternalCrawlResult(**data)
 
 
 def test_parse_sample_json_and_manual_review_replacement_reason():
@@ -243,6 +263,183 @@ def test_likely_match_sku_match_price_match_approve():
     assert result.sku_link_check == "MATCH"
     assert result.price_check == "MATCH"
     assert result.primary_action == WorkflowAction.APPROVE
+
+
+def test_match_crawl_result_ext_link_priority():
+    record = _item(extLink="https://example.com/a", skuId="sku-a")
+    crawl = _crawl(extLink="https://example.com/a", skuId="other", page_price="11.00")
+    assert match_crawl_result(record, [crawl]) == crawl
+
+
+def test_match_crawl_result_sku_id_priority():
+    record = _item(extLink="https://example.com/a", skuId="sku-a")
+    crawl = _crawl(extLink="https://example.com/b", skuId="sku-a", page_price="11.00")
+    assert match_crawl_result(record, [crawl]) == crawl
+
+
+def test_match_crawl_result_vendor_and_sku_priority():
+    record = _item(extLink="https://example.com/a", skuId="sku-a", vendorName="jd")
+    crawl = _crawl(extLink="https://example.com/b", skuId="sku-a", vendorName="京东", page_price="11.00")
+    assert match_crawl_result(record, [crawl]) == crawl
+
+
+def test_match_crawl_result_latest_crawl_time_wins():
+    record = _item(extLink="https://example.com/a")
+    old = _crawl(extLink="https://example.com/a", page_price="11.00", crawl_time="2026-06-17 10:00:00")
+    new = _crawl(extLink="https://example.com/a", page_price="12.00", crawl_time="2026-06-17 11:00:00")
+    assert match_crawl_result(record, [old, new]) == new
+
+
+def test_match_crawl_result_invalid_time_uses_last():
+    record = _item(extLink="https://example.com/a")
+    first = _crawl(extLink="https://example.com/a", page_price="11.00", crawl_time="bad")
+    last = _crawl(extLink="https://example.com/a", page_price="12.00", crawl_time="also-bad")
+    assert match_crawl_result(record, [first, last]) == last
+
+
+def test_missing_crawl_result_manual_check_when_enabled():
+    model = TitleMatchModelResult(match_result="SAME", confidence=0.91, model_match="exact")
+    result = audit_saas_approval_item(_item(
+        queryStr="阀门 DN20",
+        skuName="阀门 DN20",
+        price="10.00",
+        pageActualPrice="10.00",
+    ), title_model_result=model, crawl_results=[], use_crawl_result=True)
+    assert result.crawl_matched is False
+    assert result.price_check == "WAIT_PAGE_PRICE_CHECK"
+    assert result.primary_action == WorkflowAction.MANUAL_CHECK
+    assert "缺少内部爬取结果，需人工核验页面价格" in " ".join(result.evidence)
+
+
+@pytest.mark.parametrize("crawl_status", ["SOLD_OUT", "PRICE_MISSING", "CAPTCHA", "ACCESS_DENIED", "TIMEOUT", "FAILED"])
+def test_crawl_abnormal_status_manual_check(crawl_status):
+    model = TitleMatchModelResult(match_result="SAME", confidence=0.91, model_match="exact")
+    result = audit_saas_approval_item(_item(
+        queryStr="阀门 DN20",
+        skuName="阀门 DN20",
+        price="10.00",
+        customerPrice="100",
+    ), title_model_result=model, crawl_results=[_crawl(crawl_status=crawl_status, page_status=crawl_status, page_price="10.00")], use_crawl_result=True)
+    assert result.crawl_status == crawl_status
+    assert result.primary_action == WorkflowAction.MANUAL_CHECK
+    assert result.execution_allowed is False
+    assert result.executed is False
+    assert result.needs_human_approval is True
+
+
+def test_crawl_off_shelf_reject_suggestion_only():
+    model = TitleMatchModelResult(match_result="SAME", confidence=0.91, model_match="exact")
+    result = audit_saas_approval_item(_item(
+        queryStr="阀门 DN20",
+        skuName="阀门 DN20",
+        price="10.00",
+        customerPrice="100",
+    ), title_model_result=model, crawl_results=[_crawl(crawl_status="OFF_SHELF", page_status="OFF_SHELF", page_price="10.00")], use_crawl_result=True)
+    assert result.off_shelf is True
+    assert result.primary_action == WorkflowAction.REJECT
+    assert result.execution_allowed is False
+    assert result.executed is False
+    assert result.needs_human_approval is True
+
+
+def test_crawl_page_price_match_and_mismatch():
+    model = TitleMatchModelResult(match_result="SAME", confidence=0.91, model_match="exact")
+    matched = audit_saas_approval_item(_item(queryStr="阀门 DN20", skuName="阀门 DN20", price="10.00"), title_model_result=model, crawl_results=[_crawl(page_price="10.009")], use_crawl_result=True)
+    mismatched = audit_saas_approval_item(_item(queryStr="阀门 DN20", skuName="阀门 DN20", price="10.00"), title_model_result=model, crawl_results=[_crawl(page_price="10.02")], use_crawl_result=True)
+    assert matched.price_check == "MATCH"
+    assert mismatched.price_check == "MISMATCH"
+    assert mismatched.primary_action == WorkflowAction.REJECT
+
+
+def test_crawl_page_price_takes_priority_for_customer_price_check():
+    model = TitleMatchModelResult(match_result="SAME", confidence=0.91, model_match="exact")
+    result = audit_saas_approval_item(_item(
+        queryStr="阀门 DN20",
+        skuName="阀门 DN20",
+        price="100",
+        pageActualPrice="100",
+        customerPrice="100",
+    ), title_model_result=model, crawl_results=[_crawl(page_price="131")], use_crawl_result=True)
+    assert result.page_price == Decimal("131")
+    assert result.page_actual_price == Decimal("131")
+    assert result.price_vs_customer_check == "HIGHER_THAN_CUSTOMER_PRICE_30"
+    assert result.primary_action == WorkflowAction.REJECT
+
+
+def test_crawl_missing_page_price_does_not_approve():
+    model = TitleMatchModelResult(match_result="SAME", confidence=0.91, model_match="exact")
+    result = audit_saas_approval_item(_item(
+        queryStr="阀门 DN20",
+        skuName="阀门 DN20",
+        price="10.00",
+        customerPrice="100",
+    ), title_model_result=model, crawl_results=[_crawl(page_price=None, crawl_status="PRICE_MISSING")], use_crawl_result=True)
+    assert result.price_check == "WAIT_PAGE_PRICE_CHECK"
+    assert result.price_vs_customer_check != "HIGHER_THAN_CUSTOMER_PRICE_30"
+    assert result.primary_action == WorkflowAction.MANUAL_CHECK
+
+
+def test_crawl_customer_price_missing_and_invalid_do_not_trigger_high_price_reject():
+    model = TitleMatchModelResult(match_result="SAME", confidence=0.91, model_match="exact")
+    missing = audit_saas_approval_item(_item(queryStr="阀门 DN20", skuName="阀门 DN20", price="131"), title_model_result=model, crawl_results=[_crawl(page_price="131")], use_crawl_result=True)
+    invalid = audit_saas_approval_item(_item(queryStr="阀门 DN20", skuName="阀门 DN20", price="131", customerPrice="0"), title_model_result=model, crawl_results=[_crawl(page_price="131")], use_crawl_result=True)
+    assert missing.price_vs_customer_check == "CUSTOMER_PRICE_MISSING"
+    assert invalid.price_vs_customer_check == "CUSTOMER_PRICE_INVALID"
+    assert missing.primary_action != WorkflowAction.REJECT
+    assert invalid.primary_action != WorkflowAction.REJECT
+
+
+def test_crawl_result_does_not_call_browser_audit(monkeypatch):
+    import app.workflows.work_01_saas_approval_json_audit as mod
+
+    def fail_audit_link(_request):
+        raise AssertionError("不应在 use_crawl_result=True 时调用浏览器/链接抓取")
+
+    monkeypatch.setattr(mod, "audit_link", fail_audit_link)
+    model = TitleMatchModelResult(match_result="SAME", confidence=0.91, model_match="exact")
+    result = audit_saas_approval_item(_item(queryStr="阀门 DN20", skuName="阀门 DN20", price="10.00"), title_model_result=model, crawl_results=[_crawl(page_price="10.00")], use_crawl_result=True)
+    assert result.crawl_matched is True
+
+
+def test_ocr_price_source_cannot_directly_approve():
+    model = TitleMatchModelResult(match_result="SAME", confidence=0.91, model_match="exact")
+    result = audit_saas_approval_item(_item(queryStr="阀门 DN20", skuName="阀门 DN20", price="10.00"), title_model_result=model, crawl_results=[_crawl(page_price="10.00", price_source="OCR")], use_crawl_result=True)
+    assert result.primary_action == WorkflowAction.MANUAL_CHECK
+    assert "价格仅来自 OCR" in " ".join(result.evidence)
+
+
+def test_screenshot_path_traversal_ignored():
+    safe, safe_evidence = sanitize_screenshot_path("runtime/screenshots/link_audit/a.png")
+    unsafe, unsafe_evidence = sanitize_screenshot_path("../secret.png")
+    assert safe == "runtime/screenshots/link_audit/a.png"
+    assert "内部爬取截图路径" in " ".join(safe_evidence)
+    assert unsafe == ""
+    assert "截图路径疑似不安全，已忽略" in " ".join(unsafe_evidence)
+
+
+def test_crawl_result_does_not_expose_excel_csv_har_or_sensitive_headers():
+    result = audit_saas_approval_item(_item(queryStr="阀门 DN20", skuName="阀门 DN20", price="10.00"), crawl_results=[_crawl(page_price="10.00")], use_crawl_result=True)
+    evidence = " ".join(result.evidence).lower()
+    assert "excel" not in evidence
+    assert "csv" not in evidence
+    assert "har" not in evidence
+    assert "cookie" not in evidence
+    assert "authorization" not in evidence
+
+
+def test_crawl_summary_counts():
+    response = audit_saas_approval_records([
+        _item(vCommodityId="v1", extLink="https://example.com/1", skuId="1", price="10.00"),
+        _item(vCommodityId="v2", extLink="https://example.com/2", skuId="2", price="10.00"),
+        _item(vCommodityId="v3", extLink="https://example.com/3", skuId="3", price="10.00"),
+    ], use_model=False, crawl_results=[
+        _crawl(extLink="https://example.com/1", skuId="1", page_price="10.00"),
+        _crawl(extLink="https://example.com/2", skuId="2", page_price="11.00"),
+        _crawl(extLink="https://example.com/3", skuId="3", crawl_status="OFF_SHELF", page_status="OFF_SHELF", page_price="10.00"),
+    ], use_crawl_result=True)
+    assert response.summary["crawl_result_matched_count"] == 3
+    assert response.summary["crawl_price_mismatch_count"] == 1
+    assert response.summary["crawl_off_shelf_count"] == 1
 
 
 def test_customer_price_getter_priority():
@@ -448,7 +645,7 @@ def test_summary_group_counts():
     response = audit_saas_approval_records([
         _item(vCommodityId="v1", pageActualPrice="347.48"),
         _item(vCommodityId="v1", skuId="1", extLink="https://item.jd.com/2.html", pageActualPrice="347.48"),
-    ], use_model=False)
+    ], use_model=False, use_crawl_result=False)
     assert response.summary["total_records"] == 2
     assert response.summary["total_v_commodities"] == 1
     assert response.summary["sku_mismatch_count"] == 1
@@ -481,11 +678,65 @@ class TestSaasAuditAPI:
         client = TestClient(app)
         resp = client.post(
             "/workflows/same-product-approval/audit-saas-json",
-            json={"scope": _scope(), "records": [SAMPLE]},
+            json={"scope": _scope(), "records": [SAMPLE], "use_crawl_result": False},
             headers={"X-Local-Workflow-Token": "correct-token"},
         )
         assert resp.status_code == 200
         assert resp.json()["record_results"][0]["execution_allowed"] is False
+
+    def test_api_consumes_crawl_results(self):
+        _set_token("correct-token")
+        from app.main import app
+        client = TestClient(app)
+        sample = dict(SAMPLE)
+        sample.update({"queryStr": "阀门 DN20", "skuName": "阀门 DN20", "price": "10.00", "customerPrice": "100"})
+        resp = client.post(
+            "/workflows/same-product-approval/audit-saas-json",
+            json={"scope": _scope(), "records": [sample], "crawl_results": [_crawl(page_price="11.00").model_dump(mode="json")]},
+            headers={"X-Local-Workflow-Token": "correct-token"},
+        )
+        assert resp.status_code == 200
+        record = resp.json()["record_results"][0]
+        assert record["crawl_matched"] is True
+        assert record["page_price"] == "11.00"
+        assert record["price_check"] == "MISMATCH"
+
+    def test_api_use_crawl_result_false_keeps_r36_logic(self):
+        _set_token("correct-token")
+        from app.main import app
+        client = TestClient(app)
+        sample = dict(SAMPLE)
+        sample.update({"queryStr": "阀门 DN20", "skuName": "阀门 DN20", "price": "10.00", "pageActualPrice": "10.00"})
+        resp = client.post(
+            "/workflows/same-product-approval/audit-saas-json",
+            json={
+                "scope": _scope(),
+                "records": [sample],
+                "crawl_results": [_crawl(page_price="11.00").model_dump(mode="json")],
+                "use_crawl_result": False,
+            },
+            headers={"X-Local-Workflow-Token": "correct-token"},
+        )
+        assert resp.status_code == 200
+        record = resp.json()["record_results"][0]
+        assert record["crawl_matched"] is False
+        assert record["price_check"] == "MATCH"
+
+    def test_api_empty_crawl_results_manual_check(self):
+        _set_token("correct-token")
+        from app.main import app
+        client = TestClient(app)
+        sample = dict(SAMPLE)
+        sample.update({"queryStr": "阀门 DN20", "skuName": "阀门 DN20", "price": "10.00", "pageActualPrice": "10.00"})
+        resp = client.post(
+            "/workflows/same-product-approval/audit-saas-json",
+            json={"scope": _scope(), "records": [sample], "crawl_results": []},
+            headers={"X-Local-Workflow-Token": "correct-token"},
+        )
+        assert resp.status_code == 200
+        record = resp.json()["record_results"][0]
+        assert record["price_check"] == "WAIT_PAGE_PRICE_CHECK"
+        assert record["primary_action"] == WorkflowAction.MANUAL_CHECK
 
     def test_api_non_cnnc_scope_rejected(self):
         _set_token("correct-token")
