@@ -45,11 +45,11 @@ def test_high_risk_actions_need_human_approval():
         assert enforced.record_results[0].needs_human_approval is True, f"{act.value} should need human approval"
 
 
-def test_non_high_risk_does_not_force_approval():
+def test_non_high_risk_still_forces_approval():
     resp = _make_response([WorkflowAction.WAIT_CRAWLER])
     resp.record_results[0] = resp.record_results[0].model_copy(update={"needs_human_approval": False})
     enforced = enforce_recommendation_only(resp)
-    assert enforced.record_results[0].needs_human_approval is False
+    assert enforced.record_results[0].needs_human_approval is True
 
 
 def test_forbidden_phrases_replaced_in_reason():

@@ -19,6 +19,7 @@ from app.schemas.workflow import (
 )
 from app.services.workflow_knowledge_adapter import get_workflow_knowledge_files
 from app.workflows.human_approval_guard import enforce_recommendation_only
+from app.workflows.local_access_guard import check_local_access
 from app.workflows.router import route_workflow
 
 
@@ -205,6 +206,33 @@ class TestManualOperationNodeGuard:
         assert r.execution_allowed is False
         assert r.executed is False
         assert r.needs_human_approval is True
+
+    def test_human_approval_guard_forces_needs_human_approval_true(self):
+        rec = WorkflowRecordResult(
+            primary_action=WorkflowAction.MANUAL_CHECK,
+            reason="test",
+            needs_human_approval=False,
+            execution_allowed=True,
+            executed=True,
+        )
+        resp = WorkflowAnalyzeResponse(
+            workflow_name="test",
+            total_records=1,
+            record_results=[rec],
+        )
+        result = enforce_recommendation_only(resp)
+        r = result.record_results[0]
+        assert r.needs_human_approval is True
+        assert r.execution_allowed is False
+        assert r.executed is False
+
+
+class TestLocalAccessGuard:
+    def test_local_access_guard_rejects_non_loopback_client(self):
+        _set_token("correct-token")
+        result = check_local_access("10.1.2.3", "correct-token")
+        assert result.allowed is False
+        assert result.error_code == "LOCAL_ACCESS_DENIED"
 
 
 class TestWork03API:

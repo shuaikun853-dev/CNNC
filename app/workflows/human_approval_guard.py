@@ -36,9 +36,7 @@ def enforce_recommendation_only(
 ) -> WorkflowAnalyzeResponse:
     updated_results = []
     for r in response.record_results:
-        needs_approval = r.needs_human_approval
-        if r.primary_action in HIGH_RISK_ACTIONS:
-            needs_approval = True
+        needs_approval = True
 
         reason = r.reason
         for phrase in FORBIDDEN_EXECUTED_PHRASES:
