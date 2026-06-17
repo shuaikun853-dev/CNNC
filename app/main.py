@@ -13,6 +13,8 @@ from app.config import APP_NAME, APP_VERSION, READONLY_MODE, KNOWLEDGE_MD_PATH, 
 from app.schemas.workflow import (
     SameProductAnalyzeRequest,
     PriceFeedbackAnalyzeRequest,
+    SaasSameProductApprovalAuditRequest,
+    SaasSameProductApprovalAuditResponse,
     SupplementSameProductAnalyzeRequest,
     WorkflowAnalyzeResponse,
     WorkflowErrorResponse,
@@ -326,6 +328,20 @@ async def workflow_same_product_approval_analyze(req: SameProductAnalyzeRequest,
     response = wf.analyze([r.model_dump() for r in req.records])
     response = enforce_recommendation_only(response)
     return response
+
+
+@app.post("/workflows/same-product-approval/audit-saas-json", response_model=SaasSameProductApprovalAuditResponse)
+async def workflow_same_product_approval_audit_saas_json(req: SaasSameProductApprovalAuditRequest, request: Request):
+    _check_workflow_access(request)
+    scope_result = validate_request_scope(req.scope)
+    if not scope_result.allowed:
+        raise HTTPException(
+            status_code=400,
+            detail={"error_code": scope_result.error_code, "message": scope_result.message},
+        )
+    from app.workflows.work_01_saas_approval_json_audit import audit_saas_approval_records
+
+    return audit_saas_approval_records(req.records)
 
 
 @app.post("/workflows/price-index-feedback/analyze", response_model=WorkflowAnalyzeResponse)

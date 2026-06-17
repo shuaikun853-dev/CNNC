@@ -1,6 +1,6 @@
 from enum import Enum
 from decimal import Decimal
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class StrictModel(BaseModel):
@@ -248,6 +248,71 @@ class SupplementSameProductAnalyzeRequest(StrictModel):
     scope: WorkflowScope
     records: list[SupplementSameProductRecord] = Field(..., min_length=1)
     export_format: ExportFormat | None = None
+
+
+class SaasSameProductApprovalItem(StrictModel):
+    vCommodityId: str = ""
+    queryStr: str = ""
+    syncState: str = ""
+    skuId: str = ""
+    skuName: str = ""
+    modelAuditResult: str = ""
+    isMatch: str = ""
+    vendorName: str = ""
+    shopName: str = ""
+    price: Decimal | None = None
+    commentNum: str = ""
+    extLink: str = ""
+    createTime: str = ""
+    updateTime: str = ""
+    isOperate: int | None = None
+    pageActualPrice: Decimal | None = None
+    page_actual_price: Decimal | None = None
+
+    @field_validator("price", "pageActualPrice", "page_actual_price", mode="before")
+    @classmethod
+    def _empty_price_to_none(cls, value):
+        if value is None:
+            return None
+        if isinstance(value, str) and not value.strip():
+            return None
+        return value
+
+
+class SaasSameProductApprovalAuditRequest(StrictModel):
+    scope: WorkflowScope
+    records: list[SaasSameProductApprovalItem] = Field(..., min_length=1)
+
+
+class SaasSameProductApprovalAuditResult(StrictModel):
+    vCommodityId: str = ""
+    skuId: str = ""
+    extLink: str = ""
+    queryStr: str = ""
+    skuName: str = ""
+    vendorName: str = ""
+    shopName: str = ""
+    json_price: Decimal | None = None
+    page_actual_price: Decimal | None = None
+    title_match_result: str = ""
+    sku_link_check: str = ""
+    price_check: str = ""
+    primary_action: WorkflowAction
+    suggested_actions: list[WorkflowAction] = Field(default_factory=list)
+    reason: str = ""
+    evidence: list[str] = Field(default_factory=list)
+    needs_human_approval: bool = True
+    execution_allowed: bool = False
+    executed: bool = False
+
+
+class SaasSameProductApprovalAuditResponse(StrictModel):
+    workflow_name: str = "work_01_same_product_approval"
+    total_records: int
+    summary: dict[str, int | str | float | bool] = Field(default_factory=dict)
+    record_results: list[SaasSameProductApprovalAuditResult] = Field(default_factory=list)
+    execution_allowed: bool = False
+    executed: bool = False
 
 
 class WorkflowErrorResponse(StrictModel):
