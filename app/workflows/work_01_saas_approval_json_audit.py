@@ -22,6 +22,7 @@ from app.services.title_match_model_adapter import (
 
 RISK_WORDS = ("替代款", "通用", "适用", "升级款")
 REVIEW_TERMS = RISK_WORDS
+HIGHER_THAN_CUSTOMER_PRICE_RATIO = Decimal("1.30")
 SPEC_RE = re.compile(r"\d+\s*(?:件套|件|套)")
 MODEL_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9\-_/]*")
 
@@ -50,6 +51,46 @@ def get_page_actual_price(item: SaasSameProductApprovalItem) -> Decimal | None:
     if item.pageActualPrice is not None:
         return item.pageActualPrice
     return item.page_actual_price
+
+
+def get_customer_price(record: SaasSameProductApprovalItem) -> Decimal | None:
+    if record.customerPrice is not None:
+        return record.customerPrice
+    if record.customer_price is not None:
+        return record.customer_price
+    if record.referencePrice is not None:
+        return record.referencePrice
+    return record.reference_price
+
+
+def get_candidate_price(record: SaasSameProductApprovalItem, page_actual_price: Decimal | None) -> Decimal | None:
+    if page_actual_price is not None:
+        return page_actual_price
+    return record.price
+
+
+def check_candidate_price_against_customer_price(
+    candidate_price: Decimal | None,
+    customer_price: Decimal | None,
+) -> tuple[str, list[str]]:
+    if customer_price is None:
+        return "CUSTOMER_PRICE_MISSING", ["客户价格为空，无法执行 30% 高价过滤"]
+    if candidate_price is None:
+        return "CANDIDATE_PRICE_MISSING", ["候选价格为空，无法执行 30% 高价过滤"]
+    threshold = customer_price * HIGHER_THAN_CUSTOMER_PRICE_RATIO
+    if candidate_price > threshold:
+        return "HIGHER_THAN_CUSTOMER_PRICE_30", [
+            f"客户价格={customer_price}",
+            f"候选价格={candidate_price}",
+            f"高价阈值=客户价格*1.3={threshold}",
+            "候选价格高于客户价格30%以上",
+        ]
+    return "WITHIN_THRESHOLD", [
+        f"客户价格={customer_price}",
+        f"候选价格={candidate_price}",
+        f"高价阈值=客户价格*1.3={threshold}",
+        "候选价格未超过客户价格30%",
+    ]
 
 
 def detect_title_risk_words(query_str: str, sku_name: str) -> list[str]:
@@ -157,9 +198,12 @@ def _decide_action(
     title_result: str,
     sku_check: str,
     price_check: str,
+    price_vs_customer_check: str,
     reachable: bool | None,
     off_shelf: bool | None,
 ) -> tuple[WorkflowAction, list[WorkflowAction]]:
+    if price_vs_customer_check == "HIGHER_THAN_CUSTOMER_PRICE_30":
+        return WorkflowAction.REJECT, [WorkflowAction.REJECT, WorkflowAction.MANUAL_CHECK]
     if title_result == "NOT_SAME" or sku_check == "MISMATCH" or price_check == "MISMATCH" or reachable is False or off_shelf is True:
         return WorkflowAction.REJECT, [WorkflowAction.REJECT, WorkflowAction.MANUAL_CHECK]
     if (
@@ -177,10 +221,13 @@ def _reason(
     title_result: str,
     sku_check: str,
     price_check: str,
+    price_vs_customer_check: str,
     reachable: bool | None,
     off_shelf: bool | None,
     evidence: list[str],
 ) -> str:
+    if price_vs_customer_check == "HIGHER_THAN_CUSTOMER_PRICE_30":
+        return "候选价格高于客户价格30%以上，不建议作为同款审批数据，建议人工驳回前复核"
     if title_result == "MANUAL_REVIEW" and any("替代款" in item for item in evidence):
         return "型号命中，但标题含“替代款”，需人工确认是否为原型号同款"
     if title_result == "NOT_SAME":
@@ -240,15 +287,20 @@ def audit_saas_approval_item(
             evidence=[*sku_evidence, *price_evidence],
         )
 
+    customer_price = get_customer_price(item)
+    candidate_price = get_candidate_price(item, link_result.page_price)
+    price_vs_customer_check, customer_price_evidence = check_candidate_price_against_customer_price(candidate_price, customer_price)
     evidence = [
         f"vendor={normalize_mall_name(item.vendorName) or normalize_mall_name(item.shopName)}",
         *title_evidence,
         *link_result.evidence,
+        *customer_price_evidence,
     ]
     action, suggested = _decide_action(
         title_result,
         link_result.sku_link_check,
         link_result.price_check,
+        price_vs_customer_check,
         link_result.reachable,
         link_result.off_shelf,
     )
@@ -258,7 +310,7 @@ def audit_saas_approval_item(
         if action == WorkflowAction.APPROVE:
             action = WorkflowAction.MANUAL_CHECK
             suggested = [WorkflowAction.MANUAL_CHECK]
-    reason = _reason(title_result, link_result.sku_link_check, link_result.price_check, link_result.reachable, link_result.off_shelf, evidence)
+    reason = _reason(title_result, link_result.sku_link_check, link_result.price_check, price_vs_customer_check, link_result.reachable, link_result.off_shelf, evidence)
     if risk_words and action == WorkflowAction.MANUAL_CHECK:
         reason = "标题包含替代款/通用/适用/升级款等风险词，需人工确认是否为原型号同款"
     return SaasSameProductApprovalAuditResult(
@@ -271,6 +323,8 @@ def audit_saas_approval_item(
         shopName=item.shopName,
         json_price=item.price,
         page_actual_price=link_result.page_price,
+        customer_price=customer_price,
+        price_vs_customer_check=price_vs_customer_check,
         title_match_result=title_result,
         title_match_confidence=title_confidence,
         sku_link_check=link_result.sku_link_check,
@@ -323,6 +377,8 @@ def audit_saas_approval_records(
         "wait_page_price_check_count": len([r for r in results if r.price_check == "WAIT_PAGE_PRICE_CHECK"]),
         "price_mismatch_count": len([r for r in results if r.price_check == "MISMATCH"]),
         "sku_mismatch_count": len([r for r in results if r.sku_link_check == "MISMATCH"]),
+        "higher_than_customer_price_30_count": len([r for r in results if r.price_vs_customer_check == "HIGHER_THAN_CUSTOMER_PRICE_30"]),
+        "customer_price_missing_count": len([r for r in results if r.price_vs_customer_check == "CUSTOMER_PRICE_MISSING"]),
         "model_unavailable_count": len([r for r in results if r.title_match_result == "MODEL_UNAVAILABLE"]),
     }
     for v_commodity_id, group_results in groups.items():

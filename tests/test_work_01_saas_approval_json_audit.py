@@ -11,6 +11,9 @@ from app.workflows.work_01_saas_approval_json_audit import (
     audit_saas_approval_item,
     audit_saas_approval_records,
     audit_title_similarity,
+    check_candidate_price_against_customer_price,
+    get_candidate_price,
+    get_customer_price,
 )
 
 
@@ -240,6 +243,89 @@ def test_likely_match_sku_match_price_match_approve():
     assert result.sku_link_check == "MATCH"
     assert result.price_check == "MATCH"
     assert result.primary_action == WorkflowAction.APPROVE
+
+
+def test_customer_price_getter_priority():
+    item = _item(customerPrice="100", customer_price="101", referencePrice="102", reference_price="103")
+    assert get_customer_price(item) == Decimal("100")
+
+
+def test_customer_price_30_high_rejects_even_when_other_checks_match():
+    model = TitleMatchModelResult(match_result="SAME", confidence=0.91, model_match="exact")
+    result = audit_saas_approval_item(_item(
+        queryStr="阀门 DN20",
+        skuName="阀门 DN20",
+        price="131",
+        pageActualPrice="131",
+        customerPrice="100",
+    ), title_model_result=model)
+    assert result.price_vs_customer_check == "HIGHER_THAN_CUSTOMER_PRICE_30"
+    assert result.primary_action == WorkflowAction.REJECT
+    assert result.suggested_actions == [WorkflowAction.REJECT, WorkflowAction.MANUAL_CHECK]
+    assert result.execution_allowed is False
+    assert result.executed is False
+    assert result.needs_human_approval is True
+    evidence = " ".join(result.evidence)
+    assert "客户价格=100" in evidence
+    assert "候选价格=131" in evidence
+    assert "高价阈值=客户价格*1.3=130.00" in evidence
+    assert "候选价格高于客户价格30%以上" in evidence
+    assert "已驳回" not in evidence
+    assert "已驳回" not in result.reason
+
+
+def test_customer_price_30_equal_threshold_not_reject():
+    model = TitleMatchModelResult(match_result="SAME", confidence=0.91, model_match="exact")
+    result = audit_saas_approval_item(_item(
+        queryStr="阀门 DN20",
+        skuName="阀门 DN20",
+        price="130",
+        pageActualPrice="130",
+        customerPrice="100",
+    ), title_model_result=model)
+    assert result.price_vs_customer_check == "WITHIN_THRESHOLD"
+    assert result.primary_action == WorkflowAction.APPROVE
+
+
+def test_page_actual_price_takes_priority_for_customer_price_check():
+    model = TitleMatchModelResult(match_result="SAME", confidence=0.91, model_match="exact")
+    item = _item(queryStr="阀门 DN20", skuName="阀门 DN20", price="100", pageActualPrice="131", customerPrice="100")
+    assert get_candidate_price(item, item.pageActualPrice) == Decimal("131")
+    result = audit_saas_approval_item(item, title_model_result=model)
+    assert result.price_vs_customer_check == "HIGHER_THAN_CUSTOMER_PRICE_30"
+    assert result.primary_action == WorkflowAction.REJECT
+
+
+def test_customer_price_missing_does_not_trigger_threshold_rule():
+    model = TitleMatchModelResult(match_result="SAME", confidence=0.91, model_match="exact")
+    result = audit_saas_approval_item(_item(
+        queryStr="阀门 DN20",
+        skuName="阀门 DN20",
+        price="100",
+        pageActualPrice="100",
+    ), title_model_result=model)
+    assert result.price_vs_customer_check == "CUSTOMER_PRICE_MISSING"
+    assert result.primary_action == WorkflowAction.APPROVE
+
+
+def test_candidate_price_missing_continues_existing_manual_check_path():
+    model = TitleMatchModelResult(match_result="SAME", confidence=0.91, model_match="exact")
+    result = audit_saas_approval_item(_item(
+        queryStr="阀门 DN20",
+        skuName="阀门 DN20",
+        price="",
+        pageActualPrice=None,
+        customerPrice="100",
+    ), title_model_result=model)
+    assert result.price_vs_customer_check == "CANDIDATE_PRICE_MISSING"
+    assert result.price_check == "JSON_PRICE_MISSING"
+    assert result.primary_action == WorkflowAction.MANUAL_CHECK
+
+
+def test_candidate_price_customer_price_function_outputs():
+    result, evidence = check_candidate_price_against_customer_price(Decimal("131"), Decimal("100"))
+    assert result == "HIGHER_THAN_CUSTOMER_PRICE_30"
+    assert "候选价格高于客户价格30%以上" in evidence
 
 
 def test_price_mismatch_reject():

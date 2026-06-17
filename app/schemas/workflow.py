@@ -268,8 +268,12 @@ class SaasSameProductApprovalItem(StrictModel):
     isOperate: int | None = None
     pageActualPrice: Decimal | None = None
     page_actual_price: Decimal | None = None
+    customerPrice: Decimal | None = None
+    customer_price: Decimal | None = None
+    referencePrice: Decimal | None = None
+    reference_price: Decimal | None = None
 
-    @field_validator("price", "pageActualPrice", "page_actual_price", mode="before")
+    @field_validator("price", "pageActualPrice", "page_actual_price", "customerPrice", "customer_price", "referencePrice", "reference_price", mode="before")
     @classmethod
     def _empty_price_to_none(cls, value):
         if value is None:
@@ -296,6 +300,8 @@ class SaasSameProductApprovalAuditResult(StrictModel):
     shopName: str = ""
     json_price: Decimal | None = None
     page_actual_price: Decimal | None = None
+    customer_price: Decimal | None = None
+    price_vs_customer_check: str = ""
     title_match_result: str = ""
     title_match_confidence: float = 0.0
     sku_link_check: str = ""
