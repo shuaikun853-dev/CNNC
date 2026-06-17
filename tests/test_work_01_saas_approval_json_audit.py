@@ -1,3 +1,4 @@
+import json
 import os
 from decimal import Decimal
 
@@ -17,6 +18,7 @@ from app.workflows.work_01_saas_approval_json_audit import (
     match_crawl_result,
     sanitize_screenshot_path,
 )
+from scripts.audit_saas_json_file import load_crawl_results, load_records, main as audit_file_main
 
 
 SAMPLE = {
@@ -83,6 +85,80 @@ def _crawl(**overrides) -> InternalCrawlResult:
     }
     data.update(overrides)
     return InternalCrawlResult(**data)
+
+
+def test_local_audit_script_loads_records_array(tmp_path):
+    path = tmp_path / "records.json"
+    path.write_text(json.dumps([SAMPLE], ensure_ascii=False), encoding="utf-8")
+    records = load_records(path)
+    assert len(records) == 1
+    assert records[0].vCommodityId == SAMPLE["vCommodityId"]
+
+
+def test_local_audit_script_loads_records_object(tmp_path):
+    path = tmp_path / "records.json"
+    path.write_text(json.dumps({"records": [SAMPLE]}, ensure_ascii=False), encoding="utf-8")
+    records = load_records(path)
+    assert len(records) == 1
+    assert records[0].skuId == SAMPLE["skuId"]
+
+
+def test_local_audit_script_runs_without_crawl_results(tmp_path, capsys):
+    records_path = tmp_path / "records.json"
+    output_path = tmp_path / "audit_result.json"
+    sample = dict(SAMPLE)
+    sample.update({"queryStr": "阀门 DN20", "skuName": "阀门 DN20", "price": "10.00", "pageActualPrice": "10.00"})
+    records_path.write_text(json.dumps([sample], ensure_ascii=False), encoding="utf-8")
+    exit_code = audit_file_main(["--records-json", str(records_path), "--output-json", str(output_path)])
+    output = json.loads(output_path.read_text(encoding="utf-8"))
+    captured = capsys.readouterr().out
+    assert exit_code == 0
+    assert "总记录数" in captured
+    assert "输出文件路径" in captured
+    assert "summary" in output
+    assert "record_results" in output
+    assert output["record_results"][0]["execution_allowed"] is False
+
+
+def test_local_audit_script_runs_with_crawl_results(tmp_path):
+    records_path = tmp_path / "records.json"
+    crawl_path = tmp_path / "crawl_results.json"
+    output_path = tmp_path / "audit_result.json"
+    sample = dict(SAMPLE)
+    sample.update({"queryStr": "阀门 DN20", "skuName": "阀门 DN20", "price": "10.00", "customerPrice": "100"})
+    records_path.write_text(json.dumps({"records": [sample]}, ensure_ascii=False), encoding="utf-8")
+    crawl_path.write_text(json.dumps([_crawl(page_price="11.00").model_dump(mode="json")], ensure_ascii=False), encoding="utf-8")
+    exit_code = audit_file_main(["--records-json", str(records_path), "--crawl-results-json", str(crawl_path), "--output-json", str(output_path)])
+    output = json.loads(output_path.read_text(encoding="utf-8"))
+    record = output["record_results"][0]
+    assert exit_code == 0
+    assert record["crawl_matched"] is True
+    assert record["price_check"] == "MISMATCH"
+    assert record["needs_human_approval"] is True
+    assert record["execution_allowed"] is False
+    assert record["executed"] is False
+
+
+def test_local_audit_script_rejects_excel_csv_paths(tmp_path):
+    records_path = tmp_path / "records.csv"
+    records_path.write_text("[]", encoding="utf-8")
+    with pytest.raises(ValueError, match="不读取 Excel/CSV"):
+        load_records(records_path)
+
+
+def test_local_audit_script_loads_crawl_results_object(tmp_path):
+    crawl_path = tmp_path / "crawl_results.json"
+    crawl_path.write_text(json.dumps({"crawl_results": [_crawl().model_dump(mode="json")]}, ensure_ascii=False), encoding="utf-8")
+    results = load_crawl_results(crawl_path)
+    assert len(results) == 1
+    assert results[0].crawl_status == "SUCCESS"
+
+
+def test_local_audit_script_contains_no_external_execution_paths():
+    source = os.path.join(os.path.dirname(__file__), "..", "scripts", "audit_saas_json_file.py")
+    text = open(source, "r", encoding="utf-8").read().lower()
+    forbidden = ["playwright", "ocr", "requests", "httpx", "sqlite", "sqlalchemy", "openpyxl", "pandas", "cookie", "har"]
+    assert all(item not in text for item in forbidden)
 
 
 def test_parse_sample_json_and_manual_review_replacement_reason():
