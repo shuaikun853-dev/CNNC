@@ -308,6 +308,44 @@ def test_customer_price_missing_does_not_trigger_threshold_rule():
     assert result.primary_action == WorkflowAction.APPROVE
 
 
+def test_zero_customer_price_does_not_trigger_high_price_reject():
+    model = TitleMatchModelResult(match_result="SAME", confidence=0.91, model_match="exact")
+    result = audit_saas_approval_item(_item(
+        queryStr="阀门 DN20",
+        skuName="阀门 DN20",
+        price="131",
+        pageActualPrice="131",
+        customerPrice="0",
+    ), title_model_result=model)
+    assert result.price_vs_customer_check == "CUSTOMER_PRICE_INVALID"
+    assert result.primary_action != WorkflowAction.REJECT
+    evidence = " ".join(result.evidence)
+    assert "客户价格无效" in evidence
+    assert "候选价格高于客户价格30%以上" not in evidence
+
+
+def test_negative_customer_price_does_not_trigger_high_price_reject():
+    model = TitleMatchModelResult(match_result="SAME", confidence=0.91, model_match="exact")
+    result = audit_saas_approval_item(_item(
+        queryStr="阀门 DN20",
+        skuName="阀门 DN20",
+        price="131",
+        pageActualPrice="131",
+        customerPrice="-1",
+    ), title_model_result=model)
+    assert result.price_vs_customer_check == "CUSTOMER_PRICE_INVALID"
+    assert result.primary_action != WorkflowAction.REJECT
+    evidence = " ".join(result.evidence)
+    assert "客户价格无效" in evidence
+    assert "候选价格高于客户价格30%以上" not in evidence
+
+
+def test_candidate_price_zero_does_not_trigger_high_price_reject():
+    result, evidence = check_candidate_price_against_customer_price(Decimal("0"), Decimal("100"))
+    assert result == "CANDIDATE_PRICE_INVALID"
+    assert "候选价格无效" in " ".join(evidence)
+
+
 def test_candidate_price_missing_continues_existing_manual_check_path():
     model = TitleMatchModelResult(match_result="SAME", confidence=0.91, model_match="exact")
     result = audit_saas_approval_item(_item(

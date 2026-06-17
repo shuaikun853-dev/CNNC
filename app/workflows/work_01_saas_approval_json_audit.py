@@ -75,8 +75,12 @@ def check_candidate_price_against_customer_price(
 ) -> tuple[str, list[str]]:
     if customer_price is None:
         return "CUSTOMER_PRICE_MISSING", ["客户价格为空，无法执行 30% 高价过滤"]
+    if customer_price <= 0:
+        return "CUSTOMER_PRICE_INVALID", ["客户价格无效，无法执行30%高价过滤"]
     if candidate_price is None:
         return "CANDIDATE_PRICE_MISSING", ["候选价格为空，无法执行 30% 高价过滤"]
+    if candidate_price <= 0:
+        return "CANDIDATE_PRICE_INVALID", ["候选价格无效，无法执行30%高价过滤"]
     threshold = customer_price * HIGHER_THAN_CUSTOMER_PRICE_RATIO
     if candidate_price > threshold:
         return "HIGHER_THAN_CUSTOMER_PRICE_30", [
