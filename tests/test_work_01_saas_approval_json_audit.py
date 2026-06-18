@@ -1458,3 +1458,282 @@ class TestRunMainExclusivity:
         out = tmp_path / "out.xlsx"
         result = run_main(output_xlsx=out, input_saas_list_json=path)
         assert result["enriched"][0]["customerPriceStatus"] == "NOT_PROVIDED"
+
+
+# ---------------------------------------------------------------------------
+# Dual JSON (saas + customer) mode tests
+# ---------------------------------------------------------------------------
+
+
+from scripts.audit_saas_excel_file import (
+    SAAS_PENDING_HEADERS,
+    build_customer_index,
+    compute_over_30_check,
+    is_jd_link,
+    join_saas_with_customer,
+    read_saas_pending_json,
+)
+
+
+SAMPLE_SAAS_PENDING_ROW = {
+    "documentId": "679483364934705152",
+    "vCommodityId": "679416640600166400",
+    "queryStr": "茂谷聚 Cs树脂 AMP-PAN 1kg/瓶 100~600目（销售单位：瓶）",
+    "skuName": "茂谷聚 Cs树脂 AMP-PAN 1kg/瓶 100~600目 销售单位：瓶",
+    "skuId": "1004360200014308",
+    "vendorName": "colipu",
+    "shopName": "科力普商城",
+    "price": "11585.37",
+    "extLink": "https://www.colipu.com/itemcode-WF7769406.html",
+    "createTime": "2026-06-17 18:27:42",
+    "updateTime": "2026-06-18 09:42:43",
+    "modelAuditResult": "1",
+    "isMatch": "1",
+}
+
+SAMPLE_CUSTOMER_ROW = {
+    "documentId": "679483364934705152",
+    "fourCategoryId": "06049901",
+    "fourCategoryName": "其他离子交换树脂",
+    "referencePrice": "11585.37",
+    "commodityName": "茂谷聚 Cs树脂 AMP-PAN",
+    "referenceLink": "https://www.colipu.com/itemcode-WF7769406.html",
+}
+
+
+def _write_pending_json(tmp_path, rows):
+    path = tmp_path / "saas_pending.json"
+    payload = {"rspCode": "0000", "count": len(rows), "rows": rows, "success": True}
+    path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    return path
+
+
+def _write_customer_json(tmp_path, rows):
+    path = tmp_path / "customer.json"
+    payload = {"rspCode": "0000", "count": len(rows), "rows": rows, "success": True}
+    path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    return path
+
+
+class TestSaasPendingJsonInput:
+    def test_read_saas_pending_json(self, tmp_path):
+        path = _write_pending_json(tmp_path, [SAMPLE_SAAS_PENDING_ROW])
+        headers, rows = read_saas_pending_json(path)
+        assert headers == list(SAAS_PENDING_HEADERS)
+        assert len(rows) == 1
+        row = rows[0]
+        assert row["documentId"] == "679483364934705152"
+        assert row["queryStr"] == SAMPLE_SAAS_PENDING_ROW["queryStr"]
+        assert row["skuName"] == SAMPLE_SAAS_PENDING_ROW["skuName"]
+        assert row["extLink"].startswith("https://")
+        assert row["price"] == Decimal("11585.37")
+
+    def test_read_saas_pending_json_query_str_falls_back(self, tmp_path):
+        raw = dict(SAMPLE_SAAS_PENDING_ROW)
+        raw["queryStr"] = ""
+        raw["sassVCommodityName"] = "兜底标题"
+        path = _write_pending_json(tmp_path, [raw])
+        _, rows = read_saas_pending_json(path)
+        assert rows[0]["queryStr"] == "兜底标题"
+
+
+class TestCustomerIndex:
+    def test_build_customer_index(self, tmp_path):
+        path = _write_customer_json(tmp_path, [SAMPLE_CUSTOMER_ROW])
+        index = build_customer_index(path)
+        assert "679483364934705152" in index
+        entry = index["679483364934705152"]
+        assert entry["fourCategoryId"] == "06049901"
+        assert entry["fourCategoryName"] == "其他离子交换树脂"
+        assert entry["list_reference_price"] == Decimal("11585.37")
+
+    def test_build_customer_index_skips_rows_without_document_id(self, tmp_path):
+        bad = dict(SAMPLE_CUSTOMER_ROW)
+        bad["documentId"] = ""
+        path = _write_customer_json(tmp_path, [bad])
+        index = build_customer_index(path)
+        assert index == {}
+
+
+class TestJoin:
+    def test_join_matched(self, tmp_path):
+        saas_path = _write_pending_json(tmp_path, [SAMPLE_SAAS_PENDING_ROW])
+        cust_path = _write_customer_json(tmp_path, [SAMPLE_CUSTOMER_ROW])
+        _, saas_rows = read_saas_pending_json(saas_path)
+        index = build_customer_index(cust_path)
+        joined = join_saas_with_customer(saas_rows, index)
+        assert joined[0]["customer_lookup_status"] == "MATCHED"
+        assert joined[0]["fourCategoryId"] == "06049901"
+        assert joined[0]["list_reference_price"] == Decimal("11585.37")
+
+    def test_join_not_found(self, tmp_path):
+        saas_row = dict(SAMPLE_SAAS_PENDING_ROW)
+        saas_row["documentId"] = "999999999999999999"
+        saas_path = _write_pending_json(tmp_path, [saas_row])
+        cust_path = _write_customer_json(tmp_path, [SAMPLE_CUSTOMER_ROW])
+        _, saas_rows = read_saas_pending_json(saas_path)
+        index = build_customer_index(cust_path)
+        joined = join_saas_with_customer(saas_rows, index)
+        assert joined[0]["customer_lookup_status"] == "NOT_FOUND"
+        assert joined[0]["fourCategoryId"] == ""
+        assert joined[0]["list_reference_price"] is None
+
+    def test_join_extra_customer_rows_ignored(self, tmp_path):
+        saas_path = _write_pending_json(tmp_path, [SAMPLE_SAAS_PENDING_ROW])
+        extra_customer = dict(SAMPLE_CUSTOMER_ROW)
+        extra_customer["documentId"] = "888888888888888888"
+        cust_path = _write_customer_json(tmp_path, [SAMPLE_CUSTOMER_ROW, extra_customer])
+        _, saas_rows = read_saas_pending_json(saas_path)
+        index = build_customer_index(cust_path)
+        joined = join_saas_with_customer(saas_rows, index)
+        # 输出行数 = saas 行数（多余的 customer 行不进表）
+        assert len(joined) == len(saas_rows)
+
+
+class TestJDDetection:
+    @pytest.mark.parametrize("url,expected", [
+        ("https://item.jd.com/100237336261.html", True),
+        ("https://i-item.jd.com/100237336261.html", True),
+        ("https://jd.com/foo", True),
+        ("https://www.jd.com/abc", True),
+        ("https://www.colipu.com/itemcode-WF7769406.html", False),
+        ("https://b2b.nbdeli.com/pcweb/detail?sku=122604488", False),
+        ("", False),
+    ])
+    def test_is_jd_link(self, url, expected):
+        assert is_jd_link(url) is expected
+
+
+class TestOver30Check:
+    def test_over_30_true(self):
+        check, over = compute_over_30_check(Decimal("100"), Decimal("131"), "OK")
+        assert check == "HIGHER_THAN_CUSTOMER_PRICE_30"
+        assert over == "TRUE"
+
+    def test_over_30_false_at_threshold(self):
+        check, over = compute_over_30_check(Decimal("100"), Decimal("130"), "OK")
+        assert check == "WITHIN_THRESHOLD"
+        assert over == "FALSE"
+
+    def test_over_30_false(self):
+        check, over = compute_over_30_check(Decimal("100"), Decimal("99"), "OK")
+        assert check == "WITHIN_THRESHOLD"
+        assert over == "FALSE"
+
+    def test_over_30_pending_crawl_returns_empty(self):
+        check, over = compute_over_30_check(Decimal("100"), None, "PENDING_CRAWL")
+        assert check == "PAGE_PRICE_MISSING"
+        assert over == ""
+
+    def test_over_30_jd_skipped_returns_empty(self):
+        check, over = compute_over_30_check(Decimal("100"), None, "SKIPPED_JD")
+        assert check == "PAGE_PRICE_MISSING"
+        assert over == ""
+
+    def test_over_30_customer_price_missing(self):
+        check, over = compute_over_30_check(None, Decimal("131"), "OK")
+        assert check == "CUSTOMER_PRICE_MISSING"
+        assert over == ""
+
+    def test_over_30_customer_price_zero(self):
+        check, over = compute_over_30_check(Decimal("0"), Decimal("131"), "OK")
+        assert check == "CUSTOMER_PRICE_MISSING"
+        assert over == ""
+
+    def test_over_30_failed_status(self):
+        check, over = compute_over_30_check(Decimal("100"), None, "FAILED")
+        assert check == "PAGE_PRICE_MISSING"
+        assert over == ""
+
+
+class TestRunMainSaasJsonExclusivity:
+    def test_run_main_requires_customer_json_pair(self, tmp_path):
+        saas_path = _write_pending_json(tmp_path, [SAMPLE_SAAS_PENDING_ROW])
+        out = tmp_path / "out.xlsx"
+        with pytest.raises(ValueError, match="必须配合 --input-customer-json"):
+            run_main(output_xlsx=out, input_saas_json=saas_path)
+
+    def test_run_main_customer_json_alone_rejected(self, tmp_path):
+        cust_path = _write_customer_json(tmp_path, [SAMPLE_CUSTOMER_ROW])
+        out = tmp_path / "out.xlsx"
+        with pytest.raises(ValueError, match="必须配合 --input-saas-json"):
+            run_main(output_xlsx=out, input_customer_json=cust_path)
+
+    def test_run_main_three_modes_mutually_exclusive(self, tmp_path):
+        saas_path = _write_pending_json(tmp_path, [SAMPLE_SAAS_PENDING_ROW])
+        cust_path = _write_customer_json(tmp_path, [SAMPLE_CUSTOMER_ROW])
+        list_path = tmp_path / "list.json"
+        list_path.write_text(json.dumps({"rows": [SAMPLE_CUSTOMER_ROW]}, ensure_ascii=False), encoding="utf-8")
+        out = tmp_path / "out.xlsx"
+        with pytest.raises(ValueError, match="三选一"):
+            run_main(
+                output_xlsx=out,
+                input_saas_json=saas_path,
+                input_customer_json=cust_path,
+                input_saas_list_json=list_path,
+            )
+
+
+class TestRunMainSaasJsonE2E:
+    def test_run_main_dual_mode_e2e_no_curl_marks_not_provided(self, tmp_path):
+        saas_path = _write_pending_json(tmp_path, [SAMPLE_SAAS_PENDING_ROW])
+        cust_path = _write_customer_json(tmp_path, [SAMPLE_CUSTOMER_ROW])
+        out = tmp_path / "out.xlsx"
+        result = run_main(
+            output_xlsx=out,
+            input_saas_json=saas_path,
+            input_customer_json=cust_path,
+        )
+        assert result["mode"] == "input_saas_json"
+        assert result["enriched"][0]["customerPriceStatus"] == "NOT_PROVIDED"
+        assert result["rows"][0]["fourCategoryId"] == "06049901"
+        wb = load_workbook(str(out))
+        assert "summary" in wb.sheetnames
+        assert "record_results" in wb.sheetnames
+        ws = wb["record_results"]
+        out_headers = [str(c.value or "") for c in ws[1]]
+        for col in (
+            "documentId", "queryStr", "skuName", "extLink",
+            "fourCategoryId", "fourCategoryName",
+            "customer_lookup_status", "list_reference_price",
+            "customerPrice", "customerPriceStatus",
+            "title_match_result", "title_match_confidence", "title_match_reason",
+            "page_price_value", "page_price_status", "page_price_source",
+            "page_vs_customer_check", "over_30pct",
+        ):
+            assert col in out_headers, f"缺失列: {col}"
+        wb.close()
+
+    def test_run_main_dual_mode_lookup_failed(self, tmp_path):
+        saas_row = dict(SAMPLE_SAAS_PENDING_ROW)
+        saas_row["documentId"] = "999999999999999999"
+        saas_path = _write_pending_json(tmp_path, [saas_row])
+        cust_path = _write_customer_json(tmp_path, [SAMPLE_CUSTOMER_ROW])
+        out = tmp_path / "out.xlsx"
+        result = run_main(
+            output_xlsx=out,
+            input_saas_json=saas_path,
+            input_customer_json=cust_path,
+        )
+        assert result["enriched"][0]["customerPriceStatus"] == "LOOKUP_FAILED"
+        assert "未找到该 documentId" in result["enriched"][0]["customerPriceWarning"]
+
+    def test_run_main_dual_mode_jd_link_marks_skipped_jd(self, tmp_path):
+        saas_row = dict(SAMPLE_SAAS_PENDING_ROW)
+        saas_row["extLink"] = "https://item.jd.com/100237336261.html"
+        saas_path = _write_pending_json(tmp_path, [saas_row])
+        cust_path = _write_customer_json(tmp_path, [SAMPLE_CUSTOMER_ROW])
+        out = tmp_path / "out.xlsx"
+        run_main(
+            output_xlsx=out,
+            input_saas_json=saas_path,
+            input_customer_json=cust_path,
+        )
+        wb = load_workbook(str(out))
+        ws = wb["record_results"]
+        out_headers = [str(c.value or "") for c in ws[1]]
+        idx_status = out_headers.index("page_price_status") + 1
+        idx_over = out_headers.index("over_30pct") + 1
+        assert ws.cell(row=2, column=idx_status).value == "SKIPPED_JD"
+        assert ws.cell(row=2, column=idx_over).value in ("", None)
+        wb.close()

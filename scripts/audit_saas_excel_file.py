@@ -66,14 +66,19 @@ INPUT_BASE_FIELDS = [
 ]
 
 RESULT_APPENDED_COLUMNS = [
+    "fourCategoryId",
+    "fourCategoryName",
+    "customer_lookup_status",
+    "list_reference_price",
     "customerPrice",
     "customerPriceStatus",
     "customerPriceSource",
     "customerPriceWarning",
     "customerPriceEvidence",
     "json_price",
-    "page_price",
     "title_match_result",
+    "title_match_confidence",
+    "title_match_reason",
     "sku_link_check",
     "price_check",
     "price_vs_customer_check",
@@ -84,6 +89,11 @@ RESULT_APPENDED_COLUMNS = [
     "needs_human_approval",
     "execution_allowed",
     "executed",
+    "page_price_value",
+    "page_price_status",
+    "page_price_source",
+    "page_vs_customer_check",
+    "over_30pct",
 ]
 
 HIGHLIGHTED_RESULT_COLUMNS = {
@@ -91,12 +101,19 @@ HIGHLIGHTED_RESULT_COLUMNS = {
     "customerPriceStatus",
     "primary_action",
     "price_vs_customer_check",
+    "page_price_value",
+    "over_30pct",
 }
 
 HEADER_FONT = Font(bold=True)
 HEADER_FILL = PatternFill(start_color="D9E1F2", end_color="D9E1F2", fill_type="solid")
 HEADER_ALIGN = Alignment(horizontal="center", vertical="center", wrap_text=True)
 HIGHLIGHT_FILL = PatternFill(start_color="FFF2CC", end_color="FFF2CC", fill_type="solid")
+OVER_30_FILL = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
+
+JD_HOST_KEYWORDS = ("item.jd.com", "i-item.jd.com", "jd.com")
+
+THIRTY_PERCENT_RATIO = Decimal("1.30")
 
 
 # ---------------------------------------------------------------------------
@@ -266,6 +283,149 @@ def read_saas_list_json(path: Path) -> tuple[list[str], list[dict[str, Any]]]:
     raw_rows = _saas_list_payload_rows(payload)
     rows = [_normalize_saas_list_row(raw) for raw in raw_rows]
     return list(SAAS_LIST_HEADERS), rows
+
+
+# ---------------------------------------------------------------------------
+# SaaS pending JSON + 客户 JSON 联合输入
+# ---------------------------------------------------------------------------
+
+
+SAAS_PENDING_HEADERS = [
+    "documentId",
+    "vCommodityId",
+    "queryStr",
+    "sassVCommodityName",
+    "skuId",
+    "skuName",
+    "vendorName",
+    "shopName",
+    "price",
+    "pageActualPrice",
+    "extLink",
+    "commentNum",
+    "createTime",
+    "updateTime",
+    "modelAuditResult",
+    "isMatch",
+]
+
+
+def _normalize_saas_pending_row(raw: dict[str, Any]) -> dict[str, Any]:
+    """SaaS 同款审批页面导出的一行 → 内部 row。
+
+    queryStr   = 客户标题
+    skuName    = 互联网标题
+    extLink    = 互联网链接（要爬的）
+    """
+    document_id = normalize_cell_str(raw.get("documentId"))
+    query_str = normalize_cell_str(raw.get("queryStr"))
+    if not query_str:
+        query_str = normalize_cell_str(raw.get("sassVCommodityName"))
+    sku_name = normalize_cell_str(raw.get("skuName"))
+    if not sku_name:
+        sku_name = normalize_cell_str(raw.get("commodityName"))
+    ext_link = normalize_cell_str(raw.get("extLink"))
+    if not ext_link:
+        ext_link = normalize_cell_str(raw.get("referenceLink"))
+    return {
+        "documentId": document_id,
+        "vCommodityId": normalize_cell_str(raw.get("vCommodityId")) or document_id,
+        "queryStr": query_str,
+        "sassVCommodityName": normalize_cell_str(raw.get("sassVCommodityName")),
+        "skuId": normalize_cell_str(raw.get("skuId")),
+        "skuName": sku_name,
+        "vendorName": normalize_cell_str(raw.get("vendorName")),
+        "shopName": normalize_cell_str(raw.get("shopName")),
+        "price": parse_decimal(raw.get("price")),
+        "pageActualPrice": parse_decimal(raw.get("pageActualPrice")),
+        "extLink": ext_link,
+        "commentNum": normalize_cell_str(raw.get("commentNum")),
+        "createTime": normalize_cell_str(raw.get("createTime")),
+        "updateTime": normalize_cell_str(raw.get("updateTime")),
+        "modelAuditResult": normalize_cell_str(raw.get("modelAuditResult")),
+        "isMatch": normalize_cell_str(raw.get("isMatch")),
+    }
+
+
+def read_saas_pending_json(path: Path) -> tuple[list[str], list[dict[str, Any]]]:
+    """读取 SaaS 同款审批页面导出的 JSON，返回 (列名顺序, 行字典列表)。"""
+    if path.suffix.lower() != ".json":
+        raise ValueError(f"saas-pending 输入必须是 JSON 文件：{path}")
+    with path.open("r", encoding="utf-8") as file:
+        payload = json.load(file)
+    raw_rows = _saas_list_payload_rows(payload)
+    rows = [_normalize_saas_pending_row(raw) for raw in raw_rows]
+    return list(SAAS_PENDING_HEADERS), rows
+
+
+def build_customer_index(path: Path) -> dict[str, dict[str, Any]]:
+    """读取中核客户导出 JSON，返回 documentId -> 客户行 的映射。
+
+    每条值至少包含：
+      fourCategoryId
+      fourCategoryName
+      list_reference_price
+    """
+    if path.suffix.lower() != ".json":
+        raise ValueError(f"customer 导出输入必须是 JSON 文件：{path}")
+    with path.open("r", encoding="utf-8") as file:
+        payload = json.load(file)
+    raw_rows = _saas_list_payload_rows(payload)
+    index: dict[str, dict[str, Any]] = {}
+    for raw in raw_rows:
+        document_id = normalize_cell_str(raw.get("documentId"))
+        if not document_id:
+            continue
+        index[document_id] = {
+            "fourCategoryId": normalize_cell_str(raw.get("fourCategoryId")),
+            "fourCategoryName": normalize_cell_str(raw.get("fourCategoryName")),
+            "list_reference_price": parse_decimal(raw.get("referencePrice")),
+            "commodityName": normalize_cell_str(raw.get("commodityName")),
+            "referenceLink": normalize_cell_str(raw.get("referenceLink")),
+        }
+    return index
+
+
+def join_saas_with_customer(
+    saas_rows: list[dict[str, Any]],
+    customer_index: dict[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """给 SaaS rows 回填 fourCategoryId/Name/list_reference_price/customer_lookup_status。"""
+    joined: list[dict[str, Any]] = []
+    for row in saas_rows:
+        merged = dict(row)
+        document_id = normalize_cell_str(row.get("documentId"))
+        customer_row = customer_index.get(document_id)
+        if customer_row is None:
+            merged["fourCategoryId"] = ""
+            merged["fourCategoryName"] = ""
+            merged["list_reference_price"] = None
+            merged["customer_lookup_status"] = "NOT_FOUND"
+        else:
+            merged["fourCategoryId"] = customer_row.get("fourCategoryId", "")
+            merged["fourCategoryName"] = customer_row.get("fourCategoryName", "")
+            merged["list_reference_price"] = customer_row.get("list_reference_price")
+            merged["customer_lookup_status"] = (
+                "MATCHED" if customer_row.get("fourCategoryId") else "MATCHED_NO_CATEGORY"
+            )
+        joined.append(merged)
+    return joined
+
+
+# ---------------------------------------------------------------------------
+# 京东 / 链接判定
+# ---------------------------------------------------------------------------
+
+
+def is_jd_link(url: str) -> bool:
+    """判断是否为京东链接（按 AGENT_GUIDE.md 规则需跳过）。"""
+    text = (url or "").strip().lower()
+    if not text:
+        return False
+    for keyword in JD_HOST_KEYWORDS:
+        if keyword in text:
+            return True
+    return False
 
 
 
@@ -595,6 +755,21 @@ def enrich_rows_with_customer_price(
                 progress_func(index, total, normalize_cell_str(row.get(document_id_field)), "EXISTS")
             continue
 
+        document_id = normalize_cell_str(row.get(document_id_field))
+        four_category_id = normalize_cell_str(row.get(category_id_field))
+        lookup_status = normalize_cell_str(row.get("customer_lookup_status"))
+        if lookup_status == "NOT_FOUND":
+            enriched.append({
+                "customerPrice": None,
+                "customerPriceStatus": "LOOKUP_FAILED",
+                "customerPriceSource": "",
+                "customerPriceWarning": "客户导出 JSON 中未找到该 documentId，已跳过详情请求",
+                "customerPriceEvidence": "",
+            })
+            if progress_func is not None:
+                progress_func(index, total, document_id, "LOOKUP_FAILED")
+            continue
+
         if curl_template is None:
             enriched.append({
                 "customerPrice": None,
@@ -604,11 +779,9 @@ def enrich_rows_with_customer_price(
                 "customerPriceEvidence": "",
             })
             if progress_func is not None:
-                progress_func(index, total, normalize_cell_str(row.get(document_id_field)), "NOT_PROVIDED")
+                progress_func(index, total, document_id, "NOT_PROVIDED")
             continue
 
-        document_id = normalize_cell_str(row.get(document_id_field))
-        four_category_id = normalize_cell_str(row.get(category_id_field))
         if not document_id or not four_category_id:
             enriched.append({
                 "customerPrice": None,
@@ -662,10 +835,13 @@ def build_records(
     return records
 
 
-def run_audit(records: list[SaasSameProductApprovalItem]) -> Any:
+def run_audit(
+    records: list[SaasSameProductApprovalItem],
+    use_model: bool = False,
+) -> Any:
     return audit_saas_approval_records(
         records=records,
-        use_model=False,
+        use_model=use_model,
         use_link_audit=False,
         crawl_results=[],
         use_crawl_result=False,
@@ -732,7 +908,7 @@ def _set_column_widths(sheet: Any, headers: list[str]) -> None:
     for index, header in enumerate(headers, start=1):
         letter = get_column_letter(index)
         width = min(max(len(header) * 2 + 4, 12), 60)
-        if header in {"reason", "evidence", "customerPriceEvidence", "extLink", "queryStr", "skuName", "customerPriceWarning"}:
+        if header in {"reason", "evidence", "customerPriceEvidence", "extLink", "queryStr", "skuName", "customerPriceWarning", "title_match_reason"}:
             width = 50
         sheet.column_dimensions[letter].width = width
 
@@ -751,6 +927,67 @@ def _write_summary_sheet(workbook: Workbook, summary_counts: dict[str, Any]) -> 
     sheet.freeze_panes = "A2"
     sheet.auto_filter.ref = f"A1:{get_column_letter(len(headers))}1"
     _set_column_widths(sheet, headers)
+
+
+def _collect_title_reason(audit_result):
+    if audit_result is None:
+        return ""
+    chunks = []
+    for item in audit_result.evidence or []:
+        text = str(item)
+        if text.startswith("title_model.reason="):
+            chunks.append(text[len("title_model.reason="):])
+        elif text.startswith("title_model.risk="):
+            chunks.append("risk=" + text[len("title_model.risk="):])
+    return ";".join(chunks)
+
+
+def _compute_page_price_status(row, audit_result):
+    ext_link = normalize_cell_str(row.get("extLink"))
+    if not ext_link:
+        return {
+            "page_price_value": None,
+            "page_price_status": "SKIPPED_NO_LINK",
+            "page_price_source": "",
+        }
+    if is_jd_link(ext_link):
+        return {
+            "page_price_value": None,
+            "page_price_status": "SKIPPED_JD",
+            "page_price_source": "JD",
+        }
+    if audit_result is not None and audit_result.title_match_result == "NOT_SAME":
+        return {
+            "page_price_value": None,
+            "page_price_status": "SKIPPED_MODEL_NOT_SAME",
+            "page_price_source": "",
+        }
+    return {
+        "page_price_value": None,
+        "page_price_status": "PENDING_CRAWL",
+        "page_price_source": "",
+    }
+
+
+def compute_over_30_check(customer_price, page_price, page_price_status):
+    pending_statuses = {
+        "SKIPPED_JD",
+        "SKIPPED_NO_LINK",
+        "SKIPPED_MODEL_NOT_SAME",
+        "PENDING_CRAWL",
+        "FAILED",
+        "CRAWLER_PROCESS_FAILED",
+    }
+    if page_price_status in pending_statuses:
+        return ("PAGE_PRICE_MISSING", "")
+    if page_price is None or page_price <= 0:
+        return ("PAGE_PRICE_MISSING", "")
+    if customer_price is None or customer_price <= 0:
+        return ("CUSTOMER_PRICE_MISSING", "")
+    threshold = customer_price * THIRTY_PERCENT_RATIO
+    if page_price > threshold:
+        return ("HIGHER_THAN_CUSTOMER_PRICE_30", "TRUE")
+    return ("WITHIN_THRESHOLD", "FALSE")
 
 
 def _write_record_results_sheet(
@@ -772,7 +1009,6 @@ def _write_record_results_sheet(
 
     record_results = list(audit_response.record_results or [])
     if len(record_results) != len(rows):
-        # 长度不一致时回退到逐行最小并集，避免抛异常
         while len(record_results) < len(rows):
             record_results.append(None)
 
@@ -780,15 +1016,23 @@ def _write_record_results_sheet(
         merged: dict[str, Any] = {}
         for header in base_headers:
             merged[header] = row.get(header, "")
+
+        merged["fourCategoryId"] = row.get("fourCategoryId", "")
+        merged["fourCategoryName"] = row.get("fourCategoryName", "")
+        merged["customer_lookup_status"] = row.get("customer_lookup_status", "")
+        merged["list_reference_price"] = row.get("list_reference_price")
+
         merged["customerPrice"] = info.get("customerPrice")
         merged["customerPriceStatus"] = info.get("customerPriceStatus", "")
         merged["customerPriceSource"] = info.get("customerPriceSource", "")
         merged["customerPriceWarning"] = info.get("customerPriceWarning", "")
         merged["customerPriceEvidence"] = info.get("customerPriceEvidence", "")
+
         if audit_result is not None:
             merged["json_price"] = audit_result.json_price
-            merged["page_price"] = audit_result.page_price
             merged["title_match_result"] = audit_result.title_match_result
+            merged["title_match_confidence"] = audit_result.title_match_confidence
+            merged["title_match_reason"] = _collect_title_reason(audit_result)
             merged["sku_link_check"] = audit_result.sku_link_check
             merged["price_check"] = audit_result.price_check
             merged["price_vs_customer_check"] = audit_result.price_vs_customer_check
@@ -802,8 +1046,9 @@ def _write_record_results_sheet(
         else:
             for column in (
                 "json_price",
-                "page_price",
                 "title_match_result",
+                "title_match_confidence",
+                "title_match_reason",
                 "sku_link_check",
                 "price_check",
                 "price_vs_customer_check",
@@ -816,10 +1061,27 @@ def _write_record_results_sheet(
                 "executed",
             ):
                 merged[column] = ""
+
+        page_status_info = _compute_page_price_status(row, audit_result)
+        merged["page_price_value"] = page_status_info["page_price_value"]
+        merged["page_price_status"] = page_status_info["page_price_status"]
+        merged["page_price_source"] = page_status_info["page_price_source"]
+
+        page_vs_check, over_30 = compute_over_30_check(
+            customer_price=info.get("customerPrice"),
+            page_price=page_status_info["page_price_value"],
+            page_price_status=page_status_info["page_price_status"],
+        )
+        merged["page_vs_customer_check"] = page_vs_check
+        merged["over_30pct"] = over_30
+
+        row_is_over = over_30 == "TRUE"
         for column_index, header in enumerate(final_headers, start=1):
             cell = sheet.cell(row=row_index, column=column_index)
             cell.value = _format_cell_value(merged.get(header, ""))
-            if header in HIGHLIGHTED_RESULT_COLUMNS:
+            if row_is_over:
+                cell.fill = OVER_30_FILL
+            elif header in HIGHLIGHTED_RESULT_COLUMNS:
                 cell.fill = HIGHLIGHT_FILL
 
     sheet.freeze_panes = "A2"
@@ -853,13 +1115,19 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="本地 SaaS 待审批 Excel 审查脚本")
     parser.add_argument("--input-xlsx", type=Path, default=None)
     parser.add_argument("--input-saas-list-json", type=Path, default=None,
-                        help="SaaS 列表接口 response JSON，自动提取 documentId+fourCategoryId")
+                        help="单文件模式：客户列表接口 response JSON，自动取 documentId+fourCategoryId")
+    parser.add_argument("--input-saas-json", type=Path, default=None,
+                        help="双文件模式：SaaS 同款审批页面导出的 JSON（含客户标题/互联网标题/extLink）")
+    parser.add_argument("--input-customer-json", type=Path, default=None,
+                        help="双文件模式：中核客户导出的 JSON（用 documentId 反查 fourCategoryId）")
     parser.add_argument("--output-xlsx", required=True, type=Path)
     parser.add_argument("--curl-file", type=Path, default=None)
     parser.add_argument("--document-id-field", default=DEFAULT_DOCUMENT_ID_FIELD)
     parser.add_argument("--category-id-field", default=DEFAULT_CATEGORY_ID_FIELD)
     parser.add_argument("--request-interval", type=float, default=0.5,
                         help="详情接口每条之间等待秒数，默认 0.5")
+    parser.add_argument("--use-model", action="store_true",
+                        help="启用 SaaS 标题模型校验（需要 TITLE_MATCH_MODEL_API_KEY/BASE_URL 环境变量）")
     return parser
 
 
@@ -873,24 +1141,47 @@ def _cli_progress(index: int, total: int, document_id: str, status: str) -> None
     print(f"[{index}/{total}] documentId={document_id} status={status}")
 
 
+def _select_input_mode(input_xlsx, input_saas_list_json, input_saas_json, input_customer_json):
+    if input_customer_json is not None and input_saas_json is None:
+        raise ValueError("--input-customer-json 必须配合 --input-saas-json 使用")
+    flags = [
+        ("input_xlsx", input_xlsx),
+        ("input_saas_list_json", input_saas_list_json),
+        ("input_saas_json", input_saas_json),
+    ]
+    active = [name for name, value in flags if value is not None]
+    if not active:
+        raise ValueError("必须指定 --input-xlsx 或 --input-saas-list-json 或 --input-saas-json")
+    if len(active) > 1:
+        raise ValueError("--input-xlsx / --input-saas-list-json / --input-saas-json 互斥，三选一")
+    if input_saas_json is not None and input_customer_json is None:
+        raise ValueError("--input-saas-json 必须配合 --input-customer-json 使用")
+    return active[0]
+
+
 def run_main(
     output_xlsx: Path,
     input_xlsx: Path | None = None,
     input_saas_list_json: Path | None = None,
+    input_saas_json: Path | None = None,
+    input_customer_json: Path | None = None,
     curl_file: Path | None = None,
     document_id_field: str = DEFAULT_DOCUMENT_ID_FIELD,
     category_id_field: str = DEFAULT_CATEGORY_ID_FIELD,
     request_interval: float = 0.0,
+    use_model: bool = False,
     opener: Any | None = None,
     sleep_func: Any | None = None,
     progress_func: Any | None = None,
 ) -> dict[str, Any]:
-    if input_xlsx is None and input_saas_list_json is None:
-        raise ValueError("必须指定 --input-xlsx 或 --input-saas-list-json")
-    if input_xlsx is not None and input_saas_list_json is not None:
-        raise ValueError("--input-xlsx 与 --input-saas-list-json 互斥，二选一")
+    mode = _select_input_mode(input_xlsx, input_saas_list_json, input_saas_json, input_customer_json)
 
-    if input_saas_list_json is not None:
+    if mode == "input_saas_json":
+        headers, rows = read_saas_pending_json(input_saas_json)
+        customer_index = build_customer_index(input_customer_json)
+        rows = join_saas_with_customer(rows, customer_index)
+        source_path = input_saas_json
+    elif mode == "input_saas_list_json":
         headers, rows = read_saas_list_json(input_saas_list_json)
         source_path = input_saas_list_json
     else:
@@ -912,7 +1203,7 @@ def run_main(
         progress_func=progress_func,
     )
     records = build_records(rows, enriched)
-    audit_response = run_audit(records)
+    audit_response = run_audit(records, use_model=use_model)
     write_audit_workbook(output_xlsx, headers, rows, enriched, audit_response)
     summary_counts = _build_summary_counts(audit_response, enriched)
     return {
@@ -921,6 +1212,7 @@ def run_main(
         "enriched": enriched,
         "headers": headers,
         "rows": rows,
+        "mode": mode,
     }
 
 
@@ -929,11 +1221,14 @@ def main(argv: list[str] | None = None) -> int:
     result = run_main(
         input_xlsx=args.input_xlsx,
         input_saas_list_json=args.input_saas_list_json,
+        input_saas_json=args.input_saas_json,
+        input_customer_json=args.input_customer_json,
         output_xlsx=args.output_xlsx,
         curl_file=args.curl_file,
         document_id_field=args.document_id_field,
         category_id_field=args.category_id_field,
         request_interval=args.request_interval,
+        use_model=args.use_model,
         progress_func=_cli_progress,
     )
     print_summary(result["summary_counts"], args.output_xlsx)
