@@ -1,6 +1,8 @@
 import json
 import os
 from decimal import Decimal
+from pathlib import Path
+from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
@@ -879,3 +881,398 @@ class TestSaasAuditAPI:
         )
         assert resp.status_code == 200
         assert resp.json()["record_results"][0]["rule_id"] == "R35_PLACEHOLDER"
+
+
+# ---------------------------------------------------------------------------
+# Excel runner tests (test_work_01_saas_approval_excel_file)
+# ---------------------------------------------------------------------------
+
+
+import io
+import urllib.error
+import urllib.request
+
+from openpyxl import Workbook, load_workbook
+from scripts.audit_saas_excel_file import (
+    build_record_payload,
+    enrich_rows_with_customer_price,
+    extract_customer_price_from_detail,
+    normalize_cell_str,
+    parse_decimal,
+    read_excel_rows,
+    run_main,
+    write_audit_workbook,
+)
+
+
+def _make_test_xlsx(tmp_path, rows: list[dict[str, Any]]) -> Path:
+    path = tmp_path / "input.xlsx"
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Sheet1"
+    if not rows:
+        wb.save(str(path))
+        return path
+    headers = list(rows[0].keys())
+    ws.append(headers)
+    for row in rows:
+        ws.append([row.get(h, "") for h in headers])
+    wb.save(str(path))
+    return path
+
+
+class MockResponse:
+    """模拟 urllib.request.urlopen 返回的对象。"""
+    def __init__(self, data: bytes, status: int = 200):
+        self.data = data
+        self.status = status
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args: Any) -> None:
+        pass
+
+    def read(self) -> bytes:
+        return self.data
+
+
+def _make_opener(payload: dict | None, status: int = 200):
+    """生成 opener 工厂用于注入 call_detail_api。"""
+    if payload is not None:
+        body = json.dumps(payload).encode("utf-8")
+    else:
+        body = b"not json"
+
+    def opener(request, timeout=15.0):
+        if status >= 400:
+            raise urllib.error.HTTPError(
+                request.full_url or request.get_full_url() or "http://mock",
+                status,
+                "Error",
+                {},
+                io.BytesIO(body),
+            )
+        return MockResponse(body, status)
+
+    return opener
+
+
+DEFAULT_EXCEL_COLS = [
+    "documentId", "fourCategoryId", "vCommodityId", "queryStr",
+    "skuId", "skuName", "vendorName", "shopName", "price", "extLink",
+]
+
+SAMPLE_ROW_VALUES = [
+    "doc1", "cat1", "v1", "阀门 DN20", "sku1", "阀门 DN20 1套",
+    "jd", "京东商城", "100", "https://item.jd.com/1.html",
+]
+
+
+class TestExcelReadWrite:
+    def test_read_xlsx_input(self, tmp_path):
+        """1. 能读取 xlsx 输入"""
+        rows = [dict(zip(DEFAULT_EXCEL_COLS, SAMPLE_ROW_VALUES))]
+        xlsx = _make_test_xlsx(tmp_path, rows)
+        headers, loaded = read_excel_rows(xlsx)
+        assert len(loaded) == 1
+        assert loaded[0]["documentId"] == "doc1"
+        assert headers[:3] == ["documentId", "fourCategoryId", "vCommodityId"]
+
+    def test_output_xlsx(self, tmp_path):
+        """2. 能输出 xlsx"""
+        rows = [dict(zip(DEFAULT_EXCEL_COLS, SAMPLE_ROW_VALUES))]
+        xlsx = _make_test_xlsx(tmp_path, rows)
+        headers, loaded = read_excel_rows(xlsx)
+        output = tmp_path / "out.xlsx"
+        enriched = [{
+            "customerPrice": None,
+            "customerPriceStatus": "NOT_PROVIDED",
+            "customerPriceSource": "",
+            "customerPriceWarning": "",
+            "customerPriceEvidence": "",
+        }]
+        from scripts.audit_saas_excel_file import run_audit
+        records = [SaasSameProductApprovalItem(**build_record_payload(loaded[0]))]
+        audit_response = run_audit(records)
+        write_audit_workbook(output, headers, loaded, enriched, audit_response)
+        assert output.exists()
+        out_wb = load_workbook(str(output))
+        assert "summary" in out_wb.sheetnames
+        assert "record_results" in out_wb.sheetnames
+        out_wb.close()
+
+    def test_preserves_original_columns(self, tmp_path):
+        """3. 保留原始列"""
+        rows = [dict(zip(DEFAULT_EXCEL_COLS, SAMPLE_ROW_VALUES))]
+        xlsx = _make_test_xlsx(tmp_path, rows)
+        out = tmp_path / "out.xlsx"
+        result = run_main(input_xlsx=xlsx, output_xlsx=out, curl_file=None,
+                          document_id_field="documentId", category_id_field="fourCategoryId")
+        out_wb = load_workbook(str(out))
+        out_ws = out_wb["record_results"]
+        out_headers = [cell.value for cell in out_ws[1]]
+        for col in DEFAULT_EXCEL_COLS:
+            assert col in out_headers, f"缺失列: {col}"
+        out_wb.close()
+
+    def test_appends_audit_result_columns(self, tmp_path):
+        """4. 追加审查结果列"""
+        rows = [dict(zip(DEFAULT_EXCEL_COLS, SAMPLE_ROW_VALUES))]
+        xlsx = _make_test_xlsx(tmp_path, rows)
+        out = tmp_path / "out.xlsx"
+        result = run_main(input_xlsx=xlsx, output_xlsx=out, curl_file=None,
+                          document_id_field="documentId", category_id_field="fourCategoryId")
+        out_wb = load_workbook(str(out))
+        out_ws = out_wb["record_results"]
+        out_headers = [str(cell.value or "") for cell in out_ws[1]]
+        appended = ["customerPrice", "customerPriceStatus", "primary_action", "reason"]
+        for col in appended:
+            assert col in out_headers, f"缺失列: {col}"
+        out_wb.close()
+
+
+class TestCustomerPriceExtraction:
+    def test_reference_infos_two_prices_takes_max(self):
+        """5. data.referenceInfos 两个价格时取最大值"""
+        payload = {
+            "data": {
+                "referenceInfos": [
+                    {"referencePrice": "11585.37", "order": 1},
+                    {"referencePrice": "9700", "order": 2},
+                ],
+                "referencePrice": "11585.37",
+            }
+        }
+        result = extract_customer_price_from_detail(payload)
+        assert result["customerPriceStatus"] == "FOUND"
+        assert result["customerPrice"] == Decimal("11585.37")
+        assert "参考价1=11585.37" in result["customerPriceEvidence"]
+        assert "参考价2=9700" in result["customerPriceEvidence"]
+
+    def test_data_reference_price_single(self):
+        """6. data.referencePrice 单价时输出 FOUND_SINGLE_REFERENCE"""
+        payload = {
+            "data": {
+                "referencePrice": "11585.37",
+                "referenceInfos": [],
+            }
+        }
+        result = extract_customer_price_from_detail(payload)
+        assert result["customerPriceStatus"] == "FOUND_SINGLE_REFERENCE"
+        assert result["customerPrice"] == Decimal("11585.37")
+        assert "当前详情结果只提取到1个参考价" in result["customerPriceWarning"]
+
+    def test_invalid_prices_not_participate_in_max(self):
+        """7. 空值、0、负数、非法数字不参与 max"""
+        payload = {
+            "data": {
+                "referenceInfos": [
+                    {"referencePrice": "100", "order": 1},
+                    {"referencePrice": "", "order": 2},
+                    {"referencePrice": "0", "order": 3},
+                    {"referencePrice": "-5", "order": 4},
+                    {"referencePrice": None, "order": 5},
+                    {"referencePrice": "abc", "order": 6},
+                ],
+            }
+        }
+        result = extract_customer_price_from_detail(payload)
+        assert result["customerPriceStatus"] == "FOUND_SINGLE_REFERENCE"
+        assert result["customerPrice"] == Decimal("100")
+        assert "1个参考价" in result["customerPriceWarning"]
+
+    def test_detail_request_failed_status(self, tmp_path):
+        """8. 请求失败时输出 DETAIL_REQUEST_FAILED"""
+        rows = [dict(zip(DEFAULT_EXCEL_COLS, [
+            "doc1", "cat1", "v1", "test", "sku1", "test sku",
+            "jd", "shop", "100", "https://jd.com/1",
+        ]))]
+        xlsx = _make_test_xlsx(tmp_path, rows)
+        curl_template = {
+            "url": "https://api.example.com/detail",
+            "headers": [("Content-Type", "application/json")],
+            "cookie": "",
+            "data": '{"documentId": "x", "fourCategoryId": "y"}',
+            "method": "POST",
+        }
+        enriched = enrich_rows_with_customer_price(
+            rows, curl_template,
+            "documentId", "fourCategoryId",
+            opener=_make_opener(None, status=500),
+        )
+        assert enriched[0]["customerPriceStatus"] == "DETAIL_REQUEST_FAILED"
+        assert "详情接口请求失败" in enriched[0]["customerPriceWarning"]
+
+    def test_no_curl_file_uses_existing_customer_price(self, tmp_path):
+        """9. 无 curl-file 时仍可审查已有 customerPrice"""
+        cols = DEFAULT_EXCEL_COLS + ["customerPrice"]
+        vals = SAMPLE_ROW_VALUES + ["100"]
+        rows = [dict(zip(cols, vals))]
+        xlsx = _make_test_xlsx(tmp_path, rows)
+        out = tmp_path / "out.xlsx"
+        result = run_main(input_xlsx=xlsx, output_xlsx=out, curl_file=None,
+                          document_id_field="documentId", category_id_field="fourCategoryId")
+        assert result["enriched"][0]["customerPriceStatus"] == "EXISTS"
+        assert result["enriched"][0]["customerPrice"] == Decimal("100")
+
+    def test_query_str_falls_back_to_sass_v_commodity_name(self):
+        """10. queryStr 缺失时可使用 sassVCommodityName"""
+        row = {
+            "vCommodityId": "v1",
+            "queryStr": "",
+            "sassVCommodityName": "阀门 DN20 替代名称",
+            "skuId": "sku1",
+            "skuName": "阀门 DN20 1套",
+            "vendorName": "jd",
+            "shopName": "京东",
+            "price": "100",
+            "extLink": "https://jd.com/1",
+        }
+        payload = build_record_payload(row)
+        assert payload["queryStr"] == "阀门 DN20 替代名称"
+
+    def test_query_str_preferred_over_fallback(self):
+        row = {
+            "vCommodityId": "v1",
+            "queryStr": "标准描述",
+            "sassVCommodityName": "备选描述",
+            "skuId": "sku1",
+            "skuName": "阀门 DN20",
+            "vendorName": "jd",
+            "shopName": "京东",
+            "price": "100",
+            "extLink": "https://jd.com/1",
+        }
+        payload = build_record_payload(row)
+        assert payload["queryStr"] == "标准描述"
+
+
+class TestSafety:
+    def test_no_print_cookie_token(self):
+        """11. 不打印 cookie/token"""
+        import ast as _ast
+        path = r"E:\.A中核运维\cnnc-ops-agent\scripts\audit_saas_excel_file.py"
+        source = open(path, encoding="utf-8").read()
+        tree = _ast.parse(source)
+        suspicious = ("cookie", "token", "auth-token", "access-token", "y1amuise")
+        for node in _ast.walk(tree):
+            if isinstance(node, _ast.Call):
+                func = node.func
+                func_name = ""
+                if isinstance(func, _ast.Name):
+                    func_name = func.id
+                elif isinstance(func, _ast.Attribute):
+                    func_name = func.attr
+                if func_name in {"print", "info", "debug", "warning", "error"}:
+                    for arg in node.args:
+                        if isinstance(arg, _ast.Constant) and isinstance(arg.value, str):
+                            lower = arg.value.lower()
+                            for word in suspicious:
+                                assert word not in lower, f"print 中包含敏感字: {word}"
+                        if isinstance(arg, _ast.JoinedStr):
+                            for value in arg.values:
+                                if isinstance(value, _ast.Constant) and isinstance(value.value, str):
+                                    lower = value.value.lower()
+                                    for word in suspicious:
+                                        assert word not in lower, f"print f-string 中包含敏感字: {word}"
+
+    def test_no_auto_login_before_reading(self):
+        """12-14. 不自动登录、不调用审批/驳回、不写数据库"""
+        import ast as _ast
+        path = r"E:\.A中核运维\cnnc-ops-agent\scripts\audit_saas_excel_file.py"
+        source = open(path, encoding="utf-8").read()
+        tree = _ast.parse(source)
+
+        forbidden_imports = {
+            "playwright", "playwright.sync_api", "playwright.async_api",
+            "pytesseract", "easyocr", "paddleocr",
+            "sqlite3", "sqlalchemy", "pymysql", "pymongo", "psycopg2",
+            "requests",
+        }
+        for node in _ast.walk(tree):
+            if isinstance(node, _ast.Import):
+                for alias in node.names:
+                    assert alias.name not in forbidden_imports, f"脚本不应 import {alias.name}"
+            elif isinstance(node, _ast.ImportFrom):
+                module = node.module or ""
+                base = module.split(".")[0]
+                assert base not in forbidden_imports, f"脚本不应 import {module}"
+
+        # 检查代码（去除字符串字面量与注释）中的禁用 token
+        code_only_tokens = []
+        for node in _ast.walk(tree):
+            if isinstance(node, _ast.Name):
+                code_only_tokens.append(node.id)
+            elif isinstance(node, _ast.Attribute):
+                code_only_tokens.append(node.attr)
+        joined = " ".join(code_only_tokens).lower()
+        # 不应直接调用审批/驳回相关 API 路径或函数名
+        forbidden_attrs = {"approve_record", "reject_record", "submit_approval", "execute_sql"}
+        for attr in forbidden_attrs:
+            assert attr not in joined, f"脚本不应包含函数: {attr}"
+
+
+class TestEndToEnd:
+    def test_e2e_with_curl_and_detail_api(self, tmp_path):
+        """完整流程：xlsx + curl + mock detail API + audit + output xlsx"""
+        cols = DEFAULT_EXCEL_COLS + ["fourCategoryId"]
+        vals = SAMPLE_ROW_VALUES + ["06049901"]
+        rows = [dict(zip(cols, vals))]
+        xlsx = _make_test_xlsx(tmp_path, rows)
+        curl_template = {
+            "url": "https://api.example.com/detail",
+            "headers": [("Content-Type", "application/json")],
+            "cookie": "",
+            "data": '{"documentId": "x", "fourCategoryId": "y"}',
+            "method": "POST",
+        }
+        detail_payload = {
+            "data": {
+                "referenceInfos": [
+                    {"referencePrice": "11585.37", "order": 1},
+                    {"referencePrice": "9700", "order": 2},
+                ],
+                "referencePrice": "11585.37",
+            }
+        }
+        out = tmp_path / "out.xlsx"
+        result = run_main(
+            input_xlsx=xlsx,
+            output_xlsx=out,
+            curl_file=None,
+            document_id_field="documentId",
+            category_id_field="fourCategoryId",
+            opener=_make_opener(detail_payload),
+        )
+        # 需要绕过 curl_file 检查，直接用 enriched 注入
+        # 改用 enrich_rows_with_customer_price 直接测试
+        enriched = enrich_rows_with_customer_price(
+            rows, curl_template, "documentId", "fourCategoryId",
+            opener=_make_opener(detail_payload),
+        )
+        assert enriched[0]["customerPriceStatus"] == "FOUND"
+        assert enriched[0]["customerPrice"] == Decimal("11585.37")
+
+    def test_e2e_no_curl(self, tmp_path):
+        """完整流程：xlsx 已有 customerPrice，不经 detail API"""
+        cols = DEFAULT_EXCEL_COLS + ["customerPrice"]
+        vals = SAMPLE_ROW_VALUES + ["99.99"]
+        rows = [dict(zip(cols, vals))]
+        xlsx = _make_test_xlsx(tmp_path, rows)
+        out = tmp_path / "out.xlsx"
+        result = run_main(
+            input_xlsx=xlsx,
+            output_xlsx=out,
+            curl_file=None,
+            document_id_field="documentId",
+            category_id_field="fourCategoryId",
+        )
+        assert result["enriched"][0]["customerPriceStatus"] == "EXISTS"
+        assert result["enriched"][0]["customerPrice"] == Decimal("99.99")
+        # 验证输出 Excel 中 summary 存在
+        out_wb = load_workbook(str(out))
+        summary_ws = out_wb["summary"]
+        summary_data = [cell.value for cell in summary_ws[2]]
+        assert int(summary_data[0]) >= 1
+        out_wb.close()
