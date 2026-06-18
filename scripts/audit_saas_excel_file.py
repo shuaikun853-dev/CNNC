@@ -791,6 +791,7 @@ def enrich_rows_with_customer_price(
     sleep = sleep_func if sleep_func is not None else time.sleep
     total = len(rows)
     request_count = 0
+    detail_cache: dict[tuple[str, str], dict[str, Any]] = {}
     for index, row in enumerate(rows, start=1):
         existing_customer_price = parse_decimal(row.get("customerPrice"))
         if is_valid_reference_price(existing_customer_price):
@@ -844,22 +845,37 @@ def enrich_rows_with_customer_price(
                 progress_func(index, total, document_id, "DETAIL_REQUEST_SKIPPED")
             continue
 
+        cache_key = (document_id, four_category_id)
+        cached = detail_cache.get(cache_key)
+        if cached is not None:
+            cached_copy = dict(cached)
+            evidence = cached_copy.get("customerPriceEvidence", "")
+            if evidence and "（detail 缓存命中）" not in evidence:
+                cached_copy["customerPriceEvidence"] = evidence + "（detail 缓存命中）"
+            enriched.append(cached_copy)
+            if progress_func is not None:
+                progress_func(index, total, document_id, cached_copy.get("customerPriceStatus", "") + "_CACHED")
+            continue
+
         if request_count > 0 and request_interval > 0:
             sleep(request_interval)
         request_count += 1
         response = call_detail_api(curl_template, document_id, four_category_id, opener=opener)
         if not response.get("ok"):
-            enriched.append({
+            failed_info = {
                 "customerPrice": None,
                 "customerPriceStatus": "DETAIL_REQUEST_FAILED",
                 "customerPriceSource": "",
                 "customerPriceWarning": "详情接口请求失败，请检查 cURL 登录态是否过期",
                 "customerPriceEvidence": "",
-            })
+            }
+            detail_cache[cache_key] = failed_info
+            enriched.append(failed_info)
             if progress_func is not None:
                 progress_func(index, total, document_id, "DETAIL_REQUEST_FAILED")
             continue
         result = extract_customer_price_from_detail(response.get("payload"))
+        detail_cache[cache_key] = result
         enriched.append(result)
         if progress_func is not None:
             progress_func(index, total, document_id, result.get("customerPriceStatus", ""))

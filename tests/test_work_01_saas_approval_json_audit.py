@@ -1835,3 +1835,50 @@ class TestVCommodityIdJoin:
         for r in result["rows"]:
             assert r["fourCategoryId"] == "abc01"
             assert r["customer_lookup_status"] == "MATCHED"
+
+
+class TestDetailCache:
+    def test_detail_called_once_per_unique_document_id(self, tmp_path):
+        # 3 行同 vCommodityId，detail 只应调 1 次
+        rows = [
+            {**SAMPLE_SAAS_PENDING_ROW, "vCommodityId": "vc-X", "skuId": "sku-A", "extLink": "https://a/1"},
+            {**SAMPLE_SAAS_PENDING_ROW, "vCommodityId": "vc-X", "skuId": "sku-B", "extLink": "https://a/2"},
+            {**SAMPLE_SAAS_PENDING_ROW, "vCommodityId": "vc-X", "skuId": "sku-C", "extLink": "https://a/3"},
+        ]
+        cust_row = dict(SAMPLE_CUSTOMER_ROW)
+        cust_row["documentId"] = "vc-X"
+        cust_row["fourCategoryId"] = "cat01"
+
+        saas_path = _write_pending_json(tmp_path, rows)
+        cust_path = _write_customer_json(tmp_path, [cust_row])
+        _, saas_rows = read_saas_pending_json(saas_path)
+        index = build_customer_index(cust_path)
+        joined = join_saas_with_customer(saas_rows, index)
+
+        curl_template = {
+            "url": "https://api.example.com/detail",
+            "headers": [],
+            "cookie": "",
+            "data": '{"documentId":"x","fourCategoryId":"y"}',
+            "method": "POST",
+        }
+        detail_payload = {"data": {"referenceInfos": [{"referencePrice": "100"}, {"referencePrice": "200"}]}}
+
+        call_count = 0
+        def counting_opener(request, timeout=15.0):
+            nonlocal call_count
+            call_count += 1
+            return MockResponse(json.dumps(detail_payload).encode("utf-8"))
+
+        from scripts.audit_saas_excel_file import enrich_rows_with_customer_price as _enrich2
+        enriched = _enrich2(
+            joined, curl_template,
+            "documentId", "fourCategoryId",
+            opener=counting_opener,
+            request_interval=0.0,
+        )
+        # 3 行同一 documentId → detail 只调 1 次
+        assert call_count == 1
+        # 全部命中并取得最大值
+        assert all(item["customerPriceStatus"] in ("FOUND", "FOUND_SINGLE_REFERENCE") for item in enriched)
+        assert all(item["customerPrice"] == Decimal("200") for item in enriched)
