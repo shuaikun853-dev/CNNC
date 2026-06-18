@@ -1476,8 +1476,7 @@ from scripts.audit_saas_excel_file import (
 
 
 SAMPLE_SAAS_PENDING_ROW = {
-    "documentId": "679483364934705152",
-    "vCommodityId": "679416640600166400",
+    "vCommodityId": "679483364934705152",
     "queryStr": "茂谷聚 Cs树脂 AMP-PAN 1kg/瓶 100~600目（销售单位：瓶）",
     "skuName": "茂谷聚 Cs树脂 AMP-PAN 1kg/瓶 100~600目 销售单位：瓶",
     "skuId": "1004360200014308",
@@ -1501,6 +1500,7 @@ SAMPLE_CUSTOMER_ROW = {
 }
 
 
+
 def _write_pending_json(tmp_path, rows):
     path = tmp_path / "saas_pending.json"
     payload = {"rspCode": "0000", "count": len(rows), "rows": rows, "success": True}
@@ -1522,7 +1522,7 @@ class TestSaasPendingJsonInput:
         assert headers == list(SAAS_PENDING_HEADERS)
         assert len(rows) == 1
         row = rows[0]
-        assert row["documentId"] == "679483364934705152"
+        assert row["vCommodityId"] == "679483364934705152"
         assert row["queryStr"] == SAMPLE_SAAS_PENDING_ROW["queryStr"]
         assert row["skuName"] == SAMPLE_SAAS_PENDING_ROW["skuName"]
         assert row["extLink"].startswith("https://")
@@ -1568,7 +1568,7 @@ class TestJoin:
 
     def test_join_not_found(self, tmp_path):
         saas_row = dict(SAMPLE_SAAS_PENDING_ROW)
-        saas_row["documentId"] = "999999999999999999"
+        saas_row["vCommodityId"] = "999999999999999999"
         saas_path = _write_pending_json(tmp_path, [saas_row])
         cust_path = _write_customer_json(tmp_path, [SAMPLE_CUSTOMER_ROW])
         _, saas_rows = read_saas_pending_json(saas_path)
@@ -1706,7 +1706,7 @@ class TestRunMainSaasJsonE2E:
 
     def test_run_main_dual_mode_lookup_failed(self, tmp_path):
         saas_row = dict(SAMPLE_SAAS_PENDING_ROW)
-        saas_row["documentId"] = "999999999999999999"
+        saas_row["vCommodityId"] = "999999999999999999"
         saas_path = _write_pending_json(tmp_path, [saas_row])
         cust_path = _write_customer_json(tmp_path, [SAMPLE_CUSTOMER_ROW])
         out = tmp_path / "out.xlsx"
@@ -1737,3 +1737,101 @@ class TestRunMainSaasJsonE2E:
         assert ws.cell(row=2, column=idx_status).value == "SKIPPED_JD"
         assert ws.cell(row=2, column=idx_over).value in ("", None)
         wb.close()
+
+
+# ---------------------------------------------------------------------------
+# Multi-segment JSON + vCommodityId join tests
+# ---------------------------------------------------------------------------
+
+
+from scripts.audit_saas_excel_file import _parse_json_segments
+
+
+class TestMultiSegmentJson:
+    def test_parse_two_segments_concatenated(self):
+        seg1 = json.dumps({"rspCode": "0000", "count": 2, "rows": [{"a": 1}, {"a": 2}]}, ensure_ascii=False)
+        seg2 = json.dumps({"rspCode": "0000", "count": 1, "rows": [{"a": 3}]}, ensure_ascii=False)
+        text = seg1 + "\n" + seg2
+        segments = _parse_json_segments(text)
+        assert len(segments) == 2
+        assert segments[0]["count"] == 2
+        assert segments[1]["count"] == 1
+
+    def test_read_saas_pending_multi_segment(self, tmp_path):
+        seg1_rows = [
+            {**SAMPLE_SAAS_PENDING_ROW, "vCommodityId": "v1", "skuId": "sku-1"},
+            {**SAMPLE_SAAS_PENDING_ROW, "vCommodityId": "v1", "skuId": "sku-2"},
+        ]
+        seg2_rows = [
+            {**SAMPLE_SAAS_PENDING_ROW, "vCommodityId": "v2", "skuId": "sku-3"},
+        ]
+        path = tmp_path / "saas_multi.json"
+        text1 = json.dumps({"rspCode": "0000", "count": 2, "rows": seg1_rows}, ensure_ascii=False)
+        text2 = json.dumps({"rspCode": "0000", "count": 1, "rows": seg2_rows}, ensure_ascii=False)
+        path.write_text(text1 + "\n" + text2, encoding="utf-8")
+        _, rows = read_saas_pending_json(path)
+        assert len(rows) == 3
+        assert [r["skuId"] for r in rows] == ["sku-1", "sku-2", "sku-3"]
+        assert {r["vCommodityId"] for r in rows} == {"v1", "v2"}
+
+    def test_read_customer_multi_segment(self, tmp_path):
+        seg1 = [{"documentId": "v1", "fourCategoryId": "c1", "fourCategoryName": "n1", "referencePrice": "10"}]
+        seg2 = [{"documentId": "v2", "fourCategoryId": "c2", "fourCategoryName": "n2", "referencePrice": "20"}]
+        path = tmp_path / "customer_multi.json"
+        text1 = json.dumps({"rspCode": "0000", "count": 1, "rows": seg1}, ensure_ascii=False)
+        text2 = json.dumps({"rspCode": "0000", "count": 1, "rows": seg2}, ensure_ascii=False)
+        path.write_text(text1 + "\n" + text2, encoding="utf-8")
+        index = build_customer_index(path)
+        assert set(index.keys()) == {"v1", "v2"}
+        assert index["v1"]["fourCategoryId"] == "c1"
+        assert index["v2"]["fourCategoryId"] == "c2"
+
+
+class TestVCommodityIdJoin:
+    def test_join_uses_v_commodity_id_to_lookup_document_id(self, tmp_path):
+        # saas 端只有 vCommodityId，customer 端用 documentId 提供 fourCategoryId
+        saas_row = dict(SAMPLE_SAAS_PENDING_ROW)
+        saas_row["vCommodityId"] = "shared-id-001"
+        cust_row = dict(SAMPLE_CUSTOMER_ROW)
+        cust_row["documentId"] = "shared-id-001"
+        cust_row["fourCategoryId"] = "12345601"
+        cust_row["fourCategoryName"] = "测试类目"
+
+        saas_path = _write_pending_json(tmp_path, [saas_row])
+        cust_path = _write_customer_json(tmp_path, [cust_row])
+        _, saas_rows = read_saas_pending_json(saas_path)
+        index = build_customer_index(cust_path)
+        joined = join_saas_with_customer(saas_rows, index)
+
+        assert joined[0]["customer_lookup_status"] == "MATCHED"
+        assert joined[0]["fourCategoryId"] == "12345601"
+        assert joined[0]["fourCategoryName"] == "测试类目"
+        # documentId 应该回填为 customer 端的 documentId（与 saas.vCommodityId 相等）
+        assert joined[0]["documentId"] == "shared-id-001"
+
+    def test_multiple_sku_rows_under_same_v_commodity_id_not_merged(self, tmp_path):
+        # 同一 vCommodityId 下两条 sku 候选不合并
+        rows = [
+            {**SAMPLE_SAAS_PENDING_ROW, "vCommodityId": "vc-A", "skuId": "sku-1", "extLink": "https://a.com/1"},
+            {**SAMPLE_SAAS_PENDING_ROW, "vCommodityId": "vc-A", "skuId": "sku-2", "extLink": "https://a.com/2"},
+            {**SAMPLE_SAAS_PENDING_ROW, "vCommodityId": "vc-A", "skuId": "sku-3", "extLink": "https://a.com/3"},
+        ]
+        cust_row = dict(SAMPLE_CUSTOMER_ROW)
+        cust_row["documentId"] = "vc-A"
+        cust_row["fourCategoryId"] = "abc01"
+
+        saas_path = _write_pending_json(tmp_path, rows)
+        cust_path = _write_customer_json(tmp_path, [cust_row])
+        out = tmp_path / "out.xlsx"
+        result = run_main(
+            output_xlsx=out,
+            input_saas_json=saas_path,
+            input_customer_json=cust_path,
+        )
+        # 输出行数 = saas 行数（不合并）
+        assert len(result["rows"]) == 3
+        assert len(result["enriched"]) == 3
+        # 三行都命中同一个 fourCategoryId
+        for r in result["rows"]:
+            assert r["fourCategoryId"] == "abc01"
+            assert r["customer_lookup_status"] == "MATCHED"

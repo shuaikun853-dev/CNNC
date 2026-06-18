@@ -274,13 +274,55 @@ def _normalize_saas_list_row(raw: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def read_saas_list_json(path: Path) -> tuple[list[str], list[dict[str, Any]]]:
-    """读取 SaaS 列表接口 response JSON，返回 (列名顺序, 行字典列表)。"""
+def _parse_json_segments(text: str) -> list[Any]:
+    """解析"多段 JSON 首尾相连"的文本。
+
+    SaaS / 客户后台导出的 JSON 在分页保存时常常被首尾拼在同一个文件里，
+    例如：
+        {"rspCode": "0000", "rows": [...100 行...]}
+        {"rspCode": "0000", "rows": [...100 行...]}
+        {"rspCode": "0000", "rows": [...100 行...]}
+
+    标准 json.load 只读第一段，会报 "Extra data"。
+    本函数把每一段单独解析返回。
+    """
+    decoder = json.JSONDecoder()
+    segments: list[Any] = []
+    index = 0
+    length = len(text)
+    while index < length:
+        while index < length and text[index] in " \t\r\n\ufeff":
+            index += 1
+        if index >= length:
+            break
+        try:
+            obj, end = decoder.raw_decode(text, index)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"JSON 解析失败（位置 {index}）：{exc}") from exc
+        segments.append(obj)
+        index = end
+    return segments
+
+
+def _load_json_file_segments(path: Path) -> list[Any]:
     if path.suffix.lower() != ".json":
-        raise ValueError(f"saas-list 输入必须是 JSON 文件：{path}")
-    with path.open("r", encoding="utf-8") as file:
-        payload = json.load(file)
-    raw_rows = _saas_list_payload_rows(payload)
+        raise ValueError(f"输入必须是 JSON 文件：{path}")
+    text = path.read_text(encoding="utf-8")
+    return _parse_json_segments(text)
+
+
+def _collect_rows_from_segments(segments: list[Any]) -> list[dict[str, Any]]:
+    """把多段 payload 里的 rows 全部合并成一个列表。"""
+    all_rows: list[dict[str, Any]] = []
+    for segment in segments:
+        all_rows.extend(_saas_list_payload_rows(segment))
+    return all_rows
+
+
+def read_saas_list_json(path: Path) -> tuple[list[str], list[dict[str, Any]]]:
+    """读取 SaaS 列表接口 response JSON（支持多段拼接），返回 (列名顺序, 行字典列表)。"""
+    segments = _load_json_file_segments(path)
+    raw_rows = _collect_rows_from_segments(segments)
     rows = [_normalize_saas_list_row(raw) for raw in raw_rows]
     return list(SAAS_LIST_HEADERS), rows
 
@@ -291,8 +333,8 @@ def read_saas_list_json(path: Path) -> tuple[list[str], list[dict[str, Any]]]:
 
 
 SAAS_PENDING_HEADERS = [
-    "documentId",
     "vCommodityId",
+    "documentId",
     "queryStr",
     "sassVCommodityName",
     "skuId",
@@ -313,10 +355,12 @@ SAAS_PENDING_HEADERS = [
 def _normalize_saas_pending_row(raw: dict[str, Any]) -> dict[str, Any]:
     """SaaS 同款审批页面导出的一行 → 内部 row。
 
+    主键：vCommodityId（与中核客户后台的 documentId 对应）。
     queryStr   = 客户标题
     skuName    = 互联网标题
     extLink    = 互联网链接（要爬的）
     """
+    v_commodity_id = normalize_cell_str(raw.get("vCommodityId"))
     document_id = normalize_cell_str(raw.get("documentId"))
     query_str = normalize_cell_str(raw.get("queryStr"))
     if not query_str:
@@ -328,8 +372,8 @@ def _normalize_saas_pending_row(raw: dict[str, Any]) -> dict[str, Any]:
     if not ext_link:
         ext_link = normalize_cell_str(raw.get("referenceLink"))
     return {
+        "vCommodityId": v_commodity_id,
         "documentId": document_id,
-        "vCommodityId": normalize_cell_str(raw.get("vCommodityId")) or document_id,
         "queryStr": query_str,
         "sassVCommodityName": normalize_cell_str(raw.get("sassVCommodityName")),
         "skuId": normalize_cell_str(raw.get("skuId")),
@@ -348,29 +392,23 @@ def _normalize_saas_pending_row(raw: dict[str, Any]) -> dict[str, Any]:
 
 
 def read_saas_pending_json(path: Path) -> tuple[list[str], list[dict[str, Any]]]:
-    """读取 SaaS 同款审批页面导出的 JSON，返回 (列名顺序, 行字典列表)。"""
-    if path.suffix.lower() != ".json":
-        raise ValueError(f"saas-pending 输入必须是 JSON 文件：{path}")
-    with path.open("r", encoding="utf-8") as file:
-        payload = json.load(file)
-    raw_rows = _saas_list_payload_rows(payload)
+    """读取 SaaS 同款审批页面导出 JSON（支持多段拼接），返回 (列名顺序, 行字典列表)。"""
+    segments = _load_json_file_segments(path)
+    raw_rows = _collect_rows_from_segments(segments)
     rows = [_normalize_saas_pending_row(raw) for raw in raw_rows]
     return list(SAAS_PENDING_HEADERS), rows
 
 
 def build_customer_index(path: Path) -> dict[str, dict[str, Any]]:
-    """读取中核客户导出 JSON，返回 documentId -> 客户行 的映射。
+    """读取中核客户导出 JSON（支持多段拼接），返回 documentId -> 客户行 的映射。
 
     每条值至少包含：
       fourCategoryId
       fourCategoryName
       list_reference_price
     """
-    if path.suffix.lower() != ".json":
-        raise ValueError(f"customer 导出输入必须是 JSON 文件：{path}")
-    with path.open("r", encoding="utf-8") as file:
-        payload = json.load(file)
-    raw_rows = _saas_list_payload_rows(payload)
+    segments = _load_json_file_segments(path)
+    raw_rows = _collect_rows_from_segments(segments)
     index: dict[str, dict[str, Any]] = {}
     for raw in raw_rows:
         document_id = normalize_cell_str(raw.get("documentId"))
@@ -390,18 +428,30 @@ def join_saas_with_customer(
     saas_rows: list[dict[str, Any]],
     customer_index: dict[str, dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    """给 SaaS rows 回填 fourCategoryId/Name/list_reference_price/customer_lookup_status。"""
+    """给 SaaS rows 回填 fourCategoryId/Name/list_reference_price/customer_lookup_status。
+
+    Join key：saas.vCommodityId == customer.documentId
+    回填后：
+      row["documentId"] 取 customer.documentId（命中时）
+      row["fourCategoryId"]、["fourCategoryName"]
+      row["list_reference_price"]
+      row["customer_lookup_status"]：MATCHED / NOT_FOUND
+    """
     joined: list[dict[str, Any]] = []
     for row in saas_rows:
         merged = dict(row)
-        document_id = normalize_cell_str(row.get("documentId"))
-        customer_row = customer_index.get(document_id)
+        join_key = normalize_cell_str(row.get("vCommodityId"))
+        customer_row = customer_index.get(join_key) if join_key else None
         if customer_row is None:
+            if not merged.get("documentId"):
+                merged["documentId"] = ""
             merged["fourCategoryId"] = ""
             merged["fourCategoryName"] = ""
             merged["list_reference_price"] = None
             merged["customer_lookup_status"] = "NOT_FOUND"
         else:
+            # 命中：documentId 用 customer 端的（语义上等于 saas.vCommodityId）
+            merged["documentId"] = join_key
             merged["fourCategoryId"] = customer_row.get("fourCategoryId", "")
             merged["fourCategoryName"] = customer_row.get("fourCategoryName", "")
             merged["list_reference_price"] = customer_row.get("list_reference_price")
