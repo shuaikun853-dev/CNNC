@@ -1276,3 +1276,185 @@ class TestEndToEnd:
         summary_data = [cell.value for cell in summary_ws[2]]
         assert int(summary_data[0]) >= 1
         out_wb.close()
+
+
+# ---------------------------------------------------------------------------
+# SaaS list-json mode tests
+# ---------------------------------------------------------------------------
+
+
+from scripts.audit_saas_excel_file import (
+    SAAS_LIST_HEADERS,
+    enrich_rows_with_customer_price as _enrich,
+    read_saas_list_json,
+)
+
+
+SAMPLE_LIST_ROW = {
+    "documentId": "679483364934705152",
+    "fourCategoryId": "06049901",
+    "fourCategoryName": "其他离子交换树脂",
+    "commodityName": "茂谷聚 Cs树脂 AMP-PAN 1kg/瓶 100~600目",
+    "sassVCommodityName": "茂谷聚 Cs树脂 AMP-PAN 1kg/瓶 销售单位：瓶",
+    "referenceLink": "https://www.colipu.com/itemcode-WF7769406.html",
+    "referencePrice": "11585.37",
+    "referenceId": "679483363319898112",
+    "categoryId": "060499",
+    "categoryName": "其他离子交换树脂",
+    "materialCode": "01063412",
+    "quasiStandardCommodityCode": "20260617001681",
+}
+
+LIST_CURL_TEMPLATE = {
+    "url": "https://api.example.com/detail",
+    "headers": [("Content-Type", "application/json")],
+    "cookie": "",
+    "data": '{"documentId":"x","fourCategoryId":"y"}',
+    "method": "POST",
+}
+
+
+def _write_saas_list_json(tmp_path, rows):
+    path = tmp_path / "saas_list.json"
+    payload = {"rspCode": "0000", "count": len(rows), "rows": rows, "success": True}
+    path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    return path
+
+
+class TestSaasListJsonInput:
+    def test_read_saas_list_json_object(self, tmp_path):
+        path = _write_saas_list_json(tmp_path, [SAMPLE_LIST_ROW])
+        headers, rows = read_saas_list_json(path)
+        assert headers == list(SAAS_LIST_HEADERS)
+        assert len(rows) == 1
+        row = rows[0]
+        assert row["documentId"] == "679483364934705152"
+        assert row["fourCategoryId"] == "06049901"
+        assert row["list_reference_price"] == Decimal("11585.37")
+        assert row["referenceLink"].startswith("https://")
+
+    def test_read_saas_list_json_array(self, tmp_path):
+        path = tmp_path / "saas_list.json"
+        path.write_text(json.dumps([SAMPLE_LIST_ROW], ensure_ascii=False), encoding="utf-8")
+        _, rows = read_saas_list_json(path)
+        assert len(rows) == 1
+        assert rows[0]["documentId"] == "679483364934705152"
+
+    def test_read_saas_list_json_rejects_bad_payload(self, tmp_path):
+        path = tmp_path / "saas_list.json"
+        path.write_text(json.dumps({"foo": "bar"}, ensure_ascii=False), encoding="utf-8")
+        with pytest.raises(ValueError, match="未找到 rows"):
+            read_saas_list_json(path)
+
+    def test_read_saas_list_json_rejects_non_json_suffix(self, tmp_path):
+        path = tmp_path / "saas_list.txt"
+        path.write_text("[]", encoding="utf-8")
+        with pytest.raises(ValueError, match="必须是 JSON"):
+            read_saas_list_json(path)
+
+
+class TestSaasListJsonE2E:
+    def test_e2e_max_price_from_reference_infos(self, tmp_path):
+        """E2E：列表 JSON → mock detail 多价 → 取 max → Excel"""
+        path = _write_saas_list_json(tmp_path, [SAMPLE_LIST_ROW])
+        out = tmp_path / "saas_customer_price.xlsx"
+        detail_payload = {
+            "data": {
+                "referenceInfos": [
+                    {"referencePrice": "11585.37", "order": 1},
+                    {"referencePrice": "9700", "order": 2},
+                ],
+            }
+        }
+        from scripts.audit_saas_excel_file import (
+            build_records,
+            run_audit,
+            write_audit_workbook,
+        )
+        _, rows = read_saas_list_json(path)
+        enriched = _enrich(
+            rows, LIST_CURL_TEMPLATE,
+            "documentId", "fourCategoryId",
+            opener=_make_opener(detail_payload),
+            request_interval=0.0,
+        )
+        records = build_records(rows, enriched)
+        audit_response = run_audit(records)
+        write_audit_workbook(out, list(SAAS_LIST_HEADERS), rows, enriched, audit_response)
+        assert enriched[0]["customerPriceStatus"] == "FOUND"
+        assert enriched[0]["customerPrice"] == Decimal("11585.37")
+        wb = load_workbook(str(out))
+        assert "summary" in wb.sheetnames
+        assert "record_results" in wb.sheetnames
+        ws = wb["record_results"]
+        out_headers = [str(c.value or "") for c in ws[1]]
+        for col in (
+            "documentId", "fourCategoryId", "list_reference_price",
+            "customerPrice", "customerPriceStatus", "primary_action",
+        ):
+            assert col in out_headers, f"缺失列: {col}"
+        wb.close()
+
+    def test_e2e_request_interval_calls_sleep_between_requests(self, tmp_path):
+        rows_payload = [
+            {**SAMPLE_LIST_ROW, "documentId": "doc1"},
+            {**SAMPLE_LIST_ROW, "documentId": "doc2"},
+            {**SAMPLE_LIST_ROW, "documentId": "doc3"},
+        ]
+        path = _write_saas_list_json(tmp_path, rows_payload)
+        _, rows = read_saas_list_json(path)
+        detail_payload = {
+            "data": {
+                "referenceInfos": [
+                    {"referencePrice": "10"},
+                    {"referencePrice": "20"},
+                ]
+            }
+        }
+        sleep_calls: list[float] = []
+
+        def fake_sleep(seconds: float) -> None:
+            sleep_calls.append(seconds)
+
+        enriched = _enrich(
+            rows, LIST_CURL_TEMPLATE,
+            "documentId", "fourCategoryId",
+            opener=_make_opener(detail_payload),
+            request_interval=0.5,
+            sleep_func=fake_sleep,
+        )
+        # 3 个请求之间应有 2 次 sleep
+        assert sleep_calls == [0.5, 0.5]
+        assert all(item["customerPriceStatus"] == "FOUND" for item in enriched)
+        assert all(item["customerPrice"] == Decimal("20") for item in enriched)
+
+    def test_e2e_detail_request_failed(self, tmp_path):
+        path = _write_saas_list_json(tmp_path, [SAMPLE_LIST_ROW])
+        _, rows = read_saas_list_json(path)
+        enriched = _enrich(
+            rows, LIST_CURL_TEMPLATE,
+            "documentId", "fourCategoryId",
+            opener=_make_opener(None, status=500),
+            request_interval=0.0,
+        )
+        assert enriched[0]["customerPriceStatus"] == "DETAIL_REQUEST_FAILED"
+
+
+class TestRunMainExclusivity:
+    def test_run_main_requires_one_input(self, tmp_path):
+        out = tmp_path / "out.xlsx"
+        with pytest.raises(ValueError, match="必须指定"):
+            run_main(output_xlsx=out)
+
+    def test_run_main_rejects_both_inputs(self, tmp_path):
+        out = tmp_path / "out.xlsx"
+        xlsx = _make_test_xlsx(tmp_path, [dict(zip(DEFAULT_EXCEL_COLS, SAMPLE_ROW_VALUES))])
+        json_path = _write_saas_list_json(tmp_path, [SAMPLE_LIST_ROW])
+        with pytest.raises(ValueError, match="互斥"):
+            run_main(output_xlsx=out, input_xlsx=xlsx, input_saas_list_json=json_path)
+
+    def test_run_main_saas_list_no_curl_marks_not_provided(self, tmp_path):
+        path = _write_saas_list_json(tmp_path, [SAMPLE_LIST_ROW])
+        out = tmp_path / "out.xlsx"
+        result = run_main(output_xlsx=out, input_saas_list_json=path)
+        assert result["enriched"][0]["customerPriceStatus"] == "NOT_PROVIDED"

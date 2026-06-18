@@ -18,6 +18,7 @@ import json
 import re
 import shlex
 import sys
+import time
 import urllib.error
 import urllib.request
 from datetime import datetime
@@ -174,6 +175,98 @@ def parse_decimal(value: Any) -> Decimal | None:
 
 def is_valid_reference_price(value: Decimal | None) -> bool:
     return value is not None and value > 0
+
+
+# ---------------------------------------------------------------------------
+# SaaS 列表 JSON 输入
+# ---------------------------------------------------------------------------
+
+
+SAAS_LIST_HEADERS = [
+    "documentId",
+    "fourCategoryId",
+    "fourCategoryName",
+    "vCommodityId",
+    "queryStr",
+    "sassVCommodityName",
+    "skuId",
+    "skuName",
+    "vendorName",
+    "shopName",
+    "price",
+    "extLink",
+    "commodityName",
+    "list_reference_price",
+    "referenceLink",
+    "categoryId",
+    "categoryName",
+    "materialCode",
+    "materialDesc",
+    "quasiStandardCommodityCode",
+]
+
+
+def _saas_list_payload_rows(payload: Any) -> list[dict[str, Any]]:
+    if isinstance(payload, list):
+        return [item for item in payload if isinstance(item, dict)]
+    if not isinstance(payload, dict):
+        raise ValueError("saas-list-json 必须是数组或包含 rows 的对象")
+    for key in ("rows", "records", "data"):
+        value = payload.get(key)
+        if isinstance(value, list):
+            return [item for item in value if isinstance(item, dict)]
+        if isinstance(value, dict):
+            inner_rows = value.get("rows") if isinstance(value.get("rows"), list) else None
+            if inner_rows is not None:
+                return [item for item in inner_rows if isinstance(item, dict)]
+    raise ValueError("saas-list-json 中未找到 rows 字段")
+
+
+def _normalize_saas_list_row(raw: dict[str, Any]) -> dict[str, Any]:
+    """把列表接口返回的原始 row 转成 audit 流程能识别的 row。"""
+    document_id = normalize_cell_str(raw.get("documentId"))
+    four_category_id = normalize_cell_str(raw.get("fourCategoryId"))
+    four_category_name = normalize_cell_str(raw.get("fourCategoryName"))
+    commodity_name = normalize_cell_str(raw.get("commodityName"))
+    sass_v_name = normalize_cell_str(raw.get("sassVCommodityName"))
+    reference_link = normalize_cell_str(raw.get("referenceLink"))
+    list_reference_price = parse_decimal(raw.get("referencePrice"))
+    query_str = sass_v_name or commodity_name
+    sku_id = normalize_cell_str(raw.get("referenceId"))
+    return {
+        "documentId": document_id,
+        "fourCategoryId": four_category_id,
+        "fourCategoryName": four_category_name,
+        "vCommodityId": document_id,
+        "queryStr": query_str,
+        "sassVCommodityName": sass_v_name,
+        "skuId": sku_id,
+        "skuName": commodity_name,
+        "vendorName": "",
+        "shopName": "",
+        "price": list_reference_price,
+        "extLink": reference_link,
+        "commodityName": commodity_name,
+        "list_reference_price": list_reference_price,
+        "referenceLink": reference_link,
+        "categoryId": normalize_cell_str(raw.get("categoryId")),
+        "categoryName": normalize_cell_str(raw.get("categoryName")),
+        "materialCode": normalize_cell_str(raw.get("materialCode")),
+        "materialDesc": normalize_cell_str(raw.get("materialDesc")),
+        "quasiStandardCommodityCode": normalize_cell_str(raw.get("quasiStandardCommodityCode")),
+    }
+
+
+def read_saas_list_json(path: Path) -> tuple[list[str], list[dict[str, Any]]]:
+    """读取 SaaS 列表接口 response JSON，返回 (列名顺序, 行字典列表)。"""
+    if path.suffix.lower() != ".json":
+        raise ValueError(f"saas-list 输入必须是 JSON 文件：{path}")
+    with path.open("r", encoding="utf-8") as file:
+        payload = json.load(file)
+    raw_rows = _saas_list_payload_rows(payload)
+    rows = [_normalize_saas_list_row(raw) for raw in raw_rows]
+    return list(SAAS_LIST_HEADERS), rows
+
 
 
 # ---------------------------------------------------------------------------
@@ -474,10 +567,21 @@ def enrich_rows_with_customer_price(
     document_id_field: str,
     category_id_field: str,
     opener: Any | None = None,
+    request_interval: float = 0.0,
+    sleep_func: Any | None = None,
+    progress_func: Any | None = None,
 ) -> list[dict[str, Any]]:
-    """对每一行计算客户价信息，返回追加列字典列表。"""
+    """对每一行计算客户价信息，返回追加列字典列表。
+
+    request_interval：每次成功/失败请求后等待秒数，避免被风控。
+    sleep_func：测试可注入。
+    progress_func(index, total, document_id, status)：测试或 CLI 可观察。
+    """
     enriched: list[dict[str, Any]] = []
-    for row in rows:
+    sleep = sleep_func if sleep_func is not None else time.sleep
+    total = len(rows)
+    request_count = 0
+    for index, row in enumerate(rows, start=1):
         existing_customer_price = parse_decimal(row.get("customerPrice"))
         if is_valid_reference_price(existing_customer_price):
             enriched.append({
@@ -485,8 +589,10 @@ def enrich_rows_with_customer_price(
                 "customerPriceStatus": "EXISTS",
                 "customerPriceSource": "EXCEL_INPUT",
                 "customerPriceWarning": "",
-                "customerPriceEvidence": f"Excel 已提供客户价={existing_customer_price}",
+                "customerPriceEvidence": f"已提供客户价={existing_customer_price}",
             })
+            if progress_func is not None:
+                progress_func(index, total, normalize_cell_str(row.get(document_id_field)), "EXISTS")
             continue
 
         if curl_template is None:
@@ -494,9 +600,11 @@ def enrich_rows_with_customer_price(
                 "customerPrice": None,
                 "customerPriceStatus": "NOT_PROVIDED",
                 "customerPriceSource": "",
-                "customerPriceWarning": "未提供 --curl-file 且 Excel 未填写 customerPrice",
+                "customerPriceWarning": "未提供 --curl-file 且输入未填写 customerPrice",
                 "customerPriceEvidence": "",
             })
+            if progress_func is not None:
+                progress_func(index, total, normalize_cell_str(row.get(document_id_field)), "NOT_PROVIDED")
             continue
 
         document_id = normalize_cell_str(row.get(document_id_field))
@@ -509,8 +617,13 @@ def enrich_rows_with_customer_price(
                 "customerPriceWarning": "缺少 documentId 或 fourCategoryId，跳过详情请求",
                 "customerPriceEvidence": "",
             })
+            if progress_func is not None:
+                progress_func(index, total, document_id, "DETAIL_REQUEST_SKIPPED")
             continue
 
+        if request_count > 0 and request_interval > 0:
+            sleep(request_interval)
+        request_count += 1
         response = call_detail_api(curl_template, document_id, four_category_id, opener=opener)
         if not response.get("ok"):
             enriched.append({
@@ -520,9 +633,13 @@ def enrich_rows_with_customer_price(
                 "customerPriceWarning": "详情接口请求失败，请检查 cURL 登录态是否过期",
                 "customerPriceEvidence": "",
             })
+            if progress_func is not None:
+                progress_func(index, total, document_id, "DETAIL_REQUEST_FAILED")
             continue
         result = extract_customer_price_from_detail(response.get("payload"))
         enriched.append(result)
+        if progress_func is not None:
+            progress_func(index, total, document_id, result.get("customerPriceStatus", ""))
     return enriched
 
 
@@ -590,12 +707,20 @@ def _build_summary_counts(audit_response: Any, enriched: list[dict[str, Any]]) -
     customer_price_failed = sum(
         1 for info in enriched if info.get("customerPriceStatus") == "DETAIL_REQUEST_FAILED"
     )
+    customer_price_found = sum(
+        1 for info in enriched if info.get("customerPriceStatus") == "FOUND"
+    )
+    customer_price_single = sum(
+        1 for info in enriched if info.get("customerPriceStatus") == "FOUND_SINGLE_REFERENCE"
+    )
     return {
         "总记录数": int(summary.get("total_records", len(record_results))),
         "建议通过数量": int(summary.get("approve_suggestion_count", 0)),
         "人工核查数量": int(summary.get("manual_check_count", 0)),
         "建议驳回数量": int(summary.get("reject_suggestion_count", 0)),
         "客户价高于30%数量": int(summary.get("higher_than_customer_price_30_count", 0)),
+        "客户价FOUND数量": customer_price_found,
+        "客户价SINGLE数量": customer_price_single,
         "客户价缺失数量": customer_price_missing,
         "客户价请求失败数量": customer_price_failed,
         "价格不一致数量": int(summary.get("price_mismatch_count", 0)),
@@ -726,11 +851,15 @@ def write_audit_workbook(
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="本地 SaaS 待审批 Excel 审查脚本")
-    parser.add_argument("--input-xlsx", required=True, type=Path)
+    parser.add_argument("--input-xlsx", type=Path, default=None)
+    parser.add_argument("--input-saas-list-json", type=Path, default=None,
+                        help="SaaS 列表接口 response JSON，自动提取 documentId+fourCategoryId")
     parser.add_argument("--output-xlsx", required=True, type=Path)
     parser.add_argument("--curl-file", type=Path, default=None)
     parser.add_argument("--document-id-field", default=DEFAULT_DOCUMENT_ID_FIELD)
     parser.add_argument("--category-id-field", default=DEFAULT_CATEGORY_ID_FIELD)
+    parser.add_argument("--request-interval", type=float, default=0.5,
+                        help="详情接口每条之间等待秒数，默认 0.5")
     return parser
 
 
@@ -740,17 +869,37 @@ def print_summary(summary_counts: dict[str, Any], output_path: Path) -> None:
     print(f"输出文件路径: {output_path}")
 
 
+def _cli_progress(index: int, total: int, document_id: str, status: str) -> None:
+    print(f"[{index}/{total}] documentId={document_id} status={status}")
+
+
 def run_main(
-    input_xlsx: Path,
     output_xlsx: Path,
-    curl_file: Path | None,
-    document_id_field: str,
-    category_id_field: str,
+    input_xlsx: Path | None = None,
+    input_saas_list_json: Path | None = None,
+    curl_file: Path | None = None,
+    document_id_field: str = DEFAULT_DOCUMENT_ID_FIELD,
+    category_id_field: str = DEFAULT_CATEGORY_ID_FIELD,
+    request_interval: float = 0.0,
     opener: Any | None = None,
+    sleep_func: Any | None = None,
+    progress_func: Any | None = None,
 ) -> dict[str, Any]:
-    headers, rows = read_excel_rows(input_xlsx)
+    if input_xlsx is None and input_saas_list_json is None:
+        raise ValueError("必须指定 --input-xlsx 或 --input-saas-list-json")
+    if input_xlsx is not None and input_saas_list_json is not None:
+        raise ValueError("--input-xlsx 与 --input-saas-list-json 互斥，二选一")
+
+    if input_saas_list_json is not None:
+        headers, rows = read_saas_list_json(input_saas_list_json)
+        source_path = input_saas_list_json
+    else:
+        headers, rows = read_excel_rows(input_xlsx)
+        source_path = input_xlsx
+
     if not rows:
-        raise ValueError(f"输入 Excel 没有数据行：{input_xlsx}")
+        raise ValueError(f"输入没有数据行：{source_path}")
+
     curl_template = load_curl_file(curl_file) if curl_file is not None else None
     enriched = enrich_rows_with_customer_price(
         rows,
@@ -758,6 +907,9 @@ def run_main(
         document_id_field,
         category_id_field,
         opener=opener,
+        request_interval=request_interval,
+        sleep_func=sleep_func,
+        progress_func=progress_func,
     )
     records = build_records(rows, enriched)
     audit_response = run_audit(records)
@@ -776,10 +928,13 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     result = run_main(
         input_xlsx=args.input_xlsx,
+        input_saas_list_json=args.input_saas_list_json,
         output_xlsx=args.output_xlsx,
         curl_file=args.curl_file,
         document_id_field=args.document_id_field,
         category_id_field=args.category_id_field,
+        request_interval=args.request_interval,
+        progress_func=_cli_progress,
     )
     print_summary(result["summary_counts"], args.output_xlsx)
     return 0
