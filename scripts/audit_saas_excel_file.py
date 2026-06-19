@@ -1556,11 +1556,14 @@ def _build_crawler_argv(
     timeout_ms: int,
     limit: int,
 ) -> list[str]:
+    # 爬虫子进程 cwd = 爬虫脚本目录，所有输入/输出路径必须用绝对路径
+    abs_input = str(input_xlsx.resolve())
+    abs_output = str(output_xlsx.resolve())
     argv = [
         _resolve_crawler_python_executable(),
-        str(crawler_script),
-        "--input", str(input_xlsx),
-        "--output", str(output_xlsx),
+        str(crawler_script.resolve()),
+        "--input", abs_input,
+        "--output", abs_output,
         "--limit", str(max(limit, 1)),
         "--concurrency", str(concurrency),
         "--per-domain-delay", str(per_domain_delay),
