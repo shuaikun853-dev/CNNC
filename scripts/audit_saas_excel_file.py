@@ -388,6 +388,8 @@ def _normalize_saas_pending_row(raw: dict[str, Any]) -> dict[str, Any]:
         "updateTime": normalize_cell_str(raw.get("updateTime")),
         "modelAuditResult": normalize_cell_str(raw.get("modelAuditResult")),
         "isMatch": normalize_cell_str(raw.get("isMatch")),
+        # customerPrice 通常由 detail 接口反查得到；若 saas 输入直接提供（测试/手填场景）也透传
+        "customerPrice": parse_decimal(raw.get("customerPrice")),
     }
 
 
@@ -1009,6 +1011,13 @@ def _collect_title_reason(audit_result):
 
 
 def _compute_page_price_status(row, audit_result):
+    # 如果已被 apply_crawl_results_to_rows 写入最终结果，直接用
+    if "__page_price_status" in row:
+        return {
+            "page_price_value": row.get("__page_price_value"),
+            "page_price_status": row.get("__page_price_status", ""),
+            "page_price_source": row.get("__page_price_source", ""),
+        }
     ext_link = normalize_cell_str(row.get("extLink"))
     if not ext_link:
         return {
@@ -1040,9 +1049,11 @@ def compute_over_30_check(customer_price, page_price, page_price_status):
         "SKIPPED_JD",
         "SKIPPED_NO_LINK",
         "SKIPPED_MODEL_NOT_SAME",
+        "SKIPPED",
         "PENDING_CRAWL",
         "FAILED",
         "CRAWLER_PROCESS_FAILED",
+        "PRICE_MISSING",
     }
     if page_price_status in pending_statuses:
         return ("PAGE_PRICE_MISSING", "")
@@ -1194,6 +1205,17 @@ def build_parser() -> argparse.ArgumentParser:
                         help="详情接口每条之间等待秒数，默认 0.5")
     parser.add_argument("--use-model", action="store_true",
                         help="启用 SaaS 标题模型校验（需要 TITLE_MATCH_MODEL_API_KEY/BASE_URL 环境变量）")
+    parser.add_argument("--enable-crawler", action="store_true",
+                        help="启用多商城爬虫；不启用则 page_price_status=PENDING_CRAWL 占位")
+    parser.add_argument("--crawler-script", type=Path, default=DEFAULT_CRAWLER_SCRIPT,
+                        help="multi_mall_crawler/main.py 路径")
+    parser.add_argument("--crawler-headless", action="store_true",
+                        help="爬虫无头模式（生产推荐打开）")
+    parser.add_argument("--crawler-concurrency", type=int, default=3)
+    parser.add_argument("--crawler-per-domain-delay", type=float, default=1.5)
+    parser.add_argument("--crawler-timeout-ms", type=int, default=18000)
+    parser.add_argument("--skip-dry-run", action="store_true",
+                        help="跳过 dry-run 直接正式爬（默认会先 dry-run）")
     return parser
 
 
@@ -1236,6 +1258,14 @@ def run_main(
     category_id_field: str = DEFAULT_CATEGORY_ID_FIELD,
     request_interval: float = 0.0,
     use_model: bool = False,
+    enable_crawler: bool = False,
+    crawler_script: Path | None = None,
+    crawler_headless: bool = True,
+    crawler_concurrency: int = 3,
+    crawler_per_domain_delay: float = 1.5,
+    crawler_timeout_ms: int = 18000,
+    skip_dry_run: bool = False,
+    crawler_runner: Any = None,
     opener: Any | None = None,
     sleep_func: Any | None = None,
     progress_func: Any | None = None,
@@ -1270,6 +1300,85 @@ def run_main(
     )
     records = build_records(rows, enriched)
     audit_response = run_audit(records, use_model=use_model)
+
+    crawler_summary: dict[str, Any] = {"enabled": enable_crawler}
+    if enable_crawler:
+        urls_to_crawl = collect_urls_for_crawl(rows, enriched, audit_response)
+        crawler_summary["urls_total"] = len(urls_to_crawl)
+        if not urls_to_crawl:
+            print("[crawler] 没有需要爬取的链接（PENDING_CRAWL=0），跳过爬虫")
+            apply_crawl_results_to_rows(rows, enriched, audit_response, crawl_results_by_url={}, crawler_process_failed=False)
+        else:
+            script_path = crawler_script if crawler_script is not None else DEFAULT_CRAWLER_SCRIPT
+            runtime_dir = output_xlsx.parent if output_xlsx.parent != Path("") else Path("./runtime")
+            runtime_dir.mkdir(parents=True, exist_ok=True)
+            input_xlsx_path = runtime_dir / CRAWL_INPUT_FILENAME
+            dry_run_xlsx_path = runtime_dir / CRAWL_DRY_RUN_FILENAME
+            output_xlsx_path = runtime_dir / CRAWL_OUTPUT_FILENAME
+
+            print(f"[crawler] 待爬 URL 数（去重后）：{len(urls_to_crawl)}")
+            print(f"[crawler] 输入 xlsx：{input_xlsx_path}")
+            write_crawler_input_xlsx(urls_to_crawl, input_xlsx_path)
+
+            crawler_process_failed = False
+
+            if not skip_dry_run:
+                print(f"[crawler] dry-run 验证链接识别...")
+                dry_result = run_crawler_subprocess(
+                    crawler_script=script_path,
+                    input_xlsx=input_xlsx_path,
+                    output_xlsx=dry_run_xlsx_path,
+                    dry_run=True,
+                    headless=crawler_headless,
+                    concurrency=crawler_concurrency,
+                    per_domain_delay=crawler_per_domain_delay,
+                    timeout_ms=crawler_timeout_ms,
+                    limit=len(urls_to_crawl),
+                    runner=crawler_runner,
+                )
+                crawler_summary["dry_run"] = dry_result
+                if not dry_result["ok"]:
+                    print(f"[crawler] dry-run 失败：{dry_result['error']}")
+                    crawler_process_failed = True
+
+            if not crawler_process_failed:
+                print(f"[crawler] 正式爬取...")
+                run_result = run_crawler_subprocess(
+                    crawler_script=script_path,
+                    input_xlsx=input_xlsx_path,
+                    output_xlsx=output_xlsx_path,
+                    dry_run=False,
+                    headless=crawler_headless,
+                    concurrency=crawler_concurrency,
+                    per_domain_delay=crawler_per_domain_delay,
+                    timeout_ms=crawler_timeout_ms,
+                    limit=len(urls_to_crawl),
+                    runner=crawler_runner,
+                )
+                crawler_summary["run"] = run_result
+                if not run_result["ok"]:
+                    print(f"[crawler] 正式爬取失败：{run_result['error']}")
+                    crawler_process_failed = True
+
+            crawl_results_by_url: dict[str, dict[str, Any]] = {}
+            if not crawler_process_failed:
+                try:
+                    crawl_results_by_url = read_crawler_output(output_xlsx_path)
+                    print(f"[crawler] 读回 {len(crawl_results_by_url)} 条结果")
+                except Exception as exc:  # noqa: BLE001
+                    print(f"[crawler] 读取爬虫输出失败：{type(exc).__name__}: {exc}")
+                    crawler_process_failed = True
+
+            apply_crawl_results_to_rows(
+                rows,
+                enriched,
+                audit_response,
+                crawl_results_by_url=crawl_results_by_url,
+                crawler_process_failed=crawler_process_failed,
+            )
+            crawler_summary["crawler_process_failed"] = crawler_process_failed
+            crawler_summary["urls_returned"] = len(crawl_results_by_url)
+
     write_audit_workbook(output_xlsx, headers, rows, enriched, audit_response)
     summary_counts = _build_summary_counts(audit_response, enriched)
     return {
@@ -1279,6 +1388,7 @@ def run_main(
         "headers": headers,
         "rows": rows,
         "mode": mode,
+        "crawler": crawler_summary,
     }
 
 
@@ -1356,10 +1466,287 @@ def main(argv: list[str] | None = None) -> int:
         category_id_field=args.category_id_field,
         request_interval=args.request_interval,
         use_model=args.use_model,
+        enable_crawler=args.enable_crawler,
+        crawler_script=args.crawler_script,
+        crawler_headless=args.crawler_headless,
+        crawler_concurrency=args.crawler_concurrency,
+        crawler_per_domain_delay=args.crawler_per_domain_delay,
+        crawler_timeout_ms=args.crawler_timeout_ms,
+        skip_dry_run=args.skip_dry_run,
         progress_func=_cli_progress,
     )
     print_summary(result["summary_counts"], args.output_xlsx)
     return 0
+
+
+# ---------------------------------------------------------------------------
+# 多商城爬虫子进程接入（按 multi_mall_crawler/AGENT_GUIDE.md）
+# ---------------------------------------------------------------------------
+
+
+import subprocess as _subprocess  # noqa: E402
+
+DEFAULT_CRAWLER_SCRIPT = Path(r"E:\.A2026\多商城爬取\multi_mall_crawler\main.py")
+CRAWL_INPUT_FILENAME = "_crawl_input.xlsx"
+CRAWL_DRY_RUN_FILENAME = "_crawl_dry_run.xlsx"
+CRAWL_OUTPUT_FILENAME = "_crawl_output.xlsx"
+
+CRAWLER_OUTPUT_URL_HEADER = "原始链接"
+CRAWLER_OUTPUT_PRICE_HEADER = "商品价格"
+CRAWLER_OUTPUT_MALL_HEADER = "识别商城"
+CRAWLER_OUTPUT_STATUS_HEADER = "采集状态"
+CRAWLER_OUTPUT_REASON_HEADER = "失败原因"
+
+
+def _normalize_url(url: Any) -> str:
+    if url is None:
+        return ""
+    return str(url).strip()
+
+
+def collect_urls_for_crawl(
+    rows: list[dict[str, Any]],
+    enriched: list[dict[str, Any]],
+    audit_response: Any,
+) -> list[str]:
+    """收集 page_price_status == PENDING_CRAWL 的所有 URL，按原顺序去重。"""
+    record_results = list(audit_response.record_results or []) if audit_response is not None else []
+    while len(record_results) < len(rows):
+        record_results.append(None)
+
+    seen: set[str] = set()
+    urls: list[str] = []
+    for row, info, audit_result in zip(rows, enriched, record_results):
+        pre = _compute_page_price_status(row, audit_result)
+        if pre["page_price_status"] != "PENDING_CRAWL":
+            continue
+        url = _normalize_url(row.get("extLink"))
+        if not url or url in seen:
+            continue
+        seen.add(url)
+        urls.append(url)
+    return urls
+
+
+def write_crawler_input_xlsx(urls: list[str], path: Path) -> None:
+    """写爬虫输入 xlsx，单列 URL（表头 'URL'）。"""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "links"
+    sheet.append(["URL"])
+    for url in urls:
+        sheet.append([url])
+    workbook.save(str(path))
+
+
+def _resolve_crawler_python_executable() -> str:
+    return sys.executable or "python"
+
+
+def _build_crawler_argv(
+    crawler_script: Path,
+    input_xlsx: Path,
+    output_xlsx: Path,
+    *,
+    dry_run: bool,
+    headless: bool,
+    concurrency: int,
+    per_domain_delay: float,
+    timeout_ms: int,
+    limit: int,
+) -> list[str]:
+    argv = [
+        _resolve_crawler_python_executable(),
+        str(crawler_script),
+        "--input", str(input_xlsx),
+        "--output", str(output_xlsx),
+        "--limit", str(max(limit, 1)),
+        "--concurrency", str(concurrency),
+        "--per-domain-delay", str(per_domain_delay),
+        "--timeout", str(timeout_ms),
+    ]
+    if dry_run:
+        argv.append("--dry-run")
+    if headless:
+        argv.append("--headless")
+    return argv
+
+
+def run_crawler_subprocess(
+    crawler_script: Path,
+    input_xlsx: Path,
+    output_xlsx: Path,
+    *,
+    dry_run: bool = False,
+    headless: bool = True,
+    concurrency: int = 3,
+    per_domain_delay: float = 1.5,
+    timeout_ms: int = 18000,
+    limit: int = 100,
+    runner: Any = None,
+) -> dict[str, Any]:
+    """子进程调爬虫 main.py。
+
+    runner: 测试可注入，签名 (argv, cwd) -> int（exit_code）。
+    返回 {ok, exit_code, error}
+    """
+    if not crawler_script.exists():
+        return {"ok": False, "exit_code": -1, "error": f"爬虫脚本不存在：{crawler_script}"}
+
+    argv = _build_crawler_argv(
+        crawler_script,
+        input_xlsx,
+        output_xlsx,
+        dry_run=dry_run,
+        headless=headless,
+        concurrency=concurrency,
+        per_domain_delay=per_domain_delay,
+        timeout_ms=timeout_ms,
+        limit=limit,
+    )
+    cwd = str(crawler_script.parent)
+
+    if runner is not None:
+        try:
+            exit_code = int(runner(argv, cwd))
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "exit_code": -1, "error": f"爬虫 runner 异常：{type(exc).__name__}"}
+        return {
+            "ok": exit_code == 0,
+            "exit_code": exit_code,
+            "error": "" if exit_code == 0 else f"爬虫退出码 {exit_code}",
+        }
+
+    try:
+        proc = _subprocess.run(argv, cwd=cwd, check=False)
+        return {
+            "ok": proc.returncode == 0,
+            "exit_code": proc.returncode,
+            "error": "" if proc.returncode == 0 else f"爬虫退出码 {proc.returncode}",
+        }
+    except FileNotFoundError as exc:
+        return {"ok": False, "exit_code": -1, "error": f"无法启动爬虫：{exc}"}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "exit_code": -1, "error": f"爬虫子进程异常：{type(exc).__name__}"}
+
+
+def read_crawler_output(path: Path) -> dict[str, dict[str, Any]]:
+    """读爬虫输出 xlsx，返回 url -> {page_price_value,page_price_status,page_price_source}"""
+    if not path.exists():
+        raise FileNotFoundError(f"爬虫输出 xlsx 不存在：{path}")
+    workbook = load_workbook(filename=str(path), data_only=True, read_only=True)
+    try:
+        sheet = workbook.active
+        if sheet is None:
+            return {}
+        iterator = sheet.iter_rows(values_only=True)
+        try:
+            header_row = next(iterator)
+        except StopIteration:
+            return {}
+        headers = [str(value).strip() if value is not None else "" for value in header_row]
+
+        def _idx(name: str) -> int:
+            try:
+                return headers.index(name)
+            except ValueError:
+                return -1
+
+        url_idx = _idx(CRAWLER_OUTPUT_URL_HEADER)
+        if url_idx < 0:
+            return {}
+        price_idx = _idx(CRAWLER_OUTPUT_PRICE_HEADER)
+        mall_idx = _idx(CRAWLER_OUTPUT_MALL_HEADER)
+        status_idx = _idx(CRAWLER_OUTPUT_STATUS_HEADER)
+        reason_idx = _idx(CRAWLER_OUTPUT_REASON_HEADER)
+
+        results: dict[str, dict[str, Any]] = {}
+        for raw in iterator:
+            if raw is None:
+                continue
+            url = ""
+            if 0 <= url_idx < len(raw) and raw[url_idx] is not None:
+                url = str(raw[url_idx]).strip()
+            if not url:
+                continue
+            price_value = None
+            if 0 <= price_idx < len(raw):
+                price_value = parse_decimal(raw[price_idx])
+            status_text = ""
+            if 0 <= status_idx < len(raw) and raw[status_idx] is not None:
+                status_text = str(raw[status_idx]).strip()
+            reason_text = ""
+            if 0 <= reason_idx < len(raw) and raw[reason_idx] is not None:
+                reason_text = str(raw[reason_idx]).strip()
+            mall_text = ""
+            if 0 <= mall_idx < len(raw) and raw[mall_idx] is not None:
+                mall_text = str(raw[mall_idx]).strip()
+
+            if status_text == "成功":
+                results[url] = {
+                    "page_price_value": price_value,
+                    "page_price_status": "OK" if price_value is not None and price_value > 0 else "PRICE_MISSING",
+                    "page_price_source": mall_text or "",
+                }
+            elif status_text == "跳过":
+                results[url] = {
+                    "page_price_value": None,
+                    "page_price_status": "SKIPPED",
+                    "page_price_source": reason_text or mall_text or "",
+                }
+            else:
+                results[url] = {
+                    "page_price_value": None,
+                    "page_price_status": "FAILED",
+                    "page_price_source": reason_text or status_text or "",
+                }
+        return results
+    finally:
+        workbook.close()
+
+
+def apply_crawl_results_to_rows(
+    rows: list[dict[str, Any]],
+    enriched: list[dict[str, Any]],
+    audit_response: Any,
+    crawl_results_by_url: dict[str, dict[str, Any]],
+    crawler_process_failed: bool = False,
+) -> None:
+    """把爬虫结果（或失败原因）写入每行的 __page_price_* 字段。
+
+    _compute_page_price_status 会优先读这些字段，从而让 _write_record_results_sheet 直接使用最终结果。
+    """
+    record_results = list(audit_response.record_results or []) if audit_response is not None else []
+    while len(record_results) < len(rows):
+        record_results.append(None)
+
+    for row, info, audit_result in zip(rows, enriched, record_results):
+        pre = _compute_page_price_status(row, audit_result)
+        page_status = pre["page_price_status"]
+        page_value = pre["page_price_value"]
+        page_source = pre["page_price_source"]
+
+        if page_status == "PENDING_CRAWL":
+            if crawler_process_failed:
+                page_status = "CRAWLER_PROCESS_FAILED"
+                page_value = None
+                page_source = "爬虫子进程失败"
+            else:
+                url = _normalize_url(row.get("extLink"))
+                hit = crawl_results_by_url.get(url) if url else None
+                if hit is None:
+                    page_status = "FAILED"
+                    page_value = None
+                    page_source = "爬虫未返回该链接"
+                else:
+                    page_status = hit.get("page_price_status", "FAILED")
+                    page_value = hit.get("page_price_value")
+                    page_source = hit.get("page_price_source", "")
+
+        row["__page_price_value"] = page_value
+        row["__page_price_status"] = page_status
+        row["__page_price_source"] = page_source
 
 
 if __name__ == "__main__":

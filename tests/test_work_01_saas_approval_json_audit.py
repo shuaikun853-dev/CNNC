@@ -1955,3 +1955,305 @@ class TestEnvLoader:
         status = _load_env_file(env_path)
         assert status["TITLE_MATCH_MODEL_API_KEY"] == "EMPTY"
         assert os.environ.get("TITLE_MATCH_MODEL_API_KEY") is None
+
+
+# ---------------------------------------------------------------------------
+# Crawler subprocess integration tests (basic helpers)
+# ---------------------------------------------------------------------------
+
+
+from scripts.audit_saas_excel_file import (
+    apply_crawl_results_to_rows,
+    collect_urls_for_crawl,
+    read_crawler_output,
+    run_crawler_subprocess,
+    write_crawler_input_xlsx,
+)
+
+
+def _make_crawler_output_xlsx(tmp_path, records):
+    out = tmp_path / "_crawl_output.xlsx"
+    wb = Workbook()
+    ws = wb.active
+    headers = [
+        "原始链接", "识别域名", "识别商城", "是否京东", "是否跳过",
+        "商品编码", "商品名称", "商品价格", "商品评价数", "是否下架",
+        "采集状态", "失败原因", "采集时间",
+    ]
+    ws.append(headers)
+    for r in records:
+        ws.append([r.get(h, "") for h in headers])
+    wb.save(str(out))
+    return out
+
+
+class TestCollectUrlsForCrawl:
+    def test_collect_pending_only_and_dedupe(self, tmp_path):
+        rows = [
+            {**SAMPLE_SAAS_PENDING_ROW, "vCommodityId": "v1", "extLink": "https://item.jd.com/x.html"},
+            {**SAMPLE_SAAS_PENDING_ROW, "vCommodityId": "v2", "extLink": ""},
+            {**SAMPLE_SAAS_PENDING_ROW, "vCommodityId": "v3", "extLink": "https://www.zkh.com/item/A.html"},
+            {**SAMPLE_SAAS_PENDING_ROW, "vCommodityId": "v3", "skuId": "x", "extLink": "https://www.zkh.com/item/A.html"},
+        ]
+        cust_rows = [
+            {"documentId": v, "fourCategoryId": "c", "fourCategoryName": "n", "referencePrice": "100"}
+            for v in ("v1", "v2", "v3")
+        ]
+        saas_path = _write_pending_json(tmp_path, rows)
+        cust_path = _write_customer_json(tmp_path, cust_rows)
+        out = tmp_path / "out.xlsx"
+        result = run_main(
+            output_xlsx=out,
+            input_saas_json=saas_path,
+            input_customer_json=cust_path,
+        )
+        urls = collect_urls_for_crawl(result["rows"], result["enriched"], result["audit_response"])
+        assert urls == ["https://www.zkh.com/item/A.html"]
+
+
+class TestWriteCrawlerInput:
+    def test_write_input_xlsx(self, tmp_path):
+        path = tmp_path / "_crawl_input.xlsx"
+        write_crawler_input_xlsx(["https://a.com/1", "https://b.com/2"], path)
+        wb = load_workbook(str(path))
+        ws = wb.active
+        assert ws.cell(row=1, column=1).value == "URL"
+        assert ws.cell(row=2, column=1).value == "https://a.com/1"
+        assert ws.cell(row=3, column=1).value == "https://b.com/2"
+        wb.close()
+
+
+class TestRunCrawlerSubprocess:
+    def test_missing_script(self, tmp_path):
+        result = run_crawler_subprocess(
+            crawler_script=tmp_path / "no_such_main.py",
+            input_xlsx=tmp_path / "in.xlsx",
+            output_xlsx=tmp_path / "out.xlsx",
+        )
+        assert result["ok"] is False
+        assert "不存在" in result["error"]
+
+    def test_runner_zero(self, tmp_path):
+        script = tmp_path / "main.py"
+        script.write_text("# fake", encoding="utf-8")
+        captured = {}
+        def runner(argv, cwd):
+            captured["argv"] = argv
+            captured["cwd"] = cwd
+            return 0
+        result = run_crawler_subprocess(
+            crawler_script=script,
+            input_xlsx=tmp_path / "in.xlsx",
+            output_xlsx=tmp_path / "out.xlsx",
+            dry_run=True,
+            headless=True,
+            concurrency=2,
+            per_domain_delay=2.0,
+            timeout_ms=10000,
+            limit=5,
+            runner=runner,
+        )
+        assert result["ok"] is True
+        assert result["exit_code"] == 0
+        assert "--dry-run" in captured["argv"]
+        assert "--headless" in captured["argv"]
+        assert "5" in captured["argv"]
+        assert captured["cwd"] == str(script.parent)
+
+    def test_runner_nonzero(self, tmp_path):
+        script = tmp_path / "main.py"
+        script.write_text("# fake", encoding="utf-8")
+        result = run_crawler_subprocess(
+            crawler_script=script,
+            input_xlsx=tmp_path / "in.xlsx",
+            output_xlsx=tmp_path / "out.xlsx",
+            runner=lambda argv, cwd: 2,
+        )
+        assert result["ok"] is False
+        assert result["exit_code"] == 2
+
+    def test_runner_raises(self, tmp_path):
+        script = tmp_path / "main.py"
+        script.write_text("# fake", encoding="utf-8")
+        def boom(argv, cwd):
+            raise OSError("boom")
+        result = run_crawler_subprocess(
+            crawler_script=script,
+            input_xlsx=tmp_path / "in.xlsx",
+            output_xlsx=tmp_path / "out.xlsx",
+            runner=boom,
+        )
+        assert result["ok"] is False
+        assert "OSError" in result["error"]
+
+
+class TestReadCrawlerOutput:
+    def test_success_row(self, tmp_path):
+        path = _make_crawler_output_xlsx(tmp_path, [
+            {"原始链接": "https://a.com/1", "商品价格": "129.99", "识别商城": "震坤行", "采集状态": "成功"},
+        ])
+        results = read_crawler_output(path)
+        r = results["https://a.com/1"]
+        assert r["page_price_status"] == "OK"
+        assert r["page_price_value"] == Decimal("129.99")
+        assert r["page_price_source"] == "震坤行"
+
+    def test_failed_row(self, tmp_path):
+        path = _make_crawler_output_xlsx(tmp_path, [
+            {"原始链接": "https://a.com/2", "商品价格": "", "采集状态": "失败", "失败原因": "触发验证码"},
+        ])
+        results = read_crawler_output(path)
+        r = results["https://a.com/2"]
+        assert r["page_price_status"] == "FAILED"
+        assert r["page_price_value"] is None
+        assert r["page_price_source"] == "触发验证码"
+
+    def test_skipped_row(self, tmp_path):
+        path = _make_crawler_output_xlsx(tmp_path, [
+            {"原始链接": "https://item.jd.com/x.html", "采集状态": "跳过", "失败原因": "京东"},
+        ])
+        results = read_crawler_output(path)
+        r = results["https://item.jd.com/x.html"]
+        assert r["page_price_status"] == "SKIPPED"
+
+
+class TestApplyCrawlResults:
+    def test_apply_success_high_price_marks_over_30pct(self, tmp_path):
+        rows = [
+            {**SAMPLE_SAAS_PENDING_ROW, "vCommodityId": "v1",
+             "extLink": "https://www.zkh.com/item/A.html",
+             "customerPrice": "100", "queryStr": "test", "skuName": "test"},
+        ]
+        cust_rows = [{"documentId": "v1", "fourCategoryId": "c", "fourCategoryName": "n", "referencePrice": "100"}]
+        saas_path = _write_pending_json(tmp_path, rows)
+        cust_path = _write_customer_json(tmp_path, cust_rows)
+        out = tmp_path / "out.xlsx"
+        result = run_main(
+            output_xlsx=out,
+            input_saas_json=saas_path,
+            input_customer_json=cust_path,
+        )
+        # 模拟爬虫返回 page_price=131
+        crawl_results = {
+            "https://www.zkh.com/item/A.html": {
+                "page_price_value": Decimal("131"),
+                "page_price_status": "OK",
+                "page_price_source": "震坤行",
+            }
+        }
+        apply_crawl_results_to_rows(
+            result["rows"], result["enriched"], result["audit_response"],
+            crawl_results_by_url=crawl_results,
+            crawler_process_failed=False,
+        )
+        from scripts.audit_saas_excel_file import write_audit_workbook
+        write_audit_workbook(out, result["headers"], result["rows"], result["enriched"], result["audit_response"])
+        wb = load_workbook(str(out))
+        ws = wb["record_results"]
+        hdr = [str(c.value or "") for c in ws[1]]
+        idx_value = hdr.index("page_price_value") + 1
+        idx_status = hdr.index("page_price_status") + 1
+        idx_source = hdr.index("page_price_source") + 1
+        idx_check = hdr.index("page_vs_customer_check") + 1
+        idx_over = hdr.index("over_30pct") + 1
+        assert str(ws.cell(row=2, column=idx_value).value) == "131"
+        assert ws.cell(row=2, column=idx_status).value == "OK"
+        assert ws.cell(row=2, column=idx_source).value == "震坤行"
+        assert ws.cell(row=2, column=idx_check).value == "HIGHER_THAN_CUSTOMER_PRICE_30"
+        assert ws.cell(row=2, column=idx_over).value == "TRUE"
+        wb.close()
+
+    def test_apply_success_within_threshold_marks_false(self, tmp_path):
+        rows = [
+            {**SAMPLE_SAAS_PENDING_ROW, "vCommodityId": "v1",
+             "extLink": "https://www.zkh.com/item/A.html",
+             "customerPrice": "100", "queryStr": "test", "skuName": "test"},
+        ]
+        cust_rows = [{"documentId": "v1", "fourCategoryId": "c", "fourCategoryName": "n", "referencePrice": "100"}]
+        saas_path = _write_pending_json(tmp_path, rows)
+        cust_path = _write_customer_json(tmp_path, cust_rows)
+        out = tmp_path / "out.xlsx"
+        result = run_main(
+            output_xlsx=out,
+            input_saas_json=saas_path,
+            input_customer_json=cust_path,
+        )
+        crawl_results = {
+            "https://www.zkh.com/item/A.html": {
+                "page_price_value": Decimal("90"),
+                "page_price_status": "OK",
+                "page_price_source": "震坤行",
+            }
+        }
+        apply_crawl_results_to_rows(
+            result["rows"], result["enriched"], result["audit_response"],
+            crawl_results_by_url=crawl_results,
+        )
+        from scripts.audit_saas_excel_file import write_audit_workbook
+        write_audit_workbook(out, result["headers"], result["rows"], result["enriched"], result["audit_response"])
+        wb = load_workbook(str(out))
+        ws = wb["record_results"]
+        hdr = [str(c.value or "") for c in ws[1]]
+        idx_check = hdr.index("page_vs_customer_check") + 1
+        idx_over = hdr.index("over_30pct") + 1
+        assert ws.cell(row=2, column=idx_check).value == "WITHIN_THRESHOLD"
+        assert ws.cell(row=2, column=idx_over).value == "FALSE"
+        wb.close()
+
+    def test_apply_crawler_process_failed_marks_pending_rows(self, tmp_path):
+        rows = [
+            {**SAMPLE_SAAS_PENDING_ROW, "vCommodityId": "v1",
+             "extLink": "https://www.zkh.com/item/A.html",
+             "customerPrice": "100"},
+        ]
+        cust_rows = [{"documentId": "v1", "fourCategoryId": "c", "fourCategoryName": "n", "referencePrice": "100"}]
+        saas_path = _write_pending_json(tmp_path, rows)
+        cust_path = _write_customer_json(tmp_path, cust_rows)
+        out = tmp_path / "out.xlsx"
+        result = run_main(
+            output_xlsx=out,
+            input_saas_json=saas_path,
+            input_customer_json=cust_path,
+        )
+        apply_crawl_results_to_rows(
+            result["rows"], result["enriched"], result["audit_response"],
+            crawl_results_by_url={},
+            crawler_process_failed=True,
+        )
+        from scripts.audit_saas_excel_file import write_audit_workbook
+        write_audit_workbook(out, result["headers"], result["rows"], result["enriched"], result["audit_response"])
+        wb = load_workbook(str(out))
+        ws = wb["record_results"]
+        hdr = [str(c.value or "") for c in ws[1]]
+        idx_status = hdr.index("page_price_status") + 1
+        assert ws.cell(row=2, column=idx_status).value == "CRAWLER_PROCESS_FAILED"
+        wb.close()
+
+    def test_apply_url_not_returned_marks_failed(self, tmp_path):
+        rows = [
+            {**SAMPLE_SAAS_PENDING_ROW, "vCommodityId": "v1",
+             "extLink": "https://www.zkh.com/item/A.html",
+             "customerPrice": "100"},
+        ]
+        cust_rows = [{"documentId": "v1", "fourCategoryId": "c", "fourCategoryName": "n", "referencePrice": "100"}]
+        saas_path = _write_pending_json(tmp_path, rows)
+        cust_path = _write_customer_json(tmp_path, cust_rows)
+        out = tmp_path / "out.xlsx"
+        result = run_main(
+            output_xlsx=out,
+            input_saas_json=saas_path,
+            input_customer_json=cust_path,
+        )
+        apply_crawl_results_to_rows(
+            result["rows"], result["enriched"], result["audit_response"],
+            crawl_results_by_url={},  # 空 → 所有行都没找到
+            crawler_process_failed=False,
+        )
+        from scripts.audit_saas_excel_file import write_audit_workbook
+        write_audit_workbook(out, result["headers"], result["rows"], result["enriched"], result["audit_response"])
+        wb = load_workbook(str(out))
+        ws = wb["record_results"]
+        hdr = [str(c.value or "") for c in ws[1]]
+        idx_status = hdr.index("page_price_status") + 1
+        assert ws.cell(row=2, column=idx_status).value == "FAILED"
+        wb.close()
