@@ -82,7 +82,7 @@ def _parse_model_response(raw: str, sku_name: str) -> TitleMatchModelResult:
     return result
 
 
-def call_title_match_model(req: TitleMatchModelRequest, timeout_seconds: float = 8.0) -> TitleMatchModelResult:
+def call_title_match_model(req: TitleMatchModelRequest, timeout_seconds: float = 30.0) -> TitleMatchModelResult:
     api_key = os.environ.get("TITLE_MATCH_MODEL_API_KEY", "").strip()
     base_url = os.environ.get("TITLE_MATCH_MODEL_BASE_URL", "").strip()
     model_name = os.environ.get("TITLE_MATCH_MODEL_NAME", "").strip()
