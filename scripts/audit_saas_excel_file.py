@@ -1282,8 +1282,69 @@ def run_main(
     }
 
 
+def _load_env_file(path: Path) -> dict[str, str]:
+    """读取一个简单 KEY=VALUE 风格 .env 文件，注入到 os.environ。
+
+    安全：
+      - 不打印任何 VALUE
+      - 文件不存在不报错（跳过）
+      - 已存在的环境变量不会被覆盖（防止误覆盖系统级配置）
+      - 只识别 ALLOWED_KEYS 内的键，无关键值忽略
+    返回：{key: "SET" / "EXISTING" / "EMPTY"} 用于状态打印
+    """
+    import os as _os
+    allowed_keys = {
+        "TITLE_MATCH_MODEL_API_KEY",
+        "TITLE_MATCH_MODEL_BASE_URL",
+        "TITLE_MATCH_MODEL_NAME",
+    }
+    status: dict[str, str] = {}
+    if not path.exists() or not path.is_file():
+        return status
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return status
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key not in allowed_keys:
+            continue
+        if not value:
+            status[key] = "EMPTY"
+            continue
+        if _os.environ.get(key):
+            status[key] = "EXISTING"
+            continue
+        _os.environ[key] = value
+        status[key] = "SET"
+    return status
+
+
+def _print_model_env_status() -> None:
+    """打印模型环境变量状态，KEY 只显示是否存在，不显示值。"""
+    import os as _os
+    has_key = bool(_os.environ.get("TITLE_MATCH_MODEL_API_KEY", "").strip())
+    base_url = _os.environ.get("TITLE_MATCH_MODEL_BASE_URL", "").strip()
+    model_name = _os.environ.get("TITLE_MATCH_MODEL_NAME", "").strip()
+    print(f"[model] TITLE_MATCH_MODEL_API_KEY: {'SET' if has_key else 'NOT_SET'}")
+    print(f"[model] TITLE_MATCH_MODEL_BASE_URL: {base_url or 'NOT_SET'}")
+    print(f"[model] TITLE_MATCH_MODEL_NAME: {model_name or 'NOT_SET'}")
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    # 先加载本地 .env（不打印 KEY 值）
+    env_file = ROOT / "data" / "model.env"
+    _load_env_file(env_file)
+    if args.use_model:
+        _print_model_env_status()
     result = run_main(
         input_xlsx=args.input_xlsx,
         input_saas_list_json=args.input_saas_list_json,

@@ -1882,3 +1882,76 @@ class TestDetailCache:
         # 全部命中并取得最大值
         assert all(item["customerPriceStatus"] in ("FOUND", "FOUND_SINGLE_REFERENCE") for item in enriched)
         assert all(item["customerPrice"] == Decimal("200") for item in enriched)
+
+
+# ---------------------------------------------------------------------------
+# .env 加载与模型环境变量状态
+# ---------------------------------------------------------------------------
+
+
+from scripts.audit_saas_excel_file import _load_env_file
+
+
+class TestEnvLoader:
+    def test_load_env_file_sets_unset_keys(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("TITLE_MATCH_MODEL_API_KEY", raising=False)
+        monkeypatch.delenv("TITLE_MATCH_MODEL_BASE_URL", raising=False)
+        monkeypatch.delenv("TITLE_MATCH_MODEL_NAME", raising=False)
+        env_path = tmp_path / "model.env"
+        env_path.write_text(
+            'TITLE_MATCH_MODEL_API_KEY=secret-key-xxx\n'
+            'TITLE_MATCH_MODEL_BASE_URL=https://example.com/api\n'
+            'TITLE_MATCH_MODEL_NAME=fake-model-id\n',
+            encoding="utf-8",
+        )
+        status = _load_env_file(env_path)
+        assert status["TITLE_MATCH_MODEL_API_KEY"] == "SET"
+        assert status["TITLE_MATCH_MODEL_BASE_URL"] == "SET"
+        assert status["TITLE_MATCH_MODEL_NAME"] == "SET"
+        # 注入到 os.environ
+        assert os.environ.get("TITLE_MATCH_MODEL_API_KEY") == "secret-key-xxx"
+        assert os.environ.get("TITLE_MATCH_MODEL_BASE_URL") == "https://example.com/api"
+
+    def test_load_env_file_does_not_overwrite_existing(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("TITLE_MATCH_MODEL_API_KEY", "preexisting")
+        env_path = tmp_path / "model.env"
+        env_path.write_text(
+            'TITLE_MATCH_MODEL_API_KEY=newvalue\n', encoding="utf-8"
+        )
+        status = _load_env_file(env_path)
+        assert status["TITLE_MATCH_MODEL_API_KEY"] == "EXISTING"
+        assert os.environ.get("TITLE_MATCH_MODEL_API_KEY") == "preexisting"
+
+    def test_load_env_file_ignores_unknown_keys(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("MALICIOUS_VAR", raising=False)
+        env_path = tmp_path / "model.env"
+        env_path.write_text("MALICIOUS_VAR=evil\n", encoding="utf-8")
+        status = _load_env_file(env_path)
+        assert "MALICIOUS_VAR" not in status
+        assert os.environ.get("MALICIOUS_VAR") is None
+
+    def test_load_env_file_ignores_comments_and_blank_lines(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("TITLE_MATCH_MODEL_BASE_URL", raising=False)
+        env_path = tmp_path / "model.env"
+        env_path.write_text(
+            "# comment\n"
+            "\n"
+            'TITLE_MATCH_MODEL_BASE_URL="https://example.com/api"\n',
+            encoding="utf-8",
+        )
+        status = _load_env_file(env_path)
+        assert status["TITLE_MATCH_MODEL_BASE_URL"] == "SET"
+        assert os.environ.get("TITLE_MATCH_MODEL_BASE_URL") == "https://example.com/api"
+
+    def test_load_env_file_missing_file_returns_empty(self, tmp_path):
+        path = tmp_path / "does_not_exist.env"
+        status = _load_env_file(path)
+        assert status == {}
+
+    def test_load_env_file_empty_value_returns_empty_status(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("TITLE_MATCH_MODEL_API_KEY", raising=False)
+        env_path = tmp_path / "model.env"
+        env_path.write_text("TITLE_MATCH_MODEL_API_KEY=\n", encoding="utf-8")
+        status = _load_env_file(env_path)
+        assert status["TITLE_MATCH_MODEL_API_KEY"] == "EMPTY"
+        assert os.environ.get("TITLE_MATCH_MODEL_API_KEY") is None

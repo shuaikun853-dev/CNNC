@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+.env
+.env.local
+
+data/*.curl
+data/*token*
+data/*.xlsx
+data/*.env
+data/*.json
+runtime/
+runtime/*.xlsx
+outputs/
