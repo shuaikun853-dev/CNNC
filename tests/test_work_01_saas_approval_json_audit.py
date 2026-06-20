@@ -894,6 +894,8 @@ import urllib.request
 
 from openpyxl import Workbook, load_workbook
 from scripts.audit_saas_excel_file import (
+    _display_header,
+    _display_value,
     build_record_payload,
     enrich_rows_with_customer_price,
     extract_customer_price_from_detail,
@@ -1013,7 +1015,7 @@ class TestExcelReadWrite:
         out_ws = out_wb["record_results"]
         out_headers = [cell.value for cell in out_ws[1]]
         for col in DEFAULT_EXCEL_COLS:
-            assert col in out_headers, f"缺失列: {col}"
+            assert _display_header(col) in out_headers, f"缺失列: {col}"
         out_wb.close()
 
     def test_appends_audit_result_columns(self, tmp_path):
@@ -1028,7 +1030,7 @@ class TestExcelReadWrite:
         out_headers = [str(cell.value or "") for cell in out_ws[1]]
         appended = ["customerPrice", "customerPriceStatus", "primary_action", "reason"]
         for col in appended:
-            assert col in out_headers, f"缺失列: {col}"
+            assert _display_header(col) in out_headers, f"缺失列: {_display_header(col)}"
         out_wb.close()
 
 
@@ -1392,7 +1394,7 @@ class TestSaasListJsonE2E:
             "documentId", "fourCategoryId", "list_reference_price",
             "customerPrice", "customerPriceStatus", "primary_action",
         ):
-            assert col in out_headers, f"缺失列: {col}"
+            assert _display_header(col) in out_headers, f"缺失列: {col}"
         wb.close()
 
     def test_e2e_request_interval_calls_sleep_between_requests(self, tmp_path):
@@ -1693,7 +1695,7 @@ class TestRunMainSaasJsonE2E:
         ws = wb["record_results"]
         out_headers = [str(c.value or "") for c in ws[1]]
         for col in (
-            "documentId", "queryStr", "skuName", "extLink",
+            "vCommodityId", "queryStr", "skuName", "extLink",
             "fourCategoryId", "fourCategoryName",
             "customer_lookup_status", "list_reference_price",
             "customerPrice", "customerPriceStatus",
@@ -1701,7 +1703,7 @@ class TestRunMainSaasJsonE2E:
             "page_price_value", "page_price_status", "page_price_source",
             "page_vs_customer_check", "over_30pct",
         ):
-            assert col in out_headers, f"缺失列: {col}"
+            assert _display_header(col) in out_headers, f"缺失列: {_display_header(col)}"
         wb.close()
 
     def test_run_main_dual_mode_lookup_failed(self, tmp_path):
@@ -1732,9 +1734,9 @@ class TestRunMainSaasJsonE2E:
         wb = load_workbook(str(out))
         ws = wb["record_results"]
         out_headers = [str(c.value or "") for c in ws[1]]
-        idx_status = out_headers.index("page_price_status") + 1
-        idx_over = out_headers.index("over_30pct") + 1
-        assert ws.cell(row=2, column=idx_status).value == "SKIPPED_JD"
+        idx_status = out_headers.index(_display_header("page_price_status")) + 1
+        idx_over = out_headers.index(_display_header("over_30pct")) + 1
+        assert ws.cell(row=2, column=idx_status).value == _display_value("SKIPPED_JD")
         assert ws.cell(row=2, column=idx_over).value in ("", None)
         wb.close()
 
@@ -2151,16 +2153,16 @@ class TestApplyCrawlResults:
         wb = load_workbook(str(out))
         ws = wb["record_results"]
         hdr = [str(c.value or "") for c in ws[1]]
-        idx_value = hdr.index("page_price_value") + 1
-        idx_status = hdr.index("page_price_status") + 1
-        idx_source = hdr.index("page_price_source") + 1
-        idx_check = hdr.index("page_vs_customer_check") + 1
-        idx_over = hdr.index("over_30pct") + 1
+        idx_value = hdr.index(_display_header("page_price_value")) + 1
+        idx_status = hdr.index(_display_header("page_price_status")) + 1
+        idx_source = hdr.index(_display_header("page_price_source")) + 1
+        idx_check = hdr.index(_display_header("page_vs_customer_check")) + 1
+        idx_over = hdr.index(_display_header("over_30pct")) + 1
         assert str(ws.cell(row=2, column=idx_value).value) == "131"
-        assert ws.cell(row=2, column=idx_status).value == "OK"
+        assert ws.cell(row=2, column=idx_status).value == _display_value("OK")
         assert ws.cell(row=2, column=idx_source).value == "震坤行"
-        assert ws.cell(row=2, column=idx_check).value == "HIGHER_THAN_CUSTOMER_PRICE_30"
-        assert ws.cell(row=2, column=idx_over).value == "TRUE"
+        assert ws.cell(row=2, column=idx_check).value == _display_value("HIGHER_THAN_CUSTOMER_PRICE_30")
+        assert ws.cell(row=2, column=idx_over).value == _display_value("TRUE")
         wb.close()
 
     def test_apply_success_within_threshold_marks_false(self, tmp_path):
@@ -2194,10 +2196,10 @@ class TestApplyCrawlResults:
         wb = load_workbook(str(out))
         ws = wb["record_results"]
         hdr = [str(c.value or "") for c in ws[1]]
-        idx_check = hdr.index("page_vs_customer_check") + 1
-        idx_over = hdr.index("over_30pct") + 1
-        assert ws.cell(row=2, column=idx_check).value == "WITHIN_THRESHOLD"
-        assert ws.cell(row=2, column=idx_over).value == "FALSE"
+        idx_check = hdr.index(_display_header("page_vs_customer_check")) + 1
+        idx_over = hdr.index(_display_header("over_30pct")) + 1
+        assert ws.cell(row=2, column=idx_check).value == _display_value("WITHIN_THRESHOLD")
+        assert ws.cell(row=2, column=idx_over).value == _display_value("FALSE")
         wb.close()
 
     def test_apply_crawler_process_failed_marks_pending_rows(self, tmp_path):
@@ -2225,8 +2227,8 @@ class TestApplyCrawlResults:
         wb = load_workbook(str(out))
         ws = wb["record_results"]
         hdr = [str(c.value or "") for c in ws[1]]
-        idx_status = hdr.index("page_price_status") + 1
-        assert ws.cell(row=2, column=idx_status).value == "CRAWLER_PROCESS_FAILED"
+        idx_status = hdr.index(_display_header("page_price_status")) + 1
+        assert ws.cell(row=2, column=idx_status).value == _display_value("CRAWLER_PROCESS_FAILED")
         wb.close()
 
     def test_apply_url_not_returned_marks_failed(self, tmp_path):
@@ -2254,6 +2256,6 @@ class TestApplyCrawlResults:
         wb = load_workbook(str(out))
         ws = wb["record_results"]
         hdr = [str(c.value or "") for c in ws[1]]
-        idx_status = hdr.index("page_price_status") + 1
-        assert ws.cell(row=2, column=idx_status).value == "FAILED"
+        idx_status = hdr.index(_display_header("page_price_status")) + 1
+        assert ws.cell(row=2, column=idx_status).value == _display_value("FAILED")
         wb.close()

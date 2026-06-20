@@ -105,6 +105,147 @@ HIGHLIGHTED_RESULT_COLUMNS = {
     "over_30pct",
 }
 
+# 英文字段名 → 中文显示名（仅影响 Excel 表头显示，不影响内部逻辑）
+COLUMN_DISPLAY_NAMES = {
+    # 原始 SaaS 列
+    "vCommodityId": "SaaS商品ID",
+    "documentId": "文档ID",
+    "queryStr": "客户标题",
+    "sassVCommodityName": "SaaS商品名称",
+    "skuId": "SKU编号",
+    "skuName": "互联网标题",
+    "vendorName": "供应商",
+    "shopName": "店铺名称",
+    "price": "SaaS价格",
+    "pageActualPrice": "页面实际价格",
+    "extLink": "互联网链接",
+    "commentNum": "评论数",
+    "createTime": "创建时间",
+    "updateTime": "更新时间",
+    "modelAuditResult": "模型审核结果",
+    "isMatch": "是否匹配",
+    "customerPrice": "客户价",
+    # 客户列
+    "fourCategoryId": "四级类目ID",
+    "fourCategoryName": "四级类目名称",
+    "customer_lookup_status": "客户数据匹配状态",
+    "list_reference_price": "客户列表参考价",
+    # 客户价详情
+    "customerPriceStatus": "客户价状态",
+    "customerPriceSource": "客户价来源",
+    "customerPriceWarning": "客户价警告",
+    "customerPriceEvidence": "客户价证据",
+    # 审查结果
+    "json_price": "JSON价格",
+    "title_match_result": "标题匹配结果",
+    "title_match_confidence": "标题匹配置信度",
+    "title_match_reason": "标题匹配原因",
+    "sku_link_check": "SKU链接检查",
+    "price_check": "价格检查",
+    "price_vs_customer_check": "价格对比客户价",
+    "primary_action": "建议操作",
+    "suggested_actions": "建议操作列表",
+    "reason": "原因",
+    "evidence": "证据",
+    "needs_human_approval": "需人工审批",
+    "execution_allowed": "允许执行",
+    "executed": "已执行",
+    # 爬虫
+    "page_price_value": "爬取页面价格",
+    "page_price_status": "页面价格状态",
+    "page_price_source": "页面价格来源",
+    # 30% 高价
+    "over_30pct": "超过客户价30%",
+    # SAAS_LIST 特有
+    "commodityName": "商品名称",
+    "referenceLink": "参考链接",
+    "categoryId": "类目ID",
+    "categoryName": "类目名称",
+    "materialCode": "物料编码",
+    "materialDesc": "物料描述",
+    "quasiStandardCommodityCode": "准标准商品编码",
+}
+
+
+def _display_header(name: str) -> str:
+    """英文字段名 → 中文显示名；未映射的保持原文。"""
+    return COLUMN_DISPLAY_NAMES.get(name, name)
+
+
+# 枚举值 → 中文显示（仅影响 Excel 显示）
+VALUE_DISPLAY_NAMES = {
+    "APPROVE": "建议通过",
+    "REJECT": "建议驳回",
+    "MANUAL_CHECK": "人工核查",
+    "WAIT_CRAWLER": "等待爬取",
+    "SUPPLEMENT_SAME_PRODUCT": "补充同款",
+    "DO_NOT_PUSH": "不推送",
+    "FEEDBACK_CUSTOMER": "反馈客户",
+    "READY_TO_PUSH": "准备推送",
+    "IMPORT_CUSTOMER_LINKS": "导入客户链接",
+    "UNBIND_WRONG_RELATIONS": "解绑错误关系",
+    "RECALCULATE_INDEX": "重算指数",
+    "PUSH_INDEX": "推送指数",
+    "ASK_CUSTOMER_RECHECK": "请客户复核",
+    "MANUAL_VERIFY": "人工验证",
+    "FORWARD_TO_WORK01": "转发到Work01",
+    "NO_ACTION": "无操作",
+    "WAIT_COLLECTION": "等待采集",
+    "RETRY_PUSH": "重试推送",
+    "CONFIRM": "确认",
+    "ALERT": "告警",
+    "EXEMPTION": "豁免",
+    "QUERY": "查询",
+    "EXPORT": "导出",
+    "FOUND": "已找到",
+    "FOUND_SINGLE_REFERENCE": "仅找到单个参考价",
+    "FOUND_CACHED": "已找到(缓存)",
+    "EXISTS": "已存在",
+    "NOT_PROVIDED": "未提供",
+    "NOT_FOUND": "未找到",
+    "LOOKUP_FAILED": "匹配失败",
+    "DETAIL_REQUEST_FAILED": "详情请求失败",
+    "DETAIL_REQUEST_SKIPPED": "详情请求跳过",
+    "DETAIL_PARSE_FAILED": "详情解析失败",
+    "MATCHED": "已匹配",
+    "MATCHED_NO_CATEGORY": "已匹配但无类目",
+    "SAME": "同款",
+    "NOT_SAME": "非同款",
+    "MANUAL_REVIEW": "人工复核",
+    "MODEL_UNAVAILABLE": "模型不可用",
+    "MATCH": "一致",
+    "MISMATCH": "不一致",
+    "UNKNOWN": "未知",
+    "JSON_PRICE_MISSING": "JSON价格为空",
+    "WAIT_PAGE_PRICE_CHECK": "待页面价格核验",
+    "HIGHER_THAN_CUSTOMER_PRICE_30": "超过客户价30%",
+    "WITHIN_THRESHOLD": "在阈值内",
+    "CUSTOMER_PRICE_MISSING": "客户价缺失",
+    "CUSTOMER_PRICE_INVALID": "客户价无效",
+    "CANDIDATE_PRICE_MISSING": "候选价格缺失",
+    "CANDIDATE_PRICE_INVALID": "候选价格无效",
+    "PAGE_PRICE_MISSING": "页面价格缺失",
+    "PENDING_CRAWL": "待爬取",
+    "OK": "爬取成功",
+    "FAILED": "爬取失败",
+    "PRICE_MISSING": "价格不可见",
+    "SKIPPED_JD": "京东跳过",
+    "SKIPPED_NO_LINK": "无链接跳过",
+    "SKIPPED_MODEL_NOT_SAME": "模型判非同款跳过",
+    "SKIPPED": "跳过",
+    "CRAWLER_PROCESS_FAILED": "爬虫进程失败",
+    "TRUE": "是",
+    "FALSE": "否",
+}
+
+
+def _display_value(value: Any) -> Any:
+    """枚举值 → 中文显示。"""
+    if isinstance(value, str) and value in VALUE_DISPLAY_NAMES:
+        return VALUE_DISPLAY_NAMES[value]
+    return value
+
+
 HEADER_FONT = Font(bold=True)
 HEADER_FILL = PatternFill(start_color="D9E1F2", end_color="D9E1F2", fill_type="solid")
 HEADER_ALIGN = Alignment(horizontal="center", vertical="center", wrap_text=True)
@@ -921,20 +1062,107 @@ def run_audit(
 # ---------------------------------------------------------------------------
 
 
+# 值翻译：英文枚举值 → 中文显示（仅影响 Excel 显示，不影响内部逻辑）
+VALUE_DISPLAY_NAMES = {
+    # WorkflowAction
+    "APPROVE": "建议通过",
+    "REJECT": "建议驳回",
+    "MANUAL_CHECK": "人工核查",
+    "WAIT_CRAWLER": "等待爬取",
+    "SUPPLEMENT_SAME_PRODUCT": "补充同款",
+    "DO_NOT_PUSH": "不推送",
+    "FEEDBACK_CUSTOMER": "反馈客户",
+    "READY_TO_PUSH": "准备推送",
+    "IMPORT_CUSTOMER_LINKS": "导入客户链接",
+    "UNBIND_WRONG_RELATIONS": "解绑错误关系",
+    "RECALCULATE_INDEX": "重新计算指数",
+    "PUSH_INDEX": "推送指数",
+    "ASK_CUSTOMER_RECHECK": "请客户复核",
+    "MANUAL_VERIFY": "人工核验",
+    "FORWARD_TO_WORK01": "转交Work01",
+    "NO_ACTION": "无操作",
+    "WAIT_COLLECTION": "等待采集",
+    "RETRY_PUSH": "重试推送",
+    "CONFIRM": "确认",
+    "ALERT": "告警",
+    "EXEMPTION": "豁免",
+    "QUERY": "查询",
+    "EXPORT": "导出",
+    # title_match_result
+    "SAME": "同款",
+    "NOT_SAME": "非同款",
+    "MANUAL_REVIEW": "人工复核",
+    "MODEL_UNAVAILABLE": "模型不可用",
+    # customerPriceStatus
+    "FOUND": "已找到",
+    "FOUND_SINGLE_REFERENCE": "仅找到单个参考价",
+    "FOUND_CACHED": "已找到(缓存)",
+    "EXISTS": "已存在",
+    "NOT_PROVIDED": "未提供",
+    "NOT_FOUND": "未找到",
+    "LOOKUP_FAILED": "匹配失败",
+    "DETAIL_REQUEST_FAILED": "详情请求失败",
+    "DETAIL_REQUEST_SKIPPED": "详情请求跳过",
+    "DETAIL_PARSE_FAILED": "详情解析失败",
+    "DETAIL_SINGLE_REFERENCE": "详情单参考价",
+    "DETAIL_REFERENCE_INFOS": "详情多参考价",
+    "EXCEL_INPUT": "Excel输入",
+    # customer_lookup_status
+    "MATCHED": "已匹配",
+    "MATCHED_NO_CATEGORY": "已匹配(无类目)",
+    # sku_link_check
+    "MATCH": "一致",
+    "MISMATCH": "不一致",
+    "UNKNOWN": "未知",
+    # price_check
+    "JSON_PRICE_MISSING": "JSON价格为空",
+    "WAIT_PAGE_PRICE_CHECK": "待页面价格核验",
+    # price_vs_customer_check
+    "WITHIN_THRESHOLD": "阈值内",
+    "HIGHER_THAN_CUSTOMER_PRICE_30": "超过客户价30%",
+    "CUSTOMER_PRICE_MISSING": "客户价缺失",
+    "CUSTOMER_PRICE_INVALID": "客户价无效",
+    "CANDIDATE_PRICE_MISSING": "候选价格缺失",
+    "CANDIDATE_PRICE_INVALID": "候选价格无效",
+    "PAGE_PRICE_MISSING": "页面价格缺失",
+    # page_price_status
+    "PENDING_CRAWL": "待爬取",
+    "SKIPPED_JD": "跳过(京东)",
+    "SKIPPED_NO_LINK": "跳过(无链接)",
+    "SKIPPED_MODEL_NOT_SAME": "跳过(模型判非同款)",
+    "SKIPPED": "跳过",
+    "OK": "成功",
+    "FAILED": "失败",
+    "CRAWLER_PROCESS_FAILED": "爬虫进程失败",
+    "PRICE_MISSING": "价格不可见",
+    # over_30pct
+    "TRUE": "是",
+    "FALSE": "否",
+}
+
+
+def _translate_value(value: Any) -> Any:
+    """把英文枚举值翻译成中文显示。"""
+    if isinstance(value, str):
+        return VALUE_DISPLAY_NAMES.get(value, value)
+    return value
+
+
 def _format_cell_value(value: Any) -> Any:
     if value is None:
         return ""
+    value = _display_value(value)
     if isinstance(value, Decimal):
         return str(value)
     if isinstance(value, WorkflowAction):
-        return value.value
+        return _display_value(value.value)
     if isinstance(value, list):
         rendered: list[str] = []
         for item in value:
             if isinstance(item, WorkflowAction):
-                rendered.append(item.value)
+                rendered.append(_display_value(item.value))
             else:
-                rendered.append(str(item))
+                rendered.append(str(_display_value(item)))
         return "；".join(rendered)
     if isinstance(value, bool):
         return "TRUE" if value else "FALSE"
@@ -975,7 +1203,8 @@ def _build_summary_counts(audit_response: Any, enriched: list[dict[str, Any]]) -
 def _set_column_widths(sheet: Any, headers: list[str]) -> None:
     for index, header in enumerate(headers, start=1):
         letter = get_column_letter(index)
-        width = min(max(len(header) * 2 + 4, 12), 60)
+        display = _display_header(header)
+        width = min(max(len(display) * 2 + 4, 12), 60)
         if header in {"reason", "evidence", "customerPriceEvidence", "extLink", "queryStr", "skuName", "customerPriceWarning", "title_match_reason"}:
             width = 50
         sheet.column_dimensions[letter].width = width
@@ -1077,8 +1306,9 @@ def _write_record_results_sheet(
     sheet = workbook.create_sheet("record_results")
     base_headers = [header for header in headers if header not in RESULT_APPENDED_COLUMNS]
     final_headers = base_headers + RESULT_APPENDED_COLUMNS
-    sheet.append(final_headers)
-    for column_index, header in enumerate(final_headers, start=1):
+    display_headers = [_display_header(h) for h in final_headers]
+    sheet.append(display_headers)
+    for column_index, header in enumerate(display_headers, start=1):
         cell = sheet.cell(row=1, column=column_index)
         cell.font = HEADER_FONT
         cell.fill = HEADER_FILL
