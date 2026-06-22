@@ -76,6 +76,7 @@ RESULT_APPENDED_COLUMNS = [
     "customerPriceWarning",
     "customerPriceEvidence",
     "json_price",
+    "saas_price_vs_customer",
     "title_match_result",
     "title_match_confidence",
     "title_match_reason",
@@ -94,6 +95,8 @@ RESULT_APPENDED_COLUMNS = [
     "page_price_source",
     "page_vs_customer_check",
     "over_30pct",
+    "price_changed",
+    "final_decision",
 ]
 
 HIGHLIGHTED_RESULT_COLUMNS = {
@@ -101,8 +104,11 @@ HIGHLIGHTED_RESULT_COLUMNS = {
     "customerPriceStatus",
     "primary_action",
     "price_vs_customer_check",
+    "saas_price_vs_customer",
     "page_price_value",
     "over_30pct",
+    "price_changed",
+    "final_decision",
 }
 
 # 英文字段名 → 中文显示名（仅影响 Excel 表头显示，不影响内部逻辑）
@@ -156,6 +162,9 @@ COLUMN_DISPLAY_NAMES = {
     "page_price_source": "页面价格来源",
     # 30% 高价
     "over_30pct": "超过客户价30%",
+    "saas_price_vs_customer": "SaaS价对比客户价",
+    "price_changed": "价格变动",
+    "final_decision": "最终决策",
     # SAAS_LIST 特有
     "commodityName": "商品名称",
     "referenceLink": "参考链接",
@@ -234,6 +243,16 @@ VALUE_DISPLAY_NAMES = {
     "SKIPPED_MODEL_NOT_SAME": "模型判非同款跳过",
     "SKIPPED": "跳过",
     "CRAWLER_PROCESS_FAILED": "爬虫进程失败",
+    "SAAS_HIGHER_THAN_CUSTOMER_30": "SaaS价超客户价30%",
+    "SAAS_WITHIN_CUSTOMER_THRESHOLD": "SaaS价在客户价阈值内",
+    "SAAS_PRICE_MISSING": "SaaS价缺失",
+    "CHANGED": "是",
+    "UNCHANGED": "否",
+    "PRICE_UNAVAILABLE": "价格不可比",
+    "REJECT_SAAS_HIGH": "驳回(SaaS价超客户价30%)",
+    "REJECT_PRICE_CHANGED": "驳回(价格变动)",
+    "REJECT_BOTH": "驳回(双重异常)",
+    "PASS": "通过",
     "TRUE": "是",
     "FALSE": "否",
 }
@@ -1280,12 +1299,8 @@ def _compute_page_price_status(row, audit_result):
             "page_price_status": "SKIPPED_JD",
             "page_price_source": "JD",
         }
-    if audit_result is not None and audit_result.title_match_result == "NOT_SAME":
-        return {
-            "page_price_value": None,
-            "page_price_status": "SKIPPED_MODEL_NOT_SAME",
-            "page_price_source": "",
-        }
+    # 注意：模型 NOT_SAME 也要爬取价格（业务要求）
+    # 不再跳过爬虫，让 over_30pct + saas_price_vs_customer + price_changed 一起兜底判断
     return {
         "page_price_value": None,
         "page_price_status": "PENDING_CRAWL",
@@ -1314,6 +1329,93 @@ def compute_over_30_check(customer_price, page_price, page_price_status):
     if page_price > threshold:
         return ("HIGHER_THAN_CUSTOMER_PRICE_30", "TRUE")
     return ("WITHIN_THRESHOLD", "FALSE")
+
+
+def compute_saas_price_vs_customer(customer_price, saas_price):
+    """爬虫之前的预检：SaaS json 自身价格是否已经超出客户价 30%。
+
+    返回 ("SAAS_HIGHER_THAN_CUSTOMER_30" | "SAAS_WITHIN_CUSTOMER_THRESHOLD" | "SAAS_PRICE_MISSING" | "CUSTOMER_PRICE_MISSING", evidence_str)
+    """
+    if saas_price is None or (isinstance(saas_price, Decimal) and saas_price <= 0):
+        return ("SAAS_PRICE_MISSING", "SaaS 价格为空")
+    if customer_price is None or (isinstance(customer_price, Decimal) and customer_price <= 0):
+        return ("CUSTOMER_PRICE_MISSING", "客户价缺失")
+    threshold = customer_price * THIRTY_PERCENT_RATIO
+    if saas_price > threshold:
+        return (
+            "SAAS_HIGHER_THAN_CUSTOMER_30",
+            f"SaaS价={saas_price}；客户价={customer_price}；30%阈值={threshold}",
+        )
+    return (
+        "SAAS_WITHIN_CUSTOMER_THRESHOLD",
+        f"SaaS价={saas_price}；客户价={customer_price}",
+    )
+
+
+def compute_price_changed(saas_price, page_price, page_price_status, tolerance_ratio: Decimal = Decimal("0.01")):
+    """SaaS price vs 爬取页面价。
+
+    业务含义：SaaS JSON 里记录的价格 与 当前页面真实价格不一致 →
+    说明商城实际价格已变动，这条数据要驳回（让 SaaS 重新同步）。
+
+    返回 ("CHANGED" | "UNCHANGED" | "PRICE_UNAVAILABLE", evidence)
+    tolerance_ratio：1% 容差，避免 0.01 这种四舍五入误差被当成变动
+    """
+    pending_statuses = {
+        "SKIPPED_JD",
+        "SKIPPED_NO_LINK",
+        "SKIPPED_MODEL_NOT_SAME",
+        "SKIPPED",
+        "PENDING_CRAWL",
+        "FAILED",
+        "CRAWLER_PROCESS_FAILED",
+        "PRICE_MISSING",
+    }
+    if page_price_status in pending_statuses:
+        return ("PRICE_UNAVAILABLE", "页面价不可用")
+    if page_price is None or page_price <= 0:
+        return ("PRICE_UNAVAILABLE", "页面价无效")
+    if saas_price is None or saas_price <= 0:
+        return ("PRICE_UNAVAILABLE", "SaaS 价格无效")
+    base = saas_price if saas_price > 0 else page_price
+    diff_ratio = abs(page_price - saas_price) / base
+    if diff_ratio > tolerance_ratio:
+        return (
+            "CHANGED",
+            f"SaaS价={saas_price}；页面价={page_price}；变动={diff_ratio:.2%}",
+        )
+    return (
+        "UNCHANGED",
+        f"SaaS价={saas_price}；页面价={page_price}",
+    )
+
+
+def compute_final_decision(
+    saas_vs_customer_status: str,
+    price_changed_status: str,
+    over_30pct_value: str,
+) -> str:
+    """综合三类异常给出最终决策。
+
+    业务规则：
+      1. SaaS 自身价超客户价 30% → REJECT_SAAS_HIGH
+      2. 爬取价超客户价 30%       → 已被 over_30pct=TRUE 标记
+      3. 页面价与 SaaS 价变动      → REJECT_PRICE_CHANGED
+      多重异常时合并标记 REJECT_BOTH，否则 PASS
+    """
+    saas_high = saas_vs_customer_status == "SAAS_HIGHER_THAN_CUSTOMER_30"
+    changed = price_changed_status == "CHANGED"
+    over_30 = over_30pct_value == "TRUE"
+    flags = sum([saas_high, changed, over_30])
+    if flags >= 2:
+        return "REJECT_BOTH"
+    if saas_high:
+        return "REJECT_SAAS_HIGH"
+    if changed:
+        return "REJECT_PRICE_CHANGED"
+    if over_30:
+        return "REJECT_SAAS_HIGH"  # 爬取价超 30% 也归到此类
+    return "PASS"
 
 
 def _write_record_results_sheet(
@@ -1402,7 +1504,36 @@ def _write_record_results_sheet(
         merged["page_vs_customer_check"] = page_vs_check
         merged["over_30pct"] = over_30
 
-        row_is_over = over_30 == "TRUE"
+        # SaaS 价 vs 客户价预检（爬虫前就能算）
+        saas_price_for_check = row.get("price")
+        if not isinstance(saas_price_for_check, Decimal):
+            saas_price_for_check = parse_decimal(saas_price_for_check)
+        saas_vs_cust_status, _saas_vs_cust_evidence = compute_saas_price_vs_customer(
+            customer_price=info.get("customerPrice"),
+            saas_price=saas_price_for_check,
+        )
+        merged["saas_price_vs_customer"] = saas_vs_cust_status
+
+        # 价格变动（SaaS json 里的价 vs 爬虫拿到的页面价）
+        price_changed_status, _pc_evidence = compute_price_changed(
+            saas_price=saas_price_for_check,
+            page_price=page_status_info["page_price_value"],
+            page_price_status=page_status_info["page_price_status"],
+        )
+        merged["price_changed"] = price_changed_status
+
+        # 综合最终决策
+        merged["final_decision"] = compute_final_decision(
+            saas_vs_customer_status=saas_vs_cust_status,
+            price_changed_status=price_changed_status,
+            over_30pct_value=over_30,
+        )
+
+        row_is_over = (
+            over_30 == "TRUE"
+            or saas_vs_cust_status == "SAAS_HIGHER_THAN_CUSTOMER_30"
+            or price_changed_status == "CHANGED"
+        )
         for column_index, header in enumerate(final_headers, start=1):
             cell = sheet.cell(row=row_index, column=column_index)
             cell.value = _format_cell_value(merged.get(header, ""))
@@ -1471,6 +1602,16 @@ def build_parser() -> argparse.ArgumentParser:
                         help="爬取模板输出根目录（自动追加 YYYY-MM-DD 子目录）")
     parser.add_argument("--no-excluded-export", action="store_true",
                         help="跳过京东/震坤行爬取模板的导出")
+    parser.add_argument("--zhaoshang-task", action="store_true",
+                        help="启用招商局自动建任务（用京东.xlsx + 震坤行.xlsx）")
+    parser.add_argument("--zhaoshang-tool-path", type=Path, default=DEFAULT_ZHAOSHANG_TOOL_PATH,
+                        help="招商局 crawl_task_tool.py 路径")
+    parser.add_argument("--zhaoshang-task-prefix", default="中核价格更新",
+                        help="招商局任务名前缀，默认 '中核价格更新'")
+    parser.add_argument("--zhaoshang-wait-timeout", type=int, default=7200,
+                        help="等待招商局任务超时秒数，默认 7200 (2小时)")
+    parser.add_argument("--zhaoshang-progress-interval", type=int, default=30,
+                        help="招商局进度查询间隔秒数，默认 30")
     return parser
 
 
@@ -1522,6 +1663,11 @@ def run_main(
     skip_dry_run: bool = False,
     excluded_output_dir: Path | None = None,
     excluded_export_disabled: bool = False,
+    zhaoshang_task_enabled: bool = False,
+    zhaoshang_tool_path: Path | None = None,
+    zhaoshang_task_prefix: str = "中核价格更新",
+    zhaoshang_wait_timeout: int = 7200,
+    zhaoshang_progress_interval: int = 30,
     crawler_runner: Any = None,
     opener: Any | None = None,
     sleep_func: Any | None = None,
@@ -1670,6 +1816,27 @@ def run_main(
             crawler_summary["crawler_process_failed"] = crawler_process_failed
             crawler_summary["urls_returned"] = len(crawl_results_by_url)
 
+    # 招商局自动建任务（京东/震坤行走招商局系统）
+    zhaoshang_summary: dict[str, Any] = {"enabled": False}
+    if zhaoshang_task_enabled and mode == "input_saas_json":
+        print("\n[zhaoshang] 招商局自动建任务启动...")
+        zhaoshang_results = run_zhaoshang_tasks(
+            excluded_export_summary=excluded_export_summary,
+            task_name_prefix=zhaoshang_task_prefix,
+            tool_path=zhaoshang_tool_path,
+            wait_timeout_seconds=zhaoshang_wait_timeout,
+            progress_interval_seconds=zhaoshang_progress_interval,
+            skip_if_exists=True,
+        )
+        zhaoshang_summary = {
+            "enabled": True,
+            "results": zhaoshang_results,
+        }
+        backfilled = apply_zhaoshang_results_to_rows(rows, enriched, audit_response, zhaoshang_results)
+        zhaoshang_summary["backfilled"] = backfilled
+        if backfilled > 0:
+            print(f"[zhaoshang] 回填 {backfilled} 条京东/震坤行价格")
+
     write_audit_workbook(output_xlsx, headers, rows, enriched, audit_response)
     summary_counts = _build_summary_counts(audit_response, enriched)
     return {
@@ -1681,6 +1848,7 @@ def run_main(
         "mode": mode,
         "crawler": crawler_summary,
         "excluded_export": excluded_export_summary,
+        "zhaoshang": zhaoshang_summary,
     }
 
 
@@ -1767,6 +1935,11 @@ def main(argv: list[str] | None = None) -> int:
         skip_dry_run=args.skip_dry_run,
         excluded_output_dir=args.excluded_output_dir,
         excluded_export_disabled=args.no_excluded_export,
+        zhaoshang_task_enabled=args.zhaoshang_task,
+        zhaoshang_tool_path=args.zhaoshang_tool_path,
+        zhaoshang_task_prefix=args.zhaoshang_task_prefix,
+        zhaoshang_wait_timeout=args.zhaoshang_wait_timeout,
+        zhaoshang_progress_interval=args.zhaoshang_progress_interval,
         progress_func=_cli_progress,
     )
     print_summary(result["summary_counts"], args.output_xlsx)
@@ -2044,6 +2217,217 @@ def apply_crawl_results_to_rows(
         row["__page_price_value"] = page_value
         row["__page_price_status"] = page_status
         row["__page_price_source"] = page_source
+
+
+
+
+# ---------------------------------------------------------------------------
+# 招商局自动建任务集成（E:\.A2026\招商局自动建任务）
+# 业务：京东、震坤行不走 multi_mall_crawler，改投递到招商局采集任务系统
+# ---------------------------------------------------------------------------
+
+
+DEFAULT_ZHAOSHANG_TOOL_PATH = Path(r"E:\.A2026\招商局自动建任务\agent\tools\crawl_task_tool.py")
+ZHAOSHANG_MALL_KEYS = {
+    "京东": "jd",
+    "震坤行": "zkh",
+}
+
+
+def _load_zhaoshang_run_crawl_task(tool_path):
+    """动态加载招商局工具的 run_crawl_task 函数。
+
+    通过 importlib.util.spec_from_file_location 直接从文件路径载入，
+    避免依赖招商局项目的 sys.path 结构。
+    """
+    import importlib.util
+    tool_path = Path(tool_path)
+    if not tool_path.exists():
+        raise FileNotFoundError(f"招商局工具不存在: {tool_path}")
+    spec = importlib.util.spec_from_file_location("zhaoshang_crawl_task_tool", str(tool_path))
+    if spec is None or spec.loader is None:
+        raise ImportError(f"无法加载招商局工具: {tool_path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    if not hasattr(module, "run_crawl_task"):
+        raise AttributeError("招商局工具未导出 run_crawl_task")
+    return module.run_crawl_task
+
+
+def run_zhaoshang_tasks(
+    excluded_export_summary,
+    task_name_prefix="中核价格更新",
+    tool_path=None,
+    wait_timeout_seconds=7200,
+    progress_interval_seconds=30,
+    skip_if_exists=True,
+):
+    """对 excluded_export_summary 里的京东/震坤行 xlsx 各跑一次招商局任务。
+
+    返回：
+      {
+        "京东":   {"ok": True, "result_path": Path, "task_name": str, "mall_key": "jd", "rows": 35} | {"ok": False, "error": "..."},
+        "震坤行": ...,
+      }
+    """
+    tool_path = tool_path or DEFAULT_ZHAOSHANG_TOOL_PATH
+    try:
+        run_crawl_task = _load_zhaoshang_run_crawl_task(tool_path)
+    except Exception as exc:
+        print(f"[zhaoshang] 加载工具失败：{type(exc).__name__}: {exc}")
+        return {"_error": f"{type(exc).__name__}: {exc}"}
+
+    date_label = datetime.now().strftime("%Y%m%d")
+    results = {}
+    for mall_cn, mall_key in ZHAOSHANG_MALL_KEYS.items():
+        info = excluded_export_summary.get(mall_cn) if isinstance(excluded_export_summary, dict) else None
+        if not info or info.get("deduped", 0) == 0:
+            results[mall_cn] = {"ok": True, "skipped": True, "reason": "无可用数据行"}
+            continue
+        excel_path = info.get("path")
+        if excel_path is None or not Path(excel_path).exists():
+            results[mall_cn] = {"ok": False, "error": f"模板文件不存在: {excel_path}"}
+            continue
+        task_name = f"{task_name_prefix}-{date_label}-{mall_key}"
+        try:
+            print(f"[zhaoshang] {mall_cn}: 提交任务 task_name={task_name}, excel={excel_path}")
+            result = run_crawl_task(
+                task_name=task_name,
+                mall_key=mall_key,
+                excel_path=str(excel_path),
+                wait_timeout_seconds=wait_timeout_seconds,
+                progress_interval_seconds=progress_interval_seconds,
+                skip_if_exists=skip_if_exists,
+            )
+            print(f"[zhaoshang] {mall_cn}: 完成，结果文件={result.get('result_path')}")
+            results[mall_cn] = {
+                "ok": True,
+                "task_name": task_name,
+                "mall_key": mall_key,
+                "rows": info.get("deduped", 0),
+                "result_path": result.get("result_path"),
+            }
+        except Exception as exc:
+            print(f"[zhaoshang] {mall_cn}: 失败 {type(exc).__name__}: {exc}")
+            results[mall_cn] = {
+                "ok": False,
+                "task_name": task_name,
+                "error": f"{type(exc).__name__}: {str(exc)[:300]}",
+            }
+    return results
+
+
+def read_zhaoshang_result_xlsx(path):
+    """读招商局返回 xlsx，按"原始链接 / url / 商品链接" 找 URL 列，"价格 / 商品价格" 找价格列。
+
+    返回 {url: {"page_price_value": Decimal | None, "page_price_status": str, "page_price_source": str}}
+    """
+    path = Path(path)
+    if not path.exists():
+        return {}
+    wb = load_workbook(filename=str(path), data_only=True, read_only=True)
+    try:
+        sheet = wb.active
+        if sheet is None:
+            return {}
+        iterator = sheet.iter_rows(values_only=True)
+        try:
+            header_row = next(iterator)
+        except StopIteration:
+            return {}
+        headers = [str(v).strip() if v is not None else "" for v in header_row]
+
+        def _find(*names):
+            for name in names:
+                if name in headers:
+                    return headers.index(name)
+            return -1
+
+        url_idx = _find("原始链接", "url", "URL", "商品链接", "链接", "商品URL")
+        price_idx = _find("商品价格", "价格", "采集价格", "page_price")
+        status_idx = _find("采集状态", "状态")
+        reason_idx = _find("失败原因", "原因")
+
+        if url_idx < 0:
+            return {}
+
+        results = {}
+        for raw in iterator:
+            if raw is None:
+                continue
+            if url_idx >= len(raw):
+                continue
+            url = str(raw[url_idx] or "").strip()
+            if not url:
+                continue
+            price_value = None
+            if 0 <= price_idx < len(raw):
+                price_value = parse_decimal(raw[price_idx])
+            status_text = ""
+            if 0 <= status_idx < len(raw) and raw[status_idx] is not None:
+                status_text = str(raw[status_idx]).strip()
+            reason_text = ""
+            if 0 <= reason_idx < len(raw) and raw[reason_idx] is not None:
+                reason_text = str(raw[reason_idx]).strip()
+
+            if price_value is not None and price_value > 0:
+                results[url] = {
+                    "page_price_value": price_value,
+                    "page_price_status": "OK",
+                    "page_price_source": "招商局",
+                }
+            elif "成功" in status_text and price_value is None:
+                results[url] = {
+                    "page_price_value": None,
+                    "page_price_status": "PRICE_MISSING",
+                    "page_price_source": "招商局-价格不可见",
+                }
+            else:
+                results[url] = {
+                    "page_price_value": None,
+                    "page_price_status": "FAILED",
+                    "page_price_source": "招商局-" + (reason_text or status_text or "未知"),
+                }
+        return results
+    finally:
+        wb.close()
+
+
+def apply_zhaoshang_results_to_rows(rows, enriched, audit_response, zhaoshang_summary):
+    """把招商局任务结果回填到对应 row 的 __page_price_* 字段。
+
+    与 apply_crawl_results_to_rows 类似，但只覆盖匹配的 url（京东/震坤行）。
+    """
+    url_to_result = {}
+    if isinstance(zhaoshang_summary, dict):
+        for mall_cn, info in zhaoshang_summary.items():
+            if mall_cn.startswith("_"):
+                continue
+            if not isinstance(info, dict) or not info.get("ok") or info.get("skipped"):
+                continue
+            result_path = info.get("result_path")
+            if not result_path:
+                continue
+            mapped = read_zhaoshang_result_xlsx(Path(result_path))
+            url_to_result.update(mapped)
+            print(f"[zhaoshang] {mall_cn}: 回填 {len(mapped)} 条页面价")
+
+    if not url_to_result:
+        return 0
+
+    backfilled = 0
+    for row in rows:
+        url = _normalize_url(row.get("extLink"))
+        if not url:
+            continue
+        hit = url_to_result.get(url)
+        if hit is None:
+            continue
+        row["__page_price_value"] = hit["page_price_value"]
+        row["__page_price_status"] = hit["page_price_status"]
+        row["__page_price_source"] = hit["page_price_source"]
+        backfilled += 1
+    return backfilled
 
 
 if __name__ == "__main__":

@@ -2362,3 +2362,130 @@ class TestExcludedTemplateAutoExport:
         )
         assert result["excluded_export"]["enabled"] is False
         assert not excluded_root.exists()
+
+
+# ---------------------------------------------------------------------------
+# 新增业务规则测试：SaaS 预检、价格变动、最终决策
+# ---------------------------------------------------------------------------
+
+
+from scripts.audit_saas_excel_file import (
+    compute_final_decision,
+    compute_price_changed,
+    compute_saas_price_vs_customer,
+)
+
+
+class TestSaasPriceVsCustomer:
+    def test_saas_higher_than_30(self):
+        status, ev = compute_saas_price_vs_customer(
+            customer_price=Decimal("100"),
+            saas_price=Decimal("131"),
+        )
+        assert status == "SAAS_HIGHER_THAN_CUSTOMER_30"
+        assert "131" in ev
+
+    def test_saas_within_threshold(self):
+        status, _ = compute_saas_price_vs_customer(
+            customer_price=Decimal("100"),
+            saas_price=Decimal("130"),
+        )
+        assert status == "SAAS_WITHIN_CUSTOMER_THRESHOLD"
+
+    def test_saas_price_missing(self):
+        status, _ = compute_saas_price_vs_customer(
+            customer_price=Decimal("100"),
+            saas_price=None,
+        )
+        assert status == "SAAS_PRICE_MISSING"
+
+    def test_customer_price_missing(self):
+        status, _ = compute_saas_price_vs_customer(
+            customer_price=None,
+            saas_price=Decimal("100"),
+        )
+        assert status == "CUSTOMER_PRICE_MISSING"
+
+
+class TestPriceChanged:
+    def test_changed_obvious(self):
+        status, ev = compute_price_changed(
+            saas_price=Decimal("100"),
+            page_price=Decimal("150"),
+            page_price_status="OK",
+        )
+        assert status == "CHANGED"
+        assert "100" in ev and "150" in ev
+
+    def test_unchanged_within_tolerance(self):
+        status, _ = compute_price_changed(
+            saas_price=Decimal("100"),
+            page_price=Decimal("100.5"),  # 0.5% < 1%
+            page_price_status="OK",
+        )
+        assert status == "UNCHANGED"
+
+    def test_changed_outside_tolerance(self):
+        status, _ = compute_price_changed(
+            saas_price=Decimal("100"),
+            page_price=Decimal("102"),  # 2% > 1%
+            page_price_status="OK",
+        )
+        assert status == "CHANGED"
+
+    def test_unavailable_when_page_price_missing(self):
+        status, _ = compute_price_changed(
+            saas_price=Decimal("100"),
+            page_price=None,
+            page_price_status="FAILED",
+        )
+        assert status == "PRICE_UNAVAILABLE"
+
+    def test_unavailable_when_saas_price_invalid(self):
+        status, _ = compute_price_changed(
+            saas_price=None,
+            page_price=Decimal("100"),
+            page_price_status="OK",
+        )
+        assert status == "PRICE_UNAVAILABLE"
+
+
+class TestFinalDecision:
+    def test_pass(self):
+        assert compute_final_decision(
+            "SAAS_WITHIN_CUSTOMER_THRESHOLD", "UNCHANGED", "FALSE"
+        ) == "PASS"
+
+    def test_reject_saas_high(self):
+        assert compute_final_decision(
+            "SAAS_HIGHER_THAN_CUSTOMER_30", "UNCHANGED", "FALSE"
+        ) == "REJECT_SAAS_HIGH"
+
+    def test_reject_price_changed(self):
+        assert compute_final_decision(
+            "SAAS_WITHIN_CUSTOMER_THRESHOLD", "CHANGED", "FALSE"
+        ) == "REJECT_PRICE_CHANGED"
+
+    def test_reject_both_when_multiple_anomalies(self):
+        assert compute_final_decision(
+            "SAAS_HIGHER_THAN_CUSTOMER_30", "CHANGED", "FALSE"
+        ) == "REJECT_BOTH"
+
+    def test_over_30_alone_also_rejects(self):
+        assert compute_final_decision(
+            "SAAS_WITHIN_CUSTOMER_THRESHOLD", "UNCHANGED", "TRUE"
+        ) == "REJECT_SAAS_HIGH"
+
+
+class TestNotSameNoLongerSkipped:
+    """模型判 NOT_SAME 也要爬虫，不再 SKIPPED_MODEL_NOT_SAME。"""
+
+    def test_not_same_still_pending_crawl(self, tmp_path):
+        from scripts.audit_saas_excel_file import _compute_page_price_status
+
+        class FakeAuditResult:
+            title_match_result = "NOT_SAME"
+
+        row = {"extLink": "https://www.example.com/abc"}
+        result = _compute_page_price_status(row, FakeAuditResult())
+        assert result["page_price_status"] == "PENDING_CRAWL"
