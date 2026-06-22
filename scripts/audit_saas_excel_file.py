@@ -1530,10 +1530,14 @@ def run_main(
     mode = _select_input_mode(input_xlsx, input_saas_list_json, input_saas_json, input_customer_json)
 
     # 双 JSON 模式 + 未禁用 → 先生成京东/震坤行爬取模板（公司/人工系统处理）
+    # AUDIT_SUPPRESS_EXCLUDED_EXPORT=1 可全局禁用（用于 pytest 等测试环境，避免污染真实目录）
+    import os as _os
+    env_suppress = _os.environ.get("AUDIT_SUPPRESS_EXCLUDED_EXPORT", "").strip() == "1"
     excluded_export_summary: dict[str, Any] = {"enabled": False}
     if (
         mode == "input_saas_json"
         and not excluded_export_disabled
+        and not env_suppress
         and input_saas_json is not None
     ):
         out_root = excluded_output_dir if excluded_output_dir is not None else (ROOT / "爬取模板")

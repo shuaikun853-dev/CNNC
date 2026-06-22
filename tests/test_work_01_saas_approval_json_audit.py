@@ -2267,8 +2267,10 @@ class TestApplyCrawlResults:
 
 
 class TestExcludedTemplateAutoExport:
-    def test_dual_json_mode_auto_exports_excluded_templates(self, tmp_path):
+    def test_dual_json_mode_auto_exports_excluded_templates(self, tmp_path, monkeypatch):
         """双 JSON 模式 run_main 会在解析前自动生成京东+震坤行模板。"""
+        # 该用例需启用导出
+        monkeypatch.delenv("AUDIT_SUPPRESS_EXCLUDED_EXPORT", raising=False)
         # 准备含京东 + 震坤行的 saas 行
         rows = [
             {**SAMPLE_SAAS_PENDING_ROW, "vCommodityId": "v-jd",
