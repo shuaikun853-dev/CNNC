@@ -238,6 +238,7 @@ VALUE_DISPLAY_NAMES = {
     "OK": "爬取成功",
     "FAILED": "爬取失败",
     "PRICE_MISSING": "价格不可见",
+    "PRICE_IS_ZERO": "价格为0",
     "SKIPPED_JD": "京东跳过",
     "SKIPPED_NO_LINK": "无链接跳过",
     "SKIPPED_MODEL_NOT_SAME": "模型判非同款跳过",
@@ -437,13 +438,20 @@ def _normalize_saas_list_row(raw: dict[str, Any]) -> dict[str, Any]:
 def _heal_missing_closing_brace(text: str) -> str:
     """修复导出工具常见的缺最外层右花括号的多段 JSON。
 
-    场景：上一段 JSON 末尾 `"success": true` 后直接换行接下一段 `{`，
-    缺一个 `}` 让 json.decoder 误把后续内容当成同一对象的延续。
+    场景1：上一段 JSON 末尾 `"success": true` 后直接换行接下一段 `{`，缺一个 `}`。
+    场景2：上一段 rows 数组最后一个元素 `}` 后直接接下一段 `{`，缺 `]` 和 `}`。
+    场景3：末尾以 `"success": true` 结束但缺最后的 `}`。
     """
-    # 中间段："success": true|false 后紧跟换行 + 空白 + {  →  在两者之间补一个 }
+    # 场景1："success": true|false 后紧跟换行 + 空白 + {  →  补 }
     text = re.sub(
         r'("success"\s*:\s*(?:true|false))(\s*\n\s*)(\{)',
         r"\1}\2\3",
+        text,
+    )
+    # 场景2：}\n{ 拼接且下一行有 "rspCode" → 补 ]\n}
+    text = re.sub(
+        r'(\})(\s*\n\s*)(\{\s*\n\s*"rspCode")',
+        r'\1\n    ]\n}\2\3',
         text,
     )
     return text
@@ -467,13 +475,21 @@ def _parse_json_segments(text: str) -> list[Any]:
     index = 0
     length = len(text)
     while index < length:
+        # 跳过空白
         while index < length and text[index] in " \t\r\n\ufeff":
             index += 1
         if index >= length:
             break
-        # 兼容尾部孤立的 } / , 等冗余字符（导出工具偶尔多写一个右括号）
-        if text[index] in "}],":
-            index += 1
+        # top-level 只接受 { 或 [ 开头的 JSON 值
+        # 其他字符（}、]、,、"success": true 等尾部垃圾）全部跳过
+        if text[index] not in '{[':
+            # 尝试找到下一个 { 或 [
+            next_obj = text.find('{', index)
+            next_arr = text.find('[', index)
+            candidates = [x for x in (next_obj, next_arr) if x >= 0]
+            if not candidates:
+                break
+            index = min(candidates)
             continue
         try:
             obj, end = decoder.raw_decode(text, index)
@@ -1174,6 +1190,7 @@ VALUE_DISPLAY_NAMES = {
     "FAILED": "失败",
     "CRAWLER_PROCESS_FAILED": "爬虫进程失败",
     "PRICE_MISSING": "价格不可见",
+    "PRICE_IS_ZERO": "价格为0",
     # over_30pct
     "TRUE": "是",
     "FALSE": "否",
@@ -1321,7 +1338,11 @@ def compute_over_30_check(customer_price, page_price, page_price_status):
     }
     if page_price_status in pending_statuses:
         return ("PAGE_PRICE_MISSING", "")
-    if page_price is None or page_price <= 0:
+    if page_price is None:
+        return ("PAGE_PRICE_MISSING", "")
+    if page_price == 0:
+        return ("PAGE_PRICE_ZERO", "")
+    if page_price < 0:
         return ("PAGE_PRICE_MISSING", "")
     if customer_price is None or customer_price <= 0:
         return ("CUSTOMER_PRICE_MISSING", "")
@@ -1373,7 +1394,7 @@ def compute_price_changed(saas_price, page_price, page_price_status, tolerance_r
     }
     if page_price_status in pending_statuses:
         return ("PRICE_UNAVAILABLE", "页面价不可用")
-    if page_price is None or page_price <= 0:
+    if page_price is None:
         return ("PRICE_UNAVAILABLE", "页面价无效")
     if saas_price is None or saas_price <= 0:
         return ("PRICE_UNAVAILABLE", "SaaS 价格无效")
@@ -2156,7 +2177,7 @@ def read_crawler_output(path: Path) -> dict[str, dict[str, Any]]:
             if status_text == "成功":
                 results[url] = {
                     "page_price_value": price_value,
-                    "page_price_status": "OK" if price_value is not None and price_value > 0 else "PRICE_MISSING",
+                    "page_price_status": "OK" if price_value is not None else "PRICE_MISSING",
                     "page_price_source": mall_text or "",
                 }
             elif status_text == "跳过":
@@ -2288,7 +2309,7 @@ def run_zhaoshang_tasks(
         if excel_path is None or not Path(excel_path).exists():
             results[mall_cn] = {"ok": False, "error": f"模板文件不存在: {excel_path}"}
             continue
-        task_name = f"{task_name_prefix}-{date_label}-{mall_key}"
+        task_name = f"{task_name_prefix}-{date_label}-{mall_cn}"
         try:
             print(f"[zhaoshang] {mall_cn}: 提交任务 task_name={task_name}, excel={excel_path}")
             result = run_crawl_task(
@@ -2374,6 +2395,12 @@ def read_zhaoshang_result_xlsx(path):
                 results[url] = {
                     "page_price_value": price_value,
                     "page_price_status": "OK",
+                    "page_price_source": "招商局",
+                }
+            elif price_value is not None and price_value == 0:
+                results[url] = {
+                    "page_price_value": price_value,
+                    "page_price_status": "PRICE_ZERO",
                     "page_price_source": "招商局",
                 }
             elif "成功" in status_text and price_value is None:
