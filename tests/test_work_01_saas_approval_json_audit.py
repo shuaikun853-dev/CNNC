@@ -2259,3 +2259,104 @@ class TestApplyCrawlResults:
         idx_status = hdr.index(_display_header("page_price_status")) + 1
         assert ws.cell(row=2, column=idx_status).value == _display_value("FAILED")
         wb.close()
+
+
+# ---------------------------------------------------------------------------
+# 爬取模板自动导出（双 JSON 模式启动时先生成京东+震坤行 xlsx）
+# ---------------------------------------------------------------------------
+
+
+class TestExcludedTemplateAutoExport:
+    def test_dual_json_mode_auto_exports_excluded_templates(self, tmp_path):
+        """双 JSON 模式 run_main 会在解析前自动生成京东+震坤行模板。"""
+        # 准备含京东 + 震坤行的 saas 行
+        rows = [
+            {**SAMPLE_SAAS_PENDING_ROW, "vCommodityId": "v-jd",
+             "skuId": "100237336261", "extLink": "https://item.jd.com/100237336261.html",
+             "vendorName": "jd"},
+            {**SAMPLE_SAAS_PENDING_ROW, "vCommodityId": "v-zkh",
+             "skuId": "AA2130014", "extLink": "https://www.zkh.com/item/AA2130014.html",
+             "vendorName": "zkh"},
+            {**SAMPLE_SAAS_PENDING_ROW, "vCommodityId": "v-ok",
+             "skuId": "OK1", "extLink": "https://www.example.com/ok",
+             "vendorName": "demo"},
+        ]
+        cust_rows = [
+            {"documentId": "v-jd", "fourCategoryId": "c1", "fourCategoryName": "n1", "referencePrice": "100"},
+            {"documentId": "v-zkh", "fourCategoryId": "c2", "fourCategoryName": "n2", "referencePrice": "200"},
+            {"documentId": "v-ok", "fourCategoryId": "c3", "fourCategoryName": "n3", "referencePrice": "300"},
+        ]
+        saas_path = _write_pending_json(tmp_path, rows)
+        cust_path = _write_customer_json(tmp_path, cust_rows)
+        out = tmp_path / "out.xlsx"
+        excluded_root = tmp_path / "excluded"
+
+        result = run_main(
+            output_xlsx=out,
+            input_saas_json=saas_path,
+            input_customer_json=cust_path,
+            excluded_output_dir=excluded_root,
+        )
+
+        # 检查爬取模板被生成
+        export_info = result["excluded_export"]
+        assert export_info["enabled"] is True
+        assert "京东" in export_info
+        assert "震坤行" in export_info
+        assert export_info["京东"]["matched"] == 1
+        assert export_info["震坤行"]["matched"] == 1
+
+        # 检查文件存在
+        date_subdirs = list(excluded_root.iterdir())
+        assert len(date_subdirs) == 1
+        date_dir = date_subdirs[0]
+        assert (date_dir / "京东.xlsx").exists()
+        assert (date_dir / "震坤行.xlsx").exists()
+        assert (date_dir / "summary.txt").exists()
+
+        # 检查 xlsx 表头与内容
+        wb = load_workbook(str(date_dir / "京东.xlsx"))
+        ws = wb.active
+        hdr = [ws.cell(row=1, column=c).value for c in (1, 2)]
+        assert hdr == ["商品编码", "url"]
+        assert ws.cell(row=2, column=1).value == "100237336261"
+        assert ws.cell(row=2, column=2).value == "https://item.jd.com/100237336261.html"
+        wb.close()
+
+    def test_no_excluded_export_flag_skips_template(self, tmp_path):
+        """--no-excluded-export 应跳过模板导出。"""
+        rows = [
+            {**SAMPLE_SAAS_PENDING_ROW, "vCommodityId": "v-jd",
+             "extLink": "https://item.jd.com/x.html", "vendorName": "jd"},
+        ]
+        cust_rows = [{"documentId": "v-jd", "fourCategoryId": "c", "fourCategoryName": "n", "referencePrice": "100"}]
+        saas_path = _write_pending_json(tmp_path, rows)
+        cust_path = _write_customer_json(tmp_path, cust_rows)
+        out = tmp_path / "out.xlsx"
+        excluded_root = tmp_path / "excluded"
+
+        result = run_main(
+            output_xlsx=out,
+            input_saas_json=saas_path,
+            input_customer_json=cust_path,
+            excluded_output_dir=excluded_root,
+            excluded_export_disabled=True,
+        )
+
+        assert result["excluded_export"]["enabled"] is False
+        assert not excluded_root.exists()
+
+    def test_input_saas_list_json_mode_no_excluded_export(self, tmp_path):
+        """非双 JSON 模式不触发爬取模板导出。"""
+        list_path = tmp_path / "list.json"
+        list_path.write_text(json.dumps({"rows": [SAMPLE_CUSTOMER_ROW]}, ensure_ascii=False), encoding="utf-8")
+        out = tmp_path / "out.xlsx"
+        excluded_root = tmp_path / "excluded"
+
+        result = run_main(
+            output_xlsx=out,
+            input_saas_list_json=list_path,
+            excluded_output_dir=excluded_root,
+        )
+        assert result["excluded_export"]["enabled"] is False
+        assert not excluded_root.exists()

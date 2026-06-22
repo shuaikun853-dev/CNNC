@@ -1466,6 +1466,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--crawler-timeout-ms", type=int, default=18000)
     parser.add_argument("--skip-dry-run", action="store_true",
                         help="跳过 dry-run 直接正式爬（默认会先 dry-run）")
+    parser.add_argument("--excluded-output-dir", type=Path,
+                        default=ROOT / "爬取模板",
+                        help="爬取模板输出根目录（自动追加 YYYY-MM-DD 子目录）")
+    parser.add_argument("--no-excluded-export", action="store_true",
+                        help="跳过京东/震坤行爬取模板的导出")
     return parser
 
 
@@ -1515,12 +1520,44 @@ def run_main(
     crawler_per_domain_delay: float = 1.5,
     crawler_timeout_ms: int = 18000,
     skip_dry_run: bool = False,
+    excluded_output_dir: Path | None = None,
+    excluded_export_disabled: bool = False,
     crawler_runner: Any = None,
     opener: Any | None = None,
     sleep_func: Any | None = None,
     progress_func: Any | None = None,
 ) -> dict[str, Any]:
     mode = _select_input_mode(input_xlsx, input_saas_list_json, input_saas_json, input_customer_json)
+
+    # 双 JSON 模式 + 未禁用 → 先生成京东/震坤行爬取模板（公司/人工系统处理）
+    excluded_export_summary: dict[str, Any] = {"enabled": False}
+    if (
+        mode == "input_saas_json"
+        and not excluded_export_disabled
+        and input_saas_json is not None
+    ):
+        out_root = excluded_output_dir if excluded_output_dir is not None else (ROOT / "爬取模板")
+        try:
+            # 延迟 import 防止 run_main 不需要这条路径时也加载 openpyxl 二次
+            from scripts.export_excluded_malls import export_excluded_templates
+            print(f"[excluded-export] 输出根目录: {out_root}")
+            excluded_export_summary = export_excluded_templates(
+                input_saas_json=input_saas_json,
+                output_root=out_root,
+            )
+            excluded_export_summary["enabled"] = True
+            for name, info in excluded_export_summary.items():
+                if name == "_meta" or name == "enabled":
+                    continue
+                if isinstance(info, dict) and "matched" in info:
+                    print(
+                        f"[excluded-export] {name}: 命中 {info['matched']} 行，"
+                        f"去重后 {info['deduped']} 行 → {info['path']}"
+                    )
+        except Exception as exc:  # noqa: BLE001
+            # 模板导出失败不阻塞主审计
+            print(f"[excluded-export] 失败：{type(exc).__name__}: {exc}")
+            excluded_export_summary = {"enabled": True, "error": f"{type(exc).__name__}: {exc}"}
 
     if mode == "input_saas_json":
         headers, rows = read_saas_pending_json(input_saas_json)
@@ -1639,6 +1676,7 @@ def run_main(
         "rows": rows,
         "mode": mode,
         "crawler": crawler_summary,
+        "excluded_export": excluded_export_summary,
     }
 
 
@@ -1723,6 +1761,8 @@ def main(argv: list[str] | None = None) -> int:
         crawler_per_domain_delay=args.crawler_per_domain_delay,
         crawler_timeout_ms=args.crawler_timeout_ms,
         skip_dry_run=args.skip_dry_run,
+        excluded_output_dir=args.excluded_output_dir,
+        excluded_export_disabled=args.no_excluded_export,
         progress_func=_cli_progress,
     )
     print_summary(result["summary_counts"], args.output_xlsx)
