@@ -415,6 +415,21 @@ def _normalize_saas_list_row(raw: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _heal_missing_closing_brace(text: str) -> str:
+    """修复导出工具常见的缺最外层右花括号的多段 JSON。
+
+    场景：上一段 JSON 末尾 `"success": true` 后直接换行接下一段 `{`，
+    缺一个 `}` 让 json.decoder 误把后续内容当成同一对象的延续。
+    """
+    # 中间段："success": true|false 后紧跟换行 + 空白 + {  →  在两者之间补一个 }
+    text = re.sub(
+        r'("success"\s*:\s*(?:true|false))(\s*\n\s*)(\{)',
+        r"\1}\2\3",
+        text,
+    )
+    return text
+
+
 def _parse_json_segments(text: str) -> list[Any]:
     """解析"多段 JSON 首尾相连"的文本。
 
@@ -425,8 +440,9 @@ def _parse_json_segments(text: str) -> list[Any]:
         {"rspCode": "0000", "rows": [...100 行...]}
 
     标准 json.load 只读第一段，会报 "Extra data"。
-    本函数把每一段单独解析返回。
+    本函数把每一段单独解析返回；同时容错部分导出工具漏写最外层 `}` 的情况。
     """
+    text = _heal_missing_closing_brace(text)
     decoder = json.JSONDecoder()
     segments: list[Any] = []
     index = 0
@@ -436,6 +452,10 @@ def _parse_json_segments(text: str) -> list[Any]:
             index += 1
         if index >= length:
             break
+        # 兼容尾部孤立的 } / , 等冗余字符（导出工具偶尔多写一个右括号）
+        if text[index] in "}],":
+            index += 1
+            continue
         try:
             obj, end = decoder.raw_decode(text, index)
         except json.JSONDecodeError as exc:
