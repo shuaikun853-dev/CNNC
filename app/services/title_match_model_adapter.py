@@ -78,7 +78,7 @@ _PROMPT_TEMPLATE = (
     "- risk_points：写具体风险点数组，没有风险写 []。\n"
     "- reason：用一句中文说明核心判断依据，必须说明品牌、型号、规格/单位和风险点中影响结论的内容。\n"
     "\n"
-    "输出格式必须严格为：{\"match_result\":\"SAME|NOT_SAME|MANUAL_REVIEW\",\"confidence\":0.0,\"brand_match\":true,\"model_match\":\"exact|partial|mismatch|unknown\",\"spec_match\":true,\"risk_points\":[],\"reason\":\"\"}\n"
+    "输出格式必须严格为：{{\"match_result\":\"SAME|NOT_SAME|MANUAL_REVIEW\",\"confidence\":0.0,\"brand_match\":true,\"model_match\":\"exact|partial|mismatch|unknown\",\"spec_match\":true,\"risk_points\":[],\"reason\":\"\"}}\n"
     "\n"
     "query_str={query_str}\n"
     "sku_name={sku_name}\n"
