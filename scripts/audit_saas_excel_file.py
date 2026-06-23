@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import re
 import shlex
@@ -1114,6 +1115,120 @@ def run_audit(
     )
 
 
+def _run_batch_model_audit(
+    records: list[SaasSameProductApprovalItem],
+    max_workers: int = 5,
+) -> Any:
+    """批量并发模型校验。
+
+    每条 record 独立调 call_title_match_model，用 ThreadPoolExecutor 并发。
+    同一 (queryStr, skuName) 缓存，避免重复调用。
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from app.services.title_match_model_adapter import (
+        TitleMatchModelRequest,
+        TitleMatchModelResult,
+        call_title_match_model,
+    )
+    from app.workflows.work_01_saas_approval_json_audit import (
+        audit_saas_approval_item,
+        enforce_saas_audit_recommendation_only,
+        SaasSameProductApprovalAuditResponse,
+        SaasSameProductApprovalAuditResult,
+        WorkflowAction,
+    )
+
+    print(f"[model] 批量并发校验 {len(records)} 条，max_workers={max_workers}")
+
+    # 缓存 (queryStr, skuName) → TitleMatchModelResult
+    model_cache: dict[tuple[str, str], TitleMatchModelResult] = {}
+
+    def _call_model_for_record(record: SaasSameProductApprovalItem) -> tuple[int, TitleMatchModelResult | None]:
+        key = (record.queryStr or "", record.skuName or "")
+        if key in model_cache:
+            return (id(record), model_cache[key])
+        req = TitleMatchModelRequest(
+            query_str=record.queryStr,
+            sku_name=record.skuName,
+            model_audit_result=record.modelAuditResult,
+            is_match=record.isMatch,
+        )
+        result = call_title_match_model(req)
+        model_cache[key] = result
+        return (id(record), result)
+
+    # 并发调用模型
+    record_map: dict[int, TitleMatchModelResult | None] = {}
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = {pool.submit(_call_model_for_record, rec): rec for rec in records}
+        done_count = 0
+        for future in as_completed(futures):
+            rec_id, model_result = future.result()
+            record_map[rec_id] = model_result
+            done_count += 1
+            if done_count % 20 == 0:
+                print(f"[model] 完成 {done_count}/{len(records)}")
+
+    print(f"[model] 全部完成，缓存 {len(model_cache)} 个唯一 (queryStr, skuName) 对")
+
+    # 用模型结果跑 audit（传 title_model_result 避免重复调模型）
+    results: list[SaasSameProductApprovalAuditResult] = []
+    for rec in records:
+        model_result = record_map.get(id(rec))
+        result = audit_saas_approval_item(
+            rec,
+            use_model=False,  # 不再在 audit 内部调模型
+            use_link_audit=False,
+            title_model_result=model_result,
+            crawl_results=[],
+            use_crawl_result=False,
+        )
+        results.append(result)
+
+    # 构建 summary
+    groups: dict[str, list[SaasSameProductApprovalAuditResult]] = {}
+    for result in results:
+        groups.setdefault(result.vCommodityId, []).append(result)
+
+    summary: dict[str, int | str | float | bool] = {
+        "total_records": len(results),
+        "total_v_commodities": len(groups),
+        "approve_suggestion_count": len([r for r in results if r.primary_action == WorkflowAction.APPROVE]),
+        "manual_check_count": len([r for r in results if r.primary_action == WorkflowAction.MANUAL_CHECK]),
+        "reject_suggestion_count": len([r for r in results if r.primary_action == WorkflowAction.REJECT]),
+        "wait_page_price_check_count": len([r for r in results if r.price_check == "WAIT_PAGE_PRICE_CHECK"]),
+        "price_mismatch_count": len([r for r in results if r.price_check == "MISMATCH"]),
+        "sku_mismatch_count": len([r for r in results if r.sku_link_check == "MISMATCH"]),
+        "higher_than_customer_price_30_count": len([r for r in results if r.price_vs_customer_check == "HIGHER_THAN_CUSTOMER_PRICE_30"]),
+        "customer_price_missing_count": len([r for r in results if r.price_vs_customer_check == "CUSTOMER_PRICE_MISSING"]),
+        "crawl_result_matched_count": len([r for r in results if r.crawl_matched]),
+        "crawl_result_missing_count": len([r for r in results if not r.crawl_matched]),
+        "crawl_off_shelf_count": 0,
+        "crawl_sold_out_count": 0,
+        "crawl_price_missing_count": 0,
+        "crawl_failed_count": 0,
+        "crawl_price_mismatch_count": 0,
+        "model_unavailable_count": len([r for r in results if r.title_match_result == "MODEL_UNAVAILABLE"]),
+    }
+    for v_commodity_id, group_results in groups.items():
+        prefix = f"group.{v_commodity_id}"
+        summary[f"{prefix}.candidate_count"] = len(group_results)
+        summary[f"{prefix}.approve_suggestion_count"] = len([r for r in group_results if r.primary_action == WorkflowAction.APPROVE])
+        summary[f"{prefix}.manual_check_count"] = len([r for r in group_results if r.primary_action == WorkflowAction.MANUAL_CHECK])
+        summary[f"{prefix}.reject_suggestion_count"] = len([r for r in group_results if r.primary_action == WorkflowAction.REJECT])
+        summary[f"{prefix}.valid_mall_count"] = len({normalize_mall_name(r.shopName or r.vendorName) for r in group_results if normalize_mall_name(r.shopName or r.vendorName)})
+
+    return enforce_saas_audit_recommendation_only(
+        SaasSameProductApprovalAuditResponse(
+            total_records=len(results),
+            summary=summary,
+            record_results=results,
+            execution_allowed=False,
+            executed=False,
+        )
+    )
+
+
 # ---------------------------------------------------------------------------
 # Excel 输出
 # ---------------------------------------------------------------------------
@@ -1299,7 +1414,7 @@ def _collect_title_reason(audit_result):
 
 
 def _is_zhaoshang_mall(url: str) -> bool:
-    """检查 URL 是否属于 9 个招商局商城（不走 multi_mall_crawler）。"""
+    """检查 URL 是否属于招商局任务系统商城（不走 multi_mall_crawler）。"""
     host = (urlparse(url or "").hostname or "").lower()
     if not host:
         return False
@@ -2283,6 +2398,34 @@ DEFAULT_ZHAOSHANG_TOOL_PATH = Path(r"E:\.A2026\招商局自动建任务\agent\to
 # 中文名 → 招商局 mall_key 映射（动态从 excluded_export_summary 读取 mall_key）
 
 
+def _load_zhaoshang_run_crawl_task(tool_path: Path):
+    tool_path = Path(tool_path)
+    if not tool_path.exists():
+        raise FileNotFoundError(f"招商局工具不存在: {tool_path}")
+
+    project_root = tool_path.parent.parent.parent
+    if str(project_root) not in sys.path:
+        sys.path.insert(0, str(project_root))
+
+    spec = importlib.util.spec_from_file_location("zhaoshang_crawl_task_tool", str(tool_path))
+    if spec is None or spec.loader is None:
+        raise ImportError(f"无法加载招商局工具: {tool_path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    run_crawl_task = getattr(module, "run_crawl_task", None)
+    if run_crawl_task is None:
+        raise AttributeError(f"招商局工具缺少 run_crawl_task: {tool_path}")
+    return run_crawl_task
+
+
+def _safe_console_text(value: Any, limit: int = 300) -> str:
+    text = str(value)
+    if len(text) > limit:
+        text = text[:limit]
+    encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
+    return text.encode(encoding, errors="backslashreplace").decode(encoding, errors="replace")
+
+
 def run_zhaoshang_tasks(
     excluded_export_summary,
     task_name_prefix="中核价格爬取",
@@ -2346,11 +2489,12 @@ def run_zhaoshang_tasks(
                 "result_path": result.get("result_path"),
             }
         except Exception as exc:
-            print(f"[zhaoshang] {mall_cn}: 失败 {type(exc).__name__}: {exc}")
+            error = f"{type(exc).__name__}: {_safe_console_text(exc)}"
+            print(f"[zhaoshang] {_safe_console_text(mall_cn, 80)}: 失败 {error}")
             results[mall_cn] = {
                 "ok": False,
                 "task_name": task_name,
-                "error": f"{type(exc).__name__}: {str(exc)[:300]}",
+                "error": error,
             }
     return results
 
