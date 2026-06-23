@@ -21,6 +21,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from urllib.parse import urlparse
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -240,6 +241,7 @@ VALUE_DISPLAY_NAMES = {
     "PRICE_MISSING": "价格不可见",
     "PRICE_IS_ZERO": "价格为0",
     "SKIPPED_JD": "京东跳过",
+    "SKIPPED_ZHAOSHANG": "招商局处理",
     "SKIPPED_NO_LINK": "无链接跳过",
     "SKIPPED_MODEL_NOT_SAME": "模型判非同款跳过",
     "SKIPPED": "跳过",
@@ -1183,6 +1185,7 @@ VALUE_DISPLAY_NAMES = {
     # page_price_status
     "PENDING_CRAWL": "待爬取",
     "SKIPPED_JD": "跳过(京东)",
+    "SKIPPED_ZHAOSHANG": "招商局处理",
     "SKIPPED_NO_LINK": "跳过(无链接)",
     "SKIPPED_MODEL_NOT_SAME": "跳过(模型判非同款)",
     "SKIPPED": "跳过",
@@ -1295,6 +1298,29 @@ def _collect_title_reason(audit_result):
     return ";".join(chunks)
 
 
+def _is_zhaoshang_mall(url: str) -> bool:
+    """检查 URL 是否属于 9 个招商局商城（不走 multi_mall_crawler）。"""
+    host = (urlparse(url or "").hostname or "").lower()
+    if not host:
+        return False
+    zhaoshang_domains = (
+        "jd.com", "item.jd.com",
+        "zkh.com",
+        "tima365.com",
+        "zjmi-mall.com", "zjmi.com",
+        "xfs.com",
+        "ycw.cn",
+        "nbdeli.com", "nbdeli.cn", "delib2b.com",
+        "mymro.cn",
+        "colipu.com",
+    )
+    for d in zhaoshang_domains:
+        d = d.lower().lstrip(".")
+        if host == d or host.endswith("." + d):
+            return True
+    return False
+
+
 def _compute_page_price_status(row, audit_result):
     # 如果已被 apply_crawl_results_to_rows 写入最终结果，直接用
     if "__page_price_status" in row:
@@ -1310,11 +1336,11 @@ def _compute_page_price_status(row, audit_result):
             "page_price_status": "SKIPPED_NO_LINK",
             "page_price_source": "",
         }
-    if is_jd_link(ext_link):
+    if _is_zhaoshang_mall(ext_link):
         return {
             "page_price_value": None,
-            "page_price_status": "SKIPPED_JD",
-            "page_price_source": "JD",
+            "page_price_status": "SKIPPED_ZHAOSHANG",
+            "page_price_source": "招商局",
         }
     # 注意：模型 NOT_SAME 也要爬取价格（业务要求）
     # 不再跳过爬虫，让 over_30pct + saas_price_vs_customer + price_changed 一起兜底判断
@@ -1328,6 +1354,7 @@ def _compute_page_price_status(row, audit_result):
 def compute_over_30_check(customer_price, page_price, page_price_status):
     pending_statuses = {
         "SKIPPED_JD",
+        "SKIPPED_ZHAOSHANG",
         "SKIPPED_NO_LINK",
         "SKIPPED_MODEL_NOT_SAME",
         "SKIPPED",
@@ -1384,6 +1411,7 @@ def compute_price_changed(saas_price, page_price, page_price_status, tolerance_r
     """
     pending_statuses = {
         "SKIPPED_JD",
+        "SKIPPED_ZHAOSHANG",
         "SKIPPED_NO_LINK",
         "SKIPPED_MODEL_NOT_SAME",
         "SKIPPED",
@@ -1628,8 +1656,8 @@ def build_parser() -> argparse.ArgumentParser:
                         help="启用招商局自动建任务（用京东.xlsx + 震坤行.xlsx）")
     parser.add_argument("--zhaoshang-tool-path", type=Path, default=DEFAULT_ZHAOSHANG_TOOL_PATH,
                         help="招商局 crawl_task_tool.py 路径")
-    parser.add_argument("--zhaoshang-task-prefix", default="中核价格更新",
-                        help="招商局任务名前缀，默认 '中核价格更新'")
+    parser.add_argument("--zhaoshang-task-prefix", default="中核价格爬取",
+                        help="招商局任务名前缀，默认 '中核价格爬取'")
     parser.add_argument("--zhaoshang-wait-timeout", type=int, default=7200,
                         help="等待招商局任务超时秒数，默认 7200 (2小时)")
     parser.add_argument("--zhaoshang-progress-interval", type=int, default=30,
@@ -2250,46 +2278,25 @@ def apply_crawl_results_to_rows(
 
 
 DEFAULT_ZHAOSHANG_TOOL_PATH = Path(r"E:\.A2026\招商局自动建任务\agent\tools\crawl_task_tool.py")
-ZHAOSHANG_MALL_KEYS = {
-    "京东": "jd",
-    "震坤行": "zkh",
-}
 
-
-def _load_zhaoshang_run_crawl_task(tool_path):
-    """动态加载招商局工具的 run_crawl_task 函数。
-
-    通过 importlib.util.spec_from_file_location 直接从文件路径载入，
-    避免依赖招商局项目的 sys.path 结构。
-    """
-    import importlib.util
-    tool_path = Path(tool_path)
-    if not tool_path.exists():
-        raise FileNotFoundError(f"招商局工具不存在: {tool_path}")
-    spec = importlib.util.spec_from_file_location("zhaoshang_crawl_task_tool", str(tool_path))
-    if spec is None or spec.loader is None:
-        raise ImportError(f"无法加载招商局工具: {tool_path}")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    if not hasattr(module, "run_crawl_task"):
-        raise AttributeError("招商局工具未导出 run_crawl_task")
-    return module.run_crawl_task
+# 9 个商城全部走招商局任务系统（不再走 multi_mall_crawler）
+# 中文名 → 招商局 mall_key 映射（动态从 excluded_export_summary 读取 mall_key）
 
 
 def run_zhaoshang_tasks(
     excluded_export_summary,
-    task_name_prefix="中核价格更新",
+    task_name_prefix="中核价格爬取",
     tool_path=None,
     wait_timeout_seconds=7200,
     progress_interval_seconds=30,
     skip_if_exists=True,
 ):
-    """对 excluded_export_summary 里的京东/震坤行 xlsx 各跑一次招商局任务。
+    """对 excluded_export_summary 里每个有数据的商城各跑一次招商局任务。
 
+    任务命名：中核价格爬取+<商城中文名>+<时间戳HHMMSS>
     返回：
       {
-        "京东":   {"ok": True, "result_path": Path, "task_name": str, "mall_key": "jd", "rows": 35} | {"ok": False, "error": "..."},
-        "震坤行": ...,
+        "<商城名>": {"ok": True, "result_path": Path, ...} | {"ok": False, "error": "..."},
       }
     """
     tool_path = tool_path or DEFAULT_ZHAOSHANG_TOOL_PATH
@@ -2299,20 +2306,29 @@ def run_zhaoshang_tasks(
         print(f"[zhaoshang] 加载工具失败：{type(exc).__name__}: {exc}")
         return {"_error": f"{type(exc).__name__}: {exc}"}
 
-    date_label = datetime.now().strftime("%Y%m%d")
+    from datetime import datetime as _dt
+    timestamp = _dt.now().strftime("%H%M%S")
     results = {}
-    for mall_cn, mall_key in ZHAOSHANG_MALL_KEYS.items():
-        info = excluded_export_summary.get(mall_cn) if isinstance(excluded_export_summary, dict) else None
-        if not info or info.get("deduped", 0) == 0:
+
+    if not isinstance(excluded_export_summary, dict):
+        return results
+
+    for mall_cn, info in excluded_export_summary.items():
+        if mall_cn.startswith("_"):
+            continue
+        if not isinstance(info, dict) or info.get("deduped", 0) == 0:
             results[mall_cn] = {"ok": True, "skipped": True, "reason": "无可用数据行"}
             continue
+
+        mall_key = info.get("mall_key") or mall_cn
         excel_path = info.get("path")
         if excel_path is None or not Path(excel_path).exists():
             results[mall_cn] = {"ok": False, "error": f"模板文件不存在: {excel_path}"}
             continue
-        task_name = f"{task_name_prefix}-{date_label}-{mall_cn}"
+
+        task_name = f"{task_name_prefix}+{mall_cn}+{timestamp}"
         try:
-            print(f"[zhaoshang] {mall_cn}: 提交任务 task_name={task_name}, excel={excel_path}")
+            print(f"[zhaoshang] {mall_cn}: 提交任务 task_name={task_name}, mall_key={mall_key}, excel={excel_path}")
             result = run_crawl_task(
                 task_name=task_name,
                 mall_key=mall_key,

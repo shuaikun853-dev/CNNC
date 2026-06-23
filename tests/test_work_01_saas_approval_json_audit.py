@@ -1736,7 +1736,7 @@ class TestRunMainSaasJsonE2E:
         out_headers = [str(c.value or "") for c in ws[1]]
         idx_status = out_headers.index(_display_header("page_price_status")) + 1
         idx_over = out_headers.index(_display_header("over_30pct")) + 1
-        assert ws.cell(row=2, column=idx_status).value == _display_value("SKIPPED_JD")
+        assert ws.cell(row=2, column=idx_status).value == _display_value("SKIPPED_ZHAOSHANG")
         assert ws.cell(row=2, column=idx_over).value in ("", None)
         wb.close()
 
@@ -1994,8 +1994,8 @@ class TestCollectUrlsForCrawl:
         rows = [
             {**SAMPLE_SAAS_PENDING_ROW, "vCommodityId": "v1", "extLink": "https://item.jd.com/x.html"},
             {**SAMPLE_SAAS_PENDING_ROW, "vCommodityId": "v2", "extLink": ""},
-            {**SAMPLE_SAAS_PENDING_ROW, "vCommodityId": "v3", "extLink": "https://www.zkh.com/item/A.html"},
-            {**SAMPLE_SAAS_PENDING_ROW, "vCommodityId": "v3", "skuId": "x", "extLink": "https://www.zkh.com/item/A.html"},
+            {**SAMPLE_SAAS_PENDING_ROW, "vCommodityId": "v3", "extLink": "https://www.ehsy.com/product-A"},
+            {**SAMPLE_SAAS_PENDING_ROW, "vCommodityId": "v3", "skuId": "x", "extLink": "https://www.ehsy.com/product-A"},
         ]
         cust_rows = [
             {"documentId": v, "fourCategoryId": "c", "fourCategoryName": "n", "referencePrice": "100"}
@@ -2010,7 +2010,7 @@ class TestCollectUrlsForCrawl:
             input_customer_json=cust_path,
         )
         urls = collect_urls_for_crawl(result["rows"], result["enriched"], result["audit_response"])
-        assert urls == ["https://www.zkh.com/item/A.html"]
+        assert urls == ["https://www.ehsy.com/product-A"]
 
 
 class TestWriteCrawlerInput:
@@ -2123,7 +2123,7 @@ class TestApplyCrawlResults:
     def test_apply_success_high_price_marks_over_30pct(self, tmp_path):
         rows = [
             {**SAMPLE_SAAS_PENDING_ROW, "vCommodityId": "v1",
-             "extLink": "https://www.zkh.com/item/A.html",
+             "extLink": "https://www.ehsy.com/product-A",
              "customerPrice": "100", "queryStr": "test", "skuName": "test"},
         ]
         cust_rows = [{"documentId": "v1", "fourCategoryId": "c", "fourCategoryName": "n", "referencePrice": "100"}]
@@ -2137,7 +2137,7 @@ class TestApplyCrawlResults:
         )
         # 模拟爬虫返回 page_price=131
         crawl_results = {
-            "https://www.zkh.com/item/A.html": {
+            "https://www.ehsy.com/product-A": {
                 "page_price_value": Decimal("131"),
                 "page_price_status": "OK",
                 "page_price_source": "震坤行",
@@ -2168,7 +2168,7 @@ class TestApplyCrawlResults:
     def test_apply_success_within_threshold_marks_false(self, tmp_path):
         rows = [
             {**SAMPLE_SAAS_PENDING_ROW, "vCommodityId": "v1",
-             "extLink": "https://www.zkh.com/item/A.html",
+             "extLink": "https://www.ehsy.com/product-A",
              "customerPrice": "100", "queryStr": "test", "skuName": "test"},
         ]
         cust_rows = [{"documentId": "v1", "fourCategoryId": "c", "fourCategoryName": "n", "referencePrice": "100"}]
@@ -2181,7 +2181,7 @@ class TestApplyCrawlResults:
             input_customer_json=cust_path,
         )
         crawl_results = {
-            "https://www.zkh.com/item/A.html": {
+            "https://www.ehsy.com/product-A": {
                 "page_price_value": Decimal("90"),
                 "page_price_status": "OK",
                 "page_price_source": "震坤行",
@@ -2205,7 +2205,7 @@ class TestApplyCrawlResults:
     def test_apply_crawler_process_failed_marks_pending_rows(self, tmp_path):
         rows = [
             {**SAMPLE_SAAS_PENDING_ROW, "vCommodityId": "v1",
-             "extLink": "https://www.zkh.com/item/A.html",
+             "extLink": "https://www.ehsy.com/product-A",
              "customerPrice": "100"},
         ]
         cust_rows = [{"documentId": "v1", "fourCategoryId": "c", "fourCategoryName": "n", "referencePrice": "100"}]
@@ -2234,7 +2234,7 @@ class TestApplyCrawlResults:
     def test_apply_url_not_returned_marks_failed(self, tmp_path):
         rows = [
             {**SAMPLE_SAAS_PENDING_ROW, "vCommodityId": "v1",
-             "extLink": "https://www.zkh.com/item/A.html",
+             "extLink": "https://www.ehsy.com/product-A",
              "customerPrice": "100"},
         ]
         cust_rows = [{"documentId": "v1", "fourCategoryId": "c", "fourCategoryName": "n", "referencePrice": "100"}]

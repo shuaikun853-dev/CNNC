@@ -41,11 +41,27 @@ from scripts.audit_saas_excel_file import (  # noqa: E402
 )
 
 
-# 商城映射：(check_func, 输出文件名, 友好名)
+# 商城映射：(输出文件名, 域名后缀列表, vendorName 关键词列表, 招商局 mall_key)
+# 这 9 个商城全部走招商局任务系统，不走 multi_mall_crawler
 EXCLUDED_MALLS = [
-    ("京东", lambda row: is_jd_link(row.get("extLink", "")) or normalize_cell_str(row.get("vendorName")).lower() == "jd"),
-    ("震坤行", lambda row: _host_match(row.get("extLink", ""), ("zkh.com",)) or normalize_cell_str(row.get("vendorName")).lower() == "zkh"),
+    ("京东", ("jd.com", "item.jd.com"), ("jd",), "jd"),
+    ("震坤行", ("zkh.com",), ("zkh",), "zkh"),
+    ("浙江宏伟", ("tima365.com",), ("tima",), "tima"),
+    ("浙江物产", ("zjmi-mall.com", "zjmi.com"), ("zjmi",), "zjmi"),
+    ("鑫方盛商城", ("xfs.com",), ("xfs",), "xfs"),
+    ("阳采集团", ("ycw.cn",), ("ycw",), "ycw"),
+    ("得力商城", ("nbdeli.com", "nbdeli.cn", "delib2b.com"), ("nbdeli", "deli"), "nbdeli"),
+    ("固安捷商城", ("mymro.cn",), ("mymro",), "mymro"),
+    ("科力普商城", ("colipu.com",), ("colipu",), "colipu"),
 ]
+
+
+def _mall_predicate(row: dict, domains: tuple[str, ...], vendor_keywords: tuple[str, ...]) -> bool:
+    url = row.get("extLink", "") or ""
+    if _host_match(url, domains):
+        return True
+    vendor = normalize_cell_str(row.get("vendorName")).lower()
+    return any(kw in vendor for kw in vendor_keywords)
 
 
 def _host_match(url: str, suffixes: tuple[str, ...]) -> bool:
@@ -135,8 +151,12 @@ def export_excluded_templates(
         "",
     ]
 
-    for mall_name, predicate in EXCLUDED_MALLS:
-        matched = [row for row in saas_rows if predicate(row)]
+    for entry in EXCLUDED_MALLS:
+        mall_name = entry[0]
+        domains = entry[1]
+        vendor_keywords = entry[2]
+        mall_key = entry[3] if len(entry) > 3 else mall_name
+        matched = [row for row in saas_rows if _mall_predicate(row, domains, vendor_keywords)]
         seen: set[tuple[str, str]] = set()
         deduped: list[dict] = []
         for row in matched:
@@ -152,6 +172,7 @@ def export_excluded_templates(
             "matched": len(matched),
             "deduped": len(deduped),
             "path": out_path,
+            "mall_key": mall_key,
         }
         summary_lines.append(f"{mall_name}: 命中 {len(matched)} 行 / 去重后 {len(deduped)} 行")
 
