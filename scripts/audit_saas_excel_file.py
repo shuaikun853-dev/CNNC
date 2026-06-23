@@ -1554,6 +1554,7 @@ def _write_record_results_sheet(
             over_30 == "TRUE"
             or saas_vs_cust_status == "SAAS_HIGHER_THAN_CUSTOMER_30"
             or price_changed_status == "CHANGED"
+            or page_status_info["page_price_status"] == "PRICE_IS_ZERO"
         )
         for column_index, header in enumerate(final_headers, start=1):
             cell = sheet.cell(row=row_index, column=column_index)
