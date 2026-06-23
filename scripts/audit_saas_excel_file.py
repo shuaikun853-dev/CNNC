@@ -1118,83 +1118,103 @@ def run_audit(
 def _run_batch_model_audit(
     records: list[SaasSameProductApprovalItem],
     max_workers: int = 5,
+    batch_size: int = 20,
 ) -> Any:
-    """批量并发模型校验。
+    """批量模型校验（使用 call_title_match_model_batch 一次请求多条）。
 
-    每条 record 独立调 call_title_match_model，用 ThreadPoolExecutor 并发。
-    同一 (queryStr, skuName) 缓存，避免重复调用。
+    策略：
+    1. 先按 (queryStr, skuName) 去重，减少调用量
+    2. 按 batch_size 分批，每批一次 API 请求
+    3. 多批之间用 ThreadPoolExecutor 并发
     """
     from concurrent.futures import ThreadPoolExecutor, as_completed
     from app.services.title_match_model_adapter import (
         TitleMatchModelRequest,
         TitleMatchModelResult,
-        call_title_match_model,
+        call_title_match_model_batch,
     )
     from app.workflows.work_01_saas_approval_json_audit import (
         audit_saas_approval_item,
         enforce_saas_audit_recommendation_only,
         SaasSameProductApprovalAuditResponse,
-        SaasSameProductApprovalAuditResult,
         WorkflowAction,
     )
 
-    print(f"[model] 批量并发校验 {len(records)} 条，max_workers={max_workers}")
+    print(f"[model] 批量校验 {len(records)} 条，batch_size={batch_size}")
 
-    # 缓存 (queryStr, skuName) → TitleMatchModelResult
-    model_cache: dict[tuple[str, str], TitleMatchModelResult] = {}
+    # 去重：同一 (queryStr, skuName) 只调一次
+    unique_pairs: list[tuple[str, str, str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for rec in records:
+        key = (rec.queryStr or "", rec.skuName or "")
+        if key in seen:
+            continue
+        seen.add(key)
+        unique_pairs.append((rec.queryStr or "", rec.skuName or "", rec.modelAuditResult or "", rec.isMatch or ""))
 
-    def _call_model_for_record(record: SaasSameProductApprovalItem) -> tuple[int, TitleMatchModelResult | None]:
-        key = (record.queryStr or "", record.skuName or "")
-        if key in model_cache:
-            return (id(record), model_cache[key])
-        req = TitleMatchModelRequest(
-            query_str=record.queryStr,
-            sku_name=record.skuName,
-            model_audit_result=record.modelAuditResult,
-            is_match=record.isMatch,
-        )
-        result = call_title_match_model(req)
-        model_cache[key] = result
-        return (id(record), result)
+    print(f"[model] 去重后 {len(unique_pairs)} 个唯一 (queryStr, skuName) 对")
 
-    # 并发调用模型
-    record_map: dict[int, TitleMatchModelResult | None] = {}
-    with ThreadPoolExecutor(max_workers=max_workers) as pool:
-        futures = {pool.submit(_call_model_for_record, rec): rec for rec in records}
+    # 分批
+    batches: list[list[TitleMatchModelRequest]] = []
+    for i in range(0, len(unique_pairs), batch_size):
+        chunk = unique_pairs[i:i + batch_size]
+        batches.append([
+            TitleMatchModelRequest(query_str=q, sku_name=s, model_audit_result=m, is_match=im)
+            for q, s, m, im in chunk
+        ])
+
+    print(f"[model] 分成 {len(batches)} 批，每批最多 {batch_size} 条，{min(max_workers, len(batches))} 并发")
+
+    # 并发调批量接口
+    pair_to_result: dict[tuple[str, str], TitleMatchModelResult] = {}
+
+    def _call_batch(batch_idx: int, batch: list[TitleMatchModelRequest]):
+        results = call_title_match_model_batch(batch)
+        return batch_idx, batch, results
+
+    with ThreadPoolExecutor(max_workers=min(max_workers, len(batches))) as pool:
+        futures = {pool.submit(_call_batch, i, b): i for i, b in enumerate(batches)}
         done_count = 0
         for future in as_completed(futures):
-            rec_id, model_result = future.result()
-            record_map[rec_id] = model_result
+            batch_idx, batch, results = future.result()
+            for idx, req in enumerate(batch):
+                key = (req.query_str, req.sku_name)
+                pair_to_result[key] = results.get(idx, TitleMatchModelResult(
+                    match_result="MANUAL_REVIEW",
+                    confidence=0.0,
+                    model_match="unknown",
+                    reason="批量模型未返回该条结果",
+                ))
             done_count += 1
-            if done_count % 20 == 0:
-                print(f"[model] 完成 {done_count}/{len(records)}")
+            print(f"[model] 批次 {done_count}/{len(batches)} 完成")
 
-    print(f"[model] 全部完成，缓存 {len(model_cache)} 个唯一 (queryStr, skuName) 对")
+    print(f"[model] 全部完成，{len(pair_to_result)} 个结果")
 
-    # 用模型结果跑 audit（传 title_model_result 避免重复调模型）
-    results: list[SaasSameProductApprovalAuditResult] = []
+    # 用模型结果跑 audit
+    results_list: list = []
     for rec in records:
-        model_result = record_map.get(id(rec))
+        key = (rec.queryStr or "", rec.skuName or "")
+        model_result = pair_to_result.get(key)
         result = audit_saas_approval_item(
             rec,
-            use_model=False,  # 不再在 audit 内部调模型
+            use_model=False,
             use_link_audit=False,
             title_model_result=model_result,
             crawl_results=[],
             use_crawl_result=False,
         )
-        results.append(result)
+        results_list.append(result)
 
     # 构建 summary
-    groups: dict[str, list[SaasSameProductApprovalAuditResult]] = {}
-    for result in results:
+    groups: dict[str, list] = {}
+    for result in results_list:
         groups.setdefault(result.vCommodityId, []).append(result)
 
     summary: dict[str, int | str | float | bool] = {
-        "total_records": len(results),
+        "total_records": len(results_list),
         "total_v_commodities": len(groups),
-        "approve_suggestion_count": len([r for r in results if r.primary_action == WorkflowAction.APPROVE]),
-        "manual_check_count": len([r for r in results if r.primary_action == WorkflowAction.MANUAL_CHECK]),
+        "approve_suggestion_count": len([r for r in results_list if r.primary_action == WorkflowAction.APPROVE]),
+        "manual_check_count": len([r for r in results_list if r.primary_action == WorkflowAction.MANUAL_CHECK]),
         "reject_suggestion_count": len([r for r in results if r.primary_action == WorkflowAction.REJECT]),
         "wait_page_price_check_count": len([r for r in results if r.price_check == "WAIT_PAGE_PRICE_CHECK"]),
         "price_mismatch_count": len([r for r in results if r.price_check == "MISMATCH"]),
@@ -2486,6 +2506,7 @@ def run_zhaoshang_tasks(
                 "task_name": task_name,
                 "mall_key": mall_key,
                 "rows": info.get("deduped", 0),
+                "template_path": str(excel_path),
                 "result_path": result.get("result_path"),
             }
         except Exception as exc:
@@ -2599,6 +2620,189 @@ def apply_zhaoshang_results_to_rows(rows, enriched, audit_response, zhaoshang_su
             mapped = read_zhaoshang_result_xlsx(Path(result_path))
             url_to_result.update(mapped)
             print(f"[zhaoshang] {mall_cn}: 回填 {len(mapped)} 条页面价")
+
+    if not url_to_result:
+        return 0
+
+    backfilled = 0
+    for row in rows:
+        url = _normalize_url(row.get("extLink"))
+        if not url:
+            continue
+        hit = url_to_result.get(url)
+        if hit is None:
+            continue
+        row["__page_price_value"] = hit["page_price_value"]
+        row["__page_price_status"] = hit["page_price_status"]
+        row["__page_price_source"] = hit["page_price_source"]
+        backfilled += 1
+    return backfilled
+
+
+def _read_zhaoshang_template_code_url_map(template_path: Path | str | None) -> dict[str, str]:
+    """Read the import template exported for Zhaoshang and map product code to URL."""
+    if not template_path:
+        return {}
+    path = Path(template_path)
+    if not path.exists():
+        return {}
+    wb = load_workbook(filename=str(path), data_only=True, read_only=True)
+    try:
+        sheet = wb.active
+        if sheet is None:
+            return {}
+        iterator = sheet.iter_rows(values_only=True)
+        try:
+            header_row = next(iterator)
+        except StopIteration:
+            return {}
+        headers = [str(v).strip() if v is not None else "" for v in header_row]
+
+        def find_header(*names: str) -> int:
+            for name in names:
+                if name in headers:
+                    return headers.index(name)
+            return -1
+
+        code_idx = find_header("\u5546\u54c1\u7f16\u7801", "skuId", "sku_id", "code")
+        url_idx = find_header("url", "URL", "\u94fe\u63a5", "\u5546\u54c1URL", "\u5546\u54c1\u94fe\u63a5")
+        if code_idx < 0 or url_idx < 0:
+            return {}
+
+        mapping: dict[str, str] = {}
+        for raw in iterator:
+            if raw is None or code_idx >= len(raw) or url_idx >= len(raw):
+                continue
+            code = normalize_cell_str(raw[code_idx])
+            url = _normalize_url(raw[url_idx])
+            if code and url and code not in mapping:
+                mapping[code] = url
+        return mapping
+    finally:
+        wb.close()
+
+
+def read_zhaoshang_result_xlsx(path, template_path: Path | str | None = None):
+    """Read Zhaoshang result xlsx.
+
+    Some result files do not include the original URL. In that case, map
+    product code back to URL through the exported import template.
+    """
+    path = Path(path)
+    if not path.exists():
+        return {}
+    code_to_url = _read_zhaoshang_template_code_url_map(template_path)
+    wb = load_workbook(filename=str(path), data_only=True, read_only=True)
+    try:
+        sheet = wb.active
+        if sheet is None:
+            return {}
+        iterator = sheet.iter_rows(values_only=True)
+        try:
+            header_row = next(iterator)
+        except StopIteration:
+            return {}
+        headers = [str(v).strip() if v is not None else "" for v in header_row]
+
+        def find_header(*names: str) -> int:
+            for name in names:
+                if name in headers:
+                    return headers.index(name)
+            return -1
+
+        url_idx = find_header(
+            "\u539f\u59cb\u94fe\u63a5",
+            "url",
+            "URL",
+            "\u5546\u54c1\u94fe\u63a5",
+            "\u94fe\u63a5",
+            "\u5546\u54c1URL",
+        )
+        code_idx = find_header(
+            "\u5546\u54c1\u7f16\u7801",
+            "\u5546\u54c1\u6700\u5c0f\u54c1\u7c7b\u5355\u5143id",
+            "skuId",
+            "sku_id",
+            "code",
+        )
+        price_idx = find_header(
+            "\u5546\u54c1\u4ef7\u683c",
+            "\u4ef7\u683c",
+            "\u91c7\u96c6\u4ef7\u683c",
+            "page_price",
+        )
+        status_idx = find_header("\u91c7\u96c6\u72b6\u6001", "\u72b6\u6001")
+        reason_idx = find_header("\u5931\u8d25\u539f\u56e0", "\u539f\u56e0")
+
+        if url_idx < 0 and (code_idx < 0 or not code_to_url):
+            return {}
+
+        results = {}
+        for raw in iterator:
+            if raw is None:
+                continue
+
+            url = ""
+            if 0 <= url_idx < len(raw):
+                url = _normalize_url(raw[url_idx])
+            if not url and 0 <= code_idx < len(raw):
+                url = code_to_url.get(normalize_cell_str(raw[code_idx]), "")
+            if not url:
+                continue
+
+            price_value = None
+            if 0 <= price_idx < len(raw):
+                price_value = parse_decimal(raw[price_idx])
+            status_text = str(raw[status_idx]).strip() if 0 <= status_idx < len(raw) and raw[status_idx] is not None else ""
+            reason_text = str(raw[reason_idx]).strip() if 0 <= reason_idx < len(raw) and raw[reason_idx] is not None else ""
+
+            if price_value is not None and price_value > 0:
+                results[url] = {
+                    "page_price_value": price_value,
+                    "page_price_status": "OK",
+                    "page_price_source": "\u62db\u5546\u5c40",
+                }
+            elif price_value is not None and price_value == 0:
+                results[url] = {
+                    "page_price_value": price_value,
+                    "page_price_status": "PRICE_ZERO",
+                    "page_price_source": "\u62db\u5546\u5c40",
+                }
+            elif "\u6210\u529f" in status_text and price_value is None:
+                results[url] = {
+                    "page_price_value": None,
+                    "page_price_status": "PRICE_MISSING",
+                    "page_price_source": "\u62db\u5546\u5c40-\u4ef7\u683c\u4e0d\u53ef\u89c1",
+                }
+            else:
+                results[url] = {
+                    "page_price_value": None,
+                    "page_price_status": "FAILED",
+                    "page_price_source": "\u62db\u5546\u5c40-" + (reason_text or status_text or "\u672a\u77e5"),
+                }
+        return results
+    finally:
+        wb.close()
+
+
+def apply_zhaoshang_results_to_rows(rows, enriched, audit_response, zhaoshang_summary):
+    """Backfill Zhaoshang prices onto source rows by URL."""
+    url_to_result = {}
+    if isinstance(zhaoshang_summary, dict):
+        for mall_cn, info in zhaoshang_summary.items():
+            if str(mall_cn).startswith("_"):
+                continue
+            if not isinstance(info, dict) or not info.get("ok") or info.get("skipped"):
+                continue
+            result_path = info.get("result_path")
+            if not result_path:
+                continue
+            mapped = read_zhaoshang_result_xlsx(
+                Path(result_path),
+                template_path=info.get("template_path"),
+            )
+            url_to_result.update(mapped)
+            print(f"[zhaoshang] {_safe_console_text(mall_cn, 80)}: backfill mapped {len(mapped)} rows")
 
     if not url_to_result:
         return 0
