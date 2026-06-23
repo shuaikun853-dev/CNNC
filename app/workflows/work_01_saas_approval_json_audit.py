@@ -1,4 +1,6 @@
+import os
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from decimal import Decimal
 
@@ -19,6 +21,7 @@ from app.services.link_audit_worker import (
 from app.services.title_match_model_adapter import (
     TitleMatchModelRequest,
     TitleMatchModelResult,
+    call_title_match_model_batch,
     call_title_match_model,
 )
 
@@ -390,6 +393,162 @@ def _title_result_from_model_or_rule(
     return model_result.match_result, model_result.confidence, evidence
 
 
+def _title_model_cache_key(item: SaasSameProductApprovalItem) -> tuple[str, str, str, str]:
+    return (
+        item.queryStr or "",
+        item.skuName or "",
+        item.modelAuditResult or "",
+        item.isMatch or "",
+    )
+
+
+def _title_model_concurrency(default: int = 8) -> int:
+    raw = os.environ.get("TITLE_MATCH_MODEL_CONCURRENCY", "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return max(1, value)
+
+
+def _title_model_batch_size(default: int = 30) -> int:
+    raw = os.environ.get("TITLE_MATCH_MODEL_BATCH_SIZE", "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return max(1, value)
+
+
+def _title_model_batch_concurrency(default: int = 1) -> int:
+    raw = os.environ.get("TITLE_MATCH_MODEL_BATCH_CONCURRENCY", "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return max(1, value)
+
+
+def _call_title_model_for_item(item: SaasSameProductApprovalItem) -> TitleMatchModelResult:
+    return call_title_match_model(
+        TitleMatchModelRequest(
+            query_str=item.queryStr,
+            sku_name=item.skuName,
+            model_audit_result=item.modelAuditResult,
+            is_match=item.isMatch,
+        )
+    )
+
+
+def _precompute_title_model_results(
+    records: list[SaasSameProductApprovalItem],
+) -> dict[tuple[str, str, str, str], TitleMatchModelResult]:
+    unique_records: dict[tuple[str, str, str, str], SaasSameProductApprovalItem] = {}
+    for record in records:
+        unique_records.setdefault(_title_model_cache_key(record), record)
+    if not unique_records:
+        return {}
+
+    batch_size = _title_model_batch_size()
+    if batch_size > 1:
+        items = list(unique_records.items())
+        results: dict[tuple[str, str, str, str], TitleMatchModelResult] = {}
+        total_batches = (len(items) + batch_size - 1) // batch_size
+        batch_concurrency = min(_title_model_batch_concurrency(), total_batches)
+        print(
+            f"[model] 标题模型批量调用: rows={len(records)} unique={len(unique_records)} "
+            f"batch_size={batch_size} batches={total_batches} batch_concurrency={batch_concurrency}",
+            flush=True,
+        )
+        batches = []
+        for batch_number in range(total_batches):
+            start = batch_number * batch_size
+            chunk = items[start:start + batch_size]
+            requests = [
+                TitleMatchModelRequest(
+                    query_str=record.queryStr,
+                    sku_name=record.skuName,
+                    model_audit_result=record.modelAuditResult,
+                    is_match=record.isMatch,
+                )
+                for _key, record in chunk
+            ]
+            batches.append((batch_number, chunk, requests))
+
+        def run_batch(batch_info):
+            batch_number, chunk, requests = batch_info
+            batch_results = call_title_match_model_batch(requests)
+            return batch_number, chunk, batch_results
+
+        completed = 0
+        if batch_concurrency <= 1:
+            for batch_info in batches:
+                batch_number, chunk, batch_results = run_batch(batch_info)
+                for index, (key, _record) in enumerate(chunk):
+                    results[key] = batch_results[index]
+                completed += 1
+                print(f"[model] 批量调用进度: {completed}/{total_batches}", flush=True)
+        else:
+            with ThreadPoolExecutor(max_workers=batch_concurrency) as executor:
+                future_to_batch = {
+                    executor.submit(run_batch, batch_info): batch_info[0]
+                    for batch_info in batches
+                }
+                for future in as_completed(future_to_batch):
+                    try:
+                        _batch_number, chunk, batch_results = future.result()
+                    except Exception as exc:  # noqa: BLE001
+                        batch_number = future_to_batch[future]
+                        chunk = batches[batch_number][1]
+                        batch_results = {
+                            index: TitleMatchModelResult(
+                                match_result="MANUAL_REVIEW",
+                                confidence=0.0,
+                                model_match="unknown",
+                                reason=f"标题模型批量并发调用失败，已降级人工核查: {type(exc).__name__}",
+                            )
+                            for index in range(len(chunk))
+                        }
+                    for index, (key, _record) in enumerate(chunk):
+                        results[key] = batch_results[index]
+                    completed += 1
+                    print(f"[model] 批量调用进度: {completed}/{total_batches}", flush=True)
+        return results
+
+    concurrency = min(_title_model_concurrency(), len(unique_records))
+    print(f"[model] 标题模型逐条调用: rows={len(records)} unique={len(unique_records)} concurrency={concurrency}", flush=True)
+    results: dict[tuple[str, str, str, str], TitleMatchModelResult] = {}
+    if concurrency <= 1:
+        return {
+            key: _call_title_model_for_item(record)
+            for key, record in unique_records.items()
+        }
+
+    with ThreadPoolExecutor(max_workers=concurrency) as executor:
+        future_to_key = {
+            executor.submit(_call_title_model_for_item, record): key
+            for key, record in unique_records.items()
+        }
+        for future in as_completed(future_to_key):
+            key = future_to_key[future]
+            try:
+                results[key] = future.result()
+            except Exception as exc:  # noqa: BLE001
+                results[key] = TitleMatchModelResult(
+                    match_result="MANUAL_REVIEW",
+                    confidence=0.0,
+                    model_match="unknown",
+                    reason=f"标题模型并发调用失败，已降级人工核查: {type(exc).__name__}",
+                )
+    return results
+
+
 def _decide_action(
     title_result: str,
     sku_check: str,
@@ -595,11 +754,13 @@ def audit_saas_approval_records(
     crawl_results: list[InternalCrawlResult] | None = None,
     use_crawl_result: bool = True,
 ) -> SaasSameProductApprovalAuditResponse:
+    title_model_results = _precompute_title_model_results(records) if use_model else {}
     results = [
         audit_saas_approval_item(
             record,
-            use_model=use_model,
+            use_model=False if use_model else use_model,
             use_link_audit=use_link_audit,
+            title_model_result=title_model_results.get(_title_model_cache_key(record)),
             crawl_results=crawl_results,
             use_crawl_result=use_crawl_result,
         )

@@ -22,6 +22,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urlparse
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
@@ -51,6 +52,15 @@ SENSITIVE_HEADER_NAMES = {
 
 DEFAULT_DOCUMENT_ID_FIELD = "documentId"
 DEFAULT_CATEGORY_ID_FIELD = "fourCategoryId"
+
+
+def _elapsed_seconds(start: float) -> str:
+    return f"{time.perf_counter() - start:.2f}s"
+
+
+def _log_step(component: str, message: str, *, start: float | None = None) -> None:
+    elapsed = f" elapsed={_elapsed_seconds(start)}" if start is not None else ""
+    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [{component}] {message}{elapsed}", flush=True)
 
 INPUT_BASE_FIELDS = [
     "documentId",
@@ -1797,6 +1807,8 @@ def build_parser() -> argparse.ArgumentParser:
                         help="等待招商局任务超时秒数，默认 7200 (2小时)")
     parser.add_argument("--zhaoshang-progress-interval", type=int, default=30,
                         help="招商局进度查询间隔秒数，默认 30")
+    parser.add_argument("--zhaoshang-concurrency", type=int, default=6,
+                        help="招商局商城任务并发数，默认 6")
     return parser
 
 
@@ -1853,6 +1865,7 @@ def run_main(
     zhaoshang_task_prefix: str = "中核价格更新",
     zhaoshang_wait_timeout: int = 7200,
     zhaoshang_progress_interval: int = 30,
+    zhaoshang_concurrency: int = 6,
     crawler_runner: Any = None,
     opener: Any | None = None,
     sleep_func: Any | None = None,
@@ -1894,6 +1907,27 @@ def run_main(
             print(f"[excluded-export] 失败：{type(exc).__name__}: {exc}")
             excluded_export_summary = {"enabled": True, "error": f"{type(exc).__name__}: {exc}"}
 
+    zhaoshang_summary: dict[str, Any] = {"enabled": False}
+    zhaoshang_executor: ThreadPoolExecutor | None = None
+    zhaoshang_future = None
+    if zhaoshang_task_enabled and mode == "input_saas_json":
+        zhaoshang_start = time.perf_counter()
+        _log_step(
+            "zhaoshang",
+            f"submit async tasks concurrency={max(1, zhaoshang_concurrency)}",
+        )
+        zhaoshang_executor = ThreadPoolExecutor(max_workers=1)
+        zhaoshang_future = zhaoshang_executor.submit(
+            run_zhaoshang_tasks,
+            excluded_export_summary=excluded_export_summary,
+            task_name_prefix=zhaoshang_task_prefix,
+            tool_path=zhaoshang_tool_path,
+            wait_timeout_seconds=zhaoshang_wait_timeout,
+            progress_interval_seconds=zhaoshang_progress_interval,
+            skip_if_exists=True,
+            max_workers=zhaoshang_concurrency,
+        )
+
     if mode == "input_saas_json":
         headers, rows = read_saas_pending_json(input_saas_json)
         customer_index = build_customer_index(input_customer_json)
@@ -1910,6 +1944,8 @@ def run_main(
         raise ValueError(f"输入没有数据行：{source_path}")
 
     curl_template = load_curl_file(curl_file) if curl_file is not None else None
+    detail_start = time.perf_counter()
+    _log_step("detail", f"start rows={len(rows)}")
     enriched = enrich_rows_with_customer_price(
         rows,
         curl_template,
@@ -1920,15 +1956,20 @@ def run_main(
         sleep_func=sleep_func,
         progress_func=progress_func,
     )
+    _log_step("detail", f"completed rows={len(enriched)}", start=detail_start)
     records = build_records(rows, enriched)
+    model_start = time.perf_counter()
+    _log_step("model", f"start rows={len(records)} use_model={use_model}")
     audit_response = run_audit(records, use_model=use_model)
+    _log_step("model", "completed", start=model_start)
 
     crawler_summary: dict[str, Any] = {"enabled": enable_crawler}
     if enable_crawler:
+        crawler_stage_start = time.perf_counter()
         urls_to_crawl = collect_urls_for_crawl(rows, enriched, audit_response)
         crawler_summary["urls_total"] = len(urls_to_crawl)
         if not urls_to_crawl:
-            print("[crawler] 没有需要爬取的链接（PENDING_CRAWL=0），跳过爬虫")
+            _log_step("crawler", "no pending URLs, skipped")
             apply_crawl_results_to_rows(rows, enriched, audit_response, crawl_results_by_url={}, crawler_process_failed=False)
         else:
             script_path = crawler_script if crawler_script is not None else DEFAULT_CRAWLER_SCRIPT
@@ -1938,14 +1979,14 @@ def run_main(
             dry_run_xlsx_path = runtime_dir / CRAWL_DRY_RUN_FILENAME
             output_xlsx_path = runtime_dir / CRAWL_OUTPUT_FILENAME
 
-            print(f"[crawler] 待爬 URL 数（去重后）：{len(urls_to_crawl)}")
-            print(f"[crawler] 输入 xlsx：{input_xlsx_path}")
+            _log_step("crawler", f"pending_urls={len(urls_to_crawl)} input={input_xlsx_path}")
             write_crawler_input_xlsx(urls_to_crawl, input_xlsx_path)
 
             crawler_process_failed = False
 
             if not skip_dry_run:
-                print(f"[crawler] dry-run 验证链接识别...")
+                dry_start = time.perf_counter()
+                _log_step("crawler", "dry-run start")
                 dry_result = run_crawler_subprocess(
                     crawler_script=script_path,
                     input_xlsx=input_xlsx_path,
@@ -1958,13 +1999,15 @@ def run_main(
                     limit=len(urls_to_crawl),
                     runner=crawler_runner,
                 )
+                _log_step("crawler", f"dry-run completed ok={dry_result['ok']}", start=dry_start)
                 crawler_summary["dry_run"] = dry_result
                 if not dry_result["ok"]:
                     print(f"[crawler] dry-run 失败：{dry_result['error']}")
                     crawler_process_failed = True
 
             if not crawler_process_failed:
-                print(f"[crawler] 正式爬取...")
+                run_start = time.perf_counter()
+                _log_step("crawler", "run start")
                 run_result = run_crawler_subprocess(
                     crawler_script=script_path,
                     input_xlsx=input_xlsx_path,
@@ -1977,6 +2020,7 @@ def run_main(
                     limit=len(urls_to_crawl),
                     runner=crawler_runner,
                 )
+                _log_step("crawler", f"run completed ok={run_result['ok']}", start=run_start)
                 crawler_summary["run"] = run_result
                 if not run_result["ok"]:
                     print(f"[crawler] 正式爬取失败：{run_result['error']}")
@@ -1986,7 +2030,7 @@ def run_main(
             if not crawler_process_failed:
                 try:
                     crawl_results_by_url = read_crawler_output(output_xlsx_path)
-                    print(f"[crawler] 读回 {len(crawl_results_by_url)} 条结果")
+                    _log_step("crawler", f"loaded results={len(crawl_results_by_url)}")
                 except Exception as exc:  # noqa: BLE001
                     print(f"[crawler] 读取爬虫输出失败：{type(exc).__name__}: {exc}")
                     crawler_process_failed = True
@@ -2000,29 +2044,37 @@ def run_main(
             )
             crawler_summary["crawler_process_failed"] = crawler_process_failed
             crawler_summary["urls_returned"] = len(crawl_results_by_url)
+        _log_step("crawler", "stage completed", start=crawler_stage_start)
 
-    # 招商局自动建任务（京东/震坤行走招商局系统）
-    zhaoshang_summary: dict[str, Any] = {"enabled": False}
-    if zhaoshang_task_enabled and mode == "input_saas_json":
-        print("\n[zhaoshang] 招商局自动建任务启动...")
-        zhaoshang_results = run_zhaoshang_tasks(
-            excluded_export_summary=excluded_export_summary,
-            task_name_prefix=zhaoshang_task_prefix,
-            tool_path=zhaoshang_tool_path,
-            wait_timeout_seconds=zhaoshang_wait_timeout,
-            progress_interval_seconds=zhaoshang_progress_interval,
-            skip_if_exists=True,
+    # 招商局任务在模板导出后已异步启动；这里等待结果并回填页面价。
+    if zhaoshang_future is not None:
+        _log_step("zhaoshang", "waiting async tasks")
+        try:
+            zhaoshang_results = zhaoshang_future.result()
+        finally:
+            if zhaoshang_executor is not None:
+                zhaoshang_executor.shutdown(wait=True)
+        zhaoshang_meta = zhaoshang_results.get("_meta", {}) if isinstance(zhaoshang_results, dict) else {}
+        task_elapsed = zhaoshang_meta.get("elapsed_seconds")
+        task_elapsed_text = f"{task_elapsed:.2f}s" if isinstance(task_elapsed, (int, float)) else "unknown"
+        _log_step(
+            "zhaoshang",
+            f"async tasks joined task_elapsed={task_elapsed_text} overlapped_since_submit={_elapsed_seconds(zhaoshang_start)}",
         )
         zhaoshang_summary = {
             "enabled": True,
             "results": zhaoshang_results,
         }
+        backfill_start = time.perf_counter()
         backfilled = apply_zhaoshang_results_to_rows(rows, enriched, audit_response, zhaoshang_results)
         zhaoshang_summary["backfilled"] = backfilled
+        _log_step("zhaoshang", f"backfilled {backfilled} rows", start=backfill_start)
         if backfilled > 0:
             print(f"[zhaoshang] 回填 {backfilled} 条京东/震坤行价格")
 
+    write_start = time.perf_counter()
     write_audit_workbook(output_xlsx, headers, rows, enriched, audit_response)
+    _log_step("output", f"workbook written: {output_xlsx}", start=write_start)
     summary_counts = _build_summary_counts(audit_response, enriched)
     return {
         "summary_counts": summary_counts,
@@ -2125,6 +2177,7 @@ def main(argv: list[str] | None = None) -> int:
         zhaoshang_task_prefix=args.zhaoshang_task_prefix,
         zhaoshang_wait_timeout=args.zhaoshang_wait_timeout,
         zhaoshang_progress_interval=args.zhaoshang_progress_interval,
+        zhaoshang_concurrency=args.zhaoshang_concurrency,
         progress_func=_cli_progress,
     )
     print_summary(result["summary_counts"], args.output_xlsx)
@@ -2453,6 +2506,7 @@ def run_zhaoshang_tasks(
     wait_timeout_seconds=7200,
     progress_interval_seconds=30,
     skip_if_exists=True,
+    max_workers=6,
 ):
     """对 excluded_export_summary 里每个有数据的商城各跑一次招商局任务。
 
@@ -2820,6 +2874,114 @@ def apply_zhaoshang_results_to_rows(rows, enriched, audit_response, zhaoshang_su
         row["__page_price_source"] = hit["page_price_source"]
         backfilled += 1
     return backfilled
+
+
+def run_zhaoshang_tasks(
+    excluded_export_summary,
+    task_name_prefix="中核价格爬取",
+    tool_path=None,
+    wait_timeout_seconds=7200,
+    progress_interval_seconds=30,
+    skip_if_exists=True,
+    max_workers=6,
+):
+    """Run one Zhaoshang task per mall, concurrently."""
+    group_start = time.perf_counter()
+    tool_path = tool_path or DEFAULT_ZHAOSHANG_TOOL_PATH
+    try:
+        run_crawl_task = _load_zhaoshang_run_crawl_task(tool_path)
+    except Exception as exc:
+        _log_step("zhaoshang", f"load tool failed {type(exc).__name__}: {_safe_console_text(exc)}")
+        return {"_error": f"{type(exc).__name__}: {exc}"}
+
+    results: dict[str, dict[str, Any]] = {}
+    if not isinstance(excluded_export_summary, dict):
+        return results
+
+    timestamp = datetime.now().strftime("%H%M%S")
+    jobs: list[tuple[str, dict[str, Any], str, Path, str]] = []
+    for mall_cn, info in excluded_export_summary.items():
+        if str(mall_cn).startswith("_") or mall_cn == "enabled":
+            continue
+        if not isinstance(info, dict) or info.get("deduped", 0) == 0:
+            results[mall_cn] = {"ok": True, "skipped": True, "reason": "无可用数据行"}
+            continue
+
+        mall_key = info.get("mall_key") or mall_cn
+        excel_path = info.get("path")
+        if excel_path is None or not Path(excel_path).exists():
+            results[mall_cn] = {"ok": False, "error": f"模板文件不存在: {excel_path}"}
+            continue
+
+        task_name = f"{task_name_prefix}+{mall_cn}+{timestamp}"
+        jobs.append((mall_cn, info, mall_key, Path(excel_path), task_name))
+
+    if not jobs:
+        return results
+
+    worker_count = max(1, min(int(max_workers or 1), len(jobs)))
+    _log_step("zhaoshang", f"run mall tasks total={len(jobs)} concurrency={worker_count}")
+
+    def run_one(job: tuple[str, dict[str, Any], str, Path, str]) -> tuple[str, dict[str, Any]]:
+        mall_cn, info, mall_key, excel_path, task_name = job
+        task_start = time.perf_counter()
+        try:
+            _log_step(
+                "zhaoshang",
+                f"{_safe_console_text(mall_cn, 80)} submit task_name={_safe_console_text(task_name, 160)} mall_key={mall_key} rows={info.get('deduped', 0)}",
+            )
+            result = run_crawl_task(
+                task_name=task_name,
+                mall_key=mall_key,
+                excel_path=str(excel_path),
+                wait_timeout_seconds=wait_timeout_seconds,
+                progress_interval_seconds=progress_interval_seconds,
+                skip_if_exists=skip_if_exists,
+            )
+            _log_step(
+                "zhaoshang",
+                f"{_safe_console_text(mall_cn, 80)} completed result={_safe_console_text(result.get('result_path'), 200)}",
+                start=task_start,
+            )
+            return mall_cn, {
+                "ok": True,
+                "task_name": task_name,
+                "mall_key": mall_key,
+                "rows": info.get("deduped", 0),
+                "template_path": str(excel_path),
+                "result_path": result.get("result_path"),
+            }
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {_safe_console_text(exc)}"
+            _log_step("zhaoshang", f"{_safe_console_text(mall_cn, 80)} failed {error}", start=task_start)
+            return mall_cn, {
+                "ok": False,
+                "task_name": task_name,
+                "error": error,
+            }
+
+    if worker_count <= 1:
+        for job in jobs:
+            mall_cn, result = run_one(job)
+            results[mall_cn] = result
+    else:
+        with ThreadPoolExecutor(max_workers=worker_count) as pool:
+            future_to_mall = {pool.submit(run_one, job): job[0] for job in jobs}
+            for future in as_completed(future_to_mall):
+                mall_cn = future_to_mall[future]
+                try:
+                    result_mall, result = future.result()
+                except Exception as exc:  # noqa: BLE001
+                    result_mall = mall_cn
+                    result = {"ok": False, "error": f"{type(exc).__name__}: {_safe_console_text(exc)}"}
+                results[result_mall] = result
+
+    results["_meta"] = {
+        "elapsed_seconds": round(time.perf_counter() - group_start, 2),
+        "concurrency": worker_count,
+        "task_count": len(jobs),
+    }
+    return results
 
 
 if __name__ == "__main__":

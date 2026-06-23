@@ -9,7 +9,14 @@ from fastapi.testclient import TestClient
 
 from app.schemas.workflow import InternalCrawlResult, SaasSameProductApprovalItem, WorkflowAction
 from app.services.link_audit_worker import LinkAuditResult, check_price_consistency, check_sku_link_consistency
-from app.services.title_match_model_adapter import TitleMatchModelRequest, TitleMatchModelResult, call_title_match_model
+from app.services.title_match_model_adapter import (
+    TitleMatchModelRequest,
+    TitleMatchModelResult,
+    _parse_batch_model_response,
+    _parse_model_response,
+    call_title_match_model,
+)
+import app.workflows.work_01_saas_approval_json_audit as audit_mod
 from app.workflows.work_01_saas_approval_json_audit import (
     audit_saas_approval_item,
     audit_saas_approval_records,
@@ -240,6 +247,33 @@ def test_model_unavailable_does_not_interrupt(monkeypatch):
     monkeypatch.delenv("TITLE_MATCH_MODEL_BASE_URL", raising=False)
     result = call_title_match_model(TitleMatchModelRequest(query_str="阀门 DN20", sku_name="阀门 DN20"))
     assert result.match_result == "MODEL_UNAVAILABLE"
+
+
+def test_parse_binary_title_model_response():
+    same = _parse_model_response('{"is_same":"是"}', "阀门 DN20")
+    not_same = _parse_model_response('{"is_same":"否"}', "阀门 DN20")
+    assert same.match_result == "SAME"
+    assert not_same.match_result == "NOT_SAME"
+
+
+def test_parse_batch_binary_title_model_response():
+    parsed = _parse_batch_model_response('{"results":[{"index":0,"is_same":"是"},{"index":1,"is_same":"否"}]}', 2)
+    assert parsed[0].match_result == "SAME"
+    assert parsed[1].match_result == "NOT_SAME"
+
+
+def test_parse_batch_rich_title_model_response():
+    raw = (
+        '{"results":['
+        '{"index":0,"match_result":"SAME","confidence":0.91,"brand_match":true,"model_match":"exact","spec_match":true,"risk_points":[],"reason":"一致"},'
+        '{"index":1,"match_result":"MANUAL_REVIEW","confidence":0.6,"brand_match":false,"model_match":"unknown","spec_match":false,"risk_points":["缺品牌"],"reason":"需复核"}'
+        ']}'
+    )
+    parsed = _parse_batch_model_response(raw, 2)
+    assert parsed[0].match_result == "SAME"
+    assert parsed[0].confidence == 0.91
+    assert parsed[1].match_result == "MANUAL_REVIEW"
+    assert parsed[1].risk_points == ["缺品牌"]
 
 
 def test_model_same_participates_in_approve():
@@ -717,6 +751,33 @@ def test_output_is_recommendation_only():
         assert result.execution_allowed is False
         assert result.executed is False
         assert result.needs_human_approval is True
+
+
+def test_batch_title_model_uses_cache(monkeypatch):
+    calls = []
+
+    def fake_call_batch(requests):
+        calls.extend((req.query_str, req.sku_name) for req in requests)
+        return {
+            index: TitleMatchModelResult(
+                match_result="SAME",
+                confidence=0.99,
+                model_match="exact",
+                spec_match=True,
+                reason="测试模型结果",
+            )
+            for index, _req in enumerate(requests)
+        }
+
+    monkeypatch.setattr(audit_mod, "call_title_match_model_batch", fake_call_batch)
+    monkeypatch.setenv("TITLE_MATCH_MODEL_BATCH_SIZE", "30")
+    response = audit_saas_approval_records([
+        _item(vCommodityId="v1", queryStr="阀门 DN20", skuName="阀门 DN20", pageActualPrice="10.00"),
+        _item(vCommodityId="v2", queryStr="阀门 DN20", skuName="阀门 DN20", pageActualPrice="10.00"),
+    ], use_model=True, use_crawl_result=False)
+
+    assert len(calls) == 1
+    assert [r.title_match_result for r in response.record_results] == ["SAME", "SAME"]
 
 
 def test_summary_group_counts():
