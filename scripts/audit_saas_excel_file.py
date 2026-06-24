@@ -1458,7 +1458,8 @@ def _is_zhaoshang_mall(url: str) -> bool:
         "nbdeli.com", "nbdeli.cn", "delib2b.com",
         "mymro.cn",
         "colipu.com",
-        "66123123.com", "lt95.com",
+        "66123123.com",
+        "epec.com", "emall.epec.com", "lt95.com",
     )
     for d in zhaoshang_domains:
         d = d.lower().lstrip(".")
@@ -2047,6 +2048,18 @@ def run_main(
             crawler_summary["urls_returned"] = len(crawl_results_by_url)
         _log_step("crawler", "stage completed", start=crawler_stage_start)
 
+    # 史泰博专用爬虫（不走 multi_mall_crawler，用专用脚本）
+    stbchina_urls = collect_stbchina_urls(rows)
+    if stbchina_urls:
+        stbchina_start = time.perf_counter()
+        _log_step("stbchina", f"start urls={len(stbchina_urls)}")
+        runtime_dir = output_xlsx.parent if output_xlsx.parent != Path("") else Path("./runtime")
+        stbchina_results = run_stbchina_crawler(stbchina_urls, runtime_dir)
+        stb_backfilled = apply_stbchina_results_to_rows(rows, stbchina_results)
+        _log_step("stbchina", f"completed backfilled={stb_backfilled}", start=stbchina_start)
+    else:
+        stb_backfilled = 0
+
     # 招商局任务在模板导出后已异步启动；这里等待结果并回填页面价。
     if zhaoshang_future is not None:
         _log_step("zhaoshang", "waiting async tasks")
@@ -2413,6 +2426,149 @@ def read_crawler_output(path: Path) -> dict[str, dict[str, Any]]:
         return results
     finally:
         workbook.close()
+
+
+def _is_stbchina_link(url: str) -> bool:
+    host = (urlparse(url or "").hostname or "").lower()
+    return "stbchina.cn" in host
+
+
+def collect_stbchina_urls(rows: list[dict[str, Any]]) -> list[str]:
+    """收集所有 stbchina.cn 链接（去重）。"""
+    seen: set[str] = set()
+    urls: list[str] = []
+    for row in rows:
+        url = normalize_cell_str(row.get("extLink"))
+        if not url or not _is_stbchina_link(url) or url in seen:
+            continue
+        seen.add(url)
+        urls.append(url)
+    return urls
+
+
+def run_stbchina_crawler(urls: list[str], runtime_dir: Path) -> dict[str, dict[str, Any]]:
+    """调用史泰博专用脚本爬取价格。
+
+    返回 {url: {page_price_value, page_price_status, page_price_source}}
+    """
+    if not urls:
+        return {}
+
+    stbchina_script = Path(r"E:\.A2026\多商城爬取\multi_mall_crawler\scripts\stbchina_fast_crawler.py")
+    if not stbchina_script.exists():
+        print(f"[stbchina] 专用脚本不存在: {stbchina_script}")
+        return {}
+
+    # 写输入文件
+    input_txt = runtime_dir / "_stbchina_urls.txt"
+    input_txt.parent.mkdir(parents=True, exist_ok=True)
+    input_txt.write_text("\n".join(urls) + "\n", encoding="utf-8")
+
+    output_xlsx = runtime_dir / "_stbchina_result.xlsx"
+
+    cmd = [
+        sys.executable,
+        str(stbchina_script),
+        "--input", str(input_txt),
+        "--output", str(output_xlsx),
+    ]
+
+    print(f"[stbchina] 待爬 {len(urls)} 条，调用专用脚本...")
+    try:
+        proc = _subprocess.run(cmd, capture_output=True, text=True, timeout=600,
+                               encoding="utf-8", errors="replace",
+                               env={**_os.environ, "PYTHONIOENCODING": "utf-8"})
+        if proc.returncode != 0:
+            print(f"[stbchina] 脚本失败 (exit={proc.returncode})")
+            if proc.stderr:
+                for line in proc.stderr.strip().splitlines()[-3:]:
+                    print(f"  [stbchina stderr] {line}")
+            return {}
+        if proc.stdout:
+            for line in proc.stdout.strip().splitlines()[-3:]:
+                print(f"  [stbchina stdout] {line}")
+    except Exception as exc:
+        print(f"[stbchina] 异常: {type(exc).__name__}: {exc}")
+        return {}
+
+    # 读结果
+    if not output_xlsx.exists():
+        print(f"[stbchina] 结果文件不存在: {output_xlsx}")
+        return {}
+
+    results: dict[str, dict[str, Any]] = {}
+    try:
+        wb = load_workbook(filename=str(output_xlsx), data_only=True, read_only=True)
+        ws = wb.active
+        iterator = ws.iter_rows(values_only=True)
+        try:
+            header_row = next(iterator)
+        except StopIteration:
+            wb.close()
+            return {}
+        headers = [str(v).strip() if v is not None else "" for v in header_row]
+
+        def _find(name):
+            return headers.index(name) if name in headers else -1
+
+        url_idx = _find("商品链接")
+        price_idx = _find("商品价格")
+        status_idx = _find("采集状态")
+        reason_idx = _find("失败原因")
+
+        if url_idx < 0:
+            wb.close()
+            return {}
+
+        for raw in iterator:
+            if raw is None:
+                continue
+            url = str(raw[url_idx] or "").strip() if url_idx < len(raw) else ""
+            if not url:
+                continue
+            price = parse_decimal(raw[price_idx]) if price_idx >= 0 and price_idx < len(raw) else None
+            status_text = str(raw[status_idx] or "").strip() if status_idx >= 0 and status_idx < len(raw) else ""
+            reason_text = str(raw[reason_idx] or "").strip() if reason_idx >= 0 and reason_idx < len(raw) else ""
+
+            if price is not None and price >= 0:
+                results[url] = {
+                    "page_price_value": price,
+                    "page_price_status": "OK" if price > 0 else "PRICE_IS_ZERO",
+                    "page_price_source": "史泰博专用",
+                }
+            else:
+                results[url] = {
+                    "page_price_value": None,
+                    "page_price_status": "FAILED",
+                    "page_price_source": reason_text or status_text or "",
+                }
+        wb.close()
+    except Exception as exc:
+        print(f"[stbchina] 读取结果失败: {type(exc).__name__}: {exc}")
+        return {}
+
+    print(f"[stbchina] 读回 {len(results)} 条结果")
+    return results
+
+
+def apply_stbchina_results_to_rows(
+    rows: list[dict[str, Any]],
+    stbchina_results: dict[str, dict[str, Any]],
+) -> int:
+    """把史泰博爬取结果回填到 row 的 __page_price_* 字段。"""
+    backfilled = 0
+    for row in rows:
+        url = normalize_cell_str(row.get("extLink"))
+        if not url or not _is_stbchina_link(url):
+            continue
+        hit = stbchina_results.get(url)
+        if hit is None:
+            continue
+        row["__page_price_value"] = hit["page_price_value"]
+        row["__page_price_status"] = hit["page_price_status"]
+        row["__page_price_source"] = hit["page_price_source"]
+        backfilled += 1
+    return backfilled
 
 
 def apply_crawl_results_to_rows(

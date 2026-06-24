@@ -53,7 +53,8 @@ EXCLUDED_MALLS = [
     ("得力商城", ("nbdeli.com", "nbdeli.cn", "delib2b.com"), ("nbdeli", "deli"), "nbdeli"),
     ("固安捷商城", ("mymro.cn",), ("mymro",), "mymro"),
     ("科力普商城", ("colipu.com",), ("colipu",), "colipu"),
-    ("领先未来", ("66123123.com",), ("lxwl",), "ofs"),
+    ("易派客", ("epec.com", "emall.epec.com"), ("epec",), "epec"),
+    ("领先未来", ("66123123.com",), ("lxwl",), "lxwl"),
 ]
 
 
