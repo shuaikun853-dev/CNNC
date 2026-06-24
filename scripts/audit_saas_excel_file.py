@@ -1458,6 +1458,7 @@ def _is_zhaoshang_mall(url: str) -> bool:
         "nbdeli.com", "nbdeli.cn", "delib2b.com",
         "mymro.cn",
         "colipu.com",
+        "66123123.com", "lt95.com",
     )
     for d in zhaoshang_domains:
         d = d.lower().lstrip(".")

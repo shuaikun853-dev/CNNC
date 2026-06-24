@@ -1,4 +1,4 @@
-"""把不参与爬虫的商城（京东、震坤行）导出到爬取模板，按当日日期分目录。
+"""把走招商局任务系统的商城导出到爬取模板，按当日日期分目录。
 
 用法：
   python scripts/export_excluded_malls.py \
@@ -42,7 +42,7 @@ from scripts.audit_saas_excel_file import (  # noqa: E402
 
 
 # 商城映射：(输出文件名, 域名后缀列表, vendorName 关键词列表, 招商局 mall_key)
-# 这 9 个商城全部走招商局任务系统，不走 multi_mall_crawler
+# 商城映射：(输出文件名, 域名后缀列表, vendorName 关键词列表, 招商局 mall_key)
 EXCLUDED_MALLS = [
     ("京东", ("jd.com", "item.jd.com"), ("jd",), "jd"),
     ("震坤行", ("zkh.com",), ("zkh",), "zkh"),
@@ -53,6 +53,7 @@ EXCLUDED_MALLS = [
     ("得力商城", ("nbdeli.com", "nbdeli.cn", "delib2b.com"), ("nbdeli", "deli"), "nbdeli"),
     ("固安捷商城", ("mymro.cn",), ("mymro",), "mymro"),
     ("科力普商城", ("colipu.com",), ("colipu",), "colipu"),
+    ("领先未来", ("66123123.com",), ("lxwl",), "ofs"),
 ]
 
 
