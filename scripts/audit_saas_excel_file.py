@@ -1805,8 +1805,8 @@ def build_parser() -> argparse.ArgumentParser:
                         help="招商局 crawl_task_tool.py 路径")
     parser.add_argument("--zhaoshang-task-prefix", default="中核价格爬取",
                         help="招商局任务名前缀，默认 '中核价格爬取'")
-    parser.add_argument("--zhaoshang-wait-timeout", type=int, default=7200,
-                        help="等待招商局任务超时秒数，默认 7200 (2小时)")
+    parser.add_argument("--zhaoshang-wait-timeout", type=int, default=1200,
+                        help="等待招商局任务超时秒数，默认 600 (10分钟)")
     parser.add_argument("--zhaoshang-progress-interval", type=int, default=30,
                         help="招商局进度查询间隔秒数，默认 30")
     parser.add_argument("--zhaoshang-concurrency", type=int, default=6,
@@ -1865,7 +1865,7 @@ def run_main(
     zhaoshang_task_enabled: bool = False,
     zhaoshang_tool_path: Path | None = None,
     zhaoshang_task_prefix: str = "中核价格更新",
-    zhaoshang_wait_timeout: int = 7200,
+    zhaoshang_wait_timeout: int = 1200,
     zhaoshang_progress_interval: int = 30,
     zhaoshang_concurrency: int = 6,
     crawler_runner: Any = None,
@@ -2660,7 +2660,7 @@ def run_zhaoshang_tasks(
     excluded_export_summary,
     task_name_prefix="中核价格爬取",
     tool_path=None,
-    wait_timeout_seconds=7200,
+    wait_timeout_seconds=600,
     progress_interval_seconds=30,
     skip_if_exists=True,
     max_workers=6,
@@ -2700,7 +2700,7 @@ def run_zhaoshang_tasks(
             results[mall_cn] = {"ok": False, "error": f"模板文件不存在: {excel_path}"}
             continue
 
-        task_name = f"{task_name_prefix}+{mall_cn}+{timestamp}"
+        task_name = f"{task_name_prefix}_{mall_cn}_{timestamp}"
         try:
             print(f"[zhaoshang] {mall_cn}: 提交任务 task_name={task_name}, mall_key={mall_key}, excel={excel_path}")
             result = run_crawl_task(
@@ -3037,7 +3037,7 @@ def run_zhaoshang_tasks(
     excluded_export_summary,
     task_name_prefix="中核价格爬取",
     tool_path=None,
-    wait_timeout_seconds=7200,
+    wait_timeout_seconds=600,
     progress_interval_seconds=30,
     skip_if_exists=True,
     max_workers=6,
@@ -3055,7 +3055,7 @@ def run_zhaoshang_tasks(
     if not isinstance(excluded_export_summary, dict):
         return results
 
-    timestamp = datetime.now().strftime("%H%M%S")
+    timestamp = datetime.now().strftime("%H%M%S") + str(int(time.perf_counter() * 1000) % 1000).zfill(3)
     jobs: list[tuple[str, dict[str, Any], str, Path, str]] = []
     for mall_cn, info in excluded_export_summary.items():
         if str(mall_cn).startswith("_") or mall_cn == "enabled":
@@ -3070,7 +3070,7 @@ def run_zhaoshang_tasks(
             results[mall_cn] = {"ok": False, "error": f"模板文件不存在: {excel_path}"}
             continue
 
-        task_name = f"{task_name_prefix}+{mall_cn}+{timestamp}"
+        task_name = f"{task_name_prefix}_{mall_cn}_{timestamp}"
         jobs.append((mall_cn, info, mall_key, Path(excel_path), task_name))
 
     if not jobs:
