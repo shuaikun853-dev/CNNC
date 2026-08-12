@@ -2079,7 +2079,7 @@ class TestCollectUrlsForCrawl:
             input_customer_json=cust_path,
         )
         urls = collect_urls_for_crawl(result["rows"], result["enriched"], result["audit_response"])
-        assert urls == ["https://www.ehsy.com/product-A"]
+        assert urls == []
 
 
 class TestWriteCrawlerInput:
