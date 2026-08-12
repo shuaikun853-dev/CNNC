@@ -14,10 +14,11 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import importlib.util
 import json
+import os
 import re
-import shlex
 import sys
 import time
 import urllib.error
@@ -38,7 +39,37 @@ from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
 from app.schemas.workflow import SaasSameProductApprovalItem, WorkflowAction
+from app.services import saas_audit_core as _audit_core
+from app.services import zhaoshang_result_adapter as _zhaoshang_results
 from app.workflows.work_01_saas_approval_json_audit import audit_saas_approval_records
+from scripts.auth_manager import AuthManager, SYSTEM_CONFIG
+from scripts.curl_utils import apply_curl_headers, internal_direct_opener, load_curl_command, parse_curl_command
+from scripts.zhaoshang_mall_mapping import is_zhaoshang_domain
+
+# Legacy public names intentionally remain import-compatible while their
+# implementations live in the canonical pure core.
+normalize_cell_str = _audit_core.normalize_cell_str
+parse_decimal = _audit_core.parse_decimal
+is_valid_reference_price = _audit_core.is_valid_reference_price
+_saas_list_payload_rows = _audit_core._saas_list_payload_rows
+_normalize_saas_list_row = _audit_core._normalize_saas_list_row
+_heal_missing_closing_brace = _audit_core._heal_missing_closing_brace
+_parse_json_segments = _audit_core._parse_json_segments
+_load_json_file_segments = _audit_core._load_json_file_segments
+_collect_rows_from_segments = _audit_core._collect_rows_from_segments
+read_saas_list_json = _audit_core.read_saas_list_json
+_normalize_saas_pending_row = _audit_core._normalize_saas_pending_row
+read_saas_pending_json = _audit_core.read_saas_pending_json
+build_customer_index = _audit_core.build_customer_index
+join_saas_with_customer = _audit_core.join_saas_with_customer
+is_jd_link = _audit_core.is_jd_link
+build_record_payload = _audit_core.build_record_payload
+extract_customer_price_from_detail = _audit_core.extract_customer_price_from_detail
+build_records = _audit_core.build_records
+compute_over_30_check = _audit_core.compute_over_30_check
+compute_saas_price_vs_customer = _audit_core.compute_saas_price_vs_customer
+compute_price_changed = _audit_core.compute_price_changed
+compute_final_decision = _audit_core.compute_final_decision
 
 
 SENSITIVE_HEADER_NAMES = {
@@ -52,6 +83,67 @@ SENSITIVE_HEADER_NAMES = {
 
 DEFAULT_DOCUMENT_ID_FIELD = "documentId"
 DEFAULT_CATEGORY_ID_FIELD = "fourCategoryId"
+DEFAULT_ZHAOSHANG_ADD_CURL_FILE = ROOT / "data" / "latest_zhaoshang_add.curl"
+DEFAULT_ZHAOSHANG_EXPORT_CURL_FILE = ROOT / "data" / "latest_zhaoshang_exportTask.curl"
+
+
+def _get_header_case_insensitive(headers: dict[str, Any], name: str) -> str:
+    target = name.lower()
+    for key, value in (headers or {}).items():
+        if str(key).lower() == target:
+            return str(value or "").strip()
+    return ""
+
+
+def load_zhaoshang_auth_env_from_curl(
+    path: Path,
+    *,
+    auth_manager: AuthManager | None = None,
+) -> bool:
+    """Refresh state-backed Zhaoshang auth; cURL is only a bootstrap template."""
+    if auth_manager is None:
+        sources = {
+            name: tuple(config["curl_sources"])
+            for name, config in SYSTEM_CONFIG.items()
+        }
+        sources["zhaoshang"] = (path,)
+        auth_manager = AuthManager(curl_sources=sources)
+    os.environ.update(auth_manager.export_environment("zhaoshang", refresh=True))
+    return True
+
+
+def _zhaoshang_curl_token_is_expired(path: Path) -> bool:
+    if not path.exists():
+        return False
+    try:
+        parsed = parse_curl_command(path.read_text(encoding="utf-8-sig"))
+        blade_auth = _get_header_case_insensitive(parsed.get("headers_dict") or {}, "Blade-Auth")
+        token = blade_auth.split()[-1]
+        parts = token.split(".")
+        if len(parts) != 3:
+            return False
+        payload = parts[1] + "=" * (-len(parts[1]) % 4)
+        expires_at = json.loads(base64.urlsafe_b64decode(payload)).get("exp")
+        return isinstance(expires_at, (int, float)) and expires_at <= time.time()
+    except Exception:
+        return False
+
+
+def load_zhaoshang_auth_env(
+    *, auth_manager: AuthManager | None = None
+) -> Path:
+    """Refresh before any Zhaoshang write and export only the latest state pair."""
+    manager = auth_manager or AuthManager()
+    os.environ.update(manager.export_environment("zhaoshang", refresh=True))
+    return manager.state_path
+
+
+def load_zhaoshang_auth_env_from_export_curl(
+    path: Path = DEFAULT_ZHAOSHANG_EXPORT_CURL_FILE,
+    *,
+    auth_manager: AuthManager | None = None,
+) -> bool:
+    return load_zhaoshang_auth_env_from_curl(path, auth_manager=auth_manager)
 
 
 def _elapsed_seconds(start: float) -> str:
@@ -193,85 +285,6 @@ def _display_header(name: str) -> str:
     return COLUMN_DISPLAY_NAMES.get(name, name)
 
 
-# 枚举值 → 中文显示（仅影响 Excel 显示）
-VALUE_DISPLAY_NAMES = {
-    "APPROVE": "建议通过",
-    "REJECT": "建议驳回",
-    "MANUAL_CHECK": "人工核查",
-    "WAIT_CRAWLER": "等待爬取",
-    "SUPPLEMENT_SAME_PRODUCT": "补充同款",
-    "DO_NOT_PUSH": "不推送",
-    "FEEDBACK_CUSTOMER": "反馈客户",
-    "READY_TO_PUSH": "准备推送",
-    "IMPORT_CUSTOMER_LINKS": "导入客户链接",
-    "UNBIND_WRONG_RELATIONS": "解绑错误关系",
-    "RECALCULATE_INDEX": "重算指数",
-    "PUSH_INDEX": "推送指数",
-    "ASK_CUSTOMER_RECHECK": "请客户复核",
-    "MANUAL_VERIFY": "人工验证",
-    "FORWARD_TO_WORK01": "转发到Work01",
-    "NO_ACTION": "无操作",
-    "WAIT_COLLECTION": "等待采集",
-    "RETRY_PUSH": "重试推送",
-    "CONFIRM": "确认",
-    "ALERT": "告警",
-    "EXEMPTION": "豁免",
-    "QUERY": "查询",
-    "EXPORT": "导出",
-    "FOUND": "已找到",
-    "FOUND_SINGLE_REFERENCE": "仅找到单个参考价",
-    "FOUND_CACHED": "已找到(缓存)",
-    "EXISTS": "已存在",
-    "NOT_PROVIDED": "未提供",
-    "NOT_FOUND": "未找到",
-    "LOOKUP_FAILED": "匹配失败",
-    "DETAIL_REQUEST_FAILED": "详情请求失败",
-    "DETAIL_REQUEST_SKIPPED": "详情请求跳过",
-    "DETAIL_PARSE_FAILED": "详情解析失败",
-    "MATCHED": "已匹配",
-    "MATCHED_NO_CATEGORY": "已匹配但无类目",
-    "SAME": "同款",
-    "NOT_SAME": "非同款",
-    "MANUAL_REVIEW": "人工复核",
-    "MODEL_UNAVAILABLE": "模型不可用",
-    "MATCH": "一致",
-    "MISMATCH": "不一致",
-    "UNKNOWN": "未知",
-    "JSON_PRICE_MISSING": "JSON价格为空",
-    "WAIT_PAGE_PRICE_CHECK": "待页面价格核验",
-    "HIGHER_THAN_CUSTOMER_PRICE_30": "超过客户价30%",
-    "WITHIN_THRESHOLD": "在阈值内",
-    "CUSTOMER_PRICE_MISSING": "客户价缺失",
-    "CUSTOMER_PRICE_INVALID": "客户价无效",
-    "CANDIDATE_PRICE_MISSING": "候选价格缺失",
-    "CANDIDATE_PRICE_INVALID": "候选价格无效",
-    "PAGE_PRICE_MISSING": "页面价格缺失",
-    "PENDING_CRAWL": "待爬取",
-    "OK": "爬取成功",
-    "FAILED": "爬取失败",
-    "PRICE_MISSING": "价格不可见",
-    "PRICE_IS_ZERO": "价格为0",
-    "SKIPPED_JD": "京东跳过",
-    "SKIPPED_ZHAOSHANG": "招商局处理",
-    "SKIPPED_NO_LINK": "无链接跳过",
-    "SKIPPED_MODEL_NOT_SAME": "模型判非同款跳过",
-    "SKIPPED": "跳过",
-    "CRAWLER_PROCESS_FAILED": "爬虫进程失败",
-    "SAAS_HIGHER_THAN_CUSTOMER_30": "SaaS价超客户价30%",
-    "SAAS_WITHIN_CUSTOMER_THRESHOLD": "SaaS价在客户价阈值内",
-    "SAAS_PRICE_MISSING": "SaaS价缺失",
-    "CHANGED": "是",
-    "UNCHANGED": "否",
-    "PRICE_UNAVAILABLE": "价格不可比",
-    "REJECT_SAAS_HIGH": "驳回(SaaS价超客户价30%)",
-    "REJECT_PRICE_CHANGED": "驳回(价格变动)",
-    "REJECT_BOTH": "驳回(双重异常)",
-    "PASS": "通过",
-    "TRUE": "是",
-    "FALSE": "否",
-}
-
-
 def _display_value(value: Any) -> Any:
     """枚举值 → 中文显示。"""
     if isinstance(value, str) and value in VALUE_DISPLAY_NAMES:
@@ -330,42 +343,10 @@ def read_excel_rows(path: Path) -> tuple[list[str], list[dict[str, Any]]]:
         workbook.close()
 
 
-def normalize_cell_str(value: Any) -> str:
-    if value is None:
-        return ""
-    if isinstance(value, bool):
-        return str(value)
-    if isinstance(value, float):
-        if value.is_integer():
-            return str(int(value))
-        text = format(value, "f").rstrip("0").rstrip(".")
-        return text or "0"
-    return str(value).strip()
 
 
-def parse_decimal(value: Any) -> Decimal | None:
-    if value is None:
-        return None
-    if isinstance(value, Decimal):
-        return value
-    if isinstance(value, bool):
-        return None
-    if isinstance(value, (int, float)):
-        try:
-            return Decimal(str(value))
-        except (InvalidOperation, ValueError):
-            return None
-    text = str(value).strip()
-    if not text:
-        return None
-    try:
-        return Decimal(text)
-    except (InvalidOperation, ValueError):
-        return None
 
 
-def is_valid_reference_price(value: Decimal | None) -> bool:
-    return value is not None and value > 0
 
 
 # ---------------------------------------------------------------------------
@@ -397,143 +378,18 @@ SAAS_LIST_HEADERS = [
 ]
 
 
-def _saas_list_payload_rows(payload: Any) -> list[dict[str, Any]]:
-    if isinstance(payload, list):
-        return [item for item in payload if isinstance(item, dict)]
-    if not isinstance(payload, dict):
-        raise ValueError("saas-list-json 必须是数组或包含 rows 的对象")
-    for key in ("rows", "records", "data"):
-        value = payload.get(key)
-        if isinstance(value, list):
-            return [item for item in value if isinstance(item, dict)]
-        if isinstance(value, dict):
-            inner_rows = value.get("rows") if isinstance(value.get("rows"), list) else None
-            if inner_rows is not None:
-                return [item for item in inner_rows if isinstance(item, dict)]
-    raise ValueError("saas-list-json 中未找到 rows 字段")
 
 
-def _normalize_saas_list_row(raw: dict[str, Any]) -> dict[str, Any]:
-    """把列表接口返回的原始 row 转成 audit 流程能识别的 row。"""
-    document_id = normalize_cell_str(raw.get("documentId"))
-    four_category_id = normalize_cell_str(raw.get("fourCategoryId"))
-    four_category_name = normalize_cell_str(raw.get("fourCategoryName"))
-    commodity_name = normalize_cell_str(raw.get("commodityName"))
-    sass_v_name = normalize_cell_str(raw.get("sassVCommodityName"))
-    reference_link = normalize_cell_str(raw.get("referenceLink"))
-    list_reference_price = parse_decimal(raw.get("referencePrice"))
-    query_str = sass_v_name or commodity_name
-    sku_id = normalize_cell_str(raw.get("referenceId"))
-    return {
-        "documentId": document_id,
-        "fourCategoryId": four_category_id,
-        "fourCategoryName": four_category_name,
-        "vCommodityId": document_id,
-        "queryStr": query_str,
-        "sassVCommodityName": sass_v_name,
-        "skuId": sku_id,
-        "skuName": commodity_name,
-        "vendorName": "",
-        "shopName": "",
-        "price": list_reference_price,
-        "extLink": reference_link,
-        "commodityName": commodity_name,
-        "list_reference_price": list_reference_price,
-        "referenceLink": reference_link,
-        "categoryId": normalize_cell_str(raw.get("categoryId")),
-        "categoryName": normalize_cell_str(raw.get("categoryName")),
-        "materialCode": normalize_cell_str(raw.get("materialCode")),
-        "materialDesc": normalize_cell_str(raw.get("materialDesc")),
-        "quasiStandardCommodityCode": normalize_cell_str(raw.get("quasiStandardCommodityCode")),
-    }
 
 
-def _heal_missing_closing_brace(text: str) -> str:
-    """修复导出工具常见的缺最外层右花括号的多段 JSON。
-
-    场景1：上一段 JSON 末尾 `"success": true` 后直接换行接下一段 `{`，缺一个 `}`。
-    场景2：上一段 rows 数组最后一个元素 `}` 后直接接下一段 `{`，缺 `]` 和 `}`。
-    场景3：末尾以 `"success": true` 结束但缺最后的 `}`。
-    """
-    # 场景1："success": true|false 后紧跟换行 + 空白 + {  →  补 }
-    text = re.sub(
-        r'("success"\s*:\s*(?:true|false))(\s*\n\s*)(\{)',
-        r"\1}\2\3",
-        text,
-    )
-    # 场景2：}\n{ 拼接且下一行有 "rspCode" → 补 ]\n}
-    text = re.sub(
-        r'(\})(\s*\n\s*)(\{\s*\n\s*"rspCode")',
-        r'\1\n    ]\n}\2\3',
-        text,
-    )
-    return text
 
 
-def _parse_json_segments(text: str) -> list[Any]:
-    """解析"多段 JSON 首尾相连"的文本。
-
-    SaaS / 客户后台导出的 JSON 在分页保存时常常被首尾拼在同一个文件里，
-    例如：
-        {"rspCode": "0000", "rows": [...100 行...]}
-        {"rspCode": "0000", "rows": [...100 行...]}
-        {"rspCode": "0000", "rows": [...100 行...]}
-
-    标准 json.load 只读第一段，会报 "Extra data"。
-    本函数把每一段单独解析返回；同时容错部分导出工具漏写最外层 `}` 的情况。
-    """
-    text = _heal_missing_closing_brace(text)
-    decoder = json.JSONDecoder()
-    segments: list[Any] = []
-    index = 0
-    length = len(text)
-    while index < length:
-        # 跳过空白
-        while index < length and text[index] in " \t\r\n\ufeff":
-            index += 1
-        if index >= length:
-            break
-        # top-level 只接受 { 或 [ 开头的 JSON 值
-        # 其他字符（}、]、,、"success": true 等尾部垃圾）全部跳过
-        if text[index] not in '{[':
-            # 尝试找到下一个 { 或 [
-            next_obj = text.find('{', index)
-            next_arr = text.find('[', index)
-            candidates = [x for x in (next_obj, next_arr) if x >= 0]
-            if not candidates:
-                break
-            index = min(candidates)
-            continue
-        try:
-            obj, end = decoder.raw_decode(text, index)
-        except json.JSONDecodeError as exc:
-            raise ValueError(f"JSON 解析失败（位置 {index}）：{exc}") from exc
-        segments.append(obj)
-        index = end
-    return segments
 
 
-def _load_json_file_segments(path: Path) -> list[Any]:
-    if path.suffix.lower() != ".json":
-        raise ValueError(f"输入必须是 JSON 文件：{path}")
-    text = path.read_text(encoding="utf-8")
-    return _parse_json_segments(text)
 
 
-def _collect_rows_from_segments(segments: list[Any]) -> list[dict[str, Any]]:
-    """把多段 payload 里的 rows 全部合并成一个列表。"""
-    all_rows: list[dict[str, Any]] = []
-    for segment in segments:
-        all_rows.extend(_saas_list_payload_rows(segment))
-    return all_rows
 
 
-def read_saas_list_json(path: Path) -> tuple[list[str], list[dict[str, Any]]]:
-    """读取 SaaS 列表接口 response JSON（支持多段拼接），返回 (列名顺序, 行字典列表)。"""
-    segments = _load_json_file_segments(path)
-    raw_rows = _collect_rows_from_segments(segments)
-    rows = [_normalize_saas_list_row(raw) for raw in raw_rows]
-    return list(SAAS_LIST_HEADERS), rows
 
 
 # ---------------------------------------------------------------------------
@@ -561,116 +417,12 @@ SAAS_PENDING_HEADERS = [
 ]
 
 
-def _normalize_saas_pending_row(raw: dict[str, Any]) -> dict[str, Any]:
-    """SaaS 同款审批页面导出的一行 → 内部 row。
-
-    主键：vCommodityId（与中核客户后台的 documentId 对应）。
-    queryStr   = 客户标题
-    skuName    = 互联网标题
-    extLink    = 互联网链接（要爬的）
-    """
-    v_commodity_id = normalize_cell_str(raw.get("vCommodityId"))
-    document_id = normalize_cell_str(raw.get("documentId"))
-    query_str = normalize_cell_str(raw.get("queryStr"))
-    if not query_str:
-        query_str = normalize_cell_str(raw.get("sassVCommodityName"))
-    sku_name = normalize_cell_str(raw.get("skuName"))
-    if not sku_name:
-        sku_name = normalize_cell_str(raw.get("commodityName"))
-    ext_link = normalize_cell_str(raw.get("extLink"))
-    if not ext_link:
-        ext_link = normalize_cell_str(raw.get("referenceLink"))
-    return {
-        "vCommodityId": v_commodity_id,
-        "documentId": document_id,
-        "queryStr": query_str,
-        "sassVCommodityName": normalize_cell_str(raw.get("sassVCommodityName")),
-        "skuId": normalize_cell_str(raw.get("skuId")),
-        "skuName": sku_name,
-        "vendorName": normalize_cell_str(raw.get("vendorName")),
-        "shopName": normalize_cell_str(raw.get("shopName")),
-        "price": parse_decimal(raw.get("price")),
-        "pageActualPrice": parse_decimal(raw.get("pageActualPrice")),
-        "extLink": ext_link,
-        "commentNum": normalize_cell_str(raw.get("commentNum")),
-        "createTime": normalize_cell_str(raw.get("createTime")),
-        "updateTime": normalize_cell_str(raw.get("updateTime")),
-        "modelAuditResult": normalize_cell_str(raw.get("modelAuditResult")),
-        "isMatch": normalize_cell_str(raw.get("isMatch")),
-        # customerPrice 通常由 detail 接口反查得到；若 saas 输入直接提供（测试/手填场景）也透传
-        "customerPrice": parse_decimal(raw.get("customerPrice")),
-    }
 
 
-def read_saas_pending_json(path: Path) -> tuple[list[str], list[dict[str, Any]]]:
-    """读取 SaaS 同款审批页面导出 JSON（支持多段拼接），返回 (列名顺序, 行字典列表)。"""
-    segments = _load_json_file_segments(path)
-    raw_rows = _collect_rows_from_segments(segments)
-    rows = [_normalize_saas_pending_row(raw) for raw in raw_rows]
-    return list(SAAS_PENDING_HEADERS), rows
 
 
-def build_customer_index(path: Path) -> dict[str, dict[str, Any]]:
-    """读取中核客户导出 JSON（支持多段拼接），返回 documentId -> 客户行 的映射。
-
-    每条值至少包含：
-      fourCategoryId
-      fourCategoryName
-      list_reference_price
-    """
-    segments = _load_json_file_segments(path)
-    raw_rows = _collect_rows_from_segments(segments)
-    index: dict[str, dict[str, Any]] = {}
-    for raw in raw_rows:
-        document_id = normalize_cell_str(raw.get("documentId"))
-        if not document_id:
-            continue
-        index[document_id] = {
-            "fourCategoryId": normalize_cell_str(raw.get("fourCategoryId")),
-            "fourCategoryName": normalize_cell_str(raw.get("fourCategoryName")),
-            "list_reference_price": parse_decimal(raw.get("referencePrice")),
-            "commodityName": normalize_cell_str(raw.get("commodityName")),
-            "referenceLink": normalize_cell_str(raw.get("referenceLink")),
-        }
-    return index
 
 
-def join_saas_with_customer(
-    saas_rows: list[dict[str, Any]],
-    customer_index: dict[str, dict[str, Any]],
-) -> list[dict[str, Any]]:
-    """给 SaaS rows 回填 fourCategoryId/Name/list_reference_price/customer_lookup_status。
-
-    Join key：saas.vCommodityId == customer.documentId
-    回填后：
-      row["documentId"] 取 customer.documentId（命中时）
-      row["fourCategoryId"]、["fourCategoryName"]
-      row["list_reference_price"]
-      row["customer_lookup_status"]：MATCHED / NOT_FOUND
-    """
-    joined: list[dict[str, Any]] = []
-    for row in saas_rows:
-        merged = dict(row)
-        join_key = normalize_cell_str(row.get("vCommodityId"))
-        customer_row = customer_index.get(join_key) if join_key else None
-        if customer_row is None:
-            if not merged.get("documentId"):
-                merged["documentId"] = ""
-            merged["fourCategoryId"] = ""
-            merged["fourCategoryName"] = ""
-            merged["list_reference_price"] = None
-            merged["customer_lookup_status"] = "NOT_FOUND"
-        else:
-            # 命中：documentId 用 customer 端的（语义上等于 saas.vCommodityId）
-            merged["documentId"] = join_key
-            merged["fourCategoryId"] = customer_row.get("fourCategoryId", "")
-            merged["fourCategoryName"] = customer_row.get("fourCategoryName", "")
-            merged["list_reference_price"] = customer_row.get("list_reference_price")
-            merged["customer_lookup_status"] = (
-                "MATCHED" if customer_row.get("fourCategoryId") else "MATCHED_NO_CATEGORY"
-            )
-        joined.append(merged)
-    return joined
 
 
 # ---------------------------------------------------------------------------
@@ -678,15 +430,6 @@ def join_saas_with_customer(
 # ---------------------------------------------------------------------------
 
 
-def is_jd_link(url: str) -> bool:
-    """判断是否为京东链接（按 AGENT_GUIDE.md 规则需跳过）。"""
-    text = (url or "").strip().lower()
-    if not text:
-        return False
-    for keyword in JD_HOST_KEYWORDS:
-        if keyword in text:
-            return True
-    return False
 
 
 
@@ -695,30 +438,6 @@ def is_jd_link(url: str) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def build_record_payload(row: dict[str, Any]) -> dict[str, Any]:
-    """将 Excel 行映射到 SaasSameProductApprovalItem 接受的字段。"""
-    query_str = normalize_cell_str(row.get("queryStr"))
-    if not query_str:
-        query_str = normalize_cell_str(row.get("sassVCommodityName"))
-    payload: dict[str, Any] = {
-        "vCommodityId": normalize_cell_str(row.get("vCommodityId")),
-        "queryStr": query_str,
-        "skuId": normalize_cell_str(row.get("skuId")),
-        "skuName": normalize_cell_str(row.get("skuName")),
-        "vendorName": normalize_cell_str(row.get("vendorName")),
-        "shopName": normalize_cell_str(row.get("shopName")),
-        "extLink": normalize_cell_str(row.get("extLink")),
-    }
-    price = parse_decimal(row.get("price"))
-    if price is not None:
-        payload["price"] = price
-    page_actual = parse_decimal(row.get("pageActualPrice"))
-    if page_actual is not None:
-        payload["pageActualPrice"] = page_actual
-    customer_price = parse_decimal(row.get("customerPrice"))
-    if customer_price is not None:
-        payload["customerPrice"] = customer_price
-    return payload
 
 
 # ---------------------------------------------------------------------------
@@ -726,89 +445,6 @@ def build_record_payload(row: dict[str, Any]) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-def extract_customer_price_from_detail(detail_payload: Any) -> dict[str, Any]:
-    """根据详情返回提取客户价。"""
-    if not isinstance(detail_payload, dict):
-        return {
-            "customerPrice": None,
-            "customerPriceStatus": "DETAIL_PARSE_FAILED",
-            "customerPriceSource": "",
-            "customerPriceWarning": "详情接口返回不是 JSON 对象，无法解析参考价",
-            "customerPriceEvidence": "",
-        }
-
-    data = detail_payload.get("data") if isinstance(detail_payload.get("data"), dict) else None
-    rows: list[Any] = []
-    if isinstance(detail_payload.get("rows"), list):
-        rows = detail_payload["rows"]
-    elif isinstance(data, dict) and isinstance(data.get("rows"), list):
-        rows = data["rows"]
-
-    reference_infos: list[dict[str, Any]] = []
-    if isinstance(data, dict) and isinstance(data.get("referenceInfos"), list):
-        reference_infos = [info for info in data["referenceInfos"] if isinstance(info, dict)]
-    if not reference_infos:
-        for row in rows:
-            if isinstance(row, dict) and isinstance(row.get("referenceInfos"), list):
-                reference_infos.extend(info for info in row["referenceInfos"] if isinstance(info, dict))
-
-    valid_prices: list[Decimal] = []
-    for info in reference_infos:
-        price = parse_decimal(info.get("referencePrice"))
-        if is_valid_reference_price(price):
-            valid_prices.append(price)
-
-    if len(valid_prices) >= 2:
-        max_price = max(valid_prices)
-        evidence_parts = [f"参考价{index}={price}" for index, price in enumerate(valid_prices, start=1)]
-        evidence_parts.append(f"客户最高价={max_price}")
-        return {
-            "customerPrice": max_price,
-            "customerPriceStatus": "FOUND",
-            "customerPriceSource": "DETAIL_REFERENCE_INFOS",
-            "customerPriceWarning": "",
-            "customerPriceEvidence": "；".join(evidence_parts),
-        }
-
-    if len(valid_prices) == 1:
-        only_price = valid_prices[0]
-        return {
-            "customerPrice": only_price,
-            "customerPriceStatus": "FOUND_SINGLE_REFERENCE",
-            "customerPriceSource": "DETAIL_SINGLE_REFERENCE",
-            "customerPriceWarning": "当前详情结果只提取到1个参考价，请确认是否为完整客户价",
-            "customerPriceEvidence": f"参考价1={only_price}；客户最高价={only_price}",
-        }
-
-    fallback_price: Decimal | None = None
-    if isinstance(data, dict):
-        candidate = parse_decimal(data.get("referencePrice"))
-        if is_valid_reference_price(candidate):
-            fallback_price = candidate
-    if fallback_price is None:
-        for row in rows:
-            if isinstance(row, dict):
-                candidate = parse_decimal(row.get("referencePrice"))
-                if is_valid_reference_price(candidate):
-                    fallback_price = candidate
-                    break
-
-    if fallback_price is not None:
-        return {
-            "customerPrice": fallback_price,
-            "customerPriceStatus": "FOUND_SINGLE_REFERENCE",
-            "customerPriceSource": "DETAIL_SINGLE_REFERENCE",
-            "customerPriceWarning": "当前详情结果只提取到1个参考价，请确认是否为完整客户价",
-            "customerPriceEvidence": f"参考价1={fallback_price}；客户最高价={fallback_price}",
-        }
-
-    return {
-        "customerPrice": None,
-        "customerPriceStatus": "NOT_FOUND",
-        "customerPriceSource": "",
-        "customerPriceWarning": "详情接口未返回有效参考价",
-        "customerPriceEvidence": "",
-    }
 
 
 # ---------------------------------------------------------------------------
@@ -816,93 +452,13 @@ def extract_customer_price_from_detail(detail_payload: Any) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-_CARET_QUOTE = re.compile(r'\^"')
-_CARET_BACKSLASH_QUOTE = re.compile(r'\^\\\^"')
-_CARET_BACKSLASH = re.compile(r'\^\\')
-
-
-def _strip_windows_caret(text: str) -> str:
-    """去除 Windows cmd 风格的 ^ 续行与 ^" 转义，简化 cURL 解析。"""
-    text = text.replace("^\r\n", " ").replace("^\n", " ").replace("^\r", " ")
-    text = _CARET_BACKSLASH_QUOTE.sub('"', text)
-    text = _CARET_QUOTE.sub('"', text)
-    text = _CARET_BACKSLASH.sub("", text)
-    text = text.replace('\\"', '"')
-    return text
-
-
-def _join_continuation_lines(text: str) -> str:
-    text = text.replace("\\\r\n", " ").replace("\\\n", " ")
-    return text
-
-
 def parse_curl(curl_text: str) -> dict[str, Any]:
     """从 cURL 文本中解析出 url、headers、cookie、data 模板。"""
-    cleaned = _strip_windows_caret(curl_text)
-    cleaned = _join_continuation_lines(cleaned)
-    cleaned = cleaned.strip()
-    if cleaned.lower().startswith("curl "):
-        cleaned = cleaned[5:]
-    try:
-        tokens = shlex.split(cleaned, posix=True)
-    except ValueError as exc:
-        raise ValueError(f"cURL 内容无法解析：{exc}") from exc
-
-    url = ""
-    headers: list[tuple[str, str]] = []
-    cookie = ""
-    data: str = ""
-    method: str = ""
-
-    index = 0
-    while index < len(tokens):
-        token = tokens[index]
-        if token in ("-H", "--header") and index + 1 < len(tokens):
-            value = tokens[index + 1]
-            if ":" in value:
-                name, _, raw_value = value.partition(":")
-                headers.append((name.strip(), raw_value.strip()))
-            index += 2
-            continue
-        if token in ("-b", "--cookie") and index + 1 < len(tokens):
-            cookie = tokens[index + 1]
-            index += 2
-            continue
-        if token in ("--data-raw", "--data", "--data-binary", "-d") and index + 1 < len(tokens):
-            data = tokens[index + 1]
-            index += 2
-            continue
-        if token in ("-X", "--request") and index + 1 < len(tokens):
-            method = tokens[index + 1]
-            index += 2
-            continue
-        if token in ("--compressed", "-L", "--location", "-k", "--insecure", "-s", "--silent", "-v", "--verbose"):
-            index += 1
-            continue
-        if token.startswith("-"):
-            # 未知开关，跳过下一个值（保守一致地处理）
-            index += 2 if (index + 1 < len(tokens) and not tokens[index + 1].startswith("-")) else 1
-            continue
-        if not url:
-            url = token
-        index += 1
-
-    if not url:
-        raise ValueError("cURL 中未找到目标 URL")
-    if not method:
-        method = "POST" if data else "GET"
-    return {
-        "url": url,
-        "headers": headers,
-        "cookie": cookie,
-        "data": data,
-        "method": method.upper(),
-    }
+    return parse_curl_command(curl_text)
 
 
 def load_curl_file(path: Path) -> dict[str, Any]:
-    text = path.read_text(encoding="utf-8")
-    return parse_curl(text)
+    return load_curl_command(path)
 
 
 def build_detail_request_body(template: str, document_id: str, four_category_id: str) -> bytes:
@@ -912,7 +468,10 @@ def build_detail_request_body(template: str, document_id: str, four_category_id:
         try:
             payload = json.loads(template)
             if isinstance(payload, dict):
-                payload["documentId"] = document_id
+                if "vCommodityId" in payload and "documentId" not in payload:
+                    payload["vCommodityId"] = document_id
+                else:
+                    payload["documentId"] = document_id
                 payload["fourCategoryId"] = four_category_id
                 return json.dumps(payload, ensure_ascii=False).encode("utf-8")
         except json.JSONDecodeError:
@@ -943,20 +502,14 @@ def call_detail_api(
         data=body,
         method=curl_template.get("method", "POST") or "POST",
     )
-    has_content_type = False
-    for name, value in curl_template.get("headers", []):
-        request.add_header(name, value)
-        if name.lower() == "content-type":
-            has_content_type = True
+    has_content_type = any(name.lower() == "content-type" for name, _ in curl_template.get("headers", []))
+    apply_curl_headers(request, curl_template.get("headers", []), curl_template.get("cookie") or "")
     if not has_content_type:
-        request.add_header("Content-Type", "application/json")
-    cookie = curl_template.get("cookie") or ""
-    if cookie:
-        request.add_header("Cookie", cookie)
+        request.headers["Content-Type"] = "application/json"
 
     try:
         if opener is None:
-            response = urllib.request.urlopen(request, timeout=timeout)
+            response = internal_direct_opener().open(request, timeout=timeout)
         else:
             response = opener(request, timeout=timeout)
         with response:
@@ -1098,18 +651,6 @@ def enrich_rows_with_customer_price(
 # ---------------------------------------------------------------------------
 
 
-def build_records(
-    rows: list[dict[str, Any]],
-    enriched: list[dict[str, Any]],
-) -> list[SaasSameProductApprovalItem]:
-    records: list[SaasSameProductApprovalItem] = []
-    for row, info in zip(rows, enriched):
-        merged = dict(row)
-        if info.get("customerPrice") is not None:
-            merged["customerPrice"] = info["customerPrice"]
-        payload = build_record_payload(merged)
-        records.append(SaasSameProductApprovalItem(**payload))
-    return records
 
 
 def run_audit(
@@ -1189,12 +730,9 @@ def _run_batch_model_audit(
             batch_idx, batch, results = future.result()
             for idx, req in enumerate(batch):
                 key = (req.query_str, req.sku_name)
-                pair_to_result[key] = results.get(idx, TitleMatchModelResult(
-                    match_result="MANUAL_REVIEW",
-                    confidence=0.0,
-                    model_match="unknown",
-                    reason="批量模型未返回该条结果",
-                ))
+                if idx not in results:
+                    raise RuntimeError(f"批量模型未返回该条结果 batch={batch_idx} index={idx}")
+                pair_to_result[key] = results[idx]
             done_count += 1
             print(f"[model] 批次 {done_count}/{len(batches)} 完成")
 
@@ -1445,27 +983,7 @@ def _collect_title_reason(audit_result):
 
 def _is_zhaoshang_mall(url: str) -> bool:
     """检查 URL 是否属于招商局任务系统商城（不走 multi_mall_crawler）。"""
-    host = (urlparse(url or "").hostname or "").lower()
-    if not host:
-        return False
-    zhaoshang_domains = (
-        "jd.com", "item.jd.com",
-        "zkh.com",
-        "tima365.com",
-        "zjmi-mall.com", "zjmi.com",
-        "xfs.com",
-        "ycw.cn",
-        "nbdeli.com", "nbdeli.cn", "delib2b.com",
-        "mymro.cn",
-        "colipu.com",
-        "66123123.com",
-        "epec.com", "emall.epec.com", "lt95.com",
-    )
-    for d in zhaoshang_domains:
-        d = d.lower().lstrip(".")
-        if host == d or host.endswith("." + d):
-            return True
-    return False
+    return is_zhaoshang_domain(url)
 
 
 def _compute_page_price_status(row, audit_result):
@@ -1498,120 +1016,12 @@ def _compute_page_price_status(row, audit_result):
     }
 
 
-def compute_over_30_check(customer_price, page_price, page_price_status):
-    pending_statuses = {
-        "SKIPPED_JD",
-        "SKIPPED_ZHAOSHANG",
-        "SKIPPED_NO_LINK",
-        "SKIPPED_MODEL_NOT_SAME",
-        "SKIPPED",
-        "PENDING_CRAWL",
-        "FAILED",
-        "CRAWLER_PROCESS_FAILED",
-        "PRICE_MISSING",
-    }
-    if page_price_status in pending_statuses:
-        return ("PAGE_PRICE_MISSING", "")
-    if page_price is None:
-        return ("PAGE_PRICE_MISSING", "")
-    if page_price == 0:
-        return ("PAGE_PRICE_ZERO", "")
-    if page_price < 0:
-        return ("PAGE_PRICE_MISSING", "")
-    if customer_price is None or customer_price <= 0:
-        return ("CUSTOMER_PRICE_MISSING", "")
-    threshold = customer_price * THIRTY_PERCENT_RATIO
-    if page_price > threshold:
-        return ("HIGHER_THAN_CUSTOMER_PRICE_30", "TRUE")
-    return ("WITHIN_THRESHOLD", "FALSE")
 
 
-def compute_saas_price_vs_customer(customer_price, saas_price):
-    """爬虫之前的预检：SaaS json 自身价格是否已经超出客户价 30%。
-
-    返回 ("SAAS_HIGHER_THAN_CUSTOMER_30" | "SAAS_WITHIN_CUSTOMER_THRESHOLD" | "SAAS_PRICE_MISSING" | "CUSTOMER_PRICE_MISSING", evidence_str)
-    """
-    if saas_price is None or (isinstance(saas_price, Decimal) and saas_price <= 0):
-        return ("SAAS_PRICE_MISSING", "SaaS 价格为空")
-    if customer_price is None or (isinstance(customer_price, Decimal) and customer_price <= 0):
-        return ("CUSTOMER_PRICE_MISSING", "客户价缺失")
-    threshold = customer_price * THIRTY_PERCENT_RATIO
-    if saas_price > threshold:
-        return (
-            "SAAS_HIGHER_THAN_CUSTOMER_30",
-            f"SaaS价={saas_price}；客户价={customer_price}；30%阈值={threshold}",
-        )
-    return (
-        "SAAS_WITHIN_CUSTOMER_THRESHOLD",
-        f"SaaS价={saas_price}；客户价={customer_price}",
-    )
 
 
-def compute_price_changed(saas_price, page_price, page_price_status, tolerance_ratio: Decimal = Decimal("0.01")):
-    """SaaS price vs 爬取页面价。
-
-    业务含义：SaaS JSON 里记录的价格 与 当前页面真实价格不一致 →
-    说明商城实际价格已变动，这条数据要驳回（让 SaaS 重新同步）。
-
-    返回 ("CHANGED" | "UNCHANGED" | "PRICE_UNAVAILABLE", evidence)
-    tolerance_ratio：1% 容差，避免 0.01 这种四舍五入误差被当成变动
-    """
-    pending_statuses = {
-        "SKIPPED_JD",
-        "SKIPPED_ZHAOSHANG",
-        "SKIPPED_NO_LINK",
-        "SKIPPED_MODEL_NOT_SAME",
-        "SKIPPED",
-        "PENDING_CRAWL",
-        "FAILED",
-        "CRAWLER_PROCESS_FAILED",
-        "PRICE_MISSING",
-    }
-    if page_price_status in pending_statuses:
-        return ("PRICE_UNAVAILABLE", "页面价不可用")
-    if page_price is None:
-        return ("PRICE_UNAVAILABLE", "页面价无效")
-    if saas_price is None or saas_price <= 0:
-        return ("PRICE_UNAVAILABLE", "SaaS 价格无效")
-    base = saas_price if saas_price > 0 else page_price
-    diff_ratio = abs(page_price - saas_price) / base
-    if diff_ratio > tolerance_ratio:
-        return (
-            "CHANGED",
-            f"SaaS价={saas_price}；页面价={page_price}；变动={diff_ratio:.2%}",
-        )
-    return (
-        "UNCHANGED",
-        f"SaaS价={saas_price}；页面价={page_price}",
-    )
 
 
-def compute_final_decision(
-    saas_vs_customer_status: str,
-    price_changed_status: str,
-    over_30pct_value: str,
-) -> str:
-    """综合三类异常给出最终决策。
-
-    业务规则：
-      1. SaaS 自身价超客户价 30% → REJECT_SAAS_HIGH
-      2. 爬取价超客户价 30%       → 已被 over_30pct=TRUE 标记
-      3. 页面价与 SaaS 价变动      → REJECT_PRICE_CHANGED
-      多重异常时合并标记 REJECT_BOTH，否则 PASS
-    """
-    saas_high = saas_vs_customer_status == "SAAS_HIGHER_THAN_CUSTOMER_30"
-    changed = price_changed_status == "CHANGED"
-    over_30 = over_30pct_value == "TRUE"
-    flags = sum([saas_high, changed, over_30])
-    if flags >= 2:
-        return "REJECT_BOTH"
-    if saas_high:
-        return "REJECT_SAAS_HIGH"
-    if changed:
-        return "REJECT_PRICE_CHANGED"
-    if over_30:
-        return "REJECT_SAAS_HIGH"  # 爬取价超 30% 也归到此类
-    return "PASS"
 
 
 def _write_record_results_sheet(
@@ -1811,6 +1221,11 @@ def build_parser() -> argparse.ArgumentParser:
                         help="招商局进度查询间隔秒数，默认 30")
     parser.add_argument("--zhaoshang-concurrency", type=int, default=6,
                         help="招商局商城任务并发数，默认 6")
+    parser.add_argument(
+        "--auto-stbchina-fallback",
+        action="store_true",
+        help="仅在用户明确授权后，于招商局阶段成功结束后运行史泰博专用脚本",
+    )
     return parser
 
 
@@ -1868,12 +1283,19 @@ def run_main(
     zhaoshang_wait_timeout: int = 1200,
     zhaoshang_progress_interval: int = 30,
     zhaoshang_concurrency: int = 6,
+    auto_stbchina_fallback: bool = False,
     crawler_runner: Any = None,
     opener: Any | None = None,
     sleep_func: Any | None = None,
     progress_func: Any | None = None,
 ) -> dict[str, Any]:
     mode = _select_input_mode(input_xlsx, input_saas_list_json, input_saas_json, input_customer_json)
+    if auto_stbchina_fallback and (
+        not zhaoshang_task_enabled or mode != "input_saas_json"
+    ):
+        raise ValueError(
+            "--auto-stbchina-fallback 必须在双 JSON 的招商局阶段启用后使用"
+        )
 
     # 双 JSON 模式 + 未禁用 → 先生成京东/震坤行爬取模板（公司/人工系统处理）
     # AUDIT_SUPPRESS_EXCLUDED_EXPORT=1 可全局禁用（用于 pytest 等测试环境，避免污染真实目录）
@@ -1913,6 +1335,9 @@ def run_main(
     zhaoshang_executor: ThreadPoolExecutor | None = None
     zhaoshang_future = None
     if zhaoshang_task_enabled and mode == "input_saas_json":
+        auth_curl_path = load_zhaoshang_auth_env()
+        if auth_curl_path:
+            _log_step("zhaoshang", f"loaded auth from {auth_curl_path}")
         zhaoshang_start = time.perf_counter()
         _log_step(
             "zhaoshang",
@@ -1928,6 +1353,7 @@ def run_main(
             progress_interval_seconds=zhaoshang_progress_interval,
             skip_if_exists=True,
             max_workers=zhaoshang_concurrency,
+            batch_state_path=output_xlsx.parent / "BATCH_STATE.md",
         )
 
     if mode == "input_saas_json":
@@ -2048,17 +1474,7 @@ def run_main(
             crawler_summary["urls_returned"] = len(crawl_results_by_url)
         _log_step("crawler", "stage completed", start=crawler_stage_start)
 
-    # 史泰博专用爬虫（不走 multi_mall_crawler，用专用脚本）
-    stbchina_urls = collect_stbchina_urls(rows)
-    if stbchina_urls:
-        stbchina_start = time.perf_counter()
-        _log_step("stbchina", f"start urls={len(stbchina_urls)}")
-        runtime_dir = output_xlsx.parent if output_xlsx.parent != Path("") else Path("./runtime")
-        stbchina_results = run_stbchina_crawler(stbchina_urls, runtime_dir)
-        stb_backfilled = apply_stbchina_results_to_rows(rows, stbchina_results)
-        _log_step("stbchina", f"completed backfilled={stb_backfilled}", start=stbchina_start)
-    else:
-        stb_backfilled = 0
+    stbchina_summary: dict[str, Any] = {"enabled": auto_stbchina_fallback}
 
     # 招商局任务在模板导出后已异步启动；这里等待结果并回填页面价。
     if zhaoshang_future is not None:
@@ -2079,12 +1495,49 @@ def run_main(
             "enabled": True,
             "results": zhaoshang_results,
         }
+        failed_malls: list[str] = []
+        if not isinstance(zhaoshang_results, dict):
+            failed_malls.append("结果格式异常")
+        else:
+            if zhaoshang_results.get("_error"):
+                failed_malls.append(f"初始化失败: {zhaoshang_results['_error']}")
+            for mall_name, info in zhaoshang_results.items():
+                if str(mall_name).startswith("_"):
+                    continue
+                if not isinstance(info, dict) or not info.get("ok"):
+                    error = info.get("error", "未知错误") if isinstance(info, dict) else "结果格式异常"
+                    failed_malls.append(f"{mall_name}: {error}")
+                elif not info.get("skipped"):
+                    try:
+                        _validate_zhaoshang_priority_evidence(info)
+                    except Exception as exc:  # noqa: BLE001
+                        failed_malls.append(f"{mall_name}: {exc}")
+                        continue
+                    if not info.get("result_path"):
+                        failed_malls.append(f"{mall_name}: 未取得导出结果")
+        if failed_malls:
+            details = "; ".join(_safe_console_text(item, 300) for item in failed_malls)
+            raise RuntimeError(f"招商局阶段未完成，停止生成最终 Excel: {details}")
         backfill_start = time.perf_counter()
         backfilled = apply_zhaoshang_results_to_rows(rows, enriched, audit_response, zhaoshang_results)
         zhaoshang_summary["backfilled"] = backfilled
         _log_step("zhaoshang", f"backfilled {backfilled} rows", start=backfill_start)
         if backfilled > 0:
             print(f"[zhaoshang] 回填 {backfilled} 条京东/震坤行价格")
+
+    if auto_stbchina_fallback:
+        stbchina_urls = collect_stbchina_urls(rows, missing_only=True)
+        stbchina_summary["urls_total"] = len(stbchina_urls)
+        if stbchina_urls:
+            stbchina_start = time.perf_counter()
+            _log_step("stbchina", f"start urls={len(stbchina_urls)}")
+            runtime_dir = output_xlsx.parent if output_xlsx.parent != Path("") else Path("./runtime")
+            stbchina_results = run_stbchina_crawler(stbchina_urls, runtime_dir)
+            stb_backfilled = apply_stbchina_results_to_rows(rows, stbchina_results)
+            stbchina_summary["backfilled"] = stb_backfilled
+            _log_step("stbchina", f"completed backfilled={stb_backfilled}", start=stbchina_start)
+        else:
+            stbchina_summary["backfilled"] = 0
 
     write_start = time.perf_counter()
     write_audit_workbook(output_xlsx, headers, rows, enriched, audit_response)
@@ -2100,6 +1553,7 @@ def run_main(
         "crawler": crawler_summary,
         "excluded_export": excluded_export_summary,
         "zhaoshang": zhaoshang_summary,
+        "stbchina": stbchina_summary,
     }
 
 
@@ -2192,6 +1646,7 @@ def main(argv: list[str] | None = None) -> int:
         zhaoshang_wait_timeout=args.zhaoshang_wait_timeout,
         zhaoshang_progress_interval=args.zhaoshang_progress_interval,
         zhaoshang_concurrency=args.zhaoshang_concurrency,
+        auto_stbchina_fallback=args.auto_stbchina_fallback,
         progress_func=_cli_progress,
     )
     print_summary(result["summary_counts"], args.output_xlsx)
@@ -2433,13 +1888,19 @@ def _is_stbchina_link(url: str) -> bool:
     return "stbchina.cn" in host
 
 
-def collect_stbchina_urls(rows: list[dict[str, Any]]) -> list[str]:
+def collect_stbchina_urls(
+    rows: list[dict[str, Any]],
+    *,
+    missing_only: bool = False,
+) -> list[str]:
     """收集所有 stbchina.cn 链接（去重）。"""
     seen: set[str] = set()
     urls: list[str] = []
     for row in rows:
         url = normalize_cell_str(row.get("extLink"))
         if not url or not _is_stbchina_link(url) or url in seen:
+            continue
+        if missing_only and row.get("__page_price_status") in {"OK", "PRICE_IS_ZERO"}:
             continue
         seen.add(url)
         urls.append(url)
@@ -2656,349 +2117,181 @@ def _safe_console_text(value: Any, limit: int = 300) -> str:
     return text.encode(encoding, errors="backslashreplace").decode(encoding, errors="replace")
 
 
-def run_zhaoshang_tasks(
-    excluded_export_summary,
-    task_name_prefix="中核价格爬取",
-    tool_path=None,
-    wait_timeout_seconds=600,
-    progress_interval_seconds=30,
-    skip_if_exists=True,
-    max_workers=6,
-):
-    """对 excluded_export_summary 里每个有数据的商城各跑一次招商局任务。
+def _zhaoshang_failure_detail(exc: Exception) -> str:
+    text = str(exc)
+    text = re.sub(r"(?im)^(cookie|blade-auth|authorization|auth-token|access-token)\s*:\s*.*$", r"\1: [REDACTED]", text)
+    text = re.sub(r"(?i)(x-access-token|refreshToken|auth-token|access-token)=([^;\s]+)", r"\1=[REDACTED]", text)
+    return text
 
-    任务命名：中核价格爬取+<商城中文名>+<时间戳HHMMSS>
-    返回：
-      {
-        "<商城名>": {"ok": True, "result_path": Path, ...} | {"ok": False, "error": "..."},
-      }
-    """
-    tool_path = tool_path or DEFAULT_ZHAOSHANG_TOOL_PATH
+
+_ZHAOSHANG_PRIORITY_SUCCESS_STATES = {
+    "updated",
+    "already_highest_priority",
+    "task_completed_unconfirmed",
+}
+
+
+def _validate_zhaoshang_priority_evidence(result: Any) -> str:
+    if not isinstance(result, dict):
+        raise RuntimeError("招商局工具未返回结构化结果")
+    priority_state = str(result.get("priority_state") or "").strip()
+    if priority_state not in _ZHAOSHANG_PRIORITY_SUCCESS_STATES:
+        raise RuntimeError(
+            f"招商局任务缺少可接受的提优状态证据: {priority_state or '<missing>'}"
+        )
+    if priority_state == "updated" and int(result.get("affected_rows") or 0) <= 0:
+        raise RuntimeError("招商局任务标记 updated 但缺少 affected_rows>0 证据")
+    if (
+        priority_state == "already_highest_priority"
+        and int(result.get("already_highest_count") or 0) <= 0
+    ):
+        raise RuntimeError("招商局任务标记 already_highest 但缺少已验证行数")
+    return priority_state
+
+
+def backfill_zhaoshang_results_into_workbook(
+    source_path: Path,
+    output_path: Path,
+    zhaoshang_summary: dict[str, Any],
+) -> dict[str, int]:
+    """Merge late Zhaoshang exports and recompute all dependent price decisions."""
+    url_to_result: dict[str, dict[str, Any]] = {}
+    code_candidates: dict[str, list[dict[str, Any]]] = {}
+    for mall_cn, info in (zhaoshang_summary or {}).items():
+        if str(mall_cn).startswith("_") or not isinstance(info, dict) or not info.get("ok"):
+            continue
+        result_path = info.get("result_path")
+        if not result_path:
+            continue
+        mapped = read_zhaoshang_result_xlsx(
+            Path(result_path),
+            template_path=info.get("template_path"),
+        )
+        url_to_result.update(mapped)
+        for hit in mapped.values():
+            product_code = normalize_cell_str(hit.get("product_code"))
+            if product_code:
+                code_candidates.setdefault(product_code, []).append(hit)
+
+    unique_code_to_result = {
+        product_code: hits[0]
+        for product_code, hits in code_candidates.items()
+        if len(hits) == 1
+    }
+
+    workbook = load_workbook(source_path)
     try:
-        run_crawl_task = _load_zhaoshang_run_crawl_task(tool_path)
-    except Exception as exc:
-        print(f"[zhaoshang] 加载工具失败：{type(exc).__name__}: {exc}")
-        return {"_error": f"{type(exc).__name__}: {exc}"}
+        sheet = workbook["record_results"]
+        header_index = {
+            str(cell.value or "").strip(): index
+            for index, cell in enumerate(sheet[1], start=1)
+        }
 
-    from datetime import datetime as _dt
-    timestamp = _dt.now().strftime("%H%M%S")
-    results = {}
+        def column(field: str) -> int:
+            display = _display_header(field)
+            if display not in header_index:
+                raise ValueError(f"Excel missing column: {field}")
+            return header_index[display]
 
-    if not isinstance(excluded_export_summary, dict):
-        return results
+        url_col = column("extLink")
+        sku_col = header_index.get(_display_header("skuId"))
+        saas_price_col = column("price")
+        customer_price_col = column("customerPrice")
+        saas_vs_customer_col = column("saas_price_vs_customer")
+        page_price_col = column("page_price_value")
+        page_status_col = column("page_price_status")
+        page_source_col = column("page_price_source")
+        page_customer_col = column("page_vs_customer_check")
+        over_30_col = column("over_30pct")
+        price_changed_col = column("price_changed")
+        final_decision_col = column("final_decision")
+        highlighted_cols = {
+            header_index[_display_header(field)]
+            for field in HIGHLIGHTED_RESULT_COLUMNS
+            if _display_header(field) in header_index
+        }
 
-    for mall_cn, info in excluded_export_summary.items():
-        if mall_cn.startswith("_"):
-            continue
-        if not isinstance(info, dict) or info.get("deduped", 0) == 0:
-            results[mall_cn] = {"ok": True, "skipped": True, "reason": "无可用数据行"}
-            continue
-
-        mall_key = info.get("mall_key") or mall_cn
-        excel_path = info.get("path")
-        if excel_path is None or not Path(excel_path).exists():
-            results[mall_cn] = {"ok": False, "error": f"模板文件不存在: {excel_path}"}
-            continue
-
-        task_name = f"{task_name_prefix}_{mall_cn}_{timestamp}"
-        try:
-            print(f"[zhaoshang] {mall_cn}: 提交任务 task_name={task_name}, mall_key={mall_key}, excel={excel_path}")
-            result = run_crawl_task(
-                task_name=task_name,
-                mall_key=mall_key,
-                excel_path=str(excel_path),
-                wait_timeout_seconds=wait_timeout_seconds,
-                progress_interval_seconds=progress_interval_seconds,
-                skip_if_exists=skip_if_exists,
-            )
-            print(f"[zhaoshang] {mall_cn}: 完成，结果文件={result.get('result_path')}")
-            results[mall_cn] = {
-                "ok": True,
-                "task_name": task_name,
-                "mall_key": mall_key,
-                "rows": info.get("deduped", 0),
-                "template_path": str(excel_path),
-                "result_path": result.get("result_path"),
-            }
-        except Exception as exc:
-            error = f"{type(exc).__name__}: {_safe_console_text(exc)}"
-            print(f"[zhaoshang] {_safe_console_text(mall_cn, 80)}: 失败 {error}")
-            results[mall_cn] = {
-                "ok": False,
-                "task_name": task_name,
-                "error": error,
-            }
-    return results
-
-
-def read_zhaoshang_result_xlsx(path):
-    """读招商局返回 xlsx，按"原始链接 / url / 商品链接" 找 URL 列，"价格 / 商品价格" 找价格列。
-
-    返回 {url: {"page_price_value": Decimal | None, "page_price_status": str, "page_price_source": str}}
-    """
-    path = Path(path)
-    if not path.exists():
-        return {}
-    wb = load_workbook(filename=str(path), data_only=True, read_only=True)
-    try:
-        sheet = wb.active
-        if sheet is None:
-            return {}
-        iterator = sheet.iter_rows(values_only=True)
-        try:
-            header_row = next(iterator)
-        except StopIteration:
-            return {}
-        headers = [str(v).strip() if v is not None else "" for v in header_row]
-
-        def _find(*names):
-            for name in names:
-                if name in headers:
-                    return headers.index(name)
-            return -1
-
-        url_idx = _find("原始链接", "url", "URL", "商品链接", "链接", "商品URL")
-        price_idx = _find("商品价格", "价格", "采集价格", "page_price")
-        status_idx = _find("采集状态", "状态")
-        reason_idx = _find("失败原因", "原因")
-
-        if url_idx < 0:
-            return {}
-
-        results = {}
-        for raw in iterator:
-            if raw is None:
-                continue
-            if url_idx >= len(raw):
-                continue
-            url = str(raw[url_idx] or "").strip()
-            if not url:
-                continue
-            price_value = None
-            if 0 <= price_idx < len(raw):
-                price_value = parse_decimal(raw[price_idx])
-            status_text = ""
-            if 0 <= status_idx < len(raw) and raw[status_idx] is not None:
-                status_text = str(raw[status_idx]).strip()
-            reason_text = ""
-            if 0 <= reason_idx < len(raw) and raw[reason_idx] is not None:
-                reason_text = str(raw[reason_idx]).strip()
-
-            if price_value is not None and price_value > 0:
-                results[url] = {
-                    "page_price_value": price_value,
-                    "page_price_status": "OK",
-                    "page_price_source": "招商局",
-                }
-            elif price_value is not None and price_value == 0:
-                results[url] = {
-                    "page_price_value": price_value,
-                    "page_price_status": "PRICE_ZERO",
-                    "page_price_source": "招商局",
-                }
-            elif "成功" in status_text and price_value is None:
-                results[url] = {
-                    "page_price_value": None,
-                    "page_price_status": "PRICE_MISSING",
-                    "page_price_source": "招商局-价格不可见",
-                }
+        backfilled = 0
+        for row_index in range(2, sheet.max_row + 1):
+            source_url = _normalize_url(sheet.cell(row_index, url_col).value)
+            hit = url_to_result.get(source_url)
+            if hit is None and sku_col is not None:
+                product_code = normalize_cell_str(sheet.cell(row_index, sku_col).value)
+                hit = unique_code_to_result.get(product_code)
+            if hit is not None:
+                page_price = hit.get("page_price_value")
+                page_status = hit.get("page_price_status") or "FAILED"
+                if page_status == "PRICE_ZERO":
+                    page_status = "PRICE_IS_ZERO"
+                sheet.cell(row_index, page_price_col).value = _format_cell_value(page_price)
+                sheet.cell(row_index, page_status_col).value = page_status
+                sheet.cell(row_index, page_source_col).value = hit.get("page_price_source", "")
+                backfilled += 1
             else:
-                results[url] = {
-                    "page_price_value": None,
-                    "page_price_status": "FAILED",
-                    "page_price_source": "招商局-" + (reason_text or status_text or "未知"),
-                }
-        return results
+                page_price = parse_decimal(sheet.cell(row_index, page_price_col).value)
+                page_status = str(sheet.cell(row_index, page_status_col).value or "")
+
+            page_vs_customer, over_30 = compute_over_30_check(
+                parse_decimal(sheet.cell(row_index, customer_price_col).value),
+                page_price,
+                page_status,
+            )
+            price_changed, _ = compute_price_changed(
+                parse_decimal(sheet.cell(row_index, saas_price_col).value),
+                page_price,
+                page_status,
+            )
+            final_decision = compute_final_decision(
+                str(sheet.cell(row_index, saas_vs_customer_col).value or ""),
+                price_changed,
+                over_30,
+            )
+            sheet.cell(row_index, page_customer_col).value = page_vs_customer
+            sheet.cell(row_index, over_30_col).value = over_30
+            sheet.cell(row_index, price_changed_col).value = price_changed
+            sheet.cell(row_index, final_decision_col).value = final_decision
+
+            row_is_abnormal = (
+                over_30 == "TRUE"
+                or str(sheet.cell(row_index, saas_vs_customer_col).value or "") == "SAAS_HIGHER_THAN_CUSTOMER_30"
+                or price_changed == "CHANGED"
+                or page_status == "PRICE_IS_ZERO"
+            )
+            for cell in sheet[row_index]:
+                cell.fill = OVER_30_FILL if row_is_abnormal else PatternFill(fill_type=None)
+            if not row_is_abnormal:
+                for col_index in highlighted_cols:
+                    sheet.cell(row_index, col_index).fill = HIGHLIGHT_FILL
+
+        decisions = [str(sheet.cell(row, final_decision_col).value or "") for row in range(2, sheet.max_row + 1)]
+        if "summary" in workbook:
+            summary = workbook["summary"]
+            summary.cell(2, 2).value = decisions.count("PASS")
+            summary.cell(2, 3).value = sum(value in {"MANUAL_REVIEW", "PRICE_UNAVAILABLE"} for value in decisions)
+            summary.cell(2, 4).value = sum(value.startswith("REJECT") for value in decisions)
+            summary.cell(2, 5).value = sum(
+                str(sheet.cell(row, over_30_col).value or "") == "TRUE"
+                for row in range(2, sheet.max_row + 1)
+            )
+        workbook.save(output_path)
+        return {
+            "backfilled": backfilled,
+            "mapped_urls": len(url_to_result),
+            "mapped_unique_codes": len(unique_code_to_result),
+        }
     finally:
-        wb.close()
-
-
-def apply_zhaoshang_results_to_rows(rows, enriched, audit_response, zhaoshang_summary):
-    """把招商局任务结果回填到对应 row 的 __page_price_* 字段。
-
-    与 apply_crawl_results_to_rows 类似，但只覆盖匹配的 url（京东/震坤行）。
-    """
-    url_to_result = {}
-    if isinstance(zhaoshang_summary, dict):
-        for mall_cn, info in zhaoshang_summary.items():
-            if mall_cn.startswith("_"):
-                continue
-            if not isinstance(info, dict) or not info.get("ok") or info.get("skipped"):
-                continue
-            result_path = info.get("result_path")
-            if not result_path:
-                continue
-            mapped = read_zhaoshang_result_xlsx(Path(result_path))
-            url_to_result.update(mapped)
-            print(f"[zhaoshang] {mall_cn}: 回填 {len(mapped)} 条页面价")
-
-    if not url_to_result:
-        return 0
-
-    backfilled = 0
-    for row in rows:
-        url = _normalize_url(row.get("extLink"))
-        if not url:
-            continue
-        hit = url_to_result.get(url)
-        if hit is None:
-            continue
-        row["__page_price_value"] = hit["page_price_value"]
-        row["__page_price_status"] = hit["page_price_status"]
-        row["__page_price_source"] = hit["page_price_source"]
-        backfilled += 1
-    return backfilled
-
-
-def _read_zhaoshang_template_code_url_map(template_path: Path | str | None) -> dict[str, str]:
-    """Read the import template exported for Zhaoshang and map product code to URL."""
-    if not template_path:
-        return {}
-    path = Path(template_path)
-    if not path.exists():
-        return {}
-    wb = load_workbook(filename=str(path), data_only=True, read_only=True)
-    try:
-        sheet = wb.active
-        if sheet is None:
-            return {}
-        iterator = sheet.iter_rows(values_only=True)
-        try:
-            header_row = next(iterator)
-        except StopIteration:
-            return {}
-        headers = [str(v).strip() if v is not None else "" for v in header_row]
-
-        def find_header(*names: str) -> int:
-            for name in names:
-                if name in headers:
-                    return headers.index(name)
-            return -1
-
-        code_idx = find_header("\u5546\u54c1\u7f16\u7801", "skuId", "sku_id", "code")
-        url_idx = find_header("url", "URL", "\u94fe\u63a5", "\u5546\u54c1URL", "\u5546\u54c1\u94fe\u63a5")
-        if code_idx < 0 or url_idx < 0:
-            return {}
-
-        mapping: dict[str, str] = {}
-        for raw in iterator:
-            if raw is None or code_idx >= len(raw) or url_idx >= len(raw):
-                continue
-            code = normalize_cell_str(raw[code_idx])
-            url = _normalize_url(raw[url_idx])
-            if code and url and code not in mapping:
-                mapping[code] = url
-        return mapping
-    finally:
-        wb.close()
+        workbook.close()
 
 
 def read_zhaoshang_result_xlsx(path, template_path: Path | str | None = None):
-    """Read Zhaoshang result xlsx.
-
-    Some result files do not include the original URL. In that case, map
-    product code back to URL through the exported import template.
-    """
-    path = Path(path)
-    if not path.exists():
-        return {}
-    code_to_url = _read_zhaoshang_template_code_url_map(template_path)
-    wb = load_workbook(filename=str(path), data_only=True, read_only=True)
-    try:
-        sheet = wb.active
-        if sheet is None:
-            return {}
-        iterator = sheet.iter_rows(values_only=True)
-        try:
-            header_row = next(iterator)
-        except StopIteration:
-            return {}
-        headers = [str(v).strip() if v is not None else "" for v in header_row]
-
-        def find_header(*names: str) -> int:
-            for name in names:
-                if name in headers:
-                    return headers.index(name)
-            return -1
-
-        url_idx = find_header(
-            "\u539f\u59cb\u94fe\u63a5",
-            "url",
-            "URL",
-            "\u5546\u54c1\u94fe\u63a5",
-            "\u94fe\u63a5",
-            "\u5546\u54c1URL",
-        )
-        code_idx = find_header(
-            "\u5546\u54c1\u7f16\u7801",
-            "\u5546\u54c1\u6700\u5c0f\u54c1\u7c7b\u5355\u5143id",
-            "skuId",
-            "sku_id",
-            "code",
-        )
-        price_idx = find_header(
-            "\u5546\u54c1\u4ef7\u683c",
-            "\u4ef7\u683c",
-            "\u91c7\u96c6\u4ef7\u683c",
-            "page_price",
-        )
-        status_idx = find_header("\u91c7\u96c6\u72b6\u6001", "\u72b6\u6001")
-        reason_idx = find_header("\u5931\u8d25\u539f\u56e0", "\u539f\u56e0")
-
-        if url_idx < 0 and (code_idx < 0 or not code_to_url):
-            return {}
-
-        results = {}
-        for raw in iterator:
-            if raw is None:
-                continue
-
-            url = ""
-            if 0 <= url_idx < len(raw):
-                url = _normalize_url(raw[url_idx])
-            if not url and 0 <= code_idx < len(raw):
-                url = code_to_url.get(normalize_cell_str(raw[code_idx]), "")
-            if not url:
-                continue
-
-            price_value = None
-            if 0 <= price_idx < len(raw):
-                price_value = parse_decimal(raw[price_idx])
-            status_text = str(raw[status_idx]).strip() if 0 <= status_idx < len(raw) and raw[status_idx] is not None else ""
-            reason_text = str(raw[reason_idx]).strip() if 0 <= reason_idx < len(raw) and raw[reason_idx] is not None else ""
-
-            if price_value is not None and price_value > 0:
-                results[url] = {
-                    "page_price_value": price_value,
-                    "page_price_status": "OK",
-                    "page_price_source": "\u62db\u5546\u5c40",
-                }
-            elif price_value is not None and price_value == 0:
-                results[url] = {
-                    "page_price_value": price_value,
-                    "page_price_status": "PRICE_ZERO",
-                    "page_price_source": "\u62db\u5546\u5c40",
-                }
-            elif "\u6210\u529f" in status_text and price_value is None:
-                results[url] = {
-                    "page_price_value": None,
-                    "page_price_status": "PRICE_MISSING",
-                    "page_price_source": "\u62db\u5546\u5c40-\u4ef7\u683c\u4e0d\u53ef\u89c1",
-                }
-            else:
-                results[url] = {
-                    "page_price_value": None,
-                    "page_price_status": "FAILED",
-                    "page_price_source": "\u62db\u5546\u5c40-" + (reason_text or status_text or "\u672a\u77e5"),
-                }
-        return results
-    finally:
-        wb.close()
+    """Legacy read-only facade for the canonical result adapter."""
+    return _zhaoshang_results.read_zhaoshang_result_xlsx(path, template_path=template_path)
 
 
 def apply_zhaoshang_results_to_rows(rows, enriched, audit_response, zhaoshang_summary):
     """Backfill Zhaoshang prices onto source rows by URL."""
     url_to_result = {}
+    code_candidates = {}
     if isinstance(zhaoshang_summary, dict):
         for mall_cn, info in zhaoshang_summary.items():
             if str(mall_cn).startswith("_"):
@@ -3013,17 +2306,27 @@ def apply_zhaoshang_results_to_rows(rows, enriched, audit_response, zhaoshang_su
                 template_path=info.get("template_path"),
             )
             url_to_result.update(mapped)
+            for hit in mapped.values():
+                product_code = normalize_cell_str(hit.get("product_code"))
+                if product_code:
+                    code_candidates.setdefault(product_code, []).append(hit)
             print(f"[zhaoshang] {_safe_console_text(mall_cn, 80)}: backfill mapped {len(mapped)} rows")
 
-    if not url_to_result:
+    if not url_to_result and not code_candidates:
         return 0
+
+    unique_code_to_result = {
+        product_code: hits[0]
+        for product_code, hits in code_candidates.items()
+        if len(hits) == 1
+    }
 
     backfilled = 0
     for row in rows:
         url = _normalize_url(row.get("extLink"))
-        if not url:
-            continue
         hit = url_to_result.get(url)
+        if hit is None:
+            hit = unique_code_to_result.get(normalize_cell_str(row.get("skuId")))
         if hit is None:
             continue
         row["__page_price_value"] = hit["page_price_value"]
@@ -3041,6 +2344,7 @@ def run_zhaoshang_tasks(
     progress_interval_seconds=30,
     skip_if_exists=True,
     max_workers=6,
+    batch_state_path=None,
 ):
     """Run one Zhaoshang task per mall, concurrently."""
     group_start = time.perf_counter()
@@ -3055,8 +2359,7 @@ def run_zhaoshang_tasks(
     if not isinstance(excluded_export_summary, dict):
         return results
 
-    timestamp = datetime.now().strftime("%H%M%S") + str(int(time.perf_counter() * 1000) % 1000).zfill(3)
-    jobs: list[tuple[str, dict[str, Any], str, Path, str]] = []
+    jobs: list[tuple[str, dict[str, Any], str, Path]] = []
     for mall_cn, info in excluded_export_summary.items():
         if str(mall_cn).startswith("_") or mall_cn == "enabled":
             continue
@@ -3070,8 +2373,7 @@ def run_zhaoshang_tasks(
             results[mall_cn] = {"ok": False, "error": f"模板文件不存在: {excel_path}"}
             continue
 
-        task_name = f"{task_name_prefix}_{mall_cn}_{timestamp}"
-        jobs.append((mall_cn, info, mall_key, Path(excel_path), task_name))
+        jobs.append((mall_cn, info, mall_key, Path(excel_path)))
 
     if not jobs:
         return results
@@ -3079,8 +2381,10 @@ def run_zhaoshang_tasks(
     worker_count = max(1, min(int(max_workers or 1), len(jobs)))
     _log_step("zhaoshang", f"run mall tasks total={len(jobs)} concurrency={worker_count}")
 
-    def run_one(job: tuple[str, dict[str, Any], str, Path, str]) -> tuple[str, dict[str, Any]]:
-        mall_cn, info, mall_key, excel_path, task_name = job
+    def run_one(job: tuple[str, dict[str, Any], str, Path]) -> tuple[str, dict[str, Any]]:
+        mall_cn, info, mall_key, excel_path = job
+        task_marker = datetime.now().strftime("%Y%m%d%H%M%S%f")
+        task_name = f"cnnc_current_opt_{mall_cn}_{task_marker}"
         task_start = time.perf_counter()
         try:
             _log_step(
@@ -3094,7 +2398,9 @@ def run_zhaoshang_tasks(
                 wait_timeout_seconds=wait_timeout_seconds,
                 progress_interval_seconds=progress_interval_seconds,
                 skip_if_exists=skip_if_exists,
+                batch_state_path=batch_state_path,
             )
+            _validate_zhaoshang_priority_evidence(result)
             _log_step(
                 "zhaoshang",
                 f"{_safe_console_text(mall_cn, 80)} completed result={_safe_console_text(result.get('result_path'), 200)}",
@@ -3104,17 +2410,32 @@ def run_zhaoshang_tasks(
                 "ok": True,
                 "task_name": task_name,
                 "mall_key": mall_key,
+                "source_id": info.get("source_id", ""),
                 "rows": info.get("deduped", 0),
                 "template_path": str(excel_path),
                 "result_path": result.get("result_path"),
+                "main_task_id": result.get("main_task_id"),
+                "task_number": result.get("task_number"),
+                "priority_state": result.get("priority_state"),
+                "affected_rows": result.get("affected_rows"),
+                "already_highest_count": result.get("already_highest_count"),
             }
         except Exception as exc:
-            error = f"{type(exc).__name__}: {_safe_console_text(exc)}"
+            detail = _zhaoshang_failure_detail(exc)
+            error = f"{type(exc).__name__}: {_safe_console_text(detail)}"
             _log_step("zhaoshang", f"{_safe_console_text(mall_cn, 80)} failed {error}", start=task_start)
+            print(
+                f"[zhaoshang][failure-detail] mall={_safe_console_text(mall_cn, 80)}\n"
+                f"{_safe_console_text(detail, 1_000_000)}",
+                flush=True,
+            )
             return mall_cn, {
                 "ok": False,
                 "task_name": task_name,
+                "mall_key": mall_key,
+                "source_id": info.get("source_id", ""),
                 "error": error,
+                "failure_detail": detail,
             }
 
     if worker_count <= 1:

@@ -11,6 +11,8 @@ data/*token*
 data/*.xlsx
 data/*.env
 data/*.json
+data/auth_state.json
+data/.auth_state.json.*.lock
 runtime/
 runtime/*.xlsx
 outputs/

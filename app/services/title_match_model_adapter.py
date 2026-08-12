@@ -1,5 +1,8 @@
 import json
+import hashlib
+import math
 import os
+import time
 from urllib import error, request
 
 from pydantic import Field
@@ -28,6 +31,37 @@ class TitleMatchModelResult(StrictModel):
 ALLOWED_RESULTS = frozenset({"SAME", "NOT_SAME", "MANUAL_REVIEW", "MODEL_UNAVAILABLE"})
 ALLOWED_MODEL_MATCH = frozenset({"exact", "partial", "mismatch", "unknown"})
 RISK_TERMS = ("替代款", "通用", "适用", "升级款")
+DEFAULT_MODEL_MAX_ATTEMPTS = 3
+DEFAULT_MODEL_MAX_ELAPSED_SECONDS = 300.0
+
+
+class ModelCallRetryExhaustedError(RuntimeError):
+    """A retryable model operation exhausted its bounded retry policy."""
+
+    def __init__(
+        self,
+        operation: str,
+        attempts: int,
+        elapsed_seconds: float,
+        last_cause: BaseException | None,
+    ) -> None:
+        self.operation = operation
+        self.attempts = attempts
+        self.elapsed_seconds = elapsed_seconds
+        self.last_cause = last_cause
+        cause_name = _safe_failure_label(last_cause)
+        super().__init__(
+            f"{operation} exhausted after {attempts} attempts in {elapsed_seconds:.3f}s: "
+            f"{cause_name}"
+        )
+
+
+def _safe_failure_label(exc: BaseException | None) -> str:
+    if exc is None:
+        return "deadline"
+    if isinstance(exc, error.HTTPError):
+        return f"HTTPError(status={exc.code})"
+    return type(exc).__name__
 
 
 def _unavailable(reason: str) -> TitleMatchModelResult:
@@ -94,6 +128,27 @@ _PROMPT_TEMPLATE = (
     "is_match={is_match}"
 )
 
+_BATCH_OUTPUT_INSTRUCTION = (
+    "\n逐条判断待判断数据。输出格式必须严格为："
+    "{\"results\":[{\"index\":0,\"match_result\":\"SAME|NOT_SAME|MANUAL_REVIEW\","
+    "\"confidence\":0.0,\"brand_match\":true,\"model_match\":\"exact|partial|mismatch|unknown\","
+    "\"spec_match\":true,\"risk_points\":[],\"reason\":\"\"}]}\n"
+)
+
+# Cache invalidation follows the real prompt and validated result contract,
+# rather than a manually maintained label that can drift during deployment.
+TITLE_MATCH_PROMPT_VERSION = "sha256:" + hashlib.sha256(
+    (_PROMPT_TEMPLATE + _BATCH_OUTPUT_INSTRUCTION).encode("utf-8")
+).hexdigest()
+TITLE_MATCH_SCHEMA_VERSION = "sha256:" + hashlib.sha256(
+    json.dumps(
+        TitleMatchModelResult.model_json_schema(),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+).hexdigest()
+
 
 def _result_from_binary_value(value: object, raw_response: str = "") -> TitleMatchModelResult:
     is_same = str(value or "").strip()
@@ -122,13 +177,21 @@ def _result_from_binary_value(value: object, raw_response: str = "") -> TitleMat
     )
 
 
+def _optional_model_bool(value: object) -> bool | None:
+    if isinstance(value, bool) or value is None:
+        return value
+    if isinstance(value, str) and value.strip().lower() in {"", "unknown", "null", "none", "n/a"}:
+        return None
+    return value  # type: ignore[return-value]
+
+
 def _result_from_model_dict(data: dict, raw_response: str = "") -> TitleMatchModelResult:
     result = TitleMatchModelResult(
         match_result=str(data.get("match_result", "MANUAL_REVIEW")),
         confidence=float(data.get("confidence", 0.0)),
-        brand_match=data.get("brand_match"),
+        brand_match=_optional_model_bool(data.get("brand_match")),
         model_match=str(data.get("model_match", "unknown")),
-        spec_match=data.get("spec_match"),
+        spec_match=_optional_model_bool(data.get("spec_match")),
         risk_points=list(data.get("risk_points", [])),
         reason=str(data.get("reason", "")),
         raw_response=raw_response,
@@ -168,6 +231,132 @@ def _model_timeout_seconds(default: float = 30.0) -> float:
     return value if value > 0 else default
 
 
+def _model_retry_limit() -> int:
+    raw = os.environ.get("TITLE_MATCH_MODEL_MAX_ATTEMPTS", "").strip()
+    if not raw:
+        # Compatibility alias: historically this setting already represented attempts.
+        raw = os.environ.get("TITLE_MATCH_MODEL_MAX_RETRIES", "").strip()
+    if not raw:
+        return DEFAULT_MODEL_MAX_ATTEMPTS
+    try:
+        value = int(raw)
+    except ValueError:
+        return DEFAULT_MODEL_MAX_ATTEMPTS
+    if value <= 0:
+        return DEFAULT_MODEL_MAX_ATTEMPTS
+    return min(value, DEFAULT_MODEL_MAX_ATTEMPTS)
+
+
+def _model_retry_elapsed_limit_seconds() -> float:
+    raw = os.environ.get("TITLE_MATCH_MODEL_MAX_ELAPSED_SECONDS", "").strip()
+    if not raw:
+        return DEFAULT_MODEL_MAX_ELAPSED_SECONDS
+    try:
+        value = float(raw)
+    except ValueError:
+        return DEFAULT_MODEL_MAX_ELAPSED_SECONDS
+    if not math.isfinite(value) or value <= 0:
+        return DEFAULT_MODEL_MAX_ELAPSED_SECONDS
+    return min(value, DEFAULT_MODEL_MAX_ELAPSED_SECONDS)
+
+
+def _model_retry_sleep_seconds(default: float = 5.0) -> float:
+    raw = os.environ.get("TITLE_MATCH_MODEL_RETRY_SLEEP", "").strip()
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
+def _retryable_model_failure(exc: BaseException) -> bool:
+    if isinstance(exc, error.HTTPError):
+        return exc.code in {408, 429} or 500 <= exc.code <= 599
+    return isinstance(
+        exc,
+        (error.URLError, TimeoutError, OSError, ValueError, KeyError, IndexError, TypeError, json.JSONDecodeError),
+    )
+
+
+def _retry_model_call(
+    operation_name: str,
+    call,
+    *,
+    max_attempts: int | None = None,
+    max_elapsed_seconds: float | None = None,
+):
+    retry_limit = (
+        _model_retry_limit()
+        if max_attempts is None
+        else min(DEFAULT_MODEL_MAX_ATTEMPTS, max(1, int(max_attempts)))
+    )
+    elapsed_limit = (
+        _model_retry_elapsed_limit_seconds()
+        if max_elapsed_seconds is None
+        else min(DEFAULT_MODEL_MAX_ELAPSED_SECONDS, max(0.001, float(max_elapsed_seconds)))
+    )
+    if not math.isfinite(elapsed_limit):
+        elapsed_limit = DEFAULT_MODEL_MAX_ELAPSED_SECONDS
+    retry_sleep = _model_retry_sleep_seconds()
+    started_at = time.monotonic()
+    deadline = started_at + elapsed_limit
+    attempt = 0
+    last_cause: BaseException | None = None
+    while attempt < retry_limit:
+        now = time.monotonic()
+        remaining_seconds = deadline - now
+        if remaining_seconds <= 0:
+            raise ModelCallRetryExhaustedError(
+                operation_name,
+                attempt,
+                max(now - started_at, 0.0),
+                last_cause,
+            )
+        attempt += 1
+        try:
+            return call(remaining_seconds)
+        except error.HTTPError as exc:
+            if not _retryable_model_failure(exc):
+                raise
+            last_cause = exc
+        except (error.URLError, TimeoutError, OSError, ValueError, KeyError, IndexError, TypeError, json.JSONDecodeError) as exc:
+            last_cause = exc
+
+        now = time.monotonic()
+        remaining_seconds = deadline - now
+        if attempt >= retry_limit or remaining_seconds <= 0:
+            raise ModelCallRetryExhaustedError(
+                operation_name,
+                attempt,
+                max(now - started_at, 0.0),
+                last_cause,
+            ) from None
+        sleep_seconds = min(retry_sleep, remaining_seconds)
+        if sleep_seconds > 0:
+            print(
+                f"[model] {operation_name} failed attempt={attempt}, retry after {sleep_seconds}s: "
+                f"{_safe_failure_label(last_cause)}",
+                flush=True,
+            )
+            time.sleep(sleep_seconds)
+
+    raise ModelCallRetryExhaustedError(
+        operation_name,
+        attempt,
+        max(time.monotonic() - started_at, 0.0),
+        last_cause,
+    )
+
+
+def _clamp_model_timeout(timeout_seconds: float | None, remaining_seconds: float) -> float:
+    configured_timeout = _model_timeout_seconds() if timeout_seconds is None else float(timeout_seconds)
+    if configured_timeout <= 0:
+        configured_timeout = _model_timeout_seconds()
+    return min(configured_timeout, remaining_seconds)
+
+
 def _build_batch_prompt(requests: list[TitleMatchModelRequest]) -> str:
     items = [
         {
@@ -181,9 +370,8 @@ def _build_batch_prompt(requests: list[TitleMatchModelRequest]) -> str:
     ]
     return (
         _PROMPT_RULES
-        + "\n逐条判断待判断数据。输出格式必须严格为："
-        "{\"results\":[{\"index\":0,\"match_result\":\"SAME|NOT_SAME|MANUAL_REVIEW\",\"confidence\":0.0,\"brand_match\":true,\"model_match\":\"exact|partial|mismatch|unknown\",\"spec_match\":true,\"risk_points\":[],\"reason\":\"\"}]}\n"
-        "待判断数据：\n"
+        + _BATCH_OUTPUT_INSTRUCTION
+        + "待判断数据：\n"
         f"{json.dumps(items, ensure_ascii=False)}"
     )
 
@@ -237,11 +425,17 @@ def _post_model_payload(payload: dict, timeout_seconds: float | None = None) -> 
         method="POST",
     )
     timeout = _model_timeout_seconds() if timeout_seconds is None else timeout_seconds
-    with request.urlopen(http_req, timeout=timeout) as resp:
+    with request.build_opener(request.ProxyHandler({})).open(http_req, timeout=timeout) as resp:
         return resp.read().decode("utf-8")
 
 
-def call_title_match_model(req: TitleMatchModelRequest, timeout_seconds: float | None = None) -> TitleMatchModelResult:
+def call_title_match_model(
+    req: TitleMatchModelRequest,
+    timeout_seconds: float | None = None,
+    *,
+    max_attempts: int | None = None,
+    max_elapsed_seconds: float | None = None,
+) -> TitleMatchModelResult:
     model_env = _model_env()
     if model_env is None:
         return _unavailable("TITLE_MATCH_MODEL_API_KEY 或 TITLE_MATCH_MODEL_BASE_URL 未配置")
@@ -253,21 +447,26 @@ def call_title_match_model(req: TitleMatchModelRequest, timeout_seconds: float |
         "temperature": 0,
         "response_format": {"type": "json_object"},
     }
-    try:
-        raw = _post_model_payload(payload, timeout_seconds=timeout_seconds)
+    def _call_and_parse(effective_timeout_seconds: float) -> TitleMatchModelResult:
+        raw = _post_model_payload(payload, timeout_seconds=effective_timeout_seconds)
         return _parse_model_response(raw, req.sku_name)
-    except (error.URLError, TimeoutError, OSError, ValueError, KeyError, IndexError, TypeError, json.JSONDecodeError) as exc:
-        return TitleMatchModelResult(
-            match_result="MANUAL_REVIEW",
-            confidence=0.0,
-            model_match="unknown",
-            reason=f"标题模型调用或解析失败，已降级人工核查: {type(exc).__name__}",
-        )
+
+    return _retry_model_call(
+        "single title match model call",
+        lambda remaining_seconds: _call_and_parse(
+            _clamp_model_timeout(timeout_seconds, remaining_seconds)
+        ),
+        max_attempts=max_attempts,
+        max_elapsed_seconds=max_elapsed_seconds,
+    )
 
 
 def call_title_match_model_batch(
     requests: list[TitleMatchModelRequest],
     timeout_seconds: float | None = None,
+    *,
+    max_attempts: int | None = None,
+    max_elapsed_seconds: float | None = None,
 ) -> dict[int, TitleMatchModelResult]:
     model_env = _model_env()
     if model_env is None:
@@ -282,29 +481,19 @@ def call_title_match_model_batch(
         "temperature": 0,
         "response_format": {"type": "json_object"},
     }
-    try:
-        raw = _post_model_payload(payload, timeout_seconds=timeout_seconds)
+    def _call_and_parse_batch(effective_timeout_seconds: float) -> dict[int, TitleMatchModelResult]:
+        raw = _post_model_payload(payload, timeout_seconds=effective_timeout_seconds)
         parsed = _parse_batch_model_response(raw, len(requests))
-        return {
-            index: parsed.get(
-                index,
-                TitleMatchModelResult(
-                    match_result="NOT_SAME",
-                    confidence=0.0,
-                    model_match="unknown",
-                    reason="批量模型未返回该条结果，已按否处理",
-                    raw_response=raw,
-                ),
-            )
-            for index in range(len(requests))
-        }
-    except (error.URLError, TimeoutError, OSError, ValueError, KeyError, IndexError, TypeError, json.JSONDecodeError) as exc:
-        return {
-            index: TitleMatchModelResult(
-                match_result="MANUAL_REVIEW",
-                confidence=0.0,
-                model_match="unknown",
-                reason=f"标题模型批量调用或解析失败，已降级人工核查: {type(exc).__name__}",
-            )
-            for index in range(len(requests))
-        }
+        missing_indexes = [index for index in range(len(requests)) if index not in parsed]
+        if missing_indexes:
+            raise ValueError(f"批量模型响应缺少结果 indexes={missing_indexes}")
+        return parsed
+
+    return _retry_model_call(
+        "batch title match model call",
+        lambda remaining_seconds: _call_and_parse_batch(
+            _clamp_model_timeout(timeout_seconds, remaining_seconds)
+        ),
+        max_attempts=max_attempts,
+        max_elapsed_seconds=max_elapsed_seconds,
+    )

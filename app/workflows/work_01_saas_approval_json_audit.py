@@ -501,20 +501,7 @@ def _precompute_title_model_results(
                     for batch_info in batches
                 }
                 for future in as_completed(future_to_batch):
-                    try:
-                        _batch_number, chunk, batch_results = future.result()
-                    except Exception as exc:  # noqa: BLE001
-                        batch_number = future_to_batch[future]
-                        chunk = batches[batch_number][1]
-                        batch_results = {
-                            index: TitleMatchModelResult(
-                                match_result="MANUAL_REVIEW",
-                                confidence=0.0,
-                                model_match="unknown",
-                                reason=f"标题模型批量并发调用失败，已降级人工核查: {type(exc).__name__}",
-                            )
-                            for index in range(len(chunk))
-                        }
+                    _batch_number, chunk, batch_results = future.result()
                     for index, (key, _record) in enumerate(chunk):
                         results[key] = batch_results[index]
                     completed += 1
@@ -537,15 +524,7 @@ def _precompute_title_model_results(
         }
         for future in as_completed(future_to_key):
             key = future_to_key[future]
-            try:
-                results[key] = future.result()
-            except Exception as exc:  # noqa: BLE001
-                results[key] = TitleMatchModelResult(
-                    match_result="MANUAL_REVIEW",
-                    confidence=0.0,
-                    model_match="unknown",
-                    reason=f"标题模型并发调用失败，已降级人工核查: {type(exc).__name__}",
-                )
+            results[key] = future.result()
     return results
 
 
@@ -753,12 +732,23 @@ def audit_saas_approval_records(
     use_link_audit: bool = True,
     crawl_results: list[InternalCrawlResult] | None = None,
     use_crawl_result: bool = True,
+    precomputed_title_model_results: dict[tuple[str, str, str, str], TitleMatchModelResult] | None = None,
 ) -> SaasSameProductApprovalAuditResponse:
-    title_model_results = _precompute_title_model_results(records) if use_model else {}
+    if precomputed_title_model_results is not None:
+        missing = {
+            _title_model_cache_key(record)
+            for record in records
+            if _title_model_cache_key(record) not in precomputed_title_model_results
+        }
+        if missing:
+            raise ValueError(f"missing precomputed title model results: {len(missing)} unique inputs")
+        title_model_results = precomputed_title_model_results
+    else:
+        title_model_results = _precompute_title_model_results(records) if use_model else {}
     results = [
         audit_saas_approval_item(
             record,
-            use_model=False if use_model else use_model,
+            use_model=False if (use_model or precomputed_title_model_results is not None) else use_model,
             use_link_audit=use_link_audit,
             title_model_result=title_model_results.get(_title_model_cache_key(record)),
             crawl_results=crawl_results,
