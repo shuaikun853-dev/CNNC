@@ -1781,7 +1781,11 @@ class TestRunMainSaasJsonE2E:
         assert result["enriched"][0]["customerPriceStatus"] == "LOOKUP_FAILED"
         assert "未找到该 documentId" in result["enriched"][0]["customerPriceWarning"]
 
-    def test_run_main_dual_mode_jd_link_marks_skipped_jd(self, tmp_path):
+    def test_run_main_dual_mode_jd_link_marks_skipped_jd(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(
+            "scripts.audit_saas_excel_file.is_zhaoshang_domain",
+            lambda url: "jd.com" in url,
+        )
         saas_row = dict(SAMPLE_SAAS_PENDING_ROW)
         saas_row["extLink"] = "https://item.jd.com/100237336261.html"
         saas_path = _write_pending_json(tmp_path, [saas_row])
@@ -2051,7 +2055,11 @@ def _make_crawler_output_xlsx(tmp_path, records):
 
 
 class TestCollectUrlsForCrawl:
-    def test_collect_pending_only_and_dedupe(self, tmp_path):
+    def test_collect_pending_only_and_dedupe(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(
+            "scripts.audit_saas_excel_file.is_zhaoshang_domain",
+            lambda url: bool(url),
+        )
         rows = [
             {**SAMPLE_SAAS_PENDING_ROW, "vCommodityId": "v1", "extLink": "https://item.jd.com/x.html"},
             {**SAMPLE_SAAS_PENDING_ROW, "vCommodityId": "v2", "extLink": ""},

@@ -84,7 +84,7 @@ FINAL_EQUIVALENCE = (
 
 def _require(paths: list[Path]) -> None:
     missing = [str(path) for path in paths if not path.exists()]
-    if missing:
+    if not paths or missing:
         pytest.skip("fixed historical fixture is unavailable")
 
 

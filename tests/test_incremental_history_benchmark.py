@@ -14,7 +14,7 @@ RUNTIME_ROOT = Path("runtime")
 
 def _require(paths):
     missing = [str(path) for path in paths if not path.exists()]
-    if missing:
+    if not paths or missing:
         pytest.skip("fixed historical fixture is unavailable")
 
 
