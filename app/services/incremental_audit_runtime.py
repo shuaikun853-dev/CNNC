@@ -37,10 +37,21 @@ from app.services.incremental_audit_materializer import (
     ArtifactConflictError,
     MaterializationValidationError,
 )
+from app.services.incremental_audit_recovery import (
+    requeue_model_transient_failures,
+    release_model_recovery,
+    resolve_exported_no_result,
+    run_existing_remote_harvest,
+    run_existing_remote_priority_recovery,
+    run_local_remote_harvest_recovery,
+    run_model_recovery,
+    run_partial_exact_harvest_recovery,
+)
 from app.services.legacy_zhaoshang_adapter import (
     CnncLegacyZhaoshangAdapter,
     CrawlRequest,
     HarvestStatus,
+    PriorityStatus,
     ReconcileStatus,
     SubmitStatus,
 )
@@ -62,6 +73,7 @@ from app.workflows.incremental_price_audit import (
     TickConfig,
     TickDependencies,
     TickSummary,
+    run_existing_remote_drain,
     run_incremental_tick,
 )
 from app.workflows.incremental_price_audit_finalize import (
@@ -69,7 +81,9 @@ from app.workflows.incremental_price_audit_finalize import (
     FinalizeBlocked,
     FinalizePublication,
     FinalizeReadiness,
+    ReviewPublication,
     materialize_frozen_daily_run,
+    materialize_frozen_review,
 )
 from scripts.audit_saas_excel_file import call_detail_api
 from scripts.auth_manager import AuthManager
@@ -84,7 +98,9 @@ from app.services.title_match_model_adapter import (
 
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
-DEFAULT_RUNTIME_ROOT = Path("runtime") / "incremental_price_audit"
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+PROJECT_DATA_ROOT = PROJECT_ROOT / "data"
+DEFAULT_RUNTIME_ROOT = PROJECT_ROOT / "runtime" / "incremental_price_audit"
 _MODEL_CONFIGURATION_KEYS = (
     "TITLE_MATCH_MODEL_API_KEY",
     "TITLE_MATCH_MODEL_BASE_URL",
@@ -115,6 +131,7 @@ class RuntimeResult:
     publication: FinalizePublication | None = None
     publication_blocked: str | None = None
     publication_error_type: str | None = None
+    lock_conflict: Mapping[str, Any] | None = None
 
 
 def business_date_in_shanghai(now: datetime | None = None) -> str:
@@ -142,6 +159,264 @@ def runtime_paths(business_date: str, root: Path | str = DEFAULT_RUNTIME_ROOT) -
         detail_lock_path=root_path / "detail.lock",
         final_output_path=run_dir / f"saas_audit_final_{business_date.replace('-', '')}.xlsx",
     )
+
+
+def _record_recovery_event(paths: RuntimePaths, result: Mapping[str, Any]) -> None:
+    path = paths.run_dir / "BATCH_STATE.md"
+    if not path.is_file():
+        return
+    safe_event = {
+        "command": str(result["outcome"]),
+        "business_date": paths.business_date,
+    }
+    for key in (
+        "frozen_snapshot_id",
+        "stage_work_ids",
+        "remote_job_id",
+        "remote_identity",
+        "crawl_work_id",
+        "crawl_completed",
+        "crawl_success",
+        "crawl_no_result",
+        "crawl_manual",
+        "written_success",
+        "written_no_result",
+        "written_manual",
+        "skipped_terminal",
+        "manual_crawl_work_ids",
+        "remote_state",
+        "expected",
+        "matched",
+        "weight_type_minus_one",
+        "downloaded",
+        "validated",
+        "positive_price",
+        "real_zero",
+        "price_invalid",
+        "missing_crawl_work_ids",
+        "row_count",
+        "manual_count",
+        "output_path",
+        "sha256",
+        "expected_count",
+        "expected_attempts",
+        "error_type",
+        "last_cause",
+        "recovered",
+        "skipped",
+        "failed",
+    ):
+        if key in result:
+            safe_event[key] = result[key]
+    event_line = f"- recovery: {json.dumps(safe_event, ensure_ascii=True, sort_keys=True)}\n"
+    with _batch_state_update_lock(path):
+        with path.open("a", encoding="utf-8", newline="\n") as stream:
+            stream.write(event_line)
+            stream.flush()
+            os.fsync(stream.fileno())
+
+
+def run_model_recovery_command(
+    *,
+    business_date: str,
+    runtime_root: Path | str,
+    stage_work_ids: list[int],
+    timeout_seconds: float = 300.0,
+) -> dict[str, Any]:
+    paths = runtime_paths(business_date, runtime_root)
+    result = run_model_recovery(
+        state_path=paths.state_path,
+        lock_path=paths.lock_path,
+        business_date=business_date,
+        stage_work_ids=stage_work_ids,
+        model_batch=_model_batch_worker,
+        model_name=_configured_model_name(),
+        model_prompt_version=TITLE_MATCH_PROMPT_VERSION,
+        model_schema_version=TITLE_MATCH_SCHEMA_VERSION,
+        timeout_seconds=timeout_seconds,
+    )
+    _record_recovery_event(paths, result)
+    return result
+
+
+def run_requeue_model_transient_command(
+    *,
+    business_date: str,
+    runtime_root: Path | str,
+    expected_count: int,
+    expected_attempts: int,
+) -> dict[str, Any]:
+    paths = runtime_paths(business_date, runtime_root)
+    result = requeue_model_transient_failures(
+        state_path=paths.state_path,
+        lock_path=paths.lock_path,
+        business_date=business_date,
+        expected_count=expected_count,
+        expected_attempts=expected_attempts,
+    )
+    _record_recovery_event(paths, result)
+    return result
+
+
+def run_release_model_recovery_command(
+    *,
+    business_date: str,
+    runtime_root: Path | str,
+    stage_work_ids: list[int],
+) -> dict[str, Any]:
+    paths = runtime_paths(business_date, runtime_root)
+    result = release_model_recovery(
+        state_path=paths.state_path,
+        lock_path=paths.lock_path,
+        business_date=business_date,
+        stage_work_ids=stage_work_ids,
+    )
+    _record_recovery_event(paths, result)
+    return result
+
+
+def run_remote_harvest_recovery_command(
+    *,
+    business_date: str,
+    runtime_root: Path | str,
+    remote_job_id: int,
+    remote_identity: str,
+) -> dict[str, Any]:
+    paths = runtime_paths(business_date, runtime_root)
+    result = run_local_remote_harvest_recovery(
+        state_path=paths.state_path,
+        lock_path=paths.lock_path,
+        business_date=business_date,
+        remote_job_id=remote_job_id,
+        remote_identity=remote_identity,
+        adapter=CnncLegacyZhaoshangAdapter(),
+    )
+    _record_recovery_event(paths, result)
+    return result
+
+
+def run_partial_exact_harvest_recovery_command(
+    *,
+    business_date: str,
+    runtime_root: Path | str,
+    remote_job_id: int,
+    remote_identity: str,
+) -> dict[str, Any]:
+    paths = runtime_paths(business_date, runtime_root)
+    result = run_partial_exact_harvest_recovery(
+        state_path=paths.state_path,
+        lock_path=paths.lock_path,
+        business_date=business_date,
+        remote_job_id=remote_job_id,
+        remote_identity=remote_identity,
+        adapter=CnncLegacyZhaoshangAdapter(),
+    )
+    _record_recovery_event(paths, result)
+    return result
+
+
+def run_no_result_recovery_command(
+    *,
+    business_date: str,
+    runtime_root: Path | str,
+    crawl_work_id: int,
+    remote_job_id: int,
+    remote_identity: str,
+) -> dict[str, Any]:
+    paths = runtime_paths(business_date, runtime_root)
+    result = resolve_exported_no_result(
+        state_path=paths.state_path,
+        lock_path=paths.lock_path,
+        business_date=business_date,
+        crawl_work_id=crawl_work_id,
+        remote_job_id=remote_job_id,
+        remote_identity=remote_identity,
+        adapter=CnncLegacyZhaoshangAdapter(),
+    )
+    _record_recovery_event(paths, result)
+    return result
+
+
+def run_remote_priority_recovery_command(
+    *,
+    business_date: str,
+    runtime_root: Path | str,
+    remote_job_id: int,
+    remote_identity: str,
+    expected_current_state: str = "PRIORITY_PENDING",
+    expected_result_state: str | None = None,
+    expected_error_text: str | None = None,
+    timeout_seconds: float = 300.0,
+) -> dict[str, Any]:
+    paths = runtime_paths(business_date, runtime_root)
+    result = run_existing_remote_priority_recovery(
+        state_path=paths.state_path,
+        lock_path=paths.lock_path,
+        business_date=business_date,
+        remote_job_id=remote_job_id,
+        remote_identity=remote_identity,
+        expected_current_state=expected_current_state,
+        expected_result_state=expected_result_state,
+        expected_error_text=expected_error_text,
+        adapter=CnncLegacyZhaoshangAdapter(),
+        timeout_seconds=timeout_seconds,
+    )
+    _record_recovery_event(paths, result)
+    return result
+
+
+def run_existing_remote_harvest_command(
+    *,
+    business_date: str,
+    runtime_root: Path | str,
+    remote_job_id: int,
+    remote_identity: str,
+    timeout_seconds: float = 300.0,
+) -> dict[str, Any]:
+    paths = runtime_paths(business_date, runtime_root)
+    result = run_existing_remote_harvest(
+        state_path=paths.state_path,
+        lock_path=paths.lock_path,
+        business_date=business_date,
+        remote_job_id=remote_job_id,
+        remote_identity=remote_identity,
+        adapter=CnncLegacyZhaoshangAdapter(),
+        timeout_seconds=timeout_seconds,
+    )
+    _record_recovery_event(paths, result)
+    return result
+
+
+def run_review_export_command(
+    *,
+    business_date: str,
+    runtime_root: Path | str,
+    output_path: Path | str | None = None,
+) -> dict[str, Any]:
+    paths = runtime_paths(business_date, runtime_root)
+    resolved_output = (
+        Path(output_path)
+        if output_path is not None
+        else paths.run_dir / f"saas_audit_review_{business_date.replace('-', '')}.xlsx"
+    )
+    publication: ReviewPublication = materialize_frozen_review(
+        DailyAuditStore(paths.state_path),
+        ProcessLock(paths.lock_path),
+        business_date,
+        resolved_output,
+    )
+    result = {
+        "outcome": "REVIEW_EXPORTED",
+        "business_date": business_date,
+        "output_path": str(publication.output_path),
+        "row_count": publication.row_count,
+        "manual_count": publication.manual_count,
+        "sha256": publication.sha256,
+        "remote_calls": 0,
+        "add_calls": 0,
+    }
+    _record_recovery_event(paths, result)
+    return result
 
 
 def _batch_state_block(
@@ -268,26 +543,44 @@ def _batch_result_metadata(
     outcome = result.tick.outcome
     if result.publication is not None:
         return "COMPLETE", "none", "formal_excel_materialized", "none; formal Excel is materialized"
+    if outcome == "ALREADY_FINALIZED":
+        return "COMPLETE", "none", "formal_excel_already_materialized", "none; daily run is already finalized"
     if result.publication_blocked:
         return "BLOCKED", result.publication_blocked, "none", "resolve blocker and rerun finalize"
     if outcome == "MANUAL_REVIEW_REQUIRED":
         return "WAITING_USER", result.tick.error or outcome, "none", "review durable manual items, then rerun the finite command"
     if outcome in {"FAILED", "DISCOVERY_INCOMPLETE", "INCOMPLETE"}:
         return "BLOCKED", result.tick.error or outcome, "none", "resolve blocker and rerun the finite command"
-    if command == "finalize" and outcome in {"FINALIZE_NOT_READY", "FINALIZE_SNAPSHOT_NOT_READY"}:
-        return "ACTIVE", "none", "none", "rerun finalize at or after the cutoff snapshot is available"
-    return "ACTIVE", "none", "none", "run the next finite tick or finalize"
+    if command in {"finalize", "drain-only"} and outcome in {
+        "FINALIZE_NOT_READY",
+        "FINALIZE_SNAPSHOT_NOT_READY",
+        "DRAIN_NOT_READY",
+        "DRAIN_SNAPSHOT_NOT_READY",
+    }:
+        return "ACTIVE", "none", "none", "rerun after the cutoff snapshot is available"
+    if outcome in {"DRAIN_NO_PROGRESS", "DRAIN_MAX_ITERATIONS", "BUDGET_EXHAUSTED"}:
+        return "ACTIVE", "none", "none", "rerun drain-only for the remaining durable remote work"
+    if outcome == "WAITING_SOURCE_COUNT":
+        return "ACTIVE", "none", "none", "rerun finalize to discover the latest source counts"
+    return "ACTIVE", "none", "none", "run the next finite tick, drain-only, or finalize"
 
 
 def _is_recoverable_finalize_wait(readiness: FinalizeReadiness | None) -> bool:
     if readiness is None:
         return False
-    has_pending = any((readiness.detail_pending, readiness.model_pending, readiness.crawl_pending))
+    has_pending = any((
+        readiness.detail_pending,
+        readiness.model_pending,
+        readiness.crawl_pending,
+        readiness.remote_pending,
+    ))
     has_actionable_blocker = any((
         readiness.model_terminal,
         readiness.crawl_terminal,
         readiness.crawl_unplanned,
         readiness.crawl_invalid_price,
+        readiness.remote_manual,
+        readiness.remote_invalid,
     ))
     return has_pending and not has_actionable_blocker
 
@@ -485,7 +778,9 @@ def _detail_worker(
     return detail
 
 
-def _read_model_configuration(path: Path = Path("data/model.env")) -> dict[str, str]:
+def _read_model_configuration(path: Path | None = None) -> dict[str, str]:
+    if path is None:
+        path = PROJECT_DATA_ROOT / "model.env"
     values = {
         key: os.environ[key].strip()
         for key in _MODEL_CONFIGURATION_KEYS
@@ -504,14 +799,14 @@ def _read_model_configuration(path: Path = Path("data/model.env")) -> dict[str, 
     return values
 
 
-def _load_model_configuration(path: Path = Path("data/model.env")) -> dict[str, str]:
+def _load_model_configuration(path: Path | None = None) -> dict[str, str]:
     values = _read_model_configuration(path)
     if any(not values.get(key, "").strip() for key in _MODEL_CONFIGURATION_KEYS):
         raise RuntimeConfigurationError("title-match model configuration is incomplete")
     return values
 
 
-def _configured_model_name(path: Path = Path("data/model.env")) -> str:
+def _configured_model_name(path: Path | None = None) -> str:
     model_name = _read_model_configuration(path).get("TITLE_MATCH_MODEL_NAME", "").strip()
     # Production composition already calls _load_model_configuration() while
     # building the model dependency.  The fallback keeps dependency-injected
@@ -645,8 +940,15 @@ def legacy_zhaoshang_bridge(
         return [CrawlPlan(mall_key=key[0], logical_key=f"proposal:{key[0]}:{key[1]}", task_name="", payload_hash="", members=tuple(members)) for key, members in groups.items()]
 
     def finalize(plan: CrawlPlan, members: tuple[CrawlMember, ...], _timeout: float) -> CrawlPlan:
-        if tuple(plan.members) != members:
-            raise ValueError("legacy template must use exactly the durable pending members")
+        if not members:
+            raise ValueError("legacy template requires durable pending members")
+        proposal_index = 0
+        for member in members:
+            while proposal_index < len(plan.members) and plan.members[proposal_index] != member:
+                proposal_index += 1
+            if proposal_index >= len(plan.members):
+                raise ValueError("legacy template members must be an ordered subset of the proposal")
+            proposal_index += 1
         _ensure_batch_state(paths, enable_zhaoshang=True)
         requests = []
         for member in members:
@@ -716,6 +1018,12 @@ def legacy_zhaoshang_bridge(
             raise RuntimeConfigurationError("legacy remote task identity is incomplete")
         return f"{prepared_job.mall_key}|{task_id}|{task_number}"
 
+    def remote_identity_parts(prepared_job: Any, value: object) -> tuple[str, str]:
+        parts = str(value or "").split("|")
+        if len(parts) != 3 or parts[0] != prepared_job.mall_key or not parts[1] or not parts[2]:
+            raise RuntimeConfigurationError("legacy remote task identity is invalid")
+        return parts[1], parts[2]
+
     def submit(job: Mapping[str, Any], _crawls: list[Mapping[str, Any]], timeout: float) -> Mapping[str, Any]:
         try:
             prepared_job = reconstruct(job)
@@ -726,7 +1034,16 @@ def legacy_zhaoshang_bridge(
             raise TimeoutError("legacy create-only outcome unknown")
         if outcome.status is not SubmitStatus.SUBMITTED:
             raise RuntimeConfigurationError("legacy create-only was not accepted")
-        return {"remote_identity": remote_identity(prepared_job, outcome.task_id, outcome.task_number), "state": "SUBMITTED"}
+        state = (
+            "SUBMITTED"
+            if outcome.priority_evidence in {"updated", "already_highest_priority"}
+            else "PRIORITY_PENDING"
+        )
+        return {
+            "remote_identity": remote_identity(prepared_job, outcome.task_id, outcome.task_number),
+            "state": state,
+            "priority_evidence": outcome.priority_evidence,
+        }
 
     def harvest(jobs: list[Mapping[str, Any]], timeout: float) -> Mapping[int, Mapping[str, Any]]:
         results: dict[int, Mapping[str, Any]] = {}
@@ -752,14 +1069,54 @@ def legacy_zhaoshang_bridge(
                     except RuntimeConfigurationError:
                         publish({"manual_error": "exact legacy reconciliation returned incomplete identity"})
                     else:
-                        publish({"state": "SUBMITTED", "remote_identity": identity})
+                        publish({"state": "PRIORITY_PENDING", "remote_identity": identity})
                 elif reconcile.status is ReconcileStatus.MANUAL:
                     publish({"manual_error": "exact legacy unknown-submit reconciliation did not confirm a task"})
+                continue
+            if str(job.get("state")) == "PRIORITY_PENDING":
+                try:
+                    task_id, task_number = remote_identity_parts(prepared_job, job.get("remote_identity"))
+                except RuntimeConfigurationError:
+                    publish({"manual_error": "priority pending job has invalid remote identity"})
+                    continue
+                priority = adapter.prioritize(
+                    prepared_job,
+                    task_id=task_id,
+                    task_number=task_number,
+                    timeout_seconds=job_timeout,
+                )
+                if priority.status in {PriorityStatus.UPDATED, PriorityStatus.ALREADY_HIGHEST}:
+                    publish({
+                        "state": "SUBMITTED",
+                        "remote_identity": str(job.get("remote_identity")),
+                        "result": {
+                            "priority_status": priority.status.value,
+                            "weight_type": priority.weight_type,
+                        },
+                    })
+                elif priority.retryable:
+                    publish({
+                        "state": "PRIORITY_PENDING",
+                        "remote_identity": str(job.get("remote_identity")),
+                        "retryable_error": (
+                            priority.diagnostic
+                            or "transient priority infrastructure failure"
+                        ),
+                        "result": {
+                            "state": "PRIORITY_PENDING",
+                            "priority_status": priority.status.value,
+                            "diagnostic": priority.diagnostic,
+                        },
+                    })
+                else:
+                    publish({"manual_error": priority.diagnostic or "highest priority was not confirmed"})
                 continue
             outcome = adapter.harvest(prepared_job, timeout_seconds=job_timeout)
             if outcome.status is HarvestStatus.EXPORTED:
                 result_map = dict(outcome.result_map or {})
                 result_by_identity = dict(outcome.result_by_identity or {})
+                no_result_identities = set(outcome.no_result_identities)
+                manual_identities = dict(outcome.manual_identities or {})
                 sku_count_by_url: dict[str, set[str]] = {}
                 for request in prepared_job.requests:
                     sku_count_by_url.setdefault(request.url.strip(), set()).add(request.sku_id)
@@ -774,15 +1131,39 @@ def legacy_zhaoshang_bridge(
                     # pair can still fan out to multiple source documents.
                     if value is None and len(sku_count_by_url.get(exact_url, set())) == 1:
                         value = result_map.get(exact_url)
-                    if value is None:
+                    identity = (sku_id, exact_url)
+                    if value is not None:
+                        crawl_results[int(crawl["id"])] = value
+                    elif identity in no_result_identities:
                         crawl_results[int(crawl["id"])] = {
-                            "terminal": True,
-                            "error": "legacy export missing safe skuId / exact URL result",
+                            "no_result": True,
+                            "reason": "provenance-valid remote request has no result row",
+                        }
+                    elif identity in manual_identities:
+                        crawl_results[int(crawl["id"])] = {
+                            "manual": True,
+                            "error": manual_identities[identity],
                         }
                     else:
-                        crawl_results[int(crawl["id"])] = value
-                state = "COMPLETED" if len(crawl_results) == len(job.get("crawl_work", [])) else "EXPORTED"
-                publish({"state": state, "remote_identity": str(job.get("remote_identity") or "legacy"), "result": result_map, "crawl_results": crawl_results})
+                        crawl_results[int(crawl["id"])] = {
+                            "manual": True,
+                            "error": "provenance-valid row lacks durable request-group mapping",
+                        }
+                state = (
+                    "EXPORTED"
+                    if any(
+                        isinstance(value, Mapping) and value.get("manual")
+                        for value in crawl_results.values()
+                    )
+                    else "COMPLETED"
+                )
+                publish({
+                    "state": state,
+                    "remote_identity": str(job.get("remote_identity") or "legacy"),
+                    "export_path": str(prepared_job.result_path),
+                    "result": result_map,
+                    "crawl_results": crawl_results,
+                })
             elif outcome.status is HarvestStatus.RUNNING:
                 publish({"state": "RUNNING", "remote_identity": str(job.get("remote_identity") or "legacy")})
             else:
@@ -921,11 +1302,11 @@ def build_default_dependencies(
     or submitter and therefore cannot create a remote task.
     """
     snapshot_adapter = CnncSaasSnapshotAdapter(
-        Path("data/latest_saas_sameAudit_queryAll.curl"),
-        Path("data/latest_cnnc_query.curl"),
+        PROJECT_DATA_ROOT / "latest_saas_sameAudit_queryAll.curl",
+        PROJECT_DATA_ROOT / "latest_cnnc_query.curl",
         auth_manager=AuthManager(),
     )
-    detail_template = load_curl_command(Path("data/detail_request.curl"))
+    detail_template = load_curl_command(PROJECT_DATA_ROOT / "detail_request.curl")
     if zhaoshang_backend not in {"legacy", "batch"}:
         raise RuntimeConfigurationError("Zhaoshang backend must be legacy or batch")
     legacy_adapter: CnncLegacyZhaoshangAdapter | None = None
@@ -964,12 +1345,35 @@ def build_default_dependencies(
     return dependencies
 
 
+def build_drain_dependencies(
+    *,
+    zhaoshang_backend: str,
+    paths: RuntimePaths,
+    business_date: str,
+) -> TickDependencies:
+    """Compose only the existing-remote lifecycle; no create surface exists."""
+    if zhaoshang_backend != "legacy":
+        raise RuntimeConfigurationError("drain-only requires the evidenced legacy export backend")
+    adapter = CnncLegacyZhaoshangAdapter()
+    _planner, _finalizer, _submitter, harvester = legacy_zhaoshang_bridge(
+        adapter,
+        paths=paths,
+        business_date=business_date,
+    )
+
+    def discover_forbidden(_timeout: float) -> DiscoveredState:
+        raise RuntimeConfigurationError("drain-only cannot discover new business work")
+
+    return TickDependencies(discover=discover_forbidden, harvest=harvester)
+
+
 def run_runtime_command(
     command: str,
     *,
     business_date: str | None = None,
     runtime_root: Path | str = DEFAULT_RUNTIME_ROOT,
     runtime_budget_seconds: float = 720,
+    drain_max_iterations: int = 1000,
     enable_zhaoshang: bool = False,
     zhaoshang_backend: str = "legacy",
     dependencies: TickDependencies | None = None,
@@ -977,12 +1381,79 @@ def run_runtime_command(
     now: datetime | None = None,
     materialize: Callable[..., FinalizePublication] = materialize_frozen_daily_run,
     monotonic: Callable[[], float] = monotonic_time.monotonic,
+    invocation: str = "manual",
 ) -> RuntimeResult:
-    command_started = monotonic()
-    if command not in {"tick", "finalize"}:
-        raise ValueError("runtime command must be tick or finalize")
+    if command not in {"tick", "finalize", "drain-only"}:
+        raise ValueError("runtime command must be tick, drain-only, or finalize")
+    if command == "drain-only" and enable_zhaoshang:
+        raise ValueError("drain-only forbids the remote-create capability")
+    if invocation not in {"manual", "scheduler"}:
+        raise ValueError("invocation must be manual or scheduler")
     day = business_date or business_date_in_shanghai(now)
     paths = runtime_paths(day, runtime_root)
+    started_at = now or datetime.now(UTC)
+    if started_at.tzinfo is None or started_at.utcoffset() is None:
+        raise ValueError("runtime clock must return an explicit-timezone datetime")
+    production_lock = ProcessLock(paths.lock_path)
+    owner = {
+        "business_date": day,
+        "pid": os.getpid(),
+        "command": command,
+        "started_at": started_at.astimezone(SHANGHAI).isoformat(timespec="seconds"),
+        "invocation": invocation,
+    }
+    try:
+        production_lock.acquire(owner=owner)
+    except LeaseUnavailable:
+        conflict = ProcessLock.inspect(paths.lock_path)
+        conflict.update({
+            "active": True,
+            "business_date": day,
+            "requested": command,
+            "lock_identity": production_lock.identity,
+            "requested_invocation": invocation,
+        })
+        return RuntimeResult(
+            TickSummary("ALREADY_RUNNING", (), {}, {}, None),
+            lock_conflict=conflict,
+        )
+    try:
+        return _run_runtime_command_locked(
+            command,
+            day=day,
+            paths=paths,
+            process_lock=production_lock,
+            runtime_budget_seconds=runtime_budget_seconds,
+            drain_max_iterations=drain_max_iterations,
+            enable_zhaoshang=enable_zhaoshang,
+            zhaoshang_backend=zhaoshang_backend,
+            dependencies=dependencies,
+            output_path=output_path,
+            materialize=materialize,
+            monotonic=monotonic,
+        )
+    finally:
+        production_lock.release()
+
+
+def _run_runtime_command_locked(
+    command: str,
+    *,
+    day: str,
+    paths: RuntimePaths,
+    process_lock: ProcessLock,
+    runtime_budget_seconds: float,
+    drain_max_iterations: int,
+    enable_zhaoshang: bool,
+    zhaoshang_backend: str,
+    dependencies: TickDependencies | None,
+    output_path: Path | str | None,
+    materialize: Callable[..., FinalizePublication],
+    monotonic: Callable[[], float],
+) -> RuntimeResult:
+    command_started = monotonic()
+    if command == "drain-only" and not paths.state_path.is_file():
+        return RuntimeResult(TickSummary("DRAIN_NO_EXISTING_RUN", (), {}, {}, None))
     paths.run_dir.mkdir(parents=True, exist_ok=True)
     _ensure_batch_state(
         paths,
@@ -990,24 +1461,73 @@ def run_runtime_command(
         zhaoshang_backend=zhaoshang_backend,
     )
     store = DailyAuditStore(paths.state_path)
-    deps = dependencies or build_default_dependencies(
-        enable_zhaoshang=enable_zhaoshang,
-        zhaoshang_backend=zhaoshang_backend,
-        paths=paths,
-        business_date=day,
-    )
+    existing_run = store.get_run(day)
+    if existing_run is not None and existing_run["state"] == "FINALIZED":
+        result = RuntimeResult(
+            TickSummary(
+                "ALREADY_FINALIZED",
+                ("noop:already_finalized",),
+                {},
+                {},
+                existing_run["frozen_snapshot_id"],
+            )
+        )
+        _record_batch_result(
+            paths,
+            result,
+            command=command,
+            enable_zhaoshang=enable_zhaoshang,
+            zhaoshang_backend=zhaoshang_backend,
+            output_path=Path(output_path).resolve() if output_path else paths.final_output_path,
+        )
+        return result
+    if dependencies is not None:
+        deps = dependencies
+    elif command == "drain-only":
+        deps = build_drain_dependencies(
+            zhaoshang_backend=zhaoshang_backend,
+            paths=paths,
+            business_date=day,
+        )
+    else:
+        deps = build_default_dependencies(
+            enable_zhaoshang=enable_zhaoshang,
+            zhaoshang_backend=zhaoshang_backend,
+            paths=paths,
+            business_date=day,
+        )
+    drain_only = command == "drain-only"
     config = TickConfig(
         business_date=day,
         runtime_budget_seconds=runtime_budget_seconds,
         cutoff_at=cutoff_for_business_date(day),
-        model_name=_configured_model_name(),
+        model_name="unused-by-drain-only" if drain_only else _configured_model_name(),
         model_prompt_version=TITLE_MATCH_PROMPT_VERSION,
         model_schema_version=TITLE_MATCH_SCHEMA_VERSION,
-        model_batch_size=_runtime_model_batch_size(),
+        model_batch_size=10 if drain_only else _runtime_model_batch_size(),
     )
-    summary = run_incremental_tick(store, ProcessLock(paths.lock_path), config, deps, finalize=command == "finalize")
-    if (
+    if command == "drain-only":
+        summary = run_existing_remote_drain(
+            store,
+            process_lock,
+            config,
+            deps,
+            max_iterations=drain_max_iterations,
+        )
+    else:
+        summary = run_incremental_tick(
+            store,
+            process_lock,
+            config,
+            deps,
+            finalize=command == "finalize",
+        )
+    publication_candidate = (
         command == "finalize"
+        or (command == "drain-only" and summary.outcome == "DRAINED")
+    )
+    if (
+        publication_candidate
         and summary.frozen_snapshot_id is not None
         and summary.outcome not in {
             "FAILED",
@@ -1031,7 +1551,7 @@ def run_runtime_command(
     # may supersede that work, so only the frozen scope's readiness can decide
     # publication.  The materializer makes that decision and is idempotent.
     if (
-        command != "finalize"
+        not publication_candidate
         or summary.frozen_snapshot_id is None
         or summary.outcome in {
             "FAILED",
@@ -1054,7 +1574,7 @@ def run_runtime_command(
     try:
         publication = materialize(
             store,
-            ProcessLock(paths.lock_path),
+            process_lock,
             day,
             Path(output_path) if output_path else paths.final_output_path,
         )

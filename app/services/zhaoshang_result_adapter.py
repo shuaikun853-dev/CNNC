@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from decimal import Decimal
 from pathlib import Path
-from typing import Any
+from typing import AbstractSet, Any
 
 from openpyxl import load_workbook
 
@@ -91,7 +91,11 @@ def _template_code_urls(template_path: Path | str | None) -> dict[str, set[str]]
 
 
 def read_zhaoshang_result_xlsx_by_identity(
-    path: Path | str, template_path: Path | str | None = None
+    path: Path | str,
+    template_path: Path | str | None = None,
+    *,
+    code_index: int | None = None,
+    include_excel_rows: AbstractSet[int] | None = None,
 ) -> dict[tuple[str, str], dict[str, Any]]:
     """Read prices keyed by the verified ``(skuId, exact URL)`` crawl identity.
 
@@ -122,19 +126,29 @@ def read_zhaoshang_result_xlsx_by_identity(
             return next((headers.index(name) for name in names if name in headers), -1)
 
         url_index = find("\u539f\u59cb\u94fe\u63a5", "\u5546\u54c1\u8be6\u60c5\u5730\u5740", "url", "URL", "\u5546\u54c1\u94fe\u63a5", "\u94fe\u63a5", "\u5546\u54c1URL")
-        code_index = find("\u5546\u54c1\u7f16\u7801", "\u5546\u54c1\u6700\u5c0f\u54c1\u7c7b\u5355\u5143id", "skuId", "sku_id", "code")
+        selected_code_index = (
+            code_index
+            if code_index is not None
+            else find("\u5546\u54c1\u7f16\u7801", "\u5546\u54c1\u6700\u5c0f\u54c1\u7c7b\u5355\u5143id", "skuId", "sku_id", "code")
+        )
         price_index = find("\u5546\u54c1\u4ef7\u683c", "\u4ef7\u683c", "\u91c7\u96c6\u4ef7\u683c", "page_price")
         status_index = find("status", "crawl_status")
         reason_index = find("reason", "failure_reason")
-        if url_index < 0 and (code_index < 0 or not code_to_urls):
+        if url_index < 0 and (selected_code_index < 0 or not code_to_urls):
             return {}
 
         results: dict[tuple[str, str], dict[str, Any]] = {}
-        for row in iterator:
+        for excel_row, row in enumerate(iterator, start=2):
+            if include_excel_rows is not None and excel_row not in include_excel_rows:
+                continue
             if row is None:
                 continue
             url = normalize_result_url(row[url_index]) if 0 <= url_index < len(row) else ""
-            code = normalize_cell_str(row[code_index]) if 0 <= code_index < len(row) else ""
+            code = (
+                normalize_cell_str(row[selected_code_index])
+                if 0 <= selected_code_index < len(row)
+                else ""
+            )
             if not url:
                 urls = code_to_urls.get(code, set())
                 if len(urls) != 1:
@@ -170,7 +184,13 @@ def read_zhaoshang_result_xlsx_by_identity(
         workbook.close()
 
 
-def read_zhaoshang_result_xlsx(path: Path | str, template_path: Path | str | None = None) -> dict[str, dict[str, Any]]:
+def read_zhaoshang_result_xlsx(
+    path: Path | str,
+    template_path: Path | str | None = None,
+    *,
+    code_index: int | None = None,
+    include_excel_rows: AbstractSet[int] | None = None,
+) -> dict[str, dict[str, Any]]:
     """Read the currently effective result mapping, including template code fallback."""
     result_path = Path(path)
     if not result_path.exists():
@@ -191,19 +211,29 @@ def read_zhaoshang_result_xlsx(path: Path | str, template_path: Path | str | Non
             return next((headers.index(name) for name in names if name in headers), -1)
 
         url_index = find("原始链接", "商品详情地址", "url", "URL", "商品链接", "链接", "商品URL")
-        code_index = find("商品编码", "商品最小品类单元id", "skuId", "sku_id", "code")
+        selected_code_index = (
+            code_index
+            if code_index is not None
+            else find("商品编码", "商品最小品类单元id", "skuId", "sku_id", "code")
+        )
         price_index = find("商品价格", "价格", "采集价格", "page_price")
         status_index = find("status", "crawl_status")
         reason_index = find("reason", "failure_reason")
-        if url_index < 0 and (code_index < 0 or not code_to_url):
+        if url_index < 0 and (selected_code_index < 0 or not code_to_url):
             return {}
 
         results: dict[str, dict[str, Any]] = {}
-        for row in iterator:
+        for excel_row, row in enumerate(iterator, start=2):
+            if include_excel_rows is not None and excel_row not in include_excel_rows:
+                continue
             if row is None:
                 continue
             url = normalize_result_url(row[url_index]) if 0 <= url_index < len(row) else ""
-            code = normalize_cell_str(row[code_index]) if 0 <= code_index < len(row) else ""
+            code = (
+                normalize_cell_str(row[selected_code_index])
+                if 0 <= selected_code_index < len(row)
+                else ""
+            )
             if not url:
                 url = code_to_url.get(code, "")
             if not url:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import json
 from collections import Counter
 from datetime import datetime
@@ -17,6 +18,10 @@ from curl_utils import (
     internal_direct_opener,
     load_curl_command,
 )
+try:
+    from scripts.auth_manager import AuthManager
+except ModuleNotFoundError:  # Direct invocation from scripts/.
+    from auth_manager import AuthManager
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -73,11 +78,32 @@ def _is_valid_new_price(value: object) -> bool:
         return False
 
 
-def _request(config: dict, payload: dict) -> dict:
-    request = Request(config["url"], data=json.dumps(payload, separators=(",", ":")).encode(), method=config["method"])
-    apply_curl_headers(request, config["headers"], config["cookie"])
-    with internal_direct_opener().open(request, timeout=60) as response:
-        data = json.loads(response.read().decode(response.headers.get_content_charset() or "utf-8"))
+def _request(
+    config: dict,
+    payload: dict,
+    *,
+    auth_manager: AuthManager | None = None,
+    auth_system: str | None = None,
+) -> dict:
+    def request_factory() -> Request:
+        request = Request(
+            config["url"],
+            data=json.dumps(payload, separators=(",", ":")).encode(),
+            method=config["method"],
+        )
+        apply_curl_headers(request, config["headers"], config["cookie"])
+        return request
+
+    if auth_manager is not None and auth_system is not None:
+        data = auth_manager.request_json(
+            auth_system,
+            request_factory,
+            read_only=True,
+            timeout=60,
+        )
+    else:
+        with internal_direct_opener().open(request_factory(), timeout=60) as response:
+            data = json.loads(response.read().decode(response.headers.get_content_charset() or "utf-8"))
     if str(data.get("rspCode")) != "0000":
         raise RuntimeError(f"rspCode={data.get('rspCode')}, rspDesc={data.get('rspDesc')}")
     return data
@@ -187,13 +213,22 @@ def _write_workbook(
     }
 
 
-def main() -> None:
+def build_parser() -> argparse.ArgumentParser:
+    return argparse.ArgumentParser(
+        description="查询截至当前的中核 SaaS 监控状态并生成五 Sheet Excel。"
+    )
+
+
+def main(argv: list[str] | None = None) -> None:
+    build_parser().parse_args(argv)
     apply_internal_no_proxy_env()
     cnnc = load_curl_command(ROOT / "data/latest_cnnc_query.curl")
     saas = load_curl_command(ROOT / "data/saas_zhuangtai.curl")
     cnnc_body, saas_body = json.loads(cnnc["data"]), json.loads(saas["data"])
     if cnnc_body.get("sassCheckStatuss") != ["0"] or (str(saas_body.get("tenantId")), str(saas_body.get("commodityPoolId"))) != ("188605", "222"):
         raise RuntimeError("租户、商品池或中核待处理筛选不符合第二步范围")
+    auth_manager = AuthManager()
+    saas = auth_manager.prepare_curl("saas", saas, refresh=True)
     cnnc_rows: list[dict] = []
     page, total = 1, None
     while True:
@@ -213,7 +248,12 @@ def main() -> None:
         raise RuntimeError("documentId 为空或重复")
     saas_rows: list[dict] = []
     for start in range(0, len(ids), 200):
-        data = _request(saas, {**saas_body, "page": 1, "limit": 200, "commodityId": " ".join(ids[start:start + 200])})
+        data = _request(
+            saas,
+            {**saas_body, "page": 1, "limit": 200, "commodityId": " ".join(ids[start:start + 200])},
+            auth_manager=auth_manager,
+            auth_system="saas",
+        )
         batch = _rows(data)
         if len(batch) != int(data["count"]):
             raise RuntimeError("SaaS 分批返回 count 异常")
@@ -252,4 +292,5 @@ def main() -> None:
     )
 
 
-if __name__ == "__main__": main()
+if __name__ == "__main__":
+    main()

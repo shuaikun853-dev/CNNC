@@ -876,6 +876,7 @@ VALUE_DISPLAY_NAMES = {
     "FAILED": "失败",
     "CRAWLER_PROCESS_FAILED": "爬虫进程失败",
     "PRICE_MISSING": "价格不可见",
+    "NO_RESULT": "无采集结果",
     "PRICE_IS_ZERO": "价格为0",
     # over_30pct
     "TRUE": "是",

@@ -1,30 +1,79 @@
 [CmdletBinding()]
 param(
-    [string] $TaskPrefix = "CNNC-PriceAudit-Incremental"
+    [string] $TaskName = "CNNC-PriceAudit-Incremental"
 )
 
 $ErrorActionPreference = "Stop"
 Import-Module ScheduledTasks -ErrorAction Stop
-foreach ($taskName in @("$TaskPrefix-Tick", "$TaskPrefix-Finalize")) {
-    $task = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
-    if ($null -eq $task) {
-        [pscustomobject]@{
-            TaskName = $taskName
-            Installed = $false
-            State = "Missing"
-            LastRunTime = $null
-            LastTaskResult = $null
-            NextRunTime = $null
-        }
-        continue
+
+function ConvertFrom-DayOfWeekMask([object] $Value) {
+    if ($null -eq $Value) {
+        return @()
     }
-    $info = Get-ScheduledTaskInfo -TaskName $taskName
+    $mask = [int]$Value
+    $days = [ordered]@{
+        Monday = 2
+        Tuesday = 4
+        Wednesday = 8
+        Thursday = 16
+        Friday = 32
+        Saturday = 64
+        Sunday = 1
+    }
+    return @($days.GetEnumerator() | Where-Object { ($mask -band $_.Value) -ne 0 } | ForEach-Object Key)
+}
+
+$task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+if ($null -eq $task) {
     [pscustomobject]@{
-        TaskName = $taskName
-        Installed = $true
-        State = [string]$task.State
-        LastRunTime = $info.LastRunTime
-        LastTaskResult = $info.LastTaskResult
-        NextRunTime = $info.NextRunTime
+        TaskName = $TaskName
+        Installed = $false
+        State = "Missing"
+        LastRunTime = $null
+        LastTaskResult = $null
+        NextRunTime = $null
+        MultipleInstances = $null
+        ExecutionTimeLimit = $null
+        TriggerType = $null
+        DaysOfWeek = @()
+        WeeksInterval = $null
+        StartBoundary = $null
+        RepetitionInterval = $null
+        RepetitionDuration = $null
+        StartWhenAvailable = $null
+        ConflictingLegacyTasks = @(
+            "$TaskName-Tick", "$TaskName-Finalize" |
+                Where-Object { $null -ne (Get-ScheduledTask -TaskName $_ -ErrorAction SilentlyContinue) }
+        )
     }
+    exit 0
+}
+
+$info = Get-ScheduledTaskInfo -TaskName $TaskName
+$trigger = $task.Triggers[0]
+$localStart = [datetime]::Parse([string]$trigger.StartBoundary).ToLocalTime()
+[pscustomobject]@{
+    TaskName = $TaskName
+    Installed = $true
+    State = [string]$task.State
+    LastRunTime = $info.LastRunTime
+    LastTaskResult = $info.LastTaskResult
+    NextRunTime = $info.NextRunTime
+    MultipleInstances = [string]$task.Settings.MultipleInstances
+    ExecutionTimeLimit = [string]$task.Settings.ExecutionTimeLimit
+    TriggerType = "Weekly"
+    DaysOfWeek = @(ConvertFrom-DayOfWeekMask $trigger.DaysOfWeek)
+    WeeksInterval = [int]$trigger.WeeksInterval
+    StartBoundary = $localStart.ToString("yyyy-MM-ddTHH:mm:ssK")
+    StartTime = $localStart.ToString("HH:mm")
+    RepetitionInterval = [string]$trigger.Repetition.Interval
+    RepetitionDuration = [string]$trigger.Repetition.Duration
+    StartWhenAvailable = [bool]$task.Settings.StartWhenAvailable
+    Action = [string]$task.Actions[0].Execute
+    Arguments = [string]$task.Actions[0].Arguments
+    WorkingDirectory = [string]$task.Actions[0].WorkingDirectory
+    ConflictingLegacyTasks = @(
+        "$TaskName-Tick", "$TaskName-Finalize" |
+            Where-Object { $null -ne (Get-ScheduledTask -TaskName $_ -ErrorAction SilentlyContinue) }
+    )
 }

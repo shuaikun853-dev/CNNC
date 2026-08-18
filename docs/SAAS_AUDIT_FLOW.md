@@ -55,7 +55,7 @@ python scripts/audit_saas_excel_file.py ^
   --crawler-concurrency  3 ^
   --crawler-per-domain-delay 2 ^
   --zhaoshang-task ^
-  --zhaoshang-wait-timeout 7200 ^
+  --zhaoshang-wait-timeout 600 ^
   --zhaoshang-progress-interval 30
 ```
 
@@ -1629,7 +1629,7 @@ python scripts/audit_saas_excel_file.py ^
   --crawler-concurrency  3 ^
   --crawler-per-domain-delay 2 ^
   --zhaoshang-task ^
-  --zhaoshang-wait-timeout 7200 ^
+  --zhaoshang-wait-timeout 600 ^
   --zhaoshang-progress-interval 30
 ```
 

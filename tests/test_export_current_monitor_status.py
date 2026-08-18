@@ -17,6 +17,57 @@ monitor_export = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(monitor_export)
 
 
+def test_help_exits_without_sending_requests(monkeypatch):
+    monkeypatch.setattr(
+        monitor_export,
+        "_request",
+        lambda *_args, **_kwargs: pytest.fail("--help must not send requests"),
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        monitor_export.main(["--help"])
+
+    assert exc_info.value.code == 0
+
+
+def test_saas_request_uses_auth_manager_read_only_retry_boundary():
+    seen = {}
+
+    class RecordingAuthManager:
+        def request_json(self, system, request_factory, **kwargs):
+            request = request_factory()
+            seen.update(
+                system=system,
+                read_only=kwargs["read_only"],
+                url=request.full_url,
+                body=request.data,
+            )
+            return {"rspCode": "0000", "rows": []}
+
+    config = {
+        "url": "http://saasportal.iio.com/improxy/saas/iio2/commodityMonitorResult/query",
+        "headers": [("Content-Type", "application/json")],
+        "cookie": "x-access-token=old; refreshToken=old-r",
+        "method": "POST",
+    }
+    payload = {"tenantId": "188605", "commodityPoolId": "222", "page": 1}
+
+    result = monitor_export._request(
+        config,
+        payload,
+        auth_manager=RecordingAuthManager(),
+        auth_system="saas",
+    )
+
+    assert result == {"rspCode": "0000", "rows": []}
+    assert seen == {
+        "system": "saas",
+        "read_only": True,
+        "url": config["url"],
+        "body": b'{"tenantId":"188605","commodityPoolId":"222","page":1}',
+    }
+
+
 @pytest.mark.parametrize("value", [1, 0.01, "12.50", " 3 "])
 def test_valid_new_price_accepts_positive_numbers(value):
     assert monitor_export._is_valid_new_price(value) is True

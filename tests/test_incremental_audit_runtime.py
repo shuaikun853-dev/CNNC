@@ -28,14 +28,21 @@ from app.services.legacy_zhaoshang_adapter import (
     CrawlRequest,
     HarvestStatus,
     LegacyHarvestOutcome,
+    LegacyPriorityOutcome,
     LegacyReconcileOutcome,
     LegacySubmitOutcome,
     PreparedLegacyJob,
+    PriorityStatus,
     ReconcileStatus,
     SubmitStatus,
 )
 from app.services.incremental_audit_runtime import RuntimeResult
-from app.services.daily_audit_store import FrozenSnapshotConflict
+from app.services.daily_audit_store import (
+    DailyAuditStore,
+    FrozenSnapshotConflict,
+    LeaseUnavailable,
+    ProcessLock,
+)
 from app.services.incremental_audit_materializer import ArtifactConflictError
 from app.services.title_match_model_adapter import TitleMatchModelResult
 from app.workflows.incremental_price_audit import DiscoveredState, TickDependencies, TickSummary
@@ -54,6 +61,7 @@ def _dependencies(events: list[str]) -> TickDependencies:
             observed_at=datetime(2026, 8, 11, 10, 1, tzinfo=UTC), headers=["vCommodityId"],
             rows=[{"vCommodityId": "v1", "documentId": "v1", "skuId": "s1", "extLink": "", "fourCategoryId": "c"}],
             source_fingerprints=["source"], customer_fingerprints=["customer"],
+            evidence={"saas_count": 1, "customer_count": 1},
         )
 
     return TickDependencies(
@@ -79,6 +87,192 @@ def test_detail_lock_is_shared_across_business_dates(tmp_path):
     assert first.lock_path != second.lock_path
     assert first.detail_lock_path == second.detail_lock_path
     assert first.detail_lock_path.parent == (tmp_path / "runtime").resolve()
+
+
+def test_project_resources_and_default_runtime_root_do_not_depend_on_cwd(
+    tmp_path, monkeypatch
+):
+    cwd_data = tmp_path / "data"
+    cwd_data.mkdir()
+    for name in (
+        "latest_saas_sameAudit_queryAll.curl",
+        "latest_cnnc_query.curl",
+        "detail_request.curl",
+    ):
+        (cwd_data / name).write_text("curl https://cwd.invalid", encoding="utf-8")
+    (cwd_data / "model.env").write_text(
+        "TITLE_MATCH_MODEL_API_KEY=cwd-key\n"
+        "TITLE_MATCH_MODEL_BASE_URL=https://cwd.invalid/v1\n"
+        "TITLE_MATCH_MODEL_NAME=cwd-model\n",
+        encoding="utf-8",
+    )
+    for key in runtime_module._MODEL_CONFIGURATION_KEYS:
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.chdir(tmp_path)
+
+    captured = {}
+
+    class SnapshotAdapterSpy:
+        def __init__(self, saas_path, cnnc_path, *, auth_manager):
+            captured["saas"] = Path(saas_path)
+            captured["cnnc"] = Path(cnnc_path)
+
+    monkeypatch.setattr(runtime_module, "CnncSaasSnapshotAdapter", SnapshotAdapterSpy)
+    monkeypatch.setattr(
+        runtime_module,
+        "load_curl_command",
+        lambda path: captured.setdefault("detail", Path(path)) or {},
+    )
+
+    runtime_module.build_default_dependencies()
+    expected_configuration = runtime_module._read_model_configuration(
+        runtime_module.PROJECT_DATA_ROOT / "model.env"
+    )
+    actual_configuration = runtime_module._load_model_configuration()
+    paths = runtime_paths("2026-08-11")
+
+    assert runtime_module.PROJECT_ROOT == Path(runtime_module.__file__).resolve().parents[2]
+    assert runtime_module.PROJECT_DATA_ROOT == runtime_module.PROJECT_ROOT / "data"
+    assert captured == {
+        "saas": runtime_module.PROJECT_DATA_ROOT / "latest_saas_sameAudit_queryAll.curl",
+        "cnnc": runtime_module.PROJECT_DATA_ROOT / "latest_cnnc_query.curl",
+        "detail": runtime_module.PROJECT_DATA_ROOT / "detail_request.curl",
+    }
+    assert all(
+        actual_configuration.get(key) == expected_configuration.get(key)
+        for key in runtime_module._MODEL_CONFIGURATION_KEYS
+    )
+    assert actual_configuration["TITLE_MATCH_MODEL_NAME"] != "cwd-model"
+    assert paths.run_dir == (
+        runtime_module.PROJECT_ROOT
+        / "runtime"
+        / "incremental_price_audit"
+        / "2026-08-11"
+    )
+
+
+def test_finalize_dependency_construction_from_non_project_cwd_is_offline(
+    tmp_path, monkeypatch
+):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        runtime_module,
+        "run_incremental_tick",
+        lambda *_args, **_kwargs: TickSummary(
+            "FINALIZE_SNAPSHOT_NOT_READY", (), {}, {}, None
+        ),
+    )
+
+    result = run_runtime_command(
+        "finalize",
+        business_date="2026-08-11",
+        runtime_root=tmp_path / "runtime",
+    )
+
+    assert result.tick.outcome == "FINALIZE_SNAPSHOT_NOT_READY"
+
+
+@pytest.mark.parametrize("command", ["tick", "finalize", "drain-only"])
+def test_daily_production_writer_lock_blocks_all_writer_commands_before_lifecycle(
+    tmp_path, command, monkeypatch
+):
+    root = tmp_path / "runtime"
+    paths = runtime_paths("2026-08-11", root)
+    DailyAuditStore(paths.state_path).ensure_run("2026-08-11")
+    before = paths.state_path.read_bytes()
+    owner = ProcessLock(paths.lock_path).acquire(owner={
+        "business_date": "2026-08-11",
+        "pid": 12345,
+        "command": "drain-only",
+        "started_at": "2026-08-11T20:30:00+08:00",
+        "invocation": "manual",
+    })
+    monkeypatch.setattr(
+        runtime_module,
+        "_run_runtime_command_locked",
+        lambda *_args, **_kwargs: pytest.fail(
+            "lock conflict must not enter SQLite, priority, export, harvest, or finalize lifecycle"
+        ),
+    )
+    events: list[str] = []
+    try:
+        result = run_runtime_command(
+            command,
+            business_date="2026-08-11",
+            runtime_root=root,
+            dependencies=_dependencies(events),
+            invocation="scheduler",
+        )
+    finally:
+        owner.release()
+
+    assert result.tick.outcome == "ALREADY_RUNNING"
+    assert result.lock_conflict is not None
+    assert result.lock_conflict["requested"] == command
+    assert result.lock_conflict["command"] == "drain-only"
+    assert result.lock_conflict["pid"] == 12345
+    assert events == []
+    assert paths.state_path.read_bytes() == before
+    assert not (paths.run_dir / "BATCH_STATE.md").exists()
+
+
+def test_daily_writer_lock_is_scoped_by_business_date(tmp_path):
+    root = tmp_path / "runtime"
+    first = runtime_paths("2026-08-11", root)
+    second = runtime_paths("2026-08-12", root)
+    held = ProcessLock(first.lock_path).acquire()
+    try:
+        other = ProcessLock(second.lock_path).acquire()
+        other.release()
+    finally:
+        held.release()
+
+
+def test_runtime_releases_outer_writer_lock_when_lifecycle_raises(tmp_path, monkeypatch):
+    root = tmp_path / "runtime"
+    paths = runtime_paths("2026-08-11", root)
+
+    def fail(*_args, **_kwargs):
+        raise RuntimeError("lifecycle crashed")
+
+    monkeypatch.setattr(runtime_module, "_run_runtime_command_locked", fail)
+    with pytest.raises(RuntimeError, match="lifecycle crashed"):
+        run_runtime_command("tick", business_date="2026-08-11", runtime_root=root)
+
+    assert ProcessLock.inspect(paths.lock_path)["active"] is False
+    ProcessLock(paths.lock_path).acquire().release()
+
+
+def test_formal_materialization_remains_inside_daily_writer_lock(tmp_path, monkeypatch):
+    root = tmp_path / "runtime"
+    paths = runtime_paths("2026-08-11", root)
+    DailyAuditStore(paths.state_path).ensure_run("2026-08-11")
+    monkeypatch.setattr(
+        runtime_module,
+        "run_existing_remote_drain",
+        lambda *_args, **_kwargs: TickSummary("DRAINED", (), {}, {}, 1),
+    )
+    monkeypatch.setattr(runtime_module, "_record_batch_result", lambda *_args, **_kwargs: None)
+    observed = []
+
+    def materialize(*_args):
+        with pytest.raises(LeaseUnavailable):
+            ProcessLock(paths.lock_path).acquire()
+        observed.append("locked")
+        return object()
+
+    result = run_runtime_command(
+        "drain-only",
+        business_date="2026-08-11",
+        runtime_root=root,
+        dependencies=_dependencies([]),
+        materialize=materialize,
+        runtime_budget_seconds=300,
+    )
+
+    assert result.publication is not None
+    assert observed == ["locked"]
+    assert ProcessLock.inspect(paths.lock_path)["active"] is False
 
 
 def test_tick_uses_default_daily_path_and_zhaoshang_is_not_enabled_by_default(tmp_path):
@@ -114,6 +308,65 @@ def test_finalize_reuses_tick_core_and_then_calls_materializer(tmp_path):
     assert calls and calls[0][0] == "2026-08-11"
 
 
+def test_customer_count_mismatch_freezes_but_pending_readiness_does_not_materialize(tmp_path):
+    events: list[str] = []
+    deps = _dependencies(events)
+    deps.discover = lambda _timeout: DiscoveredState(
+        observed_at=datetime(2026, 8, 11, 10, 1, tzinfo=UTC),
+        headers=["vCommodityId"],
+        rows=[{"vCommodityId": "v1", "documentId": "v1", "skuId": "s1", "extLink": "", "fourCategoryId": "c"}],
+        source_fingerprints=["source"],
+        customer_fingerprints=["customer"],
+        evidence={"saas_count": 1, "customer_count": 0},
+    )
+    deps.model = lambda _row, _timeout: (_ for _ in ()).throw(TimeoutError("retry later"))
+    output = tmp_path / "must-not-exist.xlsx"
+
+    result = run_runtime_command(
+        "finalize",
+        business_date="2026-08-11",
+        runtime_root=tmp_path / "runtime",
+        dependencies=deps,
+        output_path=output,
+    )
+
+    assert result.tick.frozen_snapshot_id is not None
+    assert result.tick.backlog["stage_pending"] == 1
+    assert result.publication is None
+    assert not output.exists()
+
+
+def test_customer_count_mismatch_materializes_after_all_readiness_blockers_clear(tmp_path):
+    events: list[str] = []
+    deps = _dependencies(events)
+    deps.discover = lambda _timeout: DiscoveredState(
+        observed_at=datetime(2026, 8, 11, 10, 1, tzinfo=UTC),
+        headers=["vCommodityId"],
+        rows=[{"vCommodityId": "v1", "documentId": "v1", "skuId": "s1", "extLink": "", "fourCategoryId": "c"}],
+        source_fingerprints=["source"],
+        customer_fingerprints=["customer"],
+        evidence={"saas_count": 1, "customer_count": 0},
+    )
+    calls: list[str] = []
+
+    def materialize(*_args):
+        calls.append("materialize")
+        return object()
+
+    result = run_runtime_command(
+        "finalize",
+        business_date="2026-08-11",
+        runtime_root=tmp_path / "runtime",
+        dependencies=deps,
+        materialize=materialize,
+    )
+
+    assert result.tick.frozen_snapshot_id is not None
+    assert all(value == 0 for key, value in result.tick.backlog.items() if key != "detail_terminal")
+    assert result.publication is not None
+    assert calls == ["materialize"]
+
+
 def test_cli_help_does_not_construct_runtime_or_network(tmp_path, monkeypatch):
     called = []
     monkeypatch.setattr(cli, "run_runtime_command", lambda *args, **kwargs: called.append(args))
@@ -128,7 +381,22 @@ def test_direct_script_help_bootstraps_project_imports_without_runtime_writes(tm
     script = Path("scripts/incremental_price_audit.py")
     completed = subprocess.run([sys.executable, str(script), "--help"], capture_output=True, text=True, check=False)
     assert completed.returncode == 0
-    assert "{tick,finalize,status,doctor}" in completed.stdout
+    for command in (
+        "tick",
+        "finalize",
+        "status",
+        "doctor",
+        "recover-model",
+        "requeue-model-transient",
+        "release-model-recovery",
+        "recover-remote-harvest",
+        "recover-partial-exact-harvest",
+        "resolve-no-result",
+        "recover-remote-priority",
+        "harvest-existing-remote",
+        "export-review",
+    ):
+        assert command in completed.stdout
     assert not (tmp_path / "runtime").exists()
 
 
@@ -251,13 +519,15 @@ def test_finalize_publishes_frozen_scope_even_when_superseded_prefix_work_is_pen
     states = [
         DiscoveredState(
             observed_at=datetime(2026, 8, 11, 9, 0, tzinfo=UTC), headers=["vCommodityId"],
-            rows=[{"vCommodityId": "old", "documentId": "old", "skuId": "old", "extLink": "", "fourCategoryId": "c"}],
-            source_fingerprints=["old-source"], customer_fingerprints=["old-customer"],
+                rows=[{"vCommodityId": "old", "documentId": "old", "skuId": "old", "extLink": "", "fourCategoryId": "c"}],
+                source_fingerprints=["old-source"], customer_fingerprints=["old-customer"],
+                evidence={"saas_count": 1, "customer_count": 1},
         ),
         DiscoveredState(
             observed_at=datetime(2026, 8, 11, 10, 1, tzinfo=UTC), headers=["vCommodityId"],
-            rows=[{"vCommodityId": "new", "documentId": "new", "skuId": "new", "extLink": "", "fourCategoryId": "c"}],
-            source_fingerprints=["new-source"], customer_fingerprints=["new-customer"],
+                rows=[{"vCommodityId": "new", "documentId": "new", "skuId": "new", "extLink": "", "fourCategoryId": "c"}],
+                source_fingerprints=["new-source"], customer_fingerprints=["new-customer"],
+                evidence={"saas_count": 1, "customer_count": 1},
         ),
     ]
 
@@ -306,6 +576,7 @@ class _BridgeAdapter:
         self.submit_calls = 0
         self.harvest_calls = 0
         self.reconcile_calls = 0
+        self.priority_calls = 0
 
     def request_from_saas_row(self, row, *, backend_version):
         return CrawlRequest("mall", "mall-source", "Mall", str(row["skuId"]), str(row["extLink"]), backend_version)
@@ -325,7 +596,16 @@ class _BridgeAdapter:
 
     def submit(self, _job, *, timeout_seconds):
         self.submit_calls += 1
-        return LegacySubmitOutcome(SubmitStatus.SUBMITTED, task_id="remote-1", task_number="number-1")
+        return LegacySubmitOutcome(
+            SubmitStatus.SUBMITTED,
+            task_id="remote-1",
+            task_number="number-1",
+            priority_evidence="updated",
+        )
+
+    def prioritize(self, _job, *, task_id, task_number, timeout_seconds):
+        self.priority_calls += 1
+        return LegacyPriorityOutcome(PriorityStatus.UPDATED, weight_type=-1)
 
     def reconcile_unknown(self, _job, *, timeout_seconds):
         self.reconcile_calls += 1
@@ -382,7 +662,7 @@ def test_legacy_bridge_rebuilds_persisted_job_and_fans_out_by_sku_url_identity(t
 
     unknown = dict(durable_job, state="SUBMIT_UNKNOWN")
     reconciled = harvest([unknown], 10)[9]
-    assert reconciled["state"] == "SUBMITTED"
+    assert reconciled["state"] == "PRIORITY_PENDING"
     assert reconciled["remote_identity"] == "mall|remote-unknown|number-unknown"
     assert restarted.reconcile_calls == 1
     assert restarted.submit_calls == 0
@@ -396,6 +676,250 @@ def test_legacy_bridge_rebuilds_persisted_job_and_fans_out_by_sku_url_identity(t
     assert submit_after_crash(durable_job, [], 10)["state"] == "SUBMITTED"
     assert fresh_submit.prepare_calls == 1
     assert fresh_submit.submit_calls == 1
+
+
+def test_legacy_bridge_emits_request_level_no_result_and_manual_markers(tmp_path):
+    class PartialAdapter(_BridgeAdapter):
+        def harvest(self, _job, *, timeout_seconds):
+            self.harvest_calls += 1
+            return LegacyHarvestOutcome(
+                HarvestStatus.EXPORTED,
+                result_by_identity={
+                    ("sku-a", "https://same.invalid/a"): {
+                        "page_price_value": 11,
+                        "page_price_status": "OK",
+                    }
+                },
+                no_result_identities=frozenset(
+                    {("sku-b", "https://same.invalid/b")}
+                ),
+                manual_identities={
+                    ("sku-c", "https://same.invalid/c"): "provenance ambiguity"
+                },
+            )
+
+    adapter = PartialAdapter()
+    paths = runtime_paths("2026-08-11", tmp_path / "runtime")
+    paths.run_dir.mkdir(parents=True)
+    propose, finalize, _submit, harvest = legacy_zhaoshang_bridge(
+        adapter, paths=paths, business_date="2026-08-11"
+    )
+    rows = [
+        {"vCommodityId": f"v-{suffix}", "skuId": f"sku-{suffix}", "extLink": f"https://same.invalid/{suffix}"}
+        for suffix in ("a", "b", "c")
+    ]
+    plan = propose([{"row": row} for row in rows], 10)[0]
+    finalized = finalize(plan, tuple(plan.members), 10)
+    durable_job = {
+        "id": 19,
+        "logical_key": finalized.logical_key,
+        "task_name": finalized.task_name,
+        "payload_hash": finalized.payload_hash,
+        "payload_json": json.dumps(finalized.payload_json),
+        "input_path": finalized.input_path,
+        "result_path": finalized.result_path,
+        "state": "SUBMITTED",
+        "remote_identity": "mall|remote-1|number-1",
+        "crawl_work": [
+            {
+                "id": index,
+                "sku_id": f"sku-{suffix}",
+                "exact_url": f"https://same.invalid/{suffix}",
+                "source_id": f"v-{suffix}",
+            }
+            for index, suffix in enumerate(("a", "b", "c"), start=101)
+        ],
+    }
+
+    outcome = harvest([durable_job], 10)[19]
+
+    assert outcome["crawl_results"][101]["page_price_value"] == 11
+    assert outcome["crawl_results"][102]["no_result"] is True
+    assert outcome["crawl_results"][103] == {
+        "manual": True,
+        "error": "provenance ambiguity",
+    }
+    assert outcome["state"] == "EXPORTED"
+
+
+def test_legacy_bridge_finalizes_only_pending_subset_from_mixed_plan(tmp_path):
+    adapter = _BridgeAdapter()
+    paths = runtime_paths("2026-08-11", tmp_path / "runtime")
+    paths.run_dir.mkdir(parents=True)
+    propose, finalize, _submit, _harvest = legacy_zhaoshang_bridge(
+        adapter,
+        paths=paths,
+        business_date="2026-08-11",
+    )
+    rows = [
+        {"vCommodityId": "already-complete", "skuId": "sku-old", "extLink": "https://item.invalid/old"},
+        {"vCommodityId": "late-delta", "skuId": "sku-new", "extLink": "https://item.invalid/new"},
+    ]
+    proposal = propose([{"row": row} for row in rows], 10)[0]
+
+    finalized = finalize(proposal, (proposal.members[1],), 10)
+
+    assert finalized.members == (proposal.members[1],)
+    assert [request["sku_id"] for request in finalized.payload_json["requests"]] == ["sku-new"]
+    assert adapter.prepare_calls == 1
+
+    with pytest.raises(ValueError, match="ordered subset"):
+        finalize(proposal, (proposal.members[1], proposal.members[0]), 10)
+
+
+def test_legacy_bridge_keeps_confirmed_submit_priority_pending_until_verified(tmp_path):
+    class PendingPriorityAdapter(_BridgeAdapter):
+        def submit(self, _job, *, timeout_seconds):
+            self.submit_calls += 1
+            return LegacySubmitOutcome(
+                SubmitStatus.SUBMITTED,
+                task_id="remote-1",
+                task_number="number-1",
+                priority_evidence=None,
+            )
+
+    paths = runtime_paths("2026-08-11", tmp_path / "runtime")
+    paths.run_dir.mkdir(parents=True)
+    adapter = PendingPriorityAdapter()
+    propose, finalize, submit, harvest = legacy_zhaoshang_bridge(
+        adapter,
+        paths=paths,
+        business_date="2026-08-11",
+    )
+    row = {"vCommodityId": "v-a", "skuId": "sku-a", "extLink": "https://same.invalid/p"}
+    plan = propose([{"row": row}], 10)[0]
+    finalized = finalize(plan, tuple(plan.members), 10)
+
+    submitted = submit({"logical_key": finalized.logical_key}, [], 10)
+    durable = {
+        "id": 17,
+        "logical_key": finalized.logical_key,
+        "task_name": finalized.task_name,
+        "payload_hash": finalized.payload_hash,
+        "payload_json": json.dumps(finalized.payload_json),
+        "input_path": finalized.input_path,
+        "result_path": finalized.result_path,
+        "state": "PRIORITY_PENDING",
+        "remote_identity": submitted["remote_identity"],
+        "crawl_work": [],
+    }
+    priority = harvest([durable], 10)[17]
+
+    assert submitted["state"] == "PRIORITY_PENDING"
+    assert priority["state"] == "SUBMITTED"
+    assert priority["remote_identity"] == "mall|remote-1|number-1"
+    assert adapter.submit_calls == 1
+    assert adapter.priority_calls == 1
+    assert adapter.harvest_calls == 0
+
+
+def test_legacy_bridge_retries_transient_priority_on_same_remote_identity(tmp_path):
+    class RetryingPriorityAdapter(_BridgeAdapter):
+        def __init__(self):
+            super().__init__()
+            self.priority_outcomes = [
+                LegacyPriorityOutcome(
+                    PriorityStatus.UNCONFIRMED,
+                    diagnostic="InterfaceError",
+                    retryable=True,
+                ),
+                LegacyPriorityOutcome(PriorityStatus.UPDATED, weight_type=-1),
+            ]
+
+        def prioritize(self, _job, *, task_id, task_number, timeout_seconds):
+            self.priority_calls += 1
+            assert (task_id, task_number) == ("remote-1", "number-1")
+            return self.priority_outcomes.pop(0)
+
+    paths = runtime_paths("2026-08-11", tmp_path / "runtime")
+    paths.run_dir.mkdir(parents=True)
+    adapter = RetryingPriorityAdapter()
+    propose, finalize, _submit, harvest = legacy_zhaoshang_bridge(
+        adapter,
+        paths=paths,
+        business_date="2026-08-11",
+    )
+    row = {
+        "vCommodityId": "v-a",
+        "skuId": "sku-a",
+        "extLink": "https://same.invalid/p",
+    }
+    plan = propose([{"row": row}], 10)[0]
+    finalized = finalize(plan, tuple(plan.members), 10)
+    identity = "mall|remote-1|number-1"
+    durable = {
+        "id": 17,
+        "logical_key": finalized.logical_key,
+        "task_name": finalized.task_name,
+        "payload_hash": finalized.payload_hash,
+        "payload_json": json.dumps(finalized.payload_json),
+        "input_path": finalized.input_path,
+        "result_path": finalized.result_path,
+        "state": "PRIORITY_PENDING",
+        "remote_identity": identity,
+        "crawl_work": [],
+    }
+
+    first = harvest([durable], 10)[17]
+    second = harvest([durable], 10)[17]
+
+    assert first["state"] == "PRIORITY_PENDING"
+    assert first["remote_identity"] == identity
+    assert first["retryable_error"] == "InterfaceError"
+    assert "manual_error" not in first
+    assert second["state"] == "SUBMITTED"
+    assert second["remote_identity"] == identity
+    assert adapter.priority_calls == 2
+    assert adapter.submit_calls == 0
+
+
+def test_legacy_bridge_sends_deterministic_priority_conflict_directly_to_manual(
+    tmp_path,
+):
+    class ConflictingPriorityAdapter(_BridgeAdapter):
+        def prioritize(self, _job, *, task_id, task_number, timeout_seconds):
+            self.priority_calls += 1
+            return LegacyPriorityOutcome(
+                PriorityStatus.UNCONFIRMED,
+                diagnostic="priority identity does not match confirmed submission",
+                retryable=False,
+            )
+
+    paths = runtime_paths("2026-08-11", tmp_path / "runtime")
+    paths.run_dir.mkdir(parents=True)
+    adapter = ConflictingPriorityAdapter()
+    propose, finalize, _submit, harvest = legacy_zhaoshang_bridge(
+        adapter,
+        paths=paths,
+        business_date="2026-08-11",
+    )
+    row = {
+        "vCommodityId": "v-a",
+        "skuId": "sku-a",
+        "extLink": "https://same.invalid/p",
+    }
+    plan = propose([{"row": row}], 10)[0]
+    finalized = finalize(plan, tuple(plan.members), 10)
+    durable = {
+        "id": 17,
+        "logical_key": finalized.logical_key,
+        "task_name": finalized.task_name,
+        "payload_hash": finalized.payload_hash,
+        "payload_json": json.dumps(finalized.payload_json),
+        "input_path": finalized.input_path,
+        "result_path": finalized.result_path,
+        "state": "PRIORITY_PENDING",
+        "remote_identity": "mall|remote-1|number-1",
+        "crawl_work": [],
+    }
+
+    outcome = harvest([durable], 10)[17]
+
+    assert outcome["manual_error"] == (
+        "priority identity does not match confirmed submission"
+    )
+    assert "retryable_error" not in outcome
+    assert adapter.submit_calls == 0
 
 
 def test_batch_bridge_persists_slice_payload_and_reconciles_unknown_without_resubmit(tmp_path):
@@ -626,6 +1150,203 @@ def test_finalize_pending_remote_is_a_recoverable_active_drain(tmp_path, monkeyp
     assert "blocker: none" in state
 
 
+def test_drain_only_missing_state_is_noop_and_does_not_create_a_database(tmp_path):
+    root = tmp_path / "runtime"
+    paths = runtime_paths("2026-08-11", root)
+
+    result = run_runtime_command(
+        "drain-only",
+        business_date="2026-08-11",
+        runtime_root=root,
+        dependencies=_dependencies([]),
+    )
+
+    assert result.tick.outcome == "DRAIN_NO_EXISTING_RUN"
+    # Lock probing may still create the run directory; verify the command
+    # returns before durable writes.
+    assert not paths.state_path.exists()
+
+
+def test_drain_only_second_instance_with_same_business_date_lock_returns_skip_without_writes(
+    tmp_path, monkeypatch
+):
+    root = tmp_path / "runtime"
+    paths = runtime_paths("2026-08-11", root)
+    owner = ProcessLock(paths.lock_path).acquire(owner={
+        "business_date": "2026-08-11",
+        "pid": 12345,
+        "command": "tick",
+        "started_at": "2026-08-11T20:30:00+08:00",
+        "invocation": "scheduler",
+    })
+    monkeypatch.setattr(
+        runtime_module,
+        "_run_runtime_command_locked",
+        lambda *_args, **_kwargs: pytest.fail(
+            "active writer conflict must skip before lifecycle, especially when sqlite missing"
+        ),
+    )
+    try:
+        result = run_runtime_command(
+            "drain-only",
+            business_date="2026-08-11",
+            runtime_root=root,
+            invocation="manual",
+            dependencies=_dependencies([]),
+        )
+    finally:
+        owner.release()
+
+    assert result.tick.outcome == "ALREADY_RUNNING"
+    assert result.lock_conflict is not None
+    assert result.lock_conflict["requested"] == "drain-only"
+    assert result.lock_conflict["command"] == "tick"
+    assert result.lock_conflict["invocation"] == "scheduler"
+    assert result.lock_conflict["pid"] == 12345
+    # Acquire the writer lock on the same command/date, so the directory may be
+    # present from lock metadata bookkeeping; prove the lifecycle itself did not
+    # write any durable state for this second invocation.
+    assert not paths.state_path.exists()
+    assert not (paths.run_dir / "BATCH_STATE.md").exists()
+
+
+def test_drain_only_rejects_remote_create_capability(tmp_path):
+    with pytest.raises(ValueError, match="forbids the remote-create capability"):
+        run_runtime_command(
+            "drain-only",
+            business_date="2026-08-11",
+            runtime_root=tmp_path / "runtime",
+            enable_zhaoshang=True,
+            dependencies=_dependencies([]),
+        )
+
+
+def test_drain_only_default_dependencies_expose_only_existing_harvester(
+    tmp_path, monkeypatch
+):
+    harvester = lambda _jobs, _timeout: {}
+    monkeypatch.setattr(runtime_module, "CnncLegacyZhaoshangAdapter", lambda: object())
+    monkeypatch.setattr(
+        runtime_module,
+        "legacy_zhaoshang_bridge",
+        lambda *_args, **_kwargs: (object(), object(), object(), harvester),
+    )
+
+    deps = runtime_module.build_drain_dependencies(
+        zhaoshang_backend="legacy",
+        paths=runtime_paths("2026-08-11", tmp_path / "runtime"),
+        business_date="2026-08-11",
+    )
+
+    assert deps.harvest is harvester
+    assert deps.detail is None
+    assert deps.model is None
+    assert deps.model_batch is None
+    assert deps.plan_crawl is None
+    assert deps.finalize_crawl_plan is None
+    assert deps.submit_crawl is None
+    with pytest.raises(RuntimeConfigurationError, match="cannot discover"):
+        deps.discover(1)
+
+
+def test_drain_only_uses_existing_only_engine_and_materializes_when_drained(
+    tmp_path, monkeypatch
+):
+    root = tmp_path / "runtime"
+    paths = runtime_paths("2026-08-11", root)
+    paths.run_dir.mkdir(parents=True)
+    DailyAuditStore(paths.state_path).ensure_run("2026-08-11")
+    calls = []
+    monkeypatch.setattr(runtime_module, "_configured_model_name", lambda: "deployed-model")
+    monkeypatch.setattr(
+        runtime_module,
+        "run_incremental_tick",
+        lambda *_args, **_kwargs: pytest.fail("drain-only must not invoke the tick engine"),
+    )
+
+    def drain(_store, _lock, _config, _deps, *, max_iterations):
+        calls.append(("drain", max_iterations))
+        return TickSummary("DRAINED", ("checkpoint",), {}, {"remote_pending": 0}, 7)
+
+    def materialize(*_args):
+        calls.append(("materialize", None))
+        return object()
+
+    monkeypatch.setattr(runtime_module, "run_existing_remote_drain", drain)
+
+    result = run_runtime_command(
+        "drain-only",
+        business_date="2026-08-11",
+        runtime_root=root,
+        runtime_budget_seconds=300,
+        drain_max_iterations=23,
+        dependencies=_dependencies([]),
+        materialize=materialize,
+        monotonic=lambda: 0.0,
+    )
+
+    assert result.publication is not None
+    assert calls == [("drain", 23), ("materialize", None)]
+
+
+def test_drain_only_pending_work_never_attempts_formal_materialization(
+    tmp_path, monkeypatch
+):
+    root = tmp_path / "runtime"
+    paths = runtime_paths("2026-08-11", root)
+    paths.run_dir.mkdir(parents=True)
+    DailyAuditStore(paths.state_path).ensure_run("2026-08-11")
+    monkeypatch.setattr(runtime_module, "_configured_model_name", lambda: "deployed-model")
+    monkeypatch.setattr(
+        runtime_module,
+        "run_existing_remote_drain",
+        lambda *_args, **_kwargs: TickSummary(
+            "DRAIN_NO_PROGRESS", ("stop:no_progress",), {}, {"remote_pending": 1}, 7
+        ),
+    )
+
+    result = run_runtime_command(
+        "drain-only",
+        business_date="2026-08-11",
+        runtime_root=root,
+        dependencies=_dependencies([]),
+        materialize=lambda *_args: pytest.fail(
+            "pending drain-only work must not materialize a formal workbook"
+        ),
+    )
+
+    assert result.tick.outcome == "DRAIN_NO_PROGRESS"
+    assert result.publication is None
+
+
+def test_drain_only_already_finalized_is_fast_noop(tmp_path, monkeypatch):
+    root = tmp_path / "runtime"
+    paths = runtime_paths("2026-08-11", root)
+    paths.run_dir.mkdir(parents=True)
+    DailyAuditStore(paths.state_path).ensure_run("2026-08-11")
+    monkeypatch.setattr(runtime_module, "_configured_model_name", lambda: "deployed-model")
+    monkeypatch.setattr(
+        runtime_module,
+        "run_existing_remote_drain",
+        lambda *_args, **_kwargs: TickSummary(
+            "ALREADY_FINALIZED", ("noop:already_finalized",), {}, {}, 7
+        ),
+    )
+
+    result = run_runtime_command(
+        "drain-only",
+        business_date="2026-08-11",
+        runtime_root=root,
+        dependencies=_dependencies([]),
+        materialize=lambda *_args: pytest.fail("already finalized must be a no-op"),
+    )
+
+    assert result.tick.outcome == "ALREADY_FINALIZED"
+    state = (paths.run_dir / "BATCH_STATE.md").read_text(encoding="utf-8")
+    assert "status: COMPLETE" in state
+    assert "formal_excel_already_materialized" in state
+
+
 @pytest.mark.parametrize(
     "conflict",
     [
@@ -735,6 +1456,68 @@ def test_batch_state_lock_timeout_does_not_reverse_checkpointed_tick(tmp_path, m
 
     assert result.tick.outcome in {"PENDING_RETRY", "COMPLETED"}
     assert runtime_paths("2026-08-11", tmp_path / "runtime").state_path.is_file()
+
+
+def test_record_batch_result_only_masks_batch_state_lock_contention(tmp_path, monkeypatch):
+    paths = runtime_paths("2026-08-11", tmp_path / "runtime")
+    store = DailyAuditStore(paths.state_path)
+    store.ensure_run("2026-08-11")
+
+    class _UnavailableLock:
+        def __enter__(self):
+            raise TimeoutError("batch state busy")
+
+        def __exit__(self, *_args):
+            return False
+
+    monkeypatch.setattr(
+        runtime_module,
+        "_batch_state_update_lock",
+        lambda *args, **kwargs: _UnavailableLock(),
+    )
+    monkeypatch.setattr(runtime_module, "run_incremental_tick", lambda *_args, **_kwargs: TickSummary(
+        "COMPLETED", (), {}, {}, 7,
+    ))
+
+    result = run_runtime_command(
+        "tick",
+        business_date="2026-08-11",
+        runtime_root=tmp_path / "runtime",
+        dependencies=_dependencies([]),
+    )
+
+    assert result.tick.outcome == "COMPLETED"
+    assert runtime_paths("2026-08-11", tmp_path / "runtime").state_path.is_file()
+
+
+def test_record_batch_result_does_not_mask_non_lock_io_failures(tmp_path, monkeypatch):
+    paths = runtime_paths("2026-08-11", tmp_path / "runtime")
+    store = DailyAuditStore(paths.state_path)
+    store.ensure_run("2026-08-11")
+
+    class _UnavailableLock:
+        def __enter__(self):
+            raise OSError("batch state filesystem is unavailable")
+
+        def __exit__(self, *_args):
+            return False
+
+    monkeypatch.setattr(
+        runtime_module,
+        "_batch_state_update_lock",
+        lambda *args, **kwargs: _UnavailableLock(),
+    )
+    monkeypatch.setattr(runtime_module, "run_incremental_tick", lambda *_args, **_kwargs: TickSummary(
+        "COMPLETED", (), {}, {}, 7,
+    ))
+
+    with pytest.raises(OSError, match="batch state filesystem is unavailable"):
+        run_runtime_command(
+            "tick",
+            business_date="2026-08-11",
+            runtime_root=tmp_path / "runtime",
+            dependencies=_dependencies([]),
+        )
 
 
 def test_missing_batch_state_bridge_uses_normal_state_document(tmp_path):
@@ -866,6 +1649,115 @@ def test_cli_forwards_explicit_zhaoshang_backend(monkeypatch):
     assert captured[0]["zhaoshang_backend"] == "batch"
 
 
+def test_tick_cli_runtime_contract_accepts_drain_iteration_limit(
+    tmp_path, monkeypatch, capsys
+):
+    captured = {}
+
+    def run_locked(command, **kwargs):
+        captured.update({"command": command, **kwargs})
+        return RuntimeResult(TickSummary("COMPLETED", (), {}, {}, None))
+
+    monkeypatch.setattr(runtime_module, "_run_runtime_command_locked", run_locked)
+    monkeypatch.setattr(cli, "collect_runtime_status", lambda **_kwargs: {"run_id": None})
+    monkeypatch.setattr(
+        cli,
+        "write_daily_status",
+        lambda *_args, **_kwargs: tmp_path / "daily_status.json",
+    )
+
+    assert cli.main([
+        "tick",
+        "--business-date",
+        "2026-08-11",
+        "--runtime-root",
+        str(tmp_path / "runtime"),
+    ]) == 0
+
+    assert captured["command"] == "tick"
+    assert captured["drain_max_iterations"] == 1000
+    assert captured["paths"].run_dir == (tmp_path / "runtime" / "2026-08-11").resolve()
+    assert json.loads(capsys.readouterr().out)["outcome"] == "COMPLETED"
+
+
+def test_cli_drain_only_has_no_remote_create_flag_and_forwards_limits(monkeypatch):
+    captured = []
+    summary = TickSummary("DRAIN_NO_PROGRESS", (), {}, {"remote_pending": 1}, 7)
+    monkeypatch.setattr(
+        cli,
+        "run_runtime_command",
+        lambda command, **kwargs: (
+            captured.append((command, kwargs)) or RuntimeResult(summary)
+        ),
+    )
+    monkeypatch.setattr(cli, "collect_runtime_status", lambda **_kwargs: {"state": "FINALIZING"})
+    monkeypatch.setattr(cli, "write_daily_status", lambda *_args, **_kwargs: Path("daily_status.json"))
+
+    assert cli.main([
+        "drain-only",
+        "--business-date",
+        "2026-08-11",
+        "--budget-seconds",
+        "3000",
+        "--max-iterations",
+        "77",
+    ]) == 0
+
+    command, kwargs = captured[0]
+    assert command == "drain-only"
+    assert kwargs["enable_zhaoshang"] is False
+    assert kwargs["drain_max_iterations"] == 77
+    assert kwargs["runtime_budget_seconds"] == 3000
+
+
+def test_cli_manual_lock_conflict_fails_fast_with_owner_details(monkeypatch, capsys):
+    summary = TickSummary("ALREADY_RUNNING", (), {}, {}, None)
+    monkeypatch.setattr(
+        cli,
+        "run_runtime_command",
+        lambda *_args, **_kwargs: RuntimeResult(
+            summary,
+            lock_conflict={
+                "lock_identity": "C:/runtime/2026-08-11/writer.lock",
+                "pid": 12345,
+                "command": "drain-only",
+                "started_at": "2026-08-11T20:31:12+08:00",
+                "invocation": "scheduler",
+            },
+        ),
+    )
+
+    assert cli.main(["drain-only", "--business-date", "2026-08-11"]) == 0
+    output = capsys.readouterr().out
+    assert output.startswith("SKIPPED_ALREADY_RUNNING\n")
+    assert "requested=drain-only" in output
+    assert "owner_pid=12345" in output
+    assert "owner_command=drain-only" in output
+    assert "owner_invocation=scheduler" in output
+
+
+def test_cli_lock_status_is_read_only_and_does_not_call_runtime(monkeypatch, capsys):
+    monkeypatch.setattr(
+        cli,
+        "collect_production_writer_status",
+        lambda **_kwargs: {
+            "active": True,
+            "message": "production run currently active",
+            "command": "tick",
+        },
+    )
+    monkeypatch.setattr(
+        cli,
+        "run_runtime_command",
+        lambda *_args, **_kwargs: pytest.fail("lock-status must not run lifecycle"),
+    )
+
+    assert cli.main(["lock-status", "--business-date", "2026-08-11"]) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["active"] is True
+    assert report["command"] == "tick"
+
+
 @pytest.mark.parametrize(
     ("outcome", "publication_blocked", "expected"),
     [
@@ -899,3 +1791,36 @@ def test_cli_publication_success_wins_over_superseded_backlog_outcome(monkeypatc
     )
 
     assert cli.main(["finalize", "--business-date", "2026-08-11"]) == 0
+
+
+def test_cli_export_review_uses_dedicated_non_tick_command(monkeypatch, tmp_path):
+    calls = []
+    monkeypatch.setattr(
+        cli,
+        "run_review_export_command",
+        lambda **kwargs: calls.append(kwargs)
+        or {"outcome": "REVIEW_EXPORTED", "row_count": 2, "manual_count": 1},
+        raising=False,
+    )
+    output = tmp_path / "saas_audit_review_20260811.xlsx"
+
+    result = cli.main(
+        [
+            "export-review",
+            "--business-date",
+            "2026-08-11",
+            "--runtime-root",
+            str(tmp_path / "runtime"),
+            "--output-path",
+            str(output),
+        ]
+    )
+
+    assert result == 0
+    assert calls == [
+        {
+            "business_date": "2026-08-11",
+            "runtime_root": tmp_path / "runtime",
+            "output_path": output,
+        }
+    ]

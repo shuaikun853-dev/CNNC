@@ -283,7 +283,7 @@ def build_records(rows: list[dict[str, Any]], enriched: list[dict[str, Any]]) ->
 
 
 def compute_over_30_check(customer_price: Decimal | None, page_price: Decimal | None, page_price_status: str) -> tuple[str, str]:
-    if page_price_status in {"SKIPPED_JD", "SKIPPED_ZHAOSHANG", "SKIPPED_NO_LINK", "SKIPPED_MODEL_NOT_SAME", "SKIPPED", "PENDING_CRAWL", "FAILED", "CRAWLER_PROCESS_FAILED", "PRICE_MISSING"}:
+    if page_price_status in {"SKIPPED_JD", "SKIPPED_ZHAOSHANG", "SKIPPED_NO_LINK", "SKIPPED_MODEL_NOT_SAME", "SKIPPED", "PENDING_CRAWL", "FAILED", "CRAWLER_PROCESS_FAILED", "PRICE_MISSING", "NO_RESULT"}:
         return "PAGE_PRICE_MISSING", ""
     if page_price is None or page_price < 0:
         return "PAGE_PRICE_MISSING", ""
@@ -305,7 +305,7 @@ def compute_saas_price_vs_customer(customer_price: Decimal | None, saas_price: D
 
 
 def compute_price_changed(saas_price: Decimal | None, page_price: Decimal | None, page_price_status: str, tolerance_ratio: Decimal = Decimal("0.01")) -> tuple[str, str]:
-    if page_price_status in {"SKIPPED_JD", "SKIPPED_ZHAOSHANG", "SKIPPED_NO_LINK", "SKIPPED_MODEL_NOT_SAME", "SKIPPED", "PENDING_CRAWL", "FAILED", "CRAWLER_PROCESS_FAILED", "PRICE_MISSING"} or page_price is None or not is_valid_reference_price(saas_price):
+    if page_price_status in {"SKIPPED_JD", "SKIPPED_ZHAOSHANG", "SKIPPED_NO_LINK", "SKIPPED_MODEL_NOT_SAME", "SKIPPED", "PENDING_CRAWL", "FAILED", "CRAWLER_PROCESS_FAILED", "PRICE_MISSING", "NO_RESULT"} or page_price is None or not is_valid_reference_price(saas_price):
         return "PRICE_UNAVAILABLE", "page or SaaS price unavailable"
     if abs(page_price - saas_price) / saas_price > tolerance_ratio:
         return "CHANGED", f"SaaS={saas_price}; page={page_price}"

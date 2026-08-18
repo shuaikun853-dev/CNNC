@@ -34,34 +34,21 @@ from openpyxl import Workbook  # noqa: E402
 from openpyxl.styles import Alignment, Font, PatternFill  # noqa: E402
 from openpyxl.utils import get_column_letter  # noqa: E402
 
-from scripts.audit_saas_excel_file import (  # noqa: E402
+from app.services.saas_audit_core import (  # noqa: E402
     _parse_json_segments,
     is_jd_link,
     normalize_cell_str,
 )
+from scripts.zhaoshang_mall_mapping import ZhaoshangMallMapping, load_zhaoshang_mall_mappings  # noqa: E402
 
 
-# 商城映射：(输出文件名, 域名后缀列表, vendorName 关键词列表, 招商局 mall_key)
-# 商城映射：(输出文件名, 域名后缀列表, vendorName 关键词列表, 招商局 mall_key)
-EXCLUDED_MALLS = [
-    ("京东", ("jd.com", "item.jd.com"), ("jd",), "jd"),
-    ("震坤行", ("zkh.com",), ("zkh",), "zkh"),
-    ("浙江宏伟", ("tima365.com",), ("tima",), "tima"),
-    ("浙江物产", ("zjmi-mall.com", "zjmi.com"), ("zjmi",), "zjmi"),
-    ("鑫方盛商城", ("xfs.com",), ("xfs",), "xfs"),
-    ("阳采集团", ("ycw.cn",), ("ycw",), "ycw"),
-    ("得力商城", ("nbdeli.com", "nbdeli.cn", "delib2b.com"), ("nbdeli", "deli"), "nbdeli"),
-    ("固安捷商城", ("mymro.cn",), ("mymro",), "mymro"),
-    ("科力普商城", ("colipu.com",), ("colipu",), "colipu"),
-    ("易派客", ("epec.com", "emall.epec.com"), ("epec",), "epec"),
-    ("领先未来", ("66123123.com",), ("lxwl",), "lxwl"),
-]
+EXCLUDED_MALLS = load_zhaoshang_mall_mappings()
 
 
 def _mall_predicate(row: dict, domains: tuple[str, ...], vendor_keywords: tuple[str, ...]) -> bool:
     url = row.get("extLink", "") or ""
-    if _host_match(url, domains):
-        return True
+    if (urlparse(url).hostname or "").strip():
+        return _host_match(url, domains)
     vendor = normalize_cell_str(row.get("vendorName")).lower()
     return any(kw in vendor for kw in vendor_keywords)
 
@@ -153,11 +140,13 @@ def export_excluded_templates(
         "",
     ]
 
-    for entry in EXCLUDED_MALLS:
-        mall_name = entry[0]
-        domains = entry[1]
-        vendor_keywords = entry[2]
-        mall_key = entry[3] if len(entry) > 3 else mall_name
+    for mapping in EXCLUDED_MALLS:
+        if not isinstance(mapping, ZhaoshangMallMapping):
+            continue
+        mall_name = mapping.mall_name
+        domains = mapping.domains
+        vendor_keywords = mapping.vendor_keywords
+        mall_key = mapping.mall_key
         matched = [row for row in saas_rows if _mall_predicate(row, domains, vendor_keywords)]
         seen: set[tuple[str, str]] = set()
         deduped: list[dict] = []
@@ -175,6 +164,8 @@ def export_excluded_templates(
             "deduped": len(deduped),
             "path": out_path,
             "mall_key": mall_key,
+            "source_id": mapping.source_id,
+            "domains": list(domains),
         }
         summary_lines.append(f"{mall_name}: 命中 {len(matched)} 行 / 去重后 {len(deduped)} 行")
 

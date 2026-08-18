@@ -10,6 +10,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Iterable
 
+from app.services.daily_audit_store import ProcessLock
 from app.services.incremental_audit_runtime import DEFAULT_RUNTIME_ROOT, runtime_paths
 from app.services.legacy_zhaoshang_adapter import EXTERNAL_TOOL_PATH
 
@@ -31,7 +32,65 @@ def _empty_stage() -> dict[str, int]:
     return {"pending": 0, "running": 0, "completed": 0, "terminal": 0, "attempts": 0}
 
 
-def _empty_status(business_date: str, state_path: Path) -> dict[str, Any]:
+def _empty_crawl_pending_breakdown() -> dict[str, int]:
+    """Fine-grained view of crawl.pending; the buckets sum to ``pending``.
+
+    A crawl row may be PENDING while already bound to a remote job whose
+    submission or priority step is still outstanding, so the raw aggregate
+    alone cannot say whether anything still needs to be submitted.  Anything
+    the durable state cannot prove lands in ``unclassified`` instead of being
+    guessed into a nicer bucket.
+    """
+    return {
+        "waiting_submit": 0,
+        "awaiting_priority": 0,
+        "awaiting_remote": 0,
+        "blocked_manual": 0,
+        "retryable": 0,
+        "unclassified": 0,
+    }
+
+
+def _empty_blocker_summary() -> dict[str, int]:
+    """Exact component decomposition of ``final.computed_pending``.
+
+    ``final.pending`` mixes item-level and remote-job-level blockers, so it is
+    never a commodity count.  These components reproduce the computed sum
+    one-to-one and stay additive-only to keep existing consumers stable.
+    """
+    return {
+        "detail_pending": 0,
+        "model_pending": 0,
+        "model_terminal": 0,
+        "crawl_pending": 0,
+        "crawl_unplanned": 0,
+        "crawl_unknown": 0,
+        "crawl_manual": 0,
+        "remote_intent": 0,
+        "remote_pending": 0,
+        "remote_unknown": 0,
+        "remote_manual": 0,
+    }
+
+
+def collect_production_writer_status(
+    *, business_date: str, runtime_root: Path | str = DEFAULT_RUNTIME_ROOT
+) -> dict[str, Any]:
+    """Read the per-day production writer lock without creating runtime files."""
+    paths = runtime_paths(business_date, runtime_root)
+    writer = ProcessLock.inspect(paths.lock_path)
+    writer["business_date"] = business_date
+    writer["message"] = (
+        "production run currently active" if writer["active"] else "no production writer active"
+    )
+    return writer
+
+
+def _empty_status(
+    business_date: str,
+    state_path: Path,
+    production_writer: dict[str, Any],
+) -> dict[str, Any]:
     return {
         "business_date": business_date,
         "run_id": None,
@@ -42,10 +101,23 @@ def _empty_status(business_date: str, state_path: Path) -> dict[str, Any]:
         "counts": {"discovered": 0, "unique_items": 0, "new": 0, "changed": 0, "processed": 0},
         "detail": _empty_stage(),
         "model": _empty_stage(),
-        "crawl": {"pending": 0, "running": 0, "completed": 0, "unknown": 0, "manual": 0},
-        "remote": {"intent": 0, "pending": 0, "running": 0, "exported": 0, "completed": 0, "unknown": 0, "manual": 0},
-        "final": {"pending": 0, "frozen": False, "finalized": False, "output_path": None, "output_exists": False},
+        "crawl": {
+            "pending": 0, "running": 0, "completed": 0, "no_result": 0,
+            "unplanned": 0, "unknown": 0, "manual": 0,
+            **_empty_crawl_pending_breakdown(),
+        },
+        "remote": {
+            "intent": 0, "pending": 0, "running": 0, "exported": 0,
+            "completed": 0, "unknown": 0, "manual": 0,
+            "awaiting_priority": 0, "awaiting_harvest": 0,
+        },
+        "final": {
+            "pending": 0, "computed_pending": 0, "frozen": False, "finalized": False,
+            "output_path": None, "output_exists": False, "manifest_recorded": False,
+            "blocker_summary": _empty_blocker_summary(),
+        },
         "lease": {"active": False, "stale": False, "expires_at": None},
+        "production_writer": production_writer,
         "next_actions": ["run a shadow tick to create today's durable state"],
     }
 
@@ -92,7 +164,8 @@ def _stage_status(connection: sqlite3.Connection, snapshot_id: int, stage: str, 
     return {
         "pending": max(0, expected - represented)
         + states.get("PENDING", 0)
-        + states.get("RETRYABLE_FAILED", 0),
+        + states.get("RETRYABLE_FAILED", 0)
+        + states.get("RECOVERED_PENDING_REVIEW", 0),
         "running": states.get("CLAIMED", 0),
         "completed": states.get("SUCCESS", 0),
         "terminal": states.get("TERMINAL_FAILED", 0),
@@ -105,11 +178,13 @@ def _next_actions(status: dict[str, Any]) -> list[str]:
         return ["none; the frozen daily workbook is finalized"]
     if status["remote"]["unknown"]:
         return ["run doctor, then let a later tick reconcile the exact remote identity; do not resubmit"]
-    if status["remote"]["manual"] or status["detail"]["terminal"] or status["model"]["terminal"] or status["crawl"]["manual"]:
+    if status["remote"]["manual"] or status["model"]["terminal"] or status["crawl"]["manual"]:
         return ["inspect terminal/manual evidence before rerunning; do not delete durable state"]
+    if status["crawl"]["unplanned"]:
+        return ["inspect required snapshot rows without crawl work; do not finalize or submit without explicit authorization"]
     if status["final"]["frozen"]:
         return ["rerun finite finalize to drain frozen-snapshot work and materialize once ready"]
-    if status["crawl"]["pending"]:
+    if status["crawl"]["pending"] or status["crawl"]["unplanned"]:
         return ["run a shadow tick to advance read-only work, or explicitly authorize remote writes for crawl submission"]
     return ["run the next finite shadow tick; run finalize at or after the 18:00 cutoff"]
 
@@ -119,8 +194,12 @@ def collect_runtime_status(
 ) -> dict[str, Any]:
     """Read a stable status shape without creating files or making network calls."""
     paths = runtime_paths(business_date, runtime_root)
+    production_writer = collect_production_writer_status(
+        business_date=business_date,
+        runtime_root=runtime_root,
+    )
     if not paths.state_path.is_file():
-        return _empty_status(business_date, paths.state_path)
+        return _empty_status(business_date, paths.state_path, production_writer)
 
     uri = f"file:{paths.state_path.resolve().as_posix()}?mode=ro"
     connection = sqlite3.connect(uri, uri=True)
@@ -134,7 +213,7 @@ def collect_runtime_status(
             (business_date,),
         ).fetchone()
         if run is None:
-            return _empty_status(business_date, paths.state_path)
+            return _empty_status(business_date, paths.state_path, production_writer)
         run_id = int(run["id"])
         latest = connection.execute(
             """SELECT id, observed_at, row_count, ordered_hash
@@ -168,6 +247,60 @@ def collect_runtime_status(
                 (run_id,),
             ).fetchall()
         )
+        crawl_pending_breakdown = _empty_crawl_pending_breakdown()
+        for row in connection.execute(
+            """SELECT cw.state AS crawl_state, COALESCE(rj.state, '') AS remote_state,
+                      COUNT(*) AS count
+               FROM crawl_work cw LEFT JOIN remote_jobs rj ON rj.id = cw.remote_job_id
+               WHERE cw.run_id=? AND cw.state IN ('PENDING', 'RETRYABLE_FAILED')
+               GROUP BY cw.state, remote_state""",
+            (run_id,),
+        ).fetchall():
+            count = int(row["count"])
+            crawl_state = str(row["crawl_state"])
+            remote_state = str(row["remote_state"])
+            if crawl_state == "RETRYABLE_FAILED":
+                crawl_pending_breakdown["retryable"] += count
+            elif remote_state == "":
+                crawl_pending_breakdown["waiting_submit"] += count
+            elif remote_state in {"SUBMIT_INTENT", "SUBMIT_UNKNOWN", "PRIORITY_PENDING"}:
+                crawl_pending_breakdown["awaiting_priority"] += count
+            elif remote_state in {"SUBMITTED", "RUNNING", "EXPORTED"}:
+                crawl_pending_breakdown["awaiting_remote"] += count
+            elif remote_state == "MANUAL_REQUIRED":
+                crawl_pending_breakdown["blocked_manual"] += count
+            else:
+                crawl_pending_breakdown["unclassified"] += count
+        target_snapshot_id = int(run["frozen_snapshot_id"]) if run["frozen_snapshot_id"] is not None else latest_id
+        crawl_unplanned = 0
+        if target_snapshot_id is not None:
+            crawl_keys = {
+                (str(row["source_id"]).strip(), str(row["sku_id"]).strip(), str(row["exact_url"]).strip())
+                for row in connection.execute(
+                    "SELECT source_id, sku_id, exact_url FROM crawl_work WHERE run_id=?",
+                    (run_id,),
+                ).fetchall()
+            }
+            frozen_rows = connection.execute(
+                """SELECT i.row_json
+                   FROM snapshot_members m
+                   JOIN audit_items i ON i.id=m.audit_item_id
+                   WHERE m.snapshot_id=? ORDER BY m.row_ordinal""",
+                (target_snapshot_id,),
+            ).fetchall()
+            for frozen_row in frozen_rows:
+                try:
+                    row = json.loads(str(frozen_row["row_json"] or "{}"))
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    continue
+                required = bool(row.get("__crawl_required", bool(str(row.get("extLink") or "").strip())))
+                key = (
+                    str(row.get("vCommodityId") or row.get("documentId") or "").strip(),
+                    str(row.get("skuId") or "").strip(),
+                    str(row.get("extLink") or "").strip(),
+                )
+                if required and key not in crawl_keys:
+                    crawl_unplanned += 1
         remote_states = _group_counts(
             connection.execute(
                 "SELECT state, COUNT(*) AS count FROM remote_jobs WHERE run_id=? GROUP BY state",
@@ -186,22 +319,30 @@ def collect_runtime_status(
         "pending": crawl_states.get("PENDING", 0) + crawl_states.get("RETRYABLE_FAILED", 0),
         "running": crawl_states.get("SUBMITTED", 0) + crawl_states.get("RUNNING", 0) + crawl_states.get("EXPORTED", 0),
         "completed": crawl_states.get("SUCCESS", 0),
+        "no_result": crawl_states.get("NO_RESULT", 0),
+        "unplanned": crawl_unplanned,
         "unknown": crawl_states.get("SUBMIT_UNKNOWN", 0),
-        "manual": crawl_states.get("TERMINAL_FAILED", 0),
+        "manual": crawl_states.get("TERMINAL_FAILED", 0)
+        + crawl_states.get("MANUAL_REQUIRED", 0),
+        # Additive fine-grained view; the six buckets sum to "pending".
+        **crawl_pending_breakdown,
     }
     remote = {
         "intent": remote_states.get("SUBMIT_INTENT", 0),
-        "pending": remote_states.get("SUBMITTED", 0),
+        "pending": remote_states.get("PRIORITY_PENDING", 0) + remote_states.get("SUBMITTED", 0),
         "running": remote_states.get("RUNNING", 0),
         "exported": remote_states.get("EXPORTED", 0),
         "completed": remote_states.get("COMPLETED", 0),
         "unknown": remote_states.get("SUBMIT_UNKNOWN", 0),
         "manual": remote_states.get("MANUAL_REQUIRED", 0),
+        # Additive sub-views of pending/exported by next required action.
+        "awaiting_priority": remote_states.get("PRIORITY_PENDING", 0),
+        "awaiting_harvest": remote_states.get("SUBMITTED", 0) + remote_states.get("EXPORTED", 0),
     }
     computed_final_pending = (
-        detail["pending"] + detail["running"] + detail["terminal"]
+        detail["pending"] + detail["running"]
         + model["pending"] + model["running"] + model["terminal"]
-        + crawl["pending"] + crawl["running"] + crawl["unknown"] + crawl["manual"]
+        + crawl["pending"] + crawl["running"] + crawl["unplanned"] + crawl["unknown"] + crawl["manual"]
         + remote["intent"] + remote["pending"] + remote["running"]
         + remote["exported"] + remote["unknown"] + remote["manual"]
     )
@@ -245,12 +386,28 @@ def collect_runtime_status(
             "output_path": output_path,
             "output_exists": bool(output_path and Path(output_path).is_file()),
             "manifest_recorded": bool(run["final_manifest_hash"]),
+            # Exact additive decomposition of computed_pending; the components
+            # sum to it one-to-one and never pretend it is a commodity count.
+            "blocker_summary": {
+                "detail_pending": detail["pending"] + detail["running"],
+                "model_pending": model["pending"] + model["running"],
+                "model_terminal": model["terminal"],
+                "crawl_pending": crawl["pending"] + crawl["running"],
+                "crawl_unplanned": crawl["unplanned"],
+                "crawl_unknown": crawl["unknown"],
+                "crawl_manual": crawl["manual"],
+                "remote_intent": remote["intent"],
+                "remote_pending": remote["pending"] + remote["running"] + remote["exported"],
+                "remote_unknown": remote["unknown"],
+                "remote_manual": remote["manual"],
+            },
         },
         "lease": {
             "active": _lease_active(run["lease_owner"], run["lease_expires_at"]),
             "stale": _lease_stale(run["lease_owner"], run["lease_expires_at"]),
             "expires_at": run["lease_expires_at"],
         },
+        "production_writer": production_writer,
         "metrics": metrics,
     }
     status["next_actions"] = _next_actions(status)

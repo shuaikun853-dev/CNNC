@@ -266,7 +266,7 @@ E:\Python314\python.exe scripts\audit_saas_excel_file.py `
   --zhaoshang-task `
   --zhaoshang-concurrency 6 `
   --zhaoshang-task-prefix 'cnnc_current_opt' `
-  --zhaoshang-wait-timeout 7200 `
+  --zhaoshang-wait-timeout 600 `
   --zhaoshang-progress-interval 30
 ```
 
@@ -295,4 +295,3 @@ E:\Python314\python.exe -m pytest tests\test_work_01_saas_approval_json_audit.py
 4. multi_mall 的领先未来旧商城可能随机触发页面超时/域名停止；这和招商局并发优化无关。
 5. 正式集成时清理重复函数定义，保留最后的并发版 `run_zhaoshang_tasks(...)`。
 6. 如果 opencode 已经实现了“两个 JSON join 后马上启动招商局和非招商局爬虫”，需要确认 join 后仍保留 `excluded_export_summary` 的模板路径，否则招商局按商品编码无法回填 URL。
-

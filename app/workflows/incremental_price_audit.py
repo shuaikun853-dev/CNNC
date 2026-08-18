@@ -16,9 +16,11 @@ import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any, Callable, Mapping, Sequence
+from urllib import error
 
 from app.services.daily_audit_store import DailyAuditStore, LeaseToken, LeaseUnavailable, ProcessLock
 from app.services.saas_audit_core import crawl_fingerprint, detail_fingerprint, model_fingerprint
+from app.services.title_match_model_adapter import ModelCallRetryExhaustedError
 
 
 @dataclass(frozen=True)
@@ -36,19 +38,23 @@ class TickConfig:
     model_max_elapsed_seconds: float = 300
     model_batch_size: int = 10
     external_timeout_seconds: float = 60
+    snapshot_discovery_timeout_seconds: float = 180
     model_name: str = "title-match"
     model_prompt_version: str = "v1"
     model_schema_version: str = "v1"
     detail_schema_version: str = "detail-v1"
     harvest_max_attempts: int = 120
     harvest_max_elapsed_seconds: float = 21600
+    priority_retry_max_attempts: int = 3
+    priority_retry_max_elapsed_seconds: float = 180
     harvest_batch_size: int = 6
 
     def __post_init__(self) -> None:
         numeric = (
             self.runtime_budget_seconds, self.heavy_work_reserve_seconds, self.lease_ttl_seconds,
             self.detail_max_elapsed_seconds, self.model_max_elapsed_seconds,
-            self.external_timeout_seconds, self.harvest_max_elapsed_seconds,
+            self.external_timeout_seconds, self.snapshot_discovery_timeout_seconds,
+            self.harvest_max_elapsed_seconds, self.priority_retry_max_elapsed_seconds,
         )
         if not all(math.isfinite(value) for value in numeric):
             raise ValueError("tick limits must be finite")
@@ -56,15 +62,24 @@ class TickConfig:
             raise ValueError("tick runtime budget and reserve must be valid")
         if self.runtime_budget_seconds and self.heavy_work_reserve_seconds >= self.runtime_budget_seconds:
             raise ValueError("heavy-work reserve must be smaller than tick runtime budget")
-        if self.lease_ttl_seconds <= 0 or self.external_timeout_seconds <= 0:
-            raise ValueError("lease TTL and external timeout must be positive")
+        if (
+            self.lease_ttl_seconds <= 0
+            or self.external_timeout_seconds <= 0
+            or self.snapshot_discovery_timeout_seconds <= 0
+        ):
+            raise ValueError("lease TTL and external timeouts must be positive")
         if self.detail_max_attempts <= 0 or self.model_max_attempts <= 0:
             raise ValueError("stage attempt limits must be positive")
         if self.model_batch_size <= 0:
             raise ValueError("model batch size must be positive")
         if self.detail_max_elapsed_seconds <= 0 or self.model_max_elapsed_seconds <= 0:
             raise ValueError("stage elapsed limits must be positive")
-        if self.harvest_max_attempts <= 0 or self.harvest_max_elapsed_seconds <= 0:
+        if (
+            self.harvest_max_attempts <= 0
+            or self.harvest_max_elapsed_seconds <= 0
+            or self.priority_retry_max_attempts <= 0
+            or self.priority_retry_max_elapsed_seconds <= 0
+        ):
             raise ValueError("harvest limits must be positive")
         if self.harvest_batch_size <= 0:
             raise ValueError("harvest batch size must be positive")
@@ -165,6 +180,8 @@ def _empty_counters() -> dict[str, int]:
         "recovered_stage_claims": 0, "recovered_submit_unknown": 0, "today_discovered": 0,
         "delta_new": 0, "delta_changed": 0, "detail_requests": 0, "model_attempts": 0,
         "crawl_submitted": 0, "crawl_harvested": 0, "submit_unknown": 0, "crawl_running": 0,
+        "harvest_batches": 0, "harvest_swept": 0,
+        "customer_count": 0, "saas_count": 0, "source_count_gap": 0,
     }
 
 
@@ -174,7 +191,16 @@ def _canonical_hash(value: Any) -> str:
 
 def _safe_error(exc: BaseException) -> str:
     code = getattr(exc, "code", None)
-    return f"{type(exc).__name__}(status={code})" if isinstance(code, int) else type(exc).__name__
+    if isinstance(code, int):
+        return f"{type(exc).__name__}(status={code})"
+    attempts = getattr(exc, "attempts", None)
+    last_cause = getattr(exc, "last_cause", None)
+    if isinstance(attempts, int) and hasattr(exc, "elapsed_seconds"):
+        cause_name = type(last_cause).__name__ if isinstance(last_cause, BaseException) else "deadline"
+        cause_code = getattr(last_cause, "code", None)
+        status = f",status={cause_code}" if isinstance(cause_code, int) else ""
+        return f"{type(exc).__name__}(attempts={attempts},last_cause={cause_name}{status})"
+    return type(exc).__name__
 
 
 def _coerce_observed(value: datetime) -> datetime:
@@ -183,21 +209,93 @@ def _coerce_observed(value: datetime) -> datetime:
     return value.astimezone(UTC)
 
 
-def _harvest(store: DailyAuditStore, token: LeaseToken, deps: TickDependencies, budget: TickBudget, counters: dict[str, int], config: TickConfig) -> None:
-    jobs = store.list_remote_jobs(token, states={"SUBMITTED", "RUNNING", "EXPORTED", "SUBMIT_UNKNOWN"})[:config.harvest_batch_size]
+_HARVESTABLE_REMOTE_STATES = {
+    "PRIORITY_PENDING", "SUBMITTED", "RUNNING", "EXPORTED", "SUBMIT_UNKNOWN",
+}
+
+
+def _harvest_limits(
+    state: object, config: TickConfig
+) -> tuple[int, float]:
+    if str(state) == "PRIORITY_PENDING":
+        return (
+            min(config.harvest_max_attempts, config.priority_retry_max_attempts),
+            min(
+                config.harvest_max_elapsed_seconds,
+                config.priority_retry_max_elapsed_seconds,
+            ),
+        )
+    return config.harvest_max_attempts, config.harvest_max_elapsed_seconds
+
+
+def _harvest(
+    store: DailyAuditStore,
+    token: LeaseToken,
+    deps: TickDependencies,
+    budget: TickBudget,
+    counters: dict[str, int],
+    config: TickConfig,
+    *,
+    skip_job_ids: frozenset[int] | set[int] = frozenset(),
+) -> set[int]:
+    """Sweep every eligible remote job once, in batches, within one round.
+
+    The eligible set is snapshotted when the sweep starts; each remote job is
+    checked at most once per sweep even when an earlier batch leaves it
+    RUNNING, and jobs that only become eligible during the sweep (for example
+    submissions made later in the same tick) are left to the next sweep.  The
+    batch size bounds one request against the remote system, never the whole
+    round; the tick budget stops the sweep at a safe checkpoint.
+    """
     if deps.harvest is None:
-        return
-    if not jobs:
-        deps.harvest((), budget.callback_timeout(config.external_timeout_seconds))
-        return
-    claimed = [
-        job for job in (
-            store.claim_harvest(token, int(job["id"]), max_attempts=config.harvest_max_attempts, max_elapsed_seconds=config.harvest_max_elapsed_seconds)
-            for job in jobs
-        ) if job is not None
+        return set()
+    snapshot = [
+        job
+        for job in sorted(
+            store.list_remote_jobs(token, states=_HARVESTABLE_REMOTE_STATES),
+            key=lambda job: (int(job["harvest_attempts"]), int(job["id"])),
+        )
+        if int(job["id"]) not in skip_job_ids
     ]
+    if not snapshot:
+        deps.harvest((), budget.callback_timeout(config.external_timeout_seconds))
+        return set()
+    swept: set[int] = set()
+    for start in range(0, len(snapshot), config.harvest_batch_size):
+        if not budget.can_start_heavy():
+            break
+        batch = snapshot[start : start + config.harvest_batch_size]
+        _harvest_batch(store, token, deps, budget, counters, config, batch)
+        swept.update(int(job["id"]) for job in batch)
+    return swept
+
+
+def _harvest_batch(
+    store: DailyAuditStore,
+    token: LeaseToken,
+    deps: TickDependencies,
+    budget: TickBudget,
+    counters: dict[str, int],
+    config: TickConfig,
+    jobs: Sequence[Mapping[str, Any]],
+) -> None:
+    claimed = []
+    claim_limits: dict[int, tuple[int, float]] = {}
+    for job in jobs:
+        max_attempts, max_elapsed_seconds = _harvest_limits(job["state"], config)
+        claim = store.claim_harvest(
+            token,
+            int(job["id"]),
+            max_attempts=max_attempts,
+            max_elapsed_seconds=max_elapsed_seconds,
+        )
+        if claim is not None:
+            claimed.append(claim)
+            claim_limits[int(claim["id"])] = (max_attempts, max_elapsed_seconds)
     if not claimed:
         return
+    counters["harvest_batches"] = counters.get("harvest_batches", 0) + 1
+    counters["harvest_swept"] = counters.get("harvest_swept", 0) + len(claimed)
     store.renew_lease(token, max(1, budget.remaining() + budget.reserve_seconds))
     started = budget.monotonic()
     try:
@@ -209,7 +307,8 @@ def _harvest(store: DailyAuditStore, token: LeaseToken, deps: TickDependencies, 
     except Exception as exc:
         elapsed = budget.monotonic() - started
         for job in claimed:
-            store.record_harvest(token, int(job["id"]), elapsed_seconds=elapsed, max_attempts=config.harvest_max_attempts, max_elapsed_seconds=config.harvest_max_elapsed_seconds, error=_safe_error(exc))
+            max_attempts, max_elapsed_seconds = claim_limits[int(job["id"])]
+            store.record_harvest(token, int(job["id"]), elapsed_seconds=elapsed, max_attempts=max_attempts, max_elapsed_seconds=max_elapsed_seconds, error=_safe_error(exc))
         return
     elapsed = budget.monotonic() - started
     for job in claimed:
@@ -224,15 +323,45 @@ def _harvest(store: DailyAuditStore, token: LeaseToken, deps: TickDependencies, 
             if math.isfinite(candidate) and candidate >= 0:
                 evidence_elapsed = candidate
         if not isinstance(evidence, Mapping):
-            store.record_harvest(token, job_id, elapsed_seconds=elapsed, max_attempts=config.harvest_max_attempts, max_elapsed_seconds=config.harvest_max_elapsed_seconds)
+            max_attempts, max_elapsed_seconds = claim_limits[job_id]
+            store.record_harvest(token, job_id, elapsed_seconds=elapsed, max_attempts=max_attempts, max_elapsed_seconds=max_elapsed_seconds)
             continue
         if evidence.get("manual_error"):
             store.mark_remote_manual(token, job_id, str(evidence["manual_error"]))
             continue
         crawl_results = evidence.get("crawl_results")
+        manual_crawl_results: list[tuple[int, str]] = []
         if isinstance(crawl_results, Mapping):
             for raw_crawl_id, crawl_result in crawl_results.items():
-                if isinstance(crawl_result, Mapping) and crawl_result.get("terminal"):
+                if isinstance(crawl_result, Mapping) and crawl_result.get("manual"):
+                    manual_crawl_results.append(
+                        (
+                            int(raw_crawl_id),
+                            str(crawl_result.get("error", "harvest provenance is ambiguous")),
+                        )
+                    )
+                elif isinstance(crawl_result, Mapping) and crawl_result.get("no_result"):
+                    store.complete_partial_exact_no_result(
+                        token,
+                        int(raw_crawl_id),
+                        remote_job_id=job_id,
+                        remote_identity=str(
+                            evidence.get("remote_identity")
+                            or store.get_remote_job(job_id).get("remote_identity")
+                            or ""
+                        ),
+                        result_path=str(
+                            evidence.get("export_path")
+                            or store.get_remote_job(job_id).get("result_path")
+                            or ""
+                        ),
+                        reason=str(
+                            crawl_result.get(
+                                "reason", "provenance-valid remote request has no result row"
+                            )
+                        ),
+                    )
+                elif isinstance(crawl_result, Mapping) and crawl_result.get("terminal"):
                     store.fail_crawl_work(token, int(raw_crawl_id), str(crawl_result.get("error", "terminal crawler result")), retryable=False)
                 else:
                     store.complete_crawl_work(token, int(raw_crawl_id), crawl_result)
@@ -240,14 +369,45 @@ def _harvest(store: DailyAuditStore, token: LeaseToken, deps: TickDependencies, 
         state = str(evidence.get("state", "RUNNING"))
         remote_identity = str(evidence.get("remote_identity") or store.get_remote_job(job_id).get("remote_identity") or "")
         if not remote_identity:
-            store.record_harvest(token, job_id, elapsed_seconds=evidence_elapsed, max_attempts=config.harvest_max_attempts, max_elapsed_seconds=config.harvest_max_elapsed_seconds)
+            max_attempts, max_elapsed_seconds = claim_limits[job_id]
+            store.record_harvest(token, job_id, elapsed_seconds=evidence_elapsed, max_attempts=max_attempts, max_elapsed_seconds=max_elapsed_seconds)
             continue
         store.reconcile_remote_job(
             token, job_id, remote_identity=remote_identity, state=state,
             export_path=evidence.get("export_path"), result=evidence.get("result"),
         )
-        store.advance_crawl_work_for_job(token, job_id, state)
-        store.record_harvest(token, job_id, elapsed_seconds=evidence_elapsed, max_attempts=config.harvest_max_attempts, max_elapsed_seconds=config.harvest_max_elapsed_seconds)
+        if manual_crawl_results:
+            store.mark_remote_manual(
+                token, job_id, "harvest has unresolved provenance mappings"
+            )
+            for crawl_id, error in manual_crawl_results:
+                store.mark_partial_exact_crawl_manual(
+                    token,
+                    crawl_id,
+                    remote_job_id=job_id,
+                    remote_identity=remote_identity,
+                    error=error,
+                )
+        elif state != "PRIORITY_PENDING":
+            store.advance_crawl_work_for_job(token, job_id, state)
+        retryable_error = (
+            str(evidence["retryable_error"])
+            if state == "PRIORITY_PENDING" and evidence.get("retryable_error")
+            else None
+        )
+        max_attempts, max_elapsed_seconds = (
+            claim_limits[job_id]
+            if state == "PRIORITY_PENDING"
+            else _harvest_limits(state, config)
+        )
+        store.record_harvest(
+            token,
+            job_id,
+            elapsed_seconds=evidence_elapsed,
+            max_attempts=max_attempts,
+            max_elapsed_seconds=max_elapsed_seconds,
+            error=retryable_error,
+        )
 
 
 def _stage(
@@ -264,6 +424,7 @@ def _stage(
     counters: dict[str, int],
     *,
     retry_caught_errors: bool = True,
+    retry_classifier: Callable[[BaseException], bool] | None = None,
 ) -> bool:
     if not budget.can_start_heavy():
         return False
@@ -290,7 +451,10 @@ def _stage(
         elapsed = budget.monotonic() - started
         store.fail_stage_work(
             token, int(work["id"]), elapsed_seconds=elapsed, error=_safe_error(exc),
-            retryable=retry_caught_errors, max_attempts=max_attempts,
+            retryable=(
+                retry_classifier(exc) if retry_classifier is not None else retry_caught_errors
+            ),
+            max_attempts=max_attempts,
             max_elapsed_seconds=max_elapsed_seconds,
         )
         return False
@@ -305,6 +469,44 @@ def _stage(
     store.complete_stage_work(token, int(work["id"]), result)
     counters["detail_requests" if stage == "DETAIL" else "model_attempts"] += 1
     return True
+
+
+def _is_retryable_model_failure(exc: BaseException) -> bool:
+    """Classify only transport/infrastructure model failures as retryable."""
+    cause: BaseException = exc
+    if isinstance(exc, ModelCallRetryExhaustedError):
+        if not isinstance(exc.last_cause, BaseException):
+            return False
+        cause = exc.last_cause
+    if isinstance(cause, error.HTTPError):
+        return cause.code in {408, 429} or 500 <= cause.code <= 599
+    if isinstance(cause, error.URLError):
+        reason = cause.reason
+        return isinstance(reason, (TimeoutError, ConnectionError))
+    return isinstance(cause, (TimeoutError, ConnectionError))
+
+
+def _model_items_with_retry_backlog(
+    store: DailyAuditStore,
+    token: LeaseToken,
+    current_items: Sequence[Mapping[str, Any]],
+) -> list[Mapping[str, Any]]:
+    """Keep same-day retryable MODEL work claimable across later snapshots."""
+    result = list(current_items)
+    current_ids = {int(item["id"]) for item in current_items}
+    retryable = store.list_stage_work(
+        token, stage="MODEL", states={"RETRYABLE_FAILED"}
+    )
+    for work in retryable:
+        item_id = int(work["audit_item_id"])
+        if item_id in current_ids:
+            continue
+        item = store.get_audit_item(item_id)
+        if item is None:
+            raise ValueError(f"retryable MODEL work has no audit item: {work['id']}")
+        item["row"] = json.loads(str(item["row_json"]))
+        result.append(item)
+    return result
 
 
 def _stage_model_batches(
@@ -365,10 +567,12 @@ def _stage_model_batches(
                 raise ValueError("model_batch must return exactly one result for every request index")
         except Exception as exc:
             elapsed = budget.monotonic() - started
+            retryable = _is_retryable_model_failure(exc)
             for group in claimed_groups:
                 for _item, work in group:
                     store.fail_stage_work(
-                        token, int(work["id"]), elapsed_seconds=elapsed, error=_safe_error(exc), retryable=False,
+                        token, int(work["id"]), elapsed_seconds=elapsed, error=_safe_error(exc),
+                        retryable=retryable,
                         max_attempts=config.model_max_attempts, max_elapsed_seconds=config.model_max_elapsed_seconds,
                     )
             continue
@@ -418,7 +622,8 @@ def _submit(
             return
         state = str(result.get("state", "SUBMITTED"))
         store.reconcile_remote_job(token, int(job["id"]), remote_identity=remote_identity, state=state, result=result)
-        store.advance_crawl_work_for_job(token, int(job["id"]), state)
+        if state != "PRIORITY_PENDING":
+            store.advance_crawl_work_for_job(token, int(job["id"]), state)
         counters["crawl_submitted"] += 1
 
     # An interrupted tick may have committed its immutable intent and all
@@ -507,15 +712,209 @@ def _backlog(
         )
     return {
         "stage_pending": missing_stages + sum(
-            work["state"] in {"PENDING", "CLAIMED", "RETRYABLE_FAILED"}
+            work["state"] in {
+                "PENDING",
+                "CLAIMED",
+                "RETRYABLE_FAILED",
+                "RECOVERED_PENDING_REVIEW",
+            }
             for work in stages
         ),
-        "stage_terminal": sum(work["state"] == "TERMINAL_FAILED" for work in stages),
+        "detail_terminal": sum(
+            work["stage"] == "DETAIL" and work["state"] == "TERMINAL_FAILED"
+            for work in stages
+        ),
+        "model_terminal": sum(
+            work["stage"] == "MODEL" and work["state"] == "TERMINAL_FAILED"
+            for work in stages
+        ),
         "crawl_pending": sum(work["state"] in {"PENDING", "RUNNING", "RETRYABLE_FAILED", "SUBMITTED", "EXPORTED", "SUBMIT_UNKNOWN"} for work in crawls),
-        "remote_pending": sum(job["state"] in {"SUBMITTED", "RUNNING", "EXPORTED"} for job in jobs),
+        "remote_pending": sum(job["state"] in {"PRIORITY_PENDING", "SUBMITTED", "RUNNING", "EXPORTED"} for job in jobs),
         "remote_unknown": sum(job["state"] == "SUBMIT_UNKNOWN" for job in jobs),
         "remote_manual": sum(job["state"] == "MANUAL_REQUIRED" for job in jobs),
     }
+
+
+_DRAIN_REMOTE_STATES = {
+    "PRIORITY_PENDING",
+    "SUBMITTED",
+    "RUNNING",
+    "EXPORTED",
+    "SUBMIT_UNKNOWN",
+}
+
+
+def _remote_drain_progress(
+    store: DailyAuditStore,
+    token: LeaseToken,
+) -> tuple[tuple[Any, ...], dict[str, int]]:
+    jobs = store.list_remote_jobs(token)
+    crawls = store.list_crawl_work(token)
+    signature = (
+        tuple(
+            (
+                int(job["id"]),
+                str(job["state"]),
+                str(job.get("export_path") or ""),
+                str(job.get("result_json") or ""),
+                str(job.get("error_text") or ""),
+            )
+            for job in jobs
+        ),
+        tuple(
+            (
+                int(crawl["id"]),
+                str(crawl["state"]),
+                int(crawl["remote_job_id"]) if crawl.get("remote_job_id") is not None else None,
+                bool(crawl.get("result_json")),
+                str(crawl.get("error_text") or ""),
+            )
+            for crawl in crawls
+        ),
+    )
+    return signature, _backlog(store, token)
+
+
+def run_existing_remote_drain(
+    store: DailyAuditStore,
+    process_lock: ProcessLock,
+    config: TickConfig,
+    deps: TickDependencies,
+    *,
+    max_iterations: int = 1000,
+) -> TickSummary:
+    """Drain only durable remote work; never discover, stage, plan, or submit."""
+    if max_iterations <= 0:
+        raise ValueError("drain max_iterations must be positive")
+    counters = _empty_counters()
+    counters.update({"drain_iterations": 0, "drain_completed": 0})
+    trace: list[str] = []
+    run = store.get_run(config.business_date)
+    if run is None:
+        return TickSummary("DRAIN_NO_EXISTING_RUN", tuple(trace), counters, {}, None)
+    now = deps.wall_clock()
+    if now.tzinfo is None or now.utcoffset() is None:
+        raise ValueError("wall_clock must return an explicit-timezone datetime")
+    cutoff = config.cutoff_utc
+    if cutoff is not None and now.astimezone(UTC) < cutoff:
+        return TickSummary("DRAIN_NOT_READY", tuple(trace), counters, {}, None)
+    try:
+        process_lock.acquire()
+    except LeaseUnavailable:
+        return TickSummary("ALREADY_RUNNING", tuple(trace), counters, {}, None)
+
+    token: LeaseToken | None = None
+    try:
+        try:
+            token = store.acquire_lease(
+                config.business_date,
+                f"drain-{id(process_lock)}",
+                max(
+                    5,
+                    config.lease_ttl_seconds,
+                    config.runtime_budget_seconds + config.heavy_work_reserve_seconds,
+                ),
+                allow_unexpired_takeover=True,
+                process_lock=process_lock,
+            )
+        except LeaseUnavailable:
+            return TickSummary("ALREADY_RUNNING", tuple(trace), counters, {}, None)
+        run = store.get_run(config.business_date)
+        assert run is not None
+        if run["state"] == "FINALIZED":
+            _, backlog = _remote_drain_progress(store, token)
+            return TickSummary(
+                "ALREADY_FINALIZED",
+                ("noop:already_finalized",),
+                counters,
+                backlog,
+                run["frozen_snapshot_id"],
+            )
+        if cutoff is not None and run["frozen_snapshot_id"] is None:
+            _, backlog = _remote_drain_progress(store, token)
+            return TickSummary(
+                "DRAIN_SNAPSHOT_NOT_READY", tuple(trace), counters, backlog, None
+            )
+
+        budget = TickBudget(
+            deps.monotonic(),
+            config.runtime_budget_seconds,
+            config.heavy_work_reserve_seconds,
+            deps.monotonic,
+        )
+        trace.append("recover_submit_unknown")
+        counters["recovered_submit_unknown"] = store.recover_ambiguous_remote_submissions(
+            token
+        )
+        before_signature, before_backlog = _remote_drain_progress(store, token)
+        completed_before = sum(
+            job["state"] == "COMPLETED" for job in store.list_remote_jobs(token)
+        )
+        stop_reason = "drained"
+
+        while before_backlog["remote_pending"] or before_backlog["remote_unknown"]:
+            if counters["drain_iterations"] >= max_iterations:
+                stop_reason = "max_iterations"
+                break
+            available = budget.remaining() - budget.reserve_seconds
+            if available <= 0:
+                stop_reason = "deadline"
+                break
+            iteration_budget = TickBudget(
+                deps.monotonic(), available, 0, deps.monotonic
+            )
+            trace.append("drain_batch")
+            _harvest(store, token, deps, iteration_budget, counters, config)
+            counters["drain_iterations"] += 1
+            after_signature, after_backlog = _remote_drain_progress(store, token)
+            if not after_backlog["remote_pending"] and not after_backlog["remote_unknown"]:
+                before_signature, before_backlog = after_signature, after_backlog
+                break
+            if after_signature == before_signature:
+                stop_reason = "no_progress"
+                before_signature, before_backlog = after_signature, after_backlog
+                break
+            before_signature, before_backlog = after_signature, after_backlog
+
+        completed_after = sum(
+            job["state"] == "COMPLETED" for job in store.list_remote_jobs(token)
+        )
+        counters["drain_completed"] = completed_after - completed_before
+        trace.extend((f"stop:{stop_reason}", "checkpoint"))
+        backlog = before_backlog
+        if backlog["remote_manual"]:
+            outcome = "MANUAL_REVIEW_REQUIRED"
+        elif backlog["remote_unknown"]:
+            outcome = "WAITING_REMOTE_RECONCILIATION"
+        elif backlog["remote_pending"]:
+            outcome = {
+                "deadline": "BUDGET_EXHAUSTED",
+                "max_iterations": "DRAIN_MAX_ITERATIONS",
+                "no_progress": "DRAIN_NO_PROGRESS",
+            }.get(stop_reason, "WAITING_REMOTE")
+        else:
+            outcome = "DRAINED"
+        store.update_daily_metrics(token, counters)
+        final_run = store.get_run(config.business_date)
+        return TickSummary(
+            outcome,
+            tuple(trace),
+            counters,
+            backlog,
+            final_run["frozen_snapshot_id"] if final_run else None,
+        )
+    except Exception as exc:
+        if token is None:
+            return TickSummary("FAILED", tuple(trace), counters, {}, None, _safe_error(exc))
+        try:
+            _, backlog = _remote_drain_progress(store, token)
+        except BaseException:
+            backlog = {}
+        return TickSummary("FAILED", tuple(trace), counters, backlog, None, _safe_error(exc))
+    finally:
+        if token is not None:
+            store.release_lease(token)
+        process_lock.release()
 
 
 def run_incremental_tick(
@@ -553,6 +952,16 @@ def run_incremental_tick(
             )
         except LeaseUnavailable:
             return TickSummary("ALREADY_RUNNING", tuple(trace), counters, {}, None)
+        run = store.get_run(config.business_date)
+        assert run is not None
+        if run["state"] == "FINALIZED":
+            return TickSummary(
+                "ALREADY_FINALIZED",
+                ("noop:already_finalized",),
+                counters,
+                {},
+                run["frozen_snapshot_id"],
+            )
         budget = TickBudget(deps.monotonic(), config.runtime_budget_seconds, config.heavy_work_reserve_seconds, deps.monotonic)
         trace.append("recover")
         counters["recovered_stage_claims"] = store.recover_claimed_stage_work(token)
@@ -563,7 +972,7 @@ def run_incremental_tick(
             store.update_daily_metrics(token, counters)
             return TickSummary("BUDGET_EXHAUSTED", tuple(trace), counters, backlog, None)
         trace.append("harvest")
-        _harvest(store, token, deps, budget, counters, config)
+        swept_remote_jobs = _harvest(store, token, deps, budget, counters, config)
         if not budget.can_start_heavy():
             trace.append("checkpoint")
             backlog = _backlog(store, token)
@@ -580,34 +989,22 @@ def run_incremental_tick(
         if run["frozen_snapshot_id"] is not None:
             snapshot = store.get_snapshot(int(run["frozen_snapshot_id"]))
         else:
-            existing_cutoff_snapshot = (
-                store.first_snapshot_at_or_after(config.business_date, cutoff.isoformat(timespec="seconds"))
-                if finalize and cutoff is not None else None
+            trace.append("discover")
+            discovered = deps.discover(
+                budget.callback_timeout(config.snapshot_discovery_timeout_seconds)
             )
-            if existing_cutoff_snapshot is not None:
-                run = store.freeze_snapshot(token, int(existing_cutoff_snapshot["id"]))
-                snapshot = existing_cutoff_snapshot
-            else:
-                trace.append("discover")
-                discovered = deps.discover(budget.callback_timeout(config.external_timeout_seconds))
-                if not discovered.complete:
-                    return TickSummary("DISCOVERY_INCOMPLETE", tuple(trace), counters, _backlog(store, token), None)
-                observed = _coerce_observed(discovered.observed_at)
-                ingested = store.ingest_snapshot(
-                    token, list(discovered.rows), observed.isoformat(timespec="seconds"),
-                    source_fingerprints=discovered.source_fingerprints, customer_fingerprints=discovered.customer_fingerprints,
-                    headers=discovered.headers, evidence=discovered.evidence,
-                )
-                snapshot = ingested["snapshot"]
-                counters["today_discovered"] = int(ingested["member_count"])
-                counters["delta_new"] = int(ingested["status_counts"].get("NEW", 0))
-                counters["delta_changed"] = int(ingested["status_counts"].get("CHANGED", 0))
-                if finalize and cutoff is not None:
-                    first = store.first_snapshot_at_or_after(config.business_date, cutoff.isoformat(timespec="seconds"))
-                    if first is None:
-                        return TickSummary("FINALIZE_SNAPSHOT_NOT_READY", tuple(trace), counters, _backlog(store, token), None)
-                    run = store.freeze_snapshot(token, int(first["id"]))
-                    snapshot = first
+            if not discovered.complete:
+                return TickSummary("DISCOVERY_INCOMPLETE", tuple(trace), counters, _backlog(store, token), None)
+            observed = _coerce_observed(discovered.observed_at)
+            ingested = store.ingest_snapshot(
+                token, list(discovered.rows), observed.isoformat(timespec="seconds"),
+                source_fingerprints=discovered.source_fingerprints, customer_fingerprints=discovered.customer_fingerprints,
+                headers=discovered.headers, evidence=discovered.evidence,
+            )
+            snapshot = ingested["snapshot"]
+            counters["today_discovered"] = int(ingested["member_count"])
+            counters["delta_new"] = int(ingested["status_counts"].get("NEW", 0))
+            counters["delta_changed"] = int(ingested["status_counts"].get("CHANGED", 0))
         assert snapshot is not None
         snapshot_id = int(snapshot["id"])
         items = store.ordered_snapshot_items(snapshot_id)
@@ -623,29 +1020,73 @@ def run_incremental_tick(
             ):
                 continue
         trace.append("model")
+        model_items = _model_items_with_retry_backlog(store, token, items)
         if deps.model_batch is not None:
-            _stage_model_batches(store, token, items, config, deps.model_batch, budget, counters)
+            _stage_model_batches(store, token, model_items, config, deps.model_batch, budget, counters)
         else:
-            for item in items:
+            for item in model_items:
                 if not budget.can_start_heavy():
                     break
                 _stage(
                     store, token, item, "MODEL",
                     model_fingerprint(item["row"], config.model_name, config.model_prompt_version, config.model_schema_version),
                     deps.model, budget, config.external_timeout_seconds, config.model_max_attempts, config.model_max_elapsed_seconds, counters,
-                    retry_caught_errors=False,
+                    retry_classifier=_is_retryable_model_failure,
                 )
         trace.append("submit")
         if budget.can_start_heavy():
             model_by_item = {int(work["audit_item_id"]): work for work in store.list_stage_work(token, stage="MODEL")}
-            eligible = [item for item in items if model_by_item.get(int(item["id"]), {}).get("state") == "SUCCESS"]
+            eligible = [
+                item for item in model_items
+                if model_by_item.get(int(item["id"]), {}).get("state") == "SUCCESS"
+            ]
             _submit(store, token, eligible, config, deps, budget, counters)
+        if counters["crawl_submitted"] and budget.can_start_heavy() and store.list_remote_jobs(
+            token, states=_HARVESTABLE_REMOTE_STATES
+        ):
+            trace.append("post_harvest")
+            # Jobs already checked by this run's opening sweep must not be
+            # polled twice in one tick; only submissions made after it apply.
+            _harvest(
+                store, token, deps, budget, counters, config,
+                skip_job_ids=swept_remote_jobs,
+            )
         trace.append("checkpoint")
         backlog = _backlog(store, token, snapshot_items)
-        if backlog["stage_terminal"] or backlog["remote_manual"]:
+        waiting_source_count = False
+        if finalize and run["frozen_snapshot_id"] is None:
+            try:
+                evidence = json.loads(str(snapshot.get("evidence_json") or "{}"))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                evidence = {}
+            saas_count = evidence.get("saas_count")
+            customer_count = evidence.get("customer_count")
+            valid_saas_count = (
+                isinstance(saas_count, int)
+                and not isinstance(saas_count, bool)
+                and saas_count >= 0
+            )
+            valid_customer_count = (
+                isinstance(customer_count, int)
+                and not isinstance(customer_count, bool)
+                and customer_count >= 0
+            )
+            if valid_saas_count:
+                counters["saas_count"] = saas_count
+            if valid_customer_count:
+                counters["customer_count"] = customer_count
+            if valid_saas_count and valid_customer_count:
+                counters["source_count_gap"] = customer_count - saas_count
+            if valid_saas_count and int(snapshot["row_count"]) == saas_count:
+                run = store.freeze_snapshot(token, snapshot_id)
+            else:
+                waiting_source_count = True
+        if backlog["model_terminal"] or backlog["remote_manual"]:
             outcome = "MANUAL_REVIEW_REQUIRED"
         elif backlog["remote_unknown"]:
             outcome = "WAITING_REMOTE_RECONCILIATION"
+        elif waiting_source_count:
+            outcome = "WAITING_SOURCE_COUNT"
         elif backlog["remote_pending"]:
             outcome = "WAITING_REMOTE"
         elif not budget.can_start_heavy() and (backlog["stage_pending"] or backlog["crawl_pending"]):
@@ -655,7 +1096,10 @@ def run_incremental_tick(
         else:
             outcome = "COMPLETED"
         counters["crawl_running"] = backlog["crawl_pending"]
-        store.update_daily_metrics(token, {**counters, "final_pending": sum(backlog.values())})
+        final_pending = sum(
+            value for key, value in backlog.items() if key != "detail_terminal"
+        )
+        store.update_daily_metrics(token, {**counters, "final_pending": final_pending})
         final_run = store.get_run(config.business_date)
         return TickSummary(outcome, tuple(trace), counters, backlog, final_run["frozen_snapshot_id"] if final_run else None)
     except Exception as exc:

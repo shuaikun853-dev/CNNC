@@ -4,6 +4,7 @@ from urllib import error
 import pytest
 
 import app.services.title_match_model_adapter as adapter
+from app.workflows.incremental_price_audit import _safe_error
 
 
 def _clear_retry_policy(monkeypatch):
@@ -185,6 +186,33 @@ def test_retry_diagnostics_do_not_expose_request_urls_or_query_secrets(monkeypat
     assert "do-not-print" not in str(caught.value)
     assert sensitive_url not in str(caught.value)
     assert caught.value.__cause__ is None
+
+
+@pytest.mark.parametrize(
+    ("cause", "expected"),
+    [
+        (
+            TimeoutError("https://model.invalid/?token=do-not-store"),
+            "ModelCallRetryExhaustedError(attempts=2,last_cause=TimeoutError)",
+        ),
+        (
+            error.HTTPError("https://model.invalid/?token=do-not-store", 503, "temporary", {}, None),
+            "ModelCallRetryExhaustedError(attempts=2,last_cause=HTTPError,status=503)",
+        ),
+    ],
+)
+def test_persisted_retry_exhaustion_keeps_safe_root_cause(cause, expected):
+    exc = adapter.ModelCallRetryExhaustedError(
+        "batch title match model call",
+        attempts=2,
+        elapsed_seconds=60,
+        last_cause=cause,
+    )
+
+    message = _safe_error(exc)
+
+    assert message == expected
+    assert "do-not-store" not in message
 
 
 def test_call_specific_policy_can_clamp_attempts_and_total_elapsed(monkeypatch):

@@ -1,253 +1,120 @@
-# 中核 SaaS 运维诊断 Agent
+# 中核 SaaS 运维 Agent
 
-## 这是什么？
+面向中核 SaaS `tenant_id=188605`、`commodity_pool_id=222` 的日常运维工具集，主要完成价格审计、监控状态查询和不能直接推送数据处理，并提供必须二次授权的文档 ID 受控补推入口。旧 FastAPI 诊断服务仍保留，但不是每日三步主流程。
 
-这是一个**离线只读诊断工具**，专门为中核 SaaS 运维团队设计。
+## 每日三步
 
-你输入一个运维问题（比如"商品价格不更新"），它会：
+| 步骤 | 业务目标 | 固定入口 | 输出 |
+|---|---|---|---|
+| 第一步 | 当前待审批数据的客户价、标题同款、商城价和最终决策 | `scripts/audit_saas_excel_file.py` | `runtime/price_audit_<时间戳>/saas_audit_final_<时间戳>.xlsx` |
+| 第二步 | 当前中核待处理数据的 SaaS 采集/同款/价格状态 | `scripts/export_current_monitor_status.py` | `runtime/saas状态查询/<时间戳>/中核待处理_SaaS监控状态_<时间戳>.xlsx` |
+| 第三步 | 处理指定监控表中 `是否可推送=否` 的数据 | `scripts/process_monitor_no_push_zhaoshang.py` | `runtime/模板以及推送失败数据/<时间戳>/` 下三文件和缺价清单 |
 
-1. 判断问题是否属于中核范围（只处理 tenant_id=188605）
-2. 识别问题对应的诊断场景
-3. 生成经过安全校验的 SQL 查询模板
-4. 检索相关知识库片段
-5. 返回诊断步骤、SQL 模板和解读提示
+三步是业务分类，不是串行执行队列：三个步骤可以并行，同一步骤也可以同时运行多个独立批次。
 
-**它不会连接数据库，不会执行任何 SQL，不会自动修改任何数据。**
+详细执行规则：
 
-## 核心约束
+- [第一步价格审计](docs/runbooks/STEP_1_PRICE_AUDIT.md)
+- [第一步增量调度](docs/runbooks/STEP_1_INCREMENTAL_SCHEDULER.md)
+- [第二步监控状态](docs/runbooks/STEP_2_MONITOR_STATUS.md)
+- [第三步不能推送数据处理](docs/runbooks/STEP_3_NO_PUSH_PROCESSING.md)
+- [SaaS 受控价格补推](docs/runbooks/SAAS_CONTROLLED_PUSH.md)
+- [测试和验收](TESTING.md)
 
-| 约束 | 说明 |
-|------|------|
-| 只读 | 仅生成 SELECT 查询模板，禁止 UPDATE/DELETE/INSERT 等写操作 |
-| 离线 | 不连接任何数据库，不执行任何 SQL |
-| 中核专属 | 仅支持 tenant_id=188605、commodity_pool_id=222 |
-| 拒绝非中核 | 宏伟/南水北调/华盛/非 188605 租户问题会被拒绝 |
+## Agent 接管
 
-## 不支持的功能
+新会话不再通读全部历史文档。最小读取集为：
 
-- 自动重推、自动修改价格、自动删除数据
-- 连接生产数据库执行 SQL
-- 定时任务、自动巡检
-- 跨租户查询
-- LLM/模型生成 SQL（SQL 只来自预设模板）
+1. `AGENTS.md`
+2. `CURRENT_STATE.md`
+3. 当前步骤对应的一个 `docs/runbooks/STEP_*.md`
+4. 接管已有批次时，再读指定运行目录中的 `BATCH_STATE.md`
+5. 需要运行或改代码时，再读 `TESTING.md` 对应章节和入口代码
 
-## 快速开始
+`CURRENT_STATE.md` 只保存并行批次协议和提示词，不保存唯一当前任务。每个批次在自己的运行目录维护 `BATCH_STATE.md`，所以三个步骤及同一步的多个批次可以同时运行，彼此不阻塞。批次暂停等待授权时可以在原任务继续；达到上下文阈值只提醒并准备交接，不会因此停止执行。
 
-### 1. 安装依赖
+## 核心安全边界
 
-需要 Python 3.11+。
+- 中核专属，拒绝其他租户或商品池。
+- 不自动审批、驳回、保存、提交或推送；指定审计表的受控通过/驳回及指定文档 ID 的受控补推必须分别按 runbook 预览、锁定并二次授权。
+- 除既有工具对本轮招商局当前任务执行的受控优先级操作外，不执行任何 SQL。
+- 招商局 `/add` 是真实写接口，不能用于认证或连通性探测。
+- 招商局后仍缺价时先暂停；本地脚本和 detail 参考补全都需要本批次单独授权。
+- cURL 统一由 `scripts/curl_utils.py` 解析，内网请求绕过系统代理。
+- SaaS 和招商局运行时认证由 `scripts/auth_manager.py` 管理；首次从 cURL 初始化，之后只读取被忽略的 `data/auth_state.json`。
+- 密钥、Cookie、Token、数据库值和登录态文件不写入日志、文档或 Git。
+- 每次运行使用新时间戳目录，不覆盖 `data/` 输入和历史 `runtime/` 输出。
 
-```bash
-cd cnnc-ops-agent
-python -m venv .venv
+完整红线见 `AGENTS.md`。
 
-# Windows
-.venv\Scripts\activate
+## 快速准备
 
-# Linux/Mac
-source .venv/bin/activate
-
-pip install -r requirements.txt
+```powershell
+cd E:\.A中核运维\cnnc-ops-agent
+python -m pip install -r requirements.txt
+$env:PYTHONIOENCODING='utf-8'
+python -m pytest --collect-only -q
 ```
 
-### 2. 启动服务
+生产运行前按对应 runbook 检查本地 cURL、模型配置、招商局配置和用户授权。不要直接照抄历史命令，因为认证、批次路径和授权范围都会变化。
 
-```bash
-uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
-```
+## 关键输入
 
-启动后可以访问：
-- API 文档（Swagger UI）：http://localhost:8000/docs
-- 健康检查：http://localhost:8000/health
+| 文件 | 用途 |
+|---|---|
+| `data/latest_saas_sameAudit_queryAll.curl` | 第一步 SaaS 待审批分页查询 |
+| `data/latest_cnnc_query.curl` | 第一步/第二步/第三步中核列表查询 |
+| `data/detail_request.curl` | 第一步/第三步中核 detail 查询 |
+| `data/saas_zhuangtai.curl` | 第二步 SaaS 监控查询及受控补推的只读映射模板 |
+| `data/latest_zhaoshang_add.curl` | 第一步/第三步招商局正式建任务 |
+| `data/latest_zhaoshang_exportTask.curl` | 招商局导出 |
+| `data/auth_state.json` | SaaS/招商局当前旋转 Token；原子更新、默认不提交，存在后禁止回退 cURL |
+| `data/model.env` | 第一步标题同款模型 |
+| `data/ZHAOSHANG_DB.env` 或当前进程 `ZHAOSHANG_DB_*` | 当前招商局任务优先级；不得输出值 |
+| `商城sourceId映射表/` | 商城、sourceId、域名映射 |
 
-### 3. 调用诊断接口
+这些文件大多包含本地认证或运行数据，已由 `.gitignore` 排除。cURL 保持不变并作为接口模板；只有 `auth_state.json` 不存在时才从中初始化 Token。状态刷新失败时暂停并要求人工重新登录，不得回退旧 cURL，也不要把值复制到代码或 Markdown。
 
-**不带参数**（返回 SQL 模板，标记缺少的参数）：
+## 目录
 
-```bash
-curl -X POST http://localhost:8000/diagnose \
-  -H "Content-Type: application/json" \
-  -d "{\"question\": \"中核本周巡检\"}"
-```
-
-**带参数**（返回渲染后的 SQL）：
-
-```bash
-curl -X POST http://localhost:8000/diagnose \
-  -H "Content-Type: application/json" \
-  -d "{\"question\": \"中核本周巡检\", \"params\": {\"start_time\": \"2026-06-08\", \"end_time\": \"2026-06-15\"}}"
-```
-
-**查询单商品**：
-
-```bash
-curl -X POST http://localhost:8000/diagnose \
-  -H "Content-Type: application/json" \
-  -d "{\"question\": \"中核商品价格不更新\", \"params\": {\"commodity_id\": \"597894113655676928\"}}"
-```
-
-### 4. 健康检查
-
-```bash
-curl http://localhost:8000/health
-```
-
-返回示例：
-
-```json
-{
-  "status": "ok",
-  "service": "cnnc-ops-agent",
-  "version": "0.1.0-mvp",
-  "readonly_mode": true,
-  "db_connected": false,
-  "knowledge_file_exists": true,
-  "templates_dir_exists": true,
-  "template_count": 5,
-  "knowledge_status": "ok",
-  "knowledge_error": "",
-  "issues": []
-}
-```
-
-## 请求参数
-
-| 字段 | 类型 | 必填 | 说明 |
-|------|------|------|------|
-| question | string | 是 | 运维问题描述 |
-| params | object | 否 | SQL 模板参数 |
-
-### 支持的参数名和格式
-
-| 参数名 | 允许的值 | 示例 |
-|--------|----------|------|
-| start_time | YYYY-MM-DD 或 YYYY-MM-DD HH:MM:SS | "2026-06-08 00:00:00" |
-| end_time | YYYY-MM-DD 或 YYYY-MM-DD HH:MM:SS | "2026-06-15 00:00:00" |
-| commodity_id | 纯数字（int 或数字字符串） | "597894113655676928" |
-| my_commodity_id | 纯数字 | "123456" |
-| request_id | 纯数字 | "789" |
-| execution_number | 字母+数字+下划线+横线 | "TASK_20260615-001" |
-| task_type | 字母+数字+下划线+横线+点 | "price_push" |
-| hours | 纯数字 | "24" |
-
-**不允许的类型**：list、dict、tuple、set、float（commodity_id 等）、bool。
-
-**不允许的字符**：分号、反斜杠、注释符号（--、#、/* */）、换行、单引号。
-
-## 响应字段
-
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| scenario | string | 识别的诊断场景 |
-| confidence | float | 场景识别置信度 |
-| reason | string | 识别原因 |
-| diagnosis_steps | list[string] | 推荐的排查步骤 |
-| related_tables | list[string] | 涉及的中核表名 |
-| sql_templates | list[object] | SQL 模板列表（见下） |
-| result_guide | object | 结果解读提示 |
-| knowledge_snippets | list[object] | 知识库检索片段（写库 SQL 已脱敏） |
-| knowledge_status | string | 知识库状态：ok/error/degraded |
-| knowledge_error | string | 知识库错误信息（无敏感信息） |
-| missing_params | list[string] | 缺失的必要参数名 |
-| risk_notice | string | 只读安全提示 |
-
-### sql_templates 中每个模板的字段
-
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| name | string | 模板名称 |
-| purpose | string | 用途说明 |
-| description | string | 详细描述 |
-| params | list[object] | 参数规格（name/required/type/description） |
-| sql | string | 渲染后的 SQL（参数完整时）或空（缺参/被阻断时） |
-| safe | bool | 是否通过安全检查 |
-| reason | string | 状态原因 |
-| pending_params | bool | 是否缺少参数 |
-| missing_params | list[string] | 缺少的参数名 |
-| blocked | bool | 是否被安全检查阻断 |
-
-## 场景列表
-
-| 场景 | 关键词示例 | 说明 |
-|------|-----------|------|
-| weekly_check | 每周巡检、周报、统计、跑批 | 整体状况统计 |
-| single_item_check | 没价格、价格不更新、商品异常 | 单商品排查 |
-| crawler_check | 采集中、爬虫未回调、爬取失败 | 爬虫链路排查 |
-| relation_check | 无同款、同款不足、同款重复 | 同款关系排查 |
-| task_check | 推送失败、客户没收到、任务积压 | 任务链路排查 |
-| knowledge_qa | 其他运维知识问题 | 知识问答兜底 |
-
-## 错误响应
-
-非中核问题返回 HTTP 400：
-
-```json
-{"detail": {"error_code": "OUT_OF_SCOPE", "message": "当前 Agent 只支持中核 SaaS 运维，tenant_id=188605，commodity_pool_id=222，不处理其他租户或非中核专项问题。"}}
-```
-
-## 运行测试
-
-```bash
-pytest tests/ -v
-```
-
-当前共 244 个测试用例，覆盖：
-- SQL 安全校验（白名单表、写库拦截、多语句、注释、task_execute 条件）
-- 范围守卫（非中核租户拒绝）
-- SQL 模板渲染（参数类型校验、值安全、双重引号、残留占位符）
-- 知识库脱敏（fenced block、HTML pre、缩进代码块、HTML 实体）
-- /health 健康检查
-- /diagnose 集成测试
-
-## 项目结构
-
-```
+```text
 cnnc-ops-agent/
-├── app/
-│   ├── main.py               # FastAPI 入口 + 请求/响应模型
-│   ├── config.py              # 配置（路径、版本号、只读模式）
-│   ├── agent/
-│   │   ├── router.py          # scope_guard（中核范围检查）+ 场景识别
-│   │   ├── planner.py         # 诊断计划生成（场景→步骤→表）
-│   │   ├── sql_selector.py    # SQL 模板加载/参数校验/渲染/安全检查
-│   │   ├── safety_guard.py    # SQL 安全守卫（白名单+写库拦截+task_execute条件）
-│   │   └── result_analyzer.py # 结果解读提示
-│   ├── db/
-│   │   └── mock_client.py     # 离线 Mock 客户端（不执行 SQL）
-│   ├── services/
-│   │   └── knowledge_loader.py # 知识库加载/搜索/写库SQL脱敏
-│   └── templates/             # 5 个 SQL 模板 YAML
-│       ├── weekly_check.yaml
-│       ├── single_item_check.yaml
-│       ├── crawler_check.yaml
-│       ├── relation_check.yaml
-│       └── task_check.yaml
-├── data/docs/
-│   └── cnnc_ops_knowledge_pure.md  # 中核运维知识库
-├── docs/
-│   └── stage2-design.md       # 第二阶段设计文档
-├── tests/                     # 244 个测试用例
-├── requirements.txt           # Python 依赖
-├── .env.example               # 环境变量示例
-└── README.md                  # 本文件
+├── app/                              FastAPI、工作流和业务服务
+├── scripts/                          三步入口、受控补推、cURL 工具、Excel/爬价适配
+├── tests/                            pytest 回归测试
+├── data/                             本地输入和认证，默认不提交
+├── runtime/                          分批次运行输出，默认不提交
+├── docs/runbooks/                    当前三步及专项维护的权威运行手册
+├── 爬取模板/                         招商局导入模板
+├── 商城sourceId映射表/               招商局商城映射
+├── AGENTS.md                         Agent 总规则和上下文生命周期
+├── CURRENT_STATE.md                  并行批次发现和交接协议
+├── TESTING.md                        验证矩阵
+└── README.md                         项目概览
 ```
 
-## 安全机制
+## 外部依赖
 
-系统有三层安全防护：
+| 路径 | 用途 |
+|---|---|
+| `E:\.A2026\招商局自动建任务` | 招商局任务创建、启用、进度和导出 |
+| `E:\.A2026\多商城爬取\multi_mall_crawler` | 经用户授权后的商城专用脚本兜底 |
+| `E:\.A中核运维\自动拉取` | 历史/辅助数据拉取能力 |
+| `E:\.A中核运维\cnnc_to_saas_monitor.py` | 历史监控汇总工具 |
+| `E:\.A中核运维\monitor_status_export.py` | 历史本地 JSON/SaaS 监控导出工具 |
 
-1. **scope_guard**（`router.py`）：拒绝非中核租户的问题
-2. **safety_guard**（`safety_guard.py`）：SQL 安全校验，只允许 SELECT/WITH，只允许白名单表，task_execute 必须限定中核条件
-3. **knowledge_loader**（`knowledge_loader.py`）：知识库中写库 SQL 自动替换为脱敏提示
+当前每日操作优先使用本仓库 `scripts/` 下的固定入口；外部工具只按 runbook 调用。
 
-## 环境变量
+## 旧服务
 
-参考 `.env.example`：
-
+```powershell
+uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
 ```
-KNOWLEDGE_MD_PATH=data/docs/cnnc_ops_knowledge_pure.md
-TEMPLATES_DIR=app/templates
-LOG_LEVEL=INFO
-```
 
-所有环境变量都有默认值，无需配置即可运行。
+- `GET /health`
+- `POST /diagnose`
+- `POST /workflows/route`
+- `POST /workflows/*/analyze`
+- `GET /workflows/{workflow_name}/knowledge`
+
+旧诊断只生成经过安全检查的只读 SQL 模板，不连接数据库、不执行 SQL。

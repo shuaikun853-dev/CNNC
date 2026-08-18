@@ -70,6 +70,10 @@ def _dependencies(
             or datetime(2026, 8, 11, 9, 0, tzinfo=UTC),
             headers=tuple(snapshot_rows[0]) if snapshot_rows else (),
             rows=snapshot_rows,
+            evidence={
+                "saas_count": len(snapshot_rows),
+                "customer_count": len(snapshot_rows),
+            },
         ),
         harvest=lambda _jobs, _timeout: {},
         detail=detail or (lambda _row_value, _timeout: {"customerPrice": "10"}),

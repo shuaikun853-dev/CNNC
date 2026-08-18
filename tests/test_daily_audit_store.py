@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
+import subprocess
+import sys
+from pathlib import Path
 
 import pytest
 
@@ -65,6 +69,90 @@ def test_process_lock_is_nonblocking_across_instances(tmp_path):
     first.release()
     second.acquire()
     second.release()
+
+
+def test_process_lock_owner_metadata_is_auxiliary_and_removed_on_clean_release(tmp_path):
+    path = tmp_path / "tick.lock"
+    lock = ProcessLock(path).acquire(owner={
+        "business_date": "2026-08-11",
+        "pid": 123,
+        "command": "drain-only",
+        "started_at": "2026-08-11T20:30:00+08:00",
+        "invocation": "manual",
+    })
+
+    status = ProcessLock.inspect(path)
+    assert status["active"] is True
+    assert status["pid"] == 123
+    assert status["command"] == "drain-only"
+    lock.release()
+
+    assert ProcessLock.inspect(path)["active"] is False
+    assert not lock.metadata_path.exists()
+
+
+def test_process_lock_is_reentrant_for_one_command_lifecycle(tmp_path):
+    lock = ProcessLock(tmp_path / "tick.lock").acquire()
+    lock.acquire()
+    lock.release()
+
+    with pytest.raises(LeaseUnavailable):
+        ProcessLock(lock.path).acquire()
+    lock.release()
+    ProcessLock(lock.path).acquire().release()
+
+
+def test_process_lock_releases_after_exception_and_keyboard_interrupt(tmp_path):
+    path = tmp_path / "tick.lock"
+    with pytest.raises(RuntimeError):
+        with ProcessLock(path):
+            raise RuntimeError("boom")
+    ProcessLock(path).acquire().release()
+
+    with pytest.raises(KeyboardInterrupt):
+        with ProcessLock(path):
+            raise KeyboardInterrupt
+    ProcessLock(path).acquire().release()
+
+
+def test_stale_owner_metadata_never_blocks_a_new_owner(tmp_path):
+    path = tmp_path / "tick.lock"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"0")
+    metadata = path.with_name(f"{path.name}.owner.json")
+    metadata.write_text(json.dumps({"pid": 999999, "command": "stale"}), encoding="utf-8")
+
+    assert ProcessLock.inspect(path)["active"] is False
+    lock = ProcessLock(path).acquire(owner={"pid": 321, "command": "tick"})
+    assert ProcessLock.inspect(path)["command"] == "tick"
+    lock.release()
+
+
+def test_os_releases_process_lock_after_forced_process_termination(tmp_path):
+    path = tmp_path / "tick.lock"
+    code = "\n".join((
+        "import sys, time",
+        "from app.services.daily_audit_store import ProcessLock",
+        "lock = ProcessLock(sys.argv[1]).acquire(owner={'pid': 1, 'command': 'child'})",
+        "print('READY', flush=True)",
+        "time.sleep(60)",
+    ))
+    child = subprocess.Popen(
+        [sys.executable, "-c", code, str(path)],
+        cwd=Path(__file__).resolve().parents[1],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert child.stdout is not None
+        assert child.stdout.readline().strip() == "READY"
+        assert ProcessLock.inspect(path)["active"] is True
+    finally:
+        child.terminate()
+        child.wait(timeout=10)
+
+    ProcessLock(path).acquire(owner={"pid": 2, "command": "next"}).release()
 
 
 def test_lease_overlap_expiry_and_fencing(store):
@@ -210,6 +298,97 @@ def test_remote_intent_is_durable_conflict_and_unknown_submit_never_reclaims(sto
     assert store.get_remote_job(job["id"])["remote_identity"] == "remote-99"
 
 
+def test_confirmed_submit_waits_in_priority_pending_before_remote_progress(store):
+    lease = _lease(store)
+    job = store.prepare_remote_intent(lease, "mall-A:hash", "daily-20260811-mall-A", "payload-a")
+    store.claim_remote_submission(lease, job["id"])
+    store.mark_submit_unknown(lease, job["id"], "priority failed after create")
+
+    confirmed = store.reconcile_remote_job(
+        lease,
+        job["id"],
+        remote_identity="mall-A|task-id|task-number",
+        state="PRIORITY_PENDING",
+    )
+
+    assert confirmed["state"] == "PRIORITY_PENDING"
+    assert store.claim_remote_submission(lease, job["id"]) is None
+    with pytest.raises(RemoteIntentConflict):
+        store.reconcile_remote_job(
+            lease,
+            job["id"],
+            remote_identity="mall-A|task-id|task-number",
+            state="COMPLETED",
+        )
+
+
+def test_explicit_manual_priority_requeue_preserves_remote_identity(store):
+    lease = _lease(store)
+    job = store.prepare_remote_intent(lease, "mall-A:hash", "daily-20260811-mall-A", "payload-a")
+    store.claim_remote_submission(lease, job["id"])
+    store.mark_submit_unknown(lease, job["id"], "created but priority failed")
+    store.reconcile_remote_job(
+        lease,
+        job["id"],
+        remote_identity="mall-A|task-id|task-number",
+        state="PRIORITY_PENDING",
+    )
+    store.mark_remote_manual(lease, job["id"], "invalid_task_name_time_marker")
+
+    with pytest.raises(RemoteIntentConflict):
+        store.requeue_manual_priority_job(
+            lease,
+            job["id"],
+            remote_identity="mall-A|other-id|task-number",
+        )
+    recovered = store.requeue_manual_priority_job(
+        lease,
+        job["id"],
+        remote_identity="mall-A|task-id|task-number",
+    )
+
+    assert recovered["state"] == "PRIORITY_PENDING"
+    assert recovered["remote_identity"] == "mall-A|task-id|task-number"
+    assert recovered["post_attempted"] == 1
+    assert recovered["error_text"] is None
+
+
+def test_explicit_manual_harvest_requeue_preserves_remote_identity(store):
+    lease = _lease(store)
+    job = store.prepare_remote_intent(
+        lease,
+        "mall-A:hash",
+        "daily-20260811-mall-A",
+        "payload-a",
+        result_path="C:/result.xlsx",
+    )
+    store.claim_remote_submission(lease, job["id"])
+    store.reconcile_remote_job(
+        lease,
+        job["id"],
+        remote_identity="mall-A|task-id|task-number",
+        state="SUBMITTED",
+    )
+    store.mark_remote_manual(lease, job["id"], "export validation failed")
+
+    with pytest.raises(RemoteIntentConflict):
+        store.requeue_manual_harvest_job(
+            lease,
+            job["id"],
+            remote_identity="mall-A|other-id|task-number",
+        )
+    recovered = store.requeue_manual_harvest_job(
+        lease,
+        job["id"],
+        remote_identity="mall-A|task-id|task-number",
+    )
+
+    assert recovered["state"] == "SUBMITTED"
+    assert recovered["remote_identity"] == "mall-A|task-id|task-number"
+    assert recovered["post_attempted"] == 1
+    assert recovered["error_text"] is None
+
+
 def test_remote_crash_recovery_and_query_apis_are_fenced(store):
     lease = _lease(store)
     item_id = store.ingest_snapshot(lease, [_row()])["members"][0]["audit_item_id"]
@@ -281,6 +460,89 @@ def test_new_source_inherits_terminal_exact_backend_pair_without_resubmit(store)
     assert reused["remote_job_id"] is None
 
 
+def test_completed_export_can_resolve_exact_terminal_crawl_as_no_result(store):
+    lease = _lease(store)
+    job = store.prepare_remote_intent(
+        lease,
+        "mall-A:hash",
+        "daily-20260811-mall-A",
+        "payload-a",
+        result_path="C:/exports/mall-A-result.xlsx",
+    )
+    store.claim_remote_submission(lease, int(job["id"]))
+    store.reconcile_remote_job(
+        lease,
+        int(job["id"]),
+        remote_identity="mall-A|task-id|task-number",
+        state="COMPLETED",
+        result={"https://example/other": {"price": "12.30"}},
+    )
+    crawl = store.ensure_crawl_work(
+        lease,
+        "mall-A",
+        "SKU-1",
+        "https://example/p",
+        "legacy-v1",
+        "crawl-a",
+        source_id="V-1",
+    )
+    store.link_crawl_work_to_remote_job(lease, int(crawl["id"]), int(job["id"]))
+    original_error = "legacy export missing safe skuId / exact URL result"
+    store.fail_crawl_work(lease, int(crawl["id"]), original_error, retryable=False)
+
+    resolved = store.complete_crawl_work_without_result(
+        lease,
+        int(crawl["id"]),
+        reason=original_error,
+    )
+    repeated = store.complete_crawl_work_without_result(
+        lease,
+        int(crawl["id"]),
+        reason=original_error,
+    )
+
+    evidence = json.loads(resolved["result_json"])
+    assert resolved["state"] == "NO_RESULT"
+    assert resolved["error_text"] == original_error
+    assert evidence == {
+        "evidence_type": "EXPORTED_NO_MATCHING_ROW",
+        "no_result_reason": original_error,
+        "page_price_source": "招商局（无采集结果）",
+        "page_price_status": "NO_RESULT",
+        "page_price_value": None,
+        "remote_identity": "mall-A|task-id|task-number",
+        "remote_state": "COMPLETED",
+        "result_path": "C:/exports/mall-A-result.xlsx",
+    }
+    assert repeated == resolved
+
+
+def test_no_result_requires_exact_completed_export_evidence(store):
+    lease = _lease(store)
+    crawl = store.ensure_crawl_work(
+        lease,
+        "mall-A",
+        "SKU-1",
+        "https://example/p",
+        "legacy-v1",
+        "crawl-a",
+        source_id="V-1",
+    )
+    store.fail_crawl_work(
+        lease,
+        int(crawl["id"]),
+        "legacy export missing safe skuId / exact URL result",
+        retryable=False,
+    )
+
+    with pytest.raises(RemoteIntentConflict, match="completed export evidence"):
+        store.complete_crawl_work_without_result(
+            lease,
+            int(crawl["id"]),
+            reason="legacy export missing safe skuId / exact URL result",
+        )
+
+
 def test_freeze_and_finalization_are_idempotent_and_conflicts_are_rejected(store):
     lease = _lease(store)
     first = store.ingest_snapshot(lease, [_row()])["snapshot"]
@@ -332,6 +594,76 @@ def test_remote_reconciliation_is_fenced_monotonic_and_identity_immutable(store)
     store.reconcile_remote_job(lease, job["id"], remote_identity="remote-a", state="COMPLETED")
     with pytest.raises(RemoteIntentConflict):
         store.reconcile_remote_job(lease, job["id"], remote_identity="remote-a", state="RUNNING")
+
+
+def test_remote_identity_is_unique_within_a_daily_run(store):
+    lease = _lease(store)
+    first = store.prepare_remote_intent(lease, "mall-a:one", "task-a", "payload-a")
+    second = store.prepare_remote_intent(lease, "mall-a:two", "task-b", "payload-b")
+    for job in (first, second):
+        store.claim_remote_submission(lease, job["id"])
+
+    store.reconcile_remote_job(
+        lease,
+        first["id"],
+        remote_identity="mall-a|task-id|task-number",
+    )
+    with pytest.raises(RemoteIntentConflict, match="remote identity"):
+        store.reconcile_remote_job(
+            lease,
+            second["id"],
+            remote_identity="mall-a|task-id|task-number",
+        )
+
+
+def test_remote_identity_may_repeat_in_a_different_daily_run(store):
+    first_lease = _lease(store, date="2026-08-11", owner="first")
+    second_lease = _lease(store, date="2026-08-12", owner="second")
+    identity = "mall-a|task-id|task-number"
+
+    for lease, logical_key, task_name in (
+        (first_lease, "mall-a:first-day", "task-first-day"),
+        (second_lease, "mall-a:second-day", "task-second-day"),
+    ):
+        job = store.prepare_remote_intent(lease, logical_key, task_name, logical_key)
+        store.claim_remote_submission(lease, job["id"])
+        reconciled = store.reconcile_remote_job(
+            lease,
+            job["id"],
+            remote_identity=identity,
+        )
+        assert reconciled["remote_identity"] == identity
+
+
+def test_remote_identity_migration_fails_closed_on_legacy_collision(tmp_path):
+    path = tmp_path / "legacy-remote-collision.sqlite3"
+    store = DailyAuditStore(path)
+    lease = _lease(store)
+    first = store.prepare_remote_intent(lease, "mall-a:one", "task-a", "payload-a")
+    second = store.prepare_remote_intent(lease, "mall-a:two", "task-b", "payload-b")
+    for job in (first, second):
+        store.claim_remote_submission(lease, job["id"])
+    store.reconcile_remote_job(lease, first["id"], remote_identity="remote-a")
+    store.reconcile_remote_job(lease, second["id"], remote_identity="remote-b")
+    store.release_lease(lease)
+
+    with sqlite3.connect(path) as connection:
+        connection.execute("DROP INDEX IF EXISTS ux_remote_jobs_run_remote_identity")
+        connection.execute(
+            "UPDATE remote_jobs SET remote_identity='remote-a' WHERE id=?",
+            (second["id"],),
+        )
+
+    with pytest.raises(RemoteIntentConflict, match="duplicate remote_identity"):
+        DailyAuditStore(path)
+
+    with sqlite3.connect(path) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM remote_jobs WHERE remote_identity='remote-a'"
+        ).fetchone()[0] == 2
+        assert connection.execute(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='ux_remote_jobs_run_remote_identity'"
+        ).fetchone()[0] == 0
 
 
 def test_crawl_binding_and_harvest_caps_fail_closed(store):

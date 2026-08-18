@@ -2,15 +2,19 @@ import json
 import os
 import subprocess
 import sys
+from dataclasses import replace
+from datetime import datetime
 from pathlib import Path
 
 import pytest
 from openpyxl import Workbook, load_workbook
+from pymysql.err import InterfaceError, OperationalError
 
 from app.services.legacy_zhaoshang_adapter import (
     CrawlRequest,
     CnncLegacyZhaoshangAdapter,
     HarvestStatus,
+    PriorityStatus,
     ReconcileStatus,
     SubmitStatus,
     TemplateConflictError,
@@ -26,9 +30,11 @@ MAPPING = ZhaoshangMallMapping(
     domains=("jd.com",),
     vendor_keywords=("jd", "京东"),
 )
+DEFAULT_TASK_NAME = "cnnc_current_opt_京东_20260811180000000000"
 
 
 def _adapter(**kwargs):
+    kwargs.setdefault("db_env_path", None)
     return CnncLegacyZhaoshangAdapter(mappings=[MAPPING], **kwargs)
 
 
@@ -55,7 +61,7 @@ def _prepare(tmp_path, requests=(_request(),), **kwargs):
         requests=requests,
         template_path=tmp_path / "template.xlsx",
         result_path=tmp_path / "result.xlsx",
-        task_name="cnnc_current_opt_京东_20260811180000000000",
+        task_name=DEFAULT_TASK_NAME,
         batch_state_path=_state_file(tmp_path),
     )
 
@@ -66,13 +72,58 @@ def _append_event(path, action, **details):
         stream.write(f"- `{json.dumps(event, ensure_ascii=False)}`\n")
 
 
-def _write_result(path: Path, rows):
+def _append_submission(path, *, task_id="id-default", task_number="no-default", expected_subtask_count=1):
+    _append_event(
+        path,
+        "CREATED",
+        task_id=task_id,
+        task_number=task_number,
+        expected_subtask_count=expected_subtask_count,
+    )
+    _append_event(path, "ENABLED", task_id=task_id, task_number=task_number)
+
+
+def _write_result(path: Path, rows, *, task_name=DEFAULT_TASK_NAME, mall_key="jd"):
+    _write_result_with_headers(
+        path,
+        ["商品编码", "原始链接", "商品价格"],
+        rows,
+        task_name=task_name,
+        mall_key=mall_key,
+    )
+
+
+def _write_result_with_headers(
+    path: Path,
+    headers,
+    rows,
+    *,
+    task_name=DEFAULT_TASK_NAME,
+    mall_key="jd",
+    include_provenance=True,
+):
+    headers = list(headers)
+    rows = [list(row) for row in rows]
+    if include_provenance and "批次号" not in headers:
+        headers.extend(["执行编号", "批次号", "商城标识"])
+        rows = [
+            [*row, f"no-default-execution-{index}", task_name, mall_key]
+            for index, row in enumerate(rows)
+        ]
     workbook = Workbook()
     sheet = workbook.active
-    sheet.append(["商品编码", "原始链接", "商品价格"])
+    sheet.append(headers)
     for row in rows:
         sheet.append(row)
     workbook.save(path)
+
+
+def _write_provenance_result(path: Path, rows):
+    _write_result_with_headers(
+        path,
+        ["商品编码", "商品详情地址", "商品价格", "执行编号", "批次号", "商城标识"],
+        rows,
+    )
 
 
 def test_mapping_prefers_url_domain_and_uses_vendor_only_for_blank_url():
@@ -136,6 +187,30 @@ def test_immutable_template_reuses_matching_payload_and_rejects_conflict(tmp_pat
         adapter.prepare_job("2026-08-11", (_request("sku-2"),), tmp_path / "template.xlsx", tmp_path / "result.xlsx", "task", state)
 
 
+def test_template_publication_retries_transient_windows_permission_error(tmp_path, monkeypatch):
+    adapter = _adapter()
+    state = _state_file(tmp_path)
+    target = tmp_path / "template.xlsx"
+    real_replace = os.replace
+    replace_calls = 0
+
+    def transient_replace(source, destination):
+        nonlocal replace_calls
+        if Path(destination) == target:
+            replace_calls += 1
+            if replace_calls == 1:
+                raise PermissionError("transient scanner lock")
+        return real_replace(source, destination)
+
+    monkeypatch.setattr(legacy_module.os, "replace", transient_replace)
+
+    adapter.prepare_job("2026-08-11", (_request(),), target, tmp_path / "result.xlsx", "task", state)
+
+    assert replace_calls == 2
+    assert target.is_file()
+    assert not list(tmp_path.glob(".template.xlsx.*.tmp"))
+
+
 def test_template_requires_embedded_payload_evidence_and_never_overwrites_unreadable_file(tmp_path):
     adapter = _adapter()
     state = _state_file(tmp_path)
@@ -157,12 +232,14 @@ def test_template_requires_embedded_payload_evidence_and_never_overwrites_unread
     assert unreadable.read_bytes() == b""
 
 
-def test_submit_uses_exact_create_only_cli_once_and_requires_priority_evidence(tmp_path):
+def test_submit_uses_exact_create_only_cli_once_and_preserves_priority_evidence(tmp_path):
     calls = []
 
     def runner(args, timeout_seconds, env):
         calls.append((args, timeout_seconds, env))
-        _append_event(Path(args[args.index("--batch-state-file") + 1]), "PRIORITY_UPDATED", task_id="id-1", task_number="no-1", affected_rows=1)
+        state = Path(args[args.index("--batch-state-file") + 1])
+        _append_submission(state, task_id="id-1", task_number="no-1")
+        _append_event(state, "PRIORITY_UPDATED", task_id="id-1", task_number="no-1", affected_rows=1)
         return subprocess.CompletedProcess(args, 0, stdout="ok", stderr="")
 
     adapter = _adapter(runner=runner)
@@ -179,6 +256,24 @@ def test_submit_uses_exact_create_only_cli_once_and_requires_priority_evidence(t
     assert args[args.index("--task-weight") + 1] == "0"
 
 
+def test_submit_confirms_created_and_enabled_without_priority_evidence(tmp_path):
+    calls = []
+
+    def runner(args, timeout_seconds, env):
+        calls.append((args, timeout_seconds, env))
+        state = Path(args[args.index("--batch-state-file") + 1])
+        _append_event(state, "CREATED", task_id="id-1", task_number="no-1", expected_subtask_count=1)
+        _append_event(state, "ENABLED", task_id="id-1", task_number="no-1")
+        return subprocess.CompletedProcess(args, 1, stdout="", stderr="priority failed")
+
+    outcome = _adapter(runner=runner).submit(_prepare(tmp_path), timeout_seconds=30)
+
+    assert outcome.status is SubmitStatus.SUBMITTED
+    assert (outcome.task_id, outcome.task_number) == ("id-1", "no-1")
+    assert outcome.priority_evidence is None
+    assert len(calls) == 1
+
+
 @pytest.mark.parametrize(
     "action, details, expected",
     [
@@ -189,7 +284,9 @@ def test_submit_uses_exact_create_only_cli_once_and_requires_priority_evidence(t
 )
 def test_submit_accepts_only_supported_priority_evidence(tmp_path, action, details, expected):
     def runner(args, _timeout, _env):
-        _append_event(Path(args[args.index("--batch-state-file") + 1]), action, **details)
+        state = Path(args[args.index("--batch-state-file") + 1])
+        _append_submission(state)
+        _append_event(state, action, **details)
         return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
 
     outcome = _adapter(runner=runner).submit(_prepare(tmp_path), timeout_seconds=30)
@@ -201,6 +298,7 @@ def test_submit_accepts_only_supported_priority_evidence(tmp_path, action, detai
 def test_submit_binds_priority_evidence_to_identity_from_the_same_event(tmp_path):
     def runner(args, _timeout, _env):
         state = Path(args[args.index("--batch-state-file") + 1])
+        _append_submission(state, task_id="priority-id", task_number="priority-number")
         _append_event(state, "PRIORITY_UPDATED", task_id="priority-id", task_number="priority-number", affected_rows=1)
         _append_event(state, "EXPORTED", task_id="later-id", task_number="later-number")
         return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
@@ -214,6 +312,7 @@ def test_submit_binds_priority_evidence_to_identity_from_the_same_event(tmp_path
 def test_submit_fails_closed_on_conflicting_accepted_priority_identities(tmp_path):
     def runner(args, _timeout, _env):
         state = Path(args[args.index("--batch-state-file") + 1])
+        _append_submission(state)
         _append_event(state, "PRIORITY_UPDATED", task_id="first-id", task_number="first-number", affected_rows=1)
         _append_event(
             state,
@@ -226,7 +325,8 @@ def test_submit_fails_closed_on_conflicting_accepted_priority_identities(tmp_pat
 
     outcome = _adapter(runner=runner).submit(_prepare(tmp_path), timeout_seconds=30)
 
-    assert outcome.status is SubmitStatus.SUBMIT_UNKNOWN
+    assert outcome.status is SubmitStatus.SUBMITTED
+    assert outcome.priority_evidence is None
     assert "conflict" in outcome.diagnostic
 
 
@@ -263,6 +363,40 @@ def test_production_runner_shares_deadline_and_strips_model_secrets(tmp_path, mo
     assert captured["env"]["BLADE_AUTH"] == "blade"
     assert not any(name.startswith("TITLE_MATCH_MODEL_") for name in captured["env"])
     assert os.environ["TITLE_MATCH_MODEL_API_KEY"] == "must-not-leak"
+
+
+def test_production_runner_loads_required_priority_database_environment(tmp_path, monkeypatch):
+    tool = tmp_path / "auto_crawl_task.py"
+    tool.write_text("# test tool\n", encoding="utf-8")
+    db_env = tmp_path / "ZHAOSHANG_DB.env"
+    db_env.write_text(
+        "ZHAOSHANG_DB_HOST=host\n"
+        "ZHAOSHANG_DB_PORT=3306\n"
+        "ZHAOSHANG_DB_USER=user\n"
+        "ZHAOSHANG_DB_PASSWORD=password\n",
+        encoding="utf-8",
+    )
+    captured = {}
+
+    class Auth:
+        def export_environment(self, *_args, **_kwargs):
+            return {"BLADE_AUTH": "blade"}
+
+    def run(args, **kwargs):
+        captured.update(kwargs)
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(legacy_module.subprocess, "run", run)
+    adapter = _adapter(auth_manager=Auth(), external_tool_path=tool, db_env_path=db_env)
+    adapter._production_runner([sys.executable, str(legacy_module.EXTERNAL_TOOL_PATH)], 10)
+
+    assert {name for name in captured["env"] if name.startswith("ZHAOSHANG_DB_")} == {
+        "ZHAOSHANG_DB_HOST",
+        "ZHAOSHANG_DB_PORT",
+        "ZHAOSHANG_DB_USER",
+        "ZHAOSHANG_DB_PASSWORD",
+    }
+    assert not any(name.startswith("ZHAOSHANG_DB_") for name in os.environ)
 
 
 def test_production_runner_never_starts_subprocess_after_auth_uses_deadline(tmp_path, monkeypatch):
@@ -389,6 +523,7 @@ def test_reconcile_unknown_uses_exact_identity_without_write_calls(tmp_path):
         return {"taskId": "id-1", "taskNumber": "no-1", "mallLogo": "jd"}
 
     job = _prepare(tmp_path)
+    _append_submission(job.batch_state_path, task_id="id-1", task_number="no-1")
     _append_event(
         job.batch_state_path,
         "PRIORITY_ALREADY_HIGHEST",
@@ -403,8 +538,850 @@ def test_reconcile_unknown_uses_exact_identity_without_write_calls(tmp_path):
     assert calls == [("cnnc_current_opt_京东_20260811180000000000", "jd", 12)]
 
 
+def test_reconcile_unknown_confirms_created_enabled_without_priority_or_post(tmp_path):
+    reconcile_calls = []
+    post_calls = []
+
+    def reconciler(task_name, mall_key, timeout_seconds):
+        reconcile_calls.append((task_name, mall_key, timeout_seconds))
+        return {"taskId": "id-1", "taskNumber": "no-1", "mallLogo": "jd"}
+
+    job = _prepare(tmp_path)
+    _append_event(job.batch_state_path, "CREATED", task_id="id-1", task_number="no-1", expected_subtask_count=1)
+    _append_event(job.batch_state_path, "ENABLED", task_id="id-1", task_number="no-1")
+    adapter = _adapter(
+        reconciler=reconciler,
+        runner=lambda *_args: post_calls.append(True),
+    )
+
+    first = adapter.reconcile_unknown(job, timeout_seconds=12)
+    second = adapter.reconcile_unknown(job, timeout_seconds=12)
+
+    assert first.status is ReconcileStatus.FOUND
+    assert second.status is ReconcileStatus.FOUND
+    assert (first.task_id, first.task_number) == ("id-1", "no-1")
+    assert post_calls == []
+    assert len(reconcile_calls) == 2
+
+
+def test_reconcile_unknown_adopts_one_exact_remote_after_durable_intent(tmp_path):
+    job = _prepare(tmp_path)
+    _append_event(
+        job.batch_state_path,
+        "ADD_INTENT",
+        task_id="",
+        task_number="",
+        expected_subtask_count=1,
+        timestamp="2026-08-14T09:01:02+08:00",
+    )
+    recorded = []
+    post_calls = []
+
+    def record_event(path, **event):
+        recorded.append(dict(event))
+        _append_event(
+            Path(path),
+            event.pop("action"),
+            task_id=event.pop("task_id", ""),
+            task_number=event.pop("task_number", ""),
+            **event,
+        )
+
+    adapter = _adapter(
+        reconciler=lambda *_args: {
+            "taskId": "id-1",
+            "taskNumber": "no-1",
+            "taskName": job.task_name,
+            "mallLogo": job.mall_key,
+            "expectedSubtaskCount": 1,
+            "state": "1",
+        },
+        event_recorder=record_event,
+        runner=lambda *_args: post_calls.append(True),
+    )
+
+    first = adapter.reconcile_unknown(job, timeout_seconds=12)
+    second = adapter.reconcile_unknown(job, timeout_seconds=12)
+
+    assert first.status is ReconcileStatus.FOUND
+    assert second.status is ReconcileStatus.FOUND
+    assert (first.task_id, first.task_number) == ("id-1", "no-1")
+    assert [event["action"] for event in recorded] == ["CREATED", "ENABLED"]
+    assert recorded[0]["expected_subtask_count"] == 1
+    assert recorded[0]["submission_marker_time"] == "2026-08-14T09:01:02+08:00"
+    assert post_calls == []
+    events = adapter._read_batch_events(job)
+    assert adapter._submission_evidence(job, events) == ("id-1", "no-1")
+    assert adapter._submission_marker_time(events, "id-1", "no-1") == datetime(
+        2026, 8, 14, 9, 1, 2
+    )
+
+
+def test_submit_connection_reset_then_reconcile_retry_never_posts_twice(tmp_path):
+    job = _prepare(tmp_path)
+    _append_event(
+        job.batch_state_path,
+        "ADD_INTENT",
+        task_id="",
+        task_number="",
+        timestamp="2026-08-14T09:01:02+08:00",
+    )
+    add_calls = []
+
+    def runner(*_args):
+        add_calls.append("/add")
+        raise ConnectionResetError("response connection reset")
+
+    def record_event(path, **event):
+        _append_event(
+            Path(path),
+            event.pop("action"),
+            task_id=event.pop("task_id", ""),
+            task_number=event.pop("task_number", ""),
+            **event,
+        )
+
+    adapter = _adapter(
+        runner=runner,
+        reconciler=lambda *_args: {
+            "taskId": "id-1",
+            "taskNumber": "no-1",
+            "taskName": job.task_name,
+            "mallLogo": job.mall_key,
+            "expectedSubtaskCount": 1,
+            "state": "1",
+        },
+        event_recorder=record_event,
+    )
+
+    submitted = adapter.submit(job, timeout_seconds=12)
+    first = adapter.reconcile_unknown(job, timeout_seconds=12)
+    second = adapter.reconcile_unknown(job, timeout_seconds=12)
+
+    assert submitted.status is SubmitStatus.SUBMIT_UNKNOWN
+    assert first.status is ReconcileStatus.FOUND
+    assert second.status is ReconcileStatus.FOUND
+    assert add_calls == ["/add"]
+
+
+def test_exact_takeover_finishes_partial_created_evidence_after_process_crash(tmp_path):
+    job = _prepare(tmp_path)
+    _append_event(
+        job.batch_state_path,
+        "ADD_INTENT",
+        task_id="",
+        task_number="",
+        timestamp="2026-08-14T09:01:02+08:00",
+    )
+    _append_event(
+        job.batch_state_path,
+        "CREATED",
+        task_id="id-1",
+        task_number="no-1",
+        expected_subtask_count=1,
+        timestamp="2026-08-14T09:01:05+08:00",
+    )
+
+    def record_event(path, **event):
+        _append_event(
+            Path(path),
+            event.pop("action"),
+            task_id=event.pop("task_id", ""),
+            task_number=event.pop("task_number", ""),
+            **event,
+        )
+
+    adapter = _adapter(
+        reconciler=lambda *_args: {
+            "taskId": "id-1",
+            "taskNumber": "no-1",
+            "taskName": job.task_name,
+            "mallLogo": job.mall_key,
+            "expectedSubtaskCount": 1,
+            "state": "1",
+        },
+        event_recorder=record_event,
+    )
+
+    outcome = adapter.reconcile_unknown(job, timeout_seconds=12)
+    events = adapter._read_batch_events(job)
+
+    assert outcome.status is ReconcileStatus.FOUND
+    assert adapter._submission_marker_time(events, "id-1", "no-1") == datetime(
+        2026, 8, 14, 9, 1, 2
+    )
+
+
+@pytest.mark.parametrize(
+    "remote",
+    (
+        {
+            "taskId": "id-1",
+            "taskNumber": "no-1",
+            "taskName": "wrong-task",
+            "mallLogo": "jd",
+            "expectedSubtaskCount": 1,
+        },
+        {
+            "taskId": "id-1",
+            "taskNumber": "no-1",
+            "taskName": DEFAULT_TASK_NAME,
+            "mallLogo": "wrong-mall",
+            "expectedSubtaskCount": 1,
+        },
+        {
+            "taskId": "id-1",
+            "taskNumber": "no-1",
+            "taskName": DEFAULT_TASK_NAME,
+            "mallLogo": "jd",
+            "expectedSubtaskCount": 2,
+        },
+    ),
+)
+def test_reconcile_unknown_rejects_exact_remote_identity_or_count_mismatch(
+    tmp_path, remote
+):
+    job = _prepare(tmp_path)
+    _append_event(
+        job.batch_state_path,
+        "ADD_INTENT",
+        task_id="",
+        task_number="",
+        expected_subtask_count=1,
+        timestamp="2026-08-14T09:01:02+08:00",
+    )
+    recorded = []
+
+    outcome = _adapter(
+        reconciler=lambda *_args: remote,
+        event_recorder=lambda *_args, **event: recorded.append(event),
+    ).reconcile_unknown(job, timeout_seconds=12)
+
+    assert outcome.status is ReconcileStatus.MANUAL
+    assert recorded == []
+
+
+def test_reconcile_unknown_rejects_multiple_exact_remote_matches(tmp_path):
+    job = _prepare(tmp_path)
+    _append_event(
+        job.batch_state_path,
+        "ADD_INTENT",
+        task_id="",
+        task_number="",
+        expected_subtask_count=1,
+        timestamp="2026-08-14T09:01:02+08:00",
+    )
+    remote = {
+        "taskId": "id-1",
+        "taskNumber": "no-1",
+        "taskName": job.task_name,
+        "mallLogo": job.mall_key,
+        "expectedSubtaskCount": 1,
+        "state": "1",
+    }
+
+    outcome = _adapter(reconciler=lambda *_args: [remote, dict(remote)]).reconcile_unknown(
+        job, timeout_seconds=12
+    )
+
+    assert outcome.status is ReconcileStatus.MANUAL
+
+
+def test_reconcile_unknown_does_not_adopt_when_evidence_write_fails(tmp_path):
+    job = _prepare(tmp_path)
+    _append_event(
+        job.batch_state_path,
+        "ADD_INTENT",
+        task_id="",
+        task_number="",
+        expected_subtask_count=1,
+        timestamp="2026-08-14T09:01:02+08:00",
+    )
+
+    def fail_record(*_args, **_kwargs):
+        raise OSError("simulated durable event failure")
+
+    outcome = _adapter(
+        reconciler=lambda *_args: {
+            "taskId": "id-1",
+            "taskNumber": "no-1",
+            "taskName": job.task_name,
+            "mallLogo": job.mall_key,
+            "expectedSubtaskCount": 1,
+            "state": "1",
+        },
+        event_recorder=fail_record,
+    ).reconcile_unknown(job, timeout_seconds=12)
+
+    assert outcome.status is ReconcileStatus.NOT_FOUND
+    assert "durable" in outcome.diagnostic
+
+
+def test_priority_update_is_verified_evidence_and_idempotent(tmp_path):
+    calls = []
+    job = _prepare(tmp_path)
+    _append_event(job.batch_state_path, "CREATED", task_id="id-1", task_number="no-1", expected_subtask_count=1)
+    _append_event(job.batch_state_path, "ENABLED", task_id="id-1", task_number="no-1")
+
+    def prioritize(prepared, task_id, task_number, timeout_seconds):
+        calls.append((prepared.task_name, task_id, task_number, timeout_seconds))
+        _append_event(
+            prepared.batch_state_path,
+            "PRIORITY_UPDATED",
+            task_id=task_id,
+            task_number=task_number,
+            affected_rows=1,
+        )
+
+    adapter = _adapter(priority_runner=prioritize)
+
+    first = adapter.prioritize(job, task_id="id-1", task_number="no-1", timeout_seconds=12)
+    second = adapter.prioritize(job, task_id="id-1", task_number="no-1", timeout_seconds=12)
+
+    assert first.status is PriorityStatus.UPDATED
+    assert second.status is PriorityStatus.UPDATED
+    assert first.weight_type == -1
+    assert calls == [(job.task_name, "id-1", "no-1", 12)]
+
+
+def test_priority_already_highest_is_idempotent_without_update(tmp_path):
+    calls = []
+    job = _prepare(tmp_path)
+    _append_event(job.batch_state_path, "CREATED", task_id="id-1", task_number="no-1", expected_subtask_count=1)
+    _append_event(job.batch_state_path, "ENABLED", task_id="id-1", task_number="no-1")
+
+    def prioritize(prepared, task_id, task_number, _timeout_seconds):
+        calls.append((task_id, task_number))
+        _append_event(
+            prepared.batch_state_path,
+            "PRIORITY_ALREADY_HIGHEST",
+            task_id=task_id,
+            task_number=task_number,
+            already_highest_count=1,
+        )
+
+    adapter = _adapter(priority_runner=prioritize)
+    first = adapter.prioritize(job, task_id="id-1", task_number="no-1", timeout_seconds=12)
+    second = adapter.prioritize(job, task_id="id-1", task_number="no-1", timeout_seconds=12)
+
+    assert first.status is PriorityStatus.ALREADY_HIGHEST
+    assert second.status is PriorityStatus.ALREADY_HIGHEST
+    assert first.weight_type == -1
+    assert calls == [("id-1", "no-1")]
+
+
+def test_priority_unconfirmed_never_reports_highest_or_retries_automatically(tmp_path):
+    calls = []
+    job = _prepare(tmp_path)
+    _append_event(job.batch_state_path, "CREATED", task_id="id-1", task_number="no-1", expected_subtask_count=1)
+    _append_event(job.batch_state_path, "ENABLED", task_id="id-1", task_number="no-1")
+
+    def prioritize(prepared, task_id, task_number, _timeout_seconds):
+        calls.append((task_id, task_number))
+        _append_event(
+            prepared.batch_state_path,
+            "PRIORITY_UNCONFIRMED",
+            task_id=task_id,
+            task_number=task_number,
+            reason="verification_unavailable",
+        )
+
+    adapter = _adapter(priority_runner=prioritize)
+    first = adapter.prioritize(job, task_id="id-1", task_number="no-1", timeout_seconds=12)
+    second = adapter.prioritize(job, task_id="id-1", task_number="no-1", timeout_seconds=12)
+
+    assert first.status is PriorityStatus.UNCONFIRMED
+    assert second.status is PriorityStatus.UNCONFIRMED
+    assert first.weight_type is None
+    assert calls == [("id-1", "no-1")]
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        TimeoutError("priority timeout"),
+        ConnectionError("priority connection lost"),
+        InterfaceError("priority interface unavailable"),
+    ],
+)
+def test_priority_transient_infrastructure_errors_are_explicitly_retryable(
+    tmp_path, error
+):
+    job = _prepare(tmp_path)
+    _append_event(
+        job.batch_state_path,
+        "CREATED",
+        task_id="id-1",
+        task_number="no-1",
+        expected_subtask_count=1,
+    )
+    _append_event(
+        job.batch_state_path,
+        "ENABLED",
+        task_id="id-1",
+        task_number="no-1",
+    )
+
+    def prioritize(*_args):
+        raise error
+
+    outcome = _adapter(priority_runner=prioritize).prioritize(
+        job,
+        task_id="id-1",
+        task_number="no-1",
+        timeout_seconds=12,
+    )
+
+    assert outcome.status is PriorityStatus.UNCONFIRMED
+    assert outcome.retryable is True
+
+
+@pytest.mark.parametrize(
+    "error_code",
+    [1040, 1053, 1203, 1205, 1206, 1213, 2002, 2003, 2004, 2006, 2013, 2055],
+)
+def test_priority_transient_operational_error_codes_are_retryable(
+    tmp_path, error_code
+):
+    job = _prepare(tmp_path)
+    _append_submission(job.batch_state_path, task_id="id-1", task_number="no-1")
+
+    def prioritize(*_args):
+        raise OperationalError(error_code, "message is not used for classification")
+
+    outcome = _adapter(priority_runner=prioritize).prioritize(
+        job,
+        task_id="id-1",
+        task_number="no-1",
+        timeout_seconds=12,
+    )
+
+    assert outcome.status is PriorityStatus.UNCONFIRMED
+    assert outcome.retryable is True
+    assert outcome.diagnostic == f"OperationalError[{error_code}]"
+    assert legacy_module.is_retryable_priority_error_diagnostic(outcome.diagnostic)
+
+
+@pytest.mark.parametrize("error_code", [1044, 1045, 1049, 1142, 1143, 1227, 1251])
+def test_priority_deterministic_operational_error_codes_are_not_retryable(
+    tmp_path, error_code
+):
+    job = _prepare(tmp_path)
+    _append_submission(job.batch_state_path, task_id="id-1", task_number="no-1")
+
+    def prioritize(*_args):
+        raise OperationalError(error_code, "message is not used for classification")
+
+    outcome = _adapter(priority_runner=prioritize).prioritize(
+        job,
+        task_id="id-1",
+        task_number="no-1",
+        timeout_seconds=12,
+    )
+
+    assert outcome.status is PriorityStatus.UNCONFIRMED
+    assert outcome.retryable is False
+    assert outcome.diagnostic == "OperationalError"
+    assert not legacy_module.is_retryable_priority_error_diagnostic(
+        outcome.diagnostic
+    )
+
+
+def test_priority_identity_conflict_is_not_retryable(tmp_path):
+    job = _prepare(tmp_path)
+    _append_event(
+        job.batch_state_path,
+        "CREATED",
+        task_id="id-1",
+        task_number="no-1",
+        expected_subtask_count=1,
+    )
+    _append_event(
+        job.batch_state_path,
+        "ENABLED",
+        task_id="id-1",
+        task_number="no-1",
+    )
+
+    outcome = _adapter(
+        priority_runner=lambda *_args: pytest.fail(
+            "identity conflict must fail before priority infrastructure"
+        )
+    ).prioritize(
+        job,
+        task_id="different-id",
+        task_number="no-1",
+        timeout_seconds=12,
+    )
+
+    assert outcome.status is PriorityStatus.UNCONFIRMED
+    assert outcome.retryable is False
+
+
+def test_priority_error_class_name_alone_does_not_make_failure_retryable(tmp_path):
+    class InterfaceError(Exception):
+        pass
+
+    job = _prepare(tmp_path)
+    _append_submission(job.batch_state_path, task_id="id-1", task_number="no-1")
+
+    def prioritize(*_args):
+        raise InterfaceError("not the priority backend DB-API type")
+
+    outcome = _adapter(priority_runner=prioritize).prioritize(
+        job,
+        task_id="id-1",
+        task_number="no-1",
+        timeout_seconds=12,
+    )
+
+    assert outcome.status is PriorityStatus.UNCONFIRMED
+    assert outcome.retryable is False
+
+
+def test_durable_retryable_priority_failure_is_retried_without_explicit_override(
+    tmp_path,
+):
+    calls = []
+    job = _prepare(tmp_path)
+    _append_submission(job.batch_state_path, task_id="id-1", task_number="no-1")
+    _append_event(
+        job.batch_state_path,
+        "PRIORITY_UNCONFIRMED",
+        task_id="id-1",
+        task_number="no-1",
+        reason="InterfaceError",
+        retryable=True,
+    )
+
+    def prioritize(prepared, task_id, task_number, _timeout_seconds):
+        calls.append((task_id, task_number))
+        _append_event(
+            prepared.batch_state_path,
+            "PRIORITY_UPDATED",
+            task_id=task_id,
+            task_number=task_number,
+            affected_rows=1,
+        )
+
+    outcome = _adapter(priority_runner=prioritize).prioritize(
+        job,
+        task_id="id-1",
+        task_number="no-1",
+        timeout_seconds=12,
+    )
+
+    assert outcome.status is PriorityStatus.UPDATED
+    assert calls == [("id-1", "no-1")]
+
+
+def test_production_priority_runner_uses_exact_identity_and_persists_verified_event(tmp_path, monkeypatch):
+    db_env = tmp_path / "ZHAOSHANG_DB.env"
+    db_env.write_text(
+        "ZHAOSHANG_DB_HOST=host\n"
+        "ZHAOSHANG_DB_PORT=3306\n"
+        "ZHAOSHANG_DB_USER=user\n"
+        "ZHAOSHANG_DB_PASSWORD=password\n",
+        encoding="utf-8",
+    )
+    for name in ("ZHAOSHANG_DB_HOST", "ZHAOSHANG_DB_PORT", "ZHAOSHANG_DB_USER", "ZHAOSHANG_DB_PASSWORD"):
+        monkeypatch.delenv(name, raising=False)
+    observed = {}
+
+    class Connection:
+        _read_timeout = 30
+
+        def close(self):
+            observed["read_timeout_seconds"] = self._read_timeout
+            observed["closed"] = True
+
+    class AutoModule:
+        @staticmethod
+        def priority_mall_code_for_key(mall_key):
+            observed["mall_key"] = mall_key
+            return "jd"
+
+        @staticmethod
+        def record_batch_state_event(path, **event):
+            _append_event(
+                Path(path),
+                event.pop("action"),
+                task_id=event.pop("task_id"),
+                task_number=event.pop("task_number"),
+                **event,
+            )
+
+    class PriorityModule:
+        class PriorityTarget:
+            def __init__(self, **identity):
+                observed["identity"] = identity
+                self.identity = identity
+
+        @staticmethod
+        def connect_from_env():
+            observed["db_keys"] = {name for name in os.environ if name.startswith("ZHAOSHANG_DB_")}
+            return Connection()
+
+        @staticmethod
+        def boost_zhaoshang_task_priority(_connection, target, **kwargs):
+            observed["target"] = target
+            observed["kwargs"] = kwargs
+            return {"priority_state": "updated", "affected_rows": 1}
+
+    job = _prepare(tmp_path)
+    job = replace(job, task_name="cnnc_current_opt_京东_68577368911017")
+    _append_event(
+        job.batch_state_path,
+        "CREATED",
+        task_name=job.task_name,
+        task_id="id-1",
+        task_number="no-1",
+        expected_subtask_count=1,
+        timestamp="2026-08-12T16:59:05",
+    )
+    _append_event(
+        job.batch_state_path,
+        "ENABLED",
+        task_name=job.task_name,
+        task_id="id-1",
+        task_number="no-1",
+    )
+    adapter = _adapter(external_tool_path=tmp_path / "auto_crawl_task.py", db_env_path=db_env)
+    adapter._external_tool_path.write_text("# test tool\n", encoding="utf-8")
+    monkeypatch.setattr(
+        adapter,
+        "_load_module",
+        lambda path, _name: AutoModule if path.name == "auto_crawl_task.py" else PriorityModule,
+    )
+
+    outcome = adapter.prioritize(job, task_id="id-1", task_number="no-1", timeout_seconds=180)
+
+    assert outcome.status is PriorityStatus.UPDATED
+    assert observed["identity"] == {
+        "task_name": job.task_name,
+        "task_number": "no-1",
+        "mall_code": "jd",
+        "marker_time": datetime(2026, 8, 12, 16, 59, 5),
+        "window_start": datetime(2026, 8, 12, 16, 57, 5),
+        "window_end": datetime(2026, 8, 12, 17, 14, 5),
+    }
+    assert observed["kwargs"]["expected_subtask_count"] == 1
+    assert observed["read_timeout_seconds"] == 180
+    assert observed["closed"] is True
+    assert not any(name.startswith("ZHAOSHANG_DB_") for name in os.environ)
+
+
+def test_production_priority_failure_persists_unconfirmed_and_is_not_retried(tmp_path, monkeypatch):
+    db_env = tmp_path / "ZHAOSHANG_DB.env"
+    db_env.write_text(
+        "ZHAOSHANG_DB_HOST=host\n"
+        "ZHAOSHANG_DB_PORT=3306\n"
+        "ZHAOSHANG_DB_USER=user\n"
+        "ZHAOSHANG_DB_PASSWORD=password\n",
+        encoding="utf-8",
+    )
+    calls = []
+
+    class Connection:
+        _read_timeout = 30
+
+        def close(self):
+            pass
+
+    class AutoModule:
+        @staticmethod
+        def priority_mall_code_for_key(_mall_key):
+            return "jd"
+
+        @staticmethod
+        def record_batch_state_event(path, **event):
+            _append_event(
+                Path(path),
+                event.pop("action"),
+                task_id=event.pop("task_id"),
+                task_number=event.pop("task_number"),
+                **event,
+            )
+
+    class PriorityModule:
+        class PriorityTarget:
+            def __init__(self, **identity):
+                self.identity = identity
+
+        @staticmethod
+        def connect_from_env():
+            return Connection()
+
+        @staticmethod
+        def boost_zhaoshang_task_priority(*_args, **_kwargs):
+            calls.append("priority")
+            raise RuntimeError("verification failed")
+
+    job = _prepare(tmp_path)
+    _append_event(
+        job.batch_state_path,
+        "CREATED",
+        task_id="id-1",
+        task_number="no-1",
+        expected_subtask_count=1,
+        timestamp="2026-08-12T16:59:05",
+    )
+    _append_event(job.batch_state_path, "ENABLED", task_id="id-1", task_number="no-1")
+    adapter = _adapter(external_tool_path=tmp_path / "auto_crawl_task.py", db_env_path=db_env)
+    adapter._external_tool_path.write_text("# test tool\n", encoding="utf-8")
+    monkeypatch.setattr(
+        adapter,
+        "_load_module",
+        lambda path, _name: AutoModule if path.name == "auto_crawl_task.py" else PriorityModule,
+    )
+
+    first = adapter.prioritize(job, task_id="id-1", task_number="no-1", timeout_seconds=12)
+    second = adapter.prioritize(job, task_id="id-1", task_number="no-1", timeout_seconds=12)
+
+    assert first.status is PriorityStatus.UNCONFIRMED
+    assert second.status is PriorityStatus.UNCONFIRMED
+    assert calls == ["priority"]
+    events = adapter._read_batch_events(job)
+    evidence = [event for event in events if event.get("action") == "PRIORITY_UNCONFIRMED"]
+    assert len(evidence) == 1
+    assert evidence[0]["reason"] == "RuntimeError"
+    assert evidence[0]["retryable"] is False
+
+
+def test_production_priority_interface_error_persists_retryable_and_retries(
+    tmp_path, monkeypatch
+):
+    db_env = tmp_path / "ZHAOSHANG_DB.env"
+    db_env.write_text(
+        "ZHAOSHANG_DB_HOST=host\n"
+        "ZHAOSHANG_DB_PORT=3306\n"
+        "ZHAOSHANG_DB_USER=user\n"
+        "ZHAOSHANG_DB_PASSWORD=password\n",
+        encoding="utf-8",
+    )
+    calls = []
+
+    class Connection:
+        _read_timeout = 30
+
+        def close(self):
+            pass
+
+    class AutoModule:
+        @staticmethod
+        def priority_mall_code_for_key(_mall_key):
+            return "jd"
+
+        @staticmethod
+        def record_batch_state_event(path, **event):
+            _append_event(
+                Path(path),
+                event.pop("action"),
+                task_id=event.pop("task_id"),
+                task_number=event.pop("task_number"),
+                **event,
+            )
+
+    class PriorityModule:
+        class PriorityTarget:
+            def __init__(self, **identity):
+                self.identity = identity
+
+        @staticmethod
+        def connect_from_env():
+            return Connection()
+
+        @staticmethod
+        def boost_zhaoshang_task_priority(*_args, **_kwargs):
+            calls.append("priority")
+            if len(calls) == 1:
+                raise InterfaceError("database connection interrupted")
+            return {"priority_state": "updated", "affected_rows": 1}
+
+    job = _prepare(tmp_path)
+    _append_event(
+        job.batch_state_path,
+        "CREATED",
+        task_id="id-1",
+        task_number="no-1",
+        expected_subtask_count=1,
+        timestamp="2026-08-12T16:59:05",
+    )
+    _append_event(job.batch_state_path, "ENABLED", task_id="id-1", task_number="no-1")
+    adapter = _adapter(
+        external_tool_path=tmp_path / "auto_crawl_task.py",
+        db_env_path=db_env,
+    )
+    adapter._external_tool_path.write_text("# test tool\n", encoding="utf-8")
+    monkeypatch.setattr(
+        adapter,
+        "_load_module",
+        lambda path, _name: AutoModule
+        if path.name == "auto_crawl_task.py"
+        else PriorityModule,
+    )
+
+    first = adapter.prioritize(
+        job, task_id="id-1", task_number="no-1", timeout_seconds=12
+    )
+    second = adapter.prioritize(
+        job, task_id="id-1", task_number="no-1", timeout_seconds=12
+    )
+
+    assert first.status is PriorityStatus.UNCONFIRMED
+    assert first.retryable is True
+    assert second.status is PriorityStatus.UPDATED
+    assert calls == ["priority", "priority"]
+    retryable_evidence = [
+        event
+        for event in adapter._read_batch_events(job)
+        if event.get("action") == "PRIORITY_UNCONFIRMED"
+    ]
+    assert retryable_evidence[0]["reason"] == "InterfaceError"
+    assert retryable_evidence[0]["retryable"] is True
+
+
+def test_explicit_priority_retry_can_supersede_durable_unconfirmed_evidence(tmp_path):
+    calls = []
+    job = _prepare(tmp_path)
+    _append_submission(job.batch_state_path, task_id="id-1", task_number="no-1")
+    _append_event(
+        job.batch_state_path,
+        "PRIORITY_UNCONFIRMED",
+        task_id="id-1",
+        task_number="no-1",
+        reason="invalid_task_name_time_marker",
+    )
+
+    def prioritize(prepared, task_id, task_number, _timeout_seconds):
+        calls.append((task_id, task_number))
+        _append_event(
+            prepared.batch_state_path,
+            "PRIORITY_UPDATED",
+            task_id=task_id,
+            task_number=task_number,
+            affected_rows=1,
+        )
+
+    adapter = _adapter(priority_runner=prioritize)
+    blocked = adapter.prioritize(job, task_id="id-1", task_number="no-1", timeout_seconds=12)
+    recovered = adapter.prioritize(
+        job,
+        task_id="id-1",
+        task_number="no-1",
+        timeout_seconds=12,
+        retry_unconfirmed=True,
+    )
+
+    assert blocked.status is PriorityStatus.UNCONFIRMED
+    assert recovered.status is PriorityStatus.UPDATED
+    assert recovered.weight_type == -1
+    assert calls == [("id-1", "no-1")]
+
+
 def test_reconcile_unknown_rejects_priority_evidence_for_another_remote_identity(tmp_path):
     job = _prepare(tmp_path)
+    _append_submission(job.batch_state_path)
     _append_event(job.batch_state_path, "PRIORITY_ALREADY_HIGHEST", already_highest_count=1)
     adapter = _adapter(
         reconciler=lambda *_args: {"taskId": "different-id", "taskNumber": "different-number"}
@@ -452,6 +1429,82 @@ def test_harvest_reuses_valid_export_without_runner(tmp_path):
     assert calls == []
 
 
+def test_harvest_nonzero_reuses_fresh_export_only_after_formal_validation(tmp_path):
+    job = _prepare(tmp_path)
+
+    def runner(args, _timeout, _env):
+        _write_result(
+            job.result_path,
+            [["sku-1", "https://item.jd.com/a", "12.5"]],
+        )
+        return subprocess.CompletedProcess(args, returncode=1)
+
+    outcome = _adapter(runner=runner).harvest(job, timeout_seconds=15)
+
+    assert outcome.status is HarvestStatus.EXPORTED
+    assert outcome.reused_existing is True
+    assert outcome.result_map["https://item.jd.com/a"]["page_price_value"] == 12.5
+
+
+def test_harvest_nonzero_without_result_keeps_manual_failure(tmp_path):
+    job = _prepare(tmp_path)
+    outcome = _adapter(
+        runner=lambda args, _timeout, _env: subprocess.CompletedProcess(
+            args, returncode=1
+        )
+    ).harvest(job, timeout_seconds=15)
+
+    assert outcome.status is HarvestStatus.MANUAL
+
+
+def test_harvest_nonzero_with_invalid_result_keeps_manual_failure(tmp_path):
+    job = _prepare(tmp_path)
+
+    def runner(args, _timeout, _env):
+        _write_result(
+            job.result_path,
+            [["wrong-sku", "https://item.jd.com/a", "12.5"]],
+        )
+        return subprocess.CompletedProcess(args, returncode=1)
+
+    outcome = _adapter(runner=runner).harvest(job, timeout_seconds=15)
+
+    assert outcome.status is HarvestStatus.MANUAL
+
+
+def test_harvest_zero_return_keeps_normal_export_path(tmp_path):
+    job = _prepare(tmp_path)
+
+    def runner(args, _timeout, _env):
+        _write_result(
+            job.result_path,
+            [["sku-1", "https://item.jd.com/a", "12.5"]],
+        )
+        return subprocess.CompletedProcess(args, returncode=0)
+
+    outcome = _adapter(runner=runner).harvest(job, timeout_seconds=15)
+
+    assert outcome.status is HarvestStatus.EXPORTED
+    assert outcome.result_map["https://item.jd.com/a"]["page_price_value"] == 12.5
+
+
+def test_harvest_timeout_reuses_fresh_export_only_after_formal_validation(tmp_path):
+    job = _prepare(tmp_path)
+
+    def runner(args, _timeout, _env):
+        _write_result(
+            job.result_path,
+            [["sku-1", "https://item.jd.com/a", "12.5"]],
+        )
+        raise subprocess.TimeoutExpired(args, 15)
+
+    outcome = _adapter(runner=runner).harvest(job, timeout_seconds=15)
+
+    assert outcome.status is HarvestStatus.EXPORTED
+    assert outcome.reused_existing is True
+    assert outcome.result_map["https://item.jd.com/a"]["page_price_value"] == 12.5
+
+
 def test_harvest_preserves_two_skus_sharing_one_url_as_distinct_results(tmp_path):
     job = _prepare(tmp_path, requests=(_request("sku-1"), _request("sku-2")))
     _write_result(
@@ -487,6 +1540,566 @@ def test_harvest_rejects_mismatched_existing_export(tmp_path):
 
     assert outcome.status is HarvestStatus.FAILED
     assert calls == []
+
+
+def test_harvest_filters_foreign_batch_before_exact_identity_validation(tmp_path):
+    requests = tuple(
+        _request(f"sku-{index}", f"https://item.jd.com/{index}")
+        for index in range(35)
+    )
+    job = _prepare(tmp_path, requests=requests)
+    current_rows = [
+        [
+            request.sku_id,
+            request.url,
+            str(index + 1),
+            f"execution-{index}",
+            job.task_name,
+            job.mall_key,
+        ]
+        for index, request in enumerate(requests)
+    ]
+    foreign = [
+        requests[0].sku_id,
+        requests[0].url,
+        "0.01",
+        "RW-lookalike-foreign",
+        "reference-crawl-other-batch",
+        job.mall_key,
+    ]
+    _write_provenance_result(job.result_path, [*current_rows, foreign])
+
+    outcome = _adapter().harvest_existing(job)
+
+    assert outcome.status is HarvestStatus.EXPORTED
+    assert len(outcome.result_by_identity or {}) == 35
+    assert outcome.validation_summary == {
+        "expected": 35,
+        "matched": 35,
+        "missing": 0,
+        "duplicate": 0,
+        "unexpected": 0,
+        "foreign_filtered": 1,
+    }
+
+
+def test_harvest_rejects_duplicate_identity_inside_current_batch(tmp_path):
+    job = _prepare(tmp_path)
+    rows = [
+        ["sku-1", "https://item.jd.com/a", "12.5", "execution-1", job.task_name, job.mall_key],
+        ["sku-1", "https://item.jd.com/a", "13.5", "execution-2", job.task_name, job.mall_key],
+    ]
+    _write_provenance_result(job.result_path, rows)
+
+    outcome = _adapter().harvest_existing(job)
+
+    assert outcome.status is HarvestStatus.FAILED
+
+
+def test_harvest_marks_no_result_when_provenance_filter_leaves_one_request(tmp_path):
+    requests = tuple(
+        _request(f"sku-{index}", f"https://item.jd.com/{index}")
+        for index in range(35)
+    )
+    job = _prepare(tmp_path, requests=requests)
+    _append_submission(job.batch_state_path, expected_subtask_count=35)
+    _append_event(job.batch_state_path, "EXPORTED", output_path=str(job.result_path.resolve()))
+    rows = [
+            [request.sku_id, request.url, "12.5", f"no-default-execution-{index}", job.task_name, job.mall_key]
+        for index, request in enumerate(requests[:-1])
+    ]
+    rows.append(
+        [requests[-1].sku_id, requests[-1].url, "0.01", "foreign", "other-batch", job.mall_key]
+    )
+    _write_provenance_result(job.result_path, rows)
+
+    outcome = _adapter().harvest_existing(job)
+
+    assert outcome.status is HarvestStatus.EXPORTED
+    assert outcome.no_result_identities == frozenset(
+        {(requests[-1].sku_id, requests[-1].url)}
+    )
+
+
+def test_harvest_rejects_when_current_batch_has_one_unexpected_extra_row(tmp_path):
+    requests = tuple(
+        _request(f"sku-{index}", f"https://item.jd.com/{index}")
+        for index in range(35)
+    )
+    job = _prepare(tmp_path, requests=requests)
+    rows = [
+        [request.sku_id, request.url, "12.5", f"execution-{index}", job.task_name, job.mall_key]
+        for index, request in enumerate(requests)
+    ]
+    rows.append(
+        ["unexpected", "https://item.jd.com/unexpected", "1", "execution-extra", job.task_name, job.mall_key]
+    )
+    _write_provenance_result(job.result_path, rows)
+
+    outcome = _adapter().harvest_existing(job)
+
+    assert outcome.status is HarvestStatus.FAILED
+
+
+def test_harvest_rejects_export_without_required_provenance_columns(tmp_path):
+    job = _prepare(tmp_path)
+    _write_result_with_headers(
+        job.result_path,
+        ["商品编码", "原始链接", "商品价格"],
+        [["sku-1", "https://item.jd.com/a", "12.5"]],
+        include_provenance=False,
+    )
+
+    outcome = _adapter().harvest_existing(job)
+
+    assert outcome.status is HarvestStatus.FAILED
+
+
+def test_harvest_rejects_current_batch_row_without_execution_identifier(tmp_path):
+    job = _prepare(tmp_path)
+    _write_provenance_result(
+        job.result_path,
+        [["sku-1", "https://item.jd.com/a", "12.5", "", job.task_name, job.mall_key]],
+    )
+
+    outcome = _adapter().harvest_existing(job)
+
+    assert outcome.status is HarvestStatus.FAILED
+
+
+def test_harvest_rejects_foreign_batch_row_without_execution_identifier(tmp_path):
+    job = _prepare(tmp_path)
+    _write_provenance_result(
+        job.result_path,
+        [
+            ["sku-1", "https://item.jd.com/a", "12.5", "execution-1", job.task_name, job.mall_key],
+            ["foreign", "https://item.jd.com/foreign", "99", "", "other-batch", job.mall_key],
+        ],
+    )
+
+    outcome = _adapter().harvest_existing(job)
+
+    assert outcome.status is HarvestStatus.FAILED
+
+
+def test_harvest_rejects_current_batch_row_from_another_mall(tmp_path):
+    job = _prepare(tmp_path)
+    _write_provenance_result(
+        job.result_path,
+        [["sku-1", "https://item.jd.com/a", "12.5", "execution-1", job.task_name, "other-mall"]],
+    )
+
+    outcome = _adapter().harvest_existing(job)
+
+    assert outcome.status is HarvestStatus.FAILED
+
+
+def test_harvest_rejects_duplicate_execution_inside_current_batch(tmp_path):
+    requests = (
+        _request("sku-1", "https://item.jd.com/a"),
+        _request("sku-2", "https://item.jd.com/b"),
+    )
+    job = _prepare(tmp_path, requests=requests)
+    _write_provenance_result(
+        job.result_path,
+        [
+            ["sku-1", "https://item.jd.com/a", "12.5", "same-execution", job.task_name, job.mall_key],
+            ["sku-2", "https://item.jd.com/b", "13.5", "same-execution", job.task_name, job.mall_key],
+        ],
+    )
+
+    outcome = _adapter().harvest_existing(job)
+
+    assert outcome.status is HarvestStatus.FAILED
+
+
+def test_harvest_selects_the_only_sku_column_matching_durable_identities(tmp_path):
+    job = _prepare(tmp_path, requests=(_request("11858822"),))
+    _write_result_with_headers(
+        job.result_path,
+        ["商品编码", "商品最小品类单元id", "原始链接", "商品价格"],
+        [["2541608", "11858822", "https://item.jd.com/a", "104"]],
+    )
+    calls = []
+
+    outcome = _adapter(runner=lambda *_args: calls.append(1)).harvest(
+        job, timeout_seconds=15
+    )
+
+    assert outcome.status is HarvestStatus.EXPORTED
+    assert outcome.reused_existing is True
+    assert outcome.result_by_identity is not None
+    assert set(outcome.result_by_identity) == {
+        ("11858822", "https://item.jd.com/a")
+    }
+    assert calls == []
+
+
+def test_harvest_rejects_when_no_sku_candidate_column_matches(tmp_path):
+    job = _prepare(tmp_path, requests=(_request("sku-1"),))
+    _write_result_with_headers(
+        job.result_path,
+        ["商品编码", "商品最小品类单元id", "原始链接", "商品价格"],
+        [["wrong-a", "wrong-b", "https://item.jd.com/a", "12.5"]],
+    )
+
+    outcome = _adapter().harvest(job, timeout_seconds=15)
+
+    assert outcome.status is HarvestStatus.FAILED
+
+
+def test_harvest_accepts_rowwise_identical_matching_sku_candidate_columns(tmp_path):
+    job = _prepare(
+        tmp_path,
+        requests=(
+            _request("sku-1", "https://item.jd.com/a"),
+            _request("sku-2", "https://item.jd.com/b"),
+            _request("sku-3", "https://item.jd.com/c"),
+        ),
+    )
+    _write_result_with_headers(
+        job.result_path,
+        ["商品编码", "商品最小品类单元id", "原始链接", "商品价格"],
+        [
+            ["sku-1", "sku-1", "https://item.jd.com/a", "12.5"],
+            ["sku-2", "sku-2", "https://item.jd.com/b", "13.5"],
+            ["sku-3", "sku-3", "https://item.jd.com/c", "14.5"],
+        ],
+    )
+
+    outcome = _adapter().harvest(job, timeout_seconds=15)
+
+    assert outcome.status is HarvestStatus.EXPORTED
+    assert outcome.result_by_identity is not None
+    assert set(outcome.result_by_identity) == {
+        ("sku-1", "https://item.jd.com/a"),
+        ("sku-2", "https://item.jd.com/b"),
+        ("sku-3", "https://item.jd.com/c"),
+    }
+
+
+def test_harvest_accepts_distinct_exported_sku_aliases_for_one_result(tmp_path):
+    shared_url = "https://item.jd.com/a"
+    job = _prepare(
+        tmp_path,
+        requests=(_request("sku-a", shared_url), _request("sku-b", shared_url)),
+    )
+    _append_submission(job.batch_state_path, expected_subtask_count=2)
+    _append_event(
+        job.batch_state_path,
+        "EXPORTED",
+        output_path=str(job.result_path.resolve()),
+    )
+    _write_result_with_headers(
+        job.result_path,
+        ["商品编码", "商品最小品类单元id", "原始链接", "商品价格"],
+        [["sku-a", "sku-b", shared_url, "12.5"]],
+    )
+
+    outcome = _adapter().harvest(job, timeout_seconds=15)
+
+    assert outcome.status is HarvestStatus.EXPORTED
+    assert set(outcome.result_by_identity or {}) == {
+        ("sku-a", shared_url),
+        ("sku-b", shared_url),
+    }
+
+
+def test_harvest_does_not_collapse_sku_candidate_vector_with_null(tmp_path):
+    job = _prepare(tmp_path, requests=(_request("sku-a"),))
+    _write_result_with_headers(
+        job.result_path,
+        ["商品编码", "商品最小品类单元id", "原始链接", "商品价格"],
+        [["sku-a", None, "https://item.jd.com/a", "12.5"]],
+    )
+
+    outcome = _adapter().harvest(job, timeout_seconds=15)
+
+    assert outcome.status is HarvestStatus.FAILED
+
+
+def test_harvest_does_not_collapse_reordered_sku_candidate_vector(tmp_path):
+    job = _prepare(
+        tmp_path,
+        requests=(_request("sku-a", ""), _request("sku-b", "")),
+    )
+    _write_result_with_headers(
+        job.result_path,
+        ["商品编码", "商品最小品类单元id", "原始链接", "商品价格"],
+        [
+            ["sku-a", "sku-b", "", "12.5"],
+            ["sku-b", "sku-a", "", "13.5"],
+        ],
+    )
+
+    outcome = _adapter().harvest(job, timeout_seconds=15)
+
+    assert outcome.status is HarvestStatus.FAILED
+
+
+def test_harvest_accepts_all_exported_sku_alias_columns(tmp_path):
+    shared_url = "https://item.jd.com/a"
+    job = _prepare(
+        tmp_path,
+        requests=(_request("sku-a", shared_url), _request("sku-b", shared_url)),
+    )
+    _append_submission(job.batch_state_path, expected_subtask_count=2)
+    _append_event(
+        job.batch_state_path,
+        "EXPORTED",
+        output_path=str(job.result_path.resolve()),
+    )
+    _write_result_with_headers(
+        job.result_path,
+        ["商品编码", "skuId", "商品最小品类单元id", "原始链接", "商品价格"],
+        [["sku-a", "sku-a", "sku-b", shared_url, "12.5"]],
+    )
+
+    outcome = _adapter().harvest(job, timeout_seconds=15)
+
+    assert outcome.status is HarvestStatus.EXPORTED
+    assert set(outcome.result_by_identity or {}) == {
+        ("sku-a", shared_url),
+        ("sku-b", shared_url),
+    }
+
+
+def test_harvest_keeps_exact_url_validation_after_sku_candidate_collapse(tmp_path):
+    job = _prepare(
+        tmp_path,
+        requests=(_request("sku-a", "https://item.jd.com/expected"),),
+    )
+    _write_result_with_headers(
+        job.result_path,
+        ["商品编码", "商品最小品类单元id", "原始链接", "商品价格"],
+        [["sku-a", "sku-a", "https://item.jd.com/other", "12.5"]],
+    )
+
+    outcome = _adapter().harvest(job, timeout_seconds=15)
+
+    assert outcome.status is HarvestStatus.FAILED
+
+
+def test_harvest_rejects_sku_candidate_that_conflicts_with_another_exact_url(tmp_path):
+    job = _prepare(
+        tmp_path,
+        requests=(
+            _request("sku-1", "https://item.jd.com/a"),
+            _request("sku-2", "https://item.jd.com/b"),
+        ),
+    )
+    _write_result(
+        job.result_path,
+        [
+            ["sku-1", "https://item.jd.com/b", "12.5"],
+            ["sku-2", "https://item.jd.com/a", "13.5"],
+        ],
+    )
+
+    outcome = _adapter().harvest(job, timeout_seconds=15)
+
+    assert outcome.status is HarvestStatus.FAILED
+
+
+def test_harvest_rejects_matching_sku_with_unrelated_export_url(tmp_path):
+    job = _prepare(tmp_path, requests=(_request("sku-1", "https://item.jd.com/a"),))
+    _write_result(
+        job.result_path,
+        [["sku-1", "https://unrelated.example/not-the-request", "12.5"]],
+    )
+    _append_event(
+        job.batch_state_path,
+        "CREATED",
+        mall="qstbg",
+        expected_subtask_count=1,
+    )
+    _append_event(job.batch_state_path, "ENABLED", mall="qstbg")
+    _append_event(
+        job.batch_state_path,
+        "EXPORTED",
+        mall="qstbg",
+        output_path=str(job.result_path),
+    )
+
+    outcome = _adapter().harvest(job, timeout_seconds=15)
+
+    assert outcome.status is HarvestStatus.FAILED
+
+
+def test_harvest_classifies_partial_export_with_exact_export_evidence(tmp_path):
+    job = _prepare(tmp_path, requests=(_request("sku-1"), _request("sku-2")))
+    _write_result(job.result_path, [["sku-1", "https://item.jd.com/a", "12.5"]])
+    _append_submission(job.batch_state_path, expected_subtask_count=2)
+    _append_event(
+        job.batch_state_path,
+        "EXPORTED",
+        output_path=str(job.result_path),
+    )
+
+    outcome = _adapter().harvest(job, timeout_seconds=15)
+
+    assert outcome.status is HarvestStatus.EXPORTED
+    assert outcome.no_result_identities == frozenset(
+        {("sku-2", "https://item.jd.com/a")}
+    )
+
+
+def test_harvest_maps_canonicalized_export_url_by_unique_sku(tmp_path):
+    durable_url = "https://www.lxwlmall.com/detail/inner?skuNo=sku-1"
+    exported_url = "https://www.lxwlmall.com/detail?skuNo=sku-1"
+    job = _prepare(tmp_path, requests=(_request("sku-1", durable_url),))
+    _write_result(job.result_path, [["sku-1", exported_url, "12.5"]])
+    _append_submission(job.batch_state_path)
+    _append_event(
+        job.batch_state_path,
+        "EXPORTED",
+        output_path=str(job.result_path),
+    )
+
+    outcome = _adapter().harvest(job, timeout_seconds=15)
+
+    assert outcome.status is HarvestStatus.EXPORTED
+    assert outcome.result_by_identity is not None
+    assert set(outcome.result_by_identity) == {("sku-1", durable_url)}
+
+
+def test_harvest_maps_exact_qstbg_detail_redirect_by_goods_id(tmp_path):
+    durable_url = "https://www.qstbg.com/gd/detail.do?goods_id=20904038"
+    exported_url = (
+        "https://www.qstbg.com/gd/initParameter.do?"
+        "goods_id=20904038&formid=form1#title_detail"
+    )
+    request = replace(
+        _request("20904038", durable_url),
+        mall_key="qstbg",
+        mall_source_id="42",
+        mall_name="企事通商城",
+    )
+    job = _prepare(tmp_path, requests=(request,))
+    _write_result(
+        job.result_path,
+        [["20904038", exported_url, "1596.58"]],
+        task_name=job.task_name,
+        mall_key=job.mall_key,
+    )
+    _append_event(
+        job.batch_state_path,
+        "CREATED",
+        mall="qstbg",
+        expected_subtask_count=1,
+    )
+    _append_event(job.batch_state_path, "ENABLED", mall="qstbg")
+    _append_event(
+        job.batch_state_path,
+        "EXPORTED",
+        mall="qstbg",
+        output_path=str(job.result_path),
+    )
+
+    outcome = _adapter().harvest(job, timeout_seconds=15)
+
+    assert outcome.status is HarvestStatus.EXPORTED
+    assert outcome.result_by_identity is not None
+    assert set(outcome.result_by_identity) == {("20904038", durable_url)}
+
+
+@pytest.mark.parametrize(
+    "exported_url",
+    [
+        "https://www.qstbg.com/gd/initParameter.do?goods_id=other&formid=form1#title_detail",
+        "https://www.qstbg.com/gd/initParameter.do?goods_id=20904038&formid=other#title_detail",
+        "https://www.qstbg.com/gd/initParameter.do?goods_id=20904038&formid=form1&extra=1#title_detail",
+        "https://qstbg.com/gd/initParameter.do?goods_id=20904038&formid=form1#title_detail",
+    ],
+)
+def test_harvest_trusts_other_qstbg_exported_urls_after_exact_provenance(
+    tmp_path, exported_url
+):
+    durable_url = "https://www.qstbg.com/gd/detail.do?goods_id=20904038"
+    request = replace(
+        _request("20904038", durable_url),
+        mall_key="qstbg",
+        mall_source_id="42",
+        mall_name="企事通商城",
+    )
+    job = _prepare(tmp_path, requests=(request,))
+    _write_result(
+        job.result_path,
+        [["20904038", exported_url, "1596.58"]],
+        task_name=job.task_name,
+        mall_key=job.mall_key,
+    )
+    _append_event(
+        job.batch_state_path,
+        "CREATED",
+        mall="qstbg",
+        expected_subtask_count=1,
+    )
+    _append_event(job.batch_state_path, "ENABLED", mall="qstbg")
+    _append_event(
+        job.batch_state_path,
+        "EXPORTED",
+        mall="qstbg",
+        output_path=str(job.result_path),
+    )
+
+    outcome = _adapter().harvest(job, timeout_seconds=15)
+
+    assert outcome.status is HarvestStatus.EXPORTED
+    result = (outcome.result_by_identity or {})[("20904038", durable_url)]
+    assert result["exported_url"] == exported_url
+
+
+def test_harvest_maps_exact_jd_product_host_alias(tmp_path):
+    durable_url = "https://i-item.jd.com/10132026242240.html"
+    exported_url = "https://item.jd.com/10132026242240.html"
+    job = _prepare(tmp_path, requests=(_request("10132026242240", durable_url),))
+    _write_result(job.result_path, [["10132026242240", exported_url, "0"]])
+    _append_submission(job.batch_state_path)
+    _append_event(
+        job.batch_state_path,
+        "EXPORTED",
+        output_path=str(job.result_path),
+    )
+
+    outcome = _adapter().harvest(job, timeout_seconds=15)
+
+    assert outcome.status is HarvestStatus.EXPORTED
+    assert outcome.result_by_identity is not None
+    assert set(outcome.result_by_identity) == {("10132026242240", durable_url)}
+    assert outcome.result_by_identity[("10132026242240", durable_url)][
+        "page_price_status"
+    ] == "PRICE_IS_ZERO"
+
+
+@pytest.mark.parametrize(
+    "exported_url",
+    [
+        "https://item.jd.com/10132026242241.html",
+        "https://www.jd.com/10132026242240.html",
+        "https://item.jd.com/10132026242240.html?other=1",
+        "https://item.jd.com/product/10132026242240.html",
+        "http://item.jd.com/10132026242240.html",
+    ],
+)
+def test_harvest_trusts_other_jd_exported_urls_after_exact_provenance(
+    tmp_path, exported_url
+):
+    durable_url = "https://i-item.jd.com/10132026242240.html"
+    job = _prepare(tmp_path, requests=(_request("10132026242240", durable_url),))
+    _write_result(job.result_path, [["10132026242240", exported_url, "0"]])
+    _append_submission(job.batch_state_path)
+    _append_event(
+        job.batch_state_path,
+        "EXPORTED",
+        output_path=str(job.result_path),
+    )
+
+    outcome = _adapter().harvest(job, timeout_seconds=15)
+
+    assert outcome.status is HarvestStatus.EXPORTED
+    result = (outcome.result_by_identity or {})[("10132026242240", durable_url)]
+    assert result["exported_url"] == exported_url
 
 
 def test_harvest_rejects_same_count_export_with_wrong_crawl_identity(tmp_path):

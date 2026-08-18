@@ -28,6 +28,13 @@ from app.workflows.work_01_saas_approval_json_audit import (
     sanitize_screenshot_path,
 )
 from scripts.audit_saas_json_file import load_crawl_results, load_records, main as audit_file_main
+import scripts.audit_saas_excel_file as excel_audit_mod
+from scripts.audit_saas_excel_file import (
+    _zhaoshang_failure_detail,
+    load_zhaoshang_auth_env,
+    load_zhaoshang_auth_env_from_export_curl,
+)
+from scripts.curl_utils import internal_subprocess_env, parse_curl_command
 
 
 SAMPLE = {
@@ -60,6 +67,118 @@ def _set_token(value=None):
         os.environ.pop("LOCAL_WORKFLOW_TOKEN", None)
     else:
         os.environ["LOCAL_WORKFLOW_TOKEN"] = value
+
+
+class TestCurlUtils:
+    def test_zhaoshang_failure_detail_preserves_full_output_and_redacts_auth(self):
+        detail = _zhaoshang_failure_detail(RuntimeError(
+            "--- STDOUT ---\n"
+            "rspCode=3333\n"
+            "Cookie: x-access-token=secret; refreshToken=refresh\n"
+            "Blade-Auth: bearer secret-token\n"
+            + "diagnostic-line\n" * 80
+        ))
+
+        assert "rspCode=3333" in detail
+        assert "diagnostic-line" in detail
+        assert "secret-token" not in detail
+        assert "x-access-token=secret" not in detail
+
+    def test_parse_browser_curl_keeps_json_body_and_cookie(self):
+        curl_text = """curl 'http://saasportal.iio.com/improxy/saas/iio2/sameAudit/queryAll' \\
+  -H 'Accept: application/json, text/plain, */*' \\
+  -H 'Content-Type: application/json' \\
+  -b 'x-access-token=token; refreshToken=refresh' \\
+  --data-raw '{"commodityId":"","page":1,"limit":10,"tenantId":"188605","commodityPoolId":"222"}' \\
+  --insecure"""
+        parsed = parse_curl_command(curl_text)
+        assert parsed["url"].endswith("/sameAudit/queryAll")
+        assert parsed["method"] == "POST"
+        assert parsed["cookie"] == "x-access-token=token; refreshToken=refresh"
+        assert json.loads(parsed["data"])["tenantId"] == "188605"
+
+    def test_parse_zhaoshang_curl_keeps_blade_auth_and_cookie_header(self):
+        curl_text = """curl 'http://zhaosj.iioprod.com/improxy/iio/crawl/crawlTaskManage/exportTask' \\
+  -H 'Blade-Auth: bearer token-value' \\
+  -H 'Content-Type: application/json' \\
+  -b '__itrace_wid=abc; x-access-token=token; refreshToken=refresh' \\
+  --data-raw '{"taskNumber":"RW-1","taskId":1,"mallLogo":"jd"}' \\
+  --insecure"""
+        parsed = parse_curl_command(curl_text)
+        assert parsed["headers_dict"]["Blade-Auth"] == "bearer token-value"
+        assert parsed["headers_dict"]["Cookie"].startswith("__itrace_wid=abc")
+        assert json.loads(parsed["body"])["mallLogo"] == "jd"
+
+    def test_detail_request_preserves_cnnc_y1_header_case(self):
+        seen = {}
+
+        def opener(request, timeout=15.0):
+            seen.update(dict(request.header_items()))
+            return MockResponse(b'{"rspCode":"0000","success":true}')
+
+        result = excel_audit_mod.call_detail_api(
+            {
+                "url": "https://api.example.com/detail",
+                "headers": [
+                    ("Content-Type", "application/json"),
+                    ("y1AmuISe", "signed-value"),
+                ],
+                "cookie": "auth-token=token",
+                "data": '{"documentId":"sample","fourCategoryId":"sample"}',
+                "method": "POST",
+            },
+            "doc1",
+            "cat1",
+            opener=opener,
+        )
+
+        assert result["ok"] is True
+        assert seen["y1AmuISe"] == "signed-value"
+        assert "Y1amuise" not in seen
+
+    def test_internal_subprocess_env_removes_proxy_and_adds_internal_no_proxy(self):
+        env = internal_subprocess_env({
+            "HTTP_PROXY": "http://127.0.0.1:7890",
+            "HTTPS_PROXY": "http://127.0.0.1:7890",
+            "NO_PROXY": "localhost",
+        })
+        assert "HTTP_PROXY" not in env
+        assert "HTTPS_PROXY" not in env
+        assert "saasportal.iio.com" in env["NO_PROXY"]
+        assert "zhaosj.iioprod.com" in env["NO_PROXY"]
+
+    def test_load_zhaoshang_auth_from_state_sets_env(self, tmp_path, monkeypatch):
+        curl_file = tmp_path / "zhaoshang.curl"
+        curl_file.write_text(
+            """curl 'http://zhaosj.iioprod.com/improxy/iio/crawl/crawlTaskManage/exportTask' \\
+  -H 'Blade-Auth: bearer token-value' \\
+  -H 'Content-Type: application/json' \\
+  -b '__itrace_wid=abc; x-access-token=token; refreshToken=refresh' \\
+  --data-raw '{"taskNumber":"RW-1","taskId":1,"mallLogo":"jd"}' \\
+  --insecure""",
+            encoding="utf-8",
+        )
+        monkeypatch.delenv("BLADE_AUTH", raising=False)
+        monkeypatch.delenv("COOKIE", raising=False)
+
+        class FakeAuthManager:
+            state_path = tmp_path / "auth_state.json"
+
+            def export_environment(self, system="zhaoshang", *, refresh=True):
+                assert system == "zhaoshang"
+                assert refresh is True
+                return {
+                    "BLADE_AUTH": "bearer state-token",
+                    "COOKIE": "x-access-token=state-token; refreshToken=state-refresh",
+                }
+
+        manager = FakeAuthManager()
+        assert load_zhaoshang_auth_env(auth_manager=manager) == manager.state_path
+        assert os.environ["BLADE_AUTH"] == "bearer state-token"
+        assert os.environ["COOKIE"].endswith("refreshToken=state-refresh")
+        assert load_zhaoshang_auth_env_from_export_curl(
+            curl_file, auth_manager=manager
+        ) is True
 
 
 @pytest.fixture(autouse=True)
@@ -274,6 +393,19 @@ def test_parse_batch_rich_title_model_response():
     assert parsed[0].confidence == 0.91
     assert parsed[1].match_result == "MANUAL_REVIEW"
     assert parsed[1].risk_points == ["缺品牌"]
+
+
+def test_parse_batch_title_model_response_allows_unknown_optional_booleans():
+    parsed = _parse_batch_model_response(
+        '{"results":[{"index":0,"match_result":"SAME","confidence":0.91,'
+        '"brand_match":"unknown","model_match":"exact","spec_match":"unknown",'
+        '"risk_points":[],"reason":"ok"}]}',
+        1,
+    )
+
+    assert parsed[0].match_result == "SAME"
+    assert parsed[0].brand_match is None
+    assert parsed[0].spec_match is None
 
 
 def test_model_same_participates_in_approve():
@@ -778,6 +910,25 @@ def test_batch_title_model_uses_cache(monkeypatch):
 
     assert len(calls) == 1
     assert [r.title_match_result for r in response.record_results] == ["SAME", "SAME"]
+
+
+def test_precomputed_title_results_match_model_path_without_model_calls(monkeypatch):
+    records = [_item(vCommodityId="v1", pageActualPrice="10.00")]
+    key = audit_mod._title_model_cache_key(records[0])
+    supplied = {
+        key: TitleMatchModelResult(
+            match_result="SAME", confidence=1.0, model_match="exact", spec_match=True, reason="cached"
+        )
+    }
+    monkeypatch.setattr(audit_mod, "_precompute_title_model_results", lambda _records: supplied)
+    expected = audit_saas_approval_records(records, use_model=True, use_crawl_result=False)
+    monkeypatch.setattr(audit_mod, "_precompute_title_model_results", lambda _records: pytest.fail("model must not be called"))
+    actual = audit_saas_approval_records(
+        records, use_model=True, use_crawl_result=False, precomputed_title_model_results=supplied
+    )
+    assert actual.record_results == expected.record_results
+    with pytest.raises(ValueError, match="missing"):
+        audit_saas_approval_records(records, use_model=True, precomputed_title_model_results={})
 
 
 def test_summary_group_counts():
@@ -1532,8 +1683,11 @@ from scripts.audit_saas_excel_file import (
     SAAS_PENDING_HEADERS,
     build_customer_index,
     compute_over_30_check,
+    backfill_zhaoshang_results_into_workbook,
+    _display_header,
     is_jd_link,
     join_saas_with_customer,
+    read_zhaoshang_result_xlsx,
     read_saas_pending_json,
 )
 
@@ -1707,6 +1861,301 @@ class TestOver30Check:
         check, over = compute_over_30_check(Decimal("100"), None, "FAILED")
         assert check == "PAGE_PRICE_MISSING"
         assert over == ""
+
+
+class TestZhaoshangZeroPriceStatus:
+    def test_zero_price_uses_highlightable_status(self, tmp_path):
+        from openpyxl import Workbook
+
+        result_path = tmp_path / "result.xlsx"
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet.append(["url", "page_price", "status"])
+        sheet.append(["https://example.com/item/1", 0, "success"])
+        workbook.save(result_path)
+
+        result = read_zhaoshang_result_xlsx(result_path)
+
+        assert result["https://example.com/item/1"]["page_price_status"] == "PRICE_IS_ZERO"
+
+    def test_late_backfill_recomputes_changed_price_and_highlight(self, tmp_path):
+        from openpyxl import Workbook, load_workbook
+
+        source_path = tmp_path / "source.xlsx"
+        output_path = tmp_path / "output.xlsx"
+        result_path = tmp_path / "zhaoshang.xlsx"
+        fields = [
+            "extLink", "price", "customerPrice", "saas_price_vs_customer",
+            "page_price_value", "page_price_status", "page_price_source",
+            "page_vs_customer_check", "over_30pct", "price_changed", "final_decision",
+        ]
+        workbook = Workbook()
+        workbook.active.title = "summary"
+        sheet = workbook.create_sheet("record_results")
+        sheet.append([_display_header(field) for field in fields])
+        sheet.append([
+            "https://example.com/item/1", 100, 100, "SAAS_WITHIN_CUSTOMER_THRESHOLD",
+            None, "", "", "", "", "", "",
+        ])
+        workbook.save(source_path)
+
+        result_workbook = Workbook()
+        result_sheet = result_workbook.active
+        result_sheet.append(["url", "page_price", "status"])
+        result_sheet.append(["https://example.com/item/1", 120, "success"])
+        result_workbook.save(result_path)
+
+        stats = backfill_zhaoshang_results_into_workbook(
+            source_path,
+            output_path,
+            {"test": {"ok": True, "result_path": str(result_path)}},
+        )
+        updated = load_workbook(output_path)["record_results"]
+        headers = [cell.value for cell in updated[1]]
+        assert stats["backfilled"] == 1
+        assert updated.cell(2, headers.index(_display_header("price_changed")) + 1).value == "CHANGED"
+        assert updated.cell(2, headers.index(_display_header("final_decision")) + 1).value == "REJECT_PRICE_CHANGED"
+        assert updated.cell(2, 1).fill.fgColor.rgb == "00FFC7CE"
+
+    def test_late_backfill_matches_unique_product_code_when_source_url_is_blank(self, tmp_path):
+        from openpyxl import Workbook, load_workbook
+
+        source_path = tmp_path / "source.xlsx"
+        output_path = tmp_path / "output.xlsx"
+        result_path = tmp_path / "zhaoshang.xlsx"
+        fields = [
+            "skuId", "extLink", "price", "customerPrice", "saas_price_vs_customer",
+            "page_price_value", "page_price_status", "page_price_source",
+            "page_vs_customer_check", "over_30pct", "price_changed", "final_decision",
+        ]
+        workbook = Workbook()
+        workbook.active.title = "summary"
+        sheet = workbook.create_sheet("record_results")
+        sheet.append([_display_header(field) for field in fields])
+        sheet.append([
+            "HX-001", "", 100, 100, "SAAS_WITHIN_CUSTOMER_THRESHOLD",
+            None, "", "", "", "", "", "",
+        ])
+        workbook.save(source_path)
+
+        result_workbook = Workbook()
+        result_sheet = result_workbook.active
+        result_sheet.append(["商品编码", "商品价格", "商品详情地址"])
+        result_sheet.append(["HX-001", 120, "https://example.com/generated/1"])
+        result_workbook.save(result_path)
+
+        stats = backfill_zhaoshang_results_into_workbook(
+            source_path,
+            output_path,
+            {"test": {"ok": True, "result_path": str(result_path)}},
+        )
+        updated = load_workbook(output_path)["record_results"]
+        headers = [cell.value for cell in updated[1]]
+        assert stats["backfilled"] == 1
+        assert updated.cell(2, headers.index(_display_header("page_price_value")) + 1).value == "120"
+        assert updated.cell(2, headers.index(_display_header("price_changed")) + 1).value == "CHANGED"
+
+    def test_late_backfill_matches_unique_product_code_when_result_url_is_rewritten(self, tmp_path):
+        from openpyxl import Workbook, load_workbook
+
+        source_path = tmp_path / "source.xlsx"
+        output_path = tmp_path / "output.xlsx"
+        result_path = tmp_path / "zhaoshang.xlsx"
+        fields = [
+            "skuId", "extLink", "price", "customerPrice", "saas_price_vs_customer",
+            "page_price_value", "page_price_status", "page_price_source",
+            "page_vs_customer_check", "over_30pct", "price_changed", "final_decision",
+        ]
+        workbook = Workbook()
+        workbook.active.title = "summary"
+        sheet = workbook.create_sheet("record_results")
+        sheet.append([_display_header(field) for field in fields])
+        sheet.append([
+            "LX-001", "https://example.com/detail/inner?skuNo=LX-001", 100, 100,
+            "SAAS_WITHIN_CUSTOMER_THRESHOLD", None, "", "", "", "", "", "",
+        ])
+        workbook.save(source_path)
+
+        result_workbook = Workbook()
+        result_sheet = result_workbook.active
+        result_sheet.append(["商品编码", "商品价格", "商品详情地址"])
+        result_sheet.append(["LX-001", 120, "https://example.com/detail?skuNo=LX-001"])
+        result_workbook.save(result_path)
+
+        stats = backfill_zhaoshang_results_into_workbook(
+            source_path,
+            output_path,
+            {"test": {"ok": True, "result_path": str(result_path)}},
+        )
+        updated = load_workbook(output_path)["record_results"]
+        headers = [cell.value for cell in updated[1]]
+        assert stats["backfilled"] == 1
+        assert updated.cell(2, headers.index(_display_header("page_price_value")) + 1).value == "120"
+
+    def test_late_backfill_recomputes_unmatched_rows_for_final_workbook(self, tmp_path):
+        from openpyxl import Workbook, load_workbook
+
+        source_path = tmp_path / "source.xlsx"
+        output_path = tmp_path / "output.xlsx"
+        fields = [
+            "extLink", "price", "customerPrice", "saas_price_vs_customer",
+            "page_price_value", "page_price_status", "page_price_source",
+            "page_vs_customer_check", "over_30pct", "price_changed", "final_decision",
+        ]
+        workbook = Workbook()
+        workbook.active.title = "summary"
+        sheet = workbook.create_sheet("record_results")
+        sheet.append([_display_header(field) for field in fields])
+        sheet.append([
+            "https://example.com/missing/1", 100, 100, "SAAS_WITHIN_CUSTOMER_THRESHOLD",
+            None, "PENDING_CRAWL", "", "STALE", "TRUE", "CHANGED", "REJECT_BOTH",
+        ])
+        workbook.save(source_path)
+
+        stats = backfill_zhaoshang_results_into_workbook(
+            source_path,
+            output_path,
+            {},
+        )
+
+        updated = load_workbook(output_path)["record_results"]
+        headers = [cell.value for cell in updated[1]]
+        value = lambda field: updated.cell(2, headers.index(_display_header(field)) + 1).value
+        assert stats["backfilled"] == 0
+        assert value("page_vs_customer_check") == "PAGE_PRICE_MISSING"
+        assert value("over_30pct") is None
+        assert value("price_changed") == "PRICE_UNAVAILABLE"
+        assert value("final_decision") == "PASS"
+
+
+class TestProductionFallbackGates:
+    def test_stbchina_fallback_is_opt_in(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("AUDIT_SUPPRESS_EXCLUDED_EXPORT", "1")
+        saas_row = {
+            **SAMPLE_SAAS_PENDING_ROW,
+            "extLink": "https://www.stbchina.cn/product?itemId=1",
+        }
+        saas_path = _write_pending_json(tmp_path, [saas_row])
+        cust_path = _write_customer_json(tmp_path, [SAMPLE_CUSTOMER_ROW])
+        out = tmp_path / "out.xlsx"
+        monkeypatch.setattr(
+            excel_audit_mod,
+            "run_stbchina_crawler",
+            lambda *_args, **_kwargs: pytest.fail(
+                "史泰博脚本不得在未授权时自动运行"
+            ),
+        )
+
+        result = excel_audit_mod.run_main(
+            output_xlsx=out,
+            input_saas_json=saas_path,
+            input_customer_json=cust_path,
+        )
+
+        assert result["stbchina"] == {"enabled": False}
+        assert out.exists()
+
+    def test_stbchina_fallback_requires_zhaoshang_stage(self, tmp_path):
+        with pytest.raises(ValueError, match="招商局阶段启用"):
+            excel_audit_mod.run_main(
+                output_xlsx=tmp_path / "out.xlsx",
+                input_xlsx=tmp_path / "unused.xlsx",
+                auto_stbchina_fallback=True,
+            )
+
+    def test_zhaoshang_failure_stops_before_final_workbook(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        monkeypatch.setenv("AUDIT_SUPPRESS_EXCLUDED_EXPORT", "1")
+        saas_path = _write_pending_json(tmp_path, [SAMPLE_SAAS_PENDING_ROW])
+        cust_path = _write_customer_json(tmp_path, [SAMPLE_CUSTOMER_ROW])
+        out = tmp_path / "out.xlsx"
+        submitted = []
+        monkeypatch.setattr(excel_audit_mod, "load_zhaoshang_auth_env", lambda: None)
+        monkeypatch.setattr(
+            excel_audit_mod,
+            "run_zhaoshang_tasks",
+            lambda **kwargs: submitted.append(kwargs)
+            or {"测试商城": {"ok": False, "error": "priority update failed"}},
+        )
+
+        with pytest.raises(RuntimeError, match="招商局阶段未完成"):
+            excel_audit_mod.run_main(
+                output_xlsx=out,
+                input_saas_json=saas_path,
+                input_customer_json=cust_path,
+                zhaoshang_task_enabled=True,
+            )
+
+        assert not out.exists()
+        assert submitted[0]["batch_state_path"] == tmp_path / "BATCH_STATE.md"
+
+    def test_zhaoshang_task_result_preserves_priority_evidence(
+        self, tmp_path, monkeypatch
+    ):
+        template = tmp_path / "mall.xlsx"
+        template.write_bytes(b"placeholder")
+        state = tmp_path / "BATCH_STATE.md"
+        state.write_text("状态：ACTIVE\n", encoding="utf-8")
+        calls = []
+
+        def fake_run_crawl_task(**kwargs):
+            calls.append(kwargs)
+            return {
+                "result_path": str(tmp_path / "result.xlsx"),
+                "main_task_id": 123,
+                "task_number": "RW-123",
+                "priority_state": "already_highest_priority",
+                "affected_rows": 0,
+                "already_highest_count": 8,
+            }
+
+        monkeypatch.setattr(
+            excel_audit_mod,
+            "_load_zhaoshang_run_crawl_task",
+            lambda _path: fake_run_crawl_task,
+        )
+
+        result = excel_audit_mod.run_zhaoshang_tasks(
+            {
+                "测试商城": {
+                    "deduped": 8,
+                    "path": template,
+                    "mall_key": "test-mall",
+                }
+            },
+            tool_path=tmp_path / "wrapper.py",
+            max_workers=1,
+            batch_state_path=state,
+        )
+
+        assert calls[0]["batch_state_path"] == state
+        assert result["测试商城"]["main_task_id"] == 123
+        assert result["测试商城"]["task_number"] == "RW-123"
+        assert result["测试商城"]["priority_state"] == "already_highest_priority"
+        assert result["测试商城"]["already_highest_count"] == 8
+
+    @pytest.mark.parametrize(
+        "result",
+        [
+            {"result_path": "result.xlsx"},
+            {
+                "result_path": "result.xlsx",
+                "priority_state": "updated",
+                "affected_rows": 0,
+            },
+            {
+                "result_path": "result.xlsx",
+                "priority_state": "already_highest_priority",
+                "already_highest_count": 0,
+            },
+        ],
+    )
+    def test_zhaoshang_priority_evidence_fails_closed(self, result):
+        with pytest.raises(RuntimeError, match="证据|提优状态|验证行数"):
+            excel_audit_mod._validate_zhaoshang_priority_evidence(result)
 
 
 class TestRunMainSaasJsonExclusivity:
@@ -2192,7 +2641,7 @@ class TestApplyCrawlResults:
     def test_apply_success_high_price_marks_over_30pct(self, tmp_path):
         rows = [
             {**SAMPLE_SAAS_PENDING_ROW, "vCommodityId": "v1",
-             "extLink": "https://www.ehsy.com/product-A",
+             "extLink": "https://example.com/product-A",
              "customerPrice": "100", "queryStr": "test", "skuName": "test"},
         ]
         cust_rows = [{"documentId": "v1", "fourCategoryId": "c", "fourCategoryName": "n", "referencePrice": "100"}]
@@ -2206,7 +2655,7 @@ class TestApplyCrawlResults:
         )
         # 模拟爬虫返回 page_price=131
         crawl_results = {
-            "https://www.ehsy.com/product-A": {
+            "https://example.com/product-A": {
                 "page_price_value": Decimal("131"),
                 "page_price_status": "OK",
                 "page_price_source": "震坤行",
@@ -2237,7 +2686,7 @@ class TestApplyCrawlResults:
     def test_apply_success_within_threshold_marks_false(self, tmp_path):
         rows = [
             {**SAMPLE_SAAS_PENDING_ROW, "vCommodityId": "v1",
-             "extLink": "https://www.ehsy.com/product-A",
+             "extLink": "https://example.com/product-A",
              "customerPrice": "100", "queryStr": "test", "skuName": "test"},
         ]
         cust_rows = [{"documentId": "v1", "fourCategoryId": "c", "fourCategoryName": "n", "referencePrice": "100"}]
@@ -2250,7 +2699,7 @@ class TestApplyCrawlResults:
             input_customer_json=cust_path,
         )
         crawl_results = {
-            "https://www.ehsy.com/product-A": {
+            "https://example.com/product-A": {
                 "page_price_value": Decimal("90"),
                 "page_price_status": "OK",
                 "page_price_source": "震坤行",
@@ -2274,7 +2723,7 @@ class TestApplyCrawlResults:
     def test_apply_crawler_process_failed_marks_pending_rows(self, tmp_path):
         rows = [
             {**SAMPLE_SAAS_PENDING_ROW, "vCommodityId": "v1",
-             "extLink": "https://www.ehsy.com/product-A",
+             "extLink": "https://example.com/product-A",
              "customerPrice": "100"},
         ]
         cust_rows = [{"documentId": "v1", "fourCategoryId": "c", "fourCategoryName": "n", "referencePrice": "100"}]
@@ -2303,7 +2752,7 @@ class TestApplyCrawlResults:
     def test_apply_url_not_returned_marks_failed(self, tmp_path):
         rows = [
             {**SAMPLE_SAAS_PENDING_ROW, "vCommodityId": "v1",
-             "extLink": "https://www.ehsy.com/product-A",
+             "extLink": "https://example.com/product-A",
              "customerPrice": "100"},
         ]
         cust_rows = [{"documentId": "v1", "fourCategoryId": "c", "fourCategoryName": "n", "referencePrice": "100"}]
@@ -2373,16 +2822,16 @@ class TestExcludedTemplateAutoExport:
         export_info = result["excluded_export"]
         assert export_info["enabled"] is True
         assert "京东" in export_info
-        assert "震坤行" in export_info
+        assert "震坤行商城" in export_info
         assert export_info["京东"]["matched"] == 1
-        assert export_info["震坤行"]["matched"] == 1
+        assert export_info["震坤行商城"]["matched"] == 1
 
         # 检查文件存在
         date_subdirs = list(excluded_root.iterdir())
         assert len(date_subdirs) == 1
         date_dir = date_subdirs[0]
         assert (date_dir / "京东.xlsx").exists()
-        assert (date_dir / "震坤行.xlsx").exists()
+        assert (date_dir / "震坤行商城.xlsx").exists()
         assert (date_dir / "summary.txt").exists()
 
         # 检查 xlsx 表头与内容

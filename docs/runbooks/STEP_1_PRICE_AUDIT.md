@@ -49,7 +49,7 @@
 7. **模型标题校验**：先去重再分批。生产稳定参数为 `TITLE_MATCH_MODEL_BATCH_SIZE=10`、`TITLE_MATCH_MODEL_BATCH_CONCURRENCY=1`。HTTP、超时、解析失败或缺行必须重试；只有模型成功返回时才可出现业务结论“人工复核”。
 8. **生成招商局模板**：按商城/sourceId 拆分，有 URL 时优先按域名确定商城，仅 URL 空时才使用供应商关键词；商品编码必填，URL 可空，仅 URL 而无商品编码的行禁止建任务。按商城内商品编码+URL 去重，模板写到 `爬取模板/<日期>/`，不得覆盖原输入。
 9. **招商局全链路**：先刷新招商局 Token，再对每个支持商城执行 `add -> 精确 task_name 查询 -> updateState 启用 -> 当前任务优先级轮询/更新 -> 等待完成 -> exportTask`。任务名在正式创建前生成，固定为 `cnnc_current_opt_<商城名>_<至少14位纯数字时间标识>`；并发默认 6。主任务查询必须精确得到唯一的 taskNumber 和与 `MALL_CONFIG` 一致的 mall code，不得取模糊查询首条或默认商城。每次真实 add、启用、提优和导出后立即把 taskId、taskNumber 和结果写入本批次 `BATCH_STATE.md`。`/add` 发出后任何认证或网络异常都暂停，不得自动重试创建。
-10. **受控提优**：`taskNumber` 不是唯一任务标识，同一编号可属于多个商城。必须把本次 add payload 的有效子任务数传入提优工具，先用 `mall` 首列的现有 `idx_opt_distinctmall`，结合 `task_num + create_time` 窗口轮询到数量完全一致的当前商城 `task_id`；少于预期继续等，多于预期立即失败。随后以主键 `SELECT ... FOR UPDATE` 做当前读和锁定，仅按这些主键分批更新活动且有效的行；禁止锁定宽范围 mall 扫描，禁止 `task_num` 单条件或 `batch_num LIKE` 回退。只有 `affected_rows>0` 可报告本次已提优；预查确认目标已全部为 `-1` 时记录独立的幂等状态，不称为本次提优。若目标已全部完成，记录“任务已完成、未确认提优”后导出；已有活动任务但没有本次提优证据时记录 `ACTIVE_UNCONFIRMED` 并暂停。其他 0 行、越界或异常立即暂停，不得放宽 SQL。
+10. **受控提优**：`taskNumber` 不是唯一任务标识，同一编号可属于多个商城。必须把本次 add payload 的有效子任务数传入提优工具，先用 `mall` 首列的现有 `idx_opt_distinctmall`，结合 `task_num + create_time` 窗口轮询到数量完全一致的当前商城有效 `task_id`；少于预期继续等，多于预期立即失败。随后以主键 `SELECT ... FOR UPDATE` 做当前读和锁定，仅按这些主键分批更新尚未为 `weight_type=-1` 的有效行；`task_status` 只表示采集进度，不得参与 priority 的 SELECT、UPDATE 或回读成功判定。禁止锁定宽范围 mall 扫描，禁止 `task_num` 单条件或 `batch_num LIKE` 回退。只有 `affected_rows>0` 可报告本次已提优；预查确认全部精确行已为 `-1` 时记录独立的幂等状态，不称为本次提优。无论任务正在执行还是已经完成，只有回读确认 `expected == matched == weight_type=-1` 才可记录 priority 成功；其他 0 行、越界或异常立即暂停，不得放宽 SQL。
 11. **回填并复算**：所有首次或后补结果都走同一回填逻辑，重新计算 `page_vs_customer_check`、`price_changed`、`over_30pct`、`final_decision`。数值 0 标记“价格为0”并整行高亮；SaaS JSON 价与本次页面价不同必须标记价格变动。
 12. **缺价门**：汇总招商局未覆盖、失败、导出无价格和未回填 URL。先写清单，把本批次 `BATCH_STATE.md` 设为 `WAITING_USER` 或真实故障对应的 `BLOCKED`，再暂停当前批次；用户明确授权后可以在原任务继续，且结果另存后重新回填复算。其他批次不受影响。
 13. **最终验收**：最终 Excel 行数必须等于本轮 SaaS 总数，文件可打开，所有阶段均有状态证据。完成后把本批次 `BATCH_STATE.md` 改为 `COMPLETE`；不得修改其他批次状态。
@@ -98,10 +98,10 @@ python scripts\audit_saas_excel_file.py `
 - 中核 query/detail 认证、代理或请求头大小写异常。
 - 模型配置存在但持续失败。
 - 招商局 `/add` 认证失败、payload/模板错误、任务创建或启用失败。
-- 优先级复合身份或主键范围异常、活动任务实际更新 `affected_rows=0`、需要放宽 SQL 才能继续。
+- 优先级复合身份或主键范围异常、存在待更新行但实际更新 `affected_rows=0`、回读未全部为 `-1`、需要放宽 SQL 才能继续。
 - 招商局未覆盖、导出无价格或仍有未回填链接，且用户尚未授权脚本兜底。
 - 最终 Excel 行数、价格回填数或决策统计无法对账。
 
 ## 完成汇报
 
-至少给出：SaaS 总数、中核总数、客户价状态分布、模型结论分布、招商局成功/失败商城、确认提优/完成未确认提优任务数、回填数、0 价格数、价格变动数、最终决策分布、缺价数、输出和日志路径。
+至少给出：SaaS 总数、中核总数、客户价状态分布、模型结论分布、招商局成功/失败商城、priority 更新/幂等确认任务数、回填数、0 价格数、明确 `NO_RESULT` 数、价格变动数、最终决策分布、缺价数、输出和日志路径。`NO_RESULT` 必须保留原缺失证据且价格留空，不得与真实 0 价格合并。

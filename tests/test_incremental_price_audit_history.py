@@ -375,7 +375,11 @@ def test_real_history_multitick_incremental_materializes_like_legacy_writer(tmp_
         return DiscoveredState(
             observed_at=next(observed), headers=headers, rows=snapshot_rows,
             source_fingerprints=snapshot_sources, customer_fingerprints=snapshot_customers,
-            evidence={"fixture": batch},
+                evidence={
+                    "fixture": batch,
+                    "saas_count": len(snapshot_rows),
+                    "customer_count": len(rows),
+                },
         )
 
     def detail(row, _timeout):

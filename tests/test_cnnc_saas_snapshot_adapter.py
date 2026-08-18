@@ -218,6 +218,35 @@ def test_safe_transport_failure_retries_then_succeeds():
     assert sleeps == [1.0]
 
 
+def test_timeout_retries_a_second_request_when_discovery_deadline_remains():
+    adapter, opener = _adapter(
+        [
+            TimeoutError("first request timed out"),
+            _ok([{"vCommodityId": "a"}], 1),
+            _ok([], 0),
+        ]
+    )
+
+    snapshot = adapter.fetch(max_elapsed_seconds=180)
+
+    assert snapshot.saas_count == 1
+    assert len(opener.requests) == 3
+    assert opener.timeouts == [60, 60, 60]
+
+
+def test_three_timeouts_exhaust_existing_finite_retry_policy():
+    adapter, opener = _adapter(
+        [TimeoutError("one"), TimeoutError("two"), TimeoutError("three")]
+    )
+
+    with pytest.raises(SnapshotFetchExhausted) as caught:
+        adapter.fetch(max_elapsed_seconds=180)
+
+    assert caught.value.attempts == 3
+    assert isinstance(caught.value.last_cause, TimeoutError)
+    assert len(opener.requests) == 3
+
+
 def test_finite_attempt_exhaustion_has_page_context():
     adapter, _opener = _adapter(
         [error.URLError("one"), error.URLError("two")],

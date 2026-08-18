@@ -16,6 +16,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
+from time import time_ns
 from typing import Any, Iterator, Mapping, Sequence
 
 
@@ -56,15 +57,23 @@ class ProcessLock:
 
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
+        self.metadata_path = self.path.with_name(f"{self.path.name}.owner.json")
         self._file: Any | None = None
         self._held = False
+        self._depth = 0
+        self._owns_metadata = False
 
     @property
     def held(self) -> bool:
         return self._held
 
-    def acquire(self) -> "ProcessLock":
+    @property
+    def identity(self) -> str:
+        return str(self.path.resolve())
+
+    def acquire(self, *, owner: Mapping[str, Any] | None = None) -> "ProcessLock":
         if self._held:
+            self._depth += 1
             return self
         self.path.parent.mkdir(parents=True, exist_ok=True)
         handle = self.path.open("a+b")
@@ -88,12 +97,96 @@ class ProcessLock:
             raise LeaseUnavailable(f"process lock is already held: {self.path}") from exc
         self._file = handle
         self._held = True
+        self._depth = 1
+        try:
+            # Metadata is never authoritative.  Clear crash leftovers while
+            # the OS lock is held so a probe cannot attribute a new owner to
+            # the previous process during the atomic metadata refresh.
+            self.metadata_path.unlink(missing_ok=True)
+            if owner is not None:
+                self._write_owner(owner)
+        except BaseException:
+            self._depth = 1
+            self.release()
+            raise
         return self
+
+    def _write_owner(self, owner: Mapping[str, Any]) -> None:
+        payload = dict(owner)
+        payload["lock_identity"] = self.identity
+        temporary = self.metadata_path.with_name(
+            f".{self.metadata_path.name}.{os.getpid()}.{time_ns()}.tmp"
+        )
+        try:
+            with temporary.open("x", encoding="utf-8", newline="\n") as stream:
+                json.dump(payload, stream, ensure_ascii=False, sort_keys=True)
+                stream.write("\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, self.metadata_path)
+            self._owns_metadata = True
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    @classmethod
+    def inspect(cls, path: str | Path) -> dict[str, Any]:
+        """Probe an existing OS lock without creating or changing runtime state."""
+        probe = cls(path)
+        result: dict[str, Any] = {
+            "active": False,
+            "lock_identity": probe.identity,
+        }
+        if not probe.path.is_file():
+            return result
+        try:
+            handle = probe.path.open("r+b")
+        except OSError:
+            return result
+        try:
+            try:
+                if os.name == "nt":
+                    import msvcrt
+
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                else:  # pragma: no cover - Windows is the production target.
+                    import fcntl
+
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                return result
+            except (BlockingIOError, OSError):
+                result["active"] = True
+        finally:
+            handle.close()
+        try:
+            metadata = json.loads(probe.metadata_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            metadata = {}
+        if isinstance(metadata, dict):
+            for key in (
+                "business_date",
+                "pid",
+                "command",
+                "started_at",
+                "invocation",
+            ):
+                if metadata.get(key) not in (None, ""):
+                    result[key] = metadata[key]
+        return result
 
     def release(self) -> None:
         if not self._held or self._file is None:
             return
+        if self._depth > 1:
+            self._depth -= 1
+            return
         try:
+            if self._owns_metadata:
+                self.metadata_path.unlink(missing_ok=True)
+                self._owns_metadata = False
             if os.name == "nt":
                 import msvcrt
 
@@ -107,6 +200,7 @@ class ProcessLock:
             self._file.close()
             self._file = None
             self._held = False
+            self._depth = 0
 
     def __enter__(self) -> "ProcessLock":
         return self.acquire()
@@ -272,6 +366,30 @@ class DailyAuditStore:
                 connection.execute("ALTER TABLE remote_jobs ADD COLUMN harvest_attempts INTEGER NOT NULL DEFAULT 0")
             if "harvest_elapsed_seconds" not in columns:
                 connection.execute("ALTER TABLE remote_jobs ADD COLUMN harvest_elapsed_seconds REAL NOT NULL DEFAULT 0")
+            collision = connection.execute(
+                """SELECT run_id, TRIM(remote_identity) AS remote_identity, COUNT(*) AS collision_count
+                   FROM remote_jobs
+                   WHERE remote_identity IS NOT NULL AND TRIM(remote_identity) <> ''
+                   GROUP BY run_id, TRIM(remote_identity)
+                   HAVING COUNT(*) > 1
+                   ORDER BY run_id, remote_identity
+                   LIMIT 1"""
+            ).fetchone()
+            if collision is not None:
+                raise RemoteIntentConflict(
+                    "duplicate remote_identity blocks the daily-store schema migration "
+                    f"(run_id={collision['run_id']}, count={collision['collision_count']})"
+                )
+            try:
+                connection.execute(
+                    """CREATE UNIQUE INDEX IF NOT EXISTS ux_remote_jobs_run_remote_identity
+                       ON remote_jobs(run_id, TRIM(remote_identity))
+                       WHERE remote_identity IS NOT NULL AND TRIM(remote_identity) <> ''"""
+                )
+            except sqlite3.IntegrityError as exc:
+                raise RemoteIntentConflict(
+                    "duplicate remote_identity blocks the daily-store schema migration"
+                ) from exc
         self._migrate_snapshot_observation_constraint()
 
     def _migrate_snapshot_observation_constraint(self) -> None:
@@ -694,6 +812,8 @@ class DailyAuditStore:
             assert target is not None
             if target["state"] == "SUCCESS":
                 return self._row(target)
+            if target["state"] == "RECOVERED_PENDING_REVIEW":
+                return None
             source = connection.execute(
                 """SELECT s.* FROM stage_work s JOIN audit_items a ON a.id=s.audit_item_id
                    WHERE a.run_id=? AND s.stage=? AND s.fingerprint=? AND s.state='SUCCESS' AND s.id<>?
@@ -733,6 +853,33 @@ class DailyAuditStore:
             ).fetchall()
             return [self._row(row) for row in rows]  # type: ignore[list-item]
 
+    def list_stage_work_for_business_date(
+        self,
+        business_date: str,
+        *,
+        stage: str | None = None,
+        states: set[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Read stage evidence without acquiring or mutating the daily lease."""
+        clauses = ["r.business_date=?"]
+        params: list[Any] = [self._business_date(business_date)]
+        if stage is not None:
+            clauses.append("s.stage=?")
+            params.append(stage)
+        if states:
+            placeholders = ",".join("?" for _ in states)
+            clauses.append(f"s.state IN ({placeholders})")
+            params.extend(sorted(states))
+        with self._reader() as connection:
+            rows = connection.execute(
+                f"""SELECT s.* FROM stage_work s
+                    JOIN audit_items a ON a.id=s.audit_item_id
+                    JOIN daily_runs r ON r.id=a.run_id
+                    WHERE {' AND '.join(clauses)} ORDER BY s.id""",
+                params,
+            ).fetchall()
+            return [self._row(row) for row in rows]  # type: ignore[list-item]
+
     def claim_stage_work(self, token: LeaseToken, work_id: int, *, max_attempts: int, max_elapsed_seconds: float) -> dict[str, Any] | None:
         now = self._utcnow()
         with self._transaction(immediate=True) as connection:
@@ -756,6 +903,68 @@ class DailyAuditStore:
                 raise ValueError("only claimed stage work can be completed")
             connection.execute("UPDATE stage_work SET state='SUCCESS', retryable=0, result_json=?, error_text=NULL, claimed_at=NULL, updated_at=? WHERE id=?", (self._canonical_json(result), self._utcnow(), work_id))
             return self._row(connection.execute("SELECT * FROM stage_work WHERE id=?", (work_id,)).fetchone())  # type: ignore[return-value]
+
+    def complete_recovered_model_work(
+        self, token: LeaseToken, work_id: int, result: Any
+    ) -> dict[str, Any]:
+        """Persist recovered model evidence behind an explicit review hold."""
+        with self._transaction(immediate=True) as connection:
+            self._validate_stage_lease(connection, token, work_id)
+            work = connection.execute(
+                "SELECT * FROM stage_work WHERE id=?", (work_id,)
+            ).fetchone()
+            if work is None or work["stage"] != "MODEL" or work["state"] != "CLAIMED":
+                raise ValueError("only claimed MODEL work can enter recovery review")
+            connection.execute(
+                """UPDATE stage_work
+                   SET state='RECOVERED_PENDING_REVIEW', retryable=0, result_json=?,
+                       error_text=NULL, claimed_at=NULL, updated_at=? WHERE id=?""",
+                (self._canonical_json(result), self._utcnow(), work_id),
+            )
+            return self._row(
+                connection.execute("SELECT * FROM stage_work WHERE id=?", (work_id,)).fetchone()
+            )  # type: ignore[return-value]
+
+    def release_recovered_model_work_batch(
+        self, token: LeaseToken, work_ids: Sequence[int]
+    ) -> list[dict[str, Any]]:
+        """Atomically release exact reviewed model results to normal workflow."""
+        ids = [int(value) for value in work_ids]
+        if not ids or len(ids) != len(set(ids)):
+            raise ValueError("model recovery release ids must be non-empty and unique")
+        placeholders = ",".join("?" for _ in ids)
+        with self._transaction(immediate=True) as connection:
+            self._validate_lease(connection, token)
+            rows = connection.execute(
+                f"""SELECT s.*, a.run_id FROM stage_work s
+                    JOIN audit_items a ON a.id=s.audit_item_id
+                    WHERE s.id IN ({placeholders}) ORDER BY s.id""",
+                ids,
+            ).fetchall()
+            if len(rows) != len(ids):
+                raise ValueError("every model recovery release id must exist")
+            by_id = {int(row["id"]): row for row in rows}
+            for work_id in ids:
+                work = by_id[work_id]
+                if (
+                    int(work["run_id"]) != token.run_id
+                    or work["stage"] != "MODEL"
+                    or work["state"] != "RECOVERED_PENDING_REVIEW"
+                    or work["result_json"] is None
+                ):
+                    raise ValueError(
+                        f"stage_work id {work_id} is not a reviewed recoverable MODEL result"
+                    )
+            connection.execute(
+                f"UPDATE stage_work SET state='SUCCESS', updated_at=? WHERE id IN ({placeholders})",
+                (self._utcnow(), *ids),
+            )
+            return [
+                self._row(
+                    connection.execute("SELECT * FROM stage_work WHERE id=?", (work_id,)).fetchone()
+                )
+                for work_id in ids
+            ]  # type: ignore[list-item]
 
     def fail_stage_work(self, token: LeaseToken, work_id: int, *, elapsed_seconds: float, error: str, retryable: bool, max_attempts: int, max_elapsed_seconds: float) -> dict[str, Any]:
         with self._transaction(immediate=True) as connection:
@@ -786,6 +995,44 @@ class DailyAuditStore:
                 raise ValueError("only terminal stage work can be explicitly requeued")
             connection.execute("UPDATE stage_work SET state='PENDING', attempts=0, elapsed_seconds=0, retryable=1, error_text=NULL, claimed_at=NULL, updated_at=? WHERE id=?", (self._utcnow(), work_id))
             return self._row(connection.execute("SELECT * FROM stage_work WHERE id=?", (work_id,)).fetchone())  # type: ignore[return-value]
+
+    def requeue_terminal_model_work_batch_preserving_evidence(
+        self, token: LeaseToken, work_ids: Sequence[int]
+    ) -> list[dict[str, Any]]:
+        """Atomically make an exact terminal MODEL set claimable without resetting its budget."""
+        ids = [int(work_id) for work_id in work_ids]
+        if not ids or len(ids) != len(set(ids)):
+            raise ValueError("stage work ids must be a non-empty unique list")
+        placeholders = ",".join("?" for _ in ids)
+        with self._transaction(immediate=True) as connection:
+            self._validate_lease(connection, token)
+            rows = connection.execute(
+                f"""SELECT s.*, a.run_id FROM stage_work s
+                    JOIN audit_items a ON a.id=s.audit_item_id
+                    WHERE s.id IN ({placeholders}) ORDER BY s.id""",
+                ids,
+            ).fetchall()
+            if len(rows) != len(ids):
+                raise ValueError("every selected stage work id must exist")
+            if any(
+                int(row["run_id"]) != token.run_id
+                or row["stage"] != "MODEL"
+                or row["state"] != "TERMINAL_FAILED"
+                for row in rows
+            ):
+                raise ValueError("every selected stage must be terminal MODEL work in the leased run")
+            result = connection.execute(
+                f"""UPDATE stage_work
+                    SET state='RETRYABLE_FAILED', retryable=1, claimed_at=NULL, updated_at=?
+                    WHERE id IN ({placeholders}) AND state='TERMINAL_FAILED' AND stage='MODEL'""",
+                [self._utcnow(), *ids],
+            )
+            if result.rowcount != len(ids):
+                raise ValueError("terminal MODEL requeue did not update the exact selected set")
+            updated = connection.execute(
+                f"SELECT * FROM stage_work WHERE id IN ({placeholders}) ORDER BY id", ids
+            ).fetchall()
+            return [self._row(row) for row in updated]  # type: ignore[list-item]
 
     def _validate_stage_lease(self, connection: sqlite3.Connection, token: LeaseToken, work_id: int) -> None:
         self._validate_lease(connection, token)
@@ -861,6 +1108,60 @@ class DailyAuditStore:
     def mark_remote_manual(self, token: LeaseToken, job_id: int, error: str) -> dict[str, Any]:
         return self._set_job_state(token, job_id, "MANUAL_REQUIRED", error=error)
 
+    def requeue_manual_priority_job(
+        self,
+        token: LeaseToken,
+        job_id: int,
+        *,
+        remote_identity: str,
+    ) -> dict[str, Any]:
+        """Explicitly requeue a confirmed remote task after a priority-only repair."""
+        with self._transaction(immediate=True) as connection:
+            self._validate_lease(connection, token)
+            job = self._job_for_lease(connection, token, job_id)
+            remote_identity = str(remote_identity or "").strip()
+            if (
+                job["state"] != "MANUAL_REQUIRED"
+                or not int(job["post_attempted"])
+                or not remote_identity
+                or str(job["remote_identity"] or "").strip() != remote_identity
+            ):
+                raise RemoteIntentConflict("manual priority requeue requires the exact confirmed remote identity")
+            connection.execute(
+                "UPDATE remote_jobs SET state='PRIORITY_PENDING', error_text=NULL, updated_at=? WHERE id=?",
+                (self._utcnow(), job_id),
+            )
+            return self._row(connection.execute("SELECT * FROM remote_jobs WHERE id=?", (job_id,)).fetchone())  # type: ignore[return-value]
+
+    def requeue_manual_harvest_job(
+        self,
+        token: LeaseToken,
+        job_id: int,
+        *,
+        remote_identity: str,
+    ) -> dict[str, Any]:
+        """Explicitly retry export mapping for one confirmed remote task."""
+        with self._transaction(immediate=True) as connection:
+            self._validate_lease(connection, token)
+            job = self._job_for_lease(connection, token, job_id)
+            remote_identity = str(remote_identity or "").strip()
+            if (
+                job["state"] != "MANUAL_REQUIRED"
+                or not int(job["post_attempted"])
+                or not remote_identity
+                or str(job["remote_identity"] or "").strip() != remote_identity
+            ):
+                raise RemoteIntentConflict(
+                    "manual harvest requeue requires the exact confirmed remote identity"
+                )
+            connection.execute(
+                "UPDATE remote_jobs SET state='SUBMITTED', error_text=NULL, updated_at=? WHERE id=?",
+                (self._utcnow(), job_id),
+            )
+            return self._row(
+                connection.execute("SELECT * FROM remote_jobs WHERE id=?", (job_id,)).fetchone()
+            )  # type: ignore[return-value]
+
     def recover_ambiguous_remote_submissions(self, token: LeaseToken) -> int:
         """Fail closed after a crash between POST dispatch and durable outcome."""
         with self._transaction(immediate=True) as connection:
@@ -873,7 +1174,7 @@ class DailyAuditStore:
             return result.rowcount
 
     def reconcile_remote_job(self, token: LeaseToken, job_id: int, *, remote_identity: str, state: str = "SUBMITTED", export_path: str | None = None, result: Any | None = None) -> dict[str, Any]:
-        if state not in {"SUBMITTED", "RUNNING", "EXPORTED", "COMPLETED"}:
+        if state not in {"PRIORITY_PENDING", "SUBMITTED", "RUNNING", "EXPORTED", "COMPLETED"}:
             raise ValueError("remote reconciliation must use a known non-create state")
         with self._transaction(immediate=True) as connection:
             self._validate_lease(connection, token)
@@ -887,8 +1188,9 @@ class DailyAuditStore:
             if existing_identity and existing_identity != remote_identity:
                 raise RemoteIntentConflict("remote identity is immutable once recorded")
             legal = {
-                "SUBMIT_INTENT": {"SUBMITTED", "RUNNING", "EXPORTED", "COMPLETED"},
-                "SUBMIT_UNKNOWN": {"SUBMITTED", "RUNNING", "EXPORTED", "COMPLETED"},
+                "SUBMIT_INTENT": {"PRIORITY_PENDING", "SUBMITTED", "RUNNING", "EXPORTED", "COMPLETED"},
+                "SUBMIT_UNKNOWN": {"PRIORITY_PENDING", "SUBMITTED", "RUNNING", "EXPORTED", "COMPLETED"},
+                "PRIORITY_PENDING": {"PRIORITY_PENDING", "SUBMITTED"},
                 "SUBMITTED": {"SUBMITTED", "RUNNING", "EXPORTED", "COMPLETED"},
                 "RUNNING": {"RUNNING", "EXPORTED", "COMPLETED"},
                 "EXPORTED": {"EXPORTED", "COMPLETED"},
@@ -896,14 +1198,19 @@ class DailyAuditStore:
             }
             if state not in legal.get(str(job["state"]), set()):
                 raise RemoteIntentConflict(f"illegal remote state transition {job['state']} -> {state}")
-            connection.execute("UPDATE remote_jobs SET state=?, remote_identity=?, export_path=COALESCE(?, export_path), result_json=COALESCE(?, result_json), error_text=NULL, updated_at=? WHERE id=?", (state, remote_identity, export_path, self._canonical_json(result) if result is not None else None, self._utcnow(), job_id))
+            try:
+                connection.execute("UPDATE remote_jobs SET state=?, remote_identity=?, export_path=COALESCE(?, export_path), result_json=COALESCE(?, result_json), error_text=NULL, updated_at=? WHERE id=?", (state, remote_identity, export_path, self._canonical_json(result) if result is not None else None, self._utcnow(), job_id))
+            except sqlite3.IntegrityError as exc:
+                raise RemoteIntentConflict(
+                    "remote identity is already bound to another logical job in this daily run"
+                ) from exc
             return self._row(connection.execute("SELECT * FROM remote_jobs WHERE id=?", (job_id,)).fetchone())  # type: ignore[return-value]
 
     def claim_harvest(self, token: LeaseToken, job_id: int, *, max_attempts: int, max_elapsed_seconds: float) -> dict[str, Any] | None:
         with self._transaction(immediate=True) as connection:
             self._validate_lease(connection, token)
             job = self._job_for_lease(connection, token, job_id)
-            if job["state"] not in {"SUBMITTED", "RUNNING", "EXPORTED", "SUBMIT_UNKNOWN"}:
+            if job["state"] not in {"PRIORITY_PENDING", "SUBMITTED", "RUNNING", "EXPORTED", "SUBMIT_UNKNOWN"}:
                 return None
             if int(job["harvest_attempts"]) >= max_attempts or float(job["harvest_elapsed_seconds"]) >= max_elapsed_seconds:
                 connection.execute("UPDATE remote_jobs SET state='MANUAL_REQUIRED', error_text=COALESCE(error_text, 'harvest limit reached'), updated_at=? WHERE id=?", (self._utcnow(), job_id))
@@ -987,7 +1294,7 @@ class DailyAuditStore:
             for work in rows:
                 if work["remote_job_id"] is not None and int(work["remote_job_id"]) != job_id:
                     raise RemoteIntentConflict("crawl work is already bound to another remote job")
-                if work["remote_job_id"] is None and work["state"] in {"SUCCESS", "TERMINAL_FAILED"}:
+                if work["remote_job_id"] is None and work["state"] in {"SUCCESS", "NO_RESULT", "TERMINAL_FAILED"}:
                     raise RemoteIntentConflict("terminal crawl work cannot be rebound")
             connection.execute(
                 f"UPDATE crawl_work SET remote_job_id=?, updated_at=? WHERE id IN ({placeholders}) AND remote_job_id IS NULL",
@@ -1014,21 +1321,22 @@ class DailyAuditStore:
             target = connection.execute("SELECT * FROM crawl_work WHERE id=?", (crawl_work_id,)).fetchone()
             if target is None or int(target["run_id"]) != token.run_id:
                 raise ValueError("crawl work must belong to the leased daily run")
-            if target["state"] == "SUCCESS":
+            if target["state"] in {"SUCCESS", "NO_RESULT"}:
                 return self._row(target)
             if target["remote_job_id"] is not None or target["state"] not in {"PENDING", "RETRYABLE_FAILED"}:
                 return None
             source = connection.execute(
                 """SELECT * FROM crawl_work WHERE run_id=? AND mall_key=? AND sku_id=? AND exact_url=?
-                   AND backend_version=? AND state='SUCCESS' AND result_json IS NOT NULL AND id<>?
-                   ORDER BY id LIMIT 1""",
+                   AND backend_version=? AND state IN ('SUCCESS', 'NO_RESULT')
+                   AND result_json IS NOT NULL AND id<>?
+                   ORDER BY CASE state WHEN 'SUCCESS' THEN 0 ELSE 1 END, id LIMIT 1""",
                 (token.run_id, target["mall_key"], target["sku_id"], target["exact_url"], target["backend_version"], crawl_work_id),
             ).fetchone()
             if source is None:
                 source = connection.execute(
                     """SELECT * FROM crawl_work WHERE run_id=? AND mall_key=? AND sku_id=? AND exact_url=?
                        AND backend_version=? AND remote_job_id IS NOT NULL AND id<>?
-                       AND state IN ('PENDING', 'SUBMITTED', 'RUNNING', 'EXPORTED', 'RETRYABLE_FAILED', 'SUBMIT_UNKNOWN')
+                       AND state IN ('PENDING', 'PRIORITY_PENDING', 'SUBMITTED', 'RUNNING', 'EXPORTED', 'RETRYABLE_FAILED', 'SUBMIT_UNKNOWN')
                        ORDER BY id LIMIT 1""",
                     (
                         token.run_id,
@@ -1082,8 +1390,14 @@ class DailyAuditStore:
                     connection.execute("SELECT * FROM crawl_work WHERE id=?", (crawl_work_id,)).fetchone()
                 )
             connection.execute(
-                """UPDATE crawl_work SET state='SUCCESS', result_json=?, error_text=NULL, updated_at=? WHERE id=?""",
-                (source["result_json"], self._utcnow(), crawl_work_id),
+                """UPDATE crawl_work SET state=?, result_json=?, error_text=?, updated_at=? WHERE id=?""",
+                (
+                    source["state"],
+                    source["result_json"],
+                    source["error_text"] if source["state"] == "NO_RESULT" else None,
+                    self._utcnow(),
+                    crawl_work_id,
+                ),
             )
             return self._row(connection.execute("SELECT * FROM crawl_work WHERE id=?", (crawl_work_id,)).fetchone())  # type: ignore[return-value]
 
@@ -1107,10 +1421,281 @@ class DailyAuditStore:
                 if work["result_json"] != encoded:
                     raise RemoteIntentConflict("successful crawl evidence is immutable")
                 return self._row(work)  # type: ignore[return-value]
-            if work["state"] == "TERMINAL_FAILED":
-                raise RemoteIntentConflict("terminal failed crawl cannot become successful")
+            if work["state"] in {"NO_RESULT", "TERMINAL_FAILED"}:
+                raise RemoteIntentConflict("terminal crawl cannot become successful")
             connection.execute("UPDATE crawl_work SET state='SUCCESS', result_json=?, error_text=NULL, updated_at=? WHERE id=?", (encoded, self._utcnow(), crawl_work_id))
             return self._row(connection.execute("SELECT * FROM crawl_work WHERE id=?", (crawl_work_id,)).fetchone())  # type: ignore[return-value]
+
+    def complete_partial_exact_crawl_work(
+        self,
+        token: LeaseToken,
+        crawl_work_id: int,
+        *,
+        remote_job_id: int,
+        remote_identity: str,
+        result: Any,
+    ) -> dict[str, Any]:
+        """Persist one exact partial-export result bound to one confirmed job."""
+        encoded = self._canonical_json(result)
+        with self._transaction(immediate=True) as connection:
+            self._validate_crawl_lease(connection, token, crawl_work_id)
+            work = connection.execute(
+                "SELECT * FROM crawl_work WHERE id=?", (crawl_work_id,)
+            ).fetchone()
+            assert work is not None
+            job = self._job_for_lease(connection, token, int(remote_job_id))
+            if (
+                int(work["remote_job_id"] or 0) != int(remote_job_id)
+                or str(job["remote_identity"] or "").strip()
+                != str(remote_identity or "").strip()
+                or not int(job["post_attempted"])
+                or job["state"] not in {"MANUAL_REQUIRED", "COMPLETED"}
+            ):
+                raise RemoteIntentConflict(
+                    "partial exact result requires the exact confirmed manual/completed job"
+                )
+            if work["state"] == "SUCCESS":
+                if work["result_json"] != encoded:
+                    raise RemoteIntentConflict("successful crawl evidence is immutable")
+                return self._row(work)  # type: ignore[return-value]
+            if work["state"] in {"NO_RESULT", "TERMINAL_FAILED"}:
+                raise RemoteIntentConflict("terminal crawl evidence is immutable")
+            connection.execute(
+                "UPDATE crawl_work SET state='SUCCESS', result_json=?, error_text=NULL, updated_at=? WHERE id=?",
+                (encoded, self._utcnow(), crawl_work_id),
+            )
+            return self._row(
+                connection.execute(
+                    "SELECT * FROM crawl_work WHERE id=?", (crawl_work_id,)
+                ).fetchone()
+            )  # type: ignore[return-value]
+
+    def complete_partial_exact_no_result(
+        self,
+        token: LeaseToken,
+        crawl_work_id: int,
+        *,
+        remote_job_id: int,
+        remote_identity: str,
+        result_path: str,
+        reason: str = "legacy export contains no matching durable identity row",
+    ) -> dict[str, Any]:
+        """Persist exact absence from a completed, provenance-valid export."""
+        normalized_reason = str(reason or "").strip()
+        normalized_path = str(result_path or "").strip()
+        if not normalized_reason or not normalized_path:
+            raise RemoteIntentConflict("partial no-result requires exact export evidence")
+        evidence = self._canonical_json(
+            {
+                "evidence_type": "EXPORTED_NO_MATCHING_ROW",
+                "no_result_reason": normalized_reason,
+                "page_price_source": "招商局（无采集结果）",
+                "page_price_status": "NO_RESULT",
+                "page_price_value": None,
+                "remote_identity": str(remote_identity or "").strip(),
+                "remote_state": "COMPLETED",
+                "result_path": normalized_path,
+            }
+        )
+        with self._transaction(immediate=True) as connection:
+            self._validate_crawl_lease(connection, token, crawl_work_id)
+            work = connection.execute(
+                "SELECT * FROM crawl_work WHERE id=?", (crawl_work_id,)
+            ).fetchone()
+            assert work is not None
+            job = self._job_for_lease(connection, token, int(remote_job_id))
+            if (
+                int(work["remote_job_id"] or 0) != int(remote_job_id)
+                or str(job["remote_identity"] or "").strip()
+                != str(remote_identity or "").strip()
+                or not int(job["post_attempted"])
+                or job["state"] not in {
+                    "PRIORITY_PENDING",
+                    "SUBMITTED",
+                    "RUNNING",
+                    "EXPORTED",
+                    "MANUAL_REQUIRED",
+                    "COMPLETED",
+                }
+                or str(job["result_path"] or "").strip() != normalized_path
+            ):
+                raise RemoteIntentConflict(
+                    "partial no-result requires the exact confirmed export job"
+                )
+            if work["state"] == "NO_RESULT":
+                if work["result_json"] != evidence or work["error_text"] != normalized_reason:
+                    raise RemoteIntentConflict("no-result crawl evidence is immutable")
+                return self._row(work)  # type: ignore[return-value]
+            if work["state"] in {"SUCCESS", "TERMINAL_FAILED"}:
+                raise RemoteIntentConflict("terminal crawl evidence is immutable")
+            connection.execute(
+                "UPDATE crawl_work SET state='NO_RESULT', result_json=?, error_text=?, updated_at=? WHERE id=?",
+                (evidence, normalized_reason, self._utcnow(), crawl_work_id),
+            )
+            return self._row(
+                connection.execute(
+                    "SELECT * FROM crawl_work WHERE id=?", (crawl_work_id,)
+                ).fetchone()
+            )  # type: ignore[return-value]
+
+    def mark_partial_exact_crawl_manual(
+        self,
+        token: LeaseToken,
+        crawl_work_id: int,
+        *,
+        remote_job_id: int,
+        remote_identity: str,
+        error: str,
+    ) -> dict[str, Any]:
+        normalized_error = str(error or "").strip()
+        if not normalized_error:
+            raise RemoteIntentConflict("partial crawl manual state requires a reason")
+        with self._transaction(immediate=True) as connection:
+            self._validate_crawl_lease(connection, token, crawl_work_id)
+            work = connection.execute(
+                "SELECT * FROM crawl_work WHERE id=?", (crawl_work_id,)
+            ).fetchone()
+            assert work is not None
+            job = self._job_for_lease(connection, token, int(remote_job_id))
+            if (
+                int(work["remote_job_id"] or 0) != int(remote_job_id)
+                or str(job["remote_identity"] or "").strip()
+                != str(remote_identity or "").strip()
+                or job["state"] != "MANUAL_REQUIRED"
+            ):
+                raise RemoteIntentConflict("partial crawl manual state requires the exact manual job")
+            if work["state"] in {"SUCCESS", "NO_RESULT", "TERMINAL_FAILED"}:
+                return self._row(work)  # type: ignore[return-value]
+            if work["state"] == "MANUAL_REQUIRED" and work["error_text"] == normalized_error:
+                return self._row(work)  # type: ignore[return-value]
+            connection.execute(
+                "UPDATE crawl_work SET state='MANUAL_REQUIRED', result_json=NULL, error_text=?, updated_at=? WHERE id=?",
+                (normalized_error, self._utcnow(), crawl_work_id),
+            )
+            return self._row(
+                connection.execute(
+                    "SELECT * FROM crawl_work WHERE id=?", (crawl_work_id,)
+                ).fetchone()
+            )  # type: ignore[return-value]
+
+    def finish_partial_exact_harvest_job(
+        self,
+        token: LeaseToken,
+        remote_job_id: int,
+        *,
+        remote_identity: str,
+        export_path: str,
+        result: Any,
+    ) -> dict[str, Any]:
+        """Complete the job only when every linked crawl is deterministically resolved."""
+        normalized_identity = str(remote_identity or "").strip()
+        normalized_path = str(export_path or "").strip()
+        encoded_result = self._canonical_json(result)
+        with self._transaction(immediate=True) as connection:
+            self._validate_lease(connection, token)
+            job = self._job_for_lease(connection, token, int(remote_job_id))
+            if (
+                str(job["remote_identity"] or "").strip() != normalized_identity
+                or not int(job["post_attempted"])
+                or job["state"] not in {"MANUAL_REQUIRED", "COMPLETED"}
+                or str(job["result_path"] or "").strip() != normalized_path
+            ):
+                raise RemoteIntentConflict(
+                    "partial harvest finish requires the exact confirmed export job"
+                )
+            states = [
+                str(row["state"])
+                for row in connection.execute(
+                    "SELECT state FROM crawl_work WHERE run_id=? AND remote_job_id=? ORDER BY id",
+                    (token.run_id, int(remote_job_id)),
+                ).fetchall()
+            ]
+            if not states:
+                raise RemoteIntentConflict("partial harvest job has no linked crawl work")
+            completed = all(state in {"SUCCESS", "NO_RESULT"} for state in states)
+            state = "COMPLETED" if completed else "MANUAL_REQUIRED"
+            error = None if completed else "partial exact harvest has unresolved crawl identities"
+            if (
+                str(job["state"]) == state
+                and str(job["export_path"] or "") == normalized_path
+                and str(job["result_json"] or "") == encoded_result
+                and str(job["error_text"] or "") == str(error or "")
+            ):
+                return self._row(job)  # type: ignore[return-value]
+            connection.execute(
+                "UPDATE remote_jobs SET state=?, export_path=?, result_json=?, error_text=?, updated_at=? WHERE id=?",
+                (state, normalized_path, encoded_result, error, self._utcnow(), int(remote_job_id)),
+            )
+            return self._row(
+                connection.execute(
+                    "SELECT * FROM remote_jobs WHERE id=?", (int(remote_job_id),)
+                ).fetchone()
+            )  # type: ignore[return-value]
+
+    def complete_crawl_work_without_result(
+        self,
+        token: LeaseToken,
+        crawl_work_id: int,
+        *,
+        reason: str,
+    ) -> dict[str, Any]:
+        """Record an explicit no-price business outcome from one exact completed export."""
+        normalized_reason = str(reason or "").strip()
+        if not normalized_reason:
+            raise RemoteIntentConflict("no-result resolution requires the persisted failure reason")
+        with self._transaction(immediate=True) as connection:
+            self._validate_crawl_lease(connection, token, crawl_work_id)
+            work = connection.execute("SELECT * FROM crawl_work WHERE id=?", (crawl_work_id,)).fetchone()
+            assert work is not None
+            if work["state"] == "NO_RESULT":
+                try:
+                    evidence = json.loads(str(work["result_json"] or ""))
+                except (TypeError, ValueError) as exc:
+                    raise RemoteIntentConflict("no-result crawl evidence is immutable") from exc
+                if (
+                    str(work["error_text"] or "").strip() != normalized_reason
+                    or not isinstance(evidence, dict)
+                    or evidence.get("evidence_type") != "EXPORTED_NO_MATCHING_ROW"
+                    or evidence.get("no_result_reason") != normalized_reason
+                    or evidence.get("page_price_status") != "NO_RESULT"
+                    or evidence.get("page_price_value") is not None
+                ):
+                    raise RemoteIntentConflict("no-result crawl evidence is immutable")
+                return self._row(work)  # type: ignore[return-value]
+            if work["state"] != "TERMINAL_FAILED" or str(work["error_text"] or "").strip() != normalized_reason:
+                raise RemoteIntentConflict("no-result resolution requires the exact terminal failure evidence")
+            if work["remote_job_id"] is None:
+                raise RemoteIntentConflict("no-result resolution requires completed export evidence")
+            job = self._job_for_lease(connection, token, int(work["remote_job_id"]))
+            remote_identity = str(job["remote_identity"] or "").strip()
+            result_path = str(job["result_path"] or "").strip()
+            if (
+                job["state"] != "COMPLETED"
+                or not int(job["post_attempted"])
+                or not remote_identity
+                or not result_path
+                or job["result_json"] is None
+            ):
+                raise RemoteIntentConflict("no-result resolution requires completed export evidence")
+            evidence = self._canonical_json(
+                {
+                    "evidence_type": "EXPORTED_NO_MATCHING_ROW",
+                    "no_result_reason": normalized_reason,
+                    "page_price_source": "招商局（无采集结果）",
+                    "page_price_status": "NO_RESULT",
+                    "page_price_value": None,
+                    "remote_identity": remote_identity,
+                    "remote_state": "COMPLETED",
+                    "result_path": result_path,
+                }
+            )
+            connection.execute(
+                "UPDATE crawl_work SET state='NO_RESULT', result_json=?, updated_at=? WHERE id=?",
+                (evidence, self._utcnow(), crawl_work_id),
+            )
+            return self._row(
+                connection.execute("SELECT * FROM crawl_work WHERE id=?", (crawl_work_id,)).fetchone()
+            )  # type: ignore[return-value]
 
     def fail_crawl_work(self, token: LeaseToken, crawl_work_id: int, error: str, *, retryable: bool) -> dict[str, Any]:
         with self._transaction(immediate=True) as connection:
@@ -1118,7 +1703,7 @@ class DailyAuditStore:
             work = connection.execute("SELECT * FROM crawl_work WHERE id=?", (crawl_work_id,)).fetchone()
             assert work is not None
             state = "RETRYABLE_FAILED" if retryable else "TERMINAL_FAILED"
-            if work["state"] in {"SUCCESS", "TERMINAL_FAILED"}:
+            if work["state"] in {"SUCCESS", "NO_RESULT", "TERMINAL_FAILED"}:
                 if work["state"] == state and str(work["error_text"] or "") == error:
                     return self._row(work)  # type: ignore[return-value]
                 raise RemoteIntentConflict("terminal crawl evidence is immutable")
@@ -1129,7 +1714,7 @@ class DailyAuditStore:
         with self._transaction(immediate=True) as connection:
             self._validate_lease(connection, token)
             self._job_for_lease(connection, token, job_id)
-            result = connection.execute("UPDATE crawl_work SET state=?, updated_at=? WHERE run_id=? AND remote_job_id=? AND state NOT IN ('SUCCESS', 'TERMINAL_FAILED')", (state, self._utcnow(), token.run_id, job_id))
+            result = connection.execute("UPDATE crawl_work SET state=?, updated_at=? WHERE run_id=? AND remote_job_id=? AND state NOT IN ('SUCCESS', 'NO_RESULT', 'TERMINAL_FAILED')", (state, self._utcnow(), token.run_id, job_id))
             return result.rowcount
 
     def _validate_crawl_lease(self, connection: sqlite3.Connection, token: LeaseToken, crawl_work_id: int) -> None:
