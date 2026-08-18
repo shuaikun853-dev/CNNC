@@ -45,16 +45,20 @@ SQLite 仅有七张 checkpoint 表：`daily_runs`、`snapshots`、`audit_items`�
 | Start in | 仓库根目录 |
 | Trigger | 每周一至周五，09:00 起每 15 分钟唤醒，最后一次 20:00 |
 | Multiple instances | **IgnoreNew** |
-| Application budget | **720 秒** |
-| ExecutionTimeLimit | **14 分钟（840 秒）** |
+| Application budget | tick **720 秒**；closeout **1680 秒** |
+| ExecutionTimeLimit | **32 分钟（1920 秒）** |
 
-runner 是一次性有限进程，不含常驻 daemon。09:00-17:00 仅整点运行 `tick`，17:30 和 17:45
-再运行 `tick`；其余白天 15 分钟唤醒直接 NOOP。18:00-20:00 每 15 分钟运行 `finalize`，20:15 后不再自动
-进入 `drain-only`。未 frozen 时 finalize 会继续 discover 当前数据并处理 backlog；来源数量第一次满足
-当前 snapshot 的 `row_count == saas_count` 时才 freeze 当前 snapshot。`customer_count` 只作为独立观测指标，
-不参与 freeze equality gate。已 frozen 后不再 discover，
-只继续 harvest/backfill/readiness/materialize。最后一次 20:00 的运行受 14 分钟硬上限保护；20:15-08:59 即使被
-人工误调用，也会快速空操作退出。
+runner 是一次性有限进程，不含常驻 daemon。09:00-17:00 整点运行 `tick`，17:15、17:30 和 17:45
+再各运行一次 `tick`；其余白天 15 分钟唤醒直接 NOOP。18:00-20:00 每 15 分钟运行 `closeout`，
+**20:00 是当天最后一次自动 closeout**；20:15 后不再有任何自动调度，即使被人工误调用也会快速空操作退出。
+closeout 在一个进程内持续推进，不为下一个 15 分钟唤醒等待：SaaS 稳定观察最快每 300 秒一次，
+招商局 full sweep 最快每 600 秒一次（单批最多 6 个，一轮覆盖全部 eligible remote jobs）。18:00 后只要
+最近 authoritative 观测的 `row_count` 与 `ordered_hash` 连续 600 秒一致且本次分页完整，即可 freeze
+最新 snapshot（17:45 与 18:00 相同则 18:00 直接 freeze，无需等到 18:10；期间变化则窗口重新计时）。
+`customer_count` 只作为独立观测指标，不参与 freeze equality gate。已 frozen 后不再 discover，
+只继续 Detail/Model/Submit/Priority/Harvest/backfill/readiness/materialize；blocker 清零后同一进程立即
+materialize final.xlsx。`state=FINALIZED` 后任何 Scheduler 或手工 tick/closeout/finalize 都在发出
+SaaS/招商局/remote submit 请求前直接 `ALREADY_FINALIZED` NOOP。
 
 Scheduler 默认仅周一至周五运行。周六、周日中核不产生业务推送，因此不执行自动增量处理。
 主限制由 Weekly trigger 的 `Monday` 至 `Friday` 实现，不注册周末 trigger，也不启用
@@ -63,11 +67,11 @@ Scheduler 默认仅周一至周五运行。周六、周日中核不产生业务�
 
 按 `runtime_root + business_date` 建立的非阻塞 OS file lock 是手工 CLI 与 Scheduler 共用的第一层
 生产互斥；它在 SQLite、priority、export、download、harvest、backfill、readiness/freeze 和正式物化前取得，
-并覆盖整个命令生命周期。`tick`、`finalize`、`drain-only` 竞争同一把锁；拿不到时立即输出
+并覆盖整个命令生命周期。`tick`、`closeout`、`finalize`、`drain-only` 竞争同一把锁；拿不到时立即输出
 `SKIPPED_ALREADY_RUNNING` 并以 0 正常退出，不等待也不进入 lifecycle。Windows Task Scheduler 的
 `IgnoreNew` 是额外的 no-overlap 防护，内部 fenced DB lease 继续保留。预算接近末尾
 reserve 时不会领取新重工作，下一次 15 分钟唤醒继续 backlog。Python wall-clock budget 无法强行中断卡在
-操作系统或第三方库里的单次调用，所以 Scheduler 在 14 分钟作硬兜底。若硬停止恰逢 POST，
+操作系统或第三方库里的单次调用，所以 Scheduler 在 32 分钟作硬兜底。若硬停止恰逢 POST，
 已落库的 immutable intent 会在下一 tick 进入精确对账，而不是重发。调度日志按业务日写入
 `runtime\incremental_price_audit\scheduler_logs\YYYY-MM-DD.log`。
 
@@ -87,7 +91,7 @@ powershell -NoProfile -File scripts\register_incremental_price_audit_tasks.ps1 `
   -Apply
 ```
 
-脚本固定使用 legacy 招商局 backend、`MultipleInstances=IgnoreNew`、15 分钟间隔和 14 分钟硬上限。
+脚本固定使用 legacy 招商局 backend、`MultipleInstances=IgnoreNew`、15 分钟间隔和 32 分钟硬上限。
 若发现旧的 `-Tick` / `-Finalize` 双任务仍存在，注册会拒绝继续，而不会暗中删除或制造竞争任务。
 注册身份沿用当前项目的交互式低权限用户上下文；机器关机或用户未登录时不会强行改用另一套凭证。
 
@@ -136,6 +140,47 @@ mandatory crawl 的 remote job 必须全部为 `COMPLETED`；即使 crawl 已写
 导出结果证据完整但找不到该 crawl identity 返回行的 `TERMINAL_FAILED`，才可受控转为
 `NO_RESULT`。该状态保留原错误和导出证据，正式表显示“无采集结果”且价格留空，绝不能写成 0；
 没有建立 crawl work 的 frozen 记录仍是 finalize blocker，不能借此批量放行。
+
+## 20 点以后的人工 closeout
+
+20:00 是当天最后一次自动 closeout。之后仍未 `FINALIZED` 时不再有任何自动 SaaS/招商局请求，
+由运维按以下三步人工推进。
+
+### 第一步：status
+
+```powershell
+E:\Python314\python.exe `
+  "E:\.A中核运维\cnnc-ops-agent\scripts\incremental_price_audit.py" `
+  status `
+  --business-date 2026-08-18 `
+  --runtime-root "E:\.A中核运维\cnnc-ops-agent\runtime\incremental_price_audit"
+```
+
+### 第二步：根据状态判断
+
+- `state = FINALIZED`：停止，不做任何操作。之后即使误执行 closeout 也会 NOOP。
+- `remote.running > 0` 或 `remote.pending > 0`：主要还在等招商局，可按需手动执行一次 closeout。
+- `remote.manual > 0`、`remote.unknown > 0` 或 `crawl.manual > 0`：不要反复执行 closeout，
+  先按下面"精确人工恢复"处理具体异常。
+
+### 第三步：手动 closeout（一次性集中推进，不是提高调度频率）
+
+```powershell
+E:\Python314\python.exe `
+  "E:\.A中核运维\cnnc-ops-agent\scripts\incremental_price_audit.py" `
+  closeout `
+  --business-date 2026-08-18 `
+  --runtime-root "E:\.A中核运维\cnnc-ops-agent\runtime\incremental_price_audit" `
+  --budget-seconds 1680 `
+  --enable-remote-writes `
+  --zhaoshang-backend legacy
+```
+
+说明：`--enable-remote-writes` 是生产写授权（不传则 shadow，只读对账不建招商局任务）；
+`--budget-seconds 1680` 与 Scheduler closeout 预算一致（CLI 默认 720 秒，可按需调整）；
+`--source-stability-seconds` / `--source-observation-interval-seconds` /
+`--remote-sweep-interval-seconds` 已默认 600/300/600 秒，无需显式传；`--output` 可选，
+默认输出 `runtime\incremental_price_audit\<业务日>\saas_audit_final_<YYYYMMDD>.xlsx`。
 
 ## 精确人工恢复
 
@@ -255,8 +300,8 @@ task name 使用业务日和 immutable 请求集生成同日稳定、跨日不�
 - runner 将 Python stdout/stderr 都通过单个共享 UTF-8 文件句柄记录到同一业务日日志；日志读取者
   不能在输出行之间抢占写句柄，stderr 本身也不会让 Windows PowerShell 5.1 提前终止，Scheduler
   成败只由 Python 的真实退出码决定。runner 使用 .NET `Process` 并发 drain 两个流，并把进程放入
-  kill-on-close Windows Job Object；内部 deadline 小于 `PT14M`，超时返回 124 并终止 child/grandchild，
-  `PT14M` 继续作为第二道外部保险。wrapper 被强制终止时，Job Object 关闭也会清理整个进程树。
+  kill-on-close Windows Job Object；内部 deadline 小于注册的 ExecutionTimeLimit（默认 PT32M），
+  超时返回 124 并终止 child/grandchild，外层 ExecutionTimeLimit 继续作为第二道外部保险。wrapper 被强制终止时，Job Object 关闭也会清理整个进程树。
 - `--zhaoshang-backend legacy|batch` 选择 Adapter，默认 `legacy`。`batch` 使用公司 Skill 已证实的
   `/batch/autoAddTask` 与 `queryTaskProgress`，按商城和最多 100 条稳定分片；create 阶段不生成
   临时 Excel、不开每商城子进程，也不依赖 Cookie/cURL。它仍必须显式传 `--enable-remote-writes`。

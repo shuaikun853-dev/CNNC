@@ -93,8 +93,8 @@ $plan = [pscustomobject]@{
     RepeatFor = "PT11H1M"
     LastPlannedStart = "20:00"
     TickTimes = "09:00-17:00 hourly; 17:15; 17:30; 17:45"
-    CloseoutHours = "18:00-19:45 every 15 minutes (wall budget $CloseoutBudgetSeconds s; IgnoreNew drops overlaps)"
-    FinalizeHours = "20:00 fallback finalize"
+    CloseoutHours = "18:00-20:00 every 15 minutes (wall budget $CloseoutBudgetSeconds s; IgnoreNew drops overlaps; 20:00 is the last automatic start)"
+    FinalizeHours = "none after 20:00; operators run an explicit manual closeout instead"
 }
 
 if (-not $Apply) {

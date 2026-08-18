@@ -815,8 +815,9 @@ def test_scheduler_scripts_preview_weekday_production_plan_without_mutation():
     assert task["RepeatFor"] == "PT11H1M"
     assert task["LastPlannedStart"] == "20:00"
     assert task["TickTimes"] == "09:00-17:00 hourly; 17:15; 17:30; 17:45"
-    assert task["CloseoutHours"].startswith("18:00-19:45 every 15 minutes")
-    assert task["FinalizeHours"] == "20:00 fallback finalize"
+    assert task["CloseoutHours"].startswith("18:00-20:00 every 15 minutes")
+    assert "20:00 is the last automatic start" in task["CloseoutHours"]
+    assert task["FinalizeHours"] == "none after 20:00; operators run an explicit manual closeout instead"
     assert "run_incremental_price_audit_scheduled.ps1" in task["Arguments"]
     assert "-BudgetSeconds 720" in task["Arguments"]
     assert "-CloseoutBudgetSeconds 1680" in task["Arguments"]
@@ -842,10 +843,14 @@ def test_scheduled_runner_routes_hours_without_running_python(tmp_path):
         ("2026-08-13T18:00:00", ["closeout"]),
         ("2026-08-13T18:15:00", ["closeout"]),
         ("2026-08-13T18:30:00", ["closeout"]),
+        ("2026-08-13T18:45:00", ["closeout"]),
         ("2026-08-13T19:00:00", ["closeout"]),
+        ("2026-08-13T19:15:00", ["closeout"]),
+        ("2026-08-13T19:30:00", ["closeout"]),
         ("2026-08-13T19:45:00", ["closeout"]),
-        ("2026-08-13T20:00:00", ["finalize"]),
+        ("2026-08-13T20:00:00", ["closeout"]),
         ("2026-08-13T20:15:00", []),
+        ("2026-08-13T20:30:00", []),
         ("2026-08-13T21:00:00", []),
         ("2026-08-13T08:00:00", []),
         ("2026-08-15T09:00:00", []),

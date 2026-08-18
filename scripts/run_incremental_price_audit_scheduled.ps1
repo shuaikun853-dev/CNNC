@@ -53,15 +53,19 @@ if ($isWeekday -and $minute -eq 0 -and $hour -ge 9 -and $hour -le 17) {
 elseif ($isWeekday -and $hour -eq 17 -and $minute -in @(15, 30, 45)) {
     $phases = @("tick")
 }
-elseif ($isWeekday -and $hour -ge 18 -and $hour -le 19 -and ($minute % 15) -eq 0) {
+elseif (
+    $isWeekday -and (
+        ($hour -ge 18 -and $hour -le 19 -and ($minute % 15) -eq 0) -or
+        ($hour -eq 20 -and $minute -eq 0)
+    )
+) {
     # Closeout owns the production writer until FINALIZED, its wall deadline,
     # or a manual blocker; overlapping 15-minute wakeups are dropped by the
     # task's IgnoreNew policy, and a fresh closeout continues the durable
-    # SQLite state when the previous one already exited.
+    # SQLite state when the previous one already exited.  20:00 is the last
+    # automatic closeout; 20:15 and later never auto-run, so post-20:00
+    # progress is an explicit manual closeout from the operator.
     $phases = @("closeout")
-}
-elseif ($isWeekday -and $hour -eq 20 -and $minute -eq 0) {
-    $phases = @("finalize")
 }
 
 $modeArgument = if ($EnableRemoteWrites) { "--enable-remote-writes" } else { "--shadow" }
