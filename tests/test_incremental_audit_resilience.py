@@ -503,16 +503,21 @@ def test_post_response_crash_becomes_unknown_and_reconciles_without_second_post(
 
 def test_freeze_commit_crash_is_idempotently_recovered(tmp_path):
     store = DailyAuditStore(tmp_path / "state.sqlite3")
-    dependencies = _dependencies(
-        [_row()], observed_at=datetime(2026, 8, 11, 10, 1, tzinfo=UTC)
+    observed = _dependencies(
+        [_row()], observed_at=datetime(2026, 8, 11, 9, 51, tzinfo=UTC)
     )
     run_incremental_tick(
         store,
         ProcessLock(tmp_path / "tick.lock"),
         _config(),
-        dependencies,
+        observed,
     )
     snapshot_id = int(store.latest_snapshot(BUSINESS_DATE)["id"])
+    # The finalize observation repeats identical content ten minutes later, so
+    # the source-stability window is satisfied by the two authoritative rows.
+    dependencies = _dependencies(
+        [_row()], observed_at=datetime(2026, 8, 11, 10, 1, tzinfo=UTC)
+    )
     original_freeze = store.freeze_snapshot
 
     def freeze_then_crash(token, candidate_snapshot_id):
@@ -537,5 +542,7 @@ def test_freeze_commit_crash_is_idempotently_recovered(tmp_path):
         dependencies,
         finalize=True,
     )
-    assert resumed.frozen_snapshot_id == snapshot_id
-    assert store.get_run(BUSINESS_DATE)["frozen_snapshot_id"] == snapshot_id
+    frozen_snapshot = store.list_snapshots(BUSINESS_DATE)[-1]
+    assert snapshot_id < int(frozen_snapshot["id"])
+    assert resumed.frozen_snapshot_id == int(frozen_snapshot["id"])
+    assert store.get_run(BUSINESS_DATE)["frozen_snapshot_id"] == int(frozen_snapshot["id"])

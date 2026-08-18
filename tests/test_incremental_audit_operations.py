@@ -762,29 +762,35 @@ def test_doctor_checks_components_without_exposing_model_values(tmp_path):
     assert secret not in json.dumps(report)
 
 
+def _run_powershell_script(script: Path, script_arguments: list[str]):
+    """Run a scheduled-operations script with UTF-8 stdout.
+
+    ``powershell.exe`` writes redirected stdout in the console code page
+    (GBK on this deployment host), which contains the repo's Chinese path and
+    is not decodable as the UTF-8 JSON these scripts emit.  Forcing
+    ``[Console]::OutputEncoding`` inside the child makes the contract
+    deterministic on every host without touching the production scripts.
+    """
+    encoded = str(script).replace("'", "''")
+    rendered = " ".join(
+        value if value.startswith("-") else f"'{value.replace(chr(39), chr(39) * 2)}'"
+        for value in script_arguments
+    )
+    command = f"[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; & '{encoded}' {rendered}"
+    return subprocess.run(
+        ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command],
+        capture_output=True,
+        check=False,
+    )
+
+
 def test_scheduler_scripts_preview_weekday_production_plan_without_mutation():
     root = Path(__file__).resolve().parents[1]
     register = root / "scripts/register_incremental_price_audit_tasks.ps1"
     unregister = root / "scripts/unregister_incremental_price_audit_tasks.ps1"
 
-    registered = subprocess.run(
-        [
-            "powershell",
-            "-NoProfile",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-File",
-            str(register),
-            "-EnableRemoteWrites",
-        ],
-        capture_output=True,
-        check=False,
-    )
-    removed = subprocess.run(
-        ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(unregister)],
-        capture_output=True,
-        check=False,
-    )
+    registered = _run_powershell_script(register, ["-EnableRemoteWrites"])
+    removed = _run_powershell_script(unregister, [])
 
     assert registered.returncode == 0, registered.stderr.decode("utf-8", errors="replace")
     assert removed.returncode == 0, removed.stderr.decode("utf-8", errors="replace")
@@ -792,7 +798,9 @@ def test_scheduler_scripts_preview_weekday_production_plan_without_mutation():
     unregister_plan = json.loads(removed.stdout.decode("utf-8-sig"))
     assert register_plan["Applied"] is False
     assert register_plan["MultipleInstances"] == "IgnoreNew"
-    assert register_plan["ExecutionTimeLimit"] == "PT14M"
+    assert register_plan["ExecutionTimeLimit"] == "PT32M"
+    assert register_plan["BudgetSeconds"] == 720
+    assert register_plan["CloseoutBudgetSeconds"] == 1680
     assert register_plan["RemoteWrites"] is True
     assert len(register_plan["Tasks"]) == 1
     task = register_plan["Tasks"][0]
@@ -806,11 +814,13 @@ def test_scheduler_scripts_preview_weekday_production_plan_without_mutation():
     assert task["RepetitionInterval"] == "PT15M"
     assert task["RepeatFor"] == "PT11H1M"
     assert task["LastPlannedStart"] == "20:00"
-    assert task["TickTimes"] == "09:00-17:00 hourly; 17:30; 17:45"
-    assert task["FinalizeHours"] == "18:00-20:00 every 15 minutes"
+    assert task["TickTimes"] == "09:00-17:00 hourly; 17:15; 17:30; 17:45"
+    assert task["CloseoutHours"].startswith("18:00-19:45 every 15 minutes")
+    assert task["FinalizeHours"] == "20:00 fallback finalize"
     assert "run_incremental_price_audit_scheduled.ps1" in task["Arguments"]
     assert "-BudgetSeconds 720" in task["Arguments"]
-    assert "-HardTimeoutMinutes 14" in task["Arguments"]
+    assert "-CloseoutBudgetSeconds 1680" in task["Arguments"]
+    assert "-HardTimeoutMinutes 32" in task["Arguments"]
     assert "-ZhaoshangBackend legacy" in task["Arguments"]
     assert "-EnableRemoteWrites" in task["Arguments"]
     assert unregister_plan["Applied"] is False
@@ -826,14 +836,14 @@ def test_scheduled_runner_routes_hours_without_running_python(tmp_path):
         ("2026-08-13T09:15:00", []),
         ("2026-08-13T10:00:00", ["tick"]),
         ("2026-08-13T17:00:00", ["tick"]),
-        ("2026-08-13T17:15:00", []),
+        ("2026-08-13T17:15:00", ["tick"]),
         ("2026-08-13T17:30:00", ["tick"]),
         ("2026-08-13T17:45:00", ["tick"]),
-        ("2026-08-13T18:00:00", ["finalize"]),
-        ("2026-08-13T18:15:00", ["finalize"]),
-        ("2026-08-13T18:30:00", ["finalize"]),
-        ("2026-08-13T19:00:00", ["finalize"]),
-        ("2026-08-13T19:45:00", ["finalize"]),
+        ("2026-08-13T18:00:00", ["closeout"]),
+        ("2026-08-13T18:15:00", ["closeout"]),
+        ("2026-08-13T18:30:00", ["closeout"]),
+        ("2026-08-13T19:00:00", ["closeout"]),
+        ("2026-08-13T19:45:00", ["closeout"]),
         ("2026-08-13T20:00:00", ["finalize"]),
         ("2026-08-13T20:15:00", []),
         ("2026-08-13T21:00:00", []),
@@ -843,31 +853,23 @@ def test_scheduled_runner_routes_hours_without_running_python(tmp_path):
     )
 
     for timestamp, phases in expected:
-        completed = subprocess.run(
+        completed = _run_powershell_script(
+            runner,
             [
-                "powershell",
-                "-NoProfile",
-                "-ExecutionPolicy",
-                "Bypass",
-                "-File",
-                str(runner),
-                "-RepoRoot",
-                str(root),
-                "-RuntimeRoot",
-                str(runtime_root),
+                "-RepoRoot", str(root),
+                "-RuntimeRoot", str(runtime_root),
                 "-Preview",
-                "-At",
-                timestamp,
+                "-At", timestamp,
                 "-EnableRemoteWrites",
             ],
-            capture_output=True,
-            check=False,
         )
 
         assert completed.returncode == 0, completed.stderr.decode("utf-8", errors="replace")
         plan = json.loads(completed.stdout.decode("utf-8-sig"))
         assert plan["Phases"] == phases
         assert plan["RemoteWrites"] is True
+        assert plan["BudgetSeconds"] == 720
+        assert plan["CloseoutBudgetSeconds"] == 1680
         for command in plan["Commands"]:
             arguments = command["Arguments"]
             assert arguments[-2:] == ["--zhaoshang-backend", "legacy"]
@@ -876,6 +878,8 @@ def test_scheduled_runner_routes_hours_without_running_python(tmp_path):
             ]
             assert command["Phase"] != "drain-only"
             assert "--enable-remote-writes" in arguments
+            budget = arguments[arguments.index("--budget-seconds") + 1]
+            assert budget == ("1680" if command["Phase"] == "closeout" else "720")
 
     assert not runtime_root.exists()
 
@@ -948,6 +952,7 @@ function Get-Date { [datetime]'2026-08-13T17:00:00+08:00' }
     -PythonExe $PythonExe `
     -RuntimeRoot $RuntimeRoot `
     -BudgetSeconds 60 `
+    -CloseoutBudgetSeconds 60 `
     -ProcessExitGraceSeconds 0 `
     -HardTimeoutMinutes 3
 exit $LASTEXITCODE
@@ -1132,6 +1137,7 @@ function Get-Date {{ [datetime]'2026-08-13T17:00:00+08:00' }}
     -PythonExe $PythonExe `
     -RuntimeRoot $RuntimeRoot `
     -BudgetSeconds {budget_seconds} `
+    -CloseoutBudgetSeconds 60 `
     -ProcessExitGraceSeconds 0 `
     -HardTimeoutMinutes 3
 exit $LASTEXITCODE
@@ -1363,6 +1369,7 @@ function Get-Date { [datetime]'2026-08-13T17:00:00+08:00' }
     -PythonExe $PythonExe `
     -RuntimeRoot $RuntimeRoot `
     -BudgetSeconds 60 `
+    -CloseoutBudgetSeconds 60 `
     -ProcessExitGraceSeconds 0 `
     -HardTimeoutMinutes 3
 exit $LASTEXITCODE

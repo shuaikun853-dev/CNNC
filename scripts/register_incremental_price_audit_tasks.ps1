@@ -6,8 +6,10 @@ param(
     [string] $RuntimeRoot = "",
     [ValidateRange(60, 3000)]
     [int] $BudgetSeconds = 720,
+    [ValidateRange(60, 3500)]
+    [int] $CloseoutBudgetSeconds = 1680,
     [ValidateRange(2, 59)]
-    [int] $ExecutionTimeLimitMinutes = 14,
+    [int] $ExecutionTimeLimitMinutes = 32,
     [string] $StartAt = "09:00",
     [switch] $EnableRemoteWrites,
     [switch] $Apply
@@ -33,6 +35,10 @@ $headroomSeconds = ($ExecutionTimeLimitMinutes * 60) - $BudgetSeconds
 if ($headroomSeconds -lt 60) {
     throw "ExecutionTimeLimitMinutes must leave at least 60 seconds beyond BudgetSeconds."
 }
+$closeoutHeadroomSeconds = ($ExecutionTimeLimitMinutes * 60) - $CloseoutBudgetSeconds
+if ($closeoutHeadroomSeconds -lt 90) {
+    throw "ExecutionTimeLimitMinutes must leave at least 90 seconds beyond CloseoutBudgetSeconds for checkpoint, final.xlsx materialization, manifest, and exit."
+}
 
 function Quote-CommandArgument([string] $Value) {
     return '"' + $Value.Replace('"', '\"') + '"'
@@ -46,6 +52,7 @@ $runnerArguments = @(
     "-PythonExe", (Quote-CommandArgument $pythonPath),
     "-RuntimeRoot", (Quote-CommandArgument $RuntimeRoot),
     "-BudgetSeconds", $BudgetSeconds,
+    "-CloseoutBudgetSeconds", $CloseoutBudgetSeconds,
     "-HardTimeoutMinutes", $ExecutionTimeLimitMinutes,
     "-ZhaoshangBackend", "legacy"
 )
@@ -85,8 +92,9 @@ $plan = [pscustomobject]@{
     RepetitionInterval = "PT15M"
     RepeatFor = "PT11H1M"
     LastPlannedStart = "20:00"
-    TickTimes = "09:00-17:00 hourly; 17:30; 17:45"
-    FinalizeHours = "18:00-20:00 every 15 minutes"
+    TickTimes = "09:00-17:00 hourly; 17:15; 17:30; 17:45"
+    CloseoutHours = "18:00-19:45 every 15 minutes (wall budget $CloseoutBudgetSeconds s; IgnoreNew drops overlaps)"
+    FinalizeHours = "20:00 fallback finalize"
 }
 
 if (-not $Apply) {
@@ -95,6 +103,8 @@ if (-not $Apply) {
         Message = "Preview only. Rerun with -Apply only after reviewing this exact production schedule."
         MultipleInstances = "IgnoreNew"
         ExecutionTimeLimit = "PT${ExecutionTimeLimitMinutes}M"
+        BudgetSeconds = $BudgetSeconds
+        CloseoutBudgetSeconds = $CloseoutBudgetSeconds
         RemoteWrites = [bool]$EnableRemoteWrites
         ConflictingTaskNames = $legacyTaskNames
         Tasks = @($plan)

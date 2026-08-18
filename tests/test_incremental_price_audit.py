@@ -59,13 +59,16 @@ def _row(v="doc-1", sku="sku-1", **extra):
     }
 
 
-def _config(clock, *, date="2026-08-11", budget=60, reserve=10):
+def _config(clock, *, date="2026-08-11", budget=60, reserve=10, stability=0.0):
+    # Older contracts freeze on one complete observation; stability-window
+    # behaviour has its own dedicated closeout tests.
     return TickConfig(
         business_date=date,
         runtime_budget_seconds=budget,
         heavy_work_reserve_seconds=reserve,
         lease_ttl_seconds=90,
         cutoff_at=datetime(2026, 8, 11, 10, 0, tzinfo=UTC),
+        source_stability_seconds=stability,
     )
 
 
@@ -442,11 +445,11 @@ def test_finalize_does_not_freeze_when_current_row_count_differs_from_saas_count
 def test_unchanged_snapshot_is_observed_again_and_can_freeze_across_cutoff(tmp_path):
     store = DailyAuditStore(tmp_path / "state.sqlite")
     clock = Clock()
-    config = _config(clock)
+    config = _config(clock, stability=600)
     row = _row()
     first = _deps([], [row], clock)
     first.discover = lambda _timeout: DiscoveredState(
-        observed_at=datetime(2026, 8, 11, 9, 59, tzinfo=UTC),
+        observed_at=datetime(2026, 8, 11, 9, 51, tzinfo=UTC),
         headers=["vCommodityId"],
         rows=[row],
         source_fingerprints=["same-source"],
@@ -474,7 +477,7 @@ def test_unchanged_snapshot_is_observed_again_and_can_freeze_across_cutoff(tmp_p
     snapshots = store.list_snapshots("2026-08-11")
     assert len(snapshots) == 2
     assert snapshots[0]["ordered_hash"] == snapshots[1]["ordered_hash"]
-    assert snapshots[0]["observed_at"] == "2026-08-11T09:59:00+00:00"
+    assert snapshots[0]["observed_at"] == "2026-08-11T09:51:00+00:00"
     assert snapshots[1]["observed_at"] == "2026-08-11T10:01:00+00:00"
     assert finalized.frozen_snapshot_id == snapshots[1]["id"]
 

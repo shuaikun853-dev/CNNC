@@ -95,6 +95,27 @@ class FinalizeAlreadyRunning(RuntimeError):
     pass
 
 
+def is_recoverable_finalize_wait(readiness: FinalizeReadiness | None) -> bool:
+    """True when only pending (not manual/terminal) work delays the final."""
+    if readiness is None:
+        return False
+    has_pending = any((
+        readiness.detail_pending,
+        readiness.model_pending,
+        readiness.crawl_pending,
+        readiness.remote_pending,
+    ))
+    has_actionable_blocker = any((
+        readiness.model_terminal,
+        readiness.crawl_terminal,
+        readiness.crawl_unplanned,
+        readiness.crawl_invalid_price,
+        readiness.remote_manual,
+        readiness.remote_invalid,
+    ))
+    return has_pending and not has_actionable_blocker
+
+
 def _decode_json(value: object, expected: type, field: str) -> Any:
     try:
         decoded = json.loads(str(value or ""))

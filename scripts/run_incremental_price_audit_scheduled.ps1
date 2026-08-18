@@ -5,8 +5,10 @@ param(
     [string] $RuntimeRoot = "",
     [ValidateRange(1, 3000)]
     [int] $BudgetSeconds = 720,
+    [ValidateRange(1, 3500)]
+    [int] $CloseoutBudgetSeconds = 1680,
     [ValidateRange(2, 59)]
-    [int] $HardTimeoutMinutes = 14,
+    [int] $HardTimeoutMinutes = 32,
     [ValidateRange(0, 120)]
     [int] $ProcessExitGraceSeconds = 30,
     [ValidateSet("legacy")]
@@ -35,6 +37,10 @@ $headroomSeconds = ($HardTimeoutMinutes * 60) - $BudgetSeconds
 if ($headroomSeconds -lt 60) {
     throw "HardTimeoutMinutes must leave at least 60 seconds beyond BudgetSeconds."
 }
+$closeoutHeadroomSeconds = ($HardTimeoutMinutes * 60) - $CloseoutBudgetSeconds
+if ($closeoutHeadroomSeconds -lt 90) {
+    throw "HardTimeoutMinutes must leave at least 90 seconds beyond CloseoutBudgetSeconds for checkpoint, final.xlsx materialization, manifest, and exit."
+}
 
 $now = if ($null -ne $At) { [datetime]$At } else { Get-Date }
 $hour = $now.Hour
@@ -44,17 +50,27 @@ $isWeekday = $now.DayOfWeek -notin @([DayOfWeek]::Saturday, [DayOfWeek]::Sunday)
 if ($isWeekday -and $minute -eq 0 -and $hour -ge 9 -and $hour -le 17) {
     $phases = @("tick")
 }
-elseif ($isWeekday -and $hour -eq 17 -and $minute -in @(30, 45)) {
+elseif ($isWeekday -and $hour -eq 17 -and $minute -in @(15, 30, 45)) {
     $phases = @("tick")
 }
-elseif ($isWeekday -and (
-    ($hour -ge 18 -and $hour -le 19 -and ($minute % 15) -eq 0) -or
-    ($hour -eq 20 -and $minute -eq 0)
-)) {
+elseif ($isWeekday -and $hour -ge 18 -and $hour -le 19 -and ($minute % 15) -eq 0) {
+    # Closeout owns the production writer until FINALIZED, its wall deadline,
+    # or a manual blocker; overlapping 15-minute wakeups are dropped by the
+    # task's IgnoreNew policy, and a fresh closeout continues the durable
+    # SQLite state when the previous one already exited.
+    $phases = @("closeout")
+}
+elseif ($isWeekday -and $hour -eq 20 -and $minute -eq 0) {
     $phases = @("finalize")
 }
 
 $modeArgument = if ($EnableRemoteWrites) { "--enable-remote-writes" } else { "--shadow" }
+function Get-PhaseBudgetSeconds([string] $Phase) {
+    if ($Phase -eq "closeout") {
+        return [int][math]::Min($CloseoutBudgetSeconds, $HardTimeoutMinutes * 60 - 90)
+    }
+    return [int][math]::Min($BudgetSeconds, $HardTimeoutMinutes * 60 - 60)
+}
 function Get-PhaseArguments([string] $Phase, [int] $PhaseBudgetSeconds) {
     $arguments = @(
         "-u",
@@ -77,7 +93,7 @@ if ($Preview) {
             [pscustomobject]@{
                 Phase = $phase
                 Command = $PythonExe
-                Arguments = (Get-PhaseArguments $phase $BudgetSeconds)
+                Arguments = (Get-PhaseArguments $phase (Get-PhaseBudgetSeconds $phase))
             }
         }
     )
@@ -91,6 +107,8 @@ if ($Preview) {
         Commands = $commands
         RuntimeRoot = $RuntimeRoot
         RemoteWrites = [bool]$EnableRemoteWrites
+        BudgetSeconds = $BudgetSeconds
+        CloseoutBudgetSeconds = $CloseoutBudgetSeconds
         HardTimeoutMinutes = $HardTimeoutMinutes
         LogPath = (Join-Path $RuntimeRoot ("scheduler_logs\{0}.log" -f $now.ToString("yyyy-MM-dd")))
     } | ConvertTo-Json -Depth 6
@@ -188,7 +206,7 @@ try {
             Write-SchedulerLog "SKIP phase=$phase reason=insufficient_wall_clock_budget remaining_seconds=$remainingSeconds"
             break
         }
-        $phaseBudget = [math]::Min($BudgetSeconds, $remainingSeconds)
+        $phaseBudget = [math]::Min((Get-PhaseBudgetSeconds $phase), $remainingSeconds)
         $exitCode = Invoke-Phase $phase $phaseBudget
         if ($exitCode -ne 0) {
             Write-SchedulerLog "STOP reason=phase_failed phase=$phase exit_code=$exitCode"

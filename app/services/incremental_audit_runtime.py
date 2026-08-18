@@ -33,6 +33,10 @@ from app.services.daily_audit_store import (
     LeaseUnavailable,
     ProcessLock,
 )
+from app.services.incremental_audit_closeout import (
+    CloseoutConfig,
+    run_closeout,
+)
 from app.services.incremental_audit_materializer import (
     ArtifactConflictError,
     MaterializationValidationError,
@@ -82,6 +86,7 @@ from app.workflows.incremental_price_audit_finalize import (
     FinalizePublication,
     FinalizeReadiness,
     ReviewPublication,
+    is_recoverable_finalize_wait,
     materialize_frozen_daily_run,
     materialize_frozen_review,
 )
@@ -216,6 +221,65 @@ def _record_recovery_event(paths: RuntimePaths, result: Mapping[str, Any]) -> No
             os.fsync(stream.fileno())
 
 
+def _opportunistic_recovery_closeout(
+    paths: RuntimePaths,
+    recovery: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    """Materialize the final workbook when a recovery just cleared the last blocker.
+
+    Returns ``None`` (and touches nothing) when the day has no frozen snapshot
+    yet or is already finalized.  A readiness block is reported as
+    ``NOT_READY``; the recovery result itself must never fail because the
+    opportunistic closeout could not run.
+    """
+    business_date = str(recovery.get("business_date") or "")
+    if not business_date or not paths.state_path.is_file():
+        return None
+    store = DailyAuditStore(paths.state_path)
+    try:
+        run = store.get_run(business_date)
+    except Exception:
+        return None
+    if run is None or run.get("frozen_snapshot_id") is None or run["state"] == "FINALIZED":
+        return None
+    try:
+        publication = materialize_frozen_daily_run(
+            store,
+            ProcessLock(paths.lock_path),
+            business_date,
+            paths.final_output_path,
+        )
+    except Exception as exc:
+        return {
+            "finalized": False,
+            "reason": "NOT_READY",
+            "error_type": type(exc).__name__,
+        }
+    materialization = getattr(publication, "materialization", None)
+    return {
+        "finalized": True,
+        "output_path": str(getattr(materialization, "output_path", paths.final_output_path)),
+        "finalized_rows": int(getattr(materialization, "row_count", 0) or 0),
+    }
+
+
+def _attach_recovery_closeout(paths: RuntimePaths, result: dict[str, Any]) -> dict[str, Any]:
+    closeout = _opportunistic_recovery_closeout(paths, result)
+    if closeout is None:
+        return result
+    result["closeout"] = closeout
+    _record_recovery_event(
+        paths,
+        {
+            "outcome": "RECOVERY_CLOSEOUT_FINALIZED" if closeout["finalized"] else "RECOVERY_CLOSEOUT_NOT_READY",
+            "business_date": paths.business_date,
+            "row_count": closeout.get("finalized_rows", 0),
+            "output_path": closeout.get("output_path"),
+        },
+    )
+    return result
+
+
 def run_model_recovery_command(
     *,
     business_date: str,
@@ -236,7 +300,7 @@ def run_model_recovery_command(
         timeout_seconds=timeout_seconds,
     )
     _record_recovery_event(paths, result)
-    return result
+    return _attach_recovery_closeout(paths, result)
 
 
 def run_requeue_model_transient_command(
@@ -255,7 +319,7 @@ def run_requeue_model_transient_command(
         expected_attempts=expected_attempts,
     )
     _record_recovery_event(paths, result)
-    return result
+    return _attach_recovery_closeout(paths, result)
 
 
 def run_release_model_recovery_command(
@@ -272,7 +336,7 @@ def run_release_model_recovery_command(
         stage_work_ids=stage_work_ids,
     )
     _record_recovery_event(paths, result)
-    return result
+    return _attach_recovery_closeout(paths, result)
 
 
 def run_remote_harvest_recovery_command(
@@ -292,7 +356,7 @@ def run_remote_harvest_recovery_command(
         adapter=CnncLegacyZhaoshangAdapter(),
     )
     _record_recovery_event(paths, result)
-    return result
+    return _attach_recovery_closeout(paths, result)
 
 
 def run_partial_exact_harvest_recovery_command(
@@ -312,7 +376,7 @@ def run_partial_exact_harvest_recovery_command(
         adapter=CnncLegacyZhaoshangAdapter(),
     )
     _record_recovery_event(paths, result)
-    return result
+    return _attach_recovery_closeout(paths, result)
 
 
 def run_no_result_recovery_command(
@@ -334,7 +398,7 @@ def run_no_result_recovery_command(
         adapter=CnncLegacyZhaoshangAdapter(),
     )
     _record_recovery_event(paths, result)
-    return result
+    return _attach_recovery_closeout(paths, result)
 
 
 def run_remote_priority_recovery_command(
@@ -362,7 +426,27 @@ def run_remote_priority_recovery_command(
         timeout_seconds=timeout_seconds,
     )
     _record_recovery_event(paths, result)
-    return result
+    if result.get("outcome") == "REMOTE_PRIORITY_RECOVERY_COMPLETED":
+        # One bounded targeted wait/export of exactly the recovered job; the
+        # other remote jobs keep their own sweep pacing.
+        try:
+            result["targeted_harvest"] = run_existing_remote_harvest(
+                state_path=paths.state_path,
+                lock_path=paths.lock_path,
+                business_date=business_date,
+                remote_job_id=remote_job_id,
+                remote_identity=remote_identity,
+                adapter=CnncLegacyZhaoshangAdapter(),
+                timeout_seconds=timeout_seconds,
+            )
+        except RecoveryRejected as exc:
+            result["targeted_harvest"] = {
+                "outcome": "REMOTE_PRIORITY_TARGETED_HARVEST_SKIPPED",
+                "reason": str(exc),
+            }
+        if isinstance(result["targeted_harvest"], dict):
+            _record_recovery_event(paths, result["targeted_harvest"])
+    return _attach_recovery_closeout(paths, result)
 
 
 def run_existing_remote_harvest_command(
@@ -384,7 +468,7 @@ def run_existing_remote_harvest_command(
         timeout_seconds=timeout_seconds,
     )
     _record_recovery_event(paths, result)
-    return result
+    return _attach_recovery_closeout(paths, result)
 
 
 def run_review_export_command(
@@ -560,29 +644,15 @@ def _batch_result_metadata(
         return "ACTIVE", "none", "none", "rerun after the cutoff snapshot is available"
     if outcome in {"DRAIN_NO_PROGRESS", "DRAIN_MAX_ITERATIONS", "BUDGET_EXHAUSTED"}:
         return "ACTIVE", "none", "none", "rerun drain-only for the remaining durable remote work"
+    if outcome == "CLOSEOUT_DEADLINE":
+        return "ACTIVE", "none", "none", "the next scheduled closeout continues the durable SQLite state"
     if outcome == "WAITING_SOURCE_COUNT":
         return "ACTIVE", "none", "none", "rerun finalize to discover the latest source counts"
     return "ACTIVE", "none", "none", "run the next finite tick, drain-only, or finalize"
 
 
 def _is_recoverable_finalize_wait(readiness: FinalizeReadiness | None) -> bool:
-    if readiness is None:
-        return False
-    has_pending = any((
-        readiness.detail_pending,
-        readiness.model_pending,
-        readiness.crawl_pending,
-        readiness.remote_pending,
-    ))
-    has_actionable_blocker = any((
-        readiness.model_terminal,
-        readiness.crawl_terminal,
-        readiness.crawl_unplanned,
-        readiness.crawl_invalid_price,
-        readiness.remote_manual,
-        readiness.remote_invalid,
-    ))
-    return has_pending and not has_actionable_blocker
+    return is_recoverable_finalize_wait(readiness)
 
 
 def _record_batch_result(
@@ -1382,13 +1452,20 @@ def run_runtime_command(
     materialize: Callable[..., FinalizePublication] = materialize_frozen_daily_run,
     monotonic: Callable[[], float] = monotonic_time.monotonic,
     invocation: str = "manual",
+    source_stability_seconds: float | None = None,
+    closeout_observation_interval_seconds: float = 300.0,
+    closeout_remote_sweep_interval_seconds: float = 600.0,
+    closeout_final_reserve_seconds: float = 120.0,
+    closeout_sleep: Callable[[float], None] = monotonic_time.sleep,
 ) -> RuntimeResult:
-    if command not in {"tick", "finalize", "drain-only"}:
-        raise ValueError("runtime command must be tick, drain-only, or finalize")
+    if command not in {"tick", "finalize", "drain-only", "closeout"}:
+        raise ValueError("runtime command must be tick, drain-only, finalize, or closeout")
     if command == "drain-only" and enable_zhaoshang:
         raise ValueError("drain-only forbids the remote-create capability")
     if invocation not in {"manual", "scheduler"}:
         raise ValueError("invocation must be manual or scheduler")
+    if source_stability_seconds is not None and source_stability_seconds < 0:
+        raise ValueError("source stability window must be zero or positive")
     day = business_date or business_date_in_shanghai(now)
     paths = runtime_paths(day, runtime_root)
     started_at = now or datetime.now(UTC)
@@ -1431,6 +1508,14 @@ def run_runtime_command(
             output_path=output_path,
             materialize=materialize,
             monotonic=monotonic,
+            source_stability_seconds=source_stability_seconds,
+            closeout_config=CloseoutConfig(
+                wall_budget_seconds=runtime_budget_seconds,
+                source_observation_interval_seconds=closeout_observation_interval_seconds,
+                remote_sweep_interval_seconds=closeout_remote_sweep_interval_seconds,
+                final_materialize_reserve_seconds=closeout_final_reserve_seconds,
+            ),
+            closeout_sleep=closeout_sleep,
         )
     finally:
         production_lock.release()
@@ -1450,6 +1535,9 @@ def _run_runtime_command_locked(
     output_path: Path | str | None,
     materialize: Callable[..., FinalizePublication],
     monotonic: Callable[[], float],
+    source_stability_seconds: float | None = None,
+    closeout_config: CloseoutConfig | None = None,
+    closeout_sleep: Callable[[float], None] = monotonic_time.sleep,
 ) -> RuntimeResult:
     command_started = monotonic()
     if command == "drain-only" and not paths.state_path.is_file():
@@ -1505,7 +1593,40 @@ def _run_runtime_command_locked(
         model_prompt_version=TITLE_MATCH_PROMPT_VERSION,
         model_schema_version=TITLE_MATCH_SCHEMA_VERSION,
         model_batch_size=10 if drain_only else _runtime_model_batch_size(),
+        **(
+            {"source_stability_seconds": source_stability_seconds}
+            if source_stability_seconds is not None
+            else {}
+        ),
     )
+    if command == "closeout":
+        assert closeout_config is not None
+        summary, publication, blocked, blocked_error_type = run_closeout(
+            store,
+            process_lock,
+            config,
+            deps,
+            closeout_config,
+            output_path=Path(output_path) if output_path else paths.final_output_path,
+            materialize=materialize,
+            monotonic=monotonic,
+            sleep=closeout_sleep,
+        )
+        result = RuntimeResult(
+            summary,
+            publication=publication,
+            publication_blocked=blocked,
+            publication_error_type=blocked_error_type,
+        )
+        _record_batch_result(
+            paths,
+            result,
+            command=command,
+            enable_zhaoshang=enable_zhaoshang,
+            zhaoshang_backend=zhaoshang_backend,
+            output_path=Path(output_path).resolve() if output_path else paths.final_output_path,
+        )
+        return result
     if command == "drain-only":
         summary = run_existing_remote_drain(
             store,

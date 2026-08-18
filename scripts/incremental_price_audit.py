@@ -1,4 +1,4 @@
-"""CLI for finite incremental audit tick, drain-only, finalize, or status."""
+"""CLI for finite incremental audit tick, closeout, finalize, or status."""
 
 from __future__ import annotations
 
@@ -75,7 +75,7 @@ def _add_common_arguments(parser: argparse.ArgumentParser, *, allow_remote_write
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Finite CNNC/SaaS incremental price-audit commands")
     subparsers = parser.add_subparsers(dest="command", required=True)
-    for command in ("tick", "finalize"):
+    for command in ("tick", "finalize", "closeout"):
         child = subparsers.add_parser(command)
         _add_common_arguments(child, allow_remote_writes=True)
         child.add_argument(
@@ -84,8 +84,27 @@ def build_parser() -> argparse.ArgumentParser:
             default="manual",
             help=argparse.SUPPRESS,
         )
-        if command == "finalize":
+        if command in {"finalize", "closeout"}:
             child.add_argument("--output", type=Path)
+        if command == "closeout":
+            child.add_argument(
+                "--source-stability-seconds",
+                type=float,
+                default=600.0,
+                help="identical authoritative observations must span this long before freeze",
+            )
+            child.add_argument(
+                "--source-observation-interval-seconds",
+                type=float,
+                default=300.0,
+                help="minimum spacing between SaaS observations before freeze",
+            )
+            child.add_argument(
+                "--remote-sweep-interval-seconds",
+                type=float,
+                default=600.0,
+                help="minimum spacing between full remote sweeps during closeout",
+            )
     drain = subparsers.add_parser("drain-only")
     _add_common_arguments(drain, allow_remote_writes=False)
     drain.add_argument(
@@ -335,6 +354,13 @@ def main(argv: list[str] | None = None) -> int:
         zhaoshang_backend=zhaoshang_backend,
         output_path=getattr(args, "output", None),
         invocation=args.invocation,
+        source_stability_seconds=getattr(args, "source_stability_seconds", None),
+        closeout_observation_interval_seconds=getattr(
+            args, "source_observation_interval_seconds", 300.0
+        ),
+        closeout_remote_sweep_interval_seconds=getattr(
+            args, "remote_sweep_interval_seconds", 600.0
+        ),
     )
     elapsed_seconds = round(max(0.0, time.monotonic() - started), 3)
     if result.lock_conflict is not None:

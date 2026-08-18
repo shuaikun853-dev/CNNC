@@ -302,6 +302,7 @@ def test_finalize_reuses_tick_core_and_then_calls_materializer(tmp_path):
     result = run_runtime_command(
         "finalize", business_date="2026-08-11", runtime_root=tmp_path / "runtime",
         dependencies=_dependencies(events), materialize=materialize,
+        source_stability_seconds=0,
     )
     assert result.tick.frozen_snapshot_id is not None
     assert result.publication is not None
@@ -328,6 +329,7 @@ def test_customer_count_mismatch_freezes_but_pending_readiness_does_not_material
         runtime_root=tmp_path / "runtime",
         dependencies=deps,
         output_path=output,
+        source_stability_seconds=0,
     )
 
     assert result.tick.frozen_snapshot_id is not None
@@ -359,6 +361,7 @@ def test_customer_count_mismatch_materializes_after_all_readiness_blockers_clear
         runtime_root=tmp_path / "runtime",
         dependencies=deps,
         materialize=materialize,
+        source_stability_seconds=0,
     )
 
     assert result.tick.frozen_snapshot_id is not None
@@ -562,7 +565,8 @@ def test_finalize_publishes_frozen_scope_even_when_superseded_prefix_work_is_pen
         return object()
 
     result = run_runtime_command(
-        "finalize", business_date="2026-08-11", runtime_root=root, dependencies=deps, materialize=materialize
+        "finalize", business_date="2026-08-11", runtime_root=root, dependencies=deps, materialize=materialize,
+        source_stability_seconds=0,
     )
     assert result.tick.outcome in {"WAITING_REMOTE", "PENDING_RETRY"}
     assert result.tick.frozen_snapshot_id is not None
@@ -1083,6 +1087,7 @@ def test_finalize_updates_batch_state_and_preserves_external_events(tmp_path):
         enable_zhaoshang=True,
         output_path=output,
         materialize=lambda *_args: object(),
+        source_stability_seconds=0,
     )
 
     assert result.publication is not None
@@ -1106,6 +1111,7 @@ def test_finalize_block_updates_batch_state_with_recoverable_blocker(tmp_path):
         runtime_root=root,
         dependencies=_dependencies([]),
         materialize=blocked,
+        source_stability_seconds=0,
     )
 
     assert result.publication_blocked == "frozen crawl work is not ready"
@@ -1366,6 +1372,7 @@ def test_finalize_expected_publication_conflict_is_actionable_and_persisted(
         runtime_root=tmp_path / "runtime",
         dependencies=_dependencies([]),
         materialize=blocked,
+        source_stability_seconds=0,
     )
 
     assert result.publication_blocked == str(conflict)
@@ -1387,6 +1394,7 @@ def test_finalize_materializer_overlap_is_normal_defer(tmp_path):
         runtime_root=tmp_path / "runtime",
         dependencies=_dependencies([]),
         materialize=overlapping,
+        source_stability_seconds=0,
     )
 
     assert result.tick.outcome == "ALREADY_RUNNING"

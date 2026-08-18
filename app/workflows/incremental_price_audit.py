@@ -48,6 +48,10 @@ class TickConfig:
     priority_retry_max_attempts: int = 3
     priority_retry_max_elapsed_seconds: float = 180
     harvest_batch_size: int = 6
+    # Authoritative observations with identical (row_count, ordered_hash) must
+    # span at least this long before a finalize freeze may trust them.  A single
+    # complete pagination only proves one fetch was internally consistent.
+    source_stability_seconds: float = 600
 
     def __post_init__(self) -> None:
         numeric = (
@@ -55,6 +59,7 @@ class TickConfig:
             self.detail_max_elapsed_seconds, self.model_max_elapsed_seconds,
             self.external_timeout_seconds, self.snapshot_discovery_timeout_seconds,
             self.harvest_max_elapsed_seconds, self.priority_retry_max_elapsed_seconds,
+            self.source_stability_seconds,
         )
         if not all(math.isfinite(value) for value in numeric):
             raise ValueError("tick limits must be finite")
@@ -83,6 +88,8 @@ class TickConfig:
             raise ValueError("harvest limits must be positive")
         if self.harvest_batch_size <= 0:
             raise ValueError("harvest batch size must be positive")
+        if self.source_stability_seconds < 0:
+            raise ValueError("source stability window must be zero or positive")
 
     @property
     def cutoff_utc(self) -> datetime | None:
@@ -207,6 +214,42 @@ def _coerce_observed(value: datetime) -> datetime:
     if value.tzinfo is None or value.utcoffset() is None:
         raise ValueError("discovered observed_at must have an explicit timezone")
     return value.astimezone(UTC)
+
+
+def source_stability_seconds(
+    store: DailyAuditStore, business_date: str, snapshot: Mapping[str, Any]
+) -> float:
+    """Seconds the snapshot's content has been observed unchanged, ending at it.
+
+    Uses only the day's authoritative observations already persisted by
+    production discovery.  A single observation has zero stability; an
+    interleaved observation with different content restarts the timer because
+    the upstream source demonstrably changed after that run started.
+    """
+    observations = store.list_snapshots(business_date)
+    position = next(
+        (
+            index
+            for index, observed in enumerate(observations)
+            if int(observed["id"]) == int(snapshot["id"])
+        ),
+        None,
+    )
+    if position is None:
+        return 0.0
+    identity = (int(snapshot["row_count"]), str(snapshot["ordered_hash"]))
+    started_at: datetime | None = None
+    latest_at: datetime | None = None
+    for observed in reversed(observations[: position + 1]):
+        if (int(observed["row_count"]), str(observed["ordered_hash"])) != identity:
+            break
+        moment = datetime.fromisoformat(str(observed["observed_at"]))
+        if latest_at is None:
+            latest_at = moment
+        started_at = moment
+    if started_at is None or latest_at is None:
+        return 0.0
+    return max(0.0, (latest_at - started_at).total_seconds())
 
 
 _HARVESTABLE_REMOTE_STATES = {
@@ -924,8 +967,17 @@ def run_incremental_tick(
     deps: TickDependencies,
     *,
     finalize: bool = False,
+    skip_opening_harvest: bool = False,
+    skip_discovery: bool = False,
 ) -> TickSummary:
-    """Run one bounded tick; it never starts a daemon or waits for submitted jobs."""
+    """Run one bounded tick; it never starts a daemon or waits for submitted jobs.
+
+    ``skip_opening_harvest`` and ``skip_discovery`` are narrow phase controls for
+    the evening closeout orchestrator, which paces source observations and full
+    remote sweeps itself.  The defaults keep ordinary tick/finalize behaviour:
+    every tick sweeps eligible remote jobs once and discovers the source when
+    the run is not frozen.
+    """
     counters = _empty_counters()
     trace: list[str] = []
     cutoff = config.cutoff_utc
@@ -972,7 +1024,11 @@ def run_incremental_tick(
             store.update_daily_metrics(token, counters)
             return TickSummary("BUDGET_EXHAUSTED", tuple(trace), counters, backlog, None)
         trace.append("harvest")
-        swept_remote_jobs = _harvest(store, token, deps, budget, counters, config)
+        swept_remote_jobs: set[int] = set()
+        if skip_opening_harvest:
+            trace.append("harvest_deferred")
+        else:
+            swept_remote_jobs = _harvest(store, token, deps, budget, counters, config)
         if not budget.can_start_heavy():
             trace.append("checkpoint")
             backlog = _backlog(store, token)
@@ -988,6 +1044,11 @@ def run_incremental_tick(
         snapshot: Mapping[str, Any] | None = None
         if run["frozen_snapshot_id"] is not None:
             snapshot = store.get_snapshot(int(run["frozen_snapshot_id"]))
+        elif skip_discovery:
+            # A sweep-only pass: no new observation, so there are no snapshot
+            # items to preprocess this pass.  Durable pending work (remote
+            # submissions, stage retry backlog) still advances.
+            trace.append("discover_deferred")
         else:
             trace.append("discover")
             discovered = deps.discover(
@@ -1005,9 +1066,10 @@ def run_incremental_tick(
             counters["today_discovered"] = int(ingested["member_count"])
             counters["delta_new"] = int(ingested["status_counts"].get("NEW", 0))
             counters["delta_changed"] = int(ingested["status_counts"].get("CHANGED", 0))
-        assert snapshot is not None
-        snapshot_id = int(snapshot["id"])
-        items = store.ordered_snapshot_items(snapshot_id)
+        snapshot_id = int(snapshot["id"]) if snapshot is not None else None
+        items: Sequence[Mapping[str, Any]] = (
+            store.ordered_snapshot_items(snapshot_id) if snapshot_id is not None else ()
+        )
         snapshot_items = items
 
         trace.append("detail")
@@ -1055,32 +1117,43 @@ def run_incremental_tick(
         backlog = _backlog(store, token, snapshot_items)
         waiting_source_count = False
         if finalize and run["frozen_snapshot_id"] is None:
-            try:
-                evidence = json.loads(str(snapshot.get("evidence_json") or "{}"))
-            except (TypeError, ValueError, json.JSONDecodeError):
-                evidence = {}
-            saas_count = evidence.get("saas_count")
-            customer_count = evidence.get("customer_count")
-            valid_saas_count = (
-                isinstance(saas_count, int)
-                and not isinstance(saas_count, bool)
-                and saas_count >= 0
-            )
-            valid_customer_count = (
-                isinstance(customer_count, int)
-                and not isinstance(customer_count, bool)
-                and customer_count >= 0
-            )
-            if valid_saas_count:
-                counters["saas_count"] = saas_count
-            if valid_customer_count:
-                counters["customer_count"] = customer_count
-            if valid_saas_count and valid_customer_count:
-                counters["source_count_gap"] = customer_count - saas_count
-            if valid_saas_count and int(snapshot["row_count"]) == saas_count:
-                run = store.freeze_snapshot(token, snapshot_id)
-            else:
+            if snapshot is None:
+                # A sweep-only pass observed nothing new; freezing is decided by
+                # a pass that actually carries an authoritative observation.
                 waiting_source_count = True
+            else:
+                try:
+                    evidence = json.loads(str(snapshot.get("evidence_json") or "{}"))
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    evidence = {}
+                saas_count = evidence.get("saas_count")
+                customer_count = evidence.get("customer_count")
+                valid_saas_count = (
+                    isinstance(saas_count, int)
+                    and not isinstance(saas_count, bool)
+                    and saas_count >= 0
+                )
+                valid_customer_count = (
+                    isinstance(customer_count, int)
+                    and not isinstance(customer_count, bool)
+                    and customer_count >= 0
+                )
+                if valid_saas_count:
+                    counters["saas_count"] = saas_count
+                if valid_customer_count:
+                    counters["customer_count"] = customer_count
+                if valid_saas_count and valid_customer_count:
+                    counters["source_count_gap"] = customer_count - saas_count
+                if (
+                    valid_saas_count
+                    and int(snapshot["row_count"]) == saas_count
+                    and source_stability_seconds(store, config.business_date, snapshot)
+                    + 1e-9
+                    >= config.source_stability_seconds
+                ):
+                    run = store.freeze_snapshot(token, snapshot_id)
+                else:
+                    waiting_source_count = True
         if backlog["model_terminal"] or backlog["remote_manual"]:
             outcome = "MANUAL_REVIEW_REQUIRED"
         elif backlog["remote_unknown"]:
