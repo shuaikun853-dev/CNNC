@@ -25,6 +25,7 @@ from app.services.incremental_audit_runtime import (
     run_remote_harvest_recovery_command,
     run_remote_priority_recovery_command,
     run_remote_priority_zero_rows_recovery_command,
+    run_remote_wait_export_recovery_command,
     run_runtime_command,
 )
 from app.services.incremental_audit_recovery import RecoveryRejected
@@ -226,6 +227,16 @@ def build_parser() -> argparse.ArgumentParser:
     harvest_existing.add_argument("--remote-job-id", type=int, required=True)
     harvest_existing.add_argument("--remote-identity", required=True)
     harvest_existing.add_argument("--timeout-seconds", type=float, default=300.0)
+    recover_wait_export = subparsers.add_parser("recover-remote-wait-export")
+    _add_common_arguments(recover_wait_export, allow_remote_writes=False)
+    recover_wait_export.add_argument("--remote-job-id", type=int, required=True)
+    recover_wait_export.add_argument("--remote-identity", required=True)
+    recover_wait_export.add_argument(
+        "--expected-error-text",
+        required=True,
+        help="exact persisted wait-export manual diagnostic the recovery is scoped to",
+    )
+    recover_wait_export.add_argument("--timeout-seconds", type=float, default=300.0)
     export_review = subparsers.add_parser("export-review")
     _add_common_arguments(export_review, allow_remote_writes=False)
     export_review.add_argument("--output-path", type=Path)
@@ -290,6 +301,7 @@ def main(argv: list[str] | None = None) -> int:
         "resolve-no-result",
         "recover-remote-priority",
         "recover-remote-priority-zero-rows",
+        "recover-remote-wait-export",
         "harvest-existing-remote",
     }:
         try:
@@ -352,6 +364,15 @@ def main(argv: list[str] | None = None) -> int:
                 )
             elif args.command == "recover-remote-priority-zero-rows":
                 recovery = run_remote_priority_zero_rows_recovery_command(
+                    business_date=business_date,
+                    runtime_root=args.runtime_root,
+                    remote_job_id=args.remote_job_id,
+                    remote_identity=args.remote_identity,
+                    expected_error_text=args.expected_error_text,
+                    timeout_seconds=args.timeout_seconds,
+                )
+            elif args.command == "recover-remote-wait-export":
+                recovery = run_remote_wait_export_recovery_command(
                     business_date=business_date,
                     runtime_root=args.runtime_root,
                     remote_job_id=args.remote_job_id,

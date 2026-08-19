@@ -51,6 +51,7 @@ from app.services.incremental_audit_recovery import (
     run_local_remote_harvest_recovery,
     run_model_recovery,
     run_partial_exact_harvest_recovery,
+    run_remote_wait_export_recovery,
 )
 from app.services.legacy_zhaoshang_adapter import (
     CnncLegacyZhaoshangAdapter,
@@ -511,6 +512,30 @@ def run_existing_remote_harvest_command(
         business_date=business_date,
         remote_job_id=remote_job_id,
         remote_identity=remote_identity,
+        adapter=CnncLegacyZhaoshangAdapter(),
+        timeout_seconds=timeout_seconds,
+    )
+    _record_recovery_event(paths, result)
+    return _attach_recovery_closeout(paths, result)
+
+
+def run_remote_wait_export_recovery_command(
+    *,
+    business_date: str,
+    runtime_root: Path | str,
+    remote_job_id: int,
+    remote_identity: str,
+    expected_error_text: str,
+    timeout_seconds: float = 300.0,
+) -> dict[str, Any]:
+    paths = runtime_paths(business_date, runtime_root)
+    result = run_remote_wait_export_recovery(
+        state_path=paths.state_path,
+        lock_path=paths.lock_path,
+        business_date=business_date,
+        remote_job_id=remote_job_id,
+        remote_identity=remote_identity,
+        expected_error_text=expected_error_text,
         adapter=CnncLegacyZhaoshangAdapter(),
         timeout_seconds=timeout_seconds,
     )
