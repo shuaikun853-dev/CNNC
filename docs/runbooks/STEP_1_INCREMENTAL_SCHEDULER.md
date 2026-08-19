@@ -45,11 +45,13 @@ SQLite 仅有七张 checkpoint 表：`daily_runs`、`snapshots`、`audit_items`�
 | Start in | 仓库根目录 |
 | Trigger | 每周一至周五，09:00 起每 15 分钟唤醒，最后一次 20:00 |
 | Multiple instances | **IgnoreNew** |
-| Application budget | tick **720 秒**；closeout **1680 秒** |
+| Application budget | tick/harvest-only **720 秒**；closeout **1680 秒** |
 | ExecutionTimeLimit | **32 分钟（1920 秒）** |
 
 runner 是一次性有限进程，不含常驻 daemon。09:00-17:00 整点运行 `tick`，17:15、17:30 和 17:45
-再各运行一次 `tick`；其余白天 15 分钟唤醒直接 NOOP。18:00-20:00 每 15 分钟运行 `closeout`，
+再各运行一次 `tick`；09:15-16:45 的白天非整点 15 分钟唤醒运行 `harvest-only`（只回收已存在的招商局
+remote jobs：不查 SaaS、不跑 Detail/Model、不 submit、不 finalize；本地无 eligible remote job 时纯本地
+NOOP，不请求招商局）。18:00-20:00 每 15 分钟运行 `closeout`，
 **20:00 是当天最后一次自动 closeout**；20:15 后不再有任何自动调度，即使被人工误调用也会快速空操作退出。
 closeout 在一个进程内持续推进，不为下一个 15 分钟唤醒等待：SaaS 稳定观察最快每 300 秒一次，
 招商局 full sweep 最快每 600 秒一次（单批最多 6 个，一轮覆盖全部 eligible remote jobs）。18:00 后只要
@@ -67,7 +69,7 @@ Scheduler 默认仅周一至周五运行。周六、周日中核不产生业务�
 
 按 `runtime_root + business_date` 建立的非阻塞 OS file lock 是手工 CLI 与 Scheduler 共用的第一层
 生产互斥；它在 SQLite、priority、export、download、harvest、backfill、readiness/freeze 和正式物化前取得，
-并覆盖整个命令生命周期。`tick`、`closeout`、`finalize`、`drain-only` 竞争同一把锁；拿不到时立即输出
+并覆盖整个命令生命周期。`tick`、`closeout`、`finalize`、`drain-only`、`harvest-only` 竞争同一把锁；拿不到时立即输出
 `SKIPPED_ALREADY_RUNNING` 并以 0 正常退出，不等待也不进入 lifecycle。Windows Task Scheduler 的
 `IgnoreNew` 是额外的 no-overlap 防护，内部 fenced DB lease 继续保留。预算接近末尾
 reserve 时不会领取新重工作，下一次 15 分钟唤醒继续 backlog。Python wall-clock budget 无法强行中断卡在
@@ -117,7 +119,11 @@ python scripts\incremental_price_audit.py lock-status `
 ```
 
 上面的 `drain-only` 是正式手工恢复入口，不是 dry-run，也不再由 Scheduler 自动调用；它与 tick/finalize
-使用同一 writer lock。锁由文件句柄上的 Windows `msvcrt` 非阻塞字节锁持有，进程正常退出、异常、
+使用同一 writer lock。`harvest-only` 是 Scheduler 白天非整点槽位的自动命令，也可手工执行；它只调用与
+tick/drain 同一个 `_harvest()` sweep（snapshot-at-start eligible 集合、按 `harvest_attempts,id` 排序、单批
+最多 6 个、一轮覆盖全部 eligible、单 job 同轮只查一次），发现 `COMPLETED` 立即走现有 export/ingest 更新
+crawl/remote durable state，但绝不 discover/Detail/Model/submit/freeze/materialize；CLI 不暴露任何远程写
+开关。锁由文件句柄上的 Windows `msvcrt` 非阻塞字节锁持有，进程正常退出、异常、
 Ctrl+C 或被操作系统终止后都会由 `finally` 或 OS 自动释放。旁路 owner JSON 仅用于展示，不能决定
 锁是否占用；即使异常后留下 stale metadata，下一 owner 仍以 OS lock 为准并覆盖它。
 

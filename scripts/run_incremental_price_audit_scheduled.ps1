@@ -53,6 +53,12 @@ if ($isWeekday -and $minute -eq 0 -and $hour -ge 9 -and $hour -le 17) {
 elseif ($isWeekday -and $hour -eq 17 -and $minute -in @(15, 30, 45)) {
     $phases = @("tick")
 }
+elseif ($isWeekday -and $hour -ge 9 -and $hour -le 16 -and $minute -in @(15, 30, 45)) {
+    # Daytime quarter-hour wakeups only sweep already-submitted Zhaoshang jobs:
+    # no SaaS discovery, no Detail/Model, no submit, no finalize.  The 17:xx
+    # quarter slots stay full ticks because 17:00-18:00 is the new-data peak.
+    $phases = @("harvest-only")
+}
 elseif (
     $isWeekday -and (
         ($hour -ge 18 -and $hour -le 19 -and ($minute % 15) -eq 0) -or
@@ -83,7 +89,7 @@ function Get-PhaseArguments([string] $Phase, [int] $PhaseBudgetSeconds) {
         "--runtime-root", $RuntimeRoot,
         "--budget-seconds", [string]$PhaseBudgetSeconds
     )
-    if ($Phase -ne "drain-only") {
+    if ($Phase -notin @("drain-only", "harvest-only")) {
         $arguments += $modeArgument
     }
     $arguments += @("--invocation", "scheduler")
@@ -160,7 +166,7 @@ function Write-SchedulerLog([string] $Message) {
 
 function Invoke-Phase([string] $Phase, [int] $PhaseBudgetSeconds) {
     $arguments = Get-PhaseArguments $Phase $PhaseBudgetSeconds
-    $phaseMode = if ($Phase -eq "drain-only") { "drain-only" } else { $modeArgument }
+    $phaseMode = if ($Phase -in @("drain-only", "harvest-only")) { $Phase } else { $modeArgument }
     Write-SchedulerLog "START phase=$Phase budget_seconds=$PhaseBudgetSeconds mode=$phaseMode backend=$ZhaoshangBackend"
     $remainingSeconds = [math]::Floor(
         $hardLimitSeconds - $stopwatch.Elapsed.TotalSeconds - $shutdownReserveSeconds

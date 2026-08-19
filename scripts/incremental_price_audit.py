@@ -125,6 +125,25 @@ def build_parser() -> argparse.ArgumentParser:
         default="manual",
         help=argparse.SUPPRESS,
     )
+    harvest_only = subparsers.add_parser("harvest-only")
+    _add_common_arguments(harvest_only, allow_remote_writes=False)
+    harvest_only.add_argument(
+        "--budget-seconds",
+        type=float,
+        default=DEFAULT_COMMAND_BUDGET_SECONDS,
+        help="finite harvest-only wall-clock budget",
+    )
+    harvest_only.add_argument(
+        "--zhaoshang-backend",
+        choices=("legacy",),
+        default="legacy",
+    )
+    harvest_only.add_argument(
+        "--invocation",
+        choices=("manual", "scheduler"),
+        default="manual",
+        help=argparse.SUPPRESS,
+    )
     status = subparsers.add_parser("status")
     _add_common_arguments(status, allow_remote_writes=False)
     lock_status = subparsers.add_parser("lock-status")
@@ -340,8 +359,8 @@ def main(argv: list[str] | None = None) -> int:
     enable_remote_writes = getattr(args, "enable_remote_writes", False)
     zhaoshang_backend = getattr(args, "zhaoshang_backend", "legacy")
     mode = (
-        "drain-only"
-        if args.command == "drain-only"
+        args.command
+        if args.command in {"drain-only", "harvest-only"}
         else "remote-write-enabled" if enable_remote_writes else "shadow"
     )
     result = run_runtime_command(

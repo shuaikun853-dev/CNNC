@@ -93,6 +93,7 @@ $plan = [pscustomobject]@{
     RepeatFor = "PT11H1M"
     LastPlannedStart = "20:00"
     TickTimes = "09:00-17:00 hourly; 17:15; 17:30; 17:45"
+    HarvestOnlyTimes = "09:15-16:45 quarter-hour slots (sweep existing Zhaoshang remote jobs only; no SaaS discovery, Detail, Model, submit, or finalize)"
     CloseoutHours = "18:00-20:00 every 15 minutes (wall budget $CloseoutBudgetSeconds s; IgnoreNew drops overlaps; 20:00 is the last automatic start)"
     FinalizeHours = "none after 20:00; operators run an explicit manual closeout instead"
 }

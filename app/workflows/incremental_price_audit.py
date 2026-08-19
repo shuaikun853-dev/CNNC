@@ -960,6 +960,117 @@ def run_existing_remote_drain(
         process_lock.release()
 
 
+def run_harvest_only(
+    store: DailyAuditStore,
+    process_lock: ProcessLock,
+    config: TickConfig,
+    deps: TickDependencies,
+) -> TickSummary:
+    """Sweep already-submitted remote jobs exactly once; never create or finalize.
+
+    This is the daytime quarter-hour counterpart of the drain: one existing
+    :func:`_harvest` sweep over the durable eligible set, so a finished remote
+    job is exported and ingested without waiting for the next hourly tick.
+    Discovery, staging, planning, submission and finalization do not exist on
+    this path, and a day with no eligible remote job is a pure local no-op.
+    """
+    counters = _empty_counters()
+    trace: list[str] = []
+    run = store.get_run(config.business_date)
+    if run is None:
+        return TickSummary("HARVEST_NO_EXISTING_RUN", tuple(trace), counters, {}, None)
+    now = deps.wall_clock()
+    if now.tzinfo is None or now.utcoffset() is None:
+        raise ValueError("wall_clock must return an explicit-timezone datetime")
+    try:
+        process_lock.acquire()
+    except LeaseUnavailable:
+        return TickSummary("ALREADY_RUNNING", tuple(trace), counters, {}, None)
+
+    token: LeaseToken | None = None
+    try:
+        try:
+            token = store.acquire_lease(
+                config.business_date,
+                f"harvest-{id(process_lock)}",
+                max(
+                    5,
+                    config.lease_ttl_seconds,
+                    config.runtime_budget_seconds + config.heavy_work_reserve_seconds,
+                ),
+                allow_unexpired_takeover=True,
+                process_lock=process_lock,
+            )
+        except LeaseUnavailable:
+            return TickSummary("ALREADY_RUNNING", tuple(trace), counters, {}, None)
+        run = store.get_run(config.business_date)
+        assert run is not None
+        if run["state"] == "FINALIZED":
+            _, backlog = _remote_drain_progress(store, token)
+            return TickSummary(
+                "ALREADY_FINALIZED",
+                ("noop:already_finalized",),
+                counters,
+                backlog,
+                run["frozen_snapshot_id"],
+            )
+        trace.append("recover_submit_unknown")
+        counters["recovered_submit_unknown"] = store.recover_ambiguous_remote_submissions(
+            token
+        )
+        eligible = store.list_remote_jobs(token, states=_HARVESTABLE_REMOTE_STATES)
+        if not eligible:
+            trace.append("noop:nothing_eligible")
+            backlog = _backlog(store, token)
+            return TickSummary(
+                "HARVEST_NOTHING_ELIGIBLE",
+                tuple(trace),
+                counters,
+                backlog,
+                run["frozen_snapshot_id"],
+            )
+        budget = TickBudget(
+            deps.monotonic(),
+            config.runtime_budget_seconds,
+            config.heavy_work_reserve_seconds,
+            deps.monotonic,
+        )
+        trace.append("harvest")
+        _harvest(store, token, deps, budget, counters, config)
+        trace.append("checkpoint")
+        backlog = _backlog(store, token)
+        if backlog["remote_manual"]:
+            outcome = "MANUAL_REVIEW_REQUIRED"
+        elif backlog["remote_unknown"]:
+            outcome = "WAITING_REMOTE_RECONCILIATION"
+        elif backlog["remote_pending"]:
+            outcome = "WAITING_REMOTE"
+        else:
+            outcome = "HARVESTED"
+        counters["crawl_running"] = backlog["crawl_pending"]
+        store.update_daily_metrics(token, counters)
+        final_run = store.get_run(config.business_date)
+        return TickSummary(
+            outcome,
+            tuple(trace),
+            counters,
+            backlog,
+            final_run["frozen_snapshot_id"] if final_run else None,
+        )
+    except Exception as exc:
+        if token is None:
+            return TickSummary("FAILED", tuple(trace), counters, {}, None, _safe_error(exc))
+        try:
+            _, backlog = _remote_drain_progress(store, token)
+        except BaseException:
+            backlog = {}
+        return TickSummary("FAILED", tuple(trace), counters, backlog, None, _safe_error(exc))
+    finally:
+        if token is not None:
+            store.release_lease(token)
+        process_lock.release()
+
+
 def run_incremental_tick(
     store: DailyAuditStore,
     process_lock: ProcessLock,

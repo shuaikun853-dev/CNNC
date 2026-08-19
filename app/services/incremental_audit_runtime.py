@@ -78,6 +78,7 @@ from app.workflows.incremental_price_audit import (
     TickDependencies,
     TickSummary,
     run_existing_remote_drain,
+    run_harvest_only,
     run_incremental_tick,
 )
 from app.workflows.incremental_price_audit_finalize import (
@@ -1458,10 +1459,12 @@ def run_runtime_command(
     closeout_final_reserve_seconds: float = 120.0,
     closeout_sleep: Callable[[float], None] = monotonic_time.sleep,
 ) -> RuntimeResult:
-    if command not in {"tick", "finalize", "drain-only", "closeout"}:
-        raise ValueError("runtime command must be tick, drain-only, finalize, or closeout")
+    if command not in {"tick", "finalize", "drain-only", "harvest-only", "closeout"}:
+        raise ValueError("runtime command must be tick, drain-only, harvest-only, finalize, or closeout")
     if command == "drain-only" and enable_zhaoshang:
         raise ValueError("drain-only forbids the remote-create capability")
+    if command == "harvest-only" and enable_zhaoshang:
+        raise ValueError("harvest-only forbids the remote-create capability")
     if invocation not in {"manual", "scheduler"}:
         raise ValueError("invocation must be manual or scheduler")
     if source_stability_seconds is not None and source_stability_seconds < 0:
@@ -1540,8 +1543,9 @@ def _run_runtime_command_locked(
     closeout_sleep: Callable[[float], None] = monotonic_time.sleep,
 ) -> RuntimeResult:
     command_started = monotonic()
-    if command == "drain-only" and not paths.state_path.is_file():
-        return RuntimeResult(TickSummary("DRAIN_NO_EXISTING_RUN", (), {}, {}, None))
+    if command in {"drain-only", "harvest-only"} and not paths.state_path.is_file():
+        outcome = "DRAIN_NO_EXISTING_RUN" if command == "drain-only" else "HARVEST_NO_EXISTING_RUN"
+        return RuntimeResult(TickSummary(outcome, (), {}, {}, None))
     paths.run_dir.mkdir(parents=True, exist_ok=True)
     _ensure_batch_state(
         paths,
@@ -1571,7 +1575,7 @@ def _run_runtime_command_locked(
         return result
     if dependencies is not None:
         deps = dependencies
-    elif command == "drain-only":
+    elif command in {"drain-only", "harvest-only"}:
         deps = build_drain_dependencies(
             zhaoshang_backend=zhaoshang_backend,
             paths=paths,
@@ -1584,15 +1588,15 @@ def _run_runtime_command_locked(
             paths=paths,
             business_date=day,
         )
-    drain_only = command == "drain-only"
+    lifecycle_only = command in {"drain-only", "harvest-only"}
     config = TickConfig(
         business_date=day,
         runtime_budget_seconds=runtime_budget_seconds,
         cutoff_at=cutoff_for_business_date(day),
-        model_name="unused-by-drain-only" if drain_only else _configured_model_name(),
+        model_name="unused-by-existing-remote-commands" if lifecycle_only else _configured_model_name(),
         model_prompt_version=TITLE_MATCH_PROMPT_VERSION,
         model_schema_version=TITLE_MATCH_SCHEMA_VERSION,
-        model_batch_size=10 if drain_only else _runtime_model_batch_size(),
+        model_batch_size=10 if lifecycle_only else _runtime_model_batch_size(),
         **(
             {"source_stability_seconds": source_stability_seconds}
             if source_stability_seconds is not None
@@ -1635,6 +1639,8 @@ def _run_runtime_command_locked(
             deps,
             max_iterations=drain_max_iterations,
         )
+    elif command == "harvest-only":
+        summary = run_harvest_only(store, process_lock, config, deps)
     else:
         summary = run_incremental_tick(
             store,

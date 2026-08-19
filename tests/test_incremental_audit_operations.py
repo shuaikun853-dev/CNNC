@@ -815,6 +815,7 @@ def test_scheduler_scripts_preview_weekday_production_plan_without_mutation():
     assert task["RepeatFor"] == "PT11H1M"
     assert task["LastPlannedStart"] == "20:00"
     assert task["TickTimes"] == "09:00-17:00 hourly; 17:15; 17:30; 17:45"
+    assert task["HarvestOnlyTimes"].startswith("09:15-16:45 quarter-hour slots")
     assert task["CloseoutHours"].startswith("18:00-20:00 every 15 minutes")
     assert "20:00 is the last automatic start" in task["CloseoutHours"]
     assert task["FinalizeHours"] == "none after 20:00; operators run an explicit manual closeout instead"
@@ -834,8 +835,22 @@ def test_scheduled_runner_routes_hours_without_running_python(tmp_path):
     runtime_root = tmp_path / "runtime"
     expected = (
         ("2026-08-13T09:00:00", ["tick"]),
-        ("2026-08-13T09:15:00", []),
+        ("2026-08-13T09:15:00", ["harvest-only"]),
+        ("2026-08-13T09:30:00", ["harvest-only"]),
+        ("2026-08-13T09:45:00", ["harvest-only"]),
         ("2026-08-13T10:00:00", ["tick"]),
+        ("2026-08-13T10:15:00", ["harvest-only"]),
+        ("2026-08-13T10:30:00", ["harvest-only"]),
+        ("2026-08-13T10:45:00", ["harvest-only"]),
+        ("2026-08-13T11:15:00", ["harvest-only"]),
+        ("2026-08-13T12:45:00", ["harvest-only"]),
+        ("2026-08-13T13:30:00", ["harvest-only"]),
+        ("2026-08-13T14:45:00", ["harvest-only"]),
+        ("2026-08-13T15:15:00", ["harvest-only"]),
+        ("2026-08-13T16:00:00", ["tick"]),
+        ("2026-08-13T16:15:00", ["harvest-only"]),
+        ("2026-08-13T16:30:00", ["harvest-only"]),
+        ("2026-08-13T16:45:00", ["harvest-only"]),
         ("2026-08-13T17:00:00", ["tick"]),
         ("2026-08-13T17:15:00", ["tick"]),
         ("2026-08-13T17:30:00", ["tick"]),
@@ -853,7 +868,9 @@ def test_scheduled_runner_routes_hours_without_running_python(tmp_path):
         ("2026-08-13T20:30:00", []),
         ("2026-08-13T21:00:00", []),
         ("2026-08-13T08:00:00", []),
+        ("2026-08-13T08:45:00", []),
         ("2026-08-15T09:00:00", []),
+        ("2026-08-15T09:15:00", []),
         ("2026-08-16T19:00:00", []),
     )
 
@@ -882,9 +899,15 @@ def test_scheduled_runner_routes_hours_without_running_python(tmp_path):
                 arguments.index("--invocation"):arguments.index("--invocation") + 2
             ]
             assert command["Phase"] != "drain-only"
-            assert "--enable-remote-writes" in arguments
             budget = arguments[arguments.index("--budget-seconds") + 1]
             assert budget == ("1680" if command["Phase"] == "closeout" else "720")
+            if command["Phase"] == "harvest-only":
+                # The sweep has no create surface, so the runner must not pass
+                # any remote-write capability flag to it.
+                assert "--enable-remote-writes" not in arguments
+                assert "--shadow" not in arguments
+            else:
+                assert "--enable-remote-writes" in arguments
 
     assert not runtime_root.exists()
 
