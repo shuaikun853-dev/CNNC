@@ -13,6 +13,7 @@ from typing import Any, Iterable
 from app.services.daily_audit_store import ProcessLock
 from app.services.incremental_audit_runtime import DEFAULT_RUNTIME_ROOT, runtime_paths
 from app.services.legacy_zhaoshang_adapter import EXTERNAL_TOOL_PATH
+from app.services.remote_stall_breaker import evaluate_remote_stall
 
 
 REQUIRED_TABLES = frozenset(
@@ -117,6 +118,7 @@ def _empty_status(
             "blocker_summary": _empty_blocker_summary(),
         },
         "lease": {"active": False, "stale": False, "expires_at": None},
+        "remote_health": evaluate_remote_stall([]),
         "production_writer": production_writer,
         "next_actions": ["run a shadow tick to create today's durable state"],
     }
@@ -176,6 +178,11 @@ def _stage_status(connection: sqlite3.Connection, snapshot_id: int, stage: str, 
 def _next_actions(status: dict[str, Any]) -> list[str]:
     if status["state"] == "FINALIZED":
         return ["none; the frozen daily workbook is finalized"]
+    if status.get("remote_health", {}).get("stall_detected"):
+        return [
+            "remote stall detected; do not create additional remote tasks; "
+            "wait for existing-task probe/recovery"
+        ]
     if status["remote"]["unknown"]:
         return ["run doctor, then let a later tick reconcile the exact remote identity; do not resubmit"]
     if status["remote"]["manual"] or status["model"]["terminal"] or status["crawl"]["manual"]:
@@ -307,6 +314,17 @@ def collect_runtime_status(
                 (run_id,),
             ).fetchall()
         )
+        remote_health = evaluate_remote_stall(
+            [
+                dict(row)
+                for row in connection.execute(
+                    """SELECT id, state, error_text, updated_at FROM remote_jobs
+                       WHERE run_id=? AND state IN ('PRIORITY_PENDING', 'MANUAL_REQUIRED')
+                         AND error_text IS NOT NULL""",
+                    (run_id,),
+                ).fetchall()
+            ]
+        )
         try:
             metrics = json.loads(str(run["metrics_json"] or "{}"))
         except (TypeError, ValueError, json.JSONDecodeError):
@@ -378,6 +396,7 @@ def collect_runtime_status(
         "model": model,
         "crawl": crawl,
         "remote": remote,
+        "remote_health": remote_health,
         "final": {
             "pending": final_pending,
             "computed_pending": computed_final_pending,

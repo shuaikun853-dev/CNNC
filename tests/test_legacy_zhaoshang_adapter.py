@@ -1157,14 +1157,22 @@ def test_production_priority_runner_uses_exact_identity_and_persists_verified_ev
     outcome = adapter.prioritize(job, task_id="id-1", task_number="no-1", timeout_seconds=180)
 
     assert outcome.status is PriorityStatus.UPDATED
-    assert observed["identity"] == {
+    identity = observed["identity"]
+    assert {
+        key: identity[key]
+        for key in ("task_name", "task_number", "mall_code", "marker_time", "window_start")
+    } == {
         "task_name": job.task_name,
         "task_number": "no-1",
         "mall_code": "jd",
         "marker_time": datetime(2026, 8, 12, 16, 59, 5),
         "window_start": datetime(2026, 8, 12, 16, 57, 5),
-        "window_end": datetime(2026, 8, 12, 17, 14, 5),
     }
+    # The exact identity is unchanged; only the create-time upper bound
+    # stretches to now so a late-materialized subtask is still found on a
+    # re-check instead of being permanently unreachable after marker+15min.
+    assert identity["window_end"] >= datetime(2026, 8, 12, 17, 14, 5)
+    assert identity["window_end"] >= datetime.now()
     assert observed["kwargs"]["expected_subtask_count"] == 1
     assert observed["read_timeout_seconds"] == 180
     assert observed["closed"] is True

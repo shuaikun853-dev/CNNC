@@ -115,6 +115,47 @@ def is_retryable_priority_error_diagnostic(value: object) -> bool:
     return str(value or "").strip() in RETRYABLE_PRIORITY_ERROR_DIAGNOSTICS
 
 
+# The legacy priority core raises PriorityUpdateZeroRowsError from both
+# lookup-exhaustion sites ("rows not materialized yet") and several fail-closed
+# verification sites (lock-set drift, UPDATE rowcount, post-commit readback).
+# Only the two anchored lookup messages below prove REMOTE_NOT_MATERIALIZED;
+# every other raise keeps the fail-closed manual path.
+_REMOTE_NOT_MATERIALIZED_TYPE_NAMES = frozenset(
+    {
+        "PriorityUpdateZeroRowsError",
+        "PriorityRowsNotMaterializedError",
+        "PriorityRowsIncompleteError",
+    }
+)
+REMOTE_NOT_MATERIALIZED_DIAGNOSTICS = frozenset(
+    {"PriorityRowsNotMaterialized", "PriorityRowsIncomplete"}
+)
+# The pre-classification production build persisted only the bare exception
+# type name for every PriorityUpdateZeroRowsError site, so that legacy string
+# cannot by itself distinguish zero-rows from verification failures. It is
+# admitted only by the zero-rows recovery, which re-derives the classification
+# from a live probe before any state transition.
+REMOTE_NOT_MATERIALIZED_LEGACY_DIAGNOSTIC = "PriorityUpdateZeroRowsError"
+
+
+def remote_not_materialized_diagnostic(exc: BaseException) -> str | None:
+    """Classify only bounded-lookup exhaustion for the exact task identity.
+
+    Zero rows after the bounded retry loop and an incomplete-but-valid row set
+    both mean the remote scheduler has not finished materializing this exact
+    taskNumber/mall; identity or UPDATE verification anomalies are intentionally
+    excluded and stay fail-closed manual.
+    """
+    if type(exc).__name__ not in _REMOTE_NOT_MATERIALIZED_TYPE_NAMES:
+        return None
+    message = str(exc).strip()
+    if message.startswith("no matching rows for mall/task_number/create_time window"):
+        return "PriorityRowsNotMaterialized"
+    if message.startswith("incomplete subtask rows: matched="):
+        return "PriorityRowsIncomplete"
+    return None
+
+
 class SubmitStatus(str, Enum):
     SUBMITTED = "SUBMITTED"
     SUBMIT_UNKNOWN = "SUBMIT_UNKNOWN"
@@ -804,13 +845,22 @@ class CnncLegacyZhaoshangAdapter:
                     task_id,
                     task_number,
                 )
+                # A re-check must find the same already-created task, not guess
+                # by widening the identity: task_num and mall stay exact and
+                # window_start keeps guarding against earlier tasks. Only the
+                # upper bound stretches to now so a subtask materialized after
+                # marker+15min is still recoverable on a later probe.
+                window_end = max(
+                    marker_time + timedelta(minutes=15),
+                    datetime.now() + timedelta(seconds=30),
+                )
                 target = priority_module.PriorityTarget(
                     task_name=job.task_name,
                     task_number=task_number,
                     mall_code=auto_module.priority_mall_code_for_key(job.mall_key),
                     marker_time=marker_time,
                     window_start=marker_time - timedelta(minutes=2),
-                    window_end=marker_time + timedelta(minutes=15),
+                    window_end=window_end,
                 )
                 connection = priority_module.connect_from_env()
                 read_timeout_seconds = max(30, min(300, int(timeout_seconds)))
@@ -830,6 +880,7 @@ class CnncLegacyZhaoshangAdapter:
                         connection.close()
         except Exception as exc:
             retryable_diagnostic = retryable_priority_error_diagnostic(exc)
+            stall_diagnostic = remote_not_materialized_diagnostic(exc)
             try:
                 auto_module.record_batch_state_event(
                     job.batch_state_path,
@@ -838,8 +889,9 @@ class CnncLegacyZhaoshangAdapter:
                     action="PRIORITY_UNCONFIRMED",
                     task_id=task_id,
                     task_number=task_number,
-                    reason=retryable_diagnostic or type(exc).__name__,
-                    retryable=retryable_diagnostic is not None,
+                    reason=retryable_diagnostic or stall_diagnostic or type(exc).__name__,
+                    retryable=retryable_diagnostic is not None or stall_diagnostic is not None,
+                    remote_stall=stall_diagnostic,
                 )
             except Exception:
                 pass
@@ -1148,10 +1200,11 @@ class CnncLegacyZhaoshangAdapter:
             priority_runner(job, _text(task_id), _text(task_number), timeout_seconds)
         except Exception as exc:
             retryable_diagnostic = retryable_priority_error_diagnostic(exc)
+            stall_diagnostic = remote_not_materialized_diagnostic(exc)
             return LegacyPriorityOutcome(
                 PriorityStatus.UNCONFIRMED,
-                diagnostic=retryable_diagnostic or type(exc).__name__,
-                retryable=retryable_diagnostic is not None,
+                diagnostic=retryable_diagnostic or stall_diagnostic or type(exc).__name__,
+                retryable=retryable_diagnostic is not None or stall_diagnostic is not None,
             )
         return existing_outcome() or LegacyPriorityOutcome(
             PriorityStatus.UNCONFIRMED,

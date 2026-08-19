@@ -1083,6 +1083,18 @@ class DailyAuditStore:
         with self._reader() as connection:
             return self._row(connection.execute("SELECT * FROM remote_jobs WHERE id=?", (job_id,)).fetchone())
 
+    def list_remote_stall_evidence(self, run_id: int) -> list[dict[str, Any]]:
+        """Lease-free read of pending/manual remote error evidence for the stall breaker."""
+        with self._reader() as connection:
+            rows = connection.execute(
+                """SELECT id, state, error_text, updated_at FROM remote_jobs
+                   WHERE run_id=? AND state IN ('PRIORITY_PENDING', 'MANUAL_REQUIRED')
+                     AND error_text IS NOT NULL
+                   ORDER BY id""",
+                (run_id,),
+            ).fetchall()
+            return [self._row(row) for row in rows]  # type: ignore[list-item]
+
     def list_remote_jobs(self, token: LeaseToken, *, states: set[str] | None = None) -> list[dict[str, Any]]:
         with self._transaction(immediate=False) as connection:
             self._validate_lease(connection, token)

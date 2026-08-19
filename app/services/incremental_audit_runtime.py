@@ -47,6 +47,7 @@ from app.services.incremental_audit_recovery import (
     resolve_exported_no_result,
     run_existing_remote_harvest,
     run_existing_remote_priority_recovery,
+    run_existing_remote_priority_zero_rows_recovery,
     run_local_remote_harvest_recovery,
     run_model_recovery,
     run_partial_exact_harvest_recovery,
@@ -59,6 +60,7 @@ from app.services.legacy_zhaoshang_adapter import (
     ReconcileStatus,
     SubmitStatus,
 )
+from app.services.remote_stall_breaker import remote_submit_pause_reason
 from app.services.saas_audit_core import (
     SAAS_PENDING_HEADERS,
     customer_fingerprint,
@@ -443,6 +445,50 @@ def run_remote_priority_recovery_command(
         except RecoveryRejected as exc:
             result["targeted_harvest"] = {
                 "outcome": "REMOTE_PRIORITY_TARGETED_HARVEST_SKIPPED",
+                "reason": str(exc),
+            }
+        if isinstance(result["targeted_harvest"], dict):
+            _record_recovery_event(paths, result["targeted_harvest"])
+    return _attach_recovery_closeout(paths, result)
+
+
+def run_remote_priority_zero_rows_recovery_command(
+    *,
+    business_date: str,
+    runtime_root: Path | str,
+    remote_job_id: int,
+    remote_identity: str,
+    expected_error_text: str,
+    timeout_seconds: float = 300.0,
+) -> dict[str, Any]:
+    paths = runtime_paths(business_date, runtime_root)
+    result = run_existing_remote_priority_zero_rows_recovery(
+        state_path=paths.state_path,
+        lock_path=paths.lock_path,
+        business_date=business_date,
+        remote_job_id=remote_job_id,
+        remote_identity=remote_identity,
+        expected_error_text=expected_error_text,
+        adapter=CnncLegacyZhaoshangAdapter(),
+        timeout_seconds=timeout_seconds,
+    )
+    _record_recovery_event(paths, result)
+    if result.get("outcome") == "REMOTE_PRIORITY_ZERO_ROWS_RECOVERY_COMPLETED":
+        # One bounded targeted wait/export of exactly the recovered job; the
+        # other remote jobs keep their own sweep pacing.
+        try:
+            result["targeted_harvest"] = run_existing_remote_harvest(
+                state_path=paths.state_path,
+                lock_path=paths.lock_path,
+                business_date=business_date,
+                remote_job_id=remote_job_id,
+                remote_identity=remote_identity,
+                adapter=CnncLegacyZhaoshangAdapter(),
+                timeout_seconds=timeout_seconds,
+            )
+        except RecoveryRejected as exc:
+            result["targeted_harvest"] = {
+                "outcome": "REMOTE_PRIORITY_ZERO_ROWS_TARGETED_HARVEST_SKIPPED",
                 "reason": str(exc),
             }
         if isinstance(result["targeted_harvest"], dict):
@@ -1588,6 +1634,12 @@ def _run_runtime_command_locked(
             paths=paths,
             business_date=day,
         )
+    if deps.submit_crawl is not None and deps.submit_gate is None:
+        # Durable remote-stall breaker: while recent SQLite evidence shows the
+        # remote is not materializing subtasks, this tick must not create any
+        # new remote task. The gate is recomputed from persisted evidence on
+        # every process, so a scheduler restart cannot forget an open breaker.
+        deps.submit_gate = lambda: remote_submit_pause_reason(store, day)
     lifecycle_only = command in {"drain-only", "harvest-only"}
     config = TickConfig(
         business_date=day,

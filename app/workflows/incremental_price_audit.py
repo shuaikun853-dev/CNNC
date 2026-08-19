@@ -148,6 +148,10 @@ class TickDependencies:
     # the pending members it receives; it must not perform remote writes.
     finalize_crawl_plan: Callable[[CrawlPlan, Sequence[CrawlMember], float], CrawlPlan] | None = None
     submit_crawl: Callable[[Mapping[str, Any], Sequence[Mapping[str, Any]], float], Mapping[str, Any]] | None = None
+    # Durable remote-stall circuit breaker. A non-empty reason must stop this
+    # tick before it claims or dispatches any new remote submission; existing
+    # remote jobs stay harvestable so probes and exports continue.
+    submit_gate: Callable[[], str | None] | None = None
     monotonic: Callable[[], float] = time.monotonic
     wall_clock: Callable[[], datetime] = lambda: datetime.now(UTC)
 
@@ -187,7 +191,7 @@ def _empty_counters() -> dict[str, int]:
         "recovered_stage_claims": 0, "recovered_submit_unknown": 0, "today_discovered": 0,
         "delta_new": 0, "delta_changed": 0, "detail_requests": 0, "model_attempts": 0,
         "crawl_submitted": 0, "crawl_harvested": 0, "submit_unknown": 0, "crawl_running": 0,
-        "harvest_batches": 0, "harvest_swept": 0,
+        "harvest_batches": 0, "harvest_swept": 0, "submit_paused": 0,
         "customer_count": 0, "saas_count": 0, "source_count_gap": 0,
     }
 
@@ -643,6 +647,12 @@ def _submit(
     counters: dict[str, int],
 ) -> None:
     if deps.submit_crawl is None or not budget.can_start_heavy():
+        return
+    # The gate must run before any claim: a claimed submission that is then
+    # abandoned would durably burn post_attempted evidence as SUBMIT_UNKNOWN.
+    gate_reason = deps.submit_gate() if deps.submit_gate is not None else None
+    if gate_reason:
+        counters["submit_paused"] = counters.get("submit_paused", 0) + 1
         return
 
     def dispatch(job: Mapping[str, Any], crawls: Sequence[Mapping[str, Any]]) -> None:

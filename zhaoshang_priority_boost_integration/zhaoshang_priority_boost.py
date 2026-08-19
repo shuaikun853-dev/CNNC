@@ -47,6 +47,14 @@ class PriorityUpdateZeroRowsError(RuntimeError):
     """The current task could not be safely updated or verified."""
 
 
+class PriorityRowsNotMaterializedError(PriorityUpdateZeroRowsError):
+    """The bounded lookup ended with zero rows for the exact task identity."""
+
+
+class PriorityRowsIncompleteError(PriorityUpdateZeroRowsError):
+    """The bounded lookup ended with fewer rows than the expected subtask set."""
+
+
 class PriorityScopeSafetyError(RuntimeError):
     """Rows returned by the database escaped the requested task identity."""
 
@@ -304,11 +312,11 @@ def boost_zhaoshang_task_priority(
             matched_count = len(before_rows)
             if matched_count == 0:
                 logger("[priority] failure=no matching rows")
-                raise PriorityUpdateZeroRowsError(
+                raise PriorityRowsNotMaterializedError(
                     "no matching rows for mall/task_number/create_time window"
                 )
             if matched_count < expected_subtask_count:
-                raise PriorityUpdateZeroRowsError(
+                raise PriorityRowsIncompleteError(
                     "incomplete subtask rows: "
                     f"matched={matched_count} expected={expected_subtask_count}"
                 )

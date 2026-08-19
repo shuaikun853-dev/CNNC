@@ -24,6 +24,7 @@ from app.services.incremental_audit_runtime import (
     run_release_model_recovery_command,
     run_remote_harvest_recovery_command,
     run_remote_priority_recovery_command,
+    run_remote_priority_zero_rows_recovery_command,
     run_runtime_command,
 )
 from app.services.incremental_audit_recovery import RecoveryRejected
@@ -210,6 +211,16 @@ def build_parser() -> argparse.ArgumentParser:
     recover_priority.add_argument("--expected-result-state")
     recover_priority.add_argument("--expected-error-text")
     recover_priority.add_argument("--timeout-seconds", type=float, default=300.0)
+    recover_zero_rows = subparsers.add_parser("recover-remote-priority-zero-rows")
+    _add_common_arguments(recover_zero_rows, allow_remote_writes=False)
+    recover_zero_rows.add_argument("--remote-job-id", type=int, required=True)
+    recover_zero_rows.add_argument("--remote-identity", required=True)
+    recover_zero_rows.add_argument(
+        "--expected-error-text",
+        required=True,
+        help="exact persisted REMOTE_NOT_MATERIALIZED diagnostic (or the legacy PriorityUpdateZeroRowsError type name)",
+    )
+    recover_zero_rows.add_argument("--timeout-seconds", type=float, default=300.0)
     harvest_existing = subparsers.add_parser("harvest-existing-remote")
     _add_common_arguments(harvest_existing, allow_remote_writes=False)
     harvest_existing.add_argument("--remote-job-id", type=int, required=True)
@@ -278,6 +289,7 @@ def main(argv: list[str] | None = None) -> int:
         "recover-partial-exact-harvest",
         "resolve-no-result",
         "recover-remote-priority",
+        "recover-remote-priority-zero-rows",
         "harvest-existing-remote",
     }:
         try:
@@ -335,6 +347,15 @@ def main(argv: list[str] | None = None) -> int:
                     remote_identity=args.remote_identity,
                     expected_current_state=args.expected_current_state,
                     expected_result_state=args.expected_result_state,
+                    expected_error_text=args.expected_error_text,
+                    timeout_seconds=args.timeout_seconds,
+                )
+            elif args.command == "recover-remote-priority-zero-rows":
+                recovery = run_remote_priority_zero_rows_recovery_command(
+                    business_date=business_date,
+                    runtime_root=args.runtime_root,
+                    remote_job_id=args.remote_job_id,
+                    remote_identity=args.remote_identity,
                     expected_error_text=args.expected_error_text,
                     timeout_seconds=args.timeout_seconds,
                 )

@@ -264,6 +264,36 @@ def test_polling_refreshes_snapshot_until_subtasks_are_inserted(priority_module)
     assert connection.rollback_count >= 2
 
 
+def test_late_materialized_subtask_needs_a_stretched_window_and_keeps_identity_exact(priority_module):
+    """A subtask materialized after marker+15min stays recoverable on re-checks.
+
+    The exact identity (task_num + mall) is unchanged; only the upper bound of
+    the create_time window stretches, mirroring what the adapter computes for
+    every priority re-check, probe and zero-rows recovery.
+    """
+    from dataclasses import replace as _replace
+
+    late_row = row(401, create_time=datetime(2026, 8, 11, 18, 52, 0))
+    foreign_earlier_row = row(
+        402, create_time=datetime(2026, 8, 11, 18, 5, 0), mall="guangbo"
+    )
+    target = make_target(priority_module)
+
+    with pytest.raises(priority_module.PriorityUpdateZeroRowsError, match="no matching rows"):
+        boost(priority_module, MemoryConnection([late_row, foreign_earlier_row]), target)
+
+    stretched = _replace(
+        target, window_end=datetime(2026, 8, 11, 19, 0, 0)
+    )
+    connection = MemoryConnection([late_row, foreign_earlier_row])
+    result = boost(priority_module, connection, stretched)
+
+    assert result["priority_state"] == "updated"
+    assert result["matched_subtask_ids"] == [401]
+    assert connection.updated_ids == [401]
+    assert connection.rows[1]["weight_type"] == 2
+
+
 def test_polling_waits_for_complete_expected_subtask_set(priority_module):
     partial = [row(311)]
     complete = [row(311), row(312)]
