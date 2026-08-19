@@ -26,6 +26,98 @@ class RecoveryRejected(RuntimeError):
     """The requested recovery does not exactly match recoverable durable state."""
 
 
+BackendIdentity = tuple[str, str, str, str]
+
+
+def validate_linked_crawls_against_remote_payload(
+    *,
+    operation: str,
+    requests: Sequence[CrawlRequest],
+    crawls: Sequence[Mapping[str, Any]],
+    frozen_sources: set[str],
+    remote_job_id: int,
+    run_id: int,
+) -> dict[BackendIdentity, list[Mapping[str, Any]]]:
+    """Fail-closed source fan-out gate between one immutable payload and crawls.
+
+    The durable crawl identity carries ``source_id`` while the immutable legacy
+    payload holds one request per backend identity, so one submitted backend
+    request may legitimately fan out to several frozen source documents: the
+    payload identity counter may not exceed the linked counter.  Every weaker
+    shape -- a payload identity missing from the linked set, a linked backend
+    identity the payload never contained, a duplicated full durable identity, a
+    source outside the frozen snapshot, or linkage to another job or run --
+    stays rejected.
+    """
+    payload_identities: dict[BackendIdentity, CrawlRequest] = {}
+    payload_result_keys: dict[tuple[str, str], BackendIdentity] = {}
+    for request in requests:
+        backend_key: BackendIdentity = (
+            request.mall_key,
+            request.sku_id,
+            request.url.strip(),
+            request.backend_version,
+        )
+        if backend_key in payload_identities:
+            raise RecoveryRejected(
+                f"{operation}: immutable remote payload has duplicate backend identities"
+            )
+        result_key = (request.sku_id, request.url.strip())
+        if result_key in payload_result_keys:
+            raise RecoveryRejected(
+                f"{operation}: remote payload result identity is backend-ambiguous"
+            )
+        payload_identities[backend_key] = request
+        payload_result_keys[result_key] = backend_key
+
+    linked_counts: Counter[BackendIdentity] = Counter()
+    full_identities: set[tuple[str, str, str, str, str]] = set()
+    groups: dict[BackendIdentity, list[Mapping[str, Any]]] = {}
+    for crawl in crawls:
+        source_id = str(crawl.get("source_id") or "").strip()
+        backend_key = (
+            str(crawl["mall_key"]),
+            str(crawl["sku_id"]),
+            str(crawl["exact_url"]).strip(),
+            str(crawl["backend_version"]),
+        )
+        if not source_id:
+            raise RecoveryRejected(
+                f"{operation}: linked crawl work has no durable source identity"
+            )
+        full_identity = (backend_key[0], source_id, backend_key[1], backend_key[2], backend_key[3])
+        if full_identity in full_identities:
+            raise RecoveryRejected(
+                f"{operation}: linked full durable crawl identities are duplicated"
+            )
+        if backend_key not in payload_identities:
+            raise RecoveryRejected(
+                f"{operation}: linked crawl identity is outside the immutable payload"
+            )
+        if source_id not in frozen_sources:
+            raise RecoveryRejected(
+                f"{operation}: linked crawl work is outside the frozen snapshot"
+            )
+        if int(crawl.get("remote_job_id") or 0) != int(remote_job_id):
+            raise RecoveryRejected(
+                f"{operation}: linked crawl work is not bound to the exact remote job"
+            )
+        if int(crawl.get("run_id") or 0) != int(run_id):
+            raise RecoveryRejected(
+                f"{operation}: linked crawl work is outside the daily run scope"
+            )
+        full_identities.add(full_identity)
+        linked_counts[backend_key] += 1
+        groups.setdefault(backend_key, []).append(crawl)
+
+    missing = Counter(payload_identities.keys()) - linked_counts
+    if missing:
+        raise RecoveryRejected(
+            f"{operation}: immutable payload identities are missing from linked crawl work"
+        )
+    return groups
+
+
 # Precisely classified REMOTE_NOT_MATERIALIZED evidence plus the bare legacy
 # type name persisted before classification existed. The bare name is admitted
 # only because the zero-rows recovery re-derives the classification from a live
@@ -412,45 +504,14 @@ def run_local_remote_harvest_recovery(
             str(item["row"].get("vCommodityId") or "").strip()
             for item in store.ordered_snapshot_items(int(snapshot_id))
         }
-        durable_full_identities = Counter(
-            (
-                str(crawl["mall_key"]),
-                str(crawl.get("source_id") or "").strip(),
-                str(crawl["sku_id"]),
-                str(crawl["exact_url"]).strip(),
-                str(crawl["backend_version"]),
-            )
-            for crawl in crawls
+        validate_linked_crawls_against_remote_payload(
+            operation="remote harvest recovery",
+            requests=prepared.requests,
+            crawls=crawls,
+            frozen_sources=frozen_sources,
+            remote_job_id=int(remote_job_id),
+            run_id=token.run_id,
         )
-        if (
-            len(durable_full_identities) != len(crawls)
-            or any(not identity[1] or identity[1] not in frozen_sources for identity in durable_full_identities)
-        ):
-            raise RecoveryRejected(
-                "linked full crawl identities are duplicated or outside the frozen snapshot"
-            )
-        expected_crawl_identities = Counter(
-            (
-                request.mall_key,
-                request.sku_id,
-                request.url.strip(),
-                request.backend_version,
-            )
-            for request in prepared.requests
-        )
-        durable_crawl_identities = Counter(
-            (
-                str(crawl["mall_key"]),
-                str(crawl["sku_id"]),
-                str(crawl["exact_url"]).strip(),
-                str(crawl["backend_version"]),
-            )
-            for crawl in crawls
-        )
-        if durable_crawl_identities != expected_crawl_identities:
-            raise RecoveryRejected(
-                "linked crawl identities do not exactly match the immutable remote payload"
-            )
         sku_count_by_url: dict[str, set[str]] = {}
         for request in prepared.requests:
             sku_count_by_url.setdefault(request.url.strip(), set()).add(request.sku_id)
@@ -828,35 +889,23 @@ def resolve_exported_no_result(
             )
 
         crawls = store.crawl_work_for_job(int(remote_job_id))
-        durable_by_identity = {
-            (
-                str(crawl["mall_key"]),
-                str(crawl["sku_id"]),
-                str(crawl["exact_url"]).strip(),
-                str(crawl["backend_version"]),
-            ): crawl
-            for crawl in crawls
-        }
-        expected_crawl_identities = Counter(
-            (
-                request.mall_key,
-                request.sku_id,
-                request.url.strip(),
-                request.backend_version,
-            )
-            for request in prepared.requests
+        crawl_groups = validate_linked_crawls_against_remote_payload(
+            operation="no-result recovery",
+            requests=prepared.requests,
+            crawls=crawls,
+            frozen_sources=frozen_sources,
+            remote_job_id=int(remote_job_id),
+            run_id=token.run_id,
         )
-        if Counter(durable_by_identity.keys()) != expected_crawl_identities:
-            raise RecoveryRejected(
-                "linked crawl identities do not exactly match the immutable remote payload"
-            )
         target_key = (
             str(target["mall_key"]),
             str(target["sku_id"]),
             str(target["exact_url"]).strip(),
             str(target["backend_version"]),
         )
-        if durable_by_identity.get(target_key, {}).get("id") != int(crawl_work_id):
+        if int(crawl_work_id) not in {
+            int(crawl["id"]) for crawl in crawl_groups.get(target_key, ())
+        }:
             raise RecoveryRejected("target crawl identity is not unique in the remote job")
         other_states = {
             int(crawl["id"]): str(crawl["state"])
@@ -869,8 +918,8 @@ def resolve_exported_no_result(
             )
         successful_keys = {
             identity
-            for identity, crawl in durable_by_identity.items()
-            if crawl["state"] == "SUCCESS"
+            for identity, grouped in crawl_groups.items()
+            if any(crawl["state"] == "SUCCESS" for crawl in grouped)
         }
         successful_requests = tuple(
             request
@@ -1040,33 +1089,14 @@ def run_existing_remote_priority_recovery(
             raise RecoveryRejected("durable legacy job evidence is inconsistent")
 
         crawls = store.crawl_work_for_job(int(remote_job_id))
-        expected_crawls = Counter(
-            (
-                request.mall_key,
-                request.sku_id,
-                request.url.strip(),
-                request.backend_version,
-            )
-            for request in prepared.requests
+        validate_linked_crawls_against_remote_payload(
+            operation="priority recovery",
+            requests=prepared.requests,
+            crawls=crawls,
+            frozen_sources=frozen_sources,
+            remote_job_id=int(remote_job_id),
+            run_id=token.run_id,
         )
-        durable_crawls = Counter(
-            (
-                str(crawl["mall_key"]),
-                str(crawl["sku_id"]),
-                str(crawl["exact_url"]).strip(),
-                str(crawl["backend_version"]),
-            )
-            for crawl in crawls
-        )
-        if durable_crawls != expected_crawls:
-            raise RecoveryRejected(
-                "linked crawl identities do not exactly match the immutable remote payload"
-            )
-        if any(
-            str(crawl.get("source_id") or "").strip() not in frozen_sources
-            for crawl in crawls
-        ):
-            raise RecoveryRejected("priority recovery crawl work is outside the frozen snapshot")
 
         priority = adapter.prioritize(
             prepared,
@@ -1215,35 +1245,14 @@ def run_existing_remote_priority_zero_rows_recovery(
             raise RecoveryRejected("durable legacy job evidence is inconsistent")
 
         crawls = store.crawl_work_for_job(int(remote_job_id))
-        expected_crawls = Counter(
-            (
-                request.mall_key,
-                request.sku_id,
-                request.url.strip(),
-                request.backend_version,
-            )
-            for request in prepared.requests
+        validate_linked_crawls_against_remote_payload(
+            operation="zero-rows priority recovery",
+            requests=prepared.requests,
+            crawls=crawls,
+            frozen_sources=frozen_sources,
+            remote_job_id=int(remote_job_id),
+            run_id=token.run_id,
         )
-        durable_crawls = Counter(
-            (
-                str(crawl["mall_key"]),
-                str(crawl["sku_id"]),
-                str(crawl["exact_url"]).strip(),
-                str(crawl["backend_version"]),
-            )
-            for crawl in crawls
-        )
-        if durable_crawls != expected_crawls:
-            raise RecoveryRejected(
-                "linked crawl identities do not exactly match the immutable remote payload"
-            )
-        if any(
-            str(crawl.get("source_id") or "").strip() not in frozen_sources
-            for crawl in crawls
-        ):
-            raise RecoveryRejected(
-                "zero-rows priority recovery crawl work is outside the frozen snapshot"
-            )
 
         # Live probe of the exact already-created task, never a new /add. The
         # historical bare "PriorityUpdateZeroRowsError" evidence cannot by
@@ -1385,33 +1394,14 @@ def run_existing_remote_harvest(
             raise RecoveryRejected("exact accepted priority evidence is required")
 
         crawls = store.crawl_work_for_job(int(remote_job_id))
-        expected_crawls = Counter(
-            (
-                request.mall_key,
-                request.sku_id,
-                request.url.strip(),
-                request.backend_version,
-            )
-            for request in prepared.requests
+        validate_linked_crawls_against_remote_payload(
+            operation="existing harvest",
+            requests=prepared.requests,
+            crawls=crawls,
+            frozen_sources=frozen_sources,
+            remote_job_id=int(remote_job_id),
+            run_id=token.run_id,
         )
-        durable_crawls = Counter(
-            (
-                str(crawl["mall_key"]),
-                str(crawl["sku_id"]),
-                str(crawl["exact_url"]).strip(),
-                str(crawl["backend_version"]),
-            )
-            for crawl in crawls
-        )
-        if durable_crawls != expected_crawls:
-            raise RecoveryRejected(
-                "linked crawl identities do not exactly match the immutable remote payload"
-            )
-        if any(
-            str(crawl.get("source_id") or "").strip() not in frozen_sources
-            for crawl in crawls
-        ):
-            raise RecoveryRejected("existing harvest crawl work is outside the frozen snapshot")
         if any(crawl["state"] in {"NO_RESULT", "TERMINAL_FAILED"} for crawl in crawls):
             raise RecoveryRejected("existing harvest cannot overwrite terminal crawl evidence")
 
