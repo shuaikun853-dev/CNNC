@@ -1394,7 +1394,10 @@ class CnncLegacyZhaoshangAdapter:
             remaining = deadline - self._monotonic()
             if remaining <= 0:
                 raise TimeoutError("export no-price probe deadline exhausted before progress query")
-            progress_json = tool.query_task_progress(session, str(live_task_number))
+            # The progress endpoint keys on the task record's batchNumber, not
+            # the RW- taskNumber; mirror run_auto_task's identifier choice.
+            batch_number = _text(task.get("batchNumber")) or resolved_task_name
+            progress_json = tool.query_task_progress(session, batch_number)
             remote_calls += 1
             remaining = deadline - self._monotonic()
             if remaining <= 0:
@@ -1441,12 +1444,21 @@ class CnncLegacyZhaoshangAdapter:
                 "export endpoint returned a result download; terminal no-price resolution does not apply"
             )
         raw_count = data.get("count")
-        try:
-            export_count = int(raw_count)
-        except (TypeError, ValueError) as exc:
-            raise LegacyZhaoshangAdapterError(
-                "export endpoint returned no parseable count"
-            ) from exc
+        if raw_count is None:
+            # An exact no-price answer may omit the count field; only an
+            # empty data payload keeps that shape admissible.
+            if embedded not in (None, {}, []):
+                raise LegacyZhaoshangAdapterError(
+                    "export endpoint returned rows without a count"
+                )
+            export_count = 0
+        else:
+            try:
+                export_count = int(raw_count)
+            except (TypeError, ValueError) as exc:
+                raise LegacyZhaoshangAdapterError(
+                    "export endpoint returned an unparseable count"
+                ) from exc
         return ExportNoPriceProbe(
             task_status_rsp_desc=_text(status.get("rspDesc")),
             progress=dict(tool.parse_task_progress_desc(_text(progress_json.get("rspDesc")))),

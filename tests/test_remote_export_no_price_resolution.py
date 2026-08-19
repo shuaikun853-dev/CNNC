@@ -599,3 +599,197 @@ def test_export_no_price_resolution_rejects_terminal_crawl_evidence(tmp_path):
         seed.resolve(store, job)
     assert seed.probe_calls == []
     assert store.get_remote_job(int(job["id"]))["state"] == "MANUAL_REQUIRED"
+
+
+class _FakeResponse:
+    def __init__(self, payload, *, headers=None):
+        self._payload = payload
+        self.headers = headers or {}
+        self.content = json.dumps(payload).encode("utf-8")
+
+    def raise_for_status(self):
+        return None
+
+    def json(self):
+        return self._payload
+
+
+class _FakeSession:
+    def __init__(self, *, progress_payload, export_payload):
+        self.progress_payload = progress_payload
+        self.export_payload = export_payload
+        self.calls: list[tuple[str, object]] = []
+
+    def post(self, url, json=None, timeout=None):
+        self.calls.append((url, json))
+        if "exportTask" in url:
+            return _FakeResponse(self.export_payload)
+        return _FakeResponse({"data": []})
+
+    def get(self, url, params=None, timeout=None):
+        self.calls.append((url, params))
+        return _FakeResponse(self.progress_payload)
+
+
+def _fake_tool_module(task_record, session):
+    class _Module:
+        EXPORT_TASK_URL = "https://platform.invalid/exportTask"
+        QUERY_PROGRESS_URL = "https://platform.invalid/queryTaskProgress"
+
+        @staticmethod
+        def build_session():
+            return session
+
+        @staticmethod
+        def priority_mall_code_for_key(mall_key):
+            return "lxwl"
+
+        @staticmethod
+        def build_browser_task_identifiers(task_name, mall_key):
+            return task_name, task_name
+
+        @staticmethod
+        def check_existing_task(session, task_name, mall_code):
+            return dict(task_record)
+
+        @staticmethod
+        def get_task_identity(task, mall_code):
+            return task["taskId"], task["taskNumber"], mall_code
+
+        @staticmethod
+        def query_task_status(session, task_id):
+            return {"rspCode": "0000", "rspDesc": FINISHED_STATUS, "success": True}
+
+        @staticmethod
+        def query_task_progress(session, batch_number):
+            return session.get(
+                _Module.QUERY_PROGRESS_URL,
+                params={"batchNumber": batch_number},
+            ).json()
+
+        @staticmethod
+        def parse_task_progress_desc(rsp_desc):
+            values = {
+                "总任务量": "total",
+                "待执行": "pending",
+                "执行中": "running",
+                "失败": "failed",
+                "待入库": "waiting_db",
+                "执行完成": "finished",
+            }
+            summary = {}
+            for label, key in values.items():
+                marker = f"{label}："
+                if marker in rsp_desc:
+                    head = rsp_desc.split(marker, 1)[1]
+                    summary[key] = int(head.split("条", 1)[0])
+            return summary
+
+    return _Module
+
+
+class _FakeAuthManager:
+    def export_environment(self, system, refresh=False):
+        return {"BLADE_AUTH": "bearer fake", "COOKIE": "x-access-token=fake; refreshToken=fake"}
+
+
+def test_production_probe_queries_progress_by_task_batch_number(tmp_path, monkeypatch):
+    from app.services.legacy_zhaoshang_adapter import CnncLegacyZhaoshangAdapter
+
+    seed = _Seed(tmp_path)
+    prepared = seed.adapter.prepare_job(
+        BUSINESS_DATE,
+        seed.build_requests(3),
+        seed.run_dir / "input.xlsx",
+        seed.run_dir / "result.xlsx",
+        "task-target",
+        seed.batch_state,
+    )
+    task_record = {
+        "taskName": prepared.task_name,
+        "mallLogo": "lxwl",
+        "taskId": TASK_ID,
+        "taskNumber": TASK_NUMBER,
+        "batchNumber": "cnnc_current_opt_领先未来商城_61883933745201",
+    }
+    session = _FakeSession(
+        progress_payload={"rspDesc": "总任务量：3条，待执行：0条，执行中：0条，失败：0条，待入库：0条，执行完成：3条", "success": True},
+        export_payload={"rspCode": "0000", "rspDesc": NO_PRICE_RSP_DESC, "count": 0, "data": None, "success": True},
+    )
+    monkeypatch.setattr(
+        CnncLegacyZhaoshangAdapter,
+        "_load_module",
+        classmethod(lambda cls, path, name: _fake_tool_module(task_record, session)),
+    )
+    adapter = CnncLegacyZhaoshangAdapter(
+        mappings=[], db_env_path=None, auth_manager=_FakeAuthManager()
+    )
+
+    probe = adapter.probe_export_no_price(prepared, TASK_ID, TASK_NUMBER, 60.0)
+
+    assert probe.task_status_rsp_desc == FINISHED_STATUS
+    assert probe.progress == {
+        "total": 3, "pending": 0, "running": 0, "failed": 0, "waiting_db": 0, "finished": 3,
+    }
+    assert probe.export_rsp_desc == NO_PRICE_RSP_DESC
+    assert probe.export_count == 0
+    assert probe.remote_calls == 4
+    progress_calls = [call for call in session.calls if "queryTaskProgress" in str(call[0])]
+    assert len(progress_calls) == 1
+    assert progress_calls[0][1] == {"batchNumber": "cnnc_current_opt_领先未来商城_61883933745201"}
+
+
+def test_production_probe_accepts_missing_count_only_with_empty_data(tmp_path, monkeypatch):
+    from app.services.legacy_zhaoshang_adapter import (
+        CnncLegacyZhaoshangAdapter,
+        LegacyZhaoshangAdapterError,
+    )
+
+    seed = _Seed(tmp_path)
+    prepared = seed.adapter.prepare_job(
+        BUSINESS_DATE,
+        seed.build_requests(3),
+        seed.run_dir / "input.xlsx",
+        seed.run_dir / "result.xlsx",
+        "task-target",
+        seed.batch_state,
+    )
+    task_record = {
+        "taskName": prepared.task_name,
+        "mallLogo": "lxwl",
+        "taskId": TASK_ID,
+        "taskNumber": TASK_NUMBER,
+        "batchNumber": "batch-target",
+    }
+
+    def adapter_with(export_payload):
+        session = _FakeSession(
+            progress_payload={"rspDesc": "总任务量：3条，待执行：0条，执行中：0条，失败：0条，待入库：0条，执行完成：3条", "success": True},
+            export_payload=export_payload,
+        )
+        monkeypatch.setattr(
+            CnncLegacyZhaoshangAdapter,
+            "_load_module",
+            classmethod(lambda cls, path, name: _fake_tool_module(task_record, session)),
+        )
+        return CnncLegacyZhaoshangAdapter(
+            mappings=[], db_env_path=None, auth_manager=_FakeAuthManager()
+        ), session
+
+    adapter, _session = adapter_with(
+        {"rspCode": "0000", "rspDesc": NO_PRICE_RSP_DESC, "data": None, "success": True}
+    )
+    probe = adapter.probe_export_no_price(prepared, TASK_ID, TASK_NUMBER, 60.0)
+    assert probe.export_count == 0
+
+    adapter, _session = adapter_with(
+        {"rspCode": "0000", "rspDesc": NO_PRICE_RSP_DESC, "count": 2, "data": None, "success": True}
+    )
+    probe = adapter.probe_export_no_price(prepared, TASK_ID, TASK_NUMBER, 60.0)
+    assert probe.export_count == 2
+
+    adapter, _session = adapter_with(
+        {"rspCode": "0000", "rspDesc": NO_PRICE_RSP_DESC, "data": [{"row": 1}], "success": True}
+    )
+    with pytest.raises(LegacyZhaoshangAdapterError, match="rows without a count"):
+        adapter.probe_export_no_price(prepared, TASK_ID, TASK_NUMBER, 60.0)
