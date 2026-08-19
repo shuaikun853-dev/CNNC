@@ -1709,6 +1709,108 @@ class DailyAuditStore:
                 connection.execute("SELECT * FROM crawl_work WHERE id=?", (crawl_work_id,)).fetchone()
             )  # type: ignore[return-value]
 
+    def complete_crawl_work_export_no_price(
+        self,
+        token: LeaseToken,
+        crawl_work_id: int,
+        *,
+        remote_job_id: int,
+        remote_identity: str,
+        reason: str,
+        export_rsp_desc: str,
+        export_count: int,
+    ) -> dict[str, Any]:
+        """Persist terminal export-stage no-price evidence without a result workbook."""
+        normalized_reason = str(reason or "").strip()
+        normalized_rsp_desc = str(export_rsp_desc or "").strip()
+        if not normalized_reason or not normalized_rsp_desc:
+            raise RemoteIntentConflict("export no-price resolution requires exact export evidence")
+        if int(export_count) != 0:
+            raise RemoteIntentConflict("export no-price resolution requires a zero export count")
+        evidence = self._canonical_json(
+            {
+                "evidence_type": "EXPORT_NO_PRICE_TERMINAL",
+                "no_result_reason": normalized_reason,
+                "page_price_source": "招商局（无采集结果）",
+                "page_price_status": "NO_RESULT",
+                "page_price_value": None,
+                "remote_identity": str(remote_identity or "").strip(),
+                "remote_state": "COMPLETED",
+                "export_rspDesc": normalized_rsp_desc,
+                "export_count": 0,
+            }
+        )
+        with self._transaction(immediate=True) as connection:
+            self._validate_crawl_lease(connection, token, crawl_work_id)
+            work = connection.execute("SELECT * FROM crawl_work WHERE id=?", (crawl_work_id,)).fetchone()
+            assert work is not None
+            job = self._job_for_lease(connection, token, int(remote_job_id))
+            if (
+                int(work["remote_job_id"] or 0) != int(remote_job_id)
+                or str(job["remote_identity"] or "").strip() != str(remote_identity or "").strip()
+                or not int(job["post_attempted"])
+                or job["state"] not in {"MANUAL_REQUIRED", "COMPLETED"}
+            ):
+                raise RemoteIntentConflict(
+                    "export no-price resolution requires the exact confirmed remote job"
+                )
+            if work["state"] == "NO_RESULT":
+                if work["result_json"] != evidence or work["error_text"] != normalized_reason:
+                    raise RemoteIntentConflict("no-result crawl evidence is immutable")
+                return self._row(work)  # type: ignore[return-value]
+            if work["state"] in {"SUCCESS", "TERMINAL_FAILED", "MANUAL_REQUIRED"}:
+                raise RemoteIntentConflict("terminal crawl evidence is immutable")
+            if job["state"] != "MANUAL_REQUIRED":
+                raise RemoteIntentConflict(
+                    "export no-price crawl transition requires the manual remote job"
+                )
+            connection.execute(
+                "UPDATE crawl_work SET state='NO_RESULT', result_json=?, error_text=?, updated_at=? WHERE id=?",
+                (evidence, normalized_reason, self._utcnow(), crawl_work_id),
+            )
+            return self._row(
+                connection.execute("SELECT * FROM crawl_work WHERE id=?", (crawl_work_id,)).fetchone()
+            )  # type: ignore[return-value]
+
+    def complete_manual_export_no_price_job(
+        self,
+        token: LeaseToken,
+        job_id: int,
+        *,
+        remote_identity: str,
+        result: Any,
+    ) -> dict[str, Any]:
+        """Complete one MANUAL wait-export job whose export stage proved terminal no-price."""
+        normalized_identity = str(remote_identity or "").strip()
+        if not normalized_identity:
+            raise RemoteIntentConflict("export no-price completion requires an exact remote identity")
+        encoded_result = self._canonical_json(result)
+        with self._transaction(immediate=True) as connection:
+            self._validate_lease(connection, token)
+            job = self._job_for_lease(connection, token, int(job_id))
+            if (
+                str(job["remote_identity"] or "").strip() != normalized_identity
+                or not int(job["post_attempted"])
+            ):
+                raise RemoteIntentConflict(
+                    "export no-price completion requires the exact confirmed remote job"
+                )
+            if job["state"] == "COMPLETED":
+                if str(job["result_json"] or "") != encoded_result:
+                    raise RemoteIntentConflict("completed remote job evidence is immutable")
+                return self._row(job)  # type: ignore[return-value]
+            if job["state"] != "MANUAL_REQUIRED":
+                raise RemoteIntentConflict(
+                    "export no-price completion requires the manual wait-export job"
+                )
+            connection.execute(
+                "UPDATE remote_jobs SET state='COMPLETED', result_json=?, error_text=NULL, updated_at=? WHERE id=?",
+                (encoded_result, self._utcnow(), int(job_id)),
+            )
+            return self._row(
+                connection.execute("SELECT * FROM remote_jobs WHERE id=?", (int(job_id),)).fetchone()
+            )  # type: ignore[return-value]
+
     def fail_crawl_work(self, token: LeaseToken, crawl_work_id: int, error: str, *, retryable: bool) -> dict[str, Any]:
         with self._transaction(immediate=True) as connection:
             self._validate_crawl_lease(connection, token, crawl_work_id)

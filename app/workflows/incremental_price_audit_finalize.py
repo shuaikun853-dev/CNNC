@@ -166,11 +166,27 @@ def _valid_crawl_price(result: Mapping[str, Any]) -> bool:
     return (status == "OK" and value > 0) or (status == "PRICE_IS_ZERO" and value == 0)
 
 
+EXPORT_NO_PRICE_TERMINAL_EVIDENCE_TYPE = "EXPORT_NO_PRICE_TERMINAL"
+EXPORT_NO_PRICE_RSP_DESC = "未检索到商品价格信息"
+
+
 def _valid_no_result(result: Mapping[str, Any]) -> bool:
+    evidence_type = normalize_cell_str(result.get("evidence_type"))
+    if evidence_type == EXPORT_NO_PRICE_TERMINAL_EVIDENCE_TYPE:
+        try:
+            export_count = int(result.get("export_count"))
+        except (TypeError, ValueError):
+            return False
+        export_valid = (
+            normalize_cell_str(result.get("export_rspDesc")) == EXPORT_NO_PRICE_RSP_DESC
+            and export_count == 0
+        )
+    else:
+        export_valid = evidence_type == "EXPORTED_NO_MATCHING_ROW"
     return (
         normalize_cell_str(result.get("page_price_status")) == "NO_RESULT"
         and result.get("page_price_value") is None
-        and normalize_cell_str(result.get("evidence_type")) == "EXPORTED_NO_MATCHING_ROW"
+        and export_valid
         and bool(normalize_cell_str(result.get("no_result_reason")))
     )
 

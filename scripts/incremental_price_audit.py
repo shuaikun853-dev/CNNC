@@ -20,6 +20,7 @@ from app.services.incremental_audit_runtime import (
     run_no_result_recovery_command,
     run_partial_exact_harvest_recovery_command,
     run_requeue_model_transient_command,
+    run_remote_export_no_price_resolution_command,
     run_review_export_command,
     run_release_model_recovery_command,
     run_remote_harvest_recovery_command,
@@ -237,6 +238,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="exact persisted wait-export manual diagnostic the recovery is scoped to",
     )
     recover_wait_export.add_argument("--timeout-seconds", type=float, default=300.0)
+    resolve_export_no_price = subparsers.add_parser("resolve-remote-export-no-result")
+    _add_common_arguments(resolve_export_no_price, allow_remote_writes=False)
+    resolve_export_no_price.add_argument("--remote-job-id", type=int, required=True)
+    resolve_export_no_price.add_argument("--remote-identity", required=True)
+    resolve_export_no_price.add_argument(
+        "--expected-error-text",
+        required=True,
+        help="exact persisted wait-export manual diagnostic the resolution is scoped to",
+    )
+    resolve_export_no_price.add_argument("--timeout-seconds", type=float, default=300.0)
     export_review = subparsers.add_parser("export-review")
     _add_common_arguments(export_review, allow_remote_writes=False)
     export_review.add_argument("--output-path", type=Path)
@@ -299,6 +310,7 @@ def main(argv: list[str] | None = None) -> int:
         "recover-remote-harvest",
         "recover-partial-exact-harvest",
         "resolve-no-result",
+        "resolve-remote-export-no-result",
         "recover-remote-priority",
         "recover-remote-priority-zero-rows",
         "recover-remote-wait-export",
@@ -373,6 +385,15 @@ def main(argv: list[str] | None = None) -> int:
                 )
             elif args.command == "recover-remote-wait-export":
                 recovery = run_remote_wait_export_recovery_command(
+                    business_date=business_date,
+                    runtime_root=args.runtime_root,
+                    remote_job_id=args.remote_job_id,
+                    remote_identity=args.remote_identity,
+                    expected_error_text=args.expected_error_text,
+                    timeout_seconds=args.timeout_seconds,
+                )
+            elif args.command == "resolve-remote-export-no-result":
+                recovery = run_remote_export_no_price_resolution_command(
                     business_date=business_date,
                     runtime_root=args.runtime_root,
                     remote_job_id=args.remote_job_id,

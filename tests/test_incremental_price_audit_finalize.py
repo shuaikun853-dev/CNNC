@@ -43,6 +43,7 @@ def _seed(
     crawl_result=None,
     *,
     crawl_no_result=False,
+    crawl_export_no_price=False,
     crawl_pending=False,
 ):
     rows = list(rows or [_row(), _row()])
@@ -98,6 +99,47 @@ def _seed(
             error = "legacy export missing safe skuId / exact URL result"
             store.fail_crawl_work(token, int(crawl["id"]), error, retryable=False)
             store.complete_crawl_work_without_result(token, int(crawl["id"]), reason=error)
+        elif crawl_export_no_price:
+            from app.services.incremental_audit_recovery import (
+                EXPORT_NO_PRICE_CRAWL_REASON,
+                WAIT_EXPORT_NO_EXPORT_DIAGNOSTIC,
+            )
+
+            job = store.prepare_remote_intent(
+                token,
+                "mall:hash",
+                "daily-20260811-mall",
+                "payload-a",
+                result_path=str(tmp_path / "mall-result.xlsx"),
+            )
+            store.claim_remote_submission(token, int(job["id"]))
+            store.reconcile_remote_job(
+                token,
+                int(job["id"]),
+                remote_identity="mall|task-id|task-number",
+                state="SUBMITTED",
+            )
+            store.link_crawl_work_to_remote_job(token, int(crawl["id"]), int(job["id"]))
+            store.mark_remote_manual(token, int(job["id"]), WAIT_EXPORT_NO_EXPORT_DIAGNOSTIC)
+            store.complete_crawl_work_export_no_price(
+                token,
+                int(crawl["id"]),
+                remote_job_id=int(job["id"]),
+                remote_identity="mall|task-id|task-number",
+                reason=EXPORT_NO_PRICE_CRAWL_REASON,
+                export_rsp_desc="未检索到商品价格信息",
+                export_count=0,
+            )
+            store.complete_manual_export_no_price_job(
+                token,
+                int(job["id"]),
+                remote_identity="mall|task-id|task-number",
+                result={
+                    "evidence_type": "EXPORT_NO_PRICE_TERMINAL",
+                    "export_rspDesc": "未检索到商品价格信息",
+                    "export_count": 0,
+                },
+            )
         elif not crawl_pending:
             store.complete_crawl_work(token, crawl["id"], crawl_result or {
                 "page_price_value": "9.5", "page_price_status": "OK", "page_price_source": "招商局",
@@ -418,6 +460,51 @@ def test_explicit_no_result_is_materializable_without_faking_zero_price(tmp_path
     assert all(row["__page_price_status"] == "NO_RESULT" for row in built.artifact.frozen_rows)
     assert all(row["__page_price_source"] == "招商局（无采集结果）" for row in built.artifact.frozen_rows)
     store.release_lease(token)
+
+
+def test_export_no_price_terminal_no_result_is_materializable(tmp_path):
+    store, _snapshot = _seed(tmp_path, crawl_export_no_price=True)
+    token = store.acquire_lease("2026-08-11", "export-no-price", 60)
+
+    built = build_frozen_audit_artifact(store, token, output_identity="daily-final-20260811")
+
+    assert built.readiness.ready is True
+    assert built.readiness.crawl_no_result == 2
+    assert built.readiness.crawl_invalid_price == 0
+    assert built.readiness.remote_manual == 0
+    assert built.artifact is not None
+    assert all(row["__page_price_value"] is None for row in built.artifact.frozen_rows)
+    assert all(row["__page_price_status"] == "NO_RESULT" for row in built.artifact.frozen_rows)
+    assert all(row["__page_price_source"] == "招商局（无采集结果）" for row in built.artifact.frozen_rows)
+    store.release_lease(token)
+
+
+def test_valid_no_result_accepts_both_terminal_evidence_types():
+    from app.workflows.incremental_price_audit_finalize import _valid_no_result
+
+    exported = {
+        "page_price_status": "NO_RESULT",
+        "page_price_value": None,
+        "evidence_type": "EXPORTED_NO_MATCHING_ROW",
+        "no_result_reason": "legacy export missing safe skuId / exact URL result",
+    }
+    assert _valid_no_result(exported) is True
+
+    export_no_price = {
+        "page_price_status": "NO_RESULT",
+        "page_price_value": None,
+        "evidence_type": "EXPORT_NO_PRICE_TERMINAL",
+        "no_result_reason": "remote task finished and export endpoint reported no price rows",
+        "export_rspDesc": "未检索到商品价格信息",
+        "export_count": 0,
+    }
+    assert _valid_no_result(export_no_price) is True
+
+    assert _valid_no_result({**export_no_price, "export_count": 3}) is False
+    assert _valid_no_result({**export_no_price, "export_rspDesc": "导出失败"}) is False
+    assert _valid_no_result({**export_no_price, "export_count": None}) is False
+    assert _valid_no_result({**export_no_price, "page_price_value": "0"}) is False
+    assert _valid_no_result({**export_no_price, "no_result_reason": ""}) is False
 
 
 def test_workbook_display_name_for_no_result_is_explicit():

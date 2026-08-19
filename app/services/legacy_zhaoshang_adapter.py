@@ -273,6 +273,17 @@ class LegacyPriorityOutcome:
     retryable: bool = False
 
 
+@dataclass(frozen=True)
+class ExportNoPriceProbe:
+    """Read-only live evidence that one finished task exports no price rows."""
+
+    task_status_rsp_desc: str
+    progress: Mapping[str, int]
+    export_rsp_desc: str
+    export_count: int
+    remote_calls: int
+
+
 class _BoundedReadOnlySession:
     """Clamp legacy helper HTTP calls to the tick's remaining reconcile budget."""
 
@@ -356,6 +367,7 @@ class CnncLegacyZhaoshangAdapter:
         runner: Callable[[list[str], float, Mapping[str, str]], Any] | None = None,
         reconciler: Callable[[str, str, float], Mapping[str, Any] | None] | None = None,
         priority_runner: Callable[[PreparedLegacyJob, str, str, float], Any] | None = None,
+        export_probe: Callable[[PreparedLegacyJob, str, str, float], Any] | None = None,
         event_recorder: Callable[..., Any] | None = None,
         auth_manager: AuthManager | None = None,
         external_tool_path: Path = EXTERNAL_TOOL_PATH,
@@ -366,6 +378,7 @@ class CnncLegacyZhaoshangAdapter:
         self._runner = runner
         self._reconciler = reconciler
         self._priority_runner = priority_runner
+        self._export_probe = export_probe
         self._event_recorder = event_recorder
         self._auth_manager = auth_manager
         self._external_tool_path = Path(external_tool_path)
@@ -1309,6 +1322,138 @@ class CnncLegacyZhaoshangAdapter:
         ):
             return None
         return f"{job.mall_key}|{task_id}|{task_number}"
+
+    def probe_export_no_price(
+        self,
+        job: PreparedLegacyJob,
+        task_id: str,
+        task_number: str,
+        timeout_seconds: float,
+    ) -> ExportNoPriceProbe:
+        """Re-verify live terminal no-price evidence for one exact existing task.
+
+        Read-only against the crawl platform: the exact existing task is looked
+        up by durable name, its identity must match, and the status / progress /
+        export endpoints are queried directly.  The export response body is
+        inspected but never written anywhere.
+        """
+        if self._export_probe is not None:
+            return self._export_probe(job, task_id, task_number, timeout_seconds)
+        return self._production_export_no_price_probe(job, task_id, task_number, timeout_seconds)
+
+    def _production_export_no_price_probe(
+        self,
+        job: PreparedLegacyJob,
+        task_id: str,
+        task_number: str,
+        timeout_seconds: float,
+    ) -> ExportNoPriceProbe:
+        if timeout_seconds <= 0:
+            raise TimeoutError("export no-price probe timeout must be positive")
+        if not self._external_tool_path.is_file():
+            raise FileNotFoundError("legacy Zhaoshang external tool is unavailable")
+        deadline = self._monotonic() + float(timeout_seconds)
+        tool = self._load_module(self._external_tool_path, "legacy_zhaoshang_export_no_price_probe")
+        auth_manager = self._auth_manager or AuthManager()
+        environment = internal_subprocess_env()
+        environment.update(auth_manager.export_environment("zhaoshang", refresh=True))
+        remaining = deadline - self._monotonic()
+        if remaining <= 0:
+            raise TimeoutError("legacy Zhaoshang auth refresh exhausted the probe deadline")
+        # The legacy session constructor reads exactly these two auth variables.
+        session_environment = {
+            key: str(environment[key])
+            for key in ("BLADE_AUTH", "COOKIE")
+            if environment.get(key)
+        }
+        if len(session_environment) != 2:
+            raise LegacyZhaoshangAdapterError("legacy Zhaoshang session auth is unavailable")
+        with _temporary_environment(session_environment):
+            session = tool.build_session()
+            mall_code = tool.priority_mall_code_for_key(job.mall_key)
+            resolved_task_name, _batch_number = tool.build_browser_task_identifiers(
+                job.task_name,
+                job.mall_key,
+            )
+            task = tool.check_existing_task(session, resolved_task_name, mall_code)
+            remote_calls = 1
+            if task is None:
+                raise LegacyZhaoshangAdapterError(
+                    "export no-price probe found no exact existing task"
+                )
+            live_task_id, live_task_number, mall_logo = tool.get_task_identity(task, mall_code)
+            if str(live_task_id) != str(task_id) or str(live_task_number) != str(task_number):
+                raise LegacyZhaoshangAdapterError(
+                    "live task identity does not match the durable remote identity"
+                )
+            remaining = deadline - self._monotonic()
+            if remaining <= 0:
+                raise TimeoutError("export no-price probe deadline exhausted before status query")
+            status = tool.query_task_status(session, str(live_task_id))
+            remote_calls += 1
+            remaining = deadline - self._monotonic()
+            if remaining <= 0:
+                raise TimeoutError("export no-price probe deadline exhausted before progress query")
+            progress_json = tool.query_task_progress(session, str(live_task_number))
+            remote_calls += 1
+            remaining = deadline - self._monotonic()
+            if remaining <= 0:
+                raise TimeoutError("export no-price probe deadline exhausted before export query")
+            response = session.post(
+                tool.EXPORT_TASK_URL,
+                json={
+                    "taskNumber": str(live_task_number),
+                    "taskId": str(live_task_id),
+                    "mallLogo": mall_logo,
+                },
+                timeout=min(60.0, remaining),
+            )
+            response.raise_for_status()
+            remote_calls += 1
+        content_type = response.headers.get("Content-Type", "") or ""
+        content_disposition = response.headers.get("Content-Disposition", "") or ""
+        if (
+            "spreadsheetml" in content_type
+            or "application/vnd.ms-excel" in content_type
+            or "attachment" in content_disposition
+            or response.content[:2] == b"PK"
+        ):
+            raise LegacyZhaoshangAdapterError(
+                "export endpoint returned a result workbook; terminal no-price resolution does not apply"
+            )
+        try:
+            data = response.json()
+        except ValueError as exc:
+            raise LegacyZhaoshangAdapterError(
+                "export endpoint returned neither a workbook nor JSON"
+            ) from exc
+        if not isinstance(data, dict):
+            raise LegacyZhaoshangAdapterError("export endpoint returned an unexpected payload")
+        embedded = data.get("data")
+        if isinstance(embedded, dict) and any(
+            _text(embedded.get(key)) for key in ("url", "fileUrl", "downloadUrl", "exportUrl")
+        ):
+            raise LegacyZhaoshangAdapterError(
+                "export endpoint returned a result download; terminal no-price resolution does not apply"
+            )
+        if isinstance(embedded, str) and any(token in embedded for token in (".xlsx", "download", "export")):
+            raise LegacyZhaoshangAdapterError(
+                "export endpoint returned a result download; terminal no-price resolution does not apply"
+            )
+        raw_count = data.get("count")
+        try:
+            export_count = int(raw_count)
+        except (TypeError, ValueError) as exc:
+            raise LegacyZhaoshangAdapterError(
+                "export endpoint returned no parseable count"
+            ) from exc
+        return ExportNoPriceProbe(
+            task_status_rsp_desc=_text(status.get("rspDesc")),
+            progress=dict(tool.parse_task_progress_desc(_text(progress_json.get("rspDesc")))),
+            export_rsp_desc=_text(data.get("rspDesc")),
+            export_count=export_count,
+            remote_calls=remote_calls,
+        )
 
     @classmethod
     def _validate_result_workbook(cls, job: PreparedLegacyJob) -> tuple[
