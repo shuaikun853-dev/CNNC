@@ -254,6 +254,33 @@ def test_wait_export_recovery_completes_manual_job_from_original_remote_task(tmp
     )
 
 
+def test_wait_export_recovery_accepts_still_running_diagnostic(tmp_path):
+    from app.services.incremental_audit_recovery import (
+        WAIT_EXPORT_STILL_RUNNING_DIAGNOSTIC,
+    )
+
+    seed = _Seed(tmp_path)
+    seed.runner = _exporting_runner(
+        seed,
+        [
+            ["code-0", "sku-0", "https://shop.example/0", 12.3],
+            ["code-1", "sku-1", "https://shop.example/1", 0],
+            ["code-2", "sku-2", "https://shop.example/2", 7.7],
+        ],
+    )
+    requests = seed.build_requests(3)
+    store, job, _snapshot = seed.seed(
+        [_row(index) for index in range(3)],
+        requests,
+        manual_error=WAIT_EXPORT_STILL_RUNNING_DIAGNOSTIC,
+    )
+
+    result = seed.recover(store, job, expected_error_text=WAIT_EXPORT_STILL_RUNNING_DIAGNOSTIC)
+
+    assert result["outcome"] == "REMOTE_WAIT_EXPORT_RECOVERY_COMPLETED"
+    assert store.get_remote_job(int(job["id"]))["state"] == "COMPLETED"
+
+
 def test_wait_export_recovery_rejects_wrong_remote_job_id(tmp_path):
     seed = _Seed(tmp_path)
     seed.runner = _exporting_runner(seed, [])

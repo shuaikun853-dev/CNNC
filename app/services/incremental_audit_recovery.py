@@ -1590,6 +1590,14 @@ def run_existing_remote_harvest(
 
 
 WAIT_EXPORT_MANUAL_DIAGNOSTIC = "legacy wait-export-only requires manual review"
+# A capped wait that only proved the remote task is still executing strands the
+# job with the RUNNING diagnostic; the wait-export recovery exists exactly to
+# give such genuinely still-running remotes another bounded wait, so both
+# diagnostics it can itself persist stay admissible entry points.
+WAIT_EXPORT_STILL_RUNNING_DIAGNOSTIC = "legacy wait-export-only is still running"
+WAIT_EXPORT_RECOVERY_ACCEPTED_ERRORS = frozenset(
+    {WAIT_EXPORT_MANUAL_DIAGNOSTIC, WAIT_EXPORT_STILL_RUNNING_DIAGNOSTIC}
+)
 
 
 def run_remote_wait_export_recovery(
@@ -1618,7 +1626,7 @@ def run_remote_wait_export_recovery(
     identity_parts = expected_identity.split("|")
     if len(identity_parts) != 3 or not all(identity_parts):
         raise RecoveryRejected("exact remote identity is required")
-    if str(expected_error_text or "").strip() != WAIT_EXPORT_MANUAL_DIAGNOSTIC:
+    if str(expected_error_text or "").strip() not in WAIT_EXPORT_RECOVERY_ACCEPTED_ERRORS:
         raise RecoveryRejected("wait-export recovery requires the exact legacy wait-export manual diagnostic")
     if timeout_seconds <= 0:
         raise RecoveryRejected("wait-export recovery timeout must be positive")
@@ -1645,7 +1653,7 @@ def run_remote_wait_export_recovery(
             raise RecoveryRejected(f"remote job id does not exist in this run: {remote_job_id}")
         if job["state"] != "MANUAL_REQUIRED":
             raise RecoveryRejected(f"remote job id {remote_job_id} is not MANUAL_REQUIRED: {job['state']}")
-        if str(job.get("error_text") or "").strip() != WAIT_EXPORT_MANUAL_DIAGNOSTIC:
+        if str(job.get("error_text") or "").strip() not in WAIT_EXPORT_RECOVERY_ACCEPTED_ERRORS:
             raise RecoveryRejected("remote job manual error is not the wait-export diagnostic")
         if not int(job["post_attempted"]):
             raise RecoveryRejected("wait-export recovery requires durable POST evidence")
