@@ -23,6 +23,16 @@ from app.services.saas_audit_core import crawl_fingerprint, detail_fingerprint, 
 from app.services.title_match_model_adapter import ModelCallRetryExhaustedError
 
 
+class SubmitNotAttemptedError(RuntimeError):
+    """A submit callback provably never dispatched the remote create.
+
+    The burn-then-send claim discipline still applies: the workflow must
+    durably record that no POST could have started, so the next tick may
+    safely reclaim the same immutable intent. Anything merely uncertain
+    must keep raising so it lands in SUBMIT_UNKNOWN instead.
+    """
+
+
 @dataclass(frozen=True)
 class TickConfig:
     business_date: str
@@ -191,7 +201,7 @@ def _empty_counters() -> dict[str, int]:
         "recovered_stage_claims": 0, "recovered_submit_unknown": 0, "today_discovered": 0,
         "delta_new": 0, "delta_changed": 0, "detail_requests": 0, "model_attempts": 0,
         "crawl_submitted": 0, "crawl_harvested": 0, "submit_unknown": 0, "crawl_running": 0,
-        "harvest_batches": 0, "harvest_swept": 0, "submit_paused": 0,
+        "harvest_batches": 0, "harvest_swept": 0, "submit_paused": 0, "submit_not_attempted": 0,
         "customer_count": 0, "saas_count": 0, "source_count_gap": 0,
     }
 
@@ -201,6 +211,10 @@ def _canonical_hash(value: Any) -> str:
 
 
 def _safe_error(exc: BaseException) -> str:
+    # This typed pre-send message is built only from the legacy adapter's
+    # fixed diagnostic vocabulary, so it can be persisted verbatim.
+    if isinstance(exc, SubmitNotAttemptedError):
+        return str(exc)
     code = getattr(exc, "code", None)
     if isinstance(code, int):
         return f"{type(exc).__name__}(status={code})"
@@ -664,6 +678,12 @@ def _submit(
         store.renew_lease(token, max(1, budget.remaining() + budget.reserve_seconds))
         try:
             result = deps.submit_crawl(claim, crawls, budget.callback_timeout(config.external_timeout_seconds))
+        except SubmitNotAttemptedError as exc:
+            # Provably pre-send: the burned claim may retreat because no POST
+            # could have started; the next tick reclaims the same intent.
+            store.release_remote_submission_claim(token, int(job["id"]), _safe_error(exc))
+            counters["submit_not_attempted"] += 1
+            return
         except Exception as exc:
             store.mark_submit_unknown(token, int(job["id"]), _safe_error(exc))
             counters["submit_unknown"] += 1

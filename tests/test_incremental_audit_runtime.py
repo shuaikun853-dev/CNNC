@@ -1882,3 +1882,31 @@ def test_targeted_harvest_recovery_rejection_is_classified_not_name_error(
         "outcome": skipped_outcome,
         "reason": "test rejection",
     }
+
+
+def test_legacy_bridge_maps_not_attempted_to_dedicated_error(tmp_path):
+    from app.workflows.incremental_price_audit import SubmitNotAttemptedError
+
+    class NotAttemptedAdapter(_BridgeAdapter):
+        def submit(self, _job, *, timeout_seconds):
+            self.submit_calls += 1
+            return LegacySubmitOutcome(
+                SubmitStatus.NOT_ATTEMPTED,
+                diagnostic="auth refresh failed before spawn",
+            )
+
+    adapter = NotAttemptedAdapter()
+    paths = runtime_paths("2026-08-11", tmp_path / "runtime")
+    paths.run_dir.mkdir(parents=True)
+    propose, finalize, submit, _harvest = legacy_zhaoshang_bridge(
+        adapter, paths=paths, business_date="2026-08-11"
+    )
+    rows = [{"vCommodityId": "v-a", "skuId": "sku-a", "extLink": "https://same.invalid/p"}]
+    plan = propose([{"row": row} for row in rows], 10)[0]
+    finalized = finalize(plan, tuple(plan.members), 10)
+
+    with pytest.raises(SubmitNotAttemptedError) as excinfo:
+        submit({"logical_key": finalized.logical_key}, [], 10)
+
+    assert "auth refresh failed" in str(excinfo.value)
+    assert adapter.submit_calls == 1

@@ -2,6 +2,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
@@ -14,6 +15,7 @@ from app.services.legacy_zhaoshang_adapter import (
     CrawlRequest,
     CnncLegacyZhaoshangAdapter,
     HarvestStatus,
+    LegacyPreSendFailure,
     PriorityStatus,
     ReconcileStatus,
     SubmitStatus,
@@ -352,14 +354,16 @@ def test_production_runner_shares_deadline_and_strips_model_secrets(tmp_path, mo
         monotonic=lambda: next(ticks),
     )
 
-    def run(args, **kwargs):
-        captured.update(kwargs)
-        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+    process = _FakeSpawnedProcess()
 
-    monkeypatch.setattr(legacy_module.subprocess, "run", run)
+    def popen(*args, **kwargs):
+        captured.update(kwargs)
+        return process
+
+    monkeypatch.setattr(legacy_module.subprocess, "Popen", popen)
     adapter._production_runner([sys.executable, str(legacy_module.EXTERNAL_TOOL_PATH)], 10)
 
-    assert captured["timeout"] == pytest.approx(6)
+    assert process.communicate_timeouts == [pytest.approx(6)]
     assert captured["env"]["BLADE_AUTH"] == "blade"
     assert not any(name.startswith("TITLE_MATCH_MODEL_") for name in captured["env"])
     assert os.environ["TITLE_MATCH_MODEL_API_KEY"] == "must-not-leak"
@@ -382,11 +386,11 @@ def test_production_runner_loads_required_priority_database_environment(tmp_path
         def export_environment(self, *_args, **_kwargs):
             return {"BLADE_AUTH": "blade"}
 
-    def run(args, **kwargs):
+    def popen(*args, **kwargs):
         captured.update(kwargs)
-        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+        return _FakeSpawnedProcess()
 
-    monkeypatch.setattr(legacy_module.subprocess, "run", run)
+    monkeypatch.setattr(legacy_module.subprocess, "Popen", popen)
     adapter = _adapter(auth_manager=Auth(), external_tool_path=tool, db_env_path=db_env)
     adapter._production_runner([sys.executable, str(legacy_module.EXTERNAL_TOOL_PATH)], 10)
 
@@ -415,12 +419,14 @@ def test_production_runner_never_starts_subprocess_after_auth_uses_deadline(tmp_
     )
     monkeypatch.setattr(
         legacy_module.subprocess,
-        "run",
+        "Popen",
         lambda *_args, **_kwargs: pytest.fail("subprocess must not start after deadline"),
     )
 
-    with pytest.raises(TimeoutError):
+    with pytest.raises(LegacyPreSendFailure) as excinfo:
         adapter._production_runner([sys.executable, str(legacy_module.EXTERNAL_TOOL_PATH)], 10)
+
+    assert "TimeoutError" in str(excinfo.value)
 
 
 def test_default_reconciler_shares_auth_deadline_with_all_read_requests(tmp_path, monkeypatch):
@@ -2156,3 +2162,199 @@ def test_read_only_session_uses_one_aggregate_deadline_across_requests():
         session.post("https://read-only.invalid/3", timeout=60)
 
     assert calls == [pytest.approx(9), pytest.approx(6)]
+
+
+class _PreSendAuth:
+    def __init__(self, exc: BaseException | None = None):
+        self.exc = exc
+
+    def export_environment(self, *_args, **_kwargs):
+        if self.exc is not None:
+            raise self.exc
+        return {"BLADE_AUTH": "blade"}
+
+
+class _FakeSpawnedProcess:
+    def __init__(self, *, first_communicate_raises: BaseException | None = None):
+        self.first_communicate_raises = first_communicate_raises
+        self.communicate_calls = 0
+        self.communicate_timeouts = []
+        self.killed = False
+        self.returncode = 0
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc):
+        return False
+
+    def kill(self):
+        self.killed = True
+
+    def communicate(self, input=None, timeout=None):
+        self.communicate_calls += 1
+        self.communicate_timeouts.append(timeout)
+        if self.first_communicate_raises is not None and self.communicate_calls == 1:
+            raise self.first_communicate_raises
+        return ("", "")
+
+    def poll(self):
+        return self.returncode
+
+
+def _patch_spawn(monkeypatch, *, process=None, raises=None):
+    calls = []
+
+    def fake_popen(*args, **kwargs):
+        calls.append((args, kwargs))
+        if raises is not None:
+            raise raises
+        return process
+
+    monkeypatch.setattr(legacy_module.subprocess, "Popen", fake_popen)
+    return calls
+
+
+def _submit_with_production_runner(tmp_path, monkeypatch, *, auth=None, tool=None, monotonic=time.monotonic, batch_state=None):
+    adapter = _adapter(
+        auth_manager=auth if auth is not None else _PreSendAuth(),
+        external_tool_path=tool if tool is not None else _tool_file(tmp_path),
+        monotonic=monotonic,
+    )
+    job = adapter.prepare_job(
+        business_date="2026-08-11",
+        requests=(_request(),),
+        template_path=tmp_path / "template.xlsx",
+        result_path=tmp_path / "result.xlsx",
+        task_name=DEFAULT_TASK_NAME,
+        batch_state_path=batch_state if batch_state is not None else _state_file(tmp_path),
+    )
+    return adapter.submit(job, timeout_seconds=30)
+
+
+def _tool_file(tmp_path):
+    tool = tmp_path / "auto_crawl_task.py"
+    tool.write_text("# test tool\n", encoding="utf-8")
+    return tool
+
+
+def test_submit_auth_refresh_failure_is_pre_send_not_unknown(tmp_path, monkeypatch):
+    from scripts.auth_manager import RefreshTokenExpiredError
+
+    popen_calls = _patch_spawn(monkeypatch)
+
+    outcome = _submit_with_production_runner(
+        tmp_path, monkeypatch, auth=_PreSendAuth(RefreshTokenExpiredError("refresh token expired"))
+    )
+
+    assert popen_calls == []
+    assert outcome.status is SubmitStatus.NOT_ATTEMPTED
+    assert "pre-send" in outcome.diagnostic
+    assert "RefreshTokenExpiredError" in outcome.diagnostic
+
+
+def test_submit_spawn_file_not_found_is_pre_send_not_unknown(tmp_path, monkeypatch):
+    popen_calls = _patch_spawn(monkeypatch, raises=FileNotFoundError("no such executable"))
+
+    outcome = _submit_with_production_runner(tmp_path, monkeypatch)
+
+    assert len(popen_calls) == 1
+    assert outcome.status is SubmitStatus.NOT_ATTEMPTED
+    assert "could not be started" in outcome.diagnostic
+
+
+def test_submit_spawn_oserror_is_pre_send_not_unknown(tmp_path, monkeypatch):
+    popen_calls = _patch_spawn(monkeypatch, raises=PermissionError("spawn denied"))
+
+    outcome = _submit_with_production_runner(tmp_path, monkeypatch)
+
+    assert len(popen_calls) == 1
+    assert outcome.status is SubmitStatus.NOT_ATTEMPTED
+    assert "could not be started" in outcome.diagnostic
+
+
+def test_submit_missing_external_tool_is_pre_send_not_unknown(tmp_path, monkeypatch):
+    popen_calls = _patch_spawn(monkeypatch)
+    missing_tool = tmp_path / "missing" / "auto_crawl_task.py"
+
+    outcome = _submit_with_production_runner(tmp_path, monkeypatch, tool=missing_tool)
+
+    assert popen_calls == []
+    assert outcome.status is SubmitStatus.NOT_ATTEMPTED
+    assert "external tool is unavailable" in outcome.diagnostic
+
+
+def test_submit_deadline_exhausted_before_spawn_is_pre_send_not_unknown(tmp_path, monkeypatch):
+    popen_calls = _patch_spawn(monkeypatch)
+    ticks = iter((100.0, 200.0))
+
+    outcome = _submit_with_production_runner(
+        tmp_path, monkeypatch, monotonic=lambda: next(ticks)
+    )
+
+    assert popen_calls == []
+    assert outcome.status is SubmitStatus.NOT_ATTEMPTED
+    assert outcome.diagnostic
+
+
+def test_submit_timeout_after_successful_spawn_stays_unknown(tmp_path, monkeypatch):
+    process = _FakeSpawnedProcess(first_communicate_raises=subprocess.TimeoutExpired("cmd", 1))
+    popen_calls = _patch_spawn(monkeypatch, process=process)
+
+    outcome = _submit_with_production_runner(tmp_path, monkeypatch)
+
+    assert len(popen_calls) == 1
+    assert process.killed is True
+    assert outcome.status is SubmitStatus.SUBMIT_UNKNOWN
+    assert outcome.diagnostic == "legacy create-only completion is unknown"
+
+
+def test_submit_injected_runner_oserror_stays_unknown(tmp_path):
+    def runner(args, _timeout, _env):
+        raise FileNotFoundError("runner-level missing file")
+
+    outcome = _adapter(runner=runner).submit(_prepare(tmp_path), timeout_seconds=30)
+
+    assert outcome.status is SubmitStatus.SUBMIT_UNKNOWN
+
+
+def test_submit_child_died_after_possible_post_stays_unknown(tmp_path, monkeypatch):
+    process = _FakeSpawnedProcess()
+    process.returncode = 1
+    _patch_spawn(monkeypatch, process=process)
+
+    outcome = _submit_with_production_runner(tmp_path, monkeypatch)
+
+    assert outcome.status is SubmitStatus.SUBMIT_UNKNOWN
+    assert "nonzero exit" in outcome.diagnostic
+
+
+def test_submit_child_completed_without_evidence_stays_unknown(tmp_path, monkeypatch):
+    process = _FakeSpawnedProcess()
+    process.returncode = 0
+    _patch_spawn(monkeypatch, process=process)
+
+    outcome = _submit_with_production_runner(tmp_path, monkeypatch)
+
+    assert outcome.status is SubmitStatus.SUBMIT_UNKNOWN
+    assert "lacks CREATED + ENABLED evidence" in outcome.diagnostic
+
+
+def test_submit_existing_created_evidence_wins_over_pre_send_failure(tmp_path, monkeypatch):
+    from scripts.auth_manager import RefreshTokenExpiredError
+
+    popen_calls = _patch_spawn(monkeypatch)
+    batch_state = _state_file(tmp_path)
+    _append_submission(batch_state, task_id="id-9", task_number="no-9")
+
+    outcome = _submit_with_production_runner(
+        tmp_path,
+        monkeypatch,
+        auth=_PreSendAuth(RefreshTokenExpiredError("refresh token expired")),
+        batch_state=batch_state,
+    )
+
+    assert popen_calls == []
+    assert outcome.status is SubmitStatus.SUBMITTED
+    assert outcome.task_id == "id-9"
+    assert outcome.task_number == "no-9"

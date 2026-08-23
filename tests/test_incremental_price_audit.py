@@ -2668,3 +2668,66 @@ def test_new_source_follows_same_pending_backend_request_without_second_post(tmp
     assert by_source["source-a"]["remote_job_id"] == first_job["id"]
     assert by_source["source-b"]["remote_job_id"] == first_job["id"]
     assert by_source["source-c"]["remote_job_id"] == second_job["id"]
+
+
+def test_submit_pre_send_failure_releases_claim_and_next_tick_retries_safely(tmp_path):
+    from app.workflows.incremental_price_audit import SubmitNotAttemptedError
+
+    store = DailyAuditStore(tmp_path / "state.sqlite")
+    events: list[str] = []
+    clock = Clock()
+    config = _config(clock)
+
+    failing = _deps(events, [_row()], clock)
+
+    def pre_send_submit(_job, _crawls, _timeout):
+        events.append("submit")
+        raise SubmitNotAttemptedError("legacy pre-send: auth refresh failed")
+
+    failing.submit_crawl = pre_send_submit
+    first = run_incremental_tick(store, ProcessLock(tmp_path / "tick.lock"), config, failing)
+
+    assert first.counters["submit_not_attempted"] == 1
+    assert first.counters["submit_unknown"] == 0
+    inspect = store.acquire_lease("2026-08-11", "inspect", 30)
+    jobs = store.list_remote_jobs(inspect)
+    assert [job["state"] for job in jobs] == ["SUBMIT_INTENT"]
+    assert jobs[0]["post_attempted"] is False
+    assert "auth refresh failed" in jobs[0]["error_text"]
+    store.release_lease(inspect)
+
+    working = _deps(events, [_row()], clock)
+    run_incremental_tick(store, ProcessLock(tmp_path / "tick.lock"), config, working)
+
+    assert events.count("submit") == 2
+    verify = store.acquire_lease("2026-08-11", "verify", 30)
+    final = store.list_remote_jobs(verify)[0]
+    assert final["state"] == "SUBMITTED"
+    assert final["remote_identity"] == "task-1"
+    store.release_lease(verify)
+
+
+def test_repeated_pre_send_failures_keep_releasing_claim_without_unknown(tmp_path):
+    from app.workflows.incremental_price_audit import SubmitNotAttemptedError
+
+    store = DailyAuditStore(tmp_path / "state.sqlite")
+    events: list[str] = []
+    clock = Clock()
+    config = _config(clock)
+    deps = _deps(events, [_row()], clock)
+
+    def pre_send_submit(_job, _crawls, _timeout):
+        events.append("submit")
+        raise SubmitNotAttemptedError("legacy pre-send: tool missing")
+
+    deps.submit_crawl = pre_send_submit
+    for _ in range(3):
+        run_incremental_tick(store, ProcessLock(tmp_path / "tick.lock"), config, deps)
+
+    assert events.count("submit") == 3
+    inspect = store.acquire_lease("2026-08-11", "inspect", 30)
+    jobs = store.list_remote_jobs(inspect)
+    assert [job["state"] for job in jobs] == ["SUBMIT_INTENT"]
+    assert jobs[0]["post_attempted"] is False
+    assert jobs[0]["error_text"]
+    store.release_lease(inspect)

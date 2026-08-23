@@ -1117,6 +1117,28 @@ class DailyAuditStore:
     def mark_submit_unknown(self, token: LeaseToken, job_id: int, error: str) -> dict[str, Any]:
         return self._set_job_state(token, job_id, "SUBMIT_UNKNOWN", error=error, require_post_attempted=True)
 
+    def release_remote_submission_claim(self, token: LeaseToken, job_id: int, error: str) -> dict[str, Any]:
+        """Retreat a burned claim only with proof the POST never started.
+
+        Only an un-dispatched submit intent with no confirmed remote identity
+        may return to claimable state; the immutable intent, bindings and
+        uniqueness stay untouched and the durable diagnostic keeps the
+        pre-send reason auditable.
+        """
+        with self._transaction(immediate=True) as connection:
+            self._validate_lease(connection, token)
+            job = self._job_for_lease(connection, token, job_id)
+            if str(job["state"]) != "SUBMIT_INTENT":
+                raise RemoteIntentConflict("pre-send release requires the un-dispatched submit intent state")
+            if str(job["remote_identity"] or "").strip():
+                raise RemoteIntentConflict("pre-send release requires no confirmed remote identity")
+            if int(job["post_attempted"]):
+                connection.execute(
+                    "UPDATE remote_jobs SET post_attempted=0, error_text=?, updated_at=? WHERE id=?",
+                    (error, self._utcnow(), job_id),
+                )
+            return self._row(connection.execute("SELECT * FROM remote_jobs WHERE id=?", (job_id,)).fetchone())
+
     def mark_remote_manual(self, token: LeaseToken, job_id: int, error: str) -> dict[str, Any]:
         return self._set_job_state(token, job_id, "MANUAL_REQUIRED", error=error)
 

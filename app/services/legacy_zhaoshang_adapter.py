@@ -197,6 +197,10 @@ class SubmissionEvidenceConflictError(LegacyZhaoshangAdapterError):
     pass
 
 
+class LegacyPreSendFailure(LegacyZhaoshangAdapterError):
+    """The legacy subprocess provably never started; no remote POST occurred."""
+
+
 @dataclass(frozen=True)
 class CrawlRequest:
     mall_key: str
@@ -787,31 +791,55 @@ class CnncLegacyZhaoshangAdapter:
         ]
 
     def _production_runner(self, args: list[str], timeout_seconds: float) -> subprocess.CompletedProcess[str]:
-        if not self._external_tool_path.is_file():
-            raise FileNotFoundError("legacy Zhaoshang external tool is unavailable")
+        # Pre-send phase: everything before Popen() is provably local, so any
+        # failure here means no child process exists and the remote /add
+        # cannot have happened.
         deadline = self._monotonic() + timeout_seconds
-        auth_manager = self._auth_manager or AuthManager()
-        environment = internal_subprocess_env()
-        environment.update(auth_manager.export_environment("zhaoshang", refresh=True))
-        if self._db_env_path is not None:
-            environment.update(load_zhaoshang_db_env(self._db_env_path))
-        for key in tuple(environment):
-            if key.startswith("TITLE_MATCH_MODEL_"):
-                environment.pop(key, None)
-        remaining = deadline - self._monotonic()
-        if remaining <= 0:
-            raise TimeoutError("legacy Zhaoshang auth refresh exhausted the command deadline")
-        args = [str(self._external_tool_path) if value == str(EXTERNAL_TOOL_PATH) else value for value in args]
-        return subprocess.run(
-            args,
-            cwd=str(self._external_tool_path.parent),
-            capture_output=True,
-            text=True,
-            timeout=remaining,
-            env=environment,
-            shell=False,
-            check=False,
-        )
+        try:
+            if not self._external_tool_path.is_file():
+                raise LegacyPreSendFailure("legacy Zhaoshang external tool is unavailable")
+            auth_manager = self._auth_manager or AuthManager()
+            environment = internal_subprocess_env()
+            environment.update(auth_manager.export_environment("zhaoshang", refresh=True))
+            if self._db_env_path is not None:
+                environment.update(load_zhaoshang_db_env(self._db_env_path))
+            for key in tuple(environment):
+                if key.startswith("TITLE_MATCH_MODEL_"):
+                    environment.pop(key, None)
+            remaining = deadline - self._monotonic()
+            if remaining <= 0:
+                raise TimeoutError("legacy Zhaoshang auth refresh exhausted the command deadline")
+            args = [str(self._external_tool_path) if value == str(EXTERNAL_TOOL_PATH) else value for value in args]
+            try:
+                process = subprocess.Popen(
+                    args,
+                    cwd=str(self._external_tool_path.parent),
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    env=environment,
+                    shell=False,
+                )
+            except OSError as exc:
+                # Popen only raises here when the child could not be created.
+                raise LegacyPreSendFailure(f"legacy Zhaoshang subprocess could not be started: {exc}") from exc
+        except LegacyPreSendFailure:
+            raise
+        except Exception as exc:
+            raise LegacyPreSendFailure(f"legacy Zhaoshang pre-send setup failed: {type(exc).__name__}") from exc
+        # Post-send boundary: the child exists, so any failure below may
+        # already have dispatched the remote create and must stay SUBMIT_UNKNOWN.
+        try:
+            stdout, stderr = process.communicate(timeout=remaining)
+        except subprocess.TimeoutExpired as exc:
+            process.kill()
+            exc.stdout, exc.stderr = process.communicate()
+            raise
+        except BaseException:
+            process.kill()
+            process.wait()
+            raise
+        return subprocess.CompletedProcess(args, process.poll(), stdout, stderr)
 
     def _run(self, args: list[str], timeout_seconds: float) -> Any:
         if self._runner is not None:
@@ -937,8 +965,11 @@ class CnncLegacyZhaoshangAdapter:
             return LegacySubmitOutcome(SubmitStatus.NOT_ATTEMPTED, diagnostic=invalid_reason)
         process = None
         run_diagnostic = ""
+        pre_send_diagnostic = ""
         try:
             process = self._run(self._create_args(job), timeout_seconds)
+        except LegacyPreSendFailure as exc:
+            pre_send_diagnostic = str(exc)
         except (subprocess.TimeoutExpired, TimeoutError, OSError):
             run_diagnostic = "legacy create-only completion is unknown"
         events = self._read_batch_events(job)
@@ -968,6 +999,10 @@ class CnncLegacyZhaoshangAdapter:
                 priority_evidence,
                 diagnostic,
             )
+        if pre_send_diagnostic:
+            # Durable CREATED+ENABLED evidence already won above. With no such
+            # evidence and a provably un-started subprocess, no POST began.
+            return LegacySubmitOutcome(SubmitStatus.NOT_ATTEMPTED, diagnostic=pre_send_diagnostic)
         if run_diagnostic:
             return LegacySubmitOutcome(SubmitStatus.SUBMIT_UNKNOWN, diagnostic=run_diagnostic)
         if int(getattr(process, "returncode", -1)) != 0:
@@ -2135,7 +2170,7 @@ class CnncLegacyZhaoshangAdapter:
             if validated is not None:
                 return validated
             return LegacyHarvestOutcome(HarvestStatus.RUNNING, diagnostic="legacy wait-export-only is still running")
-        except OSError:
+        except (OSError, LegacyPreSendFailure):
             return LegacyHarvestOutcome(HarvestStatus.MANUAL, diagnostic="legacy wait-export-only could not be started")
         if int(getattr(process, "returncode", -1)) != 0:
             validated = validated_export_after_runner_failure()

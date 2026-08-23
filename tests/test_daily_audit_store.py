@@ -692,3 +692,58 @@ def test_explicit_stage_requeue_resets_attempt_and_elapsed(store):
     reset = store.requeue_terminal_stage_work(lease, work["id"])
     assert reset["attempts"] == 0 and reset["elapsed_seconds"] == 0
     assert store.claim_stage_work(lease, work["id"], max_attempts=1, max_elapsed_seconds=1)
+
+
+def test_release_remote_submission_claim_retreats_only_burned_intent(store):
+    lease = _lease(store)
+    job = store.prepare_remote_intent(lease, "mall-A:hash", "daily-20260811-mall-A", "payload-a")
+
+    # A fresh intent never claimed releases as an idempotent no-op.
+    released = store.release_remote_submission_claim(lease, job["id"], "auth refresh failed")
+    assert released["state"] == "SUBMIT_INTENT"
+    assert released["post_attempted"] is False
+    assert released["error_text"] is None
+
+    assert store.claim_remote_submission(lease, job["id"])["post_attempted"] is True
+    released = store.release_remote_submission_claim(lease, job["id"], "auth refresh failed")
+    assert released["state"] == "SUBMIT_INTENT"
+    assert released["post_attempted"] is False
+    assert "auth refresh failed" in released["error_text"]
+
+    # Repeated release after retreat stays idempotent.
+    again = store.release_remote_submission_claim(lease, job["id"], "auth refresh failed")
+    assert again["post_attempted"] is False
+
+    # The retreated claim can be burned again for a later retry decision.
+    assert store.claim_remote_submission(lease, job["id"])["post_attempted"] is True
+
+    # Once the outcome is uncertain the claim may never retreat.
+    store.mark_submit_unknown(lease, job["id"], "timeout")
+    with pytest.raises(RemoteIntentConflict):
+        store.release_remote_submission_claim(lease, job["id"], "late release")
+
+
+def test_release_remote_submission_claim_refuses_confirmed_remote_identity(store):
+    lease = _lease(store)
+    job = store.prepare_remote_intent(lease, "mall-B:hash", "daily-20260811-mall-B", "payload-b")
+    store.claim_remote_submission(lease, job["id"])
+    store.reconcile_remote_job(lease, job["id"], remote_identity="mall|1|RW-1", state="SUBMITTED")
+
+    with pytest.raises(RemoteIntentConflict):
+        store.release_remote_submission_claim(lease, job["id"], "unexpected pre-send")
+
+    assert store.get_remote_job(job["id"])["post_attempted"] is True
+
+
+def test_burned_claim_without_release_stays_fail_closed_as_unknown(store):
+    lease = _lease(store)
+    job = store.prepare_remote_intent(lease, "mall-C:hash", "daily-20260811-mall-C", "payload-c")
+    store.claim_remote_submission(lease, job["id"])
+
+    assert store.recover_ambiguous_remote_submissions(lease) == 1
+    swept = store.get_remote_job(job["id"])
+    assert swept["state"] == "SUBMIT_UNKNOWN"
+    assert swept["post_attempted"] is True
+
+    with pytest.raises(RemoteIntentConflict):
+        store.release_remote_submission_claim(lease, job["id"], "after sweep")

@@ -79,6 +79,7 @@ from app.workflows.incremental_price_audit import (
     CrawlMember,
     CrawlPlan,
     DiscoveredState,
+    SubmitNotAttemptedError,
     TickConfig,
     TickDependencies,
     TickSummary,
@@ -1210,7 +1211,9 @@ def legacy_zhaoshang_bridge(
         if outcome.status is SubmitStatus.SUBMIT_UNKNOWN:
             raise TimeoutError("legacy create-only outcome unknown")
         if outcome.status is not SubmitStatus.SUBMITTED:
-            raise RuntimeConfigurationError("legacy create-only was not accepted")
+            raise SubmitNotAttemptedError(
+                f"legacy create-only never dispatched: {outcome.diagnostic}"
+            )
         state = (
             "SUBMITTED"
             if outcome.priority_evidence in {"updated", "already_highest_priority"}
