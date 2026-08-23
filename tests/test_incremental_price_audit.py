@@ -741,7 +741,7 @@ def test_retryable_priority_failure_becomes_manual_only_at_harvest_limit(
     assert limited["error_text"] == "InterfaceError"
 
 
-def test_default_priority_retry_bound_is_narrower_than_remote_harvest_bound(tmp_path):
+def test_default_priority_retry_bound_matches_remote_harvest_bound(tmp_path):
     store = DailyAuditStore(tmp_path / "state.sqlite")
     clock = Clock()
     identity = "jd|1242978|RW-20260818110643"
@@ -764,7 +764,7 @@ def test_default_priority_retry_bound_is_narrower_than_remote_harvest_bound(tmp_
     )
     token = store.acquire_lease("2026-08-11", "priority-default-limit", 60)
     try:
-        for expected_attempts in (1, 2):
+        for expected_attempts in (1, 2, 3, 4, 5):
             _harvest(
                 store,
                 token,
@@ -776,23 +776,14 @@ def test_default_priority_retry_bound_is_narrower_than_remote_harvest_bound(tmp_
             pending = store.get_remote_job(int(job["id"]))
             assert pending["state"] == "PRIORITY_PENDING"
             assert pending["harvest_attempts"] == expected_attempts
-
-        _harvest(
-            store,
-            token,
-            deps,
-            TickBudget(clock.monotonic(), 60, 0, clock.monotonic),
-            {"crawl_harvested": 0},
-            config,
-        )
-        limited = store.get_remote_job(int(job["id"]))
     finally:
         store.release_lease(token)
 
-    assert config.harvest_max_attempts == 120
-    assert limited["harvest_attempts"] == 3
-    assert limited["state"] == "MANUAL_REQUIRED"
-    assert limited["remote_identity"] == identity
+    assert config.priority_retry_max_attempts == config.harvest_max_attempts == 120
+    assert (
+        config.priority_retry_max_elapsed_seconds
+        == config.harvest_max_elapsed_seconds
+    )
 
 
 def test_priority_success_on_last_permitted_attempt_wins_over_retry_bound(tmp_path):

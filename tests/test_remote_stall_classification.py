@@ -157,7 +157,9 @@ def test_verification_priority_outcome_stays_non_retryable(tmp_path):
 def test_stall_retry_keeps_priority_pending_until_bounded_budget(tmp_path):
     """First not-materialized evidence must stay PRIORITY_PENDING, not MANUAL.
 
-    The bounded budget (priority_retry_max_attempts=3) then turns the third
+    With the production defaults the retryable Priority budget now matches the
+    harvest budget, so a slow remote keeps probing.  The bounded-budget
+    terminal cap still exists: an explicitly narrowed budget turns the third
     failed sweep into MANUAL_REQUIRED with the precise stall diagnostic as
     durable error evidence.
     """
@@ -208,14 +210,26 @@ def test_stall_retry_keeps_priority_pending_until_bounded_budget(tmp_path):
         )
 
     deps = TickDependencies(discover=discover, harvest=harvest)
-    config = TickConfig(business_date="2026-08-11", lease_ttl_seconds=30)
+    default_config = TickConfig(business_date="2026-08-11", lease_ttl_seconds=30)
     summaries = [
-        run_incremental_tick(store, ProcessLock(tmp_path / "tick.lock"), config, deps)
+        run_incremental_tick(store, ProcessLock(tmp_path / "tick.lock"), default_config, deps)
         for _ in range(3)
     ]
+    pending_job = store.get_remote_job(int(job["id"]))
+    assert all(summary.outcome != "MANUAL_REVIEW_REQUIRED" for summary in summaries)
+    assert pending_job["state"] == "PRIORITY_PENDING"
+    assert pending_job["harvest_attempts"] == 3
+    assert pending_job["error_text"] == "PriorityRowsNotMaterialized"
+
+    narrowed_config = TickConfig(
+        business_date="2026-08-11",
+        lease_ttl_seconds=30,
+        priority_retry_max_attempts=3,
+        priority_retry_max_elapsed_seconds=21600,
+    )
+    run_incremental_tick(store, ProcessLock(tmp_path / "tick.lock"), narrowed_config, deps)
     final_job = store.get_remote_job(int(job["id"]))
-    assert all(summary.outcome != "MANUAL_REVIEW_REQUIRED" for summary in summaries[:1])
-    assert summaries[-1].outcome == "MANUAL_REVIEW_REQUIRED"
     assert final_job["state"] == "MANUAL_REQUIRED"
+    assert final_job["error_text"] == "PriorityRowsNotMaterialized"
     assert final_job["error_text"] == "PriorityRowsNotMaterialized"
     assert int(final_job["harvest_attempts"]) == 3

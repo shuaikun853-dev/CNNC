@@ -61,8 +61,12 @@ class TickConfig:
     detail_schema_version: str = "detail-v1"
     harvest_max_attempts: int = 120
     harvest_max_elapsed_seconds: float = 21600
-    priority_retry_max_attempts: int = 3
-    priority_retry_max_elapsed_seconds: float = 180
+    # Only adapter-confirmed retryable Priority failures (transient transport,
+    # rows not yet materialized) consume this budget; non-retryable failures go
+    # MANUAL on first evidence.  The window matches the harvest budget so a
+    # remotely slow task keeps probing instead of blocking the day's closeout.
+    priority_retry_max_attempts: int = 120
+    priority_retry_max_elapsed_seconds: float = 21600
     harvest_batch_size: int = 6
     # Authoritative observations with identical (row_count, ordered_hash) must
     # span at least this long before a finalize freeze may trust them.  A single
