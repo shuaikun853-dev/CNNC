@@ -16,7 +16,7 @@
 | 增量价格审计完整矩阵(TESTING.md §2,17 个测试文件) | **464 passed, 9 skipped, 0 failed**(250s) |
 | 9 个 skip | 历史基准/fixture 缺失类既有跳过,与生产工作区一致,非本次引入 |
 | 环境说明 | worktree 初次跑矩阵 2 个失败(`test_project_resources_and_default_runtime_root_do_not_depend_on_cwd`、`test_finalize_dependency_construction_from_non_project_cwd_is_offline`),根因是新 worktree 缺 gitignore 的 `data/` fixture(`latest_saas_sameAudit_queryAll.curl`、`model.env`);同一对测试在生产工作区验证 **2 passed**。按既有 worktree 惯例(stability-fix-0817 等三个 worktree 均带 data/ 副本)复制 `data/` 后重跑全绿。**后续所有基线/回归都在 worktree 内执行,该 2 个测试不得再失败** |
-| fixture 基线指纹(worktree 本地副本,与生产源逐字节一致,**内容不入库**) | 来源 `E:\.A中核运维\cnnc-ops-agent\data\` → `…-worktrees\refactor-cnnc-architecture-hardening\data\`:`latest_saas_sameAudit_queryAll.curl` 1560 bytes,SHA256 `8510BAAF1C407DFA9F10F0E26766E9176537C6D5C96D03EF5DFB7E28AE1FB732`;`model.env` 679 bytes,SHA256 `C686BDF1749F93DB88318090FEF48BB9AB58D31CDFE99771FFE3AC8603D7FC61`。基线复跑前先核对这两个指纹,保证 baseline 可重复 |
+| fixture 基线指纹(worktree 本地副本,与生产源逐字节一致,**内容不入库**) | 来源 `E:\.A中核运维\cnnc-ops-agent\data\` → `…-worktrees\refactor-cnnc-architecture-hardening\data\`:`latest_saas_sameAudit_queryAll.curl` 1560 bytes,SHA256 `8510BAAF1C407DFA9F10F0E26766E9176537C6D5C96D03EF5DFB7E28AE1FB732`;`model.env` 679 bytes,SHA256 `C686BDF1749F93DB88318090FEF48BB9AB58D31CDFE99771FFE3AC8603D7FC61`。Release Gate 又发现第三个未跟踪 fixture:根目录 `商城sourceId映射表\商城sourceId映射表.xlsx`(15615 bytes,SHA256 `57957A2623BE9FA0611F09DCB6F10B7EC854A45BFB827F7F7C315C223C20D790`,`scripts/zhaoshang_mall_mapping.py:11` 的 DEFAULT_MAPPING_PATH,缺失时 excluded-template 类测试失败)。基线复跑前先核对这三个指纹,保证 baseline 可重复 |
 
 基线时点发现并已核实的**既有潜在缺陷**(非本次重构造成,处理见各 Phase 标注):
 
