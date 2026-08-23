@@ -1832,3 +1832,53 @@ def test_cli_export_review_uses_dedicated_non_tick_command(monkeypatch, tmp_path
             "output_path": output,
         }
     ]
+
+
+@pytest.mark.parametrize(
+    "command_name,recovery_symbol,completed_outcome,skipped_outcome",
+    [
+        (
+            "run_remote_priority_recovery_command",
+            "run_existing_remote_priority_recovery",
+            "REMOTE_PRIORITY_RECOVERY_COMPLETED",
+            "REMOTE_PRIORITY_TARGETED_HARVEST_SKIPPED",
+        ),
+        (
+            "run_remote_priority_zero_rows_recovery_command",
+            "run_existing_remote_priority_zero_rows_recovery",
+            "REMOTE_PRIORITY_ZERO_ROWS_RECOVERY_COMPLETED",
+            "REMOTE_PRIORITY_ZERO_ROWS_TARGETED_HARVEST_SKIPPED",
+        ),
+    ],
+)
+def test_targeted_harvest_recovery_rejection_is_classified_not_name_error(
+    tmp_path, monkeypatch, command_name, recovery_symbol, completed_outcome, skipped_outcome
+):
+    from app.services.incremental_audit_recovery import RecoveryRejected
+
+    monkeypatch.setattr(runtime_module, "CnncLegacyZhaoshangAdapter", lambda: object())
+    monkeypatch.setattr(
+        runtime_module,
+        recovery_symbol,
+        lambda **_kwargs: {"outcome": completed_outcome, "business_date": "2026-08-19"},
+    )
+
+    def rejecting_harvest(**_kwargs):
+        raise RecoveryRejected("test rejection")
+
+    monkeypatch.setattr(runtime_module, "run_existing_remote_harvest", rejecting_harvest)
+
+    command = getattr(runtime_module, command_name)
+    result = command(
+        business_date="2026-08-19",
+        runtime_root=tmp_path,
+        remote_job_id=54,
+        remote_identity="mall|54|RW-20260819160830",
+        expected_error_text="PriorityUpdateZeroRowsError",
+    )
+
+    assert result["outcome"] == completed_outcome
+    assert result["targeted_harvest"] == {
+        "outcome": skipped_outcome,
+        "reason": "test rejection",
+    }

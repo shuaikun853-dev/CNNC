@@ -42,6 +42,7 @@ from app.services.incremental_audit_materializer import (
     MaterializationValidationError,
 )
 from app.services.incremental_audit_recovery import (
+    RecoveryRejected,
     requeue_model_transient_failures,
     release_model_recovery,
     resolve_exported_no_result,
