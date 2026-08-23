@@ -31,6 +31,10 @@ from app.services.recovery.validation import (
 
 
 
+# Precisely classified REMOTE_NOT_MATERIALIZED evidence plus the bare legacy
+# type name persisted before classification existed. The bare name is admitted
+# only because the zero-rows recovery re-derives the classification from a live
+# probe of the exact task before any durable state transition.
 ZERO_ROWS_PRIORITY_RECOVERY_DIAGNOSTICS = frozenset(
     REMOTE_NOT_MATERIALIZED_DIAGNOSTICS | {REMOTE_NOT_MATERIALIZED_LEGACY_DIAGNOSTIC}
 )

@@ -33,8 +33,9 @@ from app.services.recovery.validation import (
 
 WAIT_EXPORT_MANUAL_DIAGNOSTIC = "legacy wait-export-only requires manual review"
 # A capped wait that only proved the remote task is still executing strands the
-
-
+# job with the RUNNING diagnostic; the wait-export recovery exists exactly to
+# give such genuinely still-running remotes another bounded wait, so both
+# diagnostics it can itself persist stay admissible entry points.
 WAIT_EXPORT_STILL_RUNNING_DIAGNOSTIC = "legacy wait-export-only is still running"
 WAIT_EXPORT_RECOVERY_ACCEPTED_ERRORS = frozenset(
     {WAIT_EXPORT_MANUAL_DIAGNOSTIC, WAIT_EXPORT_STILL_RUNNING_DIAGNOSTIC}

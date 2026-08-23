@@ -215,8 +215,8 @@ def resolve_exported_no_result(
 
 
 # The only export-stage evidence that may legally end a crawl without a
-
-
+# workbook: the remote task finished and the export endpoint itself answered
+# with the exact no-price response and a zero count.
 EXPORT_NO_PRICE_RSP_DESC = "未检索到商品价格信息"
 EXPORT_NO_PRICE_TASK_FINISHED_DESC = "本次任务执行完毕"
 EXPORT_NO_PRICE_NO_RESULT_LIMIT = 10
