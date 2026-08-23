@@ -1460,7 +1460,10 @@ def test_harvest_nonzero_reuses_fresh_export_only_after_formal_validation(tmp_pa
     assert outcome.result_map["https://item.jd.com/a"]["page_price_value"] == 12.5
 
 
-def test_harvest_nonzero_without_result_keeps_manual_failure(tmp_path):
+def test_harvest_nonzero_without_result_keeps_running_for_retry(tmp_path):
+    # A child exit without any workbook is a transient execution failure
+    # against a confirmed remote identity; a bounded wait-export retry may
+    # still finish it, so it must not strand the job in manual review.
     job = _prepare(tmp_path)
     outcome = _adapter(
         runner=lambda args, _timeout, _env: subprocess.CompletedProcess(
@@ -1468,7 +1471,7 @@ def test_harvest_nonzero_without_result_keeps_manual_failure(tmp_path):
         )
     ).harvest(job, timeout_seconds=15)
 
-    assert outcome.status is HarvestStatus.MANUAL
+    assert outcome.status is HarvestStatus.RUNNING
 
 
 def test_harvest_nonzero_with_invalid_result_keeps_manual_failure(tmp_path):

@@ -156,6 +156,22 @@ def remote_not_materialized_diagnostic(exc: BaseException) -> str | None:
     return None
 
 
+def _deterministic_wait_export_startup_failure(exc: BaseException) -> bool:
+    """Deterministically missing local prerequisites stay manual.
+
+    A missing external tool or a missing required file cannot heal on a later
+    wait-export pass.  Any other startup failure (transient auth refresh,
+    pipe/spawn hiccup, exhausted command deadline) only proves this one
+    execution failed, so the exact remote identity keeps its bounded retry.
+    """
+    if isinstance(exc, FileNotFoundError):
+        return True
+    message = str(exc)
+    if message == "legacy Zhaoshang external tool is unavailable":
+        return True
+    return message.endswith("FileNotFoundError")
+
+
 class SubmitStatus(str, Enum):
     SUBMITTED = "SUBMITTED"
     SUBMIT_UNKNOWN = "SUBMIT_UNKNOWN"
@@ -2153,7 +2169,12 @@ class CnncLegacyZhaoshangAdapter:
 
     def harvest(self, job: PreparedLegacyJob, *, timeout_seconds: float) -> LegacyHarvestOutcome:
         if timeout_seconds <= 0:
-            return LegacyHarvestOutcome(HarvestStatus.FAILED, diagnostic="harvest timeout must be positive")
+            # Budget exhaustion is transient: the same exact remote identity
+            # stays harvestable and the next sweep retries the bounded wait.
+            return LegacyHarvestOutcome(
+                HarvestStatus.RUNNING,
+                diagnostic="legacy wait-export-only had no budget this pass",
+            )
         if job.result_path.exists():
             return self.harvest_existing(job)
 
@@ -2170,13 +2191,27 @@ class CnncLegacyZhaoshangAdapter:
             if validated is not None:
                 return validated
             return LegacyHarvestOutcome(HarvestStatus.RUNNING, diagnostic="legacy wait-export-only is still running")
-        except (OSError, LegacyPreSendFailure):
-            return LegacyHarvestOutcome(HarvestStatus.MANUAL, diagnostic="legacy wait-export-only could not be started")
+        except (OSError, LegacyPreSendFailure) as exc:
+            if _deterministic_wait_export_startup_failure(exc):
+                return LegacyHarvestOutcome(HarvestStatus.MANUAL, diagnostic="legacy wait-export-only could not be started")
+            # One failed execution against an already-confirmed remote task is
+            # transient; the retry only ever re-addresses the same identity.
+            return LegacyHarvestOutcome(
+                HarvestStatus.RUNNING,
+                diagnostic="legacy wait-export-only could not be started; retry scheduled on the same remote identity",
+            )
         if int(getattr(process, "returncode", -1)) != 0:
             validated = validated_export_after_runner_failure()
             if validated is not None:
                 return validated
-            return LegacyHarvestOutcome(HarvestStatus.MANUAL, diagnostic="legacy wait-export-only did not produce an export")
+            if job.result_path.is_file():
+                # The child failed AND left a workbook that does not validate:
+                # deterministic evidence, a rerun cannot fix it.
+                return LegacyHarvestOutcome(HarvestStatus.MANUAL, diagnostic="legacy wait-export-only did not produce an export")
+            return LegacyHarvestOutcome(
+                HarvestStatus.RUNNING,
+                diagnostic="legacy wait-export-only failed transiently; retry scheduled on the same remote identity",
+            )
         if not job.result_path.exists():
             return LegacyHarvestOutcome(HarvestStatus.RUNNING, diagnostic="legacy export is not available yet")
         return self.harvest_existing(job)
