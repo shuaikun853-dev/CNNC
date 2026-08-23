@@ -52,6 +52,68 @@ MIN_MATERIALIZE_SECONDS = 60.0
 # work done, so accumulating them across passes would overcount.
 _GAUGE_COUNTER_KEYS = {"crawl_running", "saas_count", "customer_count", "source_count_gap"}
 
+# Known-transient failure labels (from _safe_error's fixed vocabulary) keep
+# retrying until the long-operation deadline.  Known-deterministic labels fail
+# fast.  Anything else keeps the historical bounded stop — unknown exceptions
+# must never gain an unbounded retry loop.
+_RETRYABLE_CLOSEOUT_FAILURE_NAMES = frozenset(
+    {
+        "SnapshotFetchExhausted",
+        "SnapshotConsistencyDrift",
+        "TimeoutError",
+        "ConnectionError",
+        "URLError",
+        "InterfaceError",
+    }
+)
+_PERMANENT_CLOSEOUT_FAILURE_NAMES = frozenset(
+    {
+        "RuntimeConfigurationError",
+        "RemoteIntentConflict",
+        "FrozenSnapshotConflict",
+        "ArtifactConflictError",
+        "MaterializationValidationError",
+        "TemplateConflictError",
+        "PriorityEvidenceConflictError",
+        "SubmissionEvidenceConflictError",
+        "DatabaseError",
+        "IntegrityError",
+    }
+)
+_FAILED_PASS_BACKOFF_CAP_SECONDS = 300.0
+
+
+def _closeout_failure_class(summary: TickSummary) -> str:
+    """Classify one failed pass as ``retryable``, ``permanent`` or ``unknown``."""
+    if summary.outcome == "DISCOVERY_INCOMPLETE":
+        return "retryable"
+    error = str(summary.error or "").strip()
+    if error.startswith("HTTPError(status=") and error.endswith(")"):
+        try:
+            code = int(error[len("HTTPError(status=") : -1])
+        except ValueError:
+            return "unknown"
+        if code in {408, 429} or 500 <= code <= 599:
+            return "retryable"
+        return "permanent"
+    # _safe_error may append "(attempts=...,last_cause=...)" context; the
+    # leading type name is the stable classification key.
+    type_name = error.split("(", 1)[0].strip()
+    if error in _RETRYABLE_CLOSEOUT_FAILURE_NAMES or type_name in _RETRYABLE_CLOSEOUT_FAILURE_NAMES:
+        return "retryable"
+    if error in _PERMANENT_CLOSEOUT_FAILURE_NAMES or type_name in _PERMANENT_CLOSEOUT_FAILURE_NAMES:
+        return "permanent"
+    return "unknown"
+
+
+def _failed_pass_backoff_seconds(closeout: CloseoutConfig, consecutive_failed: int) -> float:
+    """Exponential spacing between retryable passes: 30s, 60s, 120s, 300s cap."""
+    if consecutive_failed <= 1:
+        return closeout.failed_pass_retry_seconds
+    if consecutive_failed <= 3:
+        return closeout.failed_pass_retry_seconds * (2 ** (consecutive_failed - 1))
+    return _FAILED_PASS_BACKOFF_CAP_SECONDS
+
 
 @dataclass(frozen=True)
 class CloseoutConfig:
@@ -189,13 +251,21 @@ def run_closeout(
         if summary.outcome == "ALREADY_FINALIZED":
             return merged("ALREADY_FINALIZED"), None, None, None
         if summary.outcome in {"FAILED", "DISCOVERY_INCOMPLETE"}:
+            failure_class = _closeout_failure_class(summary)
             consecutive_failed += 1
-            if (
+            if monotonic() >= long_op_deadline or failure_class == "permanent":
+                return merged(summary.outcome), None, None, None
+            if failure_class == "unknown" and (
                 consecutive_failed >= closeout.max_consecutive_failed_passes
-                or monotonic() >= long_op_deadline
             ):
                 return merged(summary.outcome), None, None, None
-            sleep(closeout.failed_pass_retry_seconds)
+            # Retryable failures spend the full remaining budget with a
+            # growing backoff; unknown failures keep the fixed historical wait.
+            sleep(
+                _failed_pass_backoff_seconds(closeout, consecutive_failed)
+                if failure_class == "retryable"
+                else closeout.failed_pass_retry_seconds
+            )
             continue
         consecutive_failed = 0
         if summary.frozen_snapshot_id is None:

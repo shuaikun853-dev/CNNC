@@ -5,6 +5,7 @@ import pytest
 
 from app.services.cnnc_saas_snapshot_adapter import (
     CnncSaasSnapshotAdapter,
+    SnapshotConsistencyDrift,
     SnapshotFetchExhausted,
     SnapshotFetchPolicy,
     snapshot_to_json_payloads,
@@ -286,9 +287,15 @@ def test_elapsed_budget_clamps_request_timeout_and_exhausts():
     ],
 )
 def test_count_changes_and_early_empty_pages_fail(events, error_text):
-    adapter, _opener = _adapter(events, policy=SnapshotFetchPolicy(page_size=1))
+    # Drift now voids the round and retries from page 1; the conditions must
+    # still end the fetch with a typed failure once every round drifts.
+    adapter, _opener = _adapter(
+        events * 3,
+        policy=SnapshotFetchPolicy(page_size=1),
+        monotonic=lambda: 0.0,
+    )
 
-    with pytest.raises(RuntimeError, match=error_text):
+    with pytest.raises(SnapshotConsistencyDrift, match=error_text):
         adapter.fetch()
 
 

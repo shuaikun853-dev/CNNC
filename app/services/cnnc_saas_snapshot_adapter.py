@@ -87,6 +87,24 @@ class SnapshotFetchExhausted(RuntimeError):
         )
 
 
+class SnapshotConsistencyDrift(RuntimeError):
+    """Pagination observed the authoritative source moving mid-fetch.
+
+    A drifting round (count change, empty page, overrun, underrun) proves the
+    rows collected so far belong to no single source state, so the entire
+    round is voided and pagination restarts from page 1 under the original
+    absolute deadline.
+    """
+
+    def __init__(self, side: str, reason: str) -> None:
+        self.side = side
+        self.reason = reason
+        super().__init__(f"{side} snapshot consistency drift: {reason}")
+
+
+SNAPSHOT_DRIFT_MAX_ROUNDS = 3
+
+
 class _RetryableSnapshotResponse(RuntimeError):
     pass
 
@@ -309,6 +327,25 @@ class CnncSaasSnapshotAdapter:
         deadline: float,
         started_at: float,
     ) -> tuple[tuple[dict[str, Any], ...], int, tuple[SnapshotPageEvidence, ...]]:
+        for attempt in range(1, SNAPSHOT_DRIFT_MAX_ROUNDS + 1):
+            try:
+                return self._fetch_side_round(side, config, base_body, deadline, started_at)
+            except SnapshotConsistencyDrift:
+                # A drifted round is void: nothing it collected may leak into
+                # an authoritative snapshot.  Restart from page 1 while every
+                # round still shares the same absolute deadline.
+                if attempt >= SNAPSHOT_DRIFT_MAX_ROUNDS or self._monotonic() >= deadline:
+                    raise
+        raise AssertionError("unreachable drift retry loop")
+
+    def _fetch_side_round(
+        self,
+        side: str,
+        config: Mapping[str, Any],
+        base_body: Mapping[str, Any],
+        deadline: float,
+        started_at: float,
+    ) -> tuple[tuple[dict[str, Any], ...], int, tuple[SnapshotPageEvidence, ...]]:
         rows: list[dict[str, Any]] = []
         evidence: list[SnapshotPageEvidence] = []
         expected_count: int | None = None
@@ -323,18 +360,18 @@ class CnncSaasSnapshotAdapter:
             if expected_count is None:
                 expected_count = count
             elif count != expected_count:
-                raise RuntimeError(f"{side} count changed during pagination")
+                raise SnapshotConsistencyDrift(side, "count changed during pagination")
             if not page_rows and len(rows) < count:
-                raise RuntimeError(f"{side} empty page before count")
+                raise SnapshotConsistencyDrift(side, "empty page before count")
             if len(rows) + len(page_rows) > count:
-                raise RuntimeError(f"{side} pagination overrun")
+                raise SnapshotConsistencyDrift(side, "pagination overrun")
             rows.extend(page_rows)
             evidence.append(SnapshotPageEvidence(side, page, len(page_rows), count))
             if len(rows) == count:
                 break
             page += 1
         if expected_count is None or len(rows) != expected_count:
-            raise RuntimeError(f"{side} pagination underrun")
+            raise SnapshotConsistencyDrift(side, "pagination underrun")
         return tuple(rows), expected_count, tuple(evidence)
 
     def fetch(
