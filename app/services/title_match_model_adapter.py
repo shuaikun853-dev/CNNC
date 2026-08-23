@@ -35,6 +35,16 @@ DEFAULT_MODEL_MAX_ATTEMPTS = 3
 DEFAULT_MODEL_MAX_ELAPSED_SECONDS = 300.0
 
 
+class ModelResponseContractError(ValueError):
+    """The model response violated the parseable output contract.
+
+    Covers a temporarily unparseable body, a broken ``choices`` structure, a
+    missing ``results`` array and missing batch indexes: provider-side drift
+    that a later call typically outgrows.  Business validation ``ValueError``
+    instances must not be typed as this, because those stay permanent.
+    """
+
+
 class ModelCallRetryExhaustedError(RuntimeError):
     """A retryable model operation exhausted its bounded retry policy."""
 
@@ -203,11 +213,28 @@ def _result_from_model_dict(data: dict, raw_response: str = "") -> TitleMatchMod
     return result
 
 
-def _parse_model_response(raw: str, sku_name: str) -> TitleMatchModelResult:
-    data = json.loads(raw)
-    if "choices" in data:
+def _decode_model_json(raw: object) -> dict:
+    try:
+        data = json.loads(raw)
+    except (json.JSONDecodeError, TypeError) as exc:
+        raise ModelResponseContractError("model response is not valid JSON") from exc
+    if not isinstance(data, dict):
+        raise ModelResponseContractError("model response must be a JSON object")
+    return data
+
+
+def _decode_model_choices(data: dict) -> dict:
+    try:
         content = data["choices"][0]["message"]["content"]
-        data = json.loads(content)
+    except (KeyError, IndexError, TypeError) as exc:
+        raise ModelResponseContractError("model response choices structure is incomplete") from exc
+    return _decode_model_json(content)
+
+
+def _parse_model_response(raw: str, sku_name: str) -> TitleMatchModelResult:
+    data = _decode_model_json(raw)
+    if "choices" in data:
+        data = _decode_model_choices(data)
     if "is_same" in data:
         return _result_from_binary_value(data.get("is_same"), raw)
     result = _result_from_model_dict(data, raw)
@@ -276,7 +303,17 @@ def _retryable_model_failure(exc: BaseException) -> bool:
         return exc.code in {408, 429} or 500 <= exc.code <= 599
     return isinstance(
         exc,
-        (error.URLError, TimeoutError, OSError, ValueError, KeyError, IndexError, TypeError, json.JSONDecodeError),
+        (
+            ModelResponseContractError,
+            error.URLError,
+            TimeoutError,
+            OSError,
+            ValueError,
+            KeyError,
+            IndexError,
+            TypeError,
+            json.JSONDecodeError,
+        ),
     )
 
 
@@ -377,13 +414,12 @@ def _build_batch_prompt(requests: list[TitleMatchModelRequest]) -> str:
 
 
 def _parse_batch_model_response(raw: str, expected_count: int) -> dict[int, TitleMatchModelResult]:
-    data = json.loads(raw)
+    data = _decode_model_json(raw)
     if "choices" in data:
-        content = data["choices"][0]["message"]["content"]
-        data = json.loads(content)
+        data = _decode_model_choices(data)
     rows = data.get("results")
     if not isinstance(rows, list):
-        raise ValueError("批量模型响应缺少 results 数组")
+        raise ModelResponseContractError("批量模型响应缺少 results 数组")
 
     parsed: dict[int, TitleMatchModelResult] = {}
     for row in rows:
@@ -486,7 +522,7 @@ def call_title_match_model_batch(
         parsed = _parse_batch_model_response(raw, len(requests))
         missing_indexes = [index for index in range(len(requests)) if index not in parsed]
         if missing_indexes:
-            raise ValueError(f"批量模型响应缺少结果 indexes={missing_indexes}")
+            raise ModelResponseContractError(f"批量模型响应缺少结果 indexes={missing_indexes}")
         return parsed
 
     return _retry_model_call(

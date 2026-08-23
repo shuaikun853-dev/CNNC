@@ -14,13 +14,16 @@ import json
 import math
 import time
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any, Callable, Mapping, Sequence
 from urllib import error
 
 from app.services.daily_audit_store import DailyAuditStore, LeaseToken, LeaseUnavailable, ProcessLock
 from app.services.saas_audit_core import crawl_fingerprint, detail_fingerprint, model_fingerprint
-from app.services.title_match_model_adapter import ModelCallRetryExhaustedError
+from app.services.title_match_model_adapter import (
+    ModelCallRetryExhaustedError,
+    ModelResponseContractError,
+)
 
 
 class SubmitNotAttemptedError(RuntimeError):
@@ -43,9 +46,12 @@ class TickConfig:
     detail_max_attempts: int = 3
     detail_max_elapsed_seconds: float = 300
     # The adapter performs its bounded HTTP retries inside one durable claim.
-    # A second claim exists only so an uncatchable process crash can replay.
-    model_max_attempts: int = 2
-    model_max_elapsed_seconds: float = 300
+    # The durable replay window spans several scheduler passes so a short
+    # provider outage (transport error or model-response contract drift)
+    # stays recoverable; claims are spaced by an exponential backoff derived
+    # from the durable failure timestamp.
+    model_max_attempts: int = 8
+    model_max_elapsed_seconds: float = 900
     model_batch_size: int = 10
     external_timeout_seconds: float = 60
     snapshot_discovery_timeout_seconds: float = 180
@@ -486,6 +492,8 @@ def _stage(
     *,
     retry_caught_errors: bool = True,
     retry_classifier: Callable[[BaseException], bool] | None = None,
+    retry_backoff: bool = False,
+    wall_clock: Callable[[], datetime] | None = None,
 ) -> bool:
     if not budget.can_start_heavy():
         return False
@@ -496,6 +504,10 @@ def _stage(
     if work["state"] == "SUCCESS":
         return True
     if callback is None or not budget.can_start_heavy():
+        return False
+    if retry_backoff and _durable_retry_backoff_blocks_claim(
+        work, wall_clock or (lambda: datetime.now(UTC))
+    ):
         return False
     claimed = store.claim_stage_work(token, int(work["id"]), max_attempts=max_attempts, max_elapsed_seconds=max_elapsed_seconds)
     if claimed is None:
@@ -533,18 +545,53 @@ def _stage(
 
 
 def _is_retryable_model_failure(exc: BaseException) -> bool:
-    """Classify only transport/infrastructure model failures as retryable."""
+    """Classify transport/infrastructure and response-contract failures as retryable."""
     cause: BaseException = exc
     if isinstance(exc, ModelCallRetryExhaustedError):
         if not isinstance(exc.last_cause, BaseException):
             return False
         cause = exc.last_cause
+    if isinstance(cause, ModelResponseContractError):
+        return True
     if isinstance(cause, error.HTTPError):
         return cause.code in {408, 429} or 500 <= cause.code <= 599
     if isinstance(cause, error.URLError):
         reason = cause.reason
         return isinstance(reason, (TimeoutError, ConnectionError))
     return isinstance(cause, (TimeoutError, ConnectionError))
+
+
+def _model_retry_backoff_seconds(attempts: int) -> float:
+    """Exponential durable-attempt spacing: 60s, 120s, 240s, capped at 300s."""
+    if attempts <= 0:
+        return 0.0
+    return min(60.0 * (2 ** (attempts - 1)), 300.0)
+
+
+def _durable_retry_backoff_blocks_claim(
+    work: Mapping[str, Any], wall_clock: Callable[[], datetime]
+) -> bool:
+    """True while a RETRYABLE_FAILED stage row is still inside its backoff window.
+
+    The due time is derived entirely from durable state (``updated_at`` plus a
+    schedule over ``attempts``), so the spacing survives process restarts and
+    needs no schema change.  A wall clock behind the durable failure timestamp
+    proves no trustworthy elapsed time; the row stays immediately claimable so
+    offline fixed-clock contracts keep their historic behaviour.
+    """
+    if str(work["state"]) != "RETRYABLE_FAILED":
+        return False
+    attempts = int(work["attempts"])
+    if attempts <= 0:
+        return False
+    try:
+        failed_at = datetime.fromisoformat(str(work["updated_at"]))
+    except (TypeError, ValueError):
+        return False
+    now = wall_clock().astimezone(UTC)
+    if now < failed_at:
+        return False
+    return now < failed_at + timedelta(seconds=_model_retry_backoff_seconds(attempts))
 
 
 def _model_items_with_retry_backlog(
@@ -578,6 +625,7 @@ def _stage_model_batches(
     callback: Callable[[Sequence[Mapping[str, Any]], float], Mapping[int, Any]],
     budget: TickBudget,
     counters: dict[str, int],
+    wall_clock: Callable[[], datetime] | None = None,
 ) -> None:
     """Claim/reuse durable MODEL work and make at most one HTTP call per batch."""
     grouped: dict[str, list[tuple[Mapping[str, Any], Mapping[str, Any]]]] = {}
@@ -604,6 +652,10 @@ def _stage_model_batches(
             for item, work in group:
                 if not budget.can_start_heavy():
                     break
+                if _durable_retry_backoff_blocks_claim(
+                    work, wall_clock or (lambda: datetime.now(UTC))
+                ):
+                    continue
                 current = store.claim_stage_work(
                     token, int(work["id"]), max_attempts=config.model_max_attempts,
                     max_elapsed_seconds=config.model_max_elapsed_seconds,
@@ -1225,7 +1277,7 @@ def run_incremental_tick(
         trace.append("model")
         model_items = _model_items_with_retry_backlog(store, token, items)
         if deps.model_batch is not None:
-            _stage_model_batches(store, token, model_items, config, deps.model_batch, budget, counters)
+            _stage_model_batches(store, token, model_items, config, deps.model_batch, budget, counters, deps.wall_clock)
         else:
             for item in model_items:
                 if not budget.can_start_heavy():
@@ -1235,6 +1287,8 @@ def run_incremental_tick(
                     model_fingerprint(item["row"], config.model_name, config.model_prompt_version, config.model_schema_version),
                     deps.model, budget, config.external_timeout_seconds, config.model_max_attempts, config.model_max_elapsed_seconds, counters,
                     retry_classifier=_is_retryable_model_failure,
+                    retry_backoff=True,
+                    wall_clock=deps.wall_clock,
                 )
         trace.append("submit")
         if budget.can_start_heavy():
