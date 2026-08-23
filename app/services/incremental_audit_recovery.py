@@ -21,13 +21,11 @@ from app.services.legacy_zhaoshang_adapter import (
     is_retryable_priority_error_diagnostic,
 )
 from app.services.saas_audit_core import model_fingerprint
-
-
-class RecoveryRejected(RuntimeError):
-    """The requested recovery does not exactly match recoverable durable state."""
-
-
-BackendIdentity = tuple[str, str, str, str]
+from app.services.recovery.common import (
+    BackendIdentity,
+    RecoveryRejected,
+    _acquire_recovery_lease,
+)
 
 
 def validate_linked_crawls_against_remote_payload(
@@ -140,27 +138,6 @@ def _safe_error(exc: BaseException) -> str:
         cause = type(last_cause).__name__ if isinstance(last_cause, BaseException) else "deadline"
         return f"{type(exc).__name__}(attempts={attempts},last_cause={cause})"
     return type(exc).__name__
-
-
-def _acquire_recovery_lease(
-    store: DailyAuditStore,
-    process_lock: ProcessLock,
-    business_date: str,
-    owner: str,
-    ttl_seconds: float,
-) -> LeaseToken:
-    process_lock.acquire()
-    try:
-        return store.acquire_lease(
-            business_date,
-            owner,
-            ttl_seconds,
-            allow_unexpired_takeover=True,
-            process_lock=process_lock,
-        )
-    except BaseException:
-        process_lock.release()
-        raise
 
 
 def requeue_model_transient_failures(
