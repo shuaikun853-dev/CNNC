@@ -7,7 +7,8 @@ import hashlib
 import json
 import os
 import uuid
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
+from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Mapping
@@ -46,6 +47,19 @@ class FinalizeReadiness:
     remote_pending: int = 0
     remote_manual: int = 0
     remote_invalid: int = 0
+    # Additive force-finalize decomposition of the pending counts above.  The
+    # coarse counters keep their exact ordinary-finalize meaning; these buckets
+    # split the same rows/jobs by whether the work is an already-submitted
+    # Zhaoshang long tail or something force-finalize must still refuse.
+    crawl_awaiting_remote: int = 0
+    crawl_submit_unknown: int = 0
+    crawl_pending_waiting_submit: int = 0
+    crawl_pending_awaiting_priority: int = 0
+    crawl_pending_blocked: int = 0
+    remote_awaiting_remote: int = 0
+    remote_intent: int = 0
+    remote_submit_unknown: int = 0
+    remote_priority_pending: int = 0
 
     @property
     def ready(self) -> bool:
@@ -114,6 +128,62 @@ def is_recoverable_finalize_wait(readiness: FinalizeReadiness | None) -> bool:
         readiness.remote_invalid,
     ))
     return has_pending and not has_actionable_blocker
+
+
+# Crawl rows in any of these states keep the ordinary coarse crawl_pending
+# count; force-finalize further splits them into tolerable vs intolerable.
+CRAWL_PENDING_STATES = frozenset({
+    "PENDING",
+    "PRIORITY_PENDING",
+    "SUBMITTED",
+    "RUNNING",
+    "EXPORTED",
+    "RETRYABLE_FAILED",
+    "SUBMIT_UNKNOWN",
+})
+# Remote jobs already submitted to Zhaoshang and still awaiting execution or
+# harvest.  These are the only blockers force-finalize may give up waiting on.
+INFLIGHT_REMOTE_STATES = frozenset({"SUBMITTED", "RUNNING", "EXPORTED"})
+UNSUBMITTED_REMOTE_STATES = frozenset({"SUBMIT_INTENT", "SUBMIT_UNKNOWN", "PRIORITY_PENDING"})
+
+FORCE_FINALIZE_REASON = "operator accepted limited remote crawl incompleteness"
+FORCE_FINALIZE_INCOMPLETE_TASKS_KEY = "force_finalize_incomplete_tasks"
+
+# Readiness buckets that force-finalize must never tolerate.  Detail/Model
+# evidence, unplanned or invalid crawl work, unknown submission outcomes,
+# manual/terminal states, and not-yet-submitted intent all stay blocking.
+NON_TOLERABLE_BLOCKERS = (
+    "detail_pending",
+    "detail_terminal",
+    "model_pending",
+    "model_terminal",
+    "crawl_terminal",
+    "crawl_unplanned",
+    "crawl_invalid_price",
+    "crawl_submit_unknown",
+    "crawl_pending_waiting_submit",
+    "crawl_pending_awaiting_priority",
+    "crawl_pending_blocked",
+    "remote_invalid",
+    "remote_manual",
+    "remote_intent",
+    "remote_submit_unknown",
+    "remote_priority_pending",
+)
+
+
+def _crawl_awaiting_remote(
+    crawl: Mapping[str, Any],
+    remote_jobs: Mapping[int, Mapping[str, Any]],
+) -> bool:
+    """True when this crawl row is bound to an in-flight Zhaoshang task."""
+    state = normalize_cell_str(crawl.get("state"))
+    if state in INFLIGHT_REMOTE_STATES:
+        return True
+    if state in {"PENDING", "PRIORITY_PENDING", "RETRYABLE_FAILED"}:
+        job = remote_jobs.get(int(crawl.get("remote_job_id") or 0))
+        return bool(job is not None and normalize_cell_str(job.get("state")) in INFLIGHT_REMOTE_STATES)
+    return False
 
 
 def _decode_json(value: object, expected: type, field: str) -> Any:
@@ -260,6 +330,7 @@ def build_frozen_audit_artifact(
     *,
     output_identity: str,
     review_mode: bool = False,
+    tolerate_pending: bool = False,
 ) -> FrozenArtifactBuild:
     run = store.get_run(token.business_date)
     if run is None or int(run["id"]) != token.run_id or run["frozen_snapshot_id"] is None:
@@ -298,6 +369,15 @@ def build_frozen_audit_artifact(
         "remote_pending": 0,
         "remote_manual": 0,
         "remote_invalid": 0,
+        "crawl_awaiting_remote": 0,
+        "crawl_submit_unknown": 0,
+        "crawl_pending_waiting_submit": 0,
+        "crawl_pending_awaiting_priority": 0,
+        "crawl_pending_blocked": 0,
+        "remote_awaiting_remote": 0,
+        "remote_intent": 0,
+        "remote_submit_unknown": 0,
+        "remote_priority_pending": 0,
     }
     relevant_remote_job_ids: set[int] = set()
     rows: list[dict[str, Any]] = []
@@ -389,8 +469,27 @@ def build_frozen_audit_artifact(
             if not crawl_candidates:
                 counts["crawl_unplanned"] += 1
                 review_reason = "required crawl identity has no durable crawl work"
-            elif any(crawl["state"] in {"PENDING", "PRIORITY_PENDING", "SUBMITTED", "RUNNING", "EXPORTED", "RETRYABLE_FAILED", "SUBMIT_UNKNOWN"} for crawl in crawl_candidates):
+            elif any(crawl["state"] in CRAWL_PENDING_STATES for crawl in crawl_candidates):
                 counts["crawl_pending"] += 1
+                pending_candidates = [
+                    crawl for crawl in crawl_candidates if crawl["state"] in CRAWL_PENDING_STATES
+                ]
+                if any(crawl["state"] == "SUBMIT_UNKNOWN" for crawl in pending_candidates):
+                    counts["crawl_submit_unknown"] += 1
+                elif all(_crawl_awaiting_remote(crawl, remote_jobs) for crawl in pending_candidates):
+                    counts["crawl_awaiting_remote"] += 1
+                elif all(crawl.get("remote_job_id") is None for crawl in pending_candidates):
+                    counts["crawl_pending_waiting_submit"] += 1
+                elif all(
+                    normalize_cell_str(
+                        (remote_jobs.get(int(crawl.get("remote_job_id") or 0)) or {}).get("state")
+                    )
+                    in UNSUBMITTED_REMOTE_STATES
+                    for crawl in pending_candidates
+                ):
+                    counts["crawl_pending_awaiting_priority"] += 1
+                else:
+                    counts["crawl_pending_blocked"] += 1
                 review_reason = normalize_cell_str(review_selected.get("error_text")) if review_selected else ""
             else:
                 counts["crawl_terminal"] += 1
@@ -453,13 +552,21 @@ def build_frozen_audit_artifact(
             continue
         if state in pending_remote_states:
             counts["remote_pending"] += 1
+            if state == "SUBMIT_INTENT":
+                counts["remote_intent"] += 1
+            elif state == "SUBMIT_UNKNOWN":
+                counts["remote_submit_unknown"] += 1
+            elif state == "PRIORITY_PENDING":
+                counts["remote_priority_pending"] += 1
+            else:
+                counts["remote_awaiting_remote"] += 1
         elif state == "MANUAL_REQUIRED":
             counts["remote_manual"] += 1
         else:
             counts["remote_invalid"] += 1
 
     readiness = FinalizeReadiness(**counts)
-    if not readiness.ready and not review_mode:
+    if not readiness.ready and not review_mode and not tolerate_pending:
         return FrozenArtifactBuild(readiness, None)
     if review_mode and (
         readiness.detail_pending
@@ -721,6 +828,238 @@ def materialize_frozen_daily_run(
         store.mark_finalized(token, str(resolved_output), result.manifest_sha256)
         store.update_daily_metrics(token, {"finalized_rows": result.row_count})
         return FinalizePublication(built.readiness, result)
+    finally:
+        if token is not None:
+            store.release_lease(token)
+        process_lock.release()
+
+
+class ForceFinalizeRejected(RuntimeError):
+    """A guarded refusal to force-finalize; never retries or mutates state."""
+
+    def __init__(
+        self,
+        error_type: str,
+        message: str,
+        readiness: FinalizeReadiness | None = None,
+    ) -> None:
+        self.error_type = error_type
+        self.readiness = readiness
+        super().__init__(f"{error_type}: {message}")
+
+
+@dataclass(frozen=True)
+class ForceFinalizePublication:
+    readiness: FinalizeReadiness
+    materialization: MaterializationResult | None
+    forced_incomplete_count: int
+    incomplete_tasks: tuple[Mapping[str, Any], ...]
+    already_finalized: bool
+    frozen_snapshot_id: int | None
+    output_path: Path | None
+    forced: bool
+
+
+def _run_metrics(run: Mapping[str, Any]) -> dict[str, Any]:
+    try:
+        decoded = json.loads(str(run.get("metrics_json") or "{}"))
+    except (TypeError, ValueError):
+        return {}
+    return decoded if isinstance(decoded, dict) else {}
+
+
+def _parse_remote_identity(identity: object) -> tuple[str | None, str | None]:
+    parts = [normalize_cell_str(part) for part in str(identity or "").split("|")]
+    if len(parts) == 3 and all(parts):
+        return parts[1], parts[2]
+    return None, None
+
+
+def _collect_incomplete_tasks(store: DailyAuditStore, token: LeaseToken) -> tuple[dict[str, Any], ...]:
+    """Describe the in-flight Zhaoshang tasks force-finalize gives up waiting on.
+
+    Only durable evidence is recorded; nothing here mutates remote or crawl
+    state, cancels remote work, or fabricates results.
+    """
+    inflight_jobs = store.list_remote_jobs(token, states=set(INFLIGHT_REMOTE_STATES))
+    if not inflight_jobs:
+        return ()
+    unfinished_crawls: dict[int, list[Mapping[str, Any]]] = {}
+    for crawl in store.list_crawl_work(token):
+        if crawl.get("remote_job_id") is None:
+            continue
+        if normalize_cell_str(crawl.get("state")) in {"SUCCESS", "NO_RESULT", "TERMINAL_FAILED"}:
+            continue
+        unfinished_crawls.setdefault(int(crawl["remote_job_id"]), []).append(crawl)
+    tasks: list[dict[str, Any]] = []
+    for job in inflight_jobs:
+        items = unfinished_crawls.get(int(job["id"]), [])
+        if not items:
+            continue
+        try:
+            payload = json.loads(str(job.get("payload_json") or ""))
+        except (TypeError, ValueError):
+            payload = None
+        task_id, task_number = _parse_remote_identity(job.get("remote_identity"))
+        tasks.append(
+            {
+                "remote_job_id": int(job["id"]),
+                "logical_key": job.get("logical_key"),
+                "task_name": job.get("task_name"),
+                "mall_code": job.get("mall_key"),
+                "task_id": task_id,
+                "task_number": task_number,
+                "remote_identity": job.get("remote_identity"),
+                "remote_state": job.get("state"),
+                "error_text": job.get("error_text"),
+                "expected_subtask_count": len(payload) if isinstance(payload, list) else None,
+                "crawl_item_count": len(items),
+                "crawl_items": [
+                    {
+                        "crawl_work_id": int(crawl["id"]),
+                        "source_id": crawl.get("source_id"),
+                        "sku_id": crawl.get("sku_id"),
+                        "exact_url": crawl.get("exact_url"),
+                        "mall_code": crawl.get("mall_key"),
+                        "crawl_state": crawl.get("state"),
+                    }
+                    for crawl in items
+                ],
+            }
+        )
+    return tuple(tasks)
+
+
+def _already_finalized_publication(run: Mapping[str, Any]) -> ForceFinalizePublication:
+    metrics = _run_metrics(run)
+    return ForceFinalizePublication(
+        readiness=FinalizeReadiness(),
+        materialization=None,
+        forced_incomplete_count=int(metrics.get("forced_incomplete_count", 0) or 0),
+        incomplete_tasks=(),
+        already_finalized=True,
+        frozen_snapshot_id=int(run["frozen_snapshot_id"]) if run.get("frozen_snapshot_id") is not None else None,
+        output_path=Path(str(run["final_output_path"])) if run.get("final_output_path") else None,
+        forced=bool(metrics.get("force_finalize", False)),
+    )
+
+
+def materialize_forced_frozen_daily_run(
+    store: DailyAuditStore,
+    process_lock: ProcessLock,
+    business_date: str,
+    output_path: Path | str,
+    *,
+    max_incomplete: int = 10,
+    materializer: LegacyWorkbookMaterializer | None = None,
+) -> ForceFinalizePublication:
+    """Publish the formal final workbook while tolerating bounded remote long tail.
+
+    Preconditions: the day must already be frozen, no production writer may be
+    active, and every remaining blocker must be an already-submitted Zhaoshang
+    crawl/remote item within ``max_incomplete``.  Rows without crawl results
+    keep the existing writer "no result" semantics; nothing is fabricated, and
+    the durable remote state survives untouched as history.
+    """
+    if max_incomplete < 0:
+        raise ValueError("max_incomplete must be zero or positive")
+    resolved_output = Path(output_path).resolve()
+    run = store.get_run(business_date)
+    if run is None or run.get("frozen_snapshot_id") is None:
+        raise ForceFinalizeRejected(
+            "FORCE_FINALIZE_NOT_FROZEN",
+            "daily run has no frozen authoritative snapshot; freeze first",
+        )
+    if run["state"] == "FINALIZED":
+        return _already_finalized_publication(run)
+    try:
+        process_lock.acquire()
+    except LeaseUnavailable as exc:
+        raise ForceFinalizeRejected(
+            "FORCE_FINALIZE_PRODUCTION_WRITER_ACTIVE",
+            "another tick/closeout/finalize owns the production writer lock",
+        ) from exc
+    token: LeaseToken | None = None
+    try:
+        run = store.get_run(business_date)
+        if run is None or run.get("frozen_snapshot_id") is None:
+            raise ForceFinalizeRejected(
+                "FORCE_FINALIZE_NOT_FROZEN",
+                "daily run has no frozen authoritative snapshot; freeze first",
+            )
+        if run["state"] == "FINALIZED":
+            return _already_finalized_publication(run)
+        token = store.acquire_lease(
+            business_date,
+            f"force-finalize-{os.getpid()}",
+            ttl_seconds=600,
+            allow_unexpired_takeover=True,
+            process_lock=process_lock,
+        )
+        built = build_frozen_audit_artifact(
+            store,
+            token,
+            output_identity=f"daily-final-{business_date.replace('-', '')}",
+            tolerate_pending=True,
+        )
+        readiness = built.readiness
+        if built.artifact is None:
+            raise ForceFinalizeRejected(
+                "FORCE_FINALIZE_BLOCKED",
+                "frozen artifact could not be built",
+                readiness,
+            )
+        blockers = {
+            name: getattr(readiness, name)
+            for name in NON_TOLERABLE_BLOCKERS
+            if getattr(readiness, name)
+        }
+        if blockers:
+            rendered = ", ".join(f"{name}={value}" for name, value in sorted(blockers.items()))
+            raise ForceFinalizeRejected(
+                "FORCE_FINALIZE_BLOCKED",
+                f"non-tolerable blockers remain: {rendered}",
+                readiness,
+            )
+        tolerable = readiness.crawl_awaiting_remote + readiness.remote_awaiting_remote
+        if tolerable > max_incomplete:
+            raise ForceFinalizeRejected(
+                "FORCE_FINALIZE_INCOMPLETE_LIMIT_EXCEEDED",
+                f"tolerable incomplete {tolerable} exceeds max_incomplete {max_incomplete}",
+                readiness,
+            )
+        incomplete_tasks = _collect_incomplete_tasks(store, token)
+        publisher = materializer or LegacyWorkbookMaterializer()
+        store.prepare_finalization(token, str(resolved_output))
+        result = publisher.materialize(built.artifact, resolved_output)
+        store.mark_finalized(token, str(resolved_output), result.manifest_sha256)
+        store.update_daily_metrics(
+            token,
+            {
+                "finalized_rows": result.row_count,
+                "forced": True,
+                "forced_incomplete_count": tolerable,
+                "force_finalize": True,
+                "force_finalize_at": datetime.now(UTC).isoformat(timespec="seconds"),
+                "force_finalize_max_incomplete": max_incomplete,
+                "force_finalize_actual_incomplete": tolerable,
+                "force_finalize_reason": FORCE_FINALIZE_REASON,
+                "frozen_snapshot_id": int(run["frozen_snapshot_id"]),
+                "frozen_row_count": readiness.frozen_rows,
+                "blocker_summary_at_force_finalize": asdict(readiness),
+                FORCE_FINALIZE_INCOMPLETE_TASKS_KEY: [dict(task) for task in incomplete_tasks],
+            },
+        )
+        return ForceFinalizePublication(
+            readiness=readiness,
+            materialization=result,
+            forced_incomplete_count=tolerable,
+            incomplete_tasks=incomplete_tasks,
+            already_finalized=False,
+            frozen_snapshot_id=int(run["frozen_snapshot_id"]),
+            output_path=result.output_path,
+            forced=True,
+        )
     finally:
         if token is not None:
             store.release_lease(token)

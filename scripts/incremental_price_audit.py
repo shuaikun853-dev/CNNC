@@ -16,6 +16,7 @@ from app.services.incremental_audit_runtime import (
     DEFAULT_RUNTIME_ROOT,
     business_date_in_shanghai,
     run_existing_remote_harvest_command,
+    run_force_finalize_command,
     run_model_recovery_command,
     run_no_result_recovery_command,
     run_partial_exact_harvest_recovery_command,
@@ -251,6 +252,19 @@ def build_parser() -> argparse.ArgumentParser:
     export_review = subparsers.add_parser("export-review")
     _add_common_arguments(export_review, allow_remote_writes=False)
     export_review.add_argument("--output-path", type=Path)
+    force_finalize = subparsers.add_parser("force-finalize")
+    _add_common_arguments(force_finalize, allow_remote_writes=False)
+    force_finalize.add_argument(
+        "--max-incomplete",
+        type=int,
+        default=10,
+        help="maximum tolerated count of already-submitted Zhaoshang crawl/remote long-tail blockers",
+    )
+    force_finalize.add_argument(
+        "--output",
+        type=Path,
+        help="formal output path; defaults to the day's reserved final workbook path",
+    )
     return parser
 
 
@@ -303,6 +317,15 @@ def main(argv: list[str] | None = None) -> int:
             return 2
         print(json.dumps(review, ensure_ascii=False, sort_keys=True))
         return 0
+    if args.command == "force-finalize":
+        result = run_force_finalize_command(
+            business_date=business_date,
+            runtime_root=args.runtime_root,
+            max_incomplete=args.max_incomplete,
+            output_path=args.output,
+        )
+        print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+        return 0 if result.get("outcome") in {"FORCE_FINALIZED", "ALREADY_FINALIZED"} else 2
     if args.command in {
         "recover-model",
         "requeue-model-transient",

@@ -88,14 +88,17 @@ from app.workflows.incremental_price_audit import (
     run_incremental_tick,
 )
 from app.workflows.incremental_price_audit_finalize import (
+    NON_TOLERABLE_BLOCKERS,
     FinalizeAlreadyRunning,
     FinalizeBlocked,
     FinalizePublication,
     FinalizeReadiness,
+    ForceFinalizeRejected,
     ReviewPublication,
     is_recoverable_finalize_wait,
     materialize_frozen_daily_run,
     materialize_frozen_review,
+    materialize_forced_frozen_daily_run,
 )
 from scripts.audit_saas_excel_file import call_detail_api
 from scripts.auth_manager import AuthManager
@@ -604,6 +607,87 @@ def run_review_export_command(
         "row_count": publication.row_count,
         "manual_count": publication.manual_count,
         "sha256": publication.sha256,
+        "remote_calls": 0,
+        "add_calls": 0,
+    }
+    _record_recovery_event(paths, result)
+    return result
+
+
+def run_force_finalize_command(
+    *,
+    business_date: str,
+    runtime_root: Path | str,
+    max_incomplete: int = 10,
+    output_path: Path | str | None = None,
+) -> dict[str, Any]:
+    """Guarded force-finalize: publish the formal final despite remote long tail.
+
+    The command never creates or cancels remote tasks and makes no network
+    calls; it only reads durable state, reuses the formal final writer, and
+    records the force audit metadata on the daily run.
+    """
+    paths = runtime_paths(business_date, runtime_root)
+    resolved_output = (
+        Path(output_path) if output_path is not None else paths.final_output_path
+    )
+    if not paths.state_path.is_file():
+        return {
+            "outcome": "FORCE_FINALIZE_NOT_FROZEN",
+            "error_type": "FORCE_FINALIZE_NOT_FROZEN",
+            "business_date": business_date,
+            "output_path": str(resolved_output.resolve()),
+            "finalized": False,
+        }
+    store = DailyAuditStore(paths.state_path)
+    try:
+        publication = materialize_forced_frozen_daily_run(
+            store,
+            ProcessLock(paths.lock_path),
+            business_date,
+            resolved_output,
+            max_incomplete=max_incomplete,
+        )
+    except ForceFinalizeRejected as exc:
+        blockers: dict[str, int] = {}
+        if exc.readiness is not None:
+            for name in (*NON_TOLERABLE_BLOCKERS, "crawl_awaiting_remote", "remote_awaiting_remote"):
+                value = int(getattr(exc.readiness, name))
+                if value:
+                    blockers[name] = value
+        return {
+            "outcome": exc.error_type,
+            "error_type": exc.error_type,
+            "business_date": business_date,
+            "output_path": str(resolved_output.resolve()),
+            "max_incomplete": max_incomplete,
+            "blockers": blockers,
+            "finalized": False,
+        }
+    if publication.already_finalized:
+        return {
+            "outcome": "ALREADY_FINALIZED",
+            "business_date": business_date,
+            "frozen_snapshot_id": publication.frozen_snapshot_id,
+            "forced_incomplete_count": publication.forced_incomplete_count,
+            "max_incomplete": max_incomplete,
+            "output_path": str(publication.output_path) if publication.output_path is not None else str(resolved_output.resolve()),
+            "forced": publication.forced,
+            "manifest_recorded": True,
+            "finalized": True,
+        }
+    materialization = publication.materialization
+    assert materialization is not None
+    result = {
+        "outcome": "FORCE_FINALIZED",
+        "business_date": business_date,
+        "frozen_snapshot_id": publication.frozen_snapshot_id,
+        "frozen_row_count": publication.readiness.frozen_rows,
+        "forced_incomplete_count": publication.forced_incomplete_count,
+        "max_incomplete": max_incomplete,
+        "output_path": str(materialization.output_path),
+        "manifest_recorded": True,
+        "finalized": True,
         "remote_calls": 0,
         "add_calls": 0,
     }
