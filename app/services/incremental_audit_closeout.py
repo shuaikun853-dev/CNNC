@@ -260,12 +260,17 @@ def run_closeout(
             ):
                 return merged(summary.outcome), None, None, None
             # Retryable failures spend the full remaining budget with a
-            # growing backoff; unknown failures keep the fixed historical wait.
-            sleep(
+            # growing backoff; unknown failures keep the fixed historical
+            # wait.  Either wait is clamped to the long-operation deadline so
+            # the loop can never sleep into the final materialization reserve
+            # and exits on its own clock instead of relying on a scheduler
+            # hard kill.
+            wait_seconds = (
                 _failed_pass_backoff_seconds(closeout, consecutive_failed)
                 if failure_class == "retryable"
                 else closeout.failed_pass_retry_seconds
             )
+            sleep(min(wait_seconds, max(0.0, long_op_deadline - monotonic())))
             continue
         consecutive_failed = 0
         if summary.frozen_snapshot_id is None:

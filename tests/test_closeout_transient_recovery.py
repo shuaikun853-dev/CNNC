@@ -101,13 +101,14 @@ class _Harness:
             cutoff_at=CUTOFF,
             source_stability_seconds=0.0,
         )
-        closeout = CloseoutConfig(
-            wall_budget_seconds=250,
-            source_observation_interval_seconds=10,
-            remote_sweep_interval_seconds=10,
-            final_materialize_reserve_seconds=30,
-            **closeout_overrides,
-        )
+        values = {
+            "wall_budget_seconds": 250,
+            "source_observation_interval_seconds": 10,
+            "remote_sweep_interval_seconds": 10,
+            "final_materialize_reserve_seconds": 30,
+        }
+        values.update(closeout_overrides)
+        closeout = CloseoutConfig(**values)
 
         def materialize(store, lock, business_date, output_path):
             self.materialize_calls.append(business_date)
@@ -198,7 +199,44 @@ def test_retryable_failures_use_the_full_remaining_budget(tmp_path):
     assert len(calls) == 4
     assert summary.outcome == "CLOSEOUT_DEADLINE"
     assert publication is None
-    assert harness.clock.sleeps[:4] == [30.0, 60.0, 120.0, 300.0]
+    assert harness.clock.sleeps[:4] == [30.0, 60.0, 120.0, 10.0]
+    # The final wait is clamped to the deadline instead of sleeping 300s
+    # past it: the process exits on its own clock, never past the wall
+    # budget, without relying on a scheduler hard kill.
+    assert harness.clock.now == 1000 + 220
+
+
+def test_backoff_never_sleeps_past_the_long_op_deadline(tmp_path):
+    """A 300s backoff with 10s left must sleep 10s, not 300s.
+
+    wall budget 977s with a 60s reserve puts the long-operation deadline at
+    917s.  With failed_pass_retry_seconds=1 and 1s observation/sweep pacing
+    the backoff schedule is exactly 1/2/4/300..., so the seventh failed pass
+    lands at t=907 with a scheduled 300s backoff and exactly 10s of budget
+    left.
+    """
+    calls: list[int] = []
+
+    def discover(_timeout):
+        calls.append(len(calls))
+        raise SnapshotFetchExhausted("saas", 1, 3, 5.0, TimeoutError("still down"))
+
+    harness = _Harness(tmp_path, discover)
+    summary, publication, _blocked, _error = harness.run(
+        wall_budget_seconds=977,
+        source_observation_interval_seconds=1,
+        remote_sweep_interval_seconds=1,
+        final_materialize_reserve_seconds=60,
+        failed_pass_retry_seconds=1.0,
+    )
+
+    assert summary.outcome == "CLOSEOUT_DEADLINE"
+    assert len(calls) == 7
+    assert harness.clock.sleeps == [1.0, 2.0, 4.0, 300.0, 300.0, 300.0, 10.0]
+    # Never slept into the final materialization reserve, never needed an
+    # external kill: the loop exited exactly at its own long-op deadline.
+    assert harness.clock.now == 1000 + 917
+    assert harness.clock.now <= 1000 + 977 - 60
 
 
 def test_unknown_failure_keeps_the_historical_bounded_stop(tmp_path):
