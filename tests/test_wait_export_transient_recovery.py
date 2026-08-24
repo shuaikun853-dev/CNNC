@@ -1,11 +1,13 @@
 """Transient wait-export failures must self-heal on the exact remote identity.
 
-wait-export already owns an exact remote task identity, so a transient
-process failure (startup OSError, one non-zero exit) must keep the job
-RUNNING and retry only wait/status/export against the same identity — never
-create, /add, ENABLE or a fresh priority of an unknown task.  Deterministic
-failures (missing external tool, missing required file, invalid existing
-workbook) stay MANUAL immediately.
+wait-export already owns an exact remote task identity, so a provably
+transient process failure keeps the job RUNNING and retries only
+wait/status/export against the same identity — never create, /add, ENABLE or
+a fresh priority of an unknown task.  Transient startup failures are an
+explicit allowlist (interrupted/memory-pressure spawn errors, auth-refresh
+deadlines); deterministic local failures (missing external tool, missing
+required file, permission denied, bad executable image, elevation required,
+invalid existing workbook) and unrecognized spawn errors stay MANUAL.
 """
 
 from __future__ import annotations
@@ -49,7 +51,7 @@ def test_wait_export_oserror_first_then_export_success(tmp_path):
     def runner(args, _timeout, _environment):
         calls.append(list(args))
         if len(calls) == 1:
-            raise OSError("transient pipe failure")
+            raise InterruptedError("transient interrupted spawn")
         _write_result(job.result_path, [["sku-1", "https://item.jd.com/a", "12.5"]])
         return subprocess.CompletedProcess(args, returncode=0)
 
@@ -120,6 +122,96 @@ def test_wait_export_invalid_existing_workbook_stays_manual(tmp_path):
 
 def test_wait_export_zero_budget_stays_retryable(tmp_path):
     outcome = _adapter().harvest(_prepare(tmp_path), timeout_seconds=0)
+
+    assert outcome.status is HarvestStatus.RUNNING
+
+
+# ------------------------------------------- deterministic local spawn failures
+
+
+def _winerror(winerror: int, message: str) -> OSError:
+    return OSError(0, message, None, winerror)
+
+
+@pytest.mark.parametrize(
+    "spawn_failure",
+    [
+        PermissionError("[WinError 5] Access is denied"),
+        _winerror(5, "Access is denied"),
+        _winerror(193, "%1 is not a valid Win32 application"),
+        _winerror(740, "The requested operation requires elevation"),
+    ],
+    ids=("permission-error", "winerror-5", "winerror-193", "winerror-740"),
+)
+def test_deterministic_local_spawn_failures_stay_manual(tmp_path, spawn_failure):
+    """Re-running the identical spawn cannot heal these local problems.
+
+    Permission denial, an invalid executable image and a required elevation
+    are deterministic machine-state failures: retrying the exact same command
+    on a later sweep only burns the harvest budget while the day stalls.
+    """
+
+    def runner(_args, _timeout, _environment):
+        raise spawn_failure
+
+    outcome = _adapter(runner=runner).harvest(_prepare(tmp_path), timeout_seconds=15)
+
+    assert outcome.status is HarvestStatus.MANUAL
+
+
+def test_production_wrapped_permission_error_stays_manual(tmp_path):
+    """The pre-send wrapper keeps the original OSError as __cause__."""
+
+    def runner(_args, _timeout, _environment):
+        try:
+            raise PermissionError("[WinError 5] Access is denied")
+        except OSError as exc:
+            raise LegacyPreSendFailure(
+                f"legacy Zhaoshang subprocess could not be started: {exc}"
+            ) from exc
+
+    outcome = _adapter(runner=runner).harvest(_prepare(tmp_path), timeout_seconds=15)
+
+    assert outcome.status is HarvestStatus.MANUAL
+
+
+def test_unknown_local_spawn_error_stays_manual(tmp_path):
+    def runner(_args, _timeout, _environment):
+        raise OSError(1, "unrecognized spawn failure")
+
+    outcome = _adapter(runner=runner).harvest(_prepare(tmp_path), timeout_seconds=15)
+
+    assert outcome.status is HarvestStatus.MANUAL
+
+
+@pytest.mark.parametrize(
+    "spawn_failure",
+    [
+        InterruptedError("system call interrupted"),
+        _winerror(8, "Not enough memory resources"),
+        _winerror(1455, "The paging file is too small for this operation"),
+    ],
+    ids=("interrupted", "winerror-8-memory", "winerror-1455-paging"),
+)
+def test_explicitly_transient_spawn_errors_stay_retryable(tmp_path, spawn_failure):
+    def runner(_args, _timeout, _environment):
+        raise spawn_failure
+
+    outcome = _adapter(runner=runner).harvest(_prepare(tmp_path), timeout_seconds=15)
+
+    assert outcome.status is HarvestStatus.RUNNING
+
+
+def test_auth_refresh_deadline_wrap_stays_retryable(tmp_path):
+    def runner(_args, _timeout, _environment):
+        try:
+            raise TimeoutError("legacy Zhaoshang auth refresh exhausted the command deadline")
+        except Exception as exc:
+            raise LegacyPreSendFailure(
+                f"legacy Zhaoshang pre-send setup failed: {type(exc).__name__}"
+            ) from exc
+
+    outcome = _adapter(runner=runner).harvest(_prepare(tmp_path), timeout_seconds=15)
 
     assert outcome.status is HarvestStatus.RUNNING
 
@@ -322,7 +414,7 @@ def test_transient_wait_export_failure_self_heals_across_ticks(tmp_path):
 
     def flaky_runner(args, timeout_seconds, environment):
         if len(seed.runner_calls) == 1:
-            raise OSError("transient startup failure")
+            raise InterruptedError("transient interrupted spawn")
         return _exporting_runner(seed)(args, timeout_seconds, environment)
 
     seed.runner = flaky_runner

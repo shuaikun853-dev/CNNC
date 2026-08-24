@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import importlib.util
 import json
@@ -18,6 +19,7 @@ from datetime import datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping
+from urllib import error
 from urllib.parse import parse_qsl, urlparse
 
 from openpyxl import Workbook, load_workbook
@@ -156,20 +158,40 @@ def remote_not_materialized_diagnostic(exc: BaseException) -> str | None:
     return None
 
 
-def _deterministic_wait_export_startup_failure(exc: BaseException) -> bool:
-    """Deterministically missing local prerequisites stay manual.
+# Only provably transient OS-level spawn failures may auto-retry.  Memory
+# pressure (ERROR_NOT_ENOUGH_MEMORY, ERROR_OUTOFMEMORY, ERROR_COMMITMENT_LIMIT)
+# and interrupted/again resource conditions can genuinely heal on a later
+# identical attempt; every other local spawn error is treated as deterministic.
+_TRANSIENT_SPAWN_WINERRORS = frozenset({8, 14, 1455})
+_TRANSIENT_SPAWN_ERRNOS = frozenset({errno.ENOMEM, errno.EAGAIN, errno.EINTR})
 
-    A missing external tool or a missing required file cannot heal on a later
-    wait-export pass.  Any other startup failure (transient auth refresh,
-    pipe/spawn hiccup, exhausted command deadline) only proves this one
-    execution failed, so the exact remote identity keeps its bounded retry.
+
+def _wait_export_startup_failure_is_transient(exc: BaseException) -> bool:
+    """Classify a wait-export startup failure against a transient allowlist.
+
+    The production pre-send wrapper preserves the original error as
+    ``__cause__``, so classification unwraps it first.  Deterministic local
+    spawn problems (missing file/path, permission denied, invalid executable
+    image, elevation required) and every unrecognized failure stay manual:
+    fail closed.  Auth-refresh deadlines and connection/timeout-class setup
+    errors are the known-transient exceptions.
     """
-    if isinstance(exc, FileNotFoundError):
+    cause: BaseException = exc
+    if isinstance(exc, LegacyPreSendFailure) and isinstance(exc.__cause__, BaseException):
+        cause = exc.__cause__
+    if isinstance(cause, (TimeoutError, ConnectionError)):
         return True
-    message = str(exc)
-    if message == "legacy Zhaoshang external tool is unavailable":
+    if isinstance(cause, error.URLError):
+        reason = cause.reason
+        return isinstance(reason, (TimeoutError, ConnectionError))
+    if isinstance(cause, InterruptedError):
         return True
-    return message.endswith("FileNotFoundError")
+    if isinstance(cause, OSError):
+        winerror = getattr(cause, "winerror", None)
+        if winerror is not None:
+            return winerror in _TRANSIENT_SPAWN_WINERRORS
+        return cause.errno in _TRANSIENT_SPAWN_ERRNOS
+    return False
 
 
 class SubmitStatus(str, Enum):
@@ -2192,14 +2214,18 @@ class CnncLegacyZhaoshangAdapter:
                 return validated
             return LegacyHarvestOutcome(HarvestStatus.RUNNING, diagnostic="legacy wait-export-only is still running")
         except (OSError, LegacyPreSendFailure) as exc:
-            if _deterministic_wait_export_startup_failure(exc):
-                return LegacyHarvestOutcome(HarvestStatus.MANUAL, diagnostic="legacy wait-export-only could not be started")
-            # One failed execution against an already-confirmed remote task is
-            # transient; the retry only ever re-addresses the same identity.
-            return LegacyHarvestOutcome(
-                HarvestStatus.RUNNING,
-                diagnostic="legacy wait-export-only could not be started; retry scheduled on the same remote identity",
-            )
+            if _wait_export_startup_failure_is_transient(exc):
+                # A provably transient startup failure against an
+                # already-confirmed remote task: the retry only ever
+                # re-addresses the same identity.
+                return LegacyHarvestOutcome(
+                    HarvestStatus.RUNNING,
+                    diagnostic="legacy wait-export-only could not be started; retry scheduled on the same remote identity",
+                )
+            # Deterministic or unrecognized local spawn failure: fail closed
+            # so the job reaches manual review instead of burning the
+            # harvest budget on an identical re-run.
+            return LegacyHarvestOutcome(HarvestStatus.MANUAL, diagnostic="legacy wait-export-only could not be started")
         if int(getattr(process, "returncode", -1)) != 0:
             validated = validated_export_after_runner_failure()
             if validated is not None:
