@@ -811,14 +811,36 @@ def test_scheduler_scripts_preview_weekday_production_plan_without_mutation():
     assert "Sunday" not in task["DaysOfWeek"]
     assert task["WeeksInterval"] == 1
     assert task["StartBoundary"] == "09:00"
-    assert task["RepetitionInterval"] == "PT15M"
-    assert task["RepeatFor"] == "PT11H1M"
-    assert task["LastPlannedStart"] == "20:00"
-    assert task["TickTimes"] == "09:00-17:00 hourly; 17:15; 17:30; 17:45"
+    assert task["LastPlannedStart"] == "20:35"
+    # One task, three weekly triggers: the daytime 15-minute baseline ends at
+    # 16:45, the 17:00-17:55 peak window and the 18:00-20:00 closeout window
+    # wake up every 5 minutes, and 20:00 stays the last automatic start.
+    assert [
+        (
+            trigger["Name"],
+            trigger["StartBoundary"],
+            trigger["RepetitionInterval"],
+            trigger["RepeatFor"],
+            trigger["LastPlannedStart"],
+        )
+        for trigger in task["Triggers"]
+    ] == [
+        ("Baseline", "09:00", "PT15M", "PT7H46M", "16:45"),
+        ("Peak", "17:00", "PT5M", "PT56M", "17:55"),
+        ("Closeout", "18:00", "PT5M", "PT2H1M", "20:00"),
+        ("SafetyCloseout", "20:35", None, None, "20:35"),
+    ]
+    for trigger in task["Triggers"]:
+        assert trigger["DaysOfWeek"] == ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]
+        assert "Saturday" not in trigger["DaysOfWeek"]
+        assert "Sunday" not in trigger["DaysOfWeek"]
+    assert task["TickTimes"] == "09:00-16:00 hourly; 17:00-17:50 every 5 minutes"
     assert task["HarvestOnlyTimes"].startswith("09:15-16:45 quarter-hour slots")
-    assert task["CloseoutHours"].startswith("18:00-20:00 every 15 minutes")
-    assert "20:00 is the last automatic start" in task["CloseoutHours"]
-    assert task["FinalizeHours"] == "none after 20:00; operators run an explicit manual closeout instead"
+    assert "17:55" in task["HarvestOnlyTimes"]
+    assert task["CloseoutHours"].startswith("18:00-20:00 every 5 minutes")
+    assert "one-shot 20:35 safety closeout" in task["CloseoutHours"]
+    assert "20:35 is the last automatic start" in task["CloseoutHours"]
+    assert task["FinalizeHours"] == "none after 20:35; operators run an explicit manual closeout instead"
     assert "run_incremental_price_audit_scheduled.ps1" in task["Arguments"]
     assert "-BudgetSeconds 720" in task["Arguments"]
     assert "-CloseoutBudgetSeconds 1680" in task["Arguments"]
@@ -851,26 +873,56 @@ def test_scheduled_runner_routes_hours_without_running_python(tmp_path):
         ("2026-08-13T16:15:00", ["harvest-only"]),
         ("2026-08-13T16:30:00", ["harvest-only"]),
         ("2026-08-13T16:45:00", ["harvest-only"]),
+        ("2026-08-13T16:50:00", []),
+        # 17:00-17:50 is the SaaS new-data peak: every 5-minute wakeup is a
+        # full tick with unchanged business semantics.
         ("2026-08-13T17:00:00", ["tick"]),
+        ("2026-08-13T17:05:00", ["tick"]),
+        ("2026-08-13T17:10:00", ["tick"]),
         ("2026-08-13T17:15:00", ["tick"]),
+        ("2026-08-13T17:20:00", ["tick"]),
+        ("2026-08-13T17:25:00", ["tick"]),
         ("2026-08-13T17:30:00", ["tick"]),
+        ("2026-08-13T17:35:00", ["tick"]),
+        ("2026-08-13T17:40:00", ["tick"]),
         ("2026-08-13T17:45:00", ["tick"]),
+        ("2026-08-13T17:50:00", ["tick"]),
+        # 17:55 only sweeps already-submitted Zhaoshang remote jobs ahead of
+        # the 18:00 closeout; it must never be a full tick.
+        ("2026-08-13T17:55:00", ["harvest-only"]),
+        ("2026-08-13T17:52:00", []),
+        ("2026-08-13T17:58:00", []),
+        # 18:00-20:00 closeout start opportunities every 5 minutes; IgnoreNew
+        # on the task drops overlaps, so these are opportunities, not runs.
         ("2026-08-13T18:00:00", ["closeout"]),
+        ("2026-08-13T18:05:00", ["closeout"]),
+        ("2026-08-13T18:10:00", ["closeout"]),
         ("2026-08-13T18:15:00", ["closeout"]),
+        ("2026-08-13T18:20:00", ["closeout"]),
+        ("2026-08-13T18:25:00", ["closeout"]),
         ("2026-08-13T18:30:00", ["closeout"]),
         ("2026-08-13T18:45:00", ["closeout"]),
         ("2026-08-13T19:00:00", ["closeout"]),
         ("2026-08-13T19:15:00", ["closeout"]),
         ("2026-08-13T19:30:00", ["closeout"]),
         ("2026-08-13T19:45:00", ["closeout"]),
+        ("2026-08-13T19:55:00", ["closeout"]),
         ("2026-08-13T20:00:00", ["closeout"]),
+        ("2026-08-13T18:03:00", []),
+        # One-shot 20:35 safety closeout: the last automatic start of the
+        # day; 20:05-20:34 and 20:36+ have no phase.
+        ("2026-08-13T20:05:00", []),
         ("2026-08-13T20:15:00", []),
         ("2026-08-13T20:30:00", []),
+        ("2026-08-13T20:35:00", ["closeout"]),
+        ("2026-08-13T20:40:00", []),
         ("2026-08-13T21:00:00", []),
         ("2026-08-13T08:00:00", []),
         ("2026-08-13T08:45:00", []),
         ("2026-08-15T09:00:00", []),
         ("2026-08-15T09:15:00", []),
+        ("2026-08-15T17:30:00", []),
+        ("2026-08-15T18:00:00", []),
         ("2026-08-16T19:00:00", []),
     )
 
@@ -1265,9 +1317,11 @@ def test_scheduled_runner_log_open_failure_or_noop_is_bounded_and_starts_no_chil
 
     now = datetime.now()
     scheduled = now.weekday() < 5 and (
-        (now.minute == 0 and 9 <= now.hour <= 17)
-        or (now.hour == 17 and now.minute in {30, 45})
-        or (18 <= now.hour <= 23 and now.minute % 15 == 0)
+        (now.minute == 0 and 9 <= now.hour <= 16)
+        or (9 <= now.hour <= 16 and now.minute in {15, 30, 45})
+        or (now.hour == 17 and now.minute % 5 == 0)  # 17:00-17:50 ticks + 17:55 drain
+        or (now.hour in {18, 19} and now.minute % 5 == 0)
+        or (now.hour == 20 and now.minute == 0)
     )
     assert completed.returncode != 0 if scheduled else completed.returncode == 0
     assert time.monotonic() - started < 8

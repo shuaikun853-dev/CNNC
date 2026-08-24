@@ -27,6 +27,8 @@ from app.services.legacy_zhaoshang_adapter import (
     CnncLegacyZhaoshangAdapter,
 )
 from app.workflows.incremental_price_audit import (
+    CrawlMember,
+    CrawlPlan,
     DiscoveredState,
     TickConfig,
     TickDependencies,
@@ -266,12 +268,22 @@ def test_customer_count_equality_is_never_a_freeze_condition(tmp_path):
 
 
 class CloseoutHarness:
-    def __init__(self, tmp_path: Path, discovers: list[DiscoveredState]) -> None:
+    def __init__(
+        self,
+        tmp_path: Path,
+        discovers: list[DiscoveredState],
+        *,
+        enable_submit: bool = False,
+    ) -> None:
         self.clock = VirtualClock()
         self.events: list[str] = []
         self.discover_times: list[float] = []
         self.sweep_times: list[float] = []
         self.materialize_calls: list[str] = []
+        self.submitted: list[tuple[str, ...]] = []
+        self.submit_times: list[float] = []
+        self.submitted_job_crawls: dict[int, list[dict[str, Any]]] = {}
+        self.gate_checks = 0
         self._discovers = list(discovers)
         self.root = tmp_path / "runtime"
 
@@ -301,6 +313,61 @@ class CloseoutHarness:
             model_batch=model_batch,
             wall_clock=lambda: datetime(2026, 8, 11, 10, 1, tzinfo=UTC),
         )
+        if enable_submit:
+            # The full remote-write dependency seam the production closeout
+            # gets under --enable-remote-writes: planner, plan finalizer,
+            # submitter and the durable stall gate.
+            def plan(items, _timeout):
+                members = [
+                    CrawlMember(
+                        mall_key="mall-a",
+                        source_id=item["row"]["vCommodityId"],
+                        sku_id=item["row"]["skuId"],
+                        exact_url=item["row"]["extLink"],
+                        backend_version="legacy-v1",
+                        row=item["row"],
+                    )
+                    for item in items
+                ]
+                return [
+                    CrawlPlan(
+                        mall_key="mall-a",
+                        logical_key="mall-a:batch",
+                        task_name="task-mall-a",
+                        payload_hash="payload-a",
+                        members=members,
+                    )
+                ]
+
+            def finalize(plan, members, _timeout):
+                payload = {"members": [member.sku_id for member in members]}
+                suffix = "-".join(payload["members"])
+                return CrawlPlan(
+                    mall_key=plan.mall_key,
+                    logical_key=f"{plan.mall_key}:{suffix}",
+                    task_name=f"tick-{suffix}",
+                    payload_hash=f"payload-{suffix}",
+                    payload_json=payload,
+                    members=tuple(members),
+                )
+
+            def submit(job, crawls, _timeout):
+                self.submit_times.append(self.clock.monotonic())
+                self.submitted.append(tuple(crawl["sku_id"] for crawl in crawls))
+                self.submitted_job_crawls[int(job["id"])] = [dict(crawl) for crawl in crawls]
+                return {
+                    "remote_identity": f"mall-a|id-{job['id']}|num-{job['id']}",
+                    "state": "SUBMITTED",
+                }
+
+            def submit_gate():
+                self.gate_checks += 1
+                return None
+
+            self.deps.plan_crawl = plan
+            self.deps.finalize_crawl_plan = finalize
+            self.deps.submit_crawl = submit
+            self.deps.submit_gate = submit_gate
         self.materialize = materialize
 
     def _harvest(self, jobs, _timeout):
@@ -348,6 +415,96 @@ def test_closeout_processes_new_saas_rows_in_the_same_process(tmp_path):
     assert result.publication is not None
     assert result.tick.frozen_snapshot_id is not None
     assert harness.discover_times == [1000.0, 1300.0, 1600.0, 1900.0]
+
+
+def test_closeout_submits_and_harvests_late_delta_remote_work_before_freeze(tmp_path):
+    """Characterization: the closeout already owns the full late-delta chain.
+
+    18:00 stops CNNC pushes, not SaaS latency.  A row pushed at 17:59 that
+    only appears on SaaS at 18:06 must, inside the same closeout process,
+    re-query SaaS (observation), flow through Detail, Model and crawl
+    planning, pass the submit gate, be safely submitted, keep being
+    harvested, and only freeze once the 600-second source-stability window
+    holds on a snapshot that includes the late row.
+    """
+    base_rows = [_row(f"v{index}", f"s{index}") for index in (1, 2)]
+    grown_rows = base_rows + [_row("v3", "s3", queryStr="title-3", skuName="name-3")]
+    harness = CloseoutHarness(
+        tmp_path,
+        [
+            _observation(base_rows, datetime(2026, 8, 11, 10, 1, tzinfo=UTC)),
+            _observation(grown_rows, datetime(2026, 8, 11, 10, 6, tzinfo=UTC)),
+            _observation(grown_rows, datetime(2026, 8, 11, 10, 11, tzinfo=UTC)),
+            _observation(grown_rows, datetime(2026, 8, 11, 10, 16, tzinfo=UTC)),
+        ],
+        enable_submit=True,
+    )
+
+    def harvest(jobs, _timeout):
+        # The priority-probe chain of the legacy bridge folds into the
+        # terminal COMPLETED result here; priority policy itself is covered
+        # by the tick and adapter suites.
+        result = {}
+        for job in jobs:
+            job_id = int(job["id"])
+            crawls = harness.submitted_job_crawls.get(job_id, [])
+            result[job_id] = {
+                "state": "COMPLETED",
+                "remote_identity": job.get("remote_identity")
+                or f"mall-a|id-{job_id}|num-{job_id}",
+                "crawl_results": {int(crawl["id"]): {"price": "10"} for crawl in crawls},
+            }
+        return result
+
+    harness.deps.harvest = harvest
+
+    result = harness.run(runtime_budget_seconds=2000)
+
+    # The 18:01 baseline and the 18:06 late row each reach the planner and
+    # the submitter inside this closeout; only delta work is submitted.
+    assert harness.submitted == [("s1", "s2"), ("s3",)]
+    assert harness.gate_checks >= 2  # the gate runs before every dispatch
+    assert "detail:v3" in harness.events and "model:v3" in harness.events
+    # The late submit happens on the 18:06 observation pass, well before the
+    # freeze pass at 18:16.
+    assert len(harness.submit_times) == 2
+    assert 1300.0 <= harness.submit_times[1] < 1900.0
+    # Freeze still waits for the full 600-second stability window
+    # (10:06 -> 10:16) and freezes a snapshot that includes the late row.
+    assert harness.discover_times == [1000.0, 1300.0, 1600.0, 1900.0]
+    assert result.tick.frozen_snapshot_id is not None
+    assert result.publication is not None
+
+    paths = runtime_paths(BUSINESS_DATE, harness.root)
+    store = DailyAuditStore(paths.state_path)
+    run = store.get_run(BUSINESS_DATE)
+    frozen_items = store.ordered_snapshot_items(run["frozen_snapshot_id"])
+    assert {item["row"]["skuId"] for item in frozen_items} == {"s1", "s2", "s3"}
+    assert source_stability_seconds(store, BUSINESS_DATE, {
+        "id": run["frozen_snapshot_id"],
+        "row_count": len(frozen_items),
+        "ordered_hash": next(
+            snapshot["ordered_hash"]
+            for snapshot in store.list_snapshots(BUSINESS_DATE)
+            if snapshot["id"] == run["frozen_snapshot_id"]
+        ),
+    }) == 600.0
+    # Harvest keeps running through the closeout: every submitted remote job
+    # completed with exact identity, and no unknown/manual state appeared.
+    lock = ProcessLock(paths.lock_path)
+    lock.acquire()
+    token = store.acquire_lease(BUSINESS_DATE, "verify", 60, process_lock=lock)
+    try:
+        jobs = store.list_remote_jobs(token)
+        assert len(jobs) == 2
+        assert {job["state"] for job in jobs} == {"COMPLETED"}
+        assert all(job["remote_identity"].startswith("mall-a|id-") for job in jobs)
+    finally:
+        store.release_lease(token)
+        lock.release()
+    assert result.tick.counters["submit_unknown"] == 0
+    assert result.tick.counters["submit_paused"] == 0
+    assert result.tick.counters["crawl_submitted"] == 2
 
 
 def test_closeout_paces_sweeps_independently_of_five_minute_observations(tmp_path):
@@ -534,6 +691,44 @@ def test_closeout_is_a_noop_after_the_day_is_finalized(tmp_path):
     assert again.tick.outcome == "ALREADY_FINALIZED"
     assert again.publication is None
     assert harness.discover_times == [1000.0]
+
+
+def test_safety_closeout_after_finalization_never_rewrites_final_xlsx(tmp_path):
+    """Safety Case C: the 20:35 safety closeout is a pure idempotent noop.
+
+    A day already FINALIZED before 20:00 exits through the existing
+    ALREADY_FINALIZED semantics before any SaaS request, remote call or
+    materialization, so the one-shot late trigger can never rewrite the
+    published final.xlsx.
+    """
+    rows = [_row("v1", "s1")]
+    harness = CloseoutHarness(tmp_path, [_observation(rows, datetime(2026, 8, 11, 10, 1, tzinfo=UTC))])
+    harness.run(
+        runtime_budget_seconds=2000,
+        source_stability_seconds=0,
+        materialize=materialize_frozen_daily_run,
+    )
+    paths = runtime_paths(BUSINESS_DATE, harness.root)
+    final_path = Path(paths.final_output_path)
+    original_bytes = final_path.read_bytes()
+    assert DailyAuditStore(paths.state_path).get_run(BUSINESS_DATE)["state"] == "FINALIZED"
+
+    def forbidden_materialize(*_args, **_kwargs):
+        raise AssertionError("the safety closeout must not rewrite final.xlsx")
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("an already-finalized day must not touch dependencies")
+
+    harness.materialize = forbidden_materialize
+    harness.deps.discover = forbidden
+    harness.deps.harvest = forbidden
+
+    again = harness.run(runtime_budget_seconds=2000)
+
+    assert again.tick.outcome == "ALREADY_FINALIZED"
+    assert again.publication is None
+    assert final_path.read_bytes() == original_bytes
+    assert DailyAuditStore(paths.state_path).get_run(BUSINESS_DATE)["state"] == "FINALIZED"
 
 
 # ---------------------------------------------------------------------------

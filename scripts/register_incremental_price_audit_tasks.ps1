@@ -62,22 +62,99 @@ if ($EnableRemoteWrites) {
 $actionArguments = $runnerArguments -join " "
 $legacyTaskNames = @("$TaskName-Tick", "$TaskName-Finalize")
 $weekdays = @("Monday", "Tuesday", "Wednesday", "Thursday", "Friday")
-$at = [datetime]::Today.Add([TimeSpan]::Parse($StartAt))
-$trigger = New-ScheduledTaskTrigger `
-    -Weekly `
-    -WeeksInterval 1 `
-    -DaysOfWeek $weekdays `
-    -At $at
-$repetition = New-CimInstance `
-    -ClassName MSFT_TaskRepetitionPattern `
-    -Namespace Root/Microsoft/Windows/TaskScheduler `
-    -ClientOnly `
-    -Property @{
-        Interval = "PT15M"
-        Duration = "PT11H1M"
-        StopAtDurationEnd = $false
+
+function ConvertTo-Iso8601Duration([TimeSpan] $Span) {
+    $totalMinutes = [int][math]::Ceiling($Span.TotalMinutes)
+    $hours = [int][math]::Floor($totalMinutes / 60)
+    $minutes = $totalMinutes - ($hours * 60)
+    if ($hours -eq 0) {
+        return "PT" + $minutes + "M"
     }
-$trigger.CimInstanceProperties["Repetition"].Value = $repetition
+    if ($minutes -eq 0) {
+        return "PT" + $hours + "H"
+    }
+    return "PT" + $hours + "H" + $minutes + "M"
+}
+
+function New-WeeklyRepetitionTrigger([datetime] $StartAt, [string] $Interval, [string] $Duration) {
+    $weekly = New-ScheduledTaskTrigger `
+        -Weekly `
+        -WeeksInterval 1 `
+        -DaysOfWeek $weekdays `
+        -At $StartAt
+    $repetition = New-CimInstance `
+        -ClassName MSFT_TaskRepetitionPattern `
+        -Namespace Root/Microsoft/Windows/TaskScheduler `
+        -ClientOnly `
+        -Property @{
+            Interval = $Interval
+            Duration = $Duration
+            StopAtDurationEnd = $false
+        }
+    $weekly.CimInstanceProperties["Repetition"].Value = $repetition
+    return $weekly
+}
+
+# One task, four weekday-only triggers.  Trigger A keeps the daytime 15-minute
+# baseline and ends before the peak; Trigger B wakes every 5 minutes through
+# 17:00-17:55 (17:00-17:50 full ticks routed by the runner plus the 17:55
+# harvest-only drain); Trigger C offers a closeout start every 5 minutes from
+# 18:00 through 20:00.  Trigger D is a one-shot 20:35 safety closeout: a 19:55
+# run can hold the writer past the dropped 20:00 trigger, and the PT32M
+# ExecutionTimeLimit guarantees any 20:00 run is gone by 20:32, so 20:35 is
+# the last automatic start of the day.  All triggers share one action, one
+# working directory, one process lock, and IgnoreNew, so overlaps are dropped
+# rather than queued or parallelized.
+$triggerSpecs = @(
+    [pscustomobject]@{ Name = "Baseline"; Interval = "PT15M"; At = $StartAt; LastStart = "16:45" }
+    [pscustomobject]@{ Name = "Peak"; Interval = "PT5M"; At = "17:00"; LastStart = "17:55" }
+    [pscustomobject]@{ Name = "Closeout"; Interval = "PT5M"; At = "18:00"; LastStart = "20:00" }
+    [pscustomobject]@{ Name = "SafetyCloseout"; Interval = $null; At = "20:35"; LastStart = "20:35" }
+)
+$triggerPlans = @()
+foreach ($spec in $triggerSpecs) {
+    # Loop-local names deliberately avoid `$StartAt`: it collides
+    # case-insensitively with the typed [string] script parameter above,
+    # which would silently coerce these values back to strings.
+    $windowStart = [datetime]::Today.Add([TimeSpan]::Parse($spec.At))
+    $windowLastStart = [datetime]::Today.Add([TimeSpan]::Parse($spec.LastStart))
+    if ($windowLastStart -lt $windowStart) {
+        throw "Trigger $($spec.Name): start $($spec.At) must be at or before its last planned start $($spec.LastStart)."
+    }
+    if ($null -eq $spec.Interval) {
+        # One-shot daily trigger: fires exactly once at its boundary.
+        $triggerPlans += [pscustomobject]@{
+            Name = $spec.Name
+            DaysOfWeek = $weekdays
+            StartBoundary = $windowStart.ToString("HH:mm")
+            RepetitionInterval = $null
+            RepeatFor = $null
+            LastPlannedStart = $spec.LastStart
+        }
+        continue
+    }
+    $window = $windowLastStart - $windowStart
+    $repeatFor = ConvertTo-Iso8601Duration $window.Add([TimeSpan]::FromMinutes(1))
+    $triggerPlans += [pscustomobject]@{
+        Name = $spec.Name
+        DaysOfWeek = $weekdays
+        StartBoundary = $windowStart.ToString("HH:mm")
+        RepetitionInterval = $spec.Interval
+        RepeatFor = $repeatFor
+        LastPlannedStart = $spec.LastStart
+    }
+}
+$cimTriggers = @(
+    foreach ($triggerPlan in $triggerPlans) {
+        $triggerStart = [datetime]::Today.Add([TimeSpan]::Parse($triggerPlan.StartBoundary))
+        if ($null -eq $triggerPlan.RepetitionInterval) {
+            New-ScheduledTaskTrigger -Weekly -WeeksInterval 1 -DaysOfWeek $weekdays -At $triggerStart
+        }
+        else {
+            New-WeeklyRepetitionTrigger $triggerStart $triggerPlan.RepetitionInterval $triggerPlan.RepeatFor
+        }
+    }
+)
 $plan = [pscustomobject]@{
     TaskName = $TaskName
     Command = $powerShellPath
@@ -88,14 +165,13 @@ $plan = [pscustomobject]@{
     TriggerType = "Weekly"
     DaysOfWeek = $weekdays
     WeeksInterval = 1
-    StartBoundary = $at.ToString("HH:mm")
-    RepetitionInterval = "PT15M"
-    RepeatFor = "PT11H1M"
-    LastPlannedStart = "20:00"
-    TickTimes = "09:00-17:00 hourly; 17:15; 17:30; 17:45"
-    HarvestOnlyTimes = "09:15-16:45 quarter-hour slots (sweep existing Zhaoshang remote jobs only; no SaaS discovery, Detail, Model, submit, or finalize)"
-    CloseoutHours = "18:00-20:00 every 15 minutes (wall budget $CloseoutBudgetSeconds s; IgnoreNew drops overlaps; 20:00 is the last automatic start)"
-    FinalizeHours = "none after 20:00; operators run an explicit manual closeout instead"
+    StartBoundary = $triggerPlans[0].StartBoundary
+    LastPlannedStart = $triggerPlans[-1].LastPlannedStart
+    Triggers = $triggerPlans
+    TickTimes = "$($triggerPlans[0].StartBoundary)-16:00 hourly; 17:00-17:50 every 5 minutes"
+    HarvestOnlyTimes = "09:15-16:45 quarter-hour slots and the 17:55 drain (sweep existing Zhaoshang remote jobs only; no SaaS discovery, Detail, Model, submit, or finalize)"
+    CloseoutHours = "18:00-20:00 every 5 minutes plus a one-shot 20:35 safety closeout (wall budget $CloseoutBudgetSeconds s; IgnoreNew drops overlaps; 20:35 is the last automatic start)"
+    FinalizeHours = "none after 20:35; operators run an explicit manual closeout instead"
 }
 
 if (-not $Apply) {
@@ -109,7 +185,7 @@ if (-not $Apply) {
         RemoteWrites = [bool]$EnableRemoteWrites
         ConflictingTaskNames = $legacyTaskNames
         Tasks = @($plan)
-    } | ConvertTo-Json -Depth 5
+    } | ConvertTo-Json -Depth 6
     exit 0
 }
 
@@ -136,10 +212,10 @@ $action = New-ScheduledTaskAction `
     -WorkingDirectory $repo
 $definition = New-ScheduledTask `
     -Action $action `
-    -Trigger $trigger `
+    -Trigger $cimTriggers `
     -Settings $settings `
     -Principal $principal `
-    -Description "Finite CNNC/SaaS incremental audit; 15-minute wakeups with runner time routing, SQLite state, and process locks are authoritative."
+    -Description "Finite CNNC/SaaS incremental audit; 15-minute daytime and 5-minute late-day wakeups with runner time routing, SQLite state, and process locks are authoritative."
 if ($PSCmdlet.ShouldProcess($TaskName, "Register or update scheduled task")) {
     Register-ScheduledTask -TaskName $TaskName -InputObject $definition -Force | Out-Null
 }
