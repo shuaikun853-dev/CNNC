@@ -70,7 +70,8 @@ elseif ($isWeekday -and $hour -ge 9 -and $hour -le 16 -and $minute -in @(15, 30,
 elseif (
     $isWeekday -and (
         ($hour -ge 18 -and $hour -le 19 -and ($minute % 5) -eq 0) -or
-        ($hour -eq 20 -and $minute -eq 0)
+        ($hour -eq 20 -and $minute -eq 0) -or
+        ($hour -eq 20 -and $minute -eq 35)
     )
 ) {
     # Closeout owns the production writer until FINALIZED, its wall deadline,
@@ -79,9 +80,14 @@ elseif (
     # task's IgnoreNew policy, so this raises the idle re-entry speed (at
     # most one 5-minute step after an instance exits) without concurrency;
     # a fresh closeout continues the durable SQLite state when the previous
-    # one already exited.  20:00 is the last automatic closeout; 20:05 and
-    # later never auto-run, so post-20:00 progress is an explicit manual
-    # closeout from the operator.
+    # one already exited.  20:00 is the last 5-minute start.  The one-shot
+    # 20:35 safety closeout is the last automatic start of the day: a 19:55
+    # run can hold the writer past the dropped 20:00 trigger (ending with
+    # WAITING_REMOTE and no further 5-minute opportunity), and the 32-minute
+    # ExecutionTimeLimit guarantees any 20:00 run is gone by 20:32, so 20:35
+    # always re-offers closeout; FINALIZED days exit as idempotent noops.
+    # 20:36 and later never auto-run, so later progress is an explicit
+    # manual closeout from the operator.
     $phases = @("closeout")
 }
 

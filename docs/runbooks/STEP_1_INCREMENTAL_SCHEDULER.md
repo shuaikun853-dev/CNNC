@@ -43,7 +43,7 @@ SQLite 仅有七张 checkpoint 表：`daily_runs`、`snapshots`、`audit_items`�
 | Program | Windows PowerShell |
 | Runner | `scripts\run_incremental_price_audit_scheduled.ps1` |
 | Start in | 仓库根目录 |
-| Trigger | 每周一至周五共三个 trigger：09:00 起每 15 分钟唤醒至 16:45；17:00 起每 5 分钟唤醒至 17:55；18:00 起每 5 分钟唤醒至 20:00（最后一次 20:00） |
+| Trigger | 每周一至周五共四个 trigger：09:00 起每 15 分钟唤醒至 16:45；17:00 起每 5 分钟唤醒至 17:55；18:00 起每 5 分钟唤醒至 20:00；另加 20:35 一次性 Safety Closeout（最后一次自动启动 20:35） |
 | Multiple instances | **IgnoreNew** |
 | Application budget | tick/harvest-only **720 秒**；closeout **1680 秒** |
 | ExecutionTimeLimit | **32 分钟（1920 秒）** |
@@ -54,7 +54,11 @@ submit、不 finalize；本地无 eligible remote job 时纯本地 NOOP，不请
 运行一次 `tick`（17 点是 SaaS 新数据高峰，提高启动机会；单轮超时不并发，靠 IgnoreNew 丢弃重叠
 trigger）；**17:55 只运行 `harvest-only`**，优先排空 17 点已创建的招商局远端任务，不产生新 discovery、
 新 ADD 或新 remote create。18:00-20:00 每 5 分钟提供一次 `closeout` 启动机会，
-**20:00 是当天最后一次自动 closeout**；20:05 后不再有任何自动调度，即使被人工误调用也会快速空操作退出。
+**20:00 是 5 分钟窗口的最后一次**；20:35 是一次性的 Safety Closeout，也是当天最后一次自动启动：
+19:55 的 closeout 运行超过 5 分钟时 20:00 trigger 会被 IgnoreNew 丢弃，若该轮随后以 WAITING_REMOTE
+结束，当天仍由 20:35 补一次自动 closeout（20:00 起跑的一轮最晚 20:32 被 32 分钟硬上限终止，20:35
+必可启动；当天已 FINALIZED 时按现有幂等语义直接 NOOP，不重写 final.xlsx）。20:36 后不再有任何
+自动调度，即使被人工误调用也会快速空操作退出。
 closeout 在一个进程内持续推进，不为下一个 5 分钟唤醒等待：SaaS 稳定观察最快每 300 秒一次，
 招商局 full sweep 最快每 600 秒一次（单批最多 6 个，一轮覆盖全部 eligible remote jobs）。18:00 后只要
 最近 authoritative 观测的 `row_count` 与 `ordered_hash` 连续 600 秒一致且本次分页完整，即可 freeze
@@ -67,7 +71,8 @@ SaaS/招商局/remote submit 请求前直接 `ALREADY_FINALIZED` NOOP。
 高频窗口只提高空闲后的响应速度，不改变并发语义：任务级 `IgnoreNew` 保证任意时刻至多一个生产
 writer。例如 17:30 的 tick 运行 9 分钟时，17:35 的 trigger 被自动丢弃，17:40 正常启动；18:00 的
 closeout 运行 12 分钟时，18:05 与 18:10 被丢弃，18:15 重新进入；closeout 提前结束后最多约 5 分钟
-即可获得下一次启动机会，而不再是 15 分钟。
+即可获得下一次启动机会，而不再是 15 分钟；19:55 运行 28 分钟时 20:00 被丢弃、20:23 结束后由
+20:35 Safety Closeout 补位。
 
 Scheduler 默认仅周一至周五运行。周六、周日中核不产生业务推送，因此不执行自动增量处理。
 主限制由 Weekly trigger 的 `Monday` 至 `Friday` 实现，不注册周末 trigger，也不启用
@@ -101,8 +106,8 @@ powershell -NoProfile -File scripts\register_incremental_price_audit_tasks.ps1 `
   -Apply
 ```
 
-脚本固定使用 legacy 招商局 backend、`MultipleInstances=IgnoreNew`、三窗口 trigger（白天 15 分钟、
-17:00-17:55 与 18:00-20:00 每 5 分钟）和 32 分钟硬上限。
+脚本固定使用 legacy 招商局 backend、`MultipleInstances=IgnoreNew`、三重复 trigger 加 20:35 一次性
+Safety Closeout（白天 15 分钟、17:00-17:55 与 18:00-20:00 每 5 分钟、20:35 一次）和 32 分钟硬上限。
 若发现旧的 `-Tick` / `-Finalize` 双任务仍存在，注册会拒绝继续，而不会暗中删除或制造竞争任务。
 注册身份沿用当前项目的交互式低权限用户上下文；机器关机或用户未登录时不会强行改用另一套凭证。
 
@@ -158,7 +163,7 @@ mandatory crawl 的 remote job 必须全部为 `COMPLETED`；即使 crawl 已写
 
 ## 20 点以后的人工 closeout
 
-20:00 是当天最后一次自动 closeout。之后仍未 `FINALIZED` 时不再有任何自动 SaaS/招商局请求，
+20:35 Safety Closeout 是当天最后一次自动 closeout。之后仍未 `FINALIZED` 时不再有任何自动 SaaS/招商局请求，
 由运维按以下三步人工推进。
 
 ### 第一步：status

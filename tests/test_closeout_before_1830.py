@@ -693,6 +693,44 @@ def test_closeout_is_a_noop_after_the_day_is_finalized(tmp_path):
     assert harness.discover_times == [1000.0]
 
 
+def test_safety_closeout_after_finalization_never_rewrites_final_xlsx(tmp_path):
+    """Safety Case C: the 20:35 safety closeout is a pure idempotent noop.
+
+    A day already FINALIZED before 20:00 exits through the existing
+    ALREADY_FINALIZED semantics before any SaaS request, remote call or
+    materialization, so the one-shot late trigger can never rewrite the
+    published final.xlsx.
+    """
+    rows = [_row("v1", "s1")]
+    harness = CloseoutHarness(tmp_path, [_observation(rows, datetime(2026, 8, 11, 10, 1, tzinfo=UTC))])
+    harness.run(
+        runtime_budget_seconds=2000,
+        source_stability_seconds=0,
+        materialize=materialize_frozen_daily_run,
+    )
+    paths = runtime_paths(BUSINESS_DATE, harness.root)
+    final_path = Path(paths.final_output_path)
+    original_bytes = final_path.read_bytes()
+    assert DailyAuditStore(paths.state_path).get_run(BUSINESS_DATE)["state"] == "FINALIZED"
+
+    def forbidden_materialize(*_args, **_kwargs):
+        raise AssertionError("the safety closeout must not rewrite final.xlsx")
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("an already-finalized day must not touch dependencies")
+
+    harness.materialize = forbidden_materialize
+    harness.deps.discover = forbidden
+    harness.deps.harvest = forbidden
+
+    again = harness.run(runtime_budget_seconds=2000)
+
+    assert again.tick.outcome == "ALREADY_FINALIZED"
+    assert again.publication is None
+    assert final_path.read_bytes() == original_bytes
+    assert DailyAuditStore(paths.state_path).get_run(BUSINESS_DATE)["state"] == "FINALIZED"
+
+
 # ---------------------------------------------------------------------------
 # Recovery closeout (§16): a recovery that clears the last blocker finalizes
 # in the same command; RUNNING remotes never fake a final.

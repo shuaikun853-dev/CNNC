@@ -54,6 +54,10 @@ def _weekday_trigger_times(register_plan: dict) -> list[datetime]:
     times: list[datetime] = []
     for trigger in task["Triggers"]:
         start = WEEKDAY + _parse_clock(trigger["StartBoundary"])
+        if trigger["RepetitionInterval"] is None:
+            # A one-shot daily trigger fires exactly once at its boundary.
+            times.append(start)
+            continue
         interval = _parse_iso_duration(trigger["RepetitionInterval"])
         span = _parse_iso_duration(trigger["RepeatFor"])
         elapsed = timedelta(0)
@@ -123,12 +127,14 @@ def test_trigger_plan_covers_baseline_peak_and_closeout_windows():
     ]
     # Peak window: every 5 minutes from 17:00 through the 17:55 drain slot.
     assert slots[32:44] == [f"17:{minute:02d}" for minute in range(0, 60, 5)]
-    # Closeout window: every 5 minutes from 18:00; 20:00 is the last start.
-    assert slots[44:] == CLOSEOUT_SLOTS
-    assert len(slots) == 69
-    assert slots[0] == "09:00" and slots[-1] == "20:00"
-    # No trigger fires before 09:00 or after 20:00.
-    assert all("09:00" <= slot <= "20:00" for slot in slots)
+    # Closeout window: every 5 minutes from 18:00 through the last 5-minute
+    # start at 20:00, then the one-shot 20:35 safety closeout.
+    assert slots[44:69] == CLOSEOUT_SLOTS
+    assert slots[69:] == ["20:35"]
+    assert len(slots) == 70
+    assert slots[0] == "09:00" and slots[-1] == "20:35"
+    # No trigger fires before 09:00 or after the 20:35 safety closeout.
+    assert all("09:00" <= slot <= "20:35" for slot in slots)
     # All triggers remain weekday-only weekly patterns.
     task = plan["Tasks"][0]
     for trigger in task["Triggers"]:
@@ -171,8 +177,12 @@ def test_six_and_nine_minute_peak_ticks_skip_overlaps_without_pileup():
         running = [end for _, end in started]
         for moment in skipped:
             assert any(start < moment < end for start, end in started)
-        # Once a run finishes, the next start is at most one grid step away.
-        for (start, end), (next_start, _) in zip(started, started[1:]):
+        # Once a run finishes, the next start is at most one grid step away;
+        # the one deliberate exception is the gap from the last 5-minute
+        # start (20:00) to the one-shot 20:35 safety closeout.
+        for (start, end), (next_start, _next_end) in zip(started, started[1:]):
+            if _as_hhmm(next_start) == "20:35" and _as_hhmm(start) != "20:35":
+                continue
             assert next_start - end <= timedelta(minutes=15)
         assert all(end - start >= timedelta(minutes=minutes) for start, end in started if _as_hhmm(start) in PEAK_FULL_TICKS)
 
@@ -231,6 +241,40 @@ def test_twenty_minute_closeout_restarts_within_one_grid_step():
     assert "18:20" in slots_started
 
 
+def test_safety_closeout_starts_after_long_1955_run_dropped_2000():
+    # Safety Case A: the 19:55 closeout runs its full 28-minute wall budget,
+    # so the 20:00 trigger is dropped by IgnoreNew and the run ends at 20:23.
+    # The 5-minute window has no further start, yet the day still returns
+    # WAITING_REMOTE — the one-shot 20:35 safety closeout must start.
+    times = _weekday_trigger_times(_run_register_preview())
+    started, skipped = _simulate_ignore_new(times, _durations({"19:55": 28}, _small_default))
+
+    skipped_slots = [_as_hhmm(moment) for moment in skipped]
+    assert "20:00" in skipped_slots
+    nineteen_fifty_five = next(
+        end for moment, end in started if _as_hhmm(moment) == "19:55"
+    )
+    assert nineteen_fifty_five.strftime("%H:%M") == "20:23"
+    slots_started = [_as_hhmm(moment) for moment, _ in started]
+    assert "20:35" in slots_started
+    # Between 20:23 and 20:35 nothing else can start, and after 20:35 there
+    # is no further automatic start.
+    assert all(slot <= "20:00" or slot == "20:35" for slot in slots_started)
+
+
+def test_safety_closeout_starts_even_after_full_limit_2000_run():
+    # Safety Case B: a 20:00 closeout may occupy at most the PT32M
+    # ExecutionTimeLimit, so it is gone by 20:32 at the latest; the 20:35
+    # safety trigger always finds the task idle and starts.
+    times = _weekday_trigger_times(_run_register_preview())
+    started, _skipped = _simulate_ignore_new(times, _durations({"20:00": 32}, _small_default))
+
+    twenty_o_clock = next(end for moment, end in started if _as_hhmm(moment) == "20:00")
+    assert twenty_o_clock.strftime("%H:%M") == "20:32"
+    slots_started = [_as_hhmm(moment) for moment, _ in started]
+    assert "20:35" in slots_started
+
+
 def test_never_more_than_one_production_writer_in_any_scenario():
     # Section 12: across fast and slow scenarios, running intervals never
     # overlap.  Task-level IgnoreNew therefore keeps concurrent
@@ -247,6 +291,8 @@ def test_never_more_than_one_production_writer_in_any_scenario():
         {"18:00": 12},                            # closeout overlap
         {"18:00": 20},                            # long closeout
         {"18:00": 28},                            # closeout at full budget
+        {"19:55": 28},                            # safety Case A
+        {"20:00": 32},                            # safety Case B
     )
     for overrides in scenarios:
         started, _skipped = _simulate_ignore_new(

@@ -57,7 +57,7 @@ python -m pytest tests\test_context_documents.py -q
 ```
 ### 增量价格审计
 ```powershell
-# Scheduler 路由（白天 15 分钟、17:00-17:50 每 5 分钟 tick、17:55 harvest-only、18:00-20:00 每 5 分钟 closeout）、snapshot 180 秒有限重试、公平/post harvest、freeze gate、writer lock、只读 status；simulation 文件另证三 trigger 时间线 + IgnoreNew 重叠丢弃/不堆积/单 writer（2/6/9 分钟 tick、12/20 分钟 closeout）
+# Scheduler 路由（白天 15 分钟、17:00-17:50 每 5 分钟 tick、17:55 harvest-only、18:00-20:00 每 5 分钟 closeout、20:35 一次性 safety closeout）、snapshot 180 秒有限重试、公平/post harvest、freeze gate、writer lock、只读 status；simulation 文件另证四 trigger 时间线 + IgnoreNew 重叠丢弃/不堆积/单 writer（2/6/9 分钟 tick、12/20/28/32 分钟 closeout）
 python -m pytest tests\test_incremental_audit_operations.py -k "scheduler or scheduled" -q; python -m pytest tests\test_scheduler_frequency_simulation.py -q
 python -m pytest tests\test_harvest_only.py -q  # 白天 harvest-only：无 discovery/Detail/Model/submit/finalize、本地 NOOP、全量 sweep、幂等
 python -m pytest tests\test_incremental_price_audit.py tests\test_incremental_audit_runtime.py -k "existing_remote_drain or drain_only" -q
