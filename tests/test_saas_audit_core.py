@@ -49,6 +49,41 @@ def test_concatenated_json_decimal_join_and_detail_are_stable(tmp_path):
     assert detail["customerPrice"] == Decimal("11")
 
 
+def test_detail_business_error_envelope_is_request_failed_not_not_found():
+    payload = {
+        "success": False,
+        "rspCode": "8888",
+        "rspDesc": "潜在标准商品数据详情异常:Index: 1, Size: 0",
+        "data": "",
+    }
+    result = core.extract_customer_price_from_detail(payload)
+    assert result["customerPrice"] is None
+    assert result["customerPriceStatus"] == "DETAIL_REQUEST_FAILED"
+    assert "rspCode=8888" in result["customerPriceWarning"]
+    assert "潜在标准商品数据详情异常:Index: 1, Size: 0" in result["customerPriceWarning"]
+
+
+def test_detail_success_envelope_keeps_max_reference_price():
+    payload = {
+        "success": True,
+        "rspCode": "0000",
+        "data": {
+            "referenceInfos": [{"referencePrice": "500"}, {"referencePrice": "550"}],
+            "referencePrice": "500",
+        },
+    }
+    result = core.extract_customer_price_from_detail(payload)
+    assert result["customerPrice"] == Decimal("550")
+    assert result["customerPriceStatus"] == "FOUND"
+
+
+def test_detail_success_without_references_stays_not_found():
+    payload = {"success": True, "rspCode": "0000", "data": {}}
+    result = core.extract_customer_price_from_detail(payload)
+    assert result["customerPrice"] is None
+    assert result["customerPriceStatus"] == "NOT_FOUND"
+
+
 def test_identity_and_fingerprint_keep_duplicate_snapshot_members_and_exact_urls_distinct():
     row = {"vCommodityId": "document", "skuId": "sku", "extLink": " https://a.example/item?a=1 "}
     source = core.source_fingerprint(row)

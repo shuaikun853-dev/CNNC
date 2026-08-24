@@ -245,6 +245,10 @@ def extract_customer_price_from_detail(detail_payload: Any) -> dict[str, Any]:
     failed = {"customerPrice": None, "customerPriceStatus": "DETAIL_PARSE_FAILED", "customerPriceSource": "", "customerPriceWarning": "详情接口返回不是 JSON 对象，无法解析参考价", "customerPriceEvidence": ""}
     if not isinstance(detail_payload, dict):
         return failed
+    rsp_code = normalize_cell_str(detail_payload.get("rspCode"))
+    if detail_payload.get("success") is False or (rsp_code and rsp_code != "0000"):
+        rsp_desc = normalize_cell_str(detail_payload.get("rspDesc"))
+        return {"customerPrice": None, "customerPriceStatus": "DETAIL_REQUEST_FAILED", "customerPriceSource": "", "customerPriceWarning": f"详情接口业务失败：rspCode={rsp_code or 'UNKNOWN'}；rspDesc={rsp_desc}", "customerPriceEvidence": ""}
     data = detail_payload.get("data") if isinstance(detail_payload.get("data"), dict) else None
     rows = detail_payload.get("rows") if isinstance(detail_payload.get("rows"), list) else (data.get("rows", []) if isinstance(data, dict) and isinstance(data.get("rows"), list) else [])
     infos = [item for item in (data.get("referenceInfos", []) if isinstance(data, dict) else []) if isinstance(item, dict)]
