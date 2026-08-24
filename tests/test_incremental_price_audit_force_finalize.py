@@ -9,12 +9,20 @@ non-long-tail blocker, and must stay idempotent and immutable after publish.
 from __future__ import annotations
 
 import json
+import os
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 from openpyxl import load_workbook
 
 from app.services.daily_audit_store import DailyAuditStore, ProcessLock
+from app.services.incremental_audit_runtime import (
+    run_force_finalize_command,
+    run_runtime_command,
+)
+from app.services.incremental_audit_status import collect_runtime_status
+from app.services.incremental_audit_materializer import LegacyWorkbookMaterializer
 from app.workflows.incremental_price_audit_finalize import (
     ForceFinalizeRejected,
     build_frozen_audit_artifact,
@@ -169,11 +177,15 @@ def test_force_finalize_publishes_formal_workbook_with_force_audit(tmp_path):
     output = tmp_path / "formal.xlsx"
 
     publication = materialize_forced_frozen_daily_run(
-        store, ProcessLock(tmp_path / "finalize.lock"), DATE, output, max_incomplete=10,
+        store, ProcessLock(tmp_path / "finalize.lock"), DATE, output, max_incomplete=2,
     )
 
     assert publication.already_finalized is False
-    assert publication.forced_incomplete_count == 3  # 2 crawl rows + 1 in-flight remote job
+    # Business threshold counts data rows without a crawl result; the one
+    # in-flight remote job is recorded separately and never eats the budget.
+    assert publication.forced_incomplete_count == 2
+    assert publication.remote_incomplete_job_count == 1
+    assert publication.blocker_count == 3
     assert publication.materialization is not None
     assert publication.materialization.output_path == output.resolve()
     assert output.is_file()
@@ -185,9 +197,12 @@ def test_force_finalize_publishes_formal_workbook_with_force_audit(tmp_path):
     metrics = _metrics(store)
     assert metrics["force_finalize"] is True
     assert metrics["forced"] is True
-    assert metrics["forced_incomplete_count"] == 3
-    assert metrics["force_finalize_max_incomplete"] == 10
-    assert metrics["force_finalize_actual_incomplete"] == 3
+    assert metrics["forced_incomplete_count"] == 2
+    assert metrics["forced_incomplete_item_count"] == 2
+    assert metrics["remote_incomplete_job_count"] == 1
+    assert metrics["blocker_count"] == 3
+    assert metrics["force_finalize_max_incomplete"] == 2
+    assert metrics["force_finalize_actual_incomplete"] == 2
     assert metrics["force_finalize_reason"] == "operator accepted limited remote crawl incompleteness"
     assert metrics["force_finalize_at"]
     assert metrics["frozen_snapshot_id"] == run["frozen_snapshot_id"]
@@ -206,9 +221,27 @@ def test_force_finalize_publishes_formal_workbook_with_force_audit(tmp_path):
     assert {item["crawl_state"] for item in task["crawl_items"]} == {"SUBMITTED"}
 
 
-# Case 2: tolerable incomplete above the threshold must be refused.
-def test_force_finalize_rejects_when_incomplete_exceeds_max(tmp_path):
+# Business example: 10 crawl rows + 1 remote job is allowed at max_incomplete=10.
+def test_force_finalize_item_budget_is_not_consumed_by_remote_jobs(tmp_path):
     rows = [_row(f"v-{index}", f"sku-{index}", f"https://shop.example/item-{index}") for index in range(1, 11)]
+    store, _snapshot, crawls = _seed_force(tmp_path, rows=rows)
+    _link_inflight_job(store, tmp_path, crawls)
+    output = tmp_path / "formal.xlsx"
+
+    publication = materialize_forced_frozen_daily_run(
+        store, ProcessLock(tmp_path / "finalize.lock"), DATE, output, max_incomplete=10,
+    )
+
+    assert publication.forced_incomplete_count == 10
+    assert publication.remote_incomplete_job_count == 1
+    assert publication.blocker_count == 11  # 11 blockers, still allowed
+    assert store.get_run(DATE)["state"] == "FINALIZED"
+    assert output.is_file()
+
+
+# Case 2: tolerable incomplete items above the threshold must be refused.
+def test_force_finalize_rejects_when_incomplete_exceeds_max(tmp_path):
+    rows = [_row(f"v-{index}", f"sku-{index}", f"https://shop.example/item-{index}") for index in range(1, 12)]
     store, _snapshot, crawls = _seed_force(tmp_path, rows=rows)
     _link_inflight_job(store, tmp_path, crawls)
     output = tmp_path / "formal.xlsx"
@@ -220,7 +253,7 @@ def test_force_finalize_rejects_when_incomplete_exceeds_max(tmp_path):
 
     assert excinfo.value.error_type == "FORCE_FINALIZE_INCOMPLETE_LIMIT_EXCEEDED"
     assert excinfo.value.readiness is not None
-    assert excinfo.value.readiness.crawl_awaiting_remote == 10
+    assert excinfo.value.readiness.crawl_awaiting_remote == 11
     assert excinfo.value.readiness.remote_awaiting_remote == 1
     assert not output.exists()
     assert store.get_run(DATE)["state"] != "FINALIZED"
@@ -362,6 +395,9 @@ def test_force_finalize_is_idempotent_after_success(tmp_path):
 
     assert second.already_finalized is True
     assert second.forced is True
+    assert second.forced_incomplete_count == 2
+    assert second.remote_incomplete_job_count == 1
+    assert second.blocker_count == 3
     assert second.frozen_snapshot_id == first.frozen_snapshot_id
     assert second.output_path == output.resolve()
     assert output.read_bytes() == published
@@ -387,7 +423,9 @@ def test_force_finalize_workbook_covers_whole_frozen_snapshot(tmp_path):
         store, ProcessLock(tmp_path / "finalize.lock"), DATE, output, max_incomplete=10,
     )
 
-    assert publication.forced_incomplete_count == 3  # 2 rows + 1 remote job
+    assert publication.forced_incomplete_count == 2  # the 2 unfinished rows
+    assert publication.remote_incomplete_job_count == 1
+    assert publication.blocker_count == 3
     workbook = load_workbook(output, read_only=True, data_only=True)
     try:
         sheet = workbook["record_results"]
@@ -480,7 +518,9 @@ def test_cli_force_finalize_outputs_json_and_exit_zero(tmp_path, capsys):
     assert payload["outcome"] == "FORCE_FINALIZED"
     assert payload["frozen_snapshot_id"] == store.get_run(DATE)["frozen_snapshot_id"]
     assert payload["frozen_row_count"] == 2
-    assert payload["forced_incomplete_count"] == 3
+    assert payload["forced_incomplete_count"] == 2
+    assert payload["remote_incomplete_job_count"] == 1
+    assert payload["blocker_count"] == 3
     assert payload["max_incomplete"] == 10
     assert payload["manifest_recorded"] is True
     assert payload["finalized"] is True
@@ -502,3 +542,87 @@ def test_cli_force_finalize_failure_reports_error_type_and_exit_two(tmp_path, ca
     assert code == 2
     payload = json.loads(capsys.readouterr().out)
     assert payload["error_type"] == "FORCE_FINALIZE_NOT_FROZEN"
+
+
+# Production-writer mutual exclusion, direction 1: while force-finalize is
+# inside its critical section, a real closeout must be refused entry.
+def test_closeout_cannot_enter_while_force_finalize_holds_production_lock(tmp_path, monkeypatch):
+    store, _snapshot, crawls = _seed_force(tmp_path)
+    _link_inflight_job(store, tmp_path, crawls)
+    runtime_root = tmp_path / "runtime"
+    lock_path = runtime_root / DATE / "incremental_price_audit.lock"
+    original_materialize = LegacyWorkbookMaterializer.materialize
+    probe: dict = {}
+
+    def probing_materialize(self, artifact, output_path):
+        # Runs inside force-finalize's critical section: readiness is already
+        # validated, the final writer is about to publish.  A closeout arriving
+        # now must hit the production writer lock and be refused entry.
+        result = run_runtime_command("closeout", business_date=DATE, runtime_root=runtime_root)
+        probe["outcome"] = result.tick.outcome
+        probe["lock_conflict"] = result.lock_conflict
+        return original_materialize(self, artifact, output_path)
+
+    monkeypatch.setattr(LegacyWorkbookMaterializer, "materialize", probing_materialize)
+    publication = materialize_forced_frozen_daily_run(
+        store, ProcessLock(lock_path), DATE, runtime_root / DATE / "formal.xlsx", max_incomplete=10,
+    )
+
+    assert publication.forced is True
+    assert probe["outcome"] == "ALREADY_RUNNING"
+    assert probe["lock_conflict"] is not None
+    assert probe["lock_conflict"]["requested"] == "closeout"
+    assert store.get_run(DATE)["state"] == "FINALIZED"
+
+
+# Production-writer mutual exclusion, direction 2: while a closeout owns the
+# same per-day production writer lock, force-finalize must refuse to run.
+def test_force_finalize_refused_while_closeout_holds_production_lock(tmp_path):
+    store, _snapshot, crawls = _seed_force(tmp_path)
+    _link_inflight_job(store, tmp_path, crawls)
+    runtime_root = tmp_path / "runtime"
+    closeout_lock = ProcessLock(runtime_root / DATE / "incremental_price_audit.lock")
+    closeout_lock.acquire(owner={
+        "business_date": DATE,
+        "pid": os.getpid(),
+        "command": "closeout",
+        "started_at": datetime.now(UTC).isoformat(timespec="seconds"),
+        "invocation": "scheduler",
+    })
+
+    result = run_force_finalize_command(
+        business_date=DATE, runtime_root=runtime_root, max_incomplete=10,
+    )
+
+    assert result["outcome"] == "FORCE_FINALIZE_PRODUCTION_WRITER_ACTIVE"
+    assert result["error_type"] == "FORCE_FINALIZE_PRODUCTION_WRITER_ACTIVE"
+    assert store.get_run(DATE)["state"] != "FINALIZED"
+    assert not (runtime_root / DATE / "saas_audit_final_20260824.xlsx").exists()
+    closeout_lock.release()
+
+
+# Status semantics after a forced finalize: durable crawl/remote work keeps its
+# real in-flight states, but status reports the day as forced-finalized and
+# never prompts rerunning finalize or delivering the day again.
+def test_status_after_forced_finalize_reports_done_without_rerun_prompts(tmp_path):
+    store, _snapshot, crawls = _seed_force(tmp_path)
+    _link_inflight_job(store, tmp_path, crawls)
+    runtime_root = tmp_path / "runtime"
+    result = run_force_finalize_command(
+        business_date=DATE, runtime_root=runtime_root, max_incomplete=10,
+    )
+    assert result["outcome"] == "FORCE_FINALIZED"
+
+    status = collect_runtime_status(business_date=DATE, runtime_root=runtime_root)
+
+    assert status["state"] == "FINALIZED"
+    assert status["final"]["finalized"] is True
+    assert status["final"]["forced"] is True
+    assert status["final"]["manifest_recorded"] is True
+    assert status["final"]["output_exists"] is True
+    assert status["final"]["output_path"].endswith("saas_audit_final_20260824.xlsx")
+    # Durable history keeps its real in-flight states...
+    assert status["crawl"]["running"] == 2
+    assert status["remote"]["awaiting_harvest"] == 1
+    # ...while next_actions no longer suggest any rerun/delivery work.
+    assert status["next_actions"] == ["none; the frozen daily workbook is finalized"]

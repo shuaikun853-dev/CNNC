@@ -853,6 +853,8 @@ class ForceFinalizePublication:
     readiness: FinalizeReadiness
     materialization: MaterializationResult | None
     forced_incomplete_count: int
+    remote_incomplete_job_count: int
+    blocker_count: int
     incomplete_tasks: tuple[Mapping[str, Any], ...]
     already_finalized: bool
     frozen_snapshot_id: int | None
@@ -935,7 +937,9 @@ def _already_finalized_publication(run: Mapping[str, Any]) -> ForceFinalizePubli
     return ForceFinalizePublication(
         readiness=FinalizeReadiness(),
         materialization=None,
-        forced_incomplete_count=int(metrics.get("forced_incomplete_count", 0) or 0),
+        forced_incomplete_count=int(metrics.get("forced_incomplete_item_count", metrics.get("forced_incomplete_count", 0)) or 0),
+        remote_incomplete_job_count=int(metrics.get("remote_incomplete_job_count", 0) or 0),
+        blocker_count=int(metrics.get("blocker_count", 0) or 0),
         incomplete_tasks=(),
         already_finalized=True,
         frozen_snapshot_id=int(run["frozen_snapshot_id"]) if run.get("frozen_snapshot_id") is not None else None,
@@ -957,9 +961,11 @@ def materialize_forced_frozen_daily_run(
 
     Preconditions: the day must already be frozen, no production writer may be
     active, and every remaining blocker must be an already-submitted Zhaoshang
-    crawl/remote item within ``max_incomplete``.  Rows without crawl results
-    keep the existing writer "no result" semantics; nothing is fabricated, and
-    the durable remote state survives untouched as history.
+    crawl/remote item.  ``max_incomplete`` bounds the number of business rows
+    without a crawl result; in-flight remote jobs are counted separately.
+    Rows without crawl results keep the existing writer "no result" semantics;
+    nothing is fabricated, and the durable remote state survives untouched as
+    history.
     """
     if max_incomplete < 0:
         raise ValueError("max_incomplete must be zero or positive")
@@ -1021,11 +1027,17 @@ def materialize_forced_frozen_daily_run(
                 f"non-tolerable blockers remain: {rendered}",
                 readiness,
             )
-        tolerable = readiness.crawl_awaiting_remote + readiness.remote_awaiting_remote
-        if tolerable > max_incomplete:
+        # Business threshold: at most N data rows may lack a crawl result.
+        # In-flight remote jobs are recorded separately and never consume the
+        # item budget.
+        item_count = readiness.crawl_awaiting_remote
+        remote_job_count = readiness.remote_awaiting_remote
+        blocker_count = item_count + remote_job_count
+        if item_count > max_incomplete:
             raise ForceFinalizeRejected(
                 "FORCE_FINALIZE_INCOMPLETE_LIMIT_EXCEEDED",
-                f"tolerable incomplete {tolerable} exceeds max_incomplete {max_incomplete}",
+                f"tolerable incomplete items {item_count} (plus {remote_job_count} in-flight remote jobs)"
+                f" exceed max_incomplete {max_incomplete}",
                 readiness,
             )
         incomplete_tasks = _collect_incomplete_tasks(store, token)
@@ -1038,11 +1050,14 @@ def materialize_forced_frozen_daily_run(
             {
                 "finalized_rows": result.row_count,
                 "forced": True,
-                "forced_incomplete_count": tolerable,
+                "forced_incomplete_count": item_count,
+                "forced_incomplete_item_count": item_count,
+                "remote_incomplete_job_count": remote_job_count,
+                "blocker_count": blocker_count,
                 "force_finalize": True,
                 "force_finalize_at": datetime.now(UTC).isoformat(timespec="seconds"),
                 "force_finalize_max_incomplete": max_incomplete,
-                "force_finalize_actual_incomplete": tolerable,
+                "force_finalize_actual_incomplete": item_count,
                 "force_finalize_reason": FORCE_FINALIZE_REASON,
                 "frozen_snapshot_id": int(run["frozen_snapshot_id"]),
                 "frozen_row_count": readiness.frozen_rows,
@@ -1053,7 +1068,9 @@ def materialize_forced_frozen_daily_run(
         return ForceFinalizePublication(
             readiness=readiness,
             materialization=result,
-            forced_incomplete_count=tolerable,
+            forced_incomplete_count=item_count,
+            remote_incomplete_job_count=remote_job_count,
+            blocker_count=blocker_count,
             incomplete_tasks=incomplete_tasks,
             already_finalized=False,
             frozen_snapshot_id=int(run["frozen_snapshot_id"]),

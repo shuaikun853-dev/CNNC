@@ -114,6 +114,7 @@ def _empty_status(
         },
         "final": {
             "pending": 0, "computed_pending": 0, "frozen": False, "finalized": False,
+            "forced": False,
             "output_path": None, "output_exists": False, "manifest_recorded": False,
             "blocker_summary": _empty_blocker_summary(),
         },
@@ -402,6 +403,9 @@ def collect_runtime_status(
             "computed_pending": computed_final_pending,
             "frozen": run["frozen_snapshot_id"] is not None,
             "finalized": str(run["state"]) == "FINALIZED",
+            # True only when the FINALIZED outcome came from an explicit
+            # guarded force-finalize; metrics carry the durable audit flag.
+            "forced": bool(metrics.get("force_finalize", False)),
             "output_path": output_path,
             "output_exists": bool(output_path and Path(output_path).is_file()),
             "manifest_recorded": bool(run["final_manifest_hash"]),
