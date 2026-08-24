@@ -45,6 +45,11 @@ class TickConfig:
     cutoff_at: datetime | None = None
     detail_max_attempts: int = 3
     detail_max_elapsed_seconds: float = 300
+    # NOTE: every *_max_elapsed_seconds budget below (model, harvest, priority)
+    # measures cumulative callback ACTIVE time — the sum of per-claim elapsed
+    # recorded by fail_stage_work/record_harvest while a callback actually
+    # ran.  It is NOT the wall-clock age of the work since its first attempt:
+    # scheduler gaps, backoff windows and process downtime never consume it.
     # The adapter performs its bounded HTTP retries inside one durable claim.
     # The durable replay window spans several scheduler passes so a short
     # provider outage (transport error or model-response contract drift)
@@ -64,7 +69,9 @@ class TickConfig:
     # Only adapter-confirmed retryable Priority failures (transient transport,
     # rows not yet materialized) consume this budget; non-retryable failures go
     # MANUAL on first evidence.  The window matches the harvest budget so a
-    # remotely slow task keeps probing instead of blocking the day's closeout.
+    # remotely slow task keeps probing instead of blocking the day's closeout;
+    # like harvest_max_elapsed_seconds it counts cumulative probe callback
+    # time, not the wall-clock age of the pending job.
     priority_retry_max_attempts: int = 120
     priority_retry_max_elapsed_seconds: float = 21600
     harvest_batch_size: int = 6
