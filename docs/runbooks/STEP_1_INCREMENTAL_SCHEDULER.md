@@ -43,17 +43,19 @@ SQLite 仅有七张 checkpoint 表：`daily_runs`、`snapshots`、`audit_items`�
 | Program | Windows PowerShell |
 | Runner | `scripts\run_incremental_price_audit_scheduled.ps1` |
 | Start in | 仓库根目录 |
-| Trigger | 每周一至周五，09:00 起每 15 分钟唤醒，最后一次 20:00 |
+| Trigger | 每周一至周五共三个 trigger：09:00 起每 15 分钟唤醒至 16:45；17:00 起每 5 分钟唤醒至 17:55；18:00 起每 5 分钟唤醒至 20:00（最后一次 20:00） |
 | Multiple instances | **IgnoreNew** |
 | Application budget | tick/harvest-only **720 秒**；closeout **1680 秒** |
 | ExecutionTimeLimit | **32 分钟（1920 秒）** |
 
-runner 是一次性有限进程，不含常驻 daemon。09:00-17:00 整点运行 `tick`，17:15、17:30 和 17:45
-再各运行一次 `tick`；09:15-16:45 的白天非整点 15 分钟唤醒运行 `harvest-only`（只回收已存在的招商局
-remote jobs：不查 SaaS、不跑 Detail/Model、不 submit、不 finalize；本地无 eligible remote job 时纯本地
-NOOP，不请求招商局）。18:00-20:00 每 15 分钟运行 `closeout`，
-**20:00 是当天最后一次自动 closeout**；20:15 后不再有任何自动调度，即使被人工误调用也会快速空操作退出。
-closeout 在一个进程内持续推进，不为下一个 15 分钟唤醒等待：SaaS 稳定观察最快每 300 秒一次，
+runner 是一次性有限进程，不含常驻 daemon。09:00-16:00 整点运行 `tick`；09:15-16:45 的白天非整点
+15 分钟唤醒运行 `harvest-only`（只回收已存在的招商局 remote jobs：不查 SaaS、不跑 Detail/Model、不
+submit、不 finalize；本地无 eligible remote job 时纯本地 NOOP，不请求招商局）。17:00-17:50 每 5 分钟
+运行一次 `tick`（17 点是 SaaS 新数据高峰，提高启动机会；单轮超时不并发，靠 IgnoreNew 丢弃重叠
+trigger）；**17:55 只运行 `harvest-only`**，优先排空 17 点已创建的招商局远端任务，不产生新 discovery、
+新 ADD 或新 remote create。18:00-20:00 每 5 分钟提供一次 `closeout` 启动机会，
+**20:00 是当天最后一次自动 closeout**；20:05 后不再有任何自动调度，即使被人工误调用也会快速空操作退出。
+closeout 在一个进程内持续推进，不为下一个 5 分钟唤醒等待：SaaS 稳定观察最快每 300 秒一次，
 招商局 full sweep 最快每 600 秒一次（单批最多 6 个，一轮覆盖全部 eligible remote jobs）。18:00 后只要
 最近 authoritative 观测的 `row_count` 与 `ordered_hash` 连续 600 秒一致且本次分页完整，即可 freeze
 最新 snapshot（17:45 与 18:00 相同则 18:00 直接 freeze，无需等到 18:10；期间变化则窗口重新计时）。
@@ -61,6 +63,11 @@ closeout 在一个进程内持续推进，不为下一个 15 分钟唤醒等待�
 只继续 Detail/Model/Submit/Priority/Harvest/backfill/readiness/materialize；blocker 清零后同一进程立即
 materialize final.xlsx。`state=FINALIZED` 后任何 Scheduler 或手工 tick/closeout/finalize 都在发出
 SaaS/招商局/remote submit 请求前直接 `ALREADY_FINALIZED` NOOP。
+
+高频窗口只提高空闲后的响应速度，不改变并发语义：任务级 `IgnoreNew` 保证任意时刻至多一个生产
+writer。例如 17:30 的 tick 运行 9 分钟时，17:35 的 trigger 被自动丢弃，17:40 正常启动；18:00 的
+closeout 运行 12 分钟时，18:05 与 18:10 被丢弃，18:15 重新进入；closeout 提前结束后最多约 5 分钟
+即可获得下一次启动机会，而不再是 15 分钟。
 
 Scheduler 默认仅周一至周五运行。周六、周日中核不产生业务推送，因此不执行自动增量处理。
 主限制由 Weekly trigger 的 `Monday` 至 `Friday` 实现，不注册周末 trigger，也不启用
@@ -72,7 +79,8 @@ Scheduler 默认仅周一至周五运行。周六、周日中核不产生业务�
 并覆盖整个命令生命周期。`tick`、`closeout`、`finalize`、`drain-only`、`harvest-only` 竞争同一把锁；拿不到时立即输出
 `SKIPPED_ALREADY_RUNNING` 并以 0 正常退出，不等待也不进入 lifecycle。Windows Task Scheduler 的
 `IgnoreNew` 是额外的 no-overlap 防护，内部 fenced DB lease 继续保留。预算接近末尾
-reserve 时不会领取新重工作，下一次 15 分钟唤醒继续 backlog。Python wall-clock budget 无法强行中断卡在
+reserve 时不会领取新重工作，下一次调度唤醒继续 backlog（白天最多 15 分钟、17 点高峰与
+closeout 窗口最多 5 分钟）。Python wall-clock budget 无法强行中断卡在
 操作系统或第三方库里的单次调用，所以 Scheduler 在 32 分钟作硬兜底。若硬停止恰逢 POST，
 已落库的 immutable intent 会在下一 tick 进入精确对账，而不是重发。调度日志按业务日写入
 `runtime\incremental_price_audit\scheduler_logs\YYYY-MM-DD.log`。
@@ -93,7 +101,8 @@ powershell -NoProfile -File scripts\register_incremental_price_audit_tasks.ps1 `
   -Apply
 ```
 
-脚本固定使用 legacy 招商局 backend、`MultipleInstances=IgnoreNew`、15 分钟间隔和 32 分钟硬上限。
+脚本固定使用 legacy 招商局 backend、`MultipleInstances=IgnoreNew`、三窗口 trigger（白天 15 分钟、
+17:00-17:55 与 18:00-20:00 每 5 分钟）和 32 分钟硬上限。
 若发现旧的 `-Tick` / `-Finalize` 双任务仍存在，注册会拒绝继续，而不会暗中删除或制造竞争任务。
 注册身份沿用当前项目的交互式低权限用户上下文；机器关机或用户未登录时不会强行改用另一套凭证。
 

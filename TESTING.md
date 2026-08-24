@@ -57,8 +57,8 @@ python -m pytest tests\test_context_documents.py -q
 ```
 ### 增量价格审计
 ```powershell
-# Scheduler 15 分钟路由、snapshot 180 秒有限重试、公平/post harvest、当前 row_count/saas_count freeze gate，以及同 business_date writer lock 和只读 status
-python -m pytest tests\test_incremental_audit_operations.py -k "scheduler or scheduled" -q
+# Scheduler 路由（白天 15 分钟、17:00-17:50 每 5 分钟 tick、17:55 harvest-only、18:00-20:00 每 5 分钟 closeout）、snapshot 180 秒有限重试、公平/post harvest、freeze gate、writer lock、只读 status；simulation 文件另证三 trigger 时间线 + IgnoreNew 重叠丢弃/不堆积/单 writer（2/6/9 分钟 tick、12/20 分钟 closeout）
+python -m pytest tests\test_incremental_audit_operations.py -k "scheduler or scheduled" -q; python -m pytest tests\test_scheduler_frequency_simulation.py -q
 python -m pytest tests\test_harvest_only.py -q  # 白天 harvest-only：无 discovery/Detail/Model/submit/finalize、本地 NOOP、全量 sweep、幂等
 python -m pytest tests\test_incremental_price_audit.py tests\test_incremental_audit_runtime.py -k "existing_remote_drain or drain_only" -q
 python -m pytest tests\test_daily_audit_store.py tests\test_incremental_audit_runtime.py tests\test_incremental_audit_operations.py -k "process_lock or writer_lock or lock_conflict or lock_status or active_writer or materialization_remains" -q
@@ -70,7 +70,7 @@ python -m pytest `
   tests\test_incremental_price_audit.py `
   tests\test_incremental_audit_runtime.py `
   tests\test_harvest_only.py `
-  tests\test_incremental_audit_operations.py tests\test_incremental_audit_resilience.py tests\test_incremental_audit_recovery.py `
+  tests\test_incremental_audit_operations.py tests\test_incremental_audit_resilience.py tests\test_incremental_audit_recovery.py tests\test_scheduler_frequency_simulation.py `
   tests\test_partial_exact_harvest.py `
   tests\test_incremental_price_audit_finalize.py `
   tests\test_incremental_production_readiness_audit.py `
