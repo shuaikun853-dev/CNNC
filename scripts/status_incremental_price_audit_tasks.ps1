@@ -40,6 +40,8 @@ if ($null -eq $task) {
         StartBoundary = $null
         RepetitionInterval = $null
         RepetitionDuration = $null
+        TriggerCount = 0
+        Triggers = @()
         StartWhenAvailable = $null
         ConflictingLegacyTasks = @(
             "$TaskName-Tick", "$TaskName-Finalize" |
@@ -50,8 +52,21 @@ if ($null -eq $task) {
 }
 
 $info = Get-ScheduledTaskInfo -TaskName $TaskName
-$trigger = $task.Triggers[0]
-$localStart = [datetime]::Parse([string]$trigger.StartBoundary).ToLocalTime()
+$triggerSummaries = @(
+    foreach ($trigger in $task.Triggers) {
+        $localStart = [datetime]::Parse([string]$trigger.StartBoundary).ToLocalTime()
+        [pscustomobject]@{
+            TriggerType = [string]$trigger.CimClass.CimClassName
+            DaysOfWeek = @(ConvertFrom-DayOfWeekMask $trigger.DaysOfWeek)
+            WeeksInterval = [int]$trigger.WeeksInterval
+            StartBoundary = $localStart.ToString("yyyy-MM-ddTHH:mm:ssK")
+            StartTime = $localStart.ToString("HH:mm")
+            RepetitionInterval = [string]$trigger.Repetition.Interval
+            RepetitionDuration = [string]$trigger.Repetition.Duration
+        }
+    }
+)
+$first = $triggerSummaries[0]
 [pscustomobject]@{
     TaskName = $TaskName
     Installed = $true
@@ -62,12 +77,14 @@ $localStart = [datetime]::Parse([string]$trigger.StartBoundary).ToLocalTime()
     MultipleInstances = [string]$task.Settings.MultipleInstances
     ExecutionTimeLimit = [string]$task.Settings.ExecutionTimeLimit
     TriggerType = "Weekly"
-    DaysOfWeek = @(ConvertFrom-DayOfWeekMask $trigger.DaysOfWeek)
-    WeeksInterval = [int]$trigger.WeeksInterval
-    StartBoundary = $localStart.ToString("yyyy-MM-ddTHH:mm:ssK")
-    StartTime = $localStart.ToString("HH:mm")
-    RepetitionInterval = [string]$trigger.Repetition.Interval
-    RepetitionDuration = [string]$trigger.Repetition.Duration
+    TriggerCount = $triggerSummaries.Count
+    DaysOfWeek = $first.DaysOfWeek
+    WeeksInterval = $first.WeeksInterval
+    StartBoundary = $first.StartBoundary
+    StartTime = $first.StartTime
+    RepetitionInterval = $first.RepetitionInterval
+    RepetitionDuration = $first.RepetitionDuration
+    Triggers = $triggerSummaries
     StartWhenAvailable = [bool]$task.Settings.StartWhenAvailable
     Action = [string]$task.Actions[0].Execute
     Arguments = [string]$task.Actions[0].Arguments
