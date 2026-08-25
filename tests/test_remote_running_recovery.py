@@ -551,10 +551,18 @@ class _FakeRestartResponse:
 class _RestartSession:
     """Stateful fake: updateState flips the exact task's enabled flag."""
 
-    def __init__(self, task: dict, *, fail_disable: bool = False, fail_enable: bool = False) -> None:
+    def __init__(
+        self,
+        task: dict,
+        *,
+        fail_disable: bool = False,
+        fail_enable: bool = False,
+        status_rsp_desc: str = "执行中",
+    ) -> None:
         self.task = task
         self.fail_disable = fail_disable
         self.fail_enable = fail_enable
+        self.status_rsp_desc = status_rsp_desc
         self.update_calls: list[dict] = []
 
     def post(self, url, json=None, timeout=None):
@@ -575,7 +583,7 @@ class _RestartSession:
                 {"rspCode": "0000", "rspDesc": NO_PRICE_RSP, "count": 0, "data": None, "success": True}
             )
         if "queryTaskStatus" in url:
-            return _FakeRestartResponse({"rspDesc": "执行中", "success": True})
+            return _FakeRestartResponse({"rspDesc": self.status_rsp_desc, "success": True})
         return _FakeRestartResponse({"data": [dict(self.task)]})
 
     def get(self, url, params=None, timeout=None):
@@ -616,7 +624,7 @@ def _restart_tool_module(task: dict, session: _RestartSession):
 
         @staticmethod
         def query_task_status(session, task_id):
-            return {"rspDesc": "执行中", "success": True}
+            return {"rspDesc": session.status_rsp_desc, "success": True}
 
         @staticmethod
         def query_task_progress(session, batch_number):
@@ -813,6 +821,95 @@ def test_fresh_externally_disabled_outcome_fails_closed_to_manual(tmp_path) -> N
     assert int(refreshed["recovery_attempts"] or 0) == 0
     evidence = json.loads(str(refreshed["recovery_evidence_json"]))
     assert evidence["restart"]["phase"] != "ENABLE_SENT"
+
+
+# ---------------------------------------------------------------------------
+# Review round 2, Finding 2: the write path must revalidate that the exact
+# task is STILL RUNNING right before the first fresh remote write, and only
+# status-confirmed-running observations may count as stall evidence.  The
+# status vocabulary is evidence-anchored: "本次任务执行完毕" is the terminal
+# marker the external tool itself interprets (auto_crawl_task.py:1048) and
+# "执行中" is the platform's executing label; anything else fails closed.
+# ---------------------------------------------------------------------------
+
+
+def test_adapter_fresh_restart_declines_when_task_completed_between_probe_and_write(
+    tmp_path, monkeypatch
+) -> None:
+    task = _running_task_record()
+    session = _RestartSession(task, status_rsp_desc="本次任务执行完毕")
+    adapter, prepared = _prepared_job(tmp_path, monkeypatch, task, session)
+
+    outcome = adapter.restart_running_task(prepared, TASK_ID, TASK_NUMBER, timeout_seconds=60.0)
+
+    assert outcome.status.value == "NO_LONGER_RUNNING"
+    assert session.update_calls == []
+
+
+def test_adapter_fresh_restart_declines_on_unknown_remote_status(tmp_path, monkeypatch) -> None:
+    task = _running_task_record()
+    session = _RestartSession(task, status_rsp_desc="状态异常")
+    adapter, prepared = _prepared_job(tmp_path, monkeypatch, task, session)
+
+    outcome = adapter.restart_running_task(prepared, TASK_ID, TASK_NUMBER, timeout_seconds=60.0)
+
+    assert outcome.status.value == "NO_LONGER_RUNNING"
+    assert session.update_calls == []
+
+
+def test_adapter_fresh_restart_declines_on_empty_remote_status(tmp_path, monkeypatch) -> None:
+    task = _running_task_record()
+    session = _RestartSession(task, status_rsp_desc="")
+    adapter, prepared = _prepared_job(tmp_path, monkeypatch, task, session)
+
+    outcome = adapter.restart_running_task(prepared, TASK_ID, TASK_NUMBER, timeout_seconds=60.0)
+
+    assert outcome.status.value == "NO_LONGER_RUNNING"
+    assert session.update_calls == []
+
+
+def test_no_longer_running_outcome_leaves_job_harvestable_and_reset(tmp_path) -> None:
+    store, job_id = _stalled_store(tmp_path)
+    restart = _FakeRestart([{"status": "NO_LONGER_RUNNING", "restarted": False}])
+    _run_pass(store, _probe_payload(), restart)
+    refreshed = store.get_remote_job(job_id)
+    assert refreshed["state"] == "RUNNING"
+    assert int(refreshed["recovery_attempts"] or 0) == 0
+    evidence = json.loads(str(refreshed["recovery_evidence_json"]))
+    assert evidence["restart"]["phase"] not in {"DISABLE_SENT", "ENABLE_SENT"}
+    # The declined write-ahead phase must not wedge the protocol: once the
+    # task proves stalled again a later pass may still restart it fresh.
+    working = _FakeRestart(
+        [
+            {
+                "status": "RESTARTED",
+                "restarted": True,
+                "disable_evidence": {"confirmed_disabled": True},
+                "enable_evidence": {"confirmed_enabled": True},
+            }
+        ]
+    )
+    _run_pass(store, _probe_payload(), working, now=NOW + timedelta(minutes=95))
+    assert working.calls == [(job_id, None)]
+    assert int(store.get_remote_job(job_id)["recovery_attempts"]) == 1
+
+
+def test_stationary_observations_with_terminal_status_are_not_stall_evidence() -> None:
+    evidence = _observations(4)
+    for row in evidence["observations"]:
+        row["task_status_rsp_desc"] = "本次任务执行完毕"
+    job = _job(evidence=evidence)
+    decision = evaluate_running_stall(job, now=NOW)
+    assert decision["stalled"] is False
+
+
+def test_stationary_observations_without_status_are_not_stall_evidence() -> None:
+    evidence = _observations(4)
+    for row in evidence["observations"]:
+        row["task_status_rsp_desc"] = ""
+    job = _job(evidence=evidence)
+    decision = evaluate_running_stall(job, now=NOW)
+    assert decision["stalled"] is False
 
 
 def test_adapter_probe_running_task_reports_progress_and_export(tmp_path, monkeypatch) -> None:

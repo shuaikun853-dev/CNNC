@@ -33,6 +33,20 @@ PROGRESS_FIELDS: tuple[str, ...] = (
     "finished",
 )
 RUNNING_STALL_EXPORT_NO_PRICE_RSP_DESC = "未检索到商品价格信息"
+# Task-status rspDesc vocabulary, anchored in evidence rather than guesses:
+# the external tool itself interprets exactly one status value — the terminal
+# marker "本次任务执行完毕" (auto_crawl_task.py:1048) — and production captures
+# (job 54) carry the same marker; "执行中" is the platform's executing label
+# used by the tool's progress parser.  An observation or write gate counts as
+# "still running" ONLY on that confirmed marker; empty, terminal, or
+# unrecognized values fail closed.
+RUNNING_STATUS_RUNNING_MARKERS: frozenset[str] = frozenset({"执行中"})
+RUNNING_STATUS_TERMINAL_MARKERS: frozenset[str] = frozenset({"本次任务执行完毕"})
+
+
+def is_remote_task_still_running(task_status_rsp_desc: object) -> bool:
+    """True only when the live status string is a confirmed still-running answer."""
+    return _text(task_status_rsp_desc) in RUNNING_STATUS_RUNNING_MARKERS
 # Candidate gating: only RUNNING jobs that have been harvested at least twice
 # and are at least 30 minutes old spend read-only probe calls.
 RUNNING_PROBE_MIN_HARVEST_ATTEMPTS = 2
@@ -169,6 +183,8 @@ def observation_from_probe(probe: Mapping[str, Any], *, now: datetime) -> dict[s
 
 def _observation_is_no_price(row: Mapping[str, Any]) -> bool:
     if row.get("signature") is None:
+        return False
+    if not is_remote_task_still_running(row.get("task_status_rsp_desc")):
         return False
     if bool(row.get("export_had_result")):
         return False
@@ -412,6 +428,20 @@ def _apply_restart(
             else f"remote stall recovery exact identity failure: {status}"
         )
         store.mark_remote_manual(token, job_id, f"{reason}; {_text(outcome.get('diagnostic'))}")
+        return outcome
+    if status == "NO_LONGER_RUNNING":
+        # A zero-write decline: the adapter proved the exact task is not
+        # still running, so no side effect ever left this protocol.  The
+        # write-ahead phase must be withdrawn, or a later pass would resume
+        # as if a disable had been sent.  The job stays RUNNING/harvestable;
+        # ordinary harvest reconciles the real terminal state.
+        evidence["restart"] = {
+            "phase": "DECLINED",
+            "phase_at": now.astimezone(UTC).isoformat(timespec="seconds"),
+            "declined_status": status,
+            "diagnostic": _text(outcome.get("diagnostic")),
+        }
+        store.update_remote_recovery_evidence(token, job_id, evidence)
         return outcome
     restart["diagnostic"] = _text(outcome.get("diagnostic")) or status
     store.update_remote_recovery_evidence(token, job_id, evidence)

@@ -224,6 +224,7 @@ class RestartStatus(str, Enum):
     IDENTITY_CONFLICT = "IDENTITY_CONFLICT"
     NOT_RUNNING = "NOT_RUNNING"
     EXTERNALLY_DISABLED = "EXTERNALLY_DISABLED"
+    NO_LONGER_RUNNING = "NO_LONGER_RUNNING"
     DISABLE_UNKNOWN = "DISABLE_UNKNOWN"
     DISABLE_UNCONFIRMED = "DISABLE_UNCONFIRMED"
     ENABLE_UNKNOWN = "ENABLE_UNKNOWN"
@@ -1865,6 +1866,28 @@ class CnncLegacyZhaoshangAdapter:
                         "evidence; refusing to enable an externally disabled task"
                     ),
                 )
+
+            if resume_phase is None:
+                # Write-time revalidation (race guard): the probe may have seen
+                # RUNNING minutes ago, but the task may have completed since.
+                # The first fresh remote write requires the live status to
+                # confirm the task is STILL running; anything else declines
+                # with zero writes and leaves the job to ordinary harvest.
+                from app.services.remote_running_recovery import is_remote_task_still_running
+
+                remaining = deadline - self._monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("restart deadline exhausted before status revalidation")
+                status = tool.query_task_status(session, live_task_id)
+                status_desc = _text(status.get("rspDesc")) if isinstance(status, Mapping) else ""
+                if not is_remote_task_still_running(status_desc):
+                    return LegacyRestartOutcome(
+                        RestartStatus.NO_LONGER_RUNNING,
+                        observed_enabled=enabled_now,
+                        diagnostic=(
+                            f"write-time status not confirmed still running: {status_desc or '(empty)'}"
+                        ),
+                    )
 
             disable_response: Mapping[str, Any] | None = None
             if resume_phase in {None, "DISABLE_SENT", "DISABLE_CONFIRMED"}:
