@@ -295,12 +295,18 @@ def _valid_recovery_exhausted_evidence(remote_job: Mapping[str, Any]) -> bool:
         return False
     disable_evidence = restart.get("disable_evidence")
     enable_evidence = restart.get("enable_evidence")
-    return (
+    if not (
         isinstance(disable_evidence, dict)
+        and disable_evidence.get("confirmed_disabled") is True
         and isinstance(enable_evidence, dict)
-        and bool(disable_evidence)
-        and bool(enable_evidence)
-    )
+        and enable_evidence.get("confirmed_enabled") is True
+    ):
+        return False
+    try:
+        datetime.fromisoformat(str(restart.get("recovery_at") or ""))
+    except (TypeError, ValueError):
+        return False
+    return True
 
 
 def _conflicting_export_price_reason(

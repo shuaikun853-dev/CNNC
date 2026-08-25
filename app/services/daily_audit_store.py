@@ -1368,6 +1368,25 @@ class DailyAuditStore:
                 raise RemoteIntentConflict("recovery exhaustion requires exactly one consumed recovery attempt")
             if str(restart.get("phase") or "") != "ENABLE_CONFIRMED":
                 raise RemoteIntentConflict("recovery exhaustion requires confirmed disable and enable evidence")
+            disable_evidence = restart.get("disable_evidence")
+            enable_evidence = restart.get("enable_evidence")
+            if not (
+                isinstance(disable_evidence, dict)
+                and disable_evidence.get("confirmed_disabled") is True
+                and isinstance(enable_evidence, dict)
+                and enable_evidence.get("confirmed_enabled") is True
+            ):
+                raise RemoteIntentConflict(
+                    "recovery exhaustion requires disable_evidence.confirmed_disabled and "
+                    "enable_evidence.confirmed_enabled to both be true"
+                )
+            recovery_at = str(restart.get("recovery_at") or "").strip()
+            try:
+                datetime.fromisoformat(recovery_at)
+            except ValueError as exc:
+                raise RemoteIntentConflict(
+                    "recovery exhaustion requires a valid recovery timestamp"
+                ) from exc
             merged = dict(evidence)
             merged_restart = dict(merged.get("restart") or {})
             merged_restart.setdefault("phase", "ENABLE_CONFIRMED")

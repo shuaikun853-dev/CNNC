@@ -645,9 +645,17 @@ def test_enable_unknown_resumes_by_reconciliation_only(tmp_path) -> None:
     assert int(store.get_remote_job(job_id)["recovery_attempts"]) == 1
 
 
+_CONFIRMED_RESTART_STEP = {
+    "status": "RESTARTED",
+    "restarted": True,
+    "disable_evidence": {"confirmed_disabled": True},
+    "enable_evidence": {"confirmed_enabled": True},
+}
+
+
 def test_restart_outcome_survives_store_reopen(tmp_path) -> None:
     store, job_id = _stalled_store(tmp_path)
-    restart = _FakeRestart([{"status": "RESTARTED", "restarted": True}])
+    restart = _FakeRestart([dict(_CONFIRMED_RESTART_STEP)])
     _run_pass(store, _probe_payload(), restart)
     reopened = DailyAuditStore(tmp_path / "state.sqlite3")
     refreshed = reopened.get_remote_job(job_id)
@@ -658,10 +666,10 @@ def test_restart_outcome_survives_store_reopen(tmp_path) -> None:
 
 def test_recovered_job_is_never_restarted_twice(tmp_path) -> None:
     store, job_id = _stalled_store(tmp_path)
-    restart = _FakeRestart([{"status": "RESTARTED", "restarted": True}])
+    restart = _FakeRestart([dict(_CONFIRMED_RESTART_STEP)])
     _run_pass(store, _probe_payload(), restart)
     # The job stalls again with a fresh frozen signature after the restart.
-    restart_again = _FakeRestart([{"status": "RESTARTED", "restarted": True}])
+    restart_again = _FakeRestart([dict(_CONFIRMED_RESTART_STEP)])
     _run_pass(store, _probe_payload(), restart_again, now=NOW + timedelta(minutes=5))
     assert restart_again.calls == []
     assert int(store.get_remote_job(job_id)["recovery_attempts"]) == 1
@@ -1368,6 +1376,197 @@ def _freeze(store: DailyAuditStore) -> None:
     store.release_lease(token)
 
 
+# ---------------------------------------------------------------------------
+# Review round 2, Finding 4: a legal recovery needs CONFIRMED evidence at
+# every layer.  A RESTARTED claim without confirmed disable+enable must not
+# burn the attempt, the store must refuse RECOVERY_EXHAUSTED without the
+# full proof, and finalize must reject unconfirmed evidence.
+# ---------------------------------------------------------------------------
+
+
+def test_restarted_without_disable_evidence_does_not_burn_attempt(tmp_path) -> None:
+    store, job_id = _stalled_store(tmp_path)
+    restart = _FakeRestart([{"status": "RESTARTED", "restarted": True}])
+    _run_pass(store, _probe_payload(), restart)
+    refreshed = store.get_remote_job(job_id)
+    assert int(refreshed["recovery_attempts"] or 0) == 0
+    assert refreshed["state"] == "RUNNING"
+    evidence = json.loads(str(refreshed["recovery_evidence_json"]))
+    assert evidence["restart"]["phase"] != "ENABLE_CONFIRMED"
+
+
+def test_restarted_with_unconfirmed_disable_does_not_burn_attempt(tmp_path) -> None:
+    store, job_id = _stalled_store(tmp_path)
+    restart = _FakeRestart(
+        [
+            {
+                "status": "RESTARTED",
+                "restarted": True,
+                "disable_evidence": {"confirmed_disabled": False},
+                "enable_evidence": {"confirmed_enabled": True},
+            }
+        ]
+    )
+    _run_pass(store, _probe_payload(), restart)
+    refreshed = store.get_remote_job(job_id)
+    assert int(refreshed["recovery_attempts"] or 0) == 0
+    evidence = json.loads(str(refreshed["recovery_evidence_json"]))
+    assert evidence["restart"]["phase"] != "ENABLE_CONFIRMED"
+
+
+def test_restarted_with_unconfirmed_enable_does_not_burn_attempt(tmp_path) -> None:
+    store, job_id = _stalled_store(tmp_path)
+    restart = _FakeRestart(
+        [
+            {
+                "status": "RESTARTED",
+                "restarted": True,
+                "disable_evidence": {"confirmed_disabled": True},
+                "enable_evidence": {"confirmed_enabled": False},
+            }
+        ]
+    )
+    _run_pass(store, _probe_payload(), restart)
+    refreshed = store.get_remote_job(job_id)
+    assert int(refreshed["recovery_attempts"] or 0) == 0
+    evidence = json.loads(str(refreshed["recovery_evidence_json"]))
+    assert evidence["restart"]["phase"] != "ENABLE_CONFIRMED"
+
+
+def test_unconfirmed_restarted_routes_to_enable_reconciliation_not_burn(tmp_path) -> None:
+    store, job_id = _stalled_store(tmp_path)
+    restart = _FakeRestart([{"status": "RESTARTED", "restarted": True}])
+    _run_pass(store, _probe_payload(), restart)
+    evidence = json.loads(str(store.get_remote_job(job_id)["recovery_evidence_json"]))
+    # The enable direction may have been sent: reconcile it instead of
+    # trusting an unevidenced RESTARTED claim.
+    assert evidence["restart"]["phase"] == "ENABLE_SENT"
+
+
+def test_crash_window_guard_requires_confirmed_evidence(tmp_path) -> None:
+    store, job_id = _stalled_store(tmp_path)
+    token = store.acquire_lease(BUSINESS_DATE, "crash4", ttl_seconds=300)
+    evidence = _observations(4)
+    evidence["restart"] = {
+        "phase": "ENABLE_CONFIRMED",
+        "phase_at": NOW.isoformat(timespec="seconds"),
+        "recovery_attempts": 1,
+        "recovery_at": NOW.isoformat(timespec="seconds"),
+        "recovery_reason": "REMOTE_RUNNING_STALLED",
+        "disable_evidence": {},
+        "enable_evidence": {"confirmed_enabled": False},
+    }
+    store.update_remote_recovery_evidence(token, job_id, evidence)
+    store.release_lease(token)
+    restart = _FakeRestart([{"status": "RESTARTED", "restarted": True}])
+    _run_pass(store, _probe_payload(), restart)
+    refreshed = store.get_remote_job(job_id)
+    assert restart.calls == []
+    assert int(refreshed["recovery_attempts"] or 0) == 0
+    assert refreshed["state"] == "MANUAL_REQUIRED"
+
+
+def test_mark_recovery_exhausted_rejects_incomplete_evidence(tmp_path) -> None:
+    from app.services.daily_audit_store import RemoteIntentConflict
+
+    store, job_id = _stalled_store(tmp_path)
+    token = store.acquire_lease(BUSINESS_DATE, "ex4", ttl_seconds=300)
+    evidence = _observations(4)
+    evidence["restart"] = {
+        "phase": "ENABLE_CONFIRMED",
+        "recovery_attempts": 1,
+        "recovery_at": NOW.isoformat(timespec="seconds"),
+        "disable_evidence": {"response": {"rspCode": "0000"}},
+        "enable_evidence": {"response": {"rspCode": "0000"}},
+    }
+    store.update_remote_recovery_evidence(token, job_id, evidence)
+    with store._transaction(immediate=True) as connection:
+        connection.execute(
+            "UPDATE remote_jobs SET recovery_attempts=1 WHERE id=?", (job_id,)
+        )
+    identity = str(store.get_remote_job(job_id)["remote_identity"])
+    with pytest.raises(RemoteIntentConflict):
+        store.mark_remote_recovery_exhausted(
+            token, job_id, remote_identity=identity, evidence=evidence
+        )
+    store.release_lease(token)
+
+
+def test_mark_recovery_exhausted_rejects_missing_recovery_at(tmp_path) -> None:
+    from app.services.daily_audit_store import RemoteIntentConflict
+
+    store, job_id = _stalled_store(tmp_path)
+    token = store.acquire_lease(BUSINESS_DATE, "ex4b", ttl_seconds=300)
+    evidence = _observations(4)
+    evidence["restart"] = {
+        "phase": "ENABLE_CONFIRMED",
+        "recovery_attempts": 1,
+        "disable_evidence": {"confirmed_disabled": True},
+        "enable_evidence": {"confirmed_enabled": True},
+    }
+    store.update_remote_recovery_evidence(token, job_id, evidence)
+    with store._transaction(immediate=True) as connection:
+        connection.execute(
+            "UPDATE remote_jobs SET recovery_attempts=1 WHERE id=?", (job_id,)
+        )
+    identity = str(store.get_remote_job(job_id)["remote_identity"])
+    with pytest.raises(RemoteIntentConflict):
+        store.mark_remote_recovery_exhausted(
+            token, job_id, remote_identity=identity, evidence=evidence
+        )
+    store.release_lease(token)
+
+
+def _finalize_remote_row(restart_doc: dict) -> dict:
+    return {
+        "post_attempted": 1,
+        "remote_identity": "lxwl|1269504|RW-20260825150224",
+        "recovery_attempts": 1,
+        "recovery_evidence_json": json.dumps(
+            {"version": 1, "observations": [], "restart": restart_doc}, ensure_ascii=False
+        ),
+    }
+
+
+_COMPLETE_RESTART_DOC = {
+    "phase": "ENABLE_CONFIRMED",
+    "recovery_attempts": 1,
+    "recovery_at": NOW.isoformat(timespec="seconds"),
+    "disable_evidence": {"confirmed_disabled": True},
+    "enable_evidence": {"confirmed_enabled": True},
+}
+
+
+def test_finalize_validator_accepts_complete_confirmed_evidence() -> None:
+    from app.workflows.incremental_price_audit_finalize import _valid_recovery_exhausted_evidence
+
+    assert _valid_recovery_exhausted_evidence(_finalize_remote_row(dict(_COMPLETE_RESTART_DOC))) is True
+
+
+def test_finalize_validator_rejects_unconfirmed_disable_evidence() -> None:
+    from app.workflows.incremental_price_audit_finalize import _valid_recovery_exhausted_evidence
+
+    doc = dict(_COMPLETE_RESTART_DOC)
+    doc["disable_evidence"] = {"confirmed_disabled": False}
+    assert _valid_recovery_exhausted_evidence(_finalize_remote_row(doc)) is False
+
+
+def test_finalize_validator_rejects_unconfirmed_enable_evidence() -> None:
+    from app.workflows.incremental_price_audit_finalize import _valid_recovery_exhausted_evidence
+
+    doc = dict(_COMPLETE_RESTART_DOC)
+    doc["enable_evidence"] = {"response": {"rspCode": "0000"}}
+    assert _valid_recovery_exhausted_evidence(_finalize_remote_row(doc)) is False
+
+
+def test_finalize_validator_rejects_missing_recovery_at() -> None:
+    from app.workflows.incremental_price_audit_finalize import _valid_recovery_exhausted_evidence
+
+    doc = dict(_COMPLETE_RESTART_DOC)
+    del doc["recovery_at"]
+    assert _valid_recovery_exhausted_evidence(_finalize_remote_row(doc)) is False
+
+
 def test_status_reports_recovery_exhausted_count(tmp_path) -> None:
     from app.services.incremental_audit_status import collect_runtime_status
 
@@ -1391,7 +1590,7 @@ def test_status_reports_recovery_exhausted_count(tmp_path) -> None:
 def test_c1_crash_between_evidence_and_attempt_burn_never_restarts_twice(tmp_path) -> None:
     """Doc says ENABLE_CONFIRMED but the attempt column never burned."""
     store, job_id = _stalled_store(tmp_path)
-    restart = _FakeRestart([{"status": "RESTARTED", "restarted": True}])
+    restart = _FakeRestart([dict(_CONFIRMED_RESTART_STEP)])
     _run_pass(store, _probe_payload(), restart)
     # Simulate the crash window: the finished evidence document committed,
     # the recovery_attempts column write lost.
@@ -1399,7 +1598,7 @@ def test_c1_crash_between_evidence_and_attempt_burn_never_restarts_twice(tmp_pat
     with store._transaction(immediate=True) as connection:
         connection.execute("UPDATE remote_jobs SET recovery_attempts=0 WHERE id=?", (job_id,))
     store.release_lease(token)
-    again = _FakeRestart([{"status": "RESTARTED", "restarted": True}])
+    again = _FakeRestart([dict(_CONFIRMED_RESTART_STEP)])
     _run_pass(store, _probe_payload(), again, now=NOW + timedelta(minutes=5))
     assert again.calls == []
     refreshed = store.get_remote_job(job_id)

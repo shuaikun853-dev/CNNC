@@ -332,6 +332,36 @@ def _probe_identity_matches(job: Mapping[str, Any], probe: Mapping[str, Any]) ->
     )
 
 
+def _outcome_proves_confirmed_restart(outcome: Mapping[str, Any]) -> bool:
+    """A RESTARTED callback claim is legal only with both confirmations."""
+    disable_evidence = outcome.get("disable_evidence")
+    enable_evidence = outcome.get("enable_evidence")
+    return (
+        isinstance(disable_evidence, Mapping)
+        and disable_evidence.get("confirmed_disabled") is True
+        and isinstance(enable_evidence, Mapping)
+        and enable_evidence.get("confirmed_enabled") is True
+    )
+
+
+def _durable_restart_proof_is_complete(restart: Mapping[str, Any] | None) -> bool:
+    """The durable one-shot proof: confirmed disable AND enable AND a timestamp."""
+    if not isinstance(restart, Mapping):
+        return False
+    if _text(restart.get("phase")) != "ENABLE_CONFIRMED":
+        return False
+    if _parse_timestamp(restart.get("recovery_at")) is None:
+        return False
+    disable_evidence = restart.get("disable_evidence")
+    enable_evidence = restart.get("enable_evidence")
+    return (
+        isinstance(disable_evidence, Mapping)
+        and disable_evidence.get("confirmed_disabled") is True
+        and isinstance(enable_evidence, Mapping)
+        and enable_evidence.get("confirmed_enabled") is True
+    )
+
+
 def _apply_restart(
     store: DailyAuditStore,
     token: LeaseToken,
@@ -359,10 +389,20 @@ def _apply_restart(
         and _text(restart.get("phase")) == "ENABLE_CONFIRMED"
         and int(job.get("recovery_attempts") or 0) == 0
     ):
-        store.mark_remote_recovery_attempted(
-            token, job_id, remote_identity=_text(job.get("remote_identity")), evidence=restart
+        if _durable_restart_proof_is_complete(restart):
+            store.mark_remote_recovery_attempted(
+                token, job_id, remote_identity=_text(job.get("remote_identity")), evidence=restart
+            )
+            return {"status": "RESTARTED", "restarted": True, "reconciled": True, "diagnostic": "recovered crash window: attempt slot burned from durable ENABLE_CONFIRMED evidence"}
+        # A doc claiming ENABLE_CONFIRMED without the complete confirmed proof
+        # can neither authorize the burn nor a fresh restart: fail closed.
+        store.mark_remote_manual(
+            token,
+            job_id,
+            "recovery crash-window evidence lacks confirmed disable/enable proof; "
+            "refusing to burn the attempt or re-dispatch writes",
         )
-        return {"status": "RESTARTED", "restarted": True, "reconciled": True, "diagnostic": "recovered crash window: attempt slot burned from durable ENABLE_CONFIRMED evidence"}
+        return {"status": "MANUAL_REQUIRED", "restarted": False, "diagnostic": "incomplete durable ENABLE_CONFIRMED evidence"}
     resume_phase: str | None = None
     if isinstance(restart, Mapping) and _text(restart.get("phase")) in {
         "DISABLE_SENT",
@@ -382,6 +422,18 @@ def _apply_restart(
     restart = evidence["restart"]
     phase_at = _parse_timestamp(restart.get("phase_at"))
     if status == "RESTARTED":
+        if not _outcome_proves_confirmed_restart(outcome):
+            # An unevidenced RESTARTED claim must not burn the single attempt.
+            # The enable direction may still have been sent, so persist the
+            # ENABLE_SENT phase and let the next pass reconcile the real
+            # remote state (and fail closed to manual past the window).
+            restart["phase"] = "ENABLE_SENT"
+            restart["diagnostic"] = (
+                "RESTARTED claim lacked confirmed disable/enable evidence; "
+                "awaiting phase reconciliation"
+            )
+            store.update_remote_recovery_evidence(token, job_id, evidence)
+            return outcome
         observations = evidence.get("observations") or []
         last_signature = (
             observations[-1].get("signature")
