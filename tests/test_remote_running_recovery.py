@@ -219,11 +219,18 @@ def test_stationary_span_under_one_hour_is_not_stalled() -> None:
 # ---------------------------------------------------------------------------
 
 
-def _tick(store: DailyAuditStore, deps: TickDependencies, *, finalize: bool = False):
+def _tick(
+    store: DailyAuditStore,
+    deps: TickDependencies,
+    *,
+    finalize: bool = False,
+    budget_seconds: float = 720.0,
+    reserve_seconds: float = 120.0,
+):
     config = TickConfig(
         business_date=BUSINESS_DATE,
-        runtime_budget_seconds=720.0,
-        heavy_work_reserve_seconds=120.0,
+        runtime_budget_seconds=budget_seconds,
+        heavy_work_reserve_seconds=reserve_seconds,
     )
     deps.wall_clock = lambda: NOW
     lock = ProcessLock(store.path.with_name("tick.lock"))
@@ -254,6 +261,42 @@ def _seed_running_job(store: DailyAuditStore, *, attempts: int = 2, age_minutes:
     return int(job["id"])
 
 
+def _seed_candidate_jobs(store: DailyAuditStore, count: int, *, attempts: int = 2, age_minutes: int = 35) -> list[int]:
+    """Seed several distinct probe-candidate RUNNING jobs on one store."""
+    token = store.acquire_lease(BUSINESS_DATE, "seed-many", ttl_seconds=300)
+    store.ensure_run(BUSINESS_DATE)
+    ids: list[int] = []
+    for index in range(count):
+        marker = 61284593895349 + index
+        job = store.prepare_remote_intent(
+            token,
+            f"logical-{index}",
+            f"cnnc_current_opt_领先未来商城_{marker}",
+            f"payload-hash-{index}",
+            mall_key="lxwl",
+        )
+        store.claim_remote_submission(token, int(job["id"]))
+        store.reconcile_remote_job(
+            token,
+            int(job["id"]),
+            remote_identity=f"lxwl|126950{index}|RW-2026082515022{index}",
+            state="RUNNING",
+        )
+        with store._transaction(immediate=True) as connection:
+            connection.execute(
+                "UPDATE remote_jobs SET harvest_attempts=?, created_at=?, updated_at=? WHERE id=?",
+                (
+                    attempts,
+                    (NOW - timedelta(minutes=age_minutes)).isoformat(timespec="seconds"),
+                    (NOW - timedelta(minutes=age_minutes)).isoformat(timespec="seconds"),
+                    int(job["id"]),
+                ),
+            )
+        ids.append(int(job["id"]))
+    store.release_lease(token)
+    return ids
+
+
 def _discover_noop(timeout: float) -> DiscoveredState:
     return DiscoveredState(observed_at=NOW, headers=(), rows=())
 
@@ -263,7 +306,7 @@ def test_tick_persists_probe_observation_for_candidate_running_job(tmp_path) -> 
     job_id = _seed_running_job(store)
     calls: list[int] = []
 
-    def probe(job: dict) -> dict:
+    def probe(job: dict, timeout_seconds: float | None = None) -> dict:
         calls.append(int(job["id"]))
         return {
             "progress": dict(PROGRESS_STALLED),
@@ -310,7 +353,7 @@ def test_stalled_job_without_restart_callback_stays_running(tmp_path) -> None:
             ((NOW - timedelta(minutes=180)).isoformat(timespec="seconds"), job_id),
         )
 
-    def probe(job: dict) -> dict:
+    def probe(job: dict, timeout_seconds: float | None = None) -> dict:
         return {
             "progress": dict(PROGRESS_STALLED),
             "export_count": 0,
@@ -326,6 +369,135 @@ def test_stalled_job_without_restart_callback_stays_running(tmp_path) -> None:
     assert int(refreshed["recovery_attempts"] or 0) == 0
     evidence = json.loads(str(refreshed["recovery_evidence_json"]))
     assert len(evidence["observations"]) == 4
+
+
+# ---------------------------------------------------------------------------
+# Review round 2, Finding 3: recovery must obey the tick budget.  Probes and
+# restarts receive a TickBudget-derived timeout, the pass is capped per tick,
+# and core discovery must never be starved by recovery probes.
+# ---------------------------------------------------------------------------
+
+
+def test_tick_skips_recovery_probe_when_budget_tight(tmp_path) -> None:
+    store = DailyAuditStore(tmp_path / "state.sqlite3")
+    job_id = _seed_running_job(store)
+    calls: list[int] = []
+    clock = {"now": 1000.0}
+
+    def monotonic() -> float:
+        return clock["now"]
+
+    def discover(timeout: float) -> DiscoveredState:
+        clock["now"] += 80.0  # core intake consumes most of the tick
+        return DiscoveredState(observed_at=NOW, headers=(), rows=())
+
+    def probe(job: dict, timeout_seconds: float | None = None) -> dict:
+        calls.append(int(job["id"]))
+        return _probe_payload()
+
+    deps = TickDependencies(discover=discover, remote_recovery_probe=probe)
+    deps.monotonic = monotonic
+    summary = _tick(store, deps, budget_seconds=100.0, reserve_seconds=30.0)
+    assert calls == []
+    refreshed = store.get_remote_job(job_id)
+    assert refreshed["recovery_evidence_json"] is None
+    assert summary.outcome in {"BUDGET_EXHAUSTED", "WAITING_REMOTE"}
+
+
+def test_tick_probe_callback_timeout_is_bounded_by_budget(tmp_path) -> None:
+    store = DailyAuditStore(tmp_path / "state.sqlite3")
+    _seed_running_job(store)
+    captured: list[float] = []
+
+    def probe(job: dict, timeout_seconds: float | None = None) -> dict:
+        captured.append(float(timeout_seconds))
+        return _probe_payload()
+
+    deps = TickDependencies(discover=_discover_noop, remote_recovery_probe=probe)
+    deps.monotonic = lambda: 0.0
+    _tick(store, deps, budget_seconds=45.0, reserve_seconds=10.0)
+    assert captured
+    assert all(0.0 < value <= 45.0 for value in captured)
+    assert max(captured) == 45.0  # min(configured 60s ceiling, remaining 45s)
+
+
+def test_tick_restart_callback_timeout_is_bounded_by_budget(tmp_path) -> None:
+    store, _job_id = _stalled_store(tmp_path)
+    captured: list[float] = []
+
+    def restart(job: dict, resume_phase: str | None, timeout_seconds: float | None = None) -> dict:
+        captured.append(float(timeout_seconds))
+        return {
+            "status": "RESTARTED",
+            "restarted": True,
+            "disable_evidence": {"confirmed_disabled": True},
+            "enable_evidence": {"confirmed_enabled": True},
+        }
+
+    def probe(job: dict, timeout_seconds: float | None = None) -> dict:
+        return _probe_payload()
+
+    deps = TickDependencies(
+        discover=_discover_noop, remote_recovery_probe=probe, remote_recovery_restart=restart
+    )
+    deps.monotonic = lambda: 0.0
+    _tick(store, deps, budget_seconds=50.0, reserve_seconds=10.0)
+    assert captured
+    assert all(0.0 < value <= 50.0 for value in captured)
+    assert max(captured) == 50.0  # min(configured 60s ceiling, remaining 50s)
+
+
+def test_recovery_pass_caps_probe_candidates_per_tick(tmp_path) -> None:
+    store = DailyAuditStore(tmp_path / "state.sqlite3")
+    job_ids = _seed_candidate_jobs(store, 6)
+    calls: list[int] = []
+
+    def probe(job: dict, timeout_seconds: float | None = None) -> dict:
+        calls.append(int(job["id"]))
+        parts = str(job["remote_identity"]).split("|")
+        return _probe_payload(remote_task_id=parts[1], remote_task_number=parts[2])
+
+    token = store.acquire_lease(BUSINESS_DATE, "cap", ttl_seconds=300)
+    try:
+        counters = run_running_recovery_pass(
+            store, token, probe_remote=probe, restart_remote=None, now=NOW, can_start=lambda: True
+        )
+    finally:
+        store.release_lease(token)
+    assert len(calls) == 4
+    assert counters["recovery_probes"] == 4
+    probed = [store.get_remote_job(job_id) for job_id in job_ids if job_id in calls]
+    unprobed = [store.get_remote_job(job_id) for job_id in job_ids if job_id not in calls]
+    assert all(row["recovery_evidence_json"] for row in probed)
+    assert all(row["recovery_evidence_json"] is None for row in unprobed)
+
+
+def test_full_tick_runs_discovery_with_recovery_candidates_present(tmp_path) -> None:
+    store = DailyAuditStore(tmp_path / "state.sqlite3")
+    _seed_candidate_jobs(store, 4)
+    discovered: list[float] = []
+    clock = {"now": 1000.0}
+
+    def monotonic() -> float:
+        return clock["now"]
+
+    def discover(timeout: float) -> DiscoveredState:
+        discovered.append(timeout)
+        return DiscoveredState(observed_at=NOW, headers=(), rows=())
+
+    def probe(job: dict, timeout_seconds: float | None = None) -> dict:
+        # Each probe consumes a large slice of the tick budget, as a probe
+        # with several bounded network calls would in production.
+        clock["now"] += 25.0
+        parts = str(job["remote_identity"]).split("|")
+        return _probe_payload(remote_task_id=parts[1], remote_task_number=parts[2])
+
+    deps = TickDependencies(discover=discover, remote_recovery_probe=probe)
+    deps.monotonic = monotonic
+    summary = _tick(store, deps, budget_seconds=100.0, reserve_seconds=30.0)
+    assert discovered, "core discovery must still run while recovery candidates exist"
+    assert "running_recovery" in summary.phase_trace
+    assert summary.phase_trace.index("discover") < summary.phase_trace.index("running_recovery")
 
 
 # ---------------------------------------------------------------------------
@@ -1276,7 +1448,7 @@ def test_i1_bridge_restart_dispatch_failure_keeps_manual_for_unreconstructable_j
         "remote_identity": "lxwl|1269504|RW-20260825150224",
     }
 
-    outcome = restart_cb(durable, None)
+    outcome = restart_cb(durable, None, 60.0)
 
     assert outcome["status"] == "IDENTITY_CONFLICT"
     assert outcome["restarted"] is False

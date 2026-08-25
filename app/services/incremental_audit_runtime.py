@@ -1441,11 +1441,13 @@ def legacy_zhaoshang_bridge(
                 publish({"manual_error": "legacy wait-export-only requires manual review"})
         return results
 
-    def recovery_probe(job: Mapping[str, Any]) -> Mapping[str, Any] | None:
+    def recovery_probe(job: Mapping[str, Any], timeout_seconds: float) -> Mapping[str, Any] | None:
         try:
             prepared_job = reconstruct(job)
             task_id, task_number = remote_identity_parts(prepared_job, job.get("remote_identity"))
-            probe = adapter.probe_running_task(prepared_job, task_id, task_number, 60.0)
+            probe = adapter.probe_running_task(
+                prepared_job, task_id, task_number, float(timeout_seconds)
+            )
         except Exception:
             # A probe that cannot re-confirm the exact remote task proves
             # nothing; it never blocks the tick and never counts as evidence.
@@ -1461,7 +1463,9 @@ def legacy_zhaoshang_bridge(
             "task_status_rsp_desc": probe.task_status_rsp_desc,
         }
 
-    def recovery_restart(job: Mapping[str, Any], resume_phase: str | None) -> Mapping[str, Any]:
+    def recovery_restart(
+        job: Mapping[str, Any], resume_phase: str | None, timeout_seconds: float
+    ) -> Mapping[str, Any]:
         from app.services.remote_running_recovery import classify_restart_exception
 
         try:
@@ -1477,7 +1481,11 @@ def legacy_zhaoshang_bridge(
             }
         try:
             outcome = adapter.restart_running_task(
-                prepared_job, task_id, task_number, 60.0, resume_phase=resume_phase
+                prepared_job,
+                task_id,
+                task_number,
+                float(timeout_seconds),
+                resume_phase=resume_phase,
             )
         except Exception as exc:
             # A dispatch exception proves neither success nor failure of a

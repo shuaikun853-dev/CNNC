@@ -67,6 +67,13 @@ RECOVERY_EXHAUSTED_MIN_POST_SPAN_SECONDS = 1800.0
 # the real remote state before any decision; after this window a still
 # contradictory remote state fails closed into manual review.
 RECOVERY_WRITE_CONFIRM_WINDOW_SECONDS = 900.0
+# Tick-budget bounds: recovery is tail work.  One probe or restart callback
+# may never outlive the tick's remaining budget (the configured 60s ceiling
+# is intersected with the live remaining time by the tick), and one Full
+# Tick probes at most this many candidates — anything beyond waits for the
+# next tick so 17-18h Discovery/Detail/Model/Submit intake keeps priority.
+RECOVERY_CALLBACK_TIMEOUT_SECONDS = 60.0
+RECOVERY_MAX_PROBE_CANDIDATES_PER_TICK = 4
 
 
 def classify_restart_exception(exc: BaseException, resume_phase: str | None) -> str:
@@ -537,6 +544,7 @@ def run_running_recovery_pass(
     restart_remote: Callable[[Mapping[str, Any], str | None], Mapping[str, Any]] | None = None,
     now: datetime,
     can_start: Callable[[], bool],
+    max_probe_candidates: int = RECOVERY_MAX_PROBE_CANDIDATES_PER_TICK,
 ) -> dict[str, int]:
     """One bounded recovery sweep over the durable RUNNING jobs.
 
@@ -544,6 +552,9 @@ def run_running_recovery_pass(
     A job whose evidence proves a stall may consume its single automatic
     restart when (and only when) a restart callback is wired in; with no
     callback the pass only records evidence and leaves the job RUNNING.
+    The sweep is bounded: ``can_start`` is re-checked before every candidate
+    and at most ``max_probe_candidates`` probes run per pass so the rest of
+    the tick's budget stays with core intake work.
     """
     counters = {
         "recovery_probes": 0,
@@ -577,6 +588,10 @@ def run_running_recovery_pass(
             continue
         decision = evaluate_running_stall(job, now=now)
         if not decision["probe_candidate"]:
+            continue
+        if counters["recovery_probes"] >= max_probe_candidates:
+            # Budget-shaped cap: this tick already spent its probe allowance;
+            # the remaining candidates keep harvesting and wait for a later tick.
             continue
         probe = probe_remote(job)
         if not isinstance(probe, Mapping):

@@ -1895,6 +1895,9 @@ class CnncLegacyZhaoshangAdapter:
                 # phase re-checks the world first and treats an observed
                 # disabled state as the completed disable.
                 if enabled_now and resume_phase is None:
+                    remaining = deadline - self._monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError("restart deadline exhausted before disable write")
                     try:
                         disable_response = tool.disable_task(session, live_task_id)
                     except Exception:
@@ -1928,6 +1931,9 @@ class CnncLegacyZhaoshangAdapter:
                     )
 
             enable_response: Mapping[str, Any] | None = None
+            remaining = deadline - self._monotonic()
+            if remaining <= 0:
+                raise TimeoutError("restart deadline exhausted before enable write")
             try:
                 enable_response = tool.enable_task(session, live_task_id)
             except Exception:
