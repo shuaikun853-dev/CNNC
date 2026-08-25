@@ -782,6 +782,39 @@ def test_adapter_restart_disable_unknown_reports_observed_state(tmp_path, monkey
     assert [call for call in session.update_calls if call.get("state") == "1"] == []
 
 
+# ---------------------------------------------------------------------------
+# Review round 2, Finding 1: fresh recovery must never enable an externally
+# disabled task.  CNNC holds no durable evidence that the observed disable
+# came from this protocol, so the only legal answer is zero remote writes.
+# ---------------------------------------------------------------------------
+
+
+def test_adapter_fresh_restart_of_disabled_task_issues_no_write(tmp_path, monkeypatch) -> None:
+    task = _running_task_record(enabled=False)
+    session = _RestartSession(task)
+    adapter, prepared = _prepared_job(tmp_path, monkeypatch, task, session)
+
+    outcome = adapter.restart_running_task(prepared, TASK_ID, TASK_NUMBER, timeout_seconds=60.0)
+
+    assert outcome.status.value == "EXTERNALLY_DISABLED"
+    assert outcome.observed_enabled is False
+    assert session.update_calls == []
+    assert task["enabled"] is False
+
+
+def test_fresh_externally_disabled_outcome_fails_closed_to_manual(tmp_path) -> None:
+    store, job_id = _stalled_store(tmp_path)
+    restart = _FakeRestart(
+        [{"status": "EXTERNALLY_DISABLED", "restarted": False, "observed_enabled": False}]
+    )
+    _run_pass(store, _probe_payload(), restart)
+    refreshed = store.get_remote_job(job_id)
+    assert refreshed["state"] == "MANUAL_REQUIRED"
+    assert int(refreshed["recovery_attempts"] or 0) == 0
+    evidence = json.loads(str(refreshed["recovery_evidence_json"]))
+    assert evidence["restart"]["phase"] != "ENABLE_SENT"
+
+
 def test_adapter_probe_running_task_reports_progress_and_export(tmp_path, monkeypatch) -> None:
     task = _running_task_record()
     session = _RestartSession(task)

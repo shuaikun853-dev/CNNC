@@ -223,6 +223,7 @@ class RestartStatus(str, Enum):
     RESTARTED = "RESTARTED"
     IDENTITY_CONFLICT = "IDENTITY_CONFLICT"
     NOT_RUNNING = "NOT_RUNNING"
+    EXTERNALLY_DISABLED = "EXTERNALLY_DISABLED"
     DISABLE_UNKNOWN = "DISABLE_UNKNOWN"
     DISABLE_UNCONFIRMED = "DISABLE_UNCONFIRMED"
     ENABLE_UNKNOWN = "ENABLE_UNKNOWN"
@@ -1849,6 +1850,20 @@ class CnncLegacyZhaoshangAdapter:
                     RestartStatus.ENABLE_UNCONFIRMED,
                     observed_enabled=False,
                     diagnostic="enable was sent but the exact task is still disabled",
+                )
+
+            if enabled_now is False and resume_phase is None:
+                # Fresh recovery found the exact task already disabled with no
+                # durable phase proving the disable belongs to this protocol:
+                # it may be a human, an operator, or another system.  Zero
+                # remote writes; enabling it here is forbidden.
+                return LegacyRestartOutcome(
+                    RestartStatus.EXTERNALLY_DISABLED,
+                    observed_enabled=False,
+                    diagnostic=(
+                        "exact task is already disabled without durable recovery "
+                        "evidence; refusing to enable an externally disabled task"
+                    ),
                 )
 
             disable_response: Mapping[str, Any] | None = None

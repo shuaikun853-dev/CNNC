@@ -404,13 +404,14 @@ def _apply_restart(
             restart["diagnostic"] = f"{status}; awaiting reconciliation"
             store.update_remote_recovery_evidence(token, job_id, evidence)
         return outcome
-    if status in {"IDENTITY_CONFLICT", "NOT_RUNNING"}:
-        store.mark_remote_manual(
-            token,
-            job_id,
-            f"remote stall recovery exact identity failure: {status}; "
-            f"{_text(outcome.get('diagnostic'))}",
+    if status in {"IDENTITY_CONFLICT", "NOT_RUNNING", "EXTERNALLY_DISABLED"}:
+        reason = (
+            "remote stall recovery found the exact task externally disabled; "
+            "no durable evidence proves the disable belongs to this protocol"
+            if status == "EXTERNALLY_DISABLED"
+            else f"remote stall recovery exact identity failure: {status}"
         )
+        store.mark_remote_manual(token, job_id, f"{reason}; {_text(outcome.get('diagnostic'))}")
         return outcome
     restart["diagnostic"] = _text(outcome.get("diagnostic")) or status
     store.update_remote_recovery_evidence(token, job_id, evidence)
