@@ -819,3 +819,263 @@ def test_default_dependencies_wire_probe_and_write_gated_restart(tmp_path) -> No
     )
     assert write_enabled.remote_recovery_probe is not None
     assert write_enabled.remote_recovery_restart is not None
+
+
+# ---------------------------------------------------------------------------
+# C. Recovery-exhausted terminal path (task-book cases 14-22)
+# ---------------------------------------------------------------------------
+
+
+def _recovered_store(tmp_path, *, recovery_age_minutes: int = 35, post_observations: int = 2, post_progress: dict | None = None):
+    """Seed a job whose single restart already completed (ENABLE_CONFIRMED)."""
+    store = DailyAuditStore(tmp_path / BUSINESS_DATE / "state.sqlite3")
+    job_id = _seed_running_job(store, attempts=15, age_minutes=200)
+    recovery_at = NOW - timedelta(minutes=recovery_age_minutes)
+    observations = []
+    step = timedelta(minutes=10)
+    for index in range(post_observations):
+        progress = post_progress if post_progress is not None else dict(PROGRESS_STALLED)
+        moment = recovery_at + step * (index + 1)
+        observations.append(
+            {
+                "observed_at": moment.isoformat(timespec="seconds"),
+                "progress": dict(progress),
+                "signature": _signature(progress),
+                "export_count": 0,
+                "export_rsp_desc": NO_PRICE_RSP,
+                "export_had_result": False,
+                "task_status_rsp_desc": "执行中",
+            }
+        )
+    evidence = {
+        "version": 1,
+        "observations": observations,
+        "restart": {
+            "phase": "ENABLE_CONFIRMED",
+            "phase_at": recovery_at.isoformat(timespec="seconds"),
+            "recovery_attempts": 1,
+            "recovery_at": recovery_at.isoformat(timespec="seconds"),
+            "recovery_reason": "REMOTE_RUNNING_STALLED",
+            "disable_evidence": {"confirmed_disabled": True, "response": {"rspCode": "0000"}},
+            "enable_evidence": {"confirmed_enabled": True, "response": {"rspCode": "0000"}},
+            "pre_restart_signature": _signature(PROGRESS_STALLED),
+        },
+    }
+    token = store.acquire_lease(BUSINESS_DATE, "seed-recovered", ttl_seconds=300)
+    store.update_remote_recovery_evidence(token, job_id, evidence)
+    with store._transaction(immediate=True) as connection:
+        connection.execute("UPDATE remote_jobs SET recovery_attempts=1 WHERE id=?", (job_id,))
+    store.release_lease(token)
+    return store, job_id
+
+
+def _seed_linked_crawl(store: DailyAuditStore, job_id: int) -> int:
+    token = store.acquire_lease(BUSINESS_DATE, "seed-crawl", ttl_seconds=300)
+    crawl = store.ensure_crawl_work(
+        token, "lxwl", "sku-1", "https://www.66123123.com/item/1", "legacy-v1", "fp-1", source_id="doc-1"
+    )
+    store.link_crawl_work_to_remote_job(token, int(crawl["id"]), job_id)
+    store.release_lease(token)
+    return int(crawl["id"])
+
+
+def test_case15_stalled_after_restart_becomes_recovery_exhausted(tmp_path) -> None:
+    store, job_id = _recovered_store(tmp_path)
+    crawl_id = _seed_linked_crawl(store, job_id)
+    counters = _run_pass(store, _probe_payload(), None)
+    assert counters["recovery_exhausted"] == 1
+    refreshed = store.get_remote_job(job_id)
+    assert refreshed["state"] == "RECOVERY_EXHAUSTED"
+    crawl = store.get_crawl_work(crawl_id)
+    assert crawl["state"] == "NO_RESULT"
+    evidence = json.loads(str(crawl["result_json"]))
+    assert evidence["evidence_type"] == "REMOTE_STALL_RECOVERY_EXHAUSTED"
+    assert evidence["page_price_value"] is None
+    assert evidence["recovery_attempt"] == 1
+    assert evidence["disable_confirmed"] is True
+    assert evidence["enable_confirmed"] is True
+    assert evidence["export_count"] == 0
+    assert evidence["remote_identity"] == "lxwl|1269504|RW-20260825150224"
+
+
+def test_case14_recovery_with_export_result_stays_running(tmp_path) -> None:
+    store, job_id = _recovered_store(tmp_path)
+    _run_pass(store, _probe_payload(export_had_result=True, export_count=None), None)
+    assert store.get_remote_job(job_id)["state"] == "RUNNING"
+
+
+def test_case23_slow_job_with_post_recovery_progress_not_exhausted(tmp_path) -> None:
+    moving = dict(PROGRESS_STALLED)
+    observations = []
+    recovery_at = NOW - timedelta(minutes=60)
+    for index in range(3):
+        progress = dict(moving)
+        progress["finished"] = 2 + index
+        observations.append(
+            {
+                "observed_at": (recovery_at + timedelta(minutes=15 * (index + 1))).isoformat(timespec="seconds"),
+                "progress": progress,
+                "signature": _signature(progress),
+                "export_count": 0,
+                "export_rsp_desc": NO_PRICE_RSP,
+                "export_had_result": False,
+                "task_status_rsp_desc": "执行中",
+            }
+        )
+    store, job_id = _recovered_store(tmp_path, recovery_age_minutes=60, post_observations=1)
+    token = store.acquire_lease(BUSINESS_DATE, "fix-obs", ttl_seconds=300)
+    store.update_remote_recovery_evidence(
+        token, job_id, {"version": 1, "observations": observations, "restart": json.loads(str(store.get_remote_job(job_id)["recovery_evidence_json"]))["restart"]}
+    )
+    store.release_lease(token)
+    _run_pass(store, _probe_payload(progress={**PROGRESS_STALLED, "finished": 5}), None)
+    assert store.get_remote_job(job_id)["state"] == "RUNNING"
+
+
+def test_case16_recovery_exhausted_never_enters_harvest_candidates(tmp_path) -> None:
+    store, job_id = _recovered_store(tmp_path)
+    crawl_id = _seed_linked_crawl(store, job_id)
+    _run_pass(store, _probe_payload(), None)
+    token = store.acquire_lease(BUSINESS_DATE, "claim", ttl_seconds=300)
+    claim = store.claim_harvest(token, job_id, max_attempts=10, max_elapsed_seconds=100.0)
+    store.release_lease(token)
+    assert claim is None
+    from app.workflows.incremental_price_audit import _HARVESTABLE_REMOTE_STATES
+
+    assert "RECOVERY_EXHAUSTED" not in _HARVESTABLE_REMOTE_STATES
+    assert store.get_crawl_work(crawl_id)["state"] == "NO_RESULT"
+
+
+def test_case18_recovery_exhausted_lets_ordinary_final_converge(tmp_path) -> None:
+    from app.workflows.incremental_price_audit_finalize import build_frozen_audit_artifact
+
+    store, job_id = _recovered_store(tmp_path)
+    _seed_linked_crawl(store, job_id)
+    _run_pass(store, _probe_payload(), None)
+    _freeze(store)
+
+    token = store.acquire_lease(BUSINESS_DATE, "artifact", ttl_seconds=300)
+    try:
+        built = build_frozen_audit_artifact(
+            store, token, output_identity="daily-final-test", tolerate_pending=False
+        )
+    finally:
+        store.release_lease(token)
+    assert built.readiness.remote_pending == 0
+    assert built.readiness.remote_invalid == 0
+    assert built.readiness.remote_manual == 0
+    assert built.readiness.crawl_pending == 0
+    assert built.readiness.crawl_no_result == 1
+
+
+def test_case19_submit_unknown_still_blocks_ordinary_final(tmp_path) -> None:
+    from app.workflows.incremental_price_audit_finalize import build_frozen_audit_artifact
+
+    store, job_id = _recovered_store(tmp_path)
+    crawl_id = _seed_linked_crawl(store, job_id)
+    token = store.acquire_lease(BUSINESS_DATE, "unknown", ttl_seconds=300)
+    store.mark_submit_unknown(token, job_id, "legacy create-only outcome unknown")
+    store.fail_crawl_work(token, crawl_id, "submit unknown", retryable=True)
+    store.release_lease(token)
+    _freeze(store)
+    token = store.acquire_lease(BUSINESS_DATE, "artifact2", ttl_seconds=300)
+    try:
+        built = build_frozen_audit_artifact(store, token, output_identity="daily-final-test")
+    finally:
+        store.release_lease(token)
+    assert built.readiness.remote_submit_unknown >= 1
+    assert built.artifact is None
+
+
+def test_case20_manual_required_still_blocks_ordinary_final(tmp_path) -> None:
+    from app.workflows.incremental_price_audit_finalize import build_frozen_audit_artifact
+
+    store, job_id = _recovered_store(tmp_path)
+    crawl_id = _seed_linked_crawl(store, job_id)
+    token = store.acquire_lease(BUSINESS_DATE, "manual", ttl_seconds=300)
+    store.mark_remote_manual(token, job_id, "legacy wait-export-only requires manual review")
+    store.release_lease(token)
+    _freeze(store)
+    token = store.acquire_lease(BUSINESS_DATE, "artifact3", ttl_seconds=300)
+    try:
+        built = build_frozen_audit_artifact(store, token, output_identity="daily-final-test")
+    finally:
+        store.release_lease(token)
+    assert built.readiness.remote_manual >= 1
+    assert built.artifact is None
+
+
+def test_case21_plain_running_still_blocks_ordinary_final(tmp_path) -> None:
+    from app.workflows.incremental_price_audit_finalize import build_frozen_audit_artifact
+
+    store, job_id = _recovered_store(tmp_path)
+    _seed_linked_crawl(store, job_id)
+    _freeze(store)
+    token = store.acquire_lease(BUSINESS_DATE, "artifact4", ttl_seconds=300)
+    try:
+        built = build_frozen_audit_artifact(store, token, output_identity="daily-final-test")
+    finally:
+        store.release_lease(token)
+    assert built.readiness.remote_pending >= 1
+    assert built.artifact is None
+
+
+def test_recovery_exhausted_without_full_evidence_is_invalid(tmp_path) -> None:
+    from app.workflows.incremental_price_audit_finalize import build_frozen_audit_artifact
+
+    store, job_id = _recovered_store(tmp_path)
+    _seed_linked_crawl(store, job_id)
+    _run_pass(store, _probe_payload(), None)
+    # Corrupt the durable restart evidence: the terminal state must not be
+    # accepted by finalize without its complete recovery proof.
+    token = store.acquire_lease(BUSINESS_DATE, "corrupt", ttl_seconds=300)
+    evidence = json.loads(str(store.get_remote_job(job_id)["recovery_evidence_json"]))
+    evidence["restart"].pop("disable_evidence")
+    store.update_remote_recovery_evidence(token, job_id, evidence)
+    store.release_lease(token)
+    _freeze(store)
+    token = store.acquire_lease(BUSINESS_DATE, "artifact5", ttl_seconds=300)
+    try:
+        built = build_frozen_audit_artifact(store, token, output_identity="daily-final-test")
+    finally:
+        store.release_lease(token)
+    assert built.readiness.remote_invalid >= 1
+
+
+def _freeze(store: DailyAuditStore) -> None:
+    row = {
+        "vCommodityId": "doc-1",
+        "documentId": "doc-1",
+        "skuId": "sku-1",
+        "extLink": "https://www.66123123.com/item/1",
+        "fourCategoryId": "cat",
+    }
+    deps = TickDependencies(
+        discover=lambda timeout: DiscoveredState(
+            observed_at=NOW, headers=("vCommodityId", "skuId", "extLink"), rows=[row]
+        ),
+    )
+    deps.wall_clock = lambda: NOW
+    config = TickConfig(business_date=BUSINESS_DATE)
+    lock = ProcessLock(store.path.with_name("freeze-tick.lock"))
+    run_incremental_tick(store, lock, config, deps)
+    token = store.acquire_lease(BUSINESS_DATE, "freeze2", ttl_seconds=300)
+    snapshots = store.list_snapshots(BUSINESS_DATE)
+    assert snapshots
+    store.freeze_snapshot(token, int(snapshots[-1]["id"]))
+    store.release_lease(token)
+
+
+def test_status_reports_recovery_exhausted_count(tmp_path) -> None:
+    from app.services.incremental_audit_status import collect_runtime_status
+
+    store, job_id = _recovered_store(tmp_path)
+    _seed_linked_crawl(store, job_id)
+    _run_pass(store, _probe_payload(), None)
+    status = collect_runtime_status(
+        business_date=BUSINESS_DATE,
+        runtime_root=tmp_path,
+    )
+    assert status["remote"]["recovery_exhausted"] == 1
+    assert status["remote"]["running"] == 0
+    assert status["crawl"]["no_result"] == 1

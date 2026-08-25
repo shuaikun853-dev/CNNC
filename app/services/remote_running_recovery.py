@@ -374,6 +374,57 @@ def _apply_restart(
     return outcome
 
 
+RECOVERY_EXHAUSTED_NO_RESULT_REASON = (
+    "remote stall recovery exhausted; one exact disable->enable restart did "
+    "not restore the task"
+)
+
+
+def _abandon_recovery_exhausted(
+    store: DailyAuditStore,
+    token: LeaseToken,
+    job: Mapping[str, Any],
+    evidence: Mapping[str, Any],
+) -> None:
+    """Move one unrecoverable job to the local give-up terminal state.
+
+    The remote task is NOT marked completed: the durable state records the
+    business decision to stop waiting.  Every linked crawl becomes an
+    auditable NO_RESULT carrying the full recovery evidence chain; no price
+    is fabricated anywhere.
+    """
+    job_id = int(job["id"])
+    restart = dict(evidence.get("restart") or {})
+    disable_evidence = dict(restart.get("disable_evidence") or {})
+    enable_evidence = dict(restart.get("enable_evidence") or {})
+    observations = list(evidence.get("observations") or [])
+    last_observation = observations[-1] if observations else {}
+    store.mark_remote_recovery_exhausted(
+        token,
+        job_id,
+        remote_identity=_text(job.get("remote_identity")),
+        evidence=dict(evidence),
+    )
+    for crawl in store.crawl_work_for_job(job_id):
+        if str(crawl["state"]) in {"SUCCESS", "NO_RESULT", "TERMINAL_FAILED"}:
+            continue
+        store.complete_crawl_work_recovery_exhausted(
+            token,
+            int(crawl["id"]),
+            remote_job_id=job_id,
+            remote_identity=_text(job.get("remote_identity")),
+            reason=RECOVERY_EXHAUSTED_NO_RESULT_REASON,
+            restart_phase=_text(restart.get("phase")),
+            recovery_attempt=1,
+            recovery_at=_text(restart.get("recovery_at")),
+            disable_confirmed=bool(disable_evidence.get("confirmed_disabled")),
+            enable_confirmed=bool(enable_evidence.get("confirmed_enabled")),
+            last_progress_signature=last_observation.get("signature"),
+            export_count=last_observation.get("export_count"),
+            export_rsp_desc=_text(last_observation.get("export_rsp_desc")),
+        )
+
+
 def run_running_recovery_pass(
     store: DailyAuditStore,
     token: LeaseToken,
@@ -410,6 +461,12 @@ def run_running_recovery_pass(
         evidence["observations"].append(observation_from_probe(probe, now=now))
         job = store.update_remote_recovery_evidence(token, int(job["id"]), evidence)
         decision = evaluate_running_stall(job, now=now)
+        if decision["exhausted_ready"]:
+            _abandon_recovery_exhausted(
+                store, token, job, decode_recovery_evidence(job.get("recovery_evidence_json"))
+            )
+            counters["recovery_exhausted"] += 1
+            continue
         if decision["stalled"] and restart_remote is not None:
             if not _probe_identity_matches(job, probe):
                 # The write path re-validates identity itself; a probe that

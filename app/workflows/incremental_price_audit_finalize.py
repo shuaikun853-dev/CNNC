@@ -238,6 +238,8 @@ def _valid_crawl_price(result: Mapping[str, Any]) -> bool:
 
 EXPORT_NO_PRICE_TERMINAL_EVIDENCE_TYPE = "EXPORT_NO_PRICE_TERMINAL"
 EXPORT_NO_PRICE_RSP_DESC = "未检索到商品价格信息"
+RECOVERY_EXHAUSTED_EVIDENCE_TYPE = "REMOTE_STALL_RECOVERY_EXHAUSTED"
+RECOVERY_EXHAUSTED_REMOTE_STATE = "RECOVERY_EXHAUSTED"
 
 
 def _valid_no_result(result: Mapping[str, Any]) -> bool:
@@ -251,6 +253,19 @@ def _valid_no_result(result: Mapping[str, Any]) -> bool:
             normalize_cell_str(result.get("export_rspDesc")) == EXPORT_NO_PRICE_RSP_DESC
             and export_count == 0
         )
+    elif evidence_type == RECOVERY_EXHAUSTED_EVIDENCE_TYPE:
+        try:
+            export_count = int(result.get("export_count"))
+        except (TypeError, ValueError):
+            return False
+        export_valid = (
+            normalize_cell_str(result.get("remote_state")) == RECOVERY_EXHAUSTED_REMOTE_STATE
+            and int(result.get("recovery_attempt") or 0) == 1
+            and bool(result.get("disable_confirmed"))
+            and bool(result.get("enable_confirmed"))
+            and bool(result.get("post_recovery_harvest_checked"))
+            and export_count == 0
+        )
     else:
         export_valid = evidence_type == "EXPORTED_NO_MATCHING_ROW"
     return (
@@ -258,6 +273,33 @@ def _valid_no_result(result: Mapping[str, Any]) -> bool:
         and result.get("page_price_value") is None
         and export_valid
         and bool(normalize_cell_str(result.get("no_result_reason")))
+    )
+
+
+def _valid_recovery_exhausted_evidence(remote_job: Mapping[str, Any]) -> bool:
+    """Accept the local give-up terminal only with its complete proof."""
+    if not bool(int(remote_job.get("post_attempted") or 0)):
+        return False
+    if not normalize_cell_str(remote_job.get("remote_identity")):
+        return False
+    if int(remote_job.get("recovery_attempts") or 0) != 1:
+        return False
+    try:
+        evidence = json.loads(str(remote_job.get("recovery_evidence_json") or ""))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return False
+    if not isinstance(evidence, dict):
+        return False
+    restart = evidence.get("restart")
+    if not isinstance(restart, dict) or normalize_cell_str(restart.get("phase")) != "ENABLE_CONFIRMED":
+        return False
+    disable_evidence = restart.get("disable_evidence")
+    enable_evidence = restart.get("enable_evidence")
+    return (
+        isinstance(disable_evidence, dict)
+        and isinstance(enable_evidence, dict)
+        and bool(disable_evidence)
+        and bool(enable_evidence)
     )
 
 
@@ -547,6 +589,13 @@ def build_frozen_audit_artifact(
                 and bool(int(remote_job.get("post_attempted") or 0))
                 and bool(normalize_cell_str(remote_job.get("remote_identity")))
             ):
+                continue
+            counts["remote_invalid"] += 1
+            continue
+        if state == "RECOVERY_EXHAUSTED":
+            # A local give-up is acceptable only with its complete durable
+            # recovery proof; anything less stays an invalid-state blocker.
+            if remote_job is not None and _valid_recovery_exhausted_evidence(remote_job):
                 continue
             counts["remote_invalid"] += 1
             continue

@@ -111,6 +111,7 @@ def _empty_status(
             "intent": 0, "pending": 0, "running": 0, "exported": 0,
             "completed": 0, "unknown": 0, "manual": 0,
             "awaiting_priority": 0, "awaiting_harvest": 0,
+            "recovery_exhausted": 0,
         },
         "final": {
             "pending": 0, "computed_pending": 0, "frozen": False, "finalized": False,
@@ -357,6 +358,9 @@ def collect_runtime_status(
         # Additive sub-views of pending/exported by next required action.
         "awaiting_priority": remote_states.get("PRIORITY_PENDING", 0),
         "awaiting_harvest": remote_states.get("SUBMITTED", 0) + remote_states.get("EXPORTED", 0),
+        # Local give-up terminal: the remote task was never completed; the
+        # business decided to stop waiting after one confirmed restart.
+        "recovery_exhausted": remote_states.get("RECOVERY_EXHAUSTED", 0),
     }
     computed_final_pending = (
         detail["pending"] + detail["running"]
