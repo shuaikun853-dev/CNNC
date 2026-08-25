@@ -790,6 +790,7 @@ def _restart_tool_module(task: dict, session: _RestartSession):
         QUERY_PROGRESS_URL = "https://platform.invalid/queryTaskProgress"
         QUERY_TASK_STATUS_URL = "https://platform.invalid/queryTaskStatus"
         UPDATE_STATE_URL = "https://platform.invalid/updateState"
+        QUERY_LIST_URL = "https://platform.invalid/queryList"
 
         @staticmethod
         def build_session():
@@ -805,7 +806,12 @@ def _restart_tool_module(task: dict, session: _RestartSession):
 
         @staticmethod
         def check_existing_task(session, task_name, mall_code):
-            return dict(session.task)
+            # Faithful to the real tool: HTTP through the session with its
+            # own hard-coded timeout.
+            payload = session.post(
+                _Module.QUERY_LIST_URL, json={"taskName": task_name}, timeout=60
+            ).json()
+            return payload["data"][0]
 
         @staticmethod
         def get_task_identity(task, mall_code):
@@ -813,12 +819,14 @@ def _restart_tool_module(task: dict, session: _RestartSession):
 
         @staticmethod
         def query_task_status(session, task_id):
-            return {"rspDesc": session.status_rsp_desc, "success": True}
+            return session.post(
+                _Module.QUERY_TASK_STATUS_URL + f"?taskId={task_id}", timeout=60
+            ).json()
 
         @staticmethod
         def query_task_progress(session, batch_number):
             return session.get(
-                _Module.QUERY_PROGRESS_URL, params={"batchNumber": batch_number}
+                _Module.QUERY_PROGRESS_URL, params={"batchNumber": batch_number}, timeout=60
             ).json()
 
         @staticmethod
@@ -859,15 +867,16 @@ class _FakeAuthManager:
         return {"BLADE_AUTH": "bearer fake", "COOKIE": "x-access-token=fake; refreshToken=fake"}
 
 
-def _prepared_job(tmp_path, monkeypatch, task: dict, session: _RestartSession):
+def _prepared_job(tmp_path, monkeypatch, task: dict, session: _RestartSession, monotonic=None):
     from app.services.legacy_zhaoshang_adapter import CnncLegacyZhaoshangAdapter
 
     run_dir = tmp_path / "zhaoshang"
     run_dir.mkdir(parents=True, exist_ok=True)
     batch_state = run_dir / "BATCH_STATE.md"
     batch_state.write_text("# batch\n", encoding="utf-8")
+    clock_kwargs = {"monotonic": monotonic} if monotonic is not None else {}
     adapter = CnncLegacyZhaoshangAdapter(
-        mappings=[], db_env_path=None, auth_manager=_FakeAuthManager()
+        mappings=[], db_env_path=None, auth_manager=_FakeAuthManager(), **clock_kwargs
     )
     prepared = adapter.prepare_job(
         BUSINESS_DATE,
@@ -1190,6 +1199,94 @@ def test_stationary_observations_with_terminal_status_are_not_stall_evidence() -
     job = _job(evidence=evidence)
     decision = evaluate_running_stall(job, now=NOW)
     assert decision["stalled"] is False
+
+
+# ---------------------------------------------------------------------------
+# Review round 3, Finding B: the deadline must reach the REAL requests.  The
+# external tool hard-codes timeout=60 inside its helpers, so the adapter must
+# clamp every session.get/post to the live remaining budget — asserting on
+# the timeouts the fake session actually received, not on what the adapter
+# was merely handed.
+# ---------------------------------------------------------------------------
+
+
+class _SteppingClock:
+    """Fake monotonic advancing by ``step`` on every call after the first."""
+
+    def __init__(self, start: float = 1000.0, step: float = 0.0) -> None:
+        self.value = start
+        self.step = step
+
+    def __call__(self) -> float:
+        current = self.value
+        self.value += self.step
+        return current
+
+
+def _all_recorded_timeouts(session: _RestartSession) -> list[float]:
+    return [
+        float(timeout)
+        for timeout in [*session.post_timeouts, *session.get_timeouts]
+        if timeout is not None
+    ]
+
+
+def test_case_b1_probe_requests_never_exceed_deadline(tmp_path, monkeypatch) -> None:
+    task = _running_task_record()
+    session = _RestartSession(task)
+    adapter, prepared = _prepared_job(tmp_path, monkeypatch, task, session, monotonic=_SteppingClock())
+
+    adapter.probe_running_task(prepared, TASK_ID, TASK_NUMBER, timeout_seconds=8.0)
+
+    timeouts = _all_recorded_timeouts(session)
+    assert timeouts, "the probe must have issued real requests"
+    assert max(timeouts) <= 8.0
+
+
+def test_case_b2_restart_requests_never_exceed_deadline(tmp_path, monkeypatch) -> None:
+    task = _running_task_record()
+    session = _RestartSession(task)
+    adapter, prepared = _prepared_job(tmp_path, monkeypatch, task, session, monotonic=_SteppingClock())
+
+    adapter.restart_running_task(prepared, TASK_ID, TASK_NUMBER, timeout_seconds=10.0)
+
+    timeouts = _all_recorded_timeouts(session)
+    assert timeouts, "the restart must have issued real requests"
+    assert max(timeouts) <= 10.0
+
+
+def test_case_b3_timeouts_shrink_as_budget_is_consumed(tmp_path, monkeypatch) -> None:
+    task = _running_task_record()
+    session = _RestartSession(task)
+    adapter, prepared = _prepared_job(
+        tmp_path, monkeypatch, task, session, monotonic=_SteppingClock(step=1.0)
+    )
+
+    adapter.probe_running_task(prepared, TASK_ID, TASK_NUMBER, timeout_seconds=12.0)
+
+    timeouts = _all_recorded_timeouts(session)
+    assert timeouts
+    assert max(timeouts) <= 12.0
+    assert timeouts[-1] < timeouts[0]
+
+
+def test_case_b4_exhausted_deadline_sends_no_further_request(tmp_path, monkeypatch) -> None:
+    task = _running_task_record()
+    session = _RestartSession(task)
+    clock = _SteppingClock(step=0.0)
+    calls = {"count": 0}
+
+    def monotonic() -> float:
+        calls["count"] += 1
+        if calls["count"] <= 2:
+            return clock()
+        return clock.value + 100.0  # every later check sees an exhausted deadline
+
+    adapter, prepared = _prepared_job(tmp_path, monkeypatch, task, session, monotonic=monotonic)
+    with pytest.raises(TimeoutError):
+        adapter.restart_running_task(prepared, TASK_ID, TASK_NUMBER, timeout_seconds=10.0)
+    assert session.post_calls == 0
+    assert session.get_calls == 0
 
 
 def test_adapter_probe_running_task_reports_progress_and_export(tmp_path, monkeypatch) -> None:

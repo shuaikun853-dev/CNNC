@@ -1629,7 +1629,12 @@ class CnncLegacyZhaoshangAdapter:
         if len(session_environment) != 2:
             raise LegacyZhaoshangAdapterError("legacy Zhaoshang session auth is unavailable")
         with _temporary_environment(session_environment):
-            session = tool.build_session()
+            session = _BoundedReadOnlySession(
+                tool.build_session(),
+                timeout_seconds,
+                monotonic=self._monotonic,
+                deadline=deadline,
+            )
             mall_code = tool.priority_mall_code_for_key(job.mall_key)
             resolved_task_name, _batch_number = tool.build_browser_task_identifiers(
                 job.task_name, job.mall_key
@@ -1821,7 +1826,15 @@ class CnncLegacyZhaoshangAdapter:
             return task, str(live_task_id), str(live_task_number), mall_logo
 
         with _temporary_environment(session_environment):
-            session = tool.build_session()
+            # The deadline must reach the real HTTP requests: the legacy tool
+            # hard-codes timeout=60 inside its helpers, so every call flows
+            # through this clamping session wrapper instead.
+            session = _BoundedReadOnlySession(
+                tool.build_session(),
+                timeout_seconds,
+                monotonic=self._monotonic,
+                deadline=deadline,
+            )
             mall_code = tool.priority_mall_code_for_key(job.mall_key)
             resolved_task_name, _batch_number = tool.build_browser_task_identifiers(
                 job.task_name, job.mall_key
