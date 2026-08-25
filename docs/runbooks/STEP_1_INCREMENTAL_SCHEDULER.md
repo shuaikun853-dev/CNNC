@@ -341,6 +341,18 @@ task name 使用业务日和 immutable 请求集生成同日稳定、跨日不�
   才进入正常 planner，已有 crawl/remote intent 仍按 identity 幂等复用。
 - POST 之前持久化 immutable intent；超时或进程中断进入 `SUBMIT_UNKNOWN`，后续只能精确对账，
   不自动重发 `/add`。harvest 到 attempts/elapsed 上限进入人工处理。
+- RUNNING 任务有 fail-closed 的停滞自愈：tick 会对创建超过 30 分钟且已 harvest 两次以上的
+  RUNNING 任务做只读 progress/export 探测并持久化证据（`remote_jobs.recovery_evidence_json`）。
+  只有同时满足 harvest 达 8 次、运行超 90 分钟、连续 4 次以上 progress signature 完全静止跨
+  60 分钟、且 export 持续返回 `count=0`「未检索到商品价格信息」，才认定为 stalled；旧库缺证据
+  一律视为未证明 stalled，继续正常 harvest。认定 stalled 后（仅 `--enable-remote-writes` 的
+  tick）对精确 remote identity 执行一次、且仅一次禁用→启用：phase 先持久化再写远端，任何写
+  结果未知都先重新精确查询真实状态，绝不盲重发；15 分钟确认窗内未确认保持等待，超窗或身份
+  冲突 fail-closed 转 `MANUAL_REQUIRED`。重启确认后任务回归 RUNNING 交回正常 harvest；重启
+  30 分钟后若两次以上探测仍静止且无价格，本地进入终态 `RECOVERY_EXHAUSTED`（不伪造远端
+  COMPLETED），linked crawl 以 `REMOTE_STALL_RECOVERY_EXHAUSTED` 证据收口为 `NO_RESULT`
+  （价格留空），ordinary final 视为可接受终态收敛，`SUBMIT_UNKNOWN`/`MANUAL_REQUIRED`/
+  普通 RUNNING 的 blocker 语义不变。该状态在 `status` 的 `remote.recovery_exhausted` 计数。
 - 每次命令都会安全更新该业务日的 `BATCH_STATE.md`；SQLite 仍是状态权威。重叠实例正常返回 0，
   可恢复 pending/defer 返回 0，`FAILED`、人工项或正式产物阻塞返回非零。
 - 不要在此调度中加入审批、驳回、通过、保存、提交、推送、本地 crawler fallback 或任何 SQL。
