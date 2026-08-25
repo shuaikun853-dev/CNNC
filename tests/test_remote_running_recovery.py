@@ -1231,6 +1231,79 @@ def _all_recorded_timeouts(session: _RestartSession) -> list[float]:
     ]
 
 
+# ---------------------------------------------------------------------------
+# Review round 3, Finding C: the per-tick probe cap must count ATTEMPTS, not
+# successful observations.  A platform outage making every probe fail (the
+# bridge swallows exceptions into None) must not let one tick hammer every
+# candidate — failed probes consume the allowance too.
+# ---------------------------------------------------------------------------
+
+
+def test_case_c1_all_failing_probes_stop_at_the_attempt_cap(tmp_path) -> None:
+    store = DailyAuditStore(tmp_path / "state.sqlite3")
+    job_ids = _seed_candidate_jobs(store, 10)
+    calls: list[int] = []
+
+    def probe(job: dict, timeout_seconds: float | None = None):
+        calls.append(int(job["id"]))
+        return None
+
+    token = store.acquire_lease(BUSINESS_DATE, "capc1", ttl_seconds=300)
+    try:
+        counters = run_running_recovery_pass(
+            store, token, probe_remote=probe, restart_remote=None, now=NOW, can_start=lambda: True
+        )
+    finally:
+        store.release_lease(token)
+    assert len(calls) == 4
+    assert counters["recovery_probe_attempts"] == 4
+    assert counters["recovery_probes"] == 0
+
+
+def test_case_c2_failed_probes_share_the_allowance_with_successful_ones(tmp_path) -> None:
+    store = DailyAuditStore(tmp_path / "state.sqlite3")
+    job_ids = _seed_candidate_jobs(store, 10)
+    calls: list[int] = []
+    outcomes = [None, None, "ok", "ok"]
+
+    def probe(job: dict, timeout_seconds: float | None = None):
+        calls.append(int(job["id"]))
+        index = min(len(calls) - 1, len(outcomes) - 1)
+        if outcomes[index] is None:
+            return None
+        parts = str(job["remote_identity"]).split("|")
+        return _probe_payload(remote_task_id=parts[1], remote_task_number=parts[2])
+
+    token = store.acquire_lease(BUSINESS_DATE, "capc2", ttl_seconds=300)
+    try:
+        counters = run_running_recovery_pass(
+            store, token, probe_remote=probe, restart_remote=None, now=NOW, can_start=lambda: True
+        )
+    finally:
+        store.release_lease(token)
+    assert len(calls) == 4
+    assert counters["recovery_probes"] == 2
+
+
+def test_case_c3_failed_probe_writes_nothing_and_stays_harvestable(tmp_path) -> None:
+    store = DailyAuditStore(tmp_path / "state.sqlite3")
+    job_ids = _seed_candidate_jobs(store, 1)
+
+    def probe(job: dict, timeout_seconds: float | None = None):
+        return None
+
+    token = store.acquire_lease(BUSINESS_DATE, "capc3", ttl_seconds=300)
+    try:
+        run_running_recovery_pass(
+            store, token, probe_remote=probe, restart_remote=None, now=NOW, can_start=lambda: True
+        )
+    finally:
+        store.release_lease(token)
+    refreshed = store.get_remote_job(job_ids[0])
+    assert refreshed["state"] == "RUNNING"
+    assert refreshed["recovery_evidence_json"] is None
+
+
 def test_case_b1_probe_requests_never_exceed_deadline(tmp_path, monkeypatch) -> None:
     task = _running_task_record()
     session = _RestartSession(task)

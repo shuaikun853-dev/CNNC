@@ -647,6 +647,7 @@ def run_running_recovery_pass(
     """
     counters = {
         "recovery_probes": 0,
+        "recovery_probe_attempts": 0,
         "recovery_restarts": 0,
         "recovery_exhausted": 0,
         "recovery_reconciled": 0,
@@ -678,10 +679,12 @@ def run_running_recovery_pass(
         decision = evaluate_running_stall(job, now=now)
         if not decision["probe_candidate"]:
             continue
-        if counters["recovery_probes"] >= max_probe_candidates:
-            # Budget-shaped cap: this tick already spent its probe allowance;
-            # the remaining candidates keep harvesting and wait for a later tick.
+        if counters["recovery_probe_attempts"] >= max_probe_candidates:
+            # Budget-shaped cap on ATTEMPTS: a probe allowance consumed by
+            # failed probes (platform outage) must protect the remaining
+            # candidates exactly like successful ones would.
             continue
+        counters["recovery_probe_attempts"] += 1
         probe = probe_remote(job)
         if not isinstance(probe, Mapping):
             continue
