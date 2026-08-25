@@ -710,9 +710,20 @@ def run_running_recovery_pass(
                     "remote stall probe identity no longer matches the durable remote identity",
                 )
                 continue
-            outcome = _apply_restart(
-                store, token, job, decode_recovery_evidence(job.get("recovery_evidence_json")), restart_remote, now=now
+            document = decode_recovery_evidence(job.get("recovery_evidence_json"))
+            pending_restart = document.get("restart")
+            is_already_sent = (
+                isinstance(pending_restart, Mapping)
+                and _text(pending_restart.get("phase")) in {"DISABLE_SENT", "ENABLE_SENT"}
             )
+            if not is_already_sent and not can_start():
+                # A fresh restart is deferrable tail work: the probe may have
+                # consumed the remaining headroom, so the freshly saved
+                # observation waits for a tick with budget.  Already-sent
+                # phases are reconciliation safety work (no second write is
+                # ever dispatched for them) and must not be deferred here.
+                continue
+            outcome = _apply_restart(store, token, job, document, restart_remote, now=now)
             counters["recovery_restarts"] += int(bool(outcome.get("restarted")))
             counters["recovery_reconciled"] += int(bool(outcome.get("reconciled")))
     return counters

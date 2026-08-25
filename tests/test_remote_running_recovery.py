@@ -1304,6 +1304,113 @@ def test_case_c3_failed_probe_writes_nothing_and_stays_harvestable(tmp_path) -> 
     assert refreshed["recovery_evidence_json"] is None
 
 
+# ---------------------------------------------------------------------------
+# Review round 3, Finding D (Important 4): a fresh restart is deferrable tail
+# work — after the probe spends budget, a stalled decision must re-check the
+# budget before dispatching any remote write.  Already-sent phases
+# (DISABLE_SENT / ENABLE_SENT) are reconciliation safety work and are NOT
+# deferred by this gate (SUBMIT_UNKNOWN reconcile-first parity): the loop's
+# own can_start entry check is their only budget gate.
+# ---------------------------------------------------------------------------
+
+
+def _run_flagged_pass(store, probe, restart, *, can_start):
+    token = store.acquire_lease(BUSINESS_DATE, "pass-d", ttl_seconds=300)
+    try:
+        return run_running_recovery_pass(
+            store, token, probe_remote=probe, restart_remote=restart, now=NOW, can_start=can_start
+        )
+    finally:
+        store.release_lease(token)
+
+
+def test_case_d1_budget_consumed_after_probe_defers_fresh_restart(tmp_path) -> None:
+    store, job_id = _stalled_store(tmp_path)
+    restart = _FakeRestart([dict(_CONFIRMED_RESTART_STEP)])
+    budget = {"ok": True}
+
+    def probe(job: dict, timeout_seconds: float | None = None) -> dict:
+        budget["ok"] = False  # the probe consumed the remaining headroom
+        return _probe_payload()
+
+    _run_flagged_pass(store, probe, restart, can_start=lambda: budget["ok"])
+    refreshed = store.get_remote_job(job_id)
+    assert restart.calls == []
+    assert int(refreshed["recovery_attempts"] or 0) == 0
+    evidence = json.loads(str(refreshed["recovery_evidence_json"]))
+    assert evidence["restart"] is None
+    # The expensive evidence IS saved; only the write is deferred.
+    assert len(evidence["observations"]) == 5
+
+
+def test_case_d2_next_tick_with_budget_dispatches_the_deferred_restart(tmp_path) -> None:
+    store, job_id = _stalled_store(tmp_path)
+    restart = _FakeRestart([dict(_CONFIRMED_RESTART_STEP)])
+    budget = {"ok": True}
+
+    def probe(job: dict, timeout_seconds: float | None = None) -> dict:
+        budget["ok"] = False
+        return _probe_payload()
+
+    _run_flagged_pass(store, probe, restart, can_start=lambda: budget["ok"])
+
+    def probe_again(job: dict, timeout_seconds: float | None = None) -> dict:
+        return _probe_payload()
+
+    _run_flagged_pass(store, probe_again, restart, can_start=lambda: True)
+    assert restart.calls == [(job_id, None)]
+    assert int(store.get_remote_job(job_id)["recovery_attempts"]) == 1
+
+
+def test_case_d3_resume_disable_sent_reconciles_despite_consumed_budget(tmp_path) -> None:
+    store, job_id = _stalled_store(tmp_path)
+    token = store.acquire_lease(BUSINESS_DATE, "seed-d3", ttl_seconds=300)
+    evidence = _observations(4)
+    evidence["restart"] = {
+        "phase": "DISABLE_SENT",
+        "phase_at": NOW.isoformat(timespec="seconds"),
+        "recovery_reason": "REMOTE_RUNNING_STALLED",
+    }
+    store.update_remote_recovery_evidence(token, job_id, evidence)
+    store.release_lease(token)
+    restart = _FakeRestart([dict(_CONFIRMED_RESTART_STEP)])
+    budget = {"ok": True}
+
+    def probe(job: dict, timeout_seconds: float | None = None) -> dict:
+        budget["ok"] = False
+        return _probe_payload()
+
+    _run_flagged_pass(store, probe, restart, can_start=lambda: budget["ok"])
+    # Already-sent write: reconciliation runs even though the fresh-write
+    # gate would defer; the callback receives the resume phase, never a
+    # second fresh dispatch.
+    assert restart.calls == [(job_id, "DISABLE_SENT")]
+    assert int(store.get_remote_job(job_id)["recovery_attempts"]) == 1
+
+
+def test_case_d4_resume_enable_sent_reconciles_despite_consumed_budget(tmp_path) -> None:
+    store, job_id = _stalled_store(tmp_path)
+    token = store.acquire_lease(BUSINESS_DATE, "seed-d4", ttl_seconds=300)
+    evidence = _observations(4)
+    evidence["restart"] = {
+        "phase": "ENABLE_SENT",
+        "phase_at": NOW.isoformat(timespec="seconds"),
+        "recovery_reason": "REMOTE_RUNNING_STALLED",
+    }
+    store.update_remote_recovery_evidence(token, job_id, evidence)
+    store.release_lease(token)
+    restart = _FakeRestart([dict(_CONFIRMED_RESTART_STEP)])
+    budget = {"ok": True}
+
+    def probe(job: dict, timeout_seconds: float | None = None) -> dict:
+        budget["ok"] = False
+        return _probe_payload()
+
+    _run_flagged_pass(store, probe, restart, can_start=lambda: budget["ok"])
+    assert restart.calls == [(job_id, "ENABLE_SENT")]
+    assert int(store.get_remote_job(job_id)["recovery_attempts"]) == 1
+
+
 def test_case_b1_probe_requests_never_exceed_deadline(tmp_path, monkeypatch) -> None:
     task = _running_task_record()
     session = _RestartSession(task)
