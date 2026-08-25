@@ -130,9 +130,6 @@ def extract_detail_reference_records(document_id, detail_data):
         title = str(detail_data.get(key) or "").strip()
         if title:
             break
-    if not title:
-        return {}
-
     records = {}
     reference_infos = detail_data.get("referenceInfos")
     if not isinstance(reference_infos, list):
@@ -149,6 +146,21 @@ def extract_detail_reference_records(document_id, detail_data):
         for url in URL_RE.findall(str(item.get("referenceLink") or "")):
             records[(document_id, url)] = {"price": price, "title": title}
     return records
+
+
+def apply_detail_price_results(rows, records):
+    changed = 0
+    for row in rows:
+        if row.价格 not in ("", None):
+            continue
+        record = records.get((str(row.单据id).strip(), str(row.URL).strip()))
+        if not record or record.get("price") in ("", None):
+            continue
+        row.价格 = record["price"]
+        row.爬取状态 = "中核detail参考价回填"
+        row.爬取失败原因 = ""
+        changed += 1
+    return changed
 
 
 def apply_detail_reference_results(rows, records):
@@ -200,14 +212,15 @@ def run_stbchina_fallback(urls, output_dir):
     return read_stbchina_results(result_path)
 
 
-def apply_stbchina_results(rows, records):
+def apply_stbchina_results(rows, records, fill_title=True):
     changed = 0
     for row in rows:
         record = records.get(row.URL)
         if not record:
             continue
         row.价格 = record["price"]
-        row.互联网标题 = record["title"]
+        if fill_title:
+            row.互联网标题 = record["title"]
         if record["uid"]:
             row.SKUID = record["uid"]
         row.销量_评论数 = record["comment"]

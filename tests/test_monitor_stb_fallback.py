@@ -7,6 +7,7 @@ import pytest
 
 import scripts.monitor_stb_fallback as monitor_stb_fallback
 from scripts.monitor_stb_fallback import (
+    apply_detail_price_results,
     apply_detail_reference_results,
     apply_stbchina_results,
     extract_detail_reference_records,
@@ -33,6 +34,37 @@ def test_extract_detail_reference_records_pairs_each_url_with_its_price_and_deta
         "title": "detail 商品标题",
     }
     assert records[("doc-1", "https://example.com/b?id=2")]["price"] == 0.0
+
+
+def test_extract_detail_reference_records_keeps_url_price_when_detail_has_no_title():
+    records = extract_detail_reference_records(
+        "doc-1",
+        {"referenceInfos": [{"referenceLink": "https://example.com/a?id=1", "referencePrice": "12.50"}]},
+    )
+
+    assert records[("doc-1", "https://example.com/a?id=1")] == {"price": 12.5, "title": ""}
+
+
+def test_apply_detail_price_results_fills_price_without_setting_internet_title():
+    row = SimpleNamespace(
+        单据id="doc-1",
+        URL="https://example.com/a?id=1",
+        价格="",
+        互联网标题="",
+        爬取状态="待爬取",
+        爬取失败原因="无价格",
+    )
+
+    changed = apply_detail_price_results(
+        [row],
+        {("doc-1", row.URL): {"price": 12.5, "title": "中核商品名称"}},
+    )
+
+    assert changed == 1
+    assert row.价格 == 12.5
+    assert row.互联网标题 == ""
+    assert row.爬取状态 == "中核detail参考价回填"
+    assert row.爬取失败原因 == ""
 
 
 def test_apply_detail_reference_results_only_fills_rows_missing_both_fields():
@@ -143,6 +175,26 @@ def test_apply_stbchina_results_updates_only_rows_with_a_price():
     assert row.SKUID == "1"
 
 
+def test_apply_stbchina_results_can_leave_internet_title_blank():
+    row = SimpleNamespace(
+        URL="https://www.stbchina.cn/product?itemId=1",
+        价格="",
+        互联网标题="",
+        SKUID="",
+        销量_评论数="",
+    )
+
+    changed = apply_stbchina_results(
+        [row],
+        {row.URL: {"price": 12.5, "title": "史泰博标题", "uid": "1", "comment": "2"}},
+        fill_title=False,
+    )
+
+    assert changed == 1
+    assert row.价格 == 12.5
+    assert row.互联网标题 == ""
+
+
 def test_fixed_entrypoint_exposes_opt_in_stb_and_db_env_options():
     result = subprocess.run(
         [sys.executable, "scripts/process_monitor_no_push_zhaoshang.py", "--help"],
@@ -157,6 +209,7 @@ def test_fixed_entrypoint_exposes_opt_in_stb_and_db_env_options():
     assert "--zs-wait-concurrency" in result.stdout
     assert "--auto-stbchina-fallback" in result.stdout
     assert "--detail-reference-fallback" in result.stdout
+    assert "--leave-internet-title-blank" in result.stdout
 
 
 def test_stb_fallback_reuses_complete_existing_result(tmp_path, monkeypatch):

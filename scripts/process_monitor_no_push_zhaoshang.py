@@ -20,12 +20,12 @@ from openpyxl.utils import get_column_letter
 try:
     from scripts.auth_manager import AuthManager
     from scripts.curl_utils import apply_curl_headers, internal_direct_opener, internal_subprocess_env, parse_curl_command
-    from scripts.monitor_stb_fallback import apply_detail_reference_results, apply_stbchina_results, classify_priority_output, extract_detail_reference_records, find_header, is_stbchina_url, load_zhaoshang_db_env, run_stbchina_fallback, save_or_reuse_locked_workbook
+    from scripts.monitor_stb_fallback import apply_detail_price_results, apply_detail_reference_results, apply_stbchina_results, classify_priority_output, extract_detail_reference_records, find_header, is_stbchina_url, load_zhaoshang_db_env, run_stbchina_fallback, save_or_reuse_locked_workbook
     from scripts.zhaoshang_task_phases import CreatePhaseError, MallJob, build_zhaoshang_task_name, run_create_phase, run_wait_export_phase
 except ModuleNotFoundError:
     from auth_manager import AuthManager
     from curl_utils import apply_curl_headers, internal_direct_opener, internal_subprocess_env, parse_curl_command
-    from monitor_stb_fallback import apply_detail_reference_results, apply_stbchina_results, classify_priority_output, extract_detail_reference_records, find_header, is_stbchina_url, load_zhaoshang_db_env, run_stbchina_fallback, save_or_reuse_locked_workbook
+    from monitor_stb_fallback import apply_detail_price_results, apply_detail_reference_results, apply_stbchina_results, classify_priority_output, extract_detail_reference_records, find_header, is_stbchina_url, load_zhaoshang_db_env, run_stbchina_fallback, save_or_reuse_locked_workbook
     from zhaoshang_task_phases import CreatePhaseError, MallJob, build_zhaoshang_task_name, run_create_phase, run_wait_export_phase
 
 sys.path.insert(0, r"E:\.A中核运维")
@@ -56,7 +56,8 @@ def parse_args():
     parser.add_argument("--detail-retries", type=int, default=5, help="中核 detail 网络异常重试次数")
     parser.add_argument("--zhaoshang-db-env", help="招商局优先级数据库环境变量文件，仅在当前进程加载")
     parser.add_argument("--auto-stbchina-fallback", action="store_true", help="招商局后自动运行史泰博专用脚本回填仍缺价的 stbchina.cn 链接")
-    parser.add_argument("--prefer-detail-price", action="store_true", help="中核 detail 同时有有效标题和价格时直接回填，并跳过该链接的招商局任务")
+    parser.add_argument("--prefer-detail-price", action="store_true", help="中核 detail 有有效 URL 参考价时直接回填价格，并跳过该链接的招商局任务")
+    parser.add_argument("--leave-internet-title-blank", action="store_true", help="只回填价格，所有互联网标题保留为空")
     parser.add_argument("--detail-reference-fallback", action="store_true", help="经用户明确授权后，以同单据同URL的中核detail参考价和商品标题补全仍同时缺少价格、标题的行，并另存模板")
     parser.add_argument("--skip-zhaoshang", action="store_true", help="不创建招商局任务；仅生成当前可处理的三类文件和缺价清单")
     parser.add_argument("--zs-create-only", action="store_true", help="只批量创建、启用招商局任务并尝试提优，不等待或导出")
@@ -416,10 +417,10 @@ print("    导入:{}条 推送失败:{}条".format(len(all_import_rows), len(sin
 
 detail_direct_backfilled = 0
 if ARGS.prefer_detail_price:
-    detail_direct_backfilled = apply_detail_reference_results(
+    detail_direct_backfilled = apply_detail_price_results(
         all_import_rows, detail_reference_records
     )
-    print("中核detail直接回填:{}条；其余链接再进入招商局".format(
+    print("中核detail直接回填价格:{}条；互联网标题保留为空；其余链接再进入招商局".format(
         detail_direct_backfilled
     ))
 
@@ -615,7 +616,7 @@ for ir in all_import_rows:
         if rec.get("price") not in ("", None):
             ir.价格 = rec["price"]
             price_count += 1
-            ir.互联网标题 = rec.get("title") or ""
+            ir.互联网标题 = "" if ARGS.leave_internet_title_blank else (rec.get("title") or "")
             if ir.互联网标题:
                 title_count += 1
         else:
@@ -714,7 +715,9 @@ if ARGS.auto_stbchina_fallback:
         print("[8] 史泰博自动兜底: {}条...".format(len(stb_urls)))
         try:
             stb_records = run_stbchina_fallback(stb_urls, OUT_DIR)
-            stb_backfilled = apply_stbchina_results(all_import_rows, stb_records)
+            stb_backfilled = apply_stbchina_results(
+                all_import_rows, stb_records, fill_title=not ARGS.leave_internet_title_blank
+            )
         except RuntimeError as exc:
             stb_error = str(exc)
             print("    史泰博兜底已停止: {}".format(stb_error))
