@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 from datetime import UTC, datetime
+from enum import Enum
 from typing import Any, Callable, Mapping
 
 from app.services.daily_audit_store import DailyAuditStore, LeaseToken
@@ -33,20 +34,52 @@ PROGRESS_FIELDS: tuple[str, ...] = (
     "finished",
 )
 RUNNING_STALL_EXPORT_NO_PRICE_RSP_DESC = "未检索到商品价格信息"
-# Task-status rspDesc vocabulary, anchored in evidence rather than guesses:
-# the external tool itself interprets exactly one status value — the terminal
-# marker "本次任务执行完毕" (auto_crawl_task.py:1048) — and production captures
-# (job 54) carry the same marker; "执行中" is the platform's executing label
-# used by the tool's progress parser.  An observation or write gate counts as
-# "still running" ONLY on that confirmed marker; empty, terminal, or
-# unrecognized values fail closed.
-RUNNING_STATUS_RUNNING_MARKERS: frozenset[str] = frozenset({"执行中"})
-RUNNING_STATUS_TERMINAL_MARKERS: frozenset[str] = frozenset({"本次任务执行完毕"})
+# Remote execution-state evidence.  The external tool interprets exactly one
+# status value itself -- the terminal marker "本次任务执行完毕"
+# (auto_crawl_task.py:1048) -- and no RUNNING string for the status endpoint
+# has ever been observed in production (all 24 real captures were empty;
+# "执行中" is a progress-descriptor label, not a status answer).  Liveness is
+# therefore derived from the structured query_task_progress six-field
+# payload, mirroring the tool's own ``is_progress_finished`` business
+# definition: work remains ACTIVE while any of pending/running/waiting_db is
+# positive, and is finished only when all three are zero and
+# finished + failed >= total.  Anything unparseable, contradictory, or with a
+# non-positive total is UNKNOWN and fails closed.
+TERMINAL_STATUS_MARKERS: tuple[str, ...] = ("本次任务执行完毕",)
 
 
-def is_remote_task_still_running(task_status_rsp_desc: object) -> bool:
-    """True only when the live status string is a confirmed still-running answer."""
-    return _text(task_status_rsp_desc) in RUNNING_STATUS_RUNNING_MARKERS
+class RemoteExecutionState(str, Enum):
+    ACTIVE = "REMOTE_ACTIVE"
+    TERMINAL = "REMOTE_TERMINAL"
+    UNKNOWN = "REMOTE_UNKNOWN"
+
+
+def classify_remote_execution_state(
+    progress: Mapping[str, Any] | None,
+    task_status_rsp_desc: object = "",
+) -> RemoteExecutionState:
+    """Classify one exact remote task as ACTIVE / TERMINAL / UNKNOWN.
+
+    The terminal status marker wins over any progress payload; otherwise the
+    structured progress counters decide.  UNKNOWN never authorizes stall
+    evidence and never authorizes a fresh remote write.
+    """
+    description = _text(task_status_rsp_desc)
+    if any(marker in description for marker in TERMINAL_STATUS_MARKERS):
+        return RemoteExecutionState.TERMINAL
+    signature = canonical_progress_signature(progress if isinstance(progress, Mapping) else {})
+    if signature is None:
+        return RemoteExecutionState.UNKNOWN
+    total, pending, running, failed, waiting_db, finished = signature
+    if any(value < 0 for value in signature):
+        return RemoteExecutionState.UNKNOWN
+    if pending > 0 or running > 0 or waiting_db > 0:
+        return RemoteExecutionState.ACTIVE
+    if finished + failed > total:
+        return RemoteExecutionState.UNKNOWN
+    if finished + failed >= total:
+        return RemoteExecutionState.TERMINAL
+    return RemoteExecutionState.UNKNOWN
 # Candidate gating: only RUNNING jobs that have been harvested at least twice
 # and are at least 30 minutes old spend read-only probe calls.
 RUNNING_PROBE_MIN_HARVEST_ATTEMPTS = 2
@@ -191,7 +224,10 @@ def observation_from_probe(probe: Mapping[str, Any], *, now: datetime) -> dict[s
 def _observation_is_no_price(row: Mapping[str, Any]) -> bool:
     if row.get("signature") is None:
         return False
-    if not is_remote_task_still_running(row.get("task_status_rsp_desc")):
+    if (
+        classify_remote_execution_state(row.get("progress"), row.get("task_status_rsp_desc"))
+        is not RemoteExecutionState.ACTIVE
+    ):
         return False
     if bool(row.get("export_had_result")):
         return False

@@ -728,6 +728,10 @@ class _FakeRestartResponse:
         return self._payload
 
 
+_ACTIVE_PROGRESS_RSP = "总任务量：10条，待执行：4条，执行中：3条，失败：0条，待入库：1条，执行完成：2条"
+_TERMINAL_PROGRESS_RSP = "总任务量：10条，待执行：0条，执行中：0条，失败：0条，待入库：0条，执行完成：10条"
+
+
 class _RestartSession:
     """Stateful fake: updateState flips the exact task's enabled flag."""
 
@@ -738,14 +742,22 @@ class _RestartSession:
         fail_disable: bool = False,
         fail_enable: bool = False,
         status_rsp_desc: str = "执行中",
+        progress_rsp_desc: str = _ACTIVE_PROGRESS_RSP,
     ) -> None:
         self.task = task
         self.fail_disable = fail_disable
         self.fail_enable = fail_enable
         self.status_rsp_desc = status_rsp_desc
+        self.progress_rsp_desc = progress_rsp_desc
         self.update_calls: list[dict] = []
+        self.post_timeouts: list[float | None] = []
+        self.get_timeouts: list[float | None] = []
+        self.post_calls = 0
+        self.get_calls = 0
 
     def post(self, url, json=None, timeout=None):
+        self.post_calls += 1
+        self.post_timeouts.append(timeout)
         if "updateState" in url:
             self.update_calls.append(dict(json))
             if json.get("state") == "0":
@@ -767,12 +779,9 @@ class _RestartSession:
         return _FakeRestartResponse({"data": [dict(self.task)]})
 
     def get(self, url, params=None, timeout=None):
-        return _FakeRestartResponse(
-            {
-                "rspDesc": "总任务量：10条，待执行：4条，执行中：3条，失败：0条，待入库：1条，执行完成：2条",
-                "success": True,
-            }
-        )
+        self.get_calls += 1
+        self.get_timeouts.append(timeout)
+        return _FakeRestartResponse({"rspDesc": self.progress_rsp_desc, "success": True})
 
 
 def _restart_tool_module(task: dict, session: _RestartSession):
@@ -1013,11 +1022,84 @@ def test_fresh_externally_disabled_outcome_fails_closed_to_manual(tmp_path) -> N
 # ---------------------------------------------------------------------------
 
 
-def test_adapter_fresh_restart_declines_when_task_completed_between_probe_and_write(
-    tmp_path, monkeypatch
-) -> None:
+# ---------------------------------------------------------------------------
+# Review round 3, Finding A: live activity must be derived from the
+# structured query_task_progress six-field evidence (the external tool's own
+# parse_task_progress_desc / is_progress_finished semantics), NOT from an
+# unverified query_task_status RUNNING string.  "执行中" is a progress
+# label, never a confirmed status-endpoint value (all 24 real captures were
+# empty).  Tri-state: ACTIVE / TERMINAL / UNKNOWN, fail closed on UNKNOWN.
+# ---------------------------------------------------------------------------
+
+
+def _live_progress(**overrides) -> dict:
+    progress = {"total": 10, "pending": 0, "running": 3, "failed": 0, "waiting_db": 0, "finished": 7}
+    progress.update(overrides)
+    return progress
+
+
+def test_case_a1_active_progress_with_empty_status_is_active() -> None:
+    from app.services.remote_running_recovery import RemoteExecutionState, classify_remote_execution_state
+
+    state = classify_remote_execution_state(_live_progress(), "")
+    assert state is RemoteExecutionState.ACTIVE
+
+
+def test_case_a2_all_finished_progress_is_terminal() -> None:
+    from app.services.remote_running_recovery import RemoteExecutionState, classify_remote_execution_state
+
+    state = classify_remote_execution_state(
+        _live_progress(pending=0, running=0, waiting_db=0, finished=10), ""
+    )
+    assert state is RemoteExecutionState.TERMINAL
+
+
+def test_case_a3_terminal_status_marker_wins_over_active_progress() -> None:
+    from app.services.remote_running_recovery import RemoteExecutionState, classify_remote_execution_state
+
+    state = classify_remote_execution_state(_live_progress(running=3), "本次任务执行完毕")
+    assert state is RemoteExecutionState.TERMINAL
+
+
+def test_case_a4_missing_progress_field_is_unknown() -> None:
+    from app.services.remote_running_recovery import RemoteExecutionState, classify_remote_execution_state
+
+    progress = _live_progress()
+    del progress["running"]
+    assert classify_remote_execution_state(progress, "") is RemoteExecutionState.UNKNOWN
+
+
+def test_case_a5_zero_total_is_unknown() -> None:
+    from app.services.remote_running_recovery import RemoteExecutionState, classify_remote_execution_state
+
+    assert classify_remote_execution_state(
+        _live_progress(total=0, finished=0), ""
+    ) is RemoteExecutionState.UNKNOWN
+
+
+def test_case_a6_contradictory_progress_is_unknown() -> None:
+    from app.services.remote_running_recovery import RemoteExecutionState, classify_remote_execution_state
+
+    assert classify_remote_execution_state(
+        _live_progress(pending=0, running=0, waiting_db=0, finished=12), ""
+    ) is RemoteExecutionState.UNKNOWN
+    assert classify_remote_execution_state(
+        _live_progress(pending=0, running=0, waiting_db=0, finished=9, failed=-1), ""
+    ) is RemoteExecutionState.UNKNOWN
+
+
+def test_case_a7_job53_pattern_with_empty_status_still_stalls() -> None:
+    evidence = _observations(4)
+    for row in evidence["observations"]:
+        row["task_status_rsp_desc"] = ""
+    job = _job(evidence=evidence)
+    decision = evaluate_running_stall(job, now=NOW)
+    assert decision["stalled"] is True
+
+
+def test_adapter_write_gate_declines_when_progress_turned_terminal(tmp_path, monkeypatch) -> None:
     task = _running_task_record()
-    session = _RestartSession(task, status_rsp_desc="本次任务执行完毕")
+    session = _RestartSession(task, progress_rsp_desc=_TERMINAL_PROGRESS_RSP)
     adapter, prepared = _prepared_job(tmp_path, monkeypatch, task, session)
 
     outcome = adapter.restart_running_task(prepared, TASK_ID, TASK_NUMBER, timeout_seconds=60.0)
@@ -1026,20 +1108,47 @@ def test_adapter_fresh_restart_declines_when_task_completed_between_probe_and_wr
     assert session.update_calls == []
 
 
-def test_adapter_fresh_restart_declines_on_unknown_remote_status(tmp_path, monkeypatch) -> None:
+def test_adapter_write_gate_declines_on_unparseable_progress(tmp_path, monkeypatch) -> None:
+    task = _running_task_record()
+    session = _RestartSession(task, progress_rsp_desc="进度数据异常")
+    adapter, prepared = _prepared_job(tmp_path, monkeypatch, task, session)
+
+    outcome = adapter.restart_running_task(prepared, TASK_ID, TASK_NUMBER, timeout_seconds=60.0)
+
+    assert outcome.status.value == "NO_LONGER_RUNNING"
+    assert session.update_calls == []
+
+
+def test_adapter_fresh_restart_proceeds_with_active_progress_despite_unknown_status(
+    tmp_path, monkeypatch
+) -> None:
     task = _running_task_record()
     session = _RestartSession(task, status_rsp_desc="状态异常")
     adapter, prepared = _prepared_job(tmp_path, monkeypatch, task, session)
 
     outcome = adapter.restart_running_task(prepared, TASK_ID, TASK_NUMBER, timeout_seconds=60.0)
 
-    assert outcome.status.value == "NO_LONGER_RUNNING"
-    assert session.update_calls == []
+    assert outcome.status.value == "RESTARTED"
+    assert len([call for call in session.update_calls if call.get("state") == "0"]) == 1
+    assert len([call for call in session.update_calls if call.get("state") == "1"]) == 1
 
 
-def test_adapter_fresh_restart_declines_on_empty_remote_status(tmp_path, monkeypatch) -> None:
+def test_adapter_fresh_restart_proceeds_with_empty_status(tmp_path, monkeypatch) -> None:
     task = _running_task_record()
     session = _RestartSession(task, status_rsp_desc="")
+    adapter, prepared = _prepared_job(tmp_path, monkeypatch, task, session)
+
+    outcome = adapter.restart_running_task(prepared, TASK_ID, TASK_NUMBER, timeout_seconds=60.0)
+
+    assert outcome.status.value == "RESTARTED"
+    assert len(session.update_calls) == 2
+
+
+def test_adapter_fresh_restart_declines_when_task_completed_between_probe_and_write(
+    tmp_path, monkeypatch
+) -> None:
+    task = _running_task_record()
+    session = _RestartSession(task, status_rsp_desc="本次任务执行完毕")
     adapter, prepared = _prepared_job(tmp_path, monkeypatch, task, session)
 
     outcome = adapter.restart_running_task(prepared, TASK_ID, TASK_NUMBER, timeout_seconds=60.0)
@@ -1078,15 +1187,6 @@ def test_stationary_observations_with_terminal_status_are_not_stall_evidence() -
     evidence = _observations(4)
     for row in evidence["observations"]:
         row["task_status_rsp_desc"] = "本次任务执行完毕"
-    job = _job(evidence=evidence)
-    decision = evaluate_running_stall(job, now=NOW)
-    assert decision["stalled"] is False
-
-
-def test_stationary_observations_without_status_are_not_stall_evidence() -> None:
-    evidence = _observations(4)
-    for row in evidence["observations"]:
-        row["task_status_rsp_desc"] = ""
     job = _job(evidence=evidence)
     decision = evaluate_running_stall(job, now=NOW)
     assert decision["stalled"] is False

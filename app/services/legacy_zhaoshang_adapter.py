@@ -1869,23 +1869,40 @@ class CnncLegacyZhaoshangAdapter:
 
             if resume_phase is None:
                 # Write-time revalidation (race guard): the probe may have seen
-                # RUNNING minutes ago, but the task may have completed since.
-                # The first fresh remote write requires the live status to
-                # confirm the task is STILL running; anything else declines
-                # with zero writes and leaves the job to ordinary harvest.
-                from app.services.remote_running_recovery import is_remote_task_still_running
+                # an active task minutes ago, but the task may have completed
+                # since.  The first fresh remote write requires a fresh status
+                # answer AND a fresh structured progress payload to prove the
+                # exact task is still ACTIVE; a terminal marker, terminal
+                # progress, or anything unprovable declines with zero writes
+                # and leaves the job to ordinary harvest.
+                from app.services.remote_running_recovery import (
+                    RemoteExecutionState,
+                    classify_remote_execution_state,
+                )
 
                 remaining = deadline - self._monotonic()
                 if remaining <= 0:
                     raise TimeoutError("restart deadline exhausted before status revalidation")
                 status = tool.query_task_status(session, live_task_id)
                 status_desc = _text(status.get("rspDesc")) if isinstance(status, Mapping) else ""
-                if not is_remote_task_still_running(status_desc):
+                remaining = deadline - self._monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("restart deadline exhausted before progress revalidation")
+                write_time_batch_number = _text(task.get("batchNumber")) or resolved_task_name
+                progress_json = tool.query_task_progress(session, write_time_batch_number)
+                progress_desc = (
+                    _text(progress_json.get("rspDesc")) if isinstance(progress_json, Mapping) else ""
+                )
+                execution_state = classify_remote_execution_state(
+                    tool.parse_task_progress_desc(progress_desc), status_desc
+                )
+                if execution_state is not RemoteExecutionState.ACTIVE:
                     return LegacyRestartOutcome(
                         RestartStatus.NO_LONGER_RUNNING,
                         observed_enabled=enabled_now,
                         diagnostic=(
-                            f"write-time status not confirmed still running: {status_desc or '(empty)'}"
+                            f"write-time execution state {execution_state.value} "
+                            f"(status={status_desc or '(empty)'})"
                         ),
                     )
 
