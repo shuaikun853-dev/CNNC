@@ -1079,3 +1079,131 @@ def test_status_reports_recovery_exhausted_count(tmp_path) -> None:
     assert status["remote"]["recovery_exhausted"] == 1
     assert status["remote"]["running"] == 0
     assert status["crawl"]["no_result"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Review findings: crash windows, transient classification, probe parity
+# ---------------------------------------------------------------------------
+
+
+def test_c1_crash_between_evidence_and_attempt_burn_never_restarts_twice(tmp_path) -> None:
+    """Doc says ENABLE_CONFIRMED but the attempt column never burned."""
+    store, job_id = _stalled_store(tmp_path)
+    restart = _FakeRestart([{"status": "RESTARTED", "restarted": True}])
+    _run_pass(store, _probe_payload(), restart)
+    # Simulate the crash window: the finished evidence document committed,
+    # the recovery_attempts column write lost.
+    token = store.acquire_lease(BUSINESS_DATE, "crash", ttl_seconds=300)
+    with store._transaction(immediate=True) as connection:
+        connection.execute("UPDATE remote_jobs SET recovery_attempts=0 WHERE id=?", (job_id,))
+    store.release_lease(token)
+    again = _FakeRestart([{"status": "RESTARTED", "restarted": True}])
+    _run_pass(store, _probe_payload(), again, now=NOW + timedelta(minutes=5))
+    assert again.calls == []
+    refreshed = store.get_remote_job(job_id)
+    assert int(refreshed["recovery_attempts"]) == 1
+    evidence = json.loads(str(refreshed["recovery_evidence_json"]))
+    # The first restart's audit evidence must survive un-overwritten.
+    assert evidence["restart"]["phase"] == "ENABLE_CONFIRMED"
+
+
+def test_i1_restart_dispatch_exception_reconciles_via_phase_not_manual() -> None:
+    """A transient adapter exception must not burn MANUAL_REQUIRED."""
+    from app.services.remote_running_recovery import classify_restart_exception
+
+    fresh = classify_restart_exception(TimeoutError("network blip mid-protocol"), None)
+    assert fresh == "DISABLE_UNKNOWN"
+    resumed = classify_restart_exception(
+        ConnectionError("reset after enable"), "ENABLE_SENT"
+    )
+    assert resumed == "ENABLE_UNKNOWN"
+    local = classify_restart_exception(ValueError("durable legacy paths are unavailable"), None)
+    assert local == "IDENTITY_CONFLICT"
+    ambiguous = classify_restart_exception(RuntimeError("精确任务不唯一: task_name=x"), None)
+    assert ambiguous == "IDENTITY_CONFLICT"
+    other_runtime = classify_restart_exception(RuntimeError("tool internal error"), None)
+    assert other_runtime == "DISABLE_UNKNOWN"
+
+
+def test_i1_bridge_restart_dispatch_failure_keeps_manual_for_unreconstructable_job(tmp_path) -> None:
+    from app.services.incremental_audit_runtime import legacy_zhaoshang_bridge, runtime_paths
+    from app.services.legacy_zhaoshang_adapter import CnncLegacyZhaoshangAdapter
+
+    paths = runtime_paths(BUSINESS_DATE, tmp_path / "runtime")
+    paths.run_dir.mkdir(parents=True, exist_ok=True)
+    adapter = CnncLegacyZhaoshangAdapter(mappings=[], db_env_path=None)
+    _planner, _finalizer, _submitter, _harvester, _probe, restart_cb = legacy_zhaoshang_bridge(
+        adapter, paths=paths, business_date=BUSINESS_DATE
+    )
+    durable = {
+        "id": 1,
+        "logical_key": "missing",
+        "task_name": "cnnc_current_opt_领先未来商城_61284593895349",
+        "payload_hash": "hash",
+        "payload_json": json.dumps({"requests": [], "batch_state": str(paths.run_dir / "BATCH_STATE.md")}),
+        "input_path": None,
+        "result_path": None,
+        "remote_identity": "lxwl|1269504|RW-20260825150224",
+    }
+
+    outcome = restart_cb(durable, None)
+
+    assert outcome["status"] == "IDENTITY_CONFLICT"
+    assert outcome["restarted"] is False
+
+
+def test_i2_running_probe_rejects_rows_without_count(monkeypatch, tmp_path) -> None:
+    task = _running_task_record()
+    session = _RestartSession(task)
+
+    class _RowsNoCountSession(_RestartSession):
+        def post(self, url, json=None, timeout=None):
+            if "exportTask" in url:
+                return _FakeRestartResponse(
+                    {"rspCode": "0000", "rspDesc": NO_PRICE_RSP, "count": None, "data": [{"url": "https://x/1"}], "success": True}
+                )
+            return super().post(url, json=json, timeout=timeout)
+
+    rows_session = _RowsNoCountSession(task)
+    adapter, prepared = _prepared_job(tmp_path, monkeypatch, task, rows_session)
+    import pytest as _pytest
+
+    with _pytest.raises(Exception):
+        adapter.probe_running_task(prepared, TASK_ID, TASK_NUMBER, timeout_seconds=60.0)
+
+
+def test_i2_running_probe_treats_embedded_download_as_result(monkeypatch, tmp_path) -> None:
+    task = _running_task_record()
+
+    class _DownloadSession(_RestartSession):
+        def post(self, url, json=None, timeout=None):
+            if "exportTask" in url:
+                return _FakeRestartResponse(
+                    {"rspCode": "0000", "rspDesc": NO_PRICE_RSP, "count": 0, "data": {"url": "https://cdn.invalid/r.xlsx"}, "success": True}
+                )
+            return super().post(url, json=json, timeout=timeout)
+
+    session = _DownloadSession(task)
+    adapter, prepared = _prepared_job(tmp_path, monkeypatch, task, session)
+
+    probe = adapter.probe_running_task(prepared, TASK_ID, TASK_NUMBER, timeout_seconds=60.0)
+
+    assert probe.export_had_result is True
+    assert probe.export_count is None
+
+
+def test_m1_recovery_exhausted_job_completes_leftover_pending_crawls(tmp_path) -> None:
+    store, job_id = _recovered_store(tmp_path)
+    crawl_id = _seed_linked_crawl(store, job_id)
+    # Job already terminal but the crawl conversion was lost mid-crash.
+    token = store.acquire_lease(BUSINESS_DATE, "pre-abandon", ttl_seconds=300)
+    with store._transaction(immediate=True) as connection:
+        connection.execute(
+            "UPDATE remote_jobs SET state='RECOVERY_EXHAUSTED' WHERE id=?", (job_id,)
+        )
+    store.release_lease(token)
+    assert store.get_crawl_work(crawl_id)["state"] == "PENDING"
+
+    _run_pass(store, _probe_payload(), None)
+
+    assert store.get_crawl_work(crawl_id)["state"] == "NO_RESULT"

@@ -54,7 +54,31 @@ RECOVERY_EXHAUSTED_MIN_POST_SPAN_SECONDS = 1800.0
 # contradictory remote state fails closed into manual review.
 RECOVERY_WRITE_CONFIRM_WINDOW_SECONDS = 900.0
 
-RECOVERY_EXHAUSTED_STATE = "RECOVERY_EXHAUSTED"
+
+def classify_restart_exception(exc: BaseException, resume_phase: str | None) -> str:
+    """Classify an exception escaping the restart adapter, never blanket-manual.
+
+    Transient transport failures keep the durable phase so the next pass
+    reconciles the already-sent direction against the real remote state.  Only
+    failures proving the exact local identity cannot be reconstructed are a
+    permanent identity conflict; everything unknown stays reconcilable.
+    """
+    from app.services.incremental_audit_runtime import RuntimeConfigurationError
+
+    if isinstance(exc, RuntimeConfigurationError):
+        return "IDENTITY_CONFLICT"
+    if isinstance(exc, (ValueError, KeyError, TypeError)):
+        return "IDENTITY_CONFLICT"
+    if isinstance(exc, RuntimeError):
+        # The legacy tool raises RuntimeError with these markers for permanent
+        # exact-identity anomalies; any other RuntimeError stays reconcilable.
+        message = str(exc)
+        if any(marker in message for marker in ("不唯一", "不一致", "没有拿到", "identity")):
+            return "IDENTITY_CONFLICT"
+        return "ENABLE_UNKNOWN" if resume_phase == "ENABLE_SENT" else "DISABLE_UNKNOWN"
+    if isinstance(exc, (TimeoutError, ConnectionError, OSError)):
+        return "ENABLE_UNKNOWN" if resume_phase == "ENABLE_SENT" else "DISABLE_UNKNOWN"
+    return "IDENTITY_CONFLICT"
 
 
 def _text(value: object) -> str:
@@ -268,7 +292,13 @@ def evaluate_running_stall(job: Mapping[str, Any], *, now: datetime) -> dict[str
 
 
 def _probe_identity_matches(job: Mapping[str, Any], probe: Mapping[str, Any]) -> bool:
-    """The read-only probe must re-confirm the exact durable remote identity."""
+    """The read-only probe must re-confirm the exact durable remote identity.
+
+    Identity part 0 is the durable mall key while the probe reports the
+    platform mall code; the legacy tool's MALL_CONFIG guarantees
+    identification == mallLogo == mall_key for every supported mall, so the
+    comparison is exact under that invariant.
+    """
     parts = _text(job.get("remote_identity")).split("|")
     if len(parts) != 3:
         return False
@@ -297,6 +327,19 @@ def _apply_restart(
     """
     job_id = int(job["id"])
     restart = evidence.get("restart")
+    # Crash-window guard: the finished evidence document may have committed
+    # while the recovery_attempts column write was lost.  The document is the
+    # write-ahead proof, so this state means the restart already happened and
+    # only the slot burn must be repeated — never a second remote write.
+    if (
+        isinstance(restart, Mapping)
+        and _text(restart.get("phase")) == "ENABLE_CONFIRMED"
+        and int(job.get("recovery_attempts") or 0) == 0
+    ):
+        store.mark_remote_recovery_attempted(
+            token, job_id, remote_identity=_text(job.get("remote_identity")), evidence=restart
+        )
+        return {"status": "RESTARTED", "restarted": True, "reconciled": True, "diagnostic": "recovered crash window: attempt slot burned from durable ENABLE_CONFIRMED evidence"}
     resume_phase: str | None = None
     if isinstance(restart, Mapping) and _text(restart.get("phase")) in {
         "DISABLE_SENT",
@@ -405,24 +448,54 @@ def _abandon_recovery_exhausted(
         remote_identity=_text(job.get("remote_identity")),
         evidence=dict(evidence),
     )
-    for crawl in store.crawl_work_for_job(job_id):
+    _complete_recovery_exhausted_crawls(
+        store,
+        token,
+        job,
+        restart_phase=_text(restart.get("phase")),
+        recovery_at=_text(restart.get("recovery_at")),
+        disable_confirmed=bool(disable_evidence.get("confirmed_disabled")),
+        enable_confirmed=bool(enable_evidence.get("confirmed_enabled")),
+        last_progress_signature=last_observation.get("signature"),
+        export_count=last_observation.get("export_count"),
+        export_rsp_desc=_text(last_observation.get("export_rsp_desc")),
+    )
+
+
+def _complete_recovery_exhausted_crawls(
+    store: DailyAuditStore,
+    token: LeaseToken,
+    job: Mapping[str, Any],
+    *,
+    restart_phase: str,
+    recovery_at: str,
+    disable_confirmed: bool,
+    enable_confirmed: bool,
+    last_progress_signature: object,
+    export_count: object,
+    export_rsp_desc: str,
+) -> int:
+    converted = 0
+    for crawl in store.crawl_work_for_job(int(job["id"])):
         if str(crawl["state"]) in {"SUCCESS", "NO_RESULT", "TERMINAL_FAILED"}:
             continue
         store.complete_crawl_work_recovery_exhausted(
             token,
             int(crawl["id"]),
-            remote_job_id=job_id,
+            remote_job_id=int(job["id"]),
             remote_identity=_text(job.get("remote_identity")),
             reason=RECOVERY_EXHAUSTED_NO_RESULT_REASON,
-            restart_phase=_text(restart.get("phase")),
+            restart_phase=restart_phase,
             recovery_attempt=1,
-            recovery_at=_text(restart.get("recovery_at")),
-            disable_confirmed=bool(disable_evidence.get("confirmed_disabled")),
-            enable_confirmed=bool(enable_evidence.get("confirmed_enabled")),
-            last_progress_signature=last_observation.get("signature"),
-            export_count=last_observation.get("export_count"),
-            export_rsp_desc=_text(last_observation.get("export_rsp_desc")),
+            recovery_at=recovery_at,
+            disable_confirmed=disable_confirmed,
+            enable_confirmed=enable_confirmed,
+            last_progress_signature=last_progress_signature,
+            export_count=export_count,
+            export_rsp_desc=export_rsp_desc,
         )
+        converted += 1
+    return converted
 
 
 def run_running_recovery_pass(
@@ -450,6 +523,27 @@ def run_running_recovery_pass(
     for job in store.list_remote_jobs(token):
         if not can_start():
             break
+        if str(job.get("state")) == "RECOVERY_EXHAUSTED":
+            # Crash-recovery sweep: a terminal give-up whose linked crawls were
+            # not all converted must be finished here, or ordinary finalize
+            # would wedge on those pending rows forever.
+            document = decode_recovery_evidence(job.get("recovery_evidence_json"))
+            restart = dict(document.get("restart") or {})
+            observations = list(document.get("observations") or [])
+            last_observation = observations[-1] if observations else {}
+            _complete_recovery_exhausted_crawls(
+                store,
+                token,
+                job,
+                restart_phase=_text(restart.get("phase")),
+                recovery_at=_text(restart.get("recovery_at")),
+                disable_confirmed=bool((restart.get("disable_evidence") or {}).get("confirmed_disabled")),
+                enable_confirmed=bool((restart.get("enable_evidence") or {}).get("confirmed_enabled")),
+                last_progress_signature=last_observation.get("signature"),
+                export_count=last_observation.get("export_count"),
+                export_rsp_desc=_text(last_observation.get("export_rsp_desc")),
+            )
+            continue
         decision = evaluate_running_stall(job, now=now)
         if not decision["probe_candidate"]:
             continue

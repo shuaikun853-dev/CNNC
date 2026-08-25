@@ -1694,13 +1694,51 @@ class CnncLegacyZhaoshangAdapter:
             ) from exc
         if not isinstance(data, dict):
             raise LegacyZhaoshangAdapterError("export endpoint returned an unexpected payload")
+        embedded = data.get("data")
+        if isinstance(embedded, dict) and any(
+            _text(embedded.get(key)) for key in ("url", "fileUrl", "downloadUrl", "exportUrl")
+        ):
+            return RunningTaskProbe(
+                task_id=str(live_task_id),
+                task_number=str(live_task_number),
+                mall=mall_logo,
+                enabled=self._remote_is_enabled(task),
+                task_status_rsp_desc=_text(status.get("rspDesc")),
+                progress=dict(tool.parse_task_progress_desc(_text(progress_json.get("rspDesc")))),
+                export_had_result=True,
+                export_count=None,
+                export_rsp_desc="",
+                remote_calls=remote_calls,
+            )
+        if isinstance(embedded, str) and any(token in embedded for token in (".xlsx", "download", "export")):
+            return RunningTaskProbe(
+                task_id=str(live_task_id),
+                task_number=str(live_task_number),
+                mall=mall_logo,
+                enabled=self._remote_is_enabled(task),
+                task_status_rsp_desc=_text(status.get("rspDesc")),
+                progress=dict(tool.parse_task_progress_desc(_text(progress_json.get("rspDesc")))),
+                export_had_result=True,
+                export_count=None,
+                export_rsp_desc="",
+                remote_calls=remote_calls,
+            )
         raw_count = data.get("count")
-        try:
-            export_count = int(raw_count) if raw_count is not None else 0
-        except (TypeError, ValueError) as exc:
-            raise LegacyZhaoshangAdapterError(
-                "export endpoint returned an unparseable count"
-            ) from exc
+        if raw_count is None:
+            # An exact no-price answer may omit the count field; only an
+            # empty data payload keeps that shape admissible.
+            if embedded not in (None, {}, []):
+                raise LegacyZhaoshangAdapterError(
+                    "export endpoint returned rows without a count"
+                )
+            export_count = 0
+        else:
+            try:
+                export_count = int(raw_count)
+            except (TypeError, ValueError) as exc:
+                raise LegacyZhaoshangAdapterError(
+                    "export endpoint returned an unparseable count"
+                ) from exc
         return RunningTaskProbe(
             task_id=str(live_task_id),
             task_number=str(live_task_number),

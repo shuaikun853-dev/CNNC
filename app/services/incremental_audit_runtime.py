@@ -1462,17 +1462,33 @@ def legacy_zhaoshang_bridge(
         }
 
     def recovery_restart(job: Mapping[str, Any], resume_phase: str | None) -> Mapping[str, Any]:
+        from app.services.remote_running_recovery import classify_restart_exception
+
         try:
             prepared_job = reconstruct(job)
             task_id, task_number = remote_identity_parts(prepared_job, job.get("remote_identity"))
+        except Exception as exc:
+            # The exact local identity cannot be rebuilt: fail closed before
+            # any remote write is even considered.
+            return {
+                "status": "IDENTITY_CONFLICT",
+                "restarted": False,
+                "diagnostic": f"restart identity could not be reconstructed: {type(exc).__name__}",
+            }
+        try:
             outcome = adapter.restart_running_task(
                 prepared_job, task_id, task_number, 60.0, resume_phase=resume_phase
             )
         except Exception as exc:
+            # A dispatch exception proves neither success nor failure of a
+            # write that may already have left; classify it so the durable
+            # phase reconciles the real remote state on the next pass.
+            status = classify_restart_exception(exc, resume_phase)
             return {
-                "status": "IDENTITY_CONFLICT",
+                "status": status,
                 "restarted": False,
-                "diagnostic": f"restart dispatch failed before any write: {type(exc).__name__}",
+                "observed_enabled": None,
+                "diagnostic": f"restart dispatch raised {type(exc).__name__}; awaiting phase reconciliation",
             }
         return {
             "status": outcome.status.value,
