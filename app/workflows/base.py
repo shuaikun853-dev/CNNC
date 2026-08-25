@@ -1,0 +1,148 @@
+from abc import ABC, abstractmethod
+from typing import Any
+
+from app.schemas.workflow import WorkflowAction, WorkflowAnalyzeResponse, WorkflowRecordResult
+
+
+class WorkflowBase(ABC):
+    workflow_name: str = ""
+    display_name: str = ""
+    required_inputs: list[str] = []
+    optional_inputs: list[str] = []
+    possible_actions: list[WorkflowAction] = []
+
+    @abstractmethod
+    def analyze(self, records: list[Any]) -> WorkflowAnalyzeResponse:
+        ...
+
+    def get_knowledge_refs(self) -> list[str]:
+        return []
+
+
+class SameProductApprovalWorkflow(WorkflowBase):
+    workflow_name = "work_01_same_product_approval"
+    display_name = "新增监控商品同款审批处理和价格指数同步"
+    required_inputs = ["standard_commodity_code"]
+    optional_inputs = ["variant_code", "sars_monitor_code", "crawl_price", "page_actual_price", "reference_price"]
+    possible_actions = [
+        WorkflowAction.APPROVE,
+        WorkflowAction.REJECT,
+        WorkflowAction.WAIT_CRAWLER,
+        WorkflowAction.SUPPLEMENT_SAME_PRODUCT,
+        WorkflowAction.DO_NOT_PUSH,
+        WorkflowAction.MANUAL_CHECK,
+        WorkflowAction.FEEDBACK_CUSTOMER,
+        WorkflowAction.READY_TO_PUSH,
+    ]
+
+    def analyze(self, records: list[Any]) -> WorkflowAnalyzeResponse:
+        from app.workflows.work_01_same_product_approval import analyze_records
+
+        return analyze_records(records)
+
+    def get_knowledge_refs(self) -> list[str]:
+        return [
+            "cnnc_work_01_same_product_approval.md",
+            "cnnc_base_scope.md",
+            "cnnc_forbidden_actions.md",
+        ]
+
+
+class PriceIndexFeedbackWorkflow(WorkflowBase):
+    workflow_name = "work_02_price_index_feedback"
+    display_name = "价格指数勘误和运营反馈问题处理"
+    required_inputs = ["standard_commodity_code"]
+    optional_inputs = ["variant_code", "sars_monitor_code", "feedback_type", "feedback_detail"]
+    possible_actions = [
+        WorkflowAction.IMPORT_CUSTOMER_LINKS,
+        WorkflowAction.UNBIND_WRONG_RELATIONS,
+        WorkflowAction.RECALCULATE_INDEX,
+        WorkflowAction.PUSH_INDEX,
+        WorkflowAction.SUPPLEMENT_SAME_PRODUCT,
+        WorkflowAction.WAIT_COLLECTION,
+        WorkflowAction.ASK_CUSTOMER_RECHECK,
+        WorkflowAction.MANUAL_VERIFY,
+        WorkflowAction.FORWARD_TO_WORK01,
+        WorkflowAction.NO_ACTION,
+    ]
+
+    def analyze(self, records: list[Any]) -> WorkflowAnalyzeResponse:
+        from app.workflows.work_02_price_index_feedback import analyze_records
+
+        return analyze_records(records)
+
+    def get_knowledge_refs(self) -> list[str]:
+        return [
+            "cnnc_work_02_price_index_feedback.md",
+            "cnnc_sars_import_rules.md",
+            "cnnc_base_scope.md",
+            "cnnc_forbidden_actions.md",
+        ]
+
+
+class SupplementSameProductWorkflow(WorkflowBase):
+    workflow_name = "work_03_same_product_shortage"
+    display_name = "中核监控商品同款不足数据筛查和线下流程补同款"
+    required_inputs = ["commodity_name"]
+    optional_inputs = [
+        "sars_monitor_code",
+        "standard_commodity_code",
+        "variant_code",
+        "mapped_sars_monitor_code",
+        "current_same_products",
+        "reference_price",
+    ]
+    possible_actions = [
+        WorkflowAction.SUPPLEMENT_SAME_PRODUCT,
+        WorkflowAction.IMPORT_CUSTOMER_LINKS,
+        WorkflowAction.UNBIND_WRONG_RELATIONS,
+        WorkflowAction.EXPORT,
+        WorkflowAction.QUERY,
+        WorkflowAction.MANUAL_CHECK,
+    ]
+
+    def analyze(self, records: list[Any]) -> WorkflowAnalyzeResponse:
+        results = []
+        for rec in records:
+            code = ""
+            if isinstance(rec, dict):
+                code = rec.get("standard_commodity_code", "") or rec.get("sars_monitor_code", "")
+            results.append(
+                WorkflowRecordResult(
+                    standard_commodity_code=code,
+                    primary_action=WorkflowAction.MANUAL_CHECK,
+                    suggested_actions=[WorkflowAction.MANUAL_CHECK],
+                    action=WorkflowAction.MANUAL_CHECK,
+                    reason="R3.5 only: work_03_same_product_shortage placeholder, business rules will be implemented in R4.5",
+                    pushable=False,
+                    ready_to_push=False,
+                    needs_human_approval=True,
+                    execution_allowed=False,
+                    executed=False,
+                    rule_id="R35_PLACEHOLDER",
+                    evidence=["R3.5 placeholder only", "work_03 true rules will be implemented in R4.5"],
+                )
+            )
+        return WorkflowAnalyzeResponse(
+            workflow_name=self.workflow_name,
+            total_records=len(results),
+            summary={"status": "PLACEHOLDER", "message": "R3.5: work_03 placeholder; rules in R4.5"},
+            record_results=results,
+            execution_allowed=False,
+            executed=False,
+        )
+
+    def get_knowledge_refs(self) -> list[str]:
+        return [
+            "cnnc_work_03_supplement_same_product.md",
+            "cnnc_sars_import_rules.md",
+            "cnnc_base_scope.md",
+            "cnnc_forbidden_actions.md",
+        ]
+
+
+WORKFLOW_REGISTRY: dict[str, WorkflowBase] = {
+    "work_01_same_product_approval": SameProductApprovalWorkflow(),
+    "work_02_price_index_feedback": PriceIndexFeedbackWorkflow(),
+    "work_03_same_product_shortage": SupplementSameProductWorkflow(),
+}

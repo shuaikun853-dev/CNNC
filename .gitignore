@@ -1,0 +1,37 @@
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.pytest-*/
+.pytest_tmp*/
+.codex_tmp/
+
+# Local environments and credentials
+.env
+.env.*
+!.env.example
+*.curl
+*.har
+*token*
+*secret*
+*credential*
+*cookie*
+
+# Production inputs, outputs, and runtime state
+data/*.curl*
+data/*token*
+data/*.xlsx
+data/*.xls
+data/*.env
+data/*.json
+data/auth_state.json
+data/.auth_state.json.*.lock
+runtime/
+outputs/
+*.xlsx
+*.xls
+*.sqlite
+*.sqlite3
+*.sqlite3-*
+*.db
+*.log

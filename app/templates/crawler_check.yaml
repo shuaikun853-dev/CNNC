@@ -1,0 +1,40 @@
+scenario: crawler_check
+description: 爬虫/采集链路排查 SQL 模板（只读，中核范围限定版）
+templates:
+  - name: long_running_crawl
+    purpose: 查找中核商品池 222 中长时间处于"采集中"状态的记录
+    description: 查询超过 N 小时仍处于采集中的监控记录
+    params:
+      - name: hours
+        required: true
+        type: string
+        description: 超时判定阈值（小时）
+        example: "24"
+    sql: |
+      SELECT ID, commodity_id, STATUS, update_time
+      FROM monitor_commodity_price_188605
+      WHERE COMMODITY_POOL_ID = 222
+        AND STATUS = 0
+        AND update_time < DATE_SUB(NOW(), INTERVAL :hours HOUR)
+      ORDER BY update_time ASC
+      LIMIT 50;
+    result_hint: 超过 24h 仍为 STATUS=0 的记录通常意味着爬虫未回调，需确认目标站点是否变更。
+
+  - name: crawl_fail_rate
+    purpose: 中核商品池 222 最近 N 小时采集失败率
+    description: 统计最近 N 小时的采集总数和失败数，计算失败率
+    params:
+      - name: hours
+        required: true
+        type: string
+        description: 查询时间范围（小时）
+        example: "24"
+    sql: |
+      SELECT
+        COUNT(*) AS total,
+        SUM(CASE WHEN STATUS = 2 THEN 1 ELSE 0 END) AS fail_cnt
+      FROM monitor_commodity_price_188605
+      WHERE COMMODITY_POOL_ID = 222
+        AND update_time >= DATE_SUB(NOW(), INTERVAL :hours HOUR)
+      LIMIT 1;
+    result_hint: fail_cnt / total > 10% 时应进入详细排查。
