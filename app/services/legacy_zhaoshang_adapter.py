@@ -219,6 +219,16 @@ class PriorityStatus(str, Enum):
     UNCONFIRMED = "PRIORITY_UNCONFIRMED"
 
 
+class RestartStatus(str, Enum):
+    RESTARTED = "RESTARTED"
+    IDENTITY_CONFLICT = "IDENTITY_CONFLICT"
+    NOT_RUNNING = "NOT_RUNNING"
+    DISABLE_UNKNOWN = "DISABLE_UNKNOWN"
+    DISABLE_UNCONFIRMED = "DISABLE_UNCONFIRMED"
+    ENABLE_UNKNOWN = "ENABLE_UNKNOWN"
+    ENABLE_UNCONFIRMED = "ENABLE_UNCONFIRMED"
+
+
 class LegacyZhaoshangAdapterError(RuntimeError):
     pass
 
@@ -326,6 +336,35 @@ class ExportNoPriceProbe:
     remote_calls: int
 
 
+@dataclass(frozen=True)
+class RunningTaskProbe:
+    """Read-only live evidence for one exact still-RUNNING remote task."""
+
+    task_id: str
+    task_number: str
+    mall: str
+    enabled: bool | None
+    task_status_rsp_desc: str
+    progress: Mapping[str, int]
+    export_had_result: bool
+    export_count: int | None
+    export_rsp_desc: str
+    remote_calls: int
+
+
+@dataclass(frozen=True)
+class LegacyRestartOutcome:
+    """Outcome of the single exact disable->enable restart protocol."""
+
+    status: RestartStatus
+    disable_confirmed: bool = False
+    enable_confirmed: bool = False
+    observed_enabled: bool | None = None
+    disable_response: Mapping[str, Any] | None = None
+    enable_response: Mapping[str, Any] | None = None
+    diagnostic: str = ""
+
+
 class _BoundedReadOnlySession:
     """Clamp legacy helper HTTP calls to the tick's remaining reconcile budget."""
 
@@ -410,6 +449,8 @@ class CnncLegacyZhaoshangAdapter:
         reconciler: Callable[[str, str, float], Mapping[str, Any] | None] | None = None,
         priority_runner: Callable[[PreparedLegacyJob, str, str, float], Any] | None = None,
         export_probe: Callable[[PreparedLegacyJob, str, str, float], Any] | None = None,
+        running_probe: Callable[[PreparedLegacyJob, str, str, float], RunningTaskProbe] | None = None,
+        restart_runner: Callable[..., LegacyRestartOutcome] | None = None,
         event_recorder: Callable[..., Any] | None = None,
         auth_manager: AuthManager | None = None,
         external_tool_path: Path = EXTERNAL_TOOL_PATH,
@@ -421,6 +462,8 @@ class CnncLegacyZhaoshangAdapter:
         self._reconciler = reconciler
         self._priority_runner = priority_runner
         self._export_probe = export_probe
+        self._running_probe = running_probe
+        self._restart_runner = restart_runner
         self._event_recorder = event_recorder
         self._auth_manager = auth_manager
         self._external_tool_path = Path(external_tool_path)
@@ -1539,6 +1582,320 @@ class CnncLegacyZhaoshangAdapter:
             export_count=export_count,
             remote_calls=remote_calls,
         )
+
+    def probe_running_task(
+        self,
+        job: PreparedLegacyJob,
+        task_id: str,
+        task_number: str,
+        timeout_seconds: float,
+    ) -> RunningTaskProbe:
+        """Read-only status/progress/export probe for one exact RUNNING task.
+
+        The exact task is re-looked-up by durable name and its live identity
+        must match the supplied task_id/task_number; any conflict raises so
+        callers can fail closed instead of probing the wrong remote task.
+        """
+        if self._running_probe is not None:
+            return self._running_probe(job, task_id, task_number, timeout_seconds)
+        return self._production_probe_running_task(job, task_id, task_number, timeout_seconds)
+
+    def _production_probe_running_task(
+        self,
+        job: PreparedLegacyJob,
+        task_id: str,
+        task_number: str,
+        timeout_seconds: float,
+    ) -> RunningTaskProbe:
+        if timeout_seconds <= 0:
+            raise TimeoutError("running task probe timeout must be positive")
+        if not self._external_tool_path.is_file():
+            raise FileNotFoundError("legacy Zhaoshang external tool is unavailable")
+        deadline = self._monotonic() + float(timeout_seconds)
+        tool = self._load_module(self._external_tool_path, "legacy_zhaoshang_running_probe")
+        auth_manager = self._auth_manager or AuthManager()
+        environment = internal_subprocess_env()
+        environment.update(auth_manager.export_environment("zhaoshang", refresh=True))
+        remaining = deadline - self._monotonic()
+        if remaining <= 0:
+            raise TimeoutError("legacy Zhaoshang auth refresh exhausted the probe deadline")
+        session_environment = {
+            key: str(environment[key])
+            for key in ("BLADE_AUTH", "COOKIE")
+            if environment.get(key)
+        }
+        if len(session_environment) != 2:
+            raise LegacyZhaoshangAdapterError("legacy Zhaoshang session auth is unavailable")
+        with _temporary_environment(session_environment):
+            session = tool.build_session()
+            mall_code = tool.priority_mall_code_for_key(job.mall_key)
+            resolved_task_name, _batch_number = tool.build_browser_task_identifiers(
+                job.task_name, job.mall_key
+            )
+            task = tool.check_existing_task(session, resolved_task_name, mall_code)
+            remote_calls = 1
+            if task is None:
+                raise LegacyZhaoshangAdapterError("running task probe found no exact existing task")
+            live_task_id, live_task_number, mall_logo = tool.get_task_identity(task, mall_code)
+            if str(live_task_id) != str(task_id) or str(live_task_number) != str(task_number):
+                raise LegacyZhaoshangAdapterError(
+                    "live task identity does not match the durable remote identity"
+                )
+            remaining = deadline - self._monotonic()
+            if remaining <= 0:
+                raise TimeoutError("running task probe deadline exhausted before status query")
+            status = tool.query_task_status(session, str(live_task_id))
+            remote_calls += 1
+            remaining = deadline - self._monotonic()
+            if remaining <= 0:
+                raise TimeoutError("running task probe deadline exhausted before progress query")
+            batch_number = _text(task.get("batchNumber")) or resolved_task_name
+            progress_json = tool.query_task_progress(session, batch_number)
+            remote_calls += 1
+            remaining = deadline - self._monotonic()
+            if remaining <= 0:
+                raise TimeoutError("running task probe deadline exhausted before export query")
+            response = session.post(
+                tool.EXPORT_TASK_URL,
+                json={
+                    "taskNumber": str(live_task_number),
+                    "taskId": str(live_task_id),
+                    "mallLogo": mall_logo,
+                },
+                timeout=min(60.0, remaining),
+            )
+            response.raise_for_status()
+            remote_calls += 1
+        content_type = response.headers.get("Content-Type", "") or ""
+        content_disposition = response.headers.get("Content-Disposition", "") or ""
+        if (
+            "spreadsheetml" in content_type
+            or "application/vnd.ms-excel" in content_type
+            or "attachment" in content_disposition
+            or response.content[:2] == b"PK"
+        ):
+            return RunningTaskProbe(
+                task_id=str(live_task_id),
+                task_number=str(live_task_number),
+                mall=mall_logo,
+                enabled=self._remote_is_enabled(task),
+                task_status_rsp_desc=_text(status.get("rspDesc")),
+                progress=dict(tool.parse_task_progress_desc(_text(progress_json.get("rspDesc")))),
+                export_had_result=True,
+                export_count=None,
+                export_rsp_desc="",
+                remote_calls=remote_calls,
+            )
+        try:
+            data = response.json()
+        except ValueError as exc:
+            raise LegacyZhaoshangAdapterError(
+                "export endpoint returned neither a workbook nor JSON"
+            ) from exc
+        if not isinstance(data, dict):
+            raise LegacyZhaoshangAdapterError("export endpoint returned an unexpected payload")
+        raw_count = data.get("count")
+        try:
+            export_count = int(raw_count) if raw_count is not None else 0
+        except (TypeError, ValueError) as exc:
+            raise LegacyZhaoshangAdapterError(
+                "export endpoint returned an unparseable count"
+            ) from exc
+        return RunningTaskProbe(
+            task_id=str(live_task_id),
+            task_number=str(live_task_number),
+            mall=mall_logo,
+            enabled=self._remote_is_enabled(task),
+            task_status_rsp_desc=_text(status.get("rspDesc")),
+            progress=dict(tool.parse_task_progress_desc(_text(progress_json.get("rspDesc")))),
+            export_had_result=False,
+            export_count=export_count,
+            export_rsp_desc=_text(data.get("rspDesc")),
+            remote_calls=remote_calls,
+        )
+
+    def restart_running_task(
+        self,
+        job: PreparedLegacyJob,
+        task_id: str,
+        task_number: str,
+        timeout_seconds: float,
+        *,
+        resume_phase: str | None = None,
+    ) -> LegacyRestartOutcome:
+        """Execute the single exact disable->enable restart for one remote task.
+
+        ``resume_phase`` reconciles an already-sent direction: ``DISABLE_SENT``
+        never issues another disable, and ``ENABLE_SENT`` issues no remote
+        write at all.  Unknown write outcomes return the re-observed live
+        state so the caller can reconcile before any further decision.
+        """
+        if self._restart_runner is not None:
+            return self._restart_runner(
+                job, task_id, task_number, timeout_seconds, resume_phase=resume_phase
+            )
+        return self._production_restart_running_task(
+            job, task_id, task_number, timeout_seconds, resume_phase=resume_phase
+        )
+
+    def _production_restart_running_task(
+        self,
+        job: PreparedLegacyJob,
+        task_id: str,
+        task_number: str,
+        timeout_seconds: float,
+        *,
+        resume_phase: str | None = None,
+    ) -> LegacyRestartOutcome:
+        if timeout_seconds <= 0:
+            raise TimeoutError("restart timeout must be positive")
+        if resume_phase not in {None, "DISABLE_SENT", "DISABLE_CONFIRMED", "ENABLE_SENT"}:
+            raise ValueError("restart resume phase is not recognized")
+        if not self._external_tool_path.is_file():
+            raise FileNotFoundError("legacy Zhaoshang external tool is unavailable")
+        deadline = self._monotonic() + float(timeout_seconds)
+        tool = self._load_module(self._external_tool_path, "legacy_zhaoshang_running_restart")
+        auth_manager = self._auth_manager or AuthManager()
+        environment = internal_subprocess_env()
+        environment.update(auth_manager.export_environment("zhaoshang", refresh=True))
+        remaining = deadline - self._monotonic()
+        if remaining <= 0:
+            raise TimeoutError("legacy Zhaoshang auth refresh exhausted the restart deadline")
+        session_environment = {
+            key: str(environment[key])
+            for key in ("BLADE_AUTH", "COOKIE")
+            if environment.get(key)
+        }
+        if len(session_environment) != 2:
+            raise LegacyZhaoshangAdapterError("legacy Zhaoshang session auth is unavailable")
+
+        def lookup() -> tuple[Any, str, str, str]:
+            task = tool.check_existing_task(session, resolved_task_name, mall_code)
+            if task is None:
+                raise LegacyZhaoshangAdapterError("restart found no exact existing task")
+            live_task_id, live_task_number, mall_logo = tool.get_task_identity(task, mall_code)
+            if str(live_task_id) != str(task_id) or str(live_task_number) != str(task_number):
+                raise LegacyZhaoshangAdapterError(
+                    "live task identity does not match the durable remote identity"
+                )
+            return task, str(live_task_id), str(live_task_number), mall_logo
+
+        with _temporary_environment(session_environment):
+            session = tool.build_session()
+            mall_code = tool.priority_mall_code_for_key(job.mall_key)
+            resolved_task_name, _batch_number = tool.build_browser_task_identifiers(
+                job.task_name, job.mall_key
+            )
+            try:
+                task, live_task_id, live_task_number, _mall_logo = lookup()
+            except LegacyZhaoshangAdapterError as exc:
+                message = str(exc)
+                if "found no exact existing task" in message:
+                    return LegacyRestartOutcome(RestartStatus.NOT_RUNNING, diagnostic=message)
+                return LegacyRestartOutcome(RestartStatus.IDENTITY_CONFLICT, diagnostic=message)
+
+            enabled_now = self._remote_is_enabled(task)
+
+            if resume_phase == "ENABLE_SENT":
+                # The single enable already left this process: reconciliation
+                # only.  No further remote write may be dispatched.
+                if enabled_now:
+                    return LegacyRestartOutcome(
+                        RestartStatus.RESTARTED,
+                        disable_confirmed=True,
+                        enable_confirmed=True,
+                        observed_enabled=True,
+                        diagnostic="reconciled from durable ENABLE_SENT phase",
+                    )
+                return LegacyRestartOutcome(
+                    RestartStatus.ENABLE_UNCONFIRMED,
+                    observed_enabled=False,
+                    diagnostic="enable was sent but the exact task is still disabled",
+                )
+
+            disable_response: Mapping[str, Any] | None = None
+            if resume_phase in {None, "DISABLE_SENT", "DISABLE_CONFIRMED"}:
+                # A fresh protocol may disable once; a resumed DISABLE_SENT
+                # phase re-checks the world first and treats an observed
+                # disabled state as the completed disable.
+                if enabled_now and resume_phase is None:
+                    try:
+                        disable_response = tool.disable_task(session, live_task_id)
+                    except Exception:
+                        try:
+                            retask, _rid, _rnum, _rmall = lookup()
+                            return LegacyRestartOutcome(
+                                RestartStatus.DISABLE_UNKNOWN,
+                                observed_enabled=self._remote_is_enabled(retask),
+                                diagnostic="disable request outcome unknown; re-observed live state",
+                            )
+                        except LegacyZhaoshangAdapterError as reexc:
+                            return LegacyRestartOutcome(
+                                RestartStatus.DISABLE_UNKNOWN,
+                                observed_enabled=None,
+                                diagnostic=f"disable request outcome unknown; reconcile failed: {reexc}",
+                            )
+                try:
+                    task, live_task_id, live_task_number, _mall_logo = lookup()
+                except LegacyZhaoshangAdapterError as exc:
+                    return LegacyRestartOutcome(
+                        RestartStatus.IDENTITY_CONFLICT,
+                        disable_response=disable_response,
+                        diagnostic=str(exc),
+                    )
+                if self._remote_is_enabled(task):
+                    return LegacyRestartOutcome(
+                        RestartStatus.DISABLE_UNCONFIRMED,
+                        observed_enabled=True,
+                        disable_response=disable_response,
+                        diagnostic="disable did not take effect on the exact task",
+                    )
+
+            enable_response: Mapping[str, Any] | None = None
+            try:
+                enable_response = tool.enable_task(session, live_task_id)
+            except Exception:
+                try:
+                    retask, _rid, _rnum, _rmall = lookup()
+                    return LegacyRestartOutcome(
+                        RestartStatus.ENABLE_UNKNOWN,
+                        disable_confirmed=True,
+                        observed_enabled=self._remote_is_enabled(retask),
+                        diagnostic="enable request outcome unknown; re-observed live state",
+                    )
+                except LegacyZhaoshangAdapterError as reexc:
+                    return LegacyRestartOutcome(
+                        RestartStatus.ENABLE_UNKNOWN,
+                        disable_confirmed=True,
+                        observed_enabled=None,
+                        diagnostic=f"enable request outcome unknown; reconcile failed: {reexc}",
+                    )
+            try:
+                task, live_task_id, live_task_number, _mall_logo = lookup()
+            except LegacyZhaoshangAdapterError as exc:
+                return LegacyRestartOutcome(
+                    RestartStatus.IDENTITY_CONFLICT,
+                    disable_confirmed=True,
+                    enable_response=enable_response,
+                    diagnostic=str(exc),
+                )
+            if not self._remote_is_enabled(task):
+                return LegacyRestartOutcome(
+                    RestartStatus.ENABLE_UNCONFIRMED,
+                    disable_confirmed=True,
+                    observed_enabled=False,
+                    enable_response=enable_response,
+                    diagnostic="enable did not take effect on the exact task",
+                )
+            return LegacyRestartOutcome(
+                RestartStatus.RESTARTED,
+                disable_confirmed=True,
+                enable_confirmed=True,
+                observed_enabled=True,
+                disable_response=disable_response,
+                enable_response=enable_response,
+                diagnostic="exact task disabled and re-enabled with confirmed evidence",
+            )
 
     @classmethod
     def _validate_result_workbook(cls, job: PreparedLegacyJob) -> tuple[

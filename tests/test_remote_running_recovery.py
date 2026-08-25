@@ -14,6 +14,7 @@ import pytest
 from app.services.daily_audit_store import DailyAuditStore, ProcessLock
 from app.services.remote_running_recovery import (
     evaluate_running_stall,
+    run_running_recovery_pass,
 )
 from app.workflows.incremental_price_audit import (
     DiscoveredState,
@@ -325,3 +326,496 @@ def test_stalled_job_without_restart_callback_stays_running(tmp_path) -> None:
     assert int(refreshed["recovery_attempts"] or 0) == 0
     evidence = json.loads(str(refreshed["recovery_evidence_json"]))
     assert len(evidence["observations"]) == 4
+
+
+# ---------------------------------------------------------------------------
+# B. One-shot exact restart (task-book cases 7-13)
+# ---------------------------------------------------------------------------
+
+
+class _FakeRestart:
+    def __init__(self, script: list[dict]) -> None:
+        self._script = script
+        self.calls: list[tuple[int, str | None]] = []
+
+    def __call__(self, job: dict, resume_phase: str | None) -> dict:
+        self.calls.append((int(job["id"]), resume_phase))
+        step = self._script[min(len(self.calls) - 1, len(self._script) - 1)]
+        return dict(step)
+
+
+def _stalled_store(tmp_path, *, attempts: int = 15, age_minutes: int = 180, observations: int = 4):
+    store = DailyAuditStore(tmp_path / "state.sqlite3")
+    job_id = _seed_running_job(store, attempts=attempts, age_minutes=age_minutes)
+    token = store.acquire_lease(BUSINESS_DATE, "seed-stall", ttl_seconds=300)
+    store.update_remote_recovery_evidence(token, job_id, _observations(observations))
+    store.release_lease(token)
+    return store, job_id
+
+
+def _probe_payload(**overrides) -> dict:
+    payload = {
+        "remote_task_id": "1269504",
+        "remote_task_number": "RW-20260825150224",
+        "remote_mall": "lxwl",
+        "progress": dict(PROGRESS_STALLED),
+        "export_count": 0,
+        "export_rsp_desc": NO_PRICE_RSP,
+        "export_had_result": False,
+        "task_status_rsp_desc": "执行中",
+    }
+    payload.update(overrides)
+    return payload
+
+
+def _run_pass(store, probe: dict, restart, *, now: datetime = NOW) -> dict:
+    token = store.acquire_lease(BUSINESS_DATE, "pass", ttl_seconds=300)
+    try:
+        return run_running_recovery_pass(
+            store, token, probe_remote=lambda job: probe, restart_remote=restart, now=now, can_start=lambda: True
+        )
+    finally:
+        store.release_lease(token)
+
+
+def test_restart_executes_once_and_persists_recovery_attempt(tmp_path) -> None:
+    store, job_id = _stalled_store(tmp_path)
+    restart = _FakeRestart(
+        [
+            {
+                "status": "RESTARTED",
+                "restarted": True,
+                "disable_evidence": {"rspCode": "0000", "confirmed_disabled": True},
+                "enable_evidence": {"rspCode": "0000", "confirmed_enabled": True},
+            }
+        ]
+    )
+    counters = _run_pass(store, _probe_payload(), restart)
+    assert restart.calls == [(job_id, None)]
+    assert counters["recovery_restarts"] == 1
+    refreshed = store.get_remote_job(job_id)
+    assert refreshed["state"] == "RUNNING"
+    assert int(refreshed["recovery_attempts"]) == 1
+    evidence = json.loads(str(refreshed["recovery_evidence_json"]))
+    assert evidence["restart"]["phase"] == "ENABLE_CONFIRMED"
+    assert evidence["restart"]["recovery_attempts"] == 1
+    assert evidence["restart"]["recovery_at"]
+    assert evidence["restart"]["disable_evidence"]["confirmed_disabled"] is True
+    assert evidence["restart"]["enable_evidence"]["confirmed_enabled"] is True
+    assert evidence["restart"]["recovery_reason"] == "REMOTE_RUNNING_STALLED"
+
+
+def test_probe_identity_conflict_blocks_any_remote_write(tmp_path) -> None:
+    store, job_id = _stalled_store(tmp_path)
+    restart = _FakeRestart([{"status": "RESTARTED", "restarted": True}])
+    _run_pass(store, _probe_payload(remote_task_id="999999"), restart)
+    assert restart.calls == []
+    refreshed = store.get_remote_job(job_id)
+    assert int(refreshed["recovery_attempts"] or 0) == 0
+
+
+def test_probe_with_export_result_blocks_restart(tmp_path) -> None:
+    store, job_id = _stalled_store(tmp_path)
+    restart = _FakeRestart([{"status": "RESTARTED", "restarted": True}])
+    _run_pass(store, _probe_payload(export_had_result=True, export_count=None), restart)
+    assert restart.calls == []
+    refreshed = store.get_remote_job(job_id)
+    assert refreshed["state"] == "RUNNING"
+
+
+def test_disable_unknown_persists_sent_phase_and_resumes_without_resend(tmp_path) -> None:
+    store, job_id = _stalled_store(tmp_path)
+    restart = _FakeRestart(
+        [
+            {"status": "DISABLE_UNKNOWN", "restarted": False, "observed_enabled": True},
+            {
+                "status": "RESTARTED",
+                "restarted": True,
+                "reconciled": True,
+                "disable_evidence": {"confirmed_disabled": True, "reconciled": True},
+                "enable_evidence": {"rspCode": "0000", "confirmed_enabled": True},
+            },
+        ]
+    )
+    _run_pass(store, _probe_payload(), restart, now=NOW)
+    evidence = json.loads(str(store.get_remote_job(job_id)["recovery_evidence_json"]))
+    assert evidence["restart"]["phase"] == "DISABLE_SENT"
+    assert int(store.get_remote_job(job_id)["recovery_attempts"] or 0) == 0
+    # The durable phase already burned the one disable; the next pass must
+    # resume by reconciliation, never issue a fresh disable.
+    _run_pass(store, _probe_payload(), restart, now=NOW + timedelta(minutes=2))
+    assert restart.calls == [(job_id, None), (job_id, "DISABLE_SENT")]
+    refreshed = store.get_remote_job(job_id)
+    assert int(refreshed["recovery_attempts"]) == 1
+    evidence = json.loads(str(refreshed["recovery_evidence_json"]))
+    assert evidence["restart"]["phase"] == "ENABLE_CONFIRMED"
+
+
+def test_enable_unknown_resumes_by_reconciliation_only(tmp_path) -> None:
+    store, job_id = _stalled_store(tmp_path)
+    restart = _FakeRestart(
+        [
+            {"status": "ENABLE_UNKNOWN", "restarted": False, "observed_enabled": False},
+            {
+                "status": "RESTARTED",
+                "restarted": True,
+                "reconciled": True,
+                "disable_evidence": {"confirmed_disabled": True},
+                "enable_evidence": {"confirmed_enabled": True, "reconciled": True},
+            },
+        ]
+    )
+    _run_pass(store, _probe_payload(), restart, now=NOW)
+    evidence = json.loads(str(store.get_remote_job(job_id)["recovery_evidence_json"]))
+    assert evidence["restart"]["phase"] == "ENABLE_SENT"
+    _run_pass(store, _probe_payload(), restart, now=NOW + timedelta(minutes=2))
+    assert restart.calls == [(job_id, None), (job_id, "ENABLE_SENT")]
+    assert int(store.get_remote_job(job_id)["recovery_attempts"]) == 1
+
+
+def test_restart_outcome_survives_store_reopen(tmp_path) -> None:
+    store, job_id = _stalled_store(tmp_path)
+    restart = _FakeRestart([{"status": "RESTARTED", "restarted": True}])
+    _run_pass(store, _probe_payload(), restart)
+    reopened = DailyAuditStore(tmp_path / "state.sqlite3")
+    refreshed = reopened.get_remote_job(job_id)
+    assert int(refreshed["recovery_attempts"]) == 1
+    evidence = json.loads(str(refreshed["recovery_evidence_json"]))
+    assert evidence["restart"]["phase"] == "ENABLE_CONFIRMED"
+
+
+def test_recovered_job_is_never_restarted_twice(tmp_path) -> None:
+    store, job_id = _stalled_store(tmp_path)
+    restart = _FakeRestart([{"status": "RESTARTED", "restarted": True}])
+    _run_pass(store, _probe_payload(), restart)
+    # The job stalls again with a fresh frozen signature after the restart.
+    restart_again = _FakeRestart([{"status": "RESTARTED", "restarted": True}])
+    _run_pass(store, _probe_payload(), restart_again, now=NOW + timedelta(minutes=5))
+    assert restart_again.calls == []
+    assert int(store.get_remote_job(job_id)["recovery_attempts"]) == 1
+
+
+def test_identity_conflict_outcome_fails_closed_to_manual(tmp_path) -> None:
+    store, job_id = _stalled_store(tmp_path)
+    restart = _FakeRestart([{"status": "IDENTITY_CONFLICT", "restarted": False, "diagnostic": "exact task reconciliation returned a different task name"}])
+    _run_pass(store, _probe_payload(), restart)
+    refreshed = store.get_remote_job(job_id)
+    assert refreshed["state"] == "MANUAL_REQUIRED"
+    assert "identity" in str(refreshed["error_text"]).lower()
+
+
+def test_unconfirmed_write_beyond_window_fails_closed_to_manual(tmp_path) -> None:
+    store, job_id = _stalled_store(tmp_path)
+    restart = _FakeRestart([{"status": "DISABLE_UNCONFIRMED", "restarted": False, "observed_enabled": True}])
+    _run_pass(store, _probe_payload(), restart, now=NOW)
+    assert store.get_remote_job(job_id)["state"] == "RUNNING"
+    later = NOW + timedelta(minutes=20)
+    _run_pass(store, _probe_payload(), restart, now=later)
+    refreshed = store.get_remote_job(job_id)
+    assert refreshed["state"] == "MANUAL_REQUIRED"
+    assert "unconfirmed" in str(refreshed["error_text"]).lower()
+
+
+def test_unconfirmed_write_inside_window_stays_pending(tmp_path) -> None:
+    store, job_id = _stalled_store(tmp_path)
+    restart = _FakeRestart([{"status": "DISABLE_UNCONFIRMED", "restarted": False, "observed_enabled": True}])
+    _run_pass(store, _probe_payload(), restart, now=NOW)
+    _run_pass(store, _probe_payload(), restart, now=NOW + timedelta(minutes=3))
+    refreshed = store.get_remote_job(job_id)
+    assert refreshed["state"] == "RUNNING"
+    evidence = json.loads(str(refreshed["recovery_evidence_json"]))
+    assert evidence["restart"]["phase"] == "DISABLE_SENT"
+
+
+# ---------------------------------------------------------------------------
+# Adapter production contracts: exact disable -> confirm -> enable -> confirm
+# ---------------------------------------------------------------------------
+
+TASK_ID = "1269504"
+TASK_NUMBER = "RW-20260825150224"
+
+
+class _FakeRestartResponse:
+    def __init__(self, payload):
+        self._payload = payload
+        self.headers = {}
+        self.content = json.dumps(payload).encode("utf-8")
+
+    def raise_for_status(self):
+        return None
+
+    def json(self):
+        return self._payload
+
+
+class _RestartSession:
+    """Stateful fake: updateState flips the exact task's enabled flag."""
+
+    def __init__(self, task: dict, *, fail_disable: bool = False, fail_enable: bool = False) -> None:
+        self.task = task
+        self.fail_disable = fail_disable
+        self.fail_enable = fail_enable
+        self.update_calls: list[dict] = []
+
+    def post(self, url, json=None, timeout=None):
+        if "updateState" in url:
+            self.update_calls.append(dict(json))
+            if json.get("state") == "0":
+                if self.fail_disable:
+                    raise TimeoutError("disable response lost")
+                self.task["enabled"] = False
+                return _FakeRestartResponse({"rspCode": "0000", "success": True})
+            if json.get("state") == "1":
+                if self.fail_enable:
+                    raise TimeoutError("enable response lost")
+                self.task["enabled"] = True
+                return _FakeRestartResponse({"rspCode": "0000", "success": True})
+        if "exportTask" in url:
+            return _FakeRestartResponse(
+                {"rspCode": "0000", "rspDesc": NO_PRICE_RSP, "count": 0, "data": None, "success": True}
+            )
+        if "queryTaskStatus" in url:
+            return _FakeRestartResponse({"rspDesc": "执行中", "success": True})
+        return _FakeRestartResponse({"data": [dict(self.task)]})
+
+    def get(self, url, params=None, timeout=None):
+        return _FakeRestartResponse(
+            {
+                "rspDesc": "总任务量：10条，待执行：4条，执行中：3条，失败：0条，待入库：1条，执行完成：2条",
+                "success": True,
+            }
+        )
+
+
+def _restart_tool_module(task: dict, session: _RestartSession):
+    class _Module:
+        EXPORT_TASK_URL = "https://platform.invalid/exportTask"
+        QUERY_PROGRESS_URL = "https://platform.invalid/queryTaskProgress"
+        QUERY_TASK_STATUS_URL = "https://platform.invalid/queryTaskStatus"
+        UPDATE_STATE_URL = "https://platform.invalid/updateState"
+
+        @staticmethod
+        def build_session():
+            return session
+
+        @staticmethod
+        def priority_mall_code_for_key(mall_key):
+            return "lxwl"
+
+        @staticmethod
+        def build_browser_task_identifiers(task_name, mall_key):
+            return task_name, task_name
+
+        @staticmethod
+        def check_existing_task(session, task_name, mall_code):
+            return dict(session.task)
+
+        @staticmethod
+        def get_task_identity(task, mall_code):
+            return task["taskId"], task["taskNumber"], mall_code
+
+        @staticmethod
+        def query_task_status(session, task_id):
+            return {"rspDesc": "执行中", "success": True}
+
+        @staticmethod
+        def query_task_progress(session, batch_number):
+            return session.get(
+                _Module.QUERY_PROGRESS_URL, params={"batchNumber": batch_number}
+            ).json()
+
+        @staticmethod
+        def parse_task_progress_desc(rsp_desc):
+            values = {
+                "总任务量": "total",
+                "待执行": "pending",
+                "执行中": "running",
+                "失败": "failed",
+                "待入库": "waiting_db",
+                "执行完成": "finished",
+            }
+            summary = {}
+            for label, key in values.items():
+                marker = f"{label}："
+                if marker in rsp_desc:
+                    head = rsp_desc.split(marker, 1)[1]
+                    summary[key] = int(head.split("条", 1)[0])
+            return summary
+
+        @staticmethod
+        def disable_task(session, task_id):
+            return session.post(
+                _Module.UPDATE_STATE_URL, json={"taskId": task_id, "state": "0"}, timeout=60
+            ).json()
+
+        @staticmethod
+        def enable_task(session, task_id):
+            return session.post(
+                _Module.UPDATE_STATE_URL, json={"taskId": task_id, "state": "1"}, timeout=60
+            ).json()
+
+    return _Module
+
+
+class _FakeAuthManager:
+    def export_environment(self, system, refresh=False):
+        return {"BLADE_AUTH": "bearer fake", "COOKIE": "x-access-token=fake; refreshToken=fake"}
+
+
+def _prepared_job(tmp_path, monkeypatch, task: dict, session: _RestartSession):
+    from app.services.legacy_zhaoshang_adapter import CnncLegacyZhaoshangAdapter
+
+    run_dir = tmp_path / "zhaoshang"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    batch_state = run_dir / "BATCH_STATE.md"
+    batch_state.write_text("# batch\n", encoding="utf-8")
+    adapter = CnncLegacyZhaoshangAdapter(
+        mappings=[], db_env_path=None, auth_manager=_FakeAuthManager()
+    )
+    prepared = adapter.prepare_job(
+        BUSINESS_DATE,
+        [
+            type(
+                "Request",
+                (),
+                {
+                    "mall_key": "lxwl",
+                    "mall_source_id": "34",
+                    "mall_name": "领先未来商城",
+                    "sku_id": "sku-1",
+                    "url": "https://www.66123123.com/item/1",
+                    "backend_version": "legacy-v1",
+                    "identity": ("lxwl", "34", "sku-1", "https://www.66123123.com/item/1", "legacy-v1"),
+                },
+            )()
+        ],
+        run_dir / "input.xlsx",
+        run_dir / "result.xlsx",
+        "cnnc_current_opt_领先未来商城_61284593895349",
+        batch_state,
+    )
+    monkeypatch.setattr(
+        type(adapter),
+        "_load_module",
+        classmethod(lambda cls, path, name: _restart_tool_module(task, session)),
+    )
+    return adapter, prepared
+
+
+def _running_task_record(*, task_id: str = TASK_ID, task_number: str = TASK_NUMBER, enabled: bool = True) -> dict:
+    return {
+        "taskName": "cnnc_current_opt_领先未来商城_61284593895349",
+        "mallLogo": "lxwl",
+        "taskId": task_id,
+        "taskNumber": task_number,
+        "batchNumber": "cnnc_current_opt_领先未来商城_61284593895349",
+        "enabled": enabled,
+    }
+
+
+def test_adapter_restart_full_protocol_confirms_both_writes(tmp_path, monkeypatch) -> None:
+    task = _running_task_record()
+    session = _RestartSession(task)
+    adapter, prepared = _prepared_job(tmp_path, monkeypatch, task, session)
+
+    outcome = adapter.restart_running_task(prepared, TASK_ID, TASK_NUMBER, timeout_seconds=60.0)
+
+    assert outcome.status.value == "RESTARTED"
+    assert outcome.disable_confirmed is True
+    assert outcome.enable_confirmed is True
+    disable_calls = [call for call in session.update_calls if call.get("state") == "0"]
+    enable_calls = [call for call in session.update_calls if call.get("state") == "1"]
+    assert len(disable_calls) == 1
+    assert len(enable_calls) == 1
+    assert disable_calls[0]["taskId"] == TASK_ID
+    assert enable_calls[0]["taskId"] == TASK_ID
+
+
+def test_adapter_restart_resume_disable_sent_never_disables_again(tmp_path, monkeypatch) -> None:
+    task = _running_task_record(enabled=False)
+    session = _RestartSession(task)
+    adapter, prepared = _prepared_job(tmp_path, monkeypatch, task, session)
+
+    outcome = adapter.restart_running_task(
+        prepared, TASK_ID, TASK_NUMBER, timeout_seconds=60.0, resume_phase="DISABLE_SENT"
+    )
+
+    assert outcome.status.value == "RESTARTED"
+    assert [call for call in session.update_calls if call.get("state") == "0"] == []
+    assert len([call for call in session.update_calls if call.get("state") == "1"]) == 1
+
+
+def test_adapter_restart_resume_enable_sent_never_writes(tmp_path, monkeypatch) -> None:
+    task = _running_task_record(enabled=True)
+    session = _RestartSession(task)
+    adapter, prepared = _prepared_job(tmp_path, monkeypatch, task, session)
+
+    outcome = adapter.restart_running_task(
+        prepared, TASK_ID, TASK_NUMBER, timeout_seconds=60.0, resume_phase="ENABLE_SENT"
+    )
+
+    assert outcome.status.value == "RESTARTED"
+    assert outcome.enable_confirmed is True
+    assert session.update_calls == []
+
+
+def test_adapter_restart_identity_conflict_issues_no_write(tmp_path, monkeypatch) -> None:
+    task = _running_task_record(task_id="424242")
+    session = _RestartSession(task)
+    adapter, prepared = _prepared_job(tmp_path, monkeypatch, task, session)
+
+    outcome = adapter.restart_running_task(prepared, TASK_ID, TASK_NUMBER, timeout_seconds=60.0)
+
+    assert outcome.status.value == "IDENTITY_CONFLICT"
+    assert session.update_calls == []
+
+
+def test_adapter_restart_disable_unknown_reports_observed_state(tmp_path, monkeypatch) -> None:
+    task = _running_task_record()
+    session = _RestartSession(task, fail_disable=True)
+    adapter, prepared = _prepared_job(tmp_path, monkeypatch, task, session)
+
+    outcome = adapter.restart_running_task(prepared, TASK_ID, TASK_NUMBER, timeout_seconds=60.0)
+
+    assert outcome.status.value == "DISABLE_UNKNOWN"
+    assert outcome.observed_enabled is True
+    assert [call for call in session.update_calls if call.get("state") == "1"] == []
+
+
+def test_adapter_probe_running_task_reports_progress_and_export(tmp_path, monkeypatch) -> None:
+    task = _running_task_record()
+    session = _RestartSession(task)
+    adapter, prepared = _prepared_job(tmp_path, monkeypatch, task, session)
+
+    probe = adapter.probe_running_task(prepared, TASK_ID, TASK_NUMBER, timeout_seconds=60.0)
+
+    assert probe.task_id == TASK_ID
+    assert probe.task_number == TASK_NUMBER
+    assert probe.progress["total"] == 10
+    assert probe.progress["finished"] == 2
+    assert probe.export_had_result is False
+    assert probe.export_count == 0
+    assert probe.export_rsp_desc == NO_PRICE_RSP
+
+
+def test_default_dependencies_wire_probe_and_write_gated_restart(tmp_path) -> None:
+    from app.services.incremental_audit_runtime import (
+        build_default_dependencies,
+        runtime_paths,
+    )
+
+    paths = runtime_paths(BUSINESS_DATE, tmp_path / "runtime")
+    read_only = build_default_dependencies(
+        zhaoshang_backend="legacy", paths=paths, business_date=BUSINESS_DATE
+    )
+    assert read_only.remote_recovery_probe is not None
+    assert read_only.remote_recovery_restart is None
+
+    write_enabled = build_default_dependencies(
+        enable_zhaoshang=True,
+        zhaoshang_backend="legacy",
+        paths=paths,
+        business_date=BUSINESS_DATE,
+    )
+    assert write_enabled.remote_recovery_probe is not None
+    assert write_enabled.remote_recovery_restart is not None

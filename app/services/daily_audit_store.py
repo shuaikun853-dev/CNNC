@@ -1293,6 +1293,47 @@ class DailyAuditStore:
             )
             return self._row(connection.execute("SELECT * FROM remote_jobs WHERE id=?", (job_id,)).fetchone())  # type: ignore[return-value]
 
+    def mark_remote_recovery_attempted(
+        self,
+        token: LeaseToken,
+        job_id: int,
+        *,
+        remote_identity: str,
+        evidence: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Burn the single automatic restart slot for one exact remote job.
+
+        The transition is legal only from ``RUNNING`` with a matching exact
+        remote identity and a previously unburned attempt, so a resumed
+        process can never authorize a second disable->enable.
+        """
+        from app.services.remote_running_recovery import encode_recovery_evidence, decode_recovery_evidence
+
+        normalized_identity = str(remote_identity or "").strip()
+        with self._transaction(immediate=True) as connection:
+            self._validate_lease(connection, token)
+            job = self._job_for_lease(connection, token, job_id)
+            if str(job["state"]) != "RUNNING":
+                raise RemoteIntentConflict("recovery attempt requires the RUNNING state")
+            if not normalized_identity or str(job["remote_identity"] or "").strip() != normalized_identity:
+                raise RemoteIntentConflict("recovery attempt requires the exact confirmed remote identity")
+            if int(job["recovery_attempts"] or 0) != 0:
+                raise RemoteIntentConflict("remote job already consumed its single recovery attempt")
+            document = decode_recovery_evidence(job["recovery_evidence_json"])
+            merged_restart = dict(document.get("restart") or {})
+            merged_restart.update(
+                {
+                    "phase": "ENABLE_CONFIRMED",
+                    "recovery_attempts": 1,
+                }
+            )
+            document["restart"] = merged_restart
+            connection.execute(
+                "UPDATE remote_jobs SET recovery_attempts=1, recovery_evidence_json=?, updated_at=? WHERE id=?",
+                (encode_recovery_evidence(document), self._utcnow(), job_id),
+            )
+            return self._row(connection.execute("SELECT * FROM remote_jobs WHERE id=?", (job_id,)).fetchone())  # type: ignore[return-value]
+
     def _set_job_state(self, token: LeaseToken, job_id: int, state: str, *, error: str | None = None, require_post_attempted: bool = False) -> dict[str, Any]:
         with self._transaction(immediate=True) as connection:
             self._validate_lease(connection, token)

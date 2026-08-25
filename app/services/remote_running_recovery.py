@@ -267,6 +267,113 @@ def evaluate_running_stall(job: Mapping[str, Any], *, now: datetime) -> dict[str
     return decision
 
 
+def _probe_identity_matches(job: Mapping[str, Any], probe: Mapping[str, Any]) -> bool:
+    """The read-only probe must re-confirm the exact durable remote identity."""
+    parts = _text(job.get("remote_identity")).split("|")
+    if len(parts) != 3:
+        return False
+    return (
+        _text(probe.get("remote_mall")) == parts[0]
+        and _text(probe.get("remote_task_id")) == parts[1]
+        and _text(probe.get("remote_task_number")) == parts[2]
+    )
+
+
+def _apply_restart(
+    store: DailyAuditStore,
+    token: LeaseToken,
+    job: Mapping[str, Any],
+    evidence: dict[str, Any],
+    restart_remote: Callable[[Mapping[str, Any], str | None], Mapping[str, Any]],
+    *,
+    now: datetime,
+) -> Mapping[str, Any]:
+    """Consume the one automatic disable->enable attempt under durable phases.
+
+    The phase is persisted before any remote write so a crash can never
+    dispatch a second disable or enable; resumed passes only reconcile the
+    already-sent direction.  Unconfirmed writes fail closed into manual
+    review once the confirmation window expires.
+    """
+    job_id = int(job["id"])
+    restart = evidence.get("restart")
+    resume_phase: str | None = None
+    if isinstance(restart, Mapping) and _text(restart.get("phase")) in {
+        "DISABLE_SENT",
+        "ENABLE_SENT",
+    }:
+        resume_phase = _text(restart.get("phase"))
+    else:
+        evidence["restart"] = {
+            "phase": "DISABLE_SENT",
+            "phase_at": now.astimezone(UTC).isoformat(timespec="seconds"),
+            "recovery_attempts": 0,
+            "recovery_reason": "REMOTE_RUNNING_STALLED",
+        }
+        store.update_remote_recovery_evidence(token, job_id, evidence)
+    outcome = restart_remote(job, resume_phase)
+    status = _text(outcome.get("status"))
+    restart = evidence["restart"]
+    phase_at = _parse_timestamp(restart.get("phase_at"))
+    if status == "RESTARTED":
+        observations = evidence.get("observations") or []
+        last_signature = (
+            observations[-1].get("signature")
+            if isinstance(observations, list) and observations
+            else None
+        )
+        finished = {
+            "phase": "ENABLE_CONFIRMED",
+            "phase_at": now.astimezone(UTC).isoformat(timespec="seconds"),
+            "recovery_attempts": 1,
+            "recovery_at": now.astimezone(UTC).isoformat(timespec="seconds"),
+            "recovery_reason": "REMOTE_RUNNING_STALLED",
+            "disable_evidence": outcome.get("disable_evidence"),
+            "enable_evidence": outcome.get("enable_evidence"),
+            "pre_restart_signature": last_signature,
+        }
+        evidence["restart"] = finished
+        store.update_remote_recovery_evidence(token, job_id, evidence)
+        store.mark_remote_recovery_attempted(
+            token, job_id, remote_identity=_text(job.get("remote_identity")), evidence=finished
+        )
+        return outcome
+    if status in {"DISABLE_UNKNOWN", "ENABLE_UNKNOWN"}:
+        phase = "DISABLE_SENT" if status == "DISABLE_UNKNOWN" else "ENABLE_SENT"
+        restart["phase"] = phase
+        restart["diagnostic"] = _text(outcome.get("diagnostic")) or status
+        restart["observed_enabled"] = outcome.get("observed_enabled")
+        store.update_remote_recovery_evidence(token, job_id, evidence)
+        return outcome
+    if status in {"DISABLE_UNCONFIRMED", "ENABLE_UNCONFIRMED"}:
+        window_expired = (
+            phase_at is not None
+            and (now - phase_at).total_seconds() >= RECOVERY_WRITE_CONFIRM_WINDOW_SECONDS
+        )
+        if window_expired:
+            store.mark_remote_manual(
+                token,
+                job_id,
+                f"remote stall recovery write unconfirmed: {status}; "
+                f"resume_phase={resume_phase or 'DISABLE_SENT'}",
+            )
+        else:
+            restart["diagnostic"] = f"{status}; awaiting reconciliation"
+            store.update_remote_recovery_evidence(token, job_id, evidence)
+        return outcome
+    if status in {"IDENTITY_CONFLICT", "NOT_RUNNING"}:
+        store.mark_remote_manual(
+            token,
+            job_id,
+            f"remote stall recovery exact identity failure: {status}; "
+            f"{_text(outcome.get('diagnostic'))}",
+        )
+        return outcome
+    restart["diagnostic"] = _text(outcome.get("diagnostic")) or status
+    store.update_remote_recovery_evidence(token, job_id, evidence)
+    return outcome
+
+
 def run_running_recovery_pass(
     store: DailyAuditStore,
     token: LeaseToken,
@@ -304,7 +411,19 @@ def run_running_recovery_pass(
         job = store.update_remote_recovery_evidence(token, int(job["id"]), evidence)
         decision = evaluate_running_stall(job, now=now)
         if decision["stalled"] and restart_remote is not None:
-            outcome = restart_remote(job, None)
+            if not _probe_identity_matches(job, probe):
+                # The write path re-validates identity itself; a probe that
+                # cannot re-confirm the exact durable identity must stop the
+                # restart before any remote write is dispatched.
+                store.mark_remote_manual(
+                    token,
+                    int(job["id"]),
+                    "remote stall probe identity no longer matches the durable remote identity",
+                )
+                continue
+            outcome = _apply_restart(
+                store, token, job, decode_recovery_evidence(job.get("recovery_evidence_json")), restart_remote, now=now
+            )
             counters["recovery_restarts"] += int(bool(outcome.get("restarted")))
             counters["recovery_reconciled"] += int(bool(outcome.get("reconciled")))
     return counters
