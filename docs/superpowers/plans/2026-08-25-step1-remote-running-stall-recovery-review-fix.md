@@ -30,12 +30,12 @@
 
 **Interfaces:**
 - Produces: `RestartStatus.EXTERNALLY_DISABLED`; adapter returns it with zero writes when `resume_phase is None` and the exact task is observed disabled.
-- Produces: `_apply_restart` maps `EXTERNALLY_DISABLED` → `mark_remote_manual` (fail closed, no attempt burn, no `ENABLE_SENT`).
+- Produces: `_apply_restart` maps `EXTERNALLY_DISABLED` → `mark_remote_manual` (fail closed, no attempt burn, no `ENABLE_SENT`); the write-ahead `DISABLE_SENT` doc stays as an inert audit record because MANUAL_REQUIRED is terminal. (`NO_LONGER_RUNNING` in Task 2 is the decline that resets the phase to a `DECLINED` marker.)
 
 - [ ] RED: `test_adapter_fresh_restart_of_disabled_task_issues_no_write` — fresh restart, identity ok, task enabled=False → `disable_calls == 0`, `enable_calls == 0`, outcome status `EXTERNALLY_DISABLED`, `observed_enabled is False`.
 - [ ] RED: pass-level `test_fresh_externally_disabled_outcome_fails_closed_to_manual` — restart callback returns `EXTERNALLY_DISABLED` → job becomes `MANUAL_REQUIRED`, `recovery_attempts == 0`.
 - [ ] Verify both fail on current code (adapter currently proceeds to enable).
-- [ ] GREEN: add enum value; in fresh path, when `enabled_now` is False return `EXTERNALLY_DISABLED` before any write; `_apply_restart` treats it like `IDENTITY_CONFLICT` (manual) and resets the write-ahead `DISABLE_SENT` phase to a declined marker.
+- [ ] GREEN: add enum value; in fresh path, when `enabled_now` is False return `EXTERNALLY_DISABLED` before any write; `_apply_restart` treats it like `IDENTITY_CONFLICT` (manual).
 - [ ] Resume regression: `DISABLE_SENT`/`DISABLE_CONFIRMED` resume with observed disabled still proceeds to enable (existing tests cover; add explicit assertion).
 - [ ] Commit 7: `fix(remote): refuse fresh restart of externally disabled jobs`
 

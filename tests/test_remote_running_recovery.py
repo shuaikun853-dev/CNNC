@@ -1436,11 +1436,13 @@ def test_restarted_with_unconfirmed_enable_does_not_burn_attempt(tmp_path) -> No
 def test_unconfirmed_restarted_routes_to_enable_reconciliation_not_burn(tmp_path) -> None:
     store, job_id = _stalled_store(tmp_path)
     restart = _FakeRestart([{"status": "RESTARTED", "restarted": True}])
-    _run_pass(store, _probe_payload(), restart)
+    counters = _run_pass(store, _probe_payload(), restart)
     evidence = json.loads(str(store.get_remote_job(job_id)["recovery_evidence_json"]))
     # The enable direction may have been sent: reconcile it instead of
-    # trusting an unevidenced RESTARTED claim.
+    # trusting an unevidenced RESTARTED claim, and never count the
+    # unevidenced claim as a completed restart in the metrics.
     assert evidence["restart"]["phase"] == "ENABLE_SENT"
+    assert counters["recovery_restarts"] == 0
 
 
 def test_crash_window_guard_requires_confirmed_evidence(tmp_path) -> None:

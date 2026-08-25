@@ -433,7 +433,8 @@ def _apply_restart(
                 "awaiting phase reconciliation"
             )
             store.update_remote_recovery_evidence(token, job_id, evidence)
-            return outcome
+            # Keep the metrics honest: an unevidenced claim is not a restart.
+            return {**outcome, "restarted": False}
         observations = evidence.get("observations") or []
         last_signature = (
             observations[-1].get("signature")
