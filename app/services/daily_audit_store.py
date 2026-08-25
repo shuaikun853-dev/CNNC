@@ -366,6 +366,10 @@ class DailyAuditStore:
                 connection.execute("ALTER TABLE remote_jobs ADD COLUMN harvest_attempts INTEGER NOT NULL DEFAULT 0")
             if "harvest_elapsed_seconds" not in columns:
                 connection.execute("ALTER TABLE remote_jobs ADD COLUMN harvest_elapsed_seconds REAL NOT NULL DEFAULT 0")
+            if "recovery_attempts" not in columns:
+                connection.execute("ALTER TABLE remote_jobs ADD COLUMN recovery_attempts INTEGER NOT NULL DEFAULT 0")
+            if "recovery_evidence_json" not in columns:
+                connection.execute("ALTER TABLE remote_jobs ADD COLUMN recovery_evidence_json TEXT")
             collision = connection.execute(
                 """SELECT run_id, TRIM(remote_identity) AS remote_identity, COUNT(*) AS collision_count
                    FROM remote_jobs
@@ -1265,6 +1269,28 @@ class DailyAuditStore:
             )
             state = "MANUAL_REQUIRED" if manual else str(job["state"])
             connection.execute("UPDATE remote_jobs SET state=?, harvest_elapsed_seconds=?, error_text=?, updated_at=? WHERE id=?", (state, elapsed, error, self._utcnow(), job_id))
+            return self._row(connection.execute("SELECT * FROM remote_jobs WHERE id=?", (job_id,)).fetchone())  # type: ignore[return-value]
+
+    def update_remote_recovery_evidence(self, token: LeaseToken, job_id: int, evidence: Mapping[str, Any]) -> dict[str, Any]:
+        """Persist the RUNNING-stall recovery evidence document for one job.
+
+        The evidence document is the only authority for progress observations
+        and restart phases; it never mutates ``result_json``/``error_text``
+        semantics.  Any state may record probe evidence, but the update is
+        fenced by the daily lease like every other durable write.
+        """
+        from app.services.remote_running_recovery import encode_recovery_evidence
+
+        encoded = encode_recovery_evidence(evidence)
+        with self._transaction(immediate=True) as connection:
+            self._validate_lease(connection, token)
+            job = self._job_for_lease(connection, token, job_id)
+            if str(job["state"]) == "COMPLETED":
+                raise RemoteIntentConflict("completed remote job evidence is immutable")
+            connection.execute(
+                "UPDATE remote_jobs SET recovery_evidence_json=?, updated_at=? WHERE id=?",
+                (encoded, self._utcnow(), job_id),
+            )
             return self._row(connection.execute("SELECT * FROM remote_jobs WHERE id=?", (job_id,)).fetchone())  # type: ignore[return-value]
 
     def _set_job_state(self, token: LeaseToken, job_id: int, state: str, *, error: str | None = None, require_post_attempted: bool = False) -> dict[str, Any]:
