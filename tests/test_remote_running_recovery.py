@@ -2087,3 +2087,110 @@ def test_m1_recovery_exhausted_job_completes_leftover_pending_crawls(tmp_path) -
     _run_pass(store, _probe_payload(), None)
 
     assert store.get_crawl_work(crawl_id)["state"] == "NO_RESULT"
+
+
+# ---------------------------------------------------------------------------
+# Review round 4, BLOCKER A: structural and mathematical consistency of the
+# six-field progress payload must be proven BEFORE the ACTIVE branch can
+# accept the row.  A contradictory payload (finished + failed > total while
+# pending/running/waiting_db are also positive) is UNKNOWN and can never
+# become stall evidence, no matter how stationary it looks.
+# ---------------------------------------------------------------------------
+
+
+_ROUND4_CONTRADICTION = {
+    "total": 10,
+    "pending": 1,
+    "running": 1,
+    "failed": 1,
+    "waiting_db": 0,
+    "finished": 10,
+}
+
+
+def test_round4_a1_contradictory_active_looking_progress_is_unknown() -> None:
+    from app.services.remote_running_recovery import RemoteExecutionState, classify_remote_execution_state
+
+    state = classify_remote_execution_state(dict(_ROUND4_CONTRADICTION), "")
+    assert state is RemoteExecutionState.UNKNOWN
+
+
+def test_round4_a2_contradictory_progress_never_proves_stall() -> None:
+    evidence = _observations(4, progress=dict(_ROUND4_CONTRADICTION))
+    job = _job(evidence=evidence)
+    decision = evaluate_running_stall(job, now=NOW)
+    assert decision["stalled"] is False
+
+
+def test_round4_a3_contradictory_stall_evidence_reaches_no_remote_write(tmp_path) -> None:
+    store = DailyAuditStore(tmp_path / "state.sqlite3")
+    job_id = _seed_running_job(store, attempts=15, age_minutes=180)
+    token = store.acquire_lease(BUSINESS_DATE, "seed-a3", ttl_seconds=300)
+    store.update_remote_recovery_evidence(
+        token, job_id, _observations(4, progress=dict(_ROUND4_CONTRADICTION))
+    )
+    store.release_lease(token)
+    restart = _FakeRestart([dict(_CONFIRMED_RESTART_STEP)])
+
+    _run_pass(store, _probe_payload(progress=dict(_ROUND4_CONTRADICTION)), restart)
+
+    assert restart.calls == []
+    assert int(store.get_remote_job(job_id)["recovery_attempts"] or 0) == 0
+
+
+def test_round4_a4_legal_active_progress_is_still_active() -> None:
+    from app.services.remote_running_recovery import RemoteExecutionState, classify_remote_execution_state
+
+    state = classify_remote_execution_state(
+        {"total": 10, "pending": 1, "running": 2, "failed": 0, "waiting_db": 0, "finished": 7},
+        "",
+    )
+    assert state is RemoteExecutionState.ACTIVE
+
+
+def test_round4_a5_legal_terminal_progress_is_still_terminal() -> None:
+    from app.services.remote_running_recovery import RemoteExecutionState, classify_remote_execution_state
+
+    state = classify_remote_execution_state(
+        {"total": 10, "pending": 0, "running": 0, "failed": 1, "waiting_db": 0, "finished": 9},
+        "",
+    )
+    assert state is RemoteExecutionState.TERMINAL
+
+
+# ---------------------------------------------------------------------------
+# Review round 4, IMPORTANT D: the terminal marker is exactly one status
+# value the external tool itself interprets (auto_crawl_task.py:1048,
+# rspDesc == "本次任务执行完毕").  Substring containment widened the
+# evidence: a failure phrase containing the marker must stay governed by
+# the structured progress payload, and an unrecognized status with
+# unprovable progress stays UNKNOWN.
+# ---------------------------------------------------------------------------
+
+
+def test_round4_d1_exact_marker_with_active_progress_is_terminal() -> None:
+    from app.services.remote_running_recovery import RemoteExecutionState, classify_remote_execution_state
+
+    state = classify_remote_execution_state(_live_progress(running=3), "本次任务执行完毕")
+    assert state is RemoteExecutionState.TERMINAL
+
+
+def test_round4_d2_whitespace_padded_marker_is_terminal() -> None:
+    from app.services.remote_running_recovery import RemoteExecutionState, classify_remote_execution_state
+
+    state = classify_remote_execution_state(_live_progress(running=3), "  本次任务执行完毕  ")
+    assert state is RemoteExecutionState.TERMINAL
+
+
+def test_round4_d3_failure_phrase_containing_marker_is_not_terminal() -> None:
+    from app.services.remote_running_recovery import RemoteExecutionState, classify_remote_execution_state
+
+    state = classify_remote_execution_state(_live_progress(running=3), "查询本次任务执行完毕状态失败")
+    assert state is RemoteExecutionState.ACTIVE
+
+
+def test_round4_d4_marker_suffixed_failure_phrase_with_unknown_progress_is_unknown() -> None:
+    from app.services.remote_running_recovery import RemoteExecutionState, classify_remote_execution_state
+
+    state = classify_remote_execution_state({}, "本次任务执行完毕失败")
+    assert state is RemoteExecutionState.UNKNOWN

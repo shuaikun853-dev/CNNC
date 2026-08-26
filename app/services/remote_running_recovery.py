@@ -38,13 +38,20 @@ RUNNING_STALL_EXPORT_NO_PRICE_RSP_DESC = "未检索到商品价格信息"
 # status value itself -- the terminal marker "本次任务执行完毕"
 # (auto_crawl_task.py:1048) -- and no RUNNING string for the status endpoint
 # has ever been observed in production (all 24 real captures were empty;
-# "执行中" is a progress-descriptor label, not a status answer).  Liveness is
-# therefore derived from the structured query_task_progress six-field
-# payload, mirroring the tool's own ``is_progress_finished`` business
-# definition: work remains ACTIVE while any of pending/running/waiting_db is
-# positive, and is finished only when all three are zero and
-# finished + failed >= total.  Anything unparseable, contradictory, or with a
-# non-positive total is UNKNOWN and fails closed.
+# "执行中" is a progress-descriptor label, not a status answer).  The marker
+# therefore matches the _text()-normalized status value EXACTLY; substring,
+# prefix, or suffix containment would widen the evidence to failure phrases
+# like "查询本次任务执行完毕状态失败".  Liveness is derived from the
+# structured query_task_progress six-field payload, mirroring the tool's own
+# ``is_progress_finished`` business definition — but fail-closed: structural
+# completeness (all six integer fields, total > 0, none negative) and the one
+# deterministic mathematical consistency the tool's counters guarantee
+# (finished + failed <= total) are verified BEFORE the ACTIVE branch may
+# accept the row, so a contradictory payload is UNKNOWN regardless of
+# pending/running/waiting_db.  Work is ACTIVE while any of those three is
+# positive; TERMINAL only when all three are zero and finished + failed >=
+# total.  Anything unparseable, contradictory, or otherwise unprovable is
+# UNKNOWN and fails closed.
 TERMINAL_STATUS_MARKERS: tuple[str, ...] = ("本次任务执行完毕",)
 
 
@@ -65,7 +72,7 @@ def classify_remote_execution_state(
     evidence and never authorizes a fresh remote write.
     """
     description = _text(task_status_rsp_desc)
-    if any(marker in description for marker in TERMINAL_STATUS_MARKERS):
+    if description in TERMINAL_STATUS_MARKERS:
         return RemoteExecutionState.TERMINAL
     signature = canonical_progress_signature(progress if isinstance(progress, Mapping) else {})
     if signature is None:
@@ -73,10 +80,10 @@ def classify_remote_execution_state(
     total, pending, running, failed, waiting_db, finished = signature
     if any(value < 0 for value in signature):
         return RemoteExecutionState.UNKNOWN
-    if pending > 0 or running > 0 or waiting_db > 0:
-        return RemoteExecutionState.ACTIVE
     if finished + failed > total:
         return RemoteExecutionState.UNKNOWN
+    if pending > 0 or running > 0 or waiting_db > 0:
+        return RemoteExecutionState.ACTIVE
     if finished + failed >= total:
         return RemoteExecutionState.TERMINAL
     return RemoteExecutionState.UNKNOWN
