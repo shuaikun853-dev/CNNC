@@ -126,6 +126,15 @@ RECOVERY_MAX_PROBE_CANDIDATES_PER_TICK = 4
 def classify_restart_exception(exc: BaseException, resume_phase: str | None) -> str:
     """Classify an exception escaping the restart adapter, never blanket-manual.
 
+    Since Round 5 the production restart adapter converts every escape into
+    an explicit outcome that names the side-effect boundary itself
+    (``PRE_WRITE_FAILED`` / ``DISABLE_UNKNOWN`` / ``ENABLE_UNKNOWN`` /
+    ``IDENTITY_CONFLICT``), so this classifier is a last-resort defense for
+    injected test runners and unforeseen adapter escapes only.  An escape
+    that cannot be proven pre-write stays reconcile-only toward the resumed
+    direction — it may fail closed into manual review but can never
+    authorize a second write.
+
     Transient transport failures keep the durable phase so the next pass
     reconciles the already-sent direction against the real remote state.  Only
     failures proving the exact local identity cannot be reconstructed are a
@@ -147,6 +156,26 @@ def classify_restart_exception(exc: BaseException, resume_phase: str | None) -> 
     if isinstance(exc, (TimeoutError, ConnectionError, OSError)):
         return "ENABLE_UNKNOWN" if resume_phase == "ENABLE_SENT" else "DISABLE_UNKNOWN"
     return "IDENTITY_CONFLICT"
+
+
+def _pre_write_restart_failure_status(exc: BaseException) -> str:
+    """Classify an exception raised before any remote write was attempted.
+
+    Identity-shaped failures (the exact local↔remote identity cannot be
+    reconstructed) stay the permanent IDENTITY_CONFLICT; every other
+    pre-write failure — auth refresh, transport, deadline exhaustion,
+    tooling — provably sent no remote write and is retryable as a fresh
+    attempt on the next pass.
+    """
+    from app.services.incremental_audit_runtime import RuntimeConfigurationError
+
+    if isinstance(exc, (RuntimeConfigurationError, ValueError, KeyError, TypeError)):
+        return "IDENTITY_CONFLICT"
+    if isinstance(exc, RuntimeError):
+        message = str(exc)
+        if any(marker in message for marker in ("不唯一", "不一致", "没有拿到", "identity")):
+            return "IDENTITY_CONFLICT"
+    return "PRE_WRITE_FAILED"
 
 
 def _text(value: object) -> str:
@@ -503,6 +532,22 @@ def _apply_restart(
         store.mark_remote_recovery_attempted(
             token, job_id, remote_identity=_text(job.get("remote_identity")), evidence=finished
         )
+        return outcome
+    if status == "PRE_WRITE_FAILED":
+        # Zero-write proof: the adapter established that no remote write was
+        # attempted (auth/lookup/status/progress/deadline all precede the
+        # first write).  The write-ahead DISABLE_SENT must be withdrawn —
+        # leaving it would force reconcile-only and waste the single
+        # automatic recovery attempt on a transient fault.  The diagnostic
+        # is kept durably; the attempt slot is NOT consumed; the job stays
+        # RUNNING so the next pass may re-enter fresh recovery.
+        evidence["restart"] = {
+            "phase": "PRE_WRITE_FAILED",
+            "phase_at": now.astimezone(UTC).isoformat(timespec="seconds"),
+            "failed_status": status,
+            "diagnostic": _text(outcome.get("diagnostic")) or status,
+        }
+        store.update_remote_recovery_evidence(token, job_id, evidence)
         return outcome
     if status in {"DISABLE_UNKNOWN", "ENABLE_UNKNOWN"}:
         phase = "DISABLE_SENT" if status == "DISABLE_UNKNOWN" else "ENABLE_SENT"

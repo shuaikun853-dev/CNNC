@@ -1488,9 +1488,12 @@ def legacy_zhaoshang_bridge(
                 resume_phase=resume_phase,
             )
         except Exception as exc:
-            # A dispatch exception proves neither success nor failure of a
-            # write that may already have left; classify it so the durable
-            # phase reconciles the real remote state on the next pass.
+            # Since Round 5 the production adapter converts its own escapes
+            # into explicit boundary outcomes (PRE_WRITE_FAILED for proven
+            # zero-write failures), so this branch is defense-in-depth for
+            # injected runners and unforeseen escapes only: the classifier
+            # keeps the resumed direction reconcile-only and can never
+            # authorize a fresh second write.
             status = classify_restart_exception(exc, resume_phase)
             return {
                 "status": status,

@@ -741,12 +741,22 @@ class _RestartSession:
         *,
         fail_disable: bool = False,
         fail_enable: bool = False,
+        fail_lookup: bool = False,
+        fail_status: bool = False,
+        fail_progress: bool = False,
+        fail_lookup_after_enable: bool = False,
+        fail_lookup_after_disable: bool = False,
         status_rsp_desc: str = "执行中",
         progress_rsp_desc: str = _ACTIVE_PROGRESS_RSP,
     ) -> None:
         self.task = task
         self.fail_disable = fail_disable
         self.fail_enable = fail_enable
+        self.fail_lookup = fail_lookup
+        self.fail_status = fail_status
+        self.fail_progress = fail_progress
+        self.fail_lookup_after_enable = fail_lookup_after_enable
+        self.fail_lookup_after_disable = fail_lookup_after_disable
         self.status_rsp_desc = status_rsp_desc
         self.progress_rsp_desc = progress_rsp_desc
         self.update_calls: list[dict] = []
@@ -754,6 +764,8 @@ class _RestartSession:
         self.get_timeouts: list[float | None] = []
         self.post_calls = 0
         self.get_calls = 0
+        self._enable_posts_seen = 0
+        self._disable_posts_seen = 0
 
     def post(self, url, json=None, timeout=None):
         self.post_calls += 1
@@ -761,11 +773,13 @@ class _RestartSession:
         if "updateState" in url:
             self.update_calls.append(dict(json))
             if json.get("state") == "0":
+                self._disable_posts_seen += 1
                 if self.fail_disable:
                     raise TimeoutError("disable response lost")
                 self.task["enabled"] = False
                 return _FakeRestartResponse({"rspCode": "0000", "success": True})
             if json.get("state") == "1":
+                self._enable_posts_seen += 1
                 if self.fail_enable:
                     raise TimeoutError("enable response lost")
                 self.task["enabled"] = True
@@ -775,12 +789,24 @@ class _RestartSession:
                 {"rspCode": "0000", "rspDesc": NO_PRICE_RSP, "count": 0, "data": None, "success": True}
             )
         if "queryTaskStatus" in url:
+            if self.fail_status:
+                raise TimeoutError("status response lost")
             return _FakeRestartResponse({"rspDesc": self.status_rsp_desc, "success": True})
+        if "queryList" in url:
+            if self.fail_lookup or (
+                self.fail_lookup_after_enable and self._enable_posts_seen > 0
+            ) or (
+                self.fail_lookup_after_disable and self._disable_posts_seen > 0
+            ):
+                raise TimeoutError("lookup response lost")
+            return _FakeRestartResponse({"data": [dict(self.task)]})
         return _FakeRestartResponse({"data": [dict(self.task)]})
 
     def get(self, url, params=None, timeout=None):
         self.get_calls += 1
         self.get_timeouts.append(timeout)
+        if self.fail_progress:
+            raise TimeoutError("progress response lost")
         return _FakeRestartResponse({"rspDesc": self.progress_rsp_desc, "success": True})
 
 
@@ -1462,8 +1488,10 @@ def test_case_b4_exhausted_deadline_sends_no_further_request(tmp_path, monkeypat
         return clock.value + 100.0  # every later check sees an exhausted deadline
 
     adapter, prepared = _prepared_job(tmp_path, monkeypatch, task, session, monotonic=monotonic)
-    with pytest.raises(TimeoutError):
-        adapter.restart_running_task(prepared, TASK_ID, TASK_NUMBER, timeout_seconds=10.0)
+    # Round 5 contract: the exhausted pre-write deadline is a zero-write
+    # outcome instead of an escaping TimeoutError.
+    outcome = adapter.restart_running_task(prepared, TASK_ID, TASK_NUMBER, timeout_seconds=10.0)
+    assert outcome.status.value == "PRE_WRITE_FAILED"
     assert session.post_calls == 0
     assert session.get_calls == 0
 
@@ -2545,8 +2573,6 @@ def test_round4_c6_restart_auth_refresh_shares_the_callback_deadline(tmp_path, m
 
 
 def test_round4_c7_auth_refresh_timeout_dispatches_no_remote_write(tmp_path, monkeypatch) -> None:
-    from scripts.auth_manager import AuthError
-
     task = _running_task_record()
     session = _RestartSession(task)
     opener = _TimingOutAuthOpener()
@@ -2554,10 +2580,170 @@ def test_round4_c7_auth_refresh_timeout_dispatches_no_remote_write(tmp_path, mon
         tmp_path, monkeypatch, task, session, auth=_real_auth_manager(tmp_path, opener)
     )
 
-    with pytest.raises(AuthError):
-        adapter.restart_running_task(prepared, TASK_ID, TASK_NUMBER, timeout_seconds=10.0)
+    # Round 5 contract: a pre-write auth failure is an explicit zero-write
+    # outcome, not an exception escaping the adapter (which the bridge would
+    # have to guess at).
+    outcome = adapter.restart_running_task(prepared, TASK_ID, TASK_NUMBER, timeout_seconds=10.0)
 
+    assert outcome.status.value == "PRE_WRITE_FAILED"
     assert opener.timeouts, "the refresh HTTP was attempted and timed out"
     assert session.update_calls == []
     assert session.post_calls == 0
     assert session.get_calls == 0
+
+
+# ---------------------------------------------------------------------------
+# Round 5, BLOCKER A: a pre-write failure proves no remote write was
+# attempted, so it must never be classified DISABLE_UNKNOWN (which would
+# leave the write-ahead DISABLE_SENT durable, force reconcile-only, and
+# waste the single automatic recovery attempt on a transient fault).
+# ---------------------------------------------------------------------------
+
+
+def test_round5_a1_pre_write_failure_keeps_fresh_retry_across_two_ticks(tmp_path) -> None:
+    store, job_id = _stalled_store(tmp_path)
+    restart = _FakeRestart(
+        [
+            # Tick 1: the bridge translated a pre-write auth failure into an
+            # explicit PRE_WRITE_FAILED outcome; no disable was attempted.
+            {
+                "status": "PRE_WRITE_FAILED",
+                "restarted": False,
+                "diagnostic": "restart raised AuthError before any write; nothing sent",
+            },
+            # Tick 2: the fault is gone; the same job must still be allowed
+            # its single fresh disable->enable with resume_phase=None.
+            {
+                "status": "RESTARTED",
+                "restarted": True,
+                "disable_evidence": {"confirmed_disabled": True},
+                "enable_evidence": {"confirmed_enabled": True},
+            },
+        ]
+    )
+    counters = _run_pass(store, _probe_payload(), restart, now=NOW)
+    # Tick 1 durable state: no write left, no attempt burned, no pending
+    # write-ahead phase that would force reconcile-only next tick.
+    assert restart.calls == [(job_id, None)]
+    assert counters["recovery_restarts"] == 0
+    job = store.get_remote_job(job_id)
+    evidence = json.loads(str(job["recovery_evidence_json"]))
+    assert job["state"] == "RUNNING"
+    assert int(job["recovery_attempts"]) == 0
+    assert evidence["restart"]["phase"] == "PRE_WRITE_FAILED"
+    assert evidence["restart"]["phase"] not in ("DISABLE_SENT", "ENABLE_SENT")
+    assert evidence["restart"]["diagnostic"]
+
+    counters = _run_pass(store, _probe_payload(), restart, now=NOW + timedelta(minutes=2))
+    assert restart.calls == [(job_id, None), (job_id, None)]
+    assert counters["recovery_restarts"] == 1
+    job = store.get_remote_job(job_id)
+    evidence = json.loads(str(job["recovery_evidence_json"]))
+    assert int(job["recovery_attempts"]) == 1
+    assert evidence["restart"]["phase"] == "ENABLE_CONFIRMED"
+
+
+def test_round5_a1_auth_refresh_failure_returns_pre_write_failed(tmp_path, monkeypatch) -> None:
+    task = _running_task_record()
+    session = _RestartSession(task)
+    adapter, prepared = _prepared_job(
+        tmp_path, monkeypatch, task, session, auth=_real_auth_manager(tmp_path, _TimingOutAuthOpener())
+    )
+
+    outcome = adapter.restart_running_task(prepared, TASK_ID, TASK_NUMBER, timeout_seconds=10.0)
+
+    assert outcome.status.value == "PRE_WRITE_FAILED"
+    assert session.update_calls == []
+    assert session.post_calls == 0
+    assert session.get_calls == 0
+
+
+def test_round5_a2_lookup_timeout_is_pre_write_failed(tmp_path, monkeypatch) -> None:
+    task = _running_task_record()
+    session = _RestartSession(task, fail_lookup=True)
+    adapter, prepared = _prepared_job(tmp_path, monkeypatch, task, session)
+
+    outcome = adapter.restart_running_task(prepared, TASK_ID, TASK_NUMBER, timeout_seconds=20.0)
+
+    assert outcome.status.value == "PRE_WRITE_FAILED"
+    assert session.update_calls == []
+
+
+def test_round5_a3_status_timeout_is_pre_write_failed(tmp_path, monkeypatch) -> None:
+    task = _running_task_record()
+    session = _RestartSession(task, fail_status=True)
+    adapter, prepared = _prepared_job(tmp_path, monkeypatch, task, session)
+
+    outcome = adapter.restart_running_task(prepared, TASK_ID, TASK_NUMBER, timeout_seconds=20.0)
+
+    assert outcome.status.value == "PRE_WRITE_FAILED"
+    assert session.update_calls == []
+
+
+def test_round5_a4_progress_timeout_is_pre_write_failed(tmp_path, monkeypatch) -> None:
+    task = _running_task_record()
+    session = _RestartSession(task, fail_progress=True)
+    adapter, prepared = _prepared_job(tmp_path, monkeypatch, task, session)
+
+    outcome = adapter.restart_running_task(prepared, TASK_ID, TASK_NUMBER, timeout_seconds=20.0)
+
+    assert outcome.status.value == "PRE_WRITE_FAILED"
+    assert session.update_calls == []
+
+
+def test_round5_a5_deadline_exhausted_before_disable_is_pre_write_failed(tmp_path, monkeypatch) -> None:
+    task = _running_task_record()
+    session = _RestartSession(task)
+    calls = {"count": 0}
+
+    def monotonic() -> float:
+        calls["count"] += 1
+        if calls["count"] <= 1:
+            return 1000.0
+        return 2000.0  # every later deadline check sees the budget exhausted
+
+    adapter, prepared = _prepared_job(tmp_path, monkeypatch, task, session, monotonic=monotonic)
+
+    outcome = adapter.restart_running_task(prepared, TASK_ID, TASK_NUMBER, timeout_seconds=8.0)
+
+    assert outcome.status.value == "PRE_WRITE_FAILED"
+    assert session.update_calls == []
+
+
+def test_round5_a8_pre_write_failed_does_not_burn_or_count_a_restart(tmp_path) -> None:
+    store, job_id = _stalled_store(tmp_path)
+    restart = _FakeRestart(
+        [
+            {
+                "status": "PRE_WRITE_FAILED",
+                "restarted": False,
+                "diagnostic": "transient pre-write fault",
+            }
+        ]
+    )
+    counters = _run_pass(store, _probe_payload(), restart, now=NOW)
+    assert counters["recovery_restarts"] == 0
+    assert int(store.get_remote_job(job_id)["recovery_attempts"] or 0) == 0
+
+
+def test_round5_post_disable_reconcile_timeout_stays_disable_unknown(tmp_path, monkeypatch) -> None:
+    task = _running_task_record()
+    session = _RestartSession(task, fail_disable=True, fail_lookup_after_disable=True)
+    adapter, prepared = _prepared_job(tmp_path, monkeypatch, task, session)
+
+    outcome = adapter.restart_running_task(prepared, TASK_ID, TASK_NUMBER, timeout_seconds=20.0)
+
+    assert outcome.status.value == "DISABLE_UNKNOWN"
+    assert len([c for c in session.update_calls if c.get("state") == "0"]) == 1
+
+
+def test_round5_post_enable_confirm_timeout_is_enable_unknown(tmp_path, monkeypatch) -> None:
+    task = _running_task_record()
+    session = _RestartSession(task, fail_lookup_after_enable=True)
+    adapter, prepared = _prepared_job(tmp_path, monkeypatch, task, session)
+
+    outcome = adapter.restart_running_task(prepared, TASK_ID, TASK_NUMBER, timeout_seconds=20.0)
+
+    assert outcome.status.value == "ENABLE_UNKNOWN"
+    assert len([c for c in session.update_calls if c.get("state") == "0"]) == 1
+    assert len([c for c in session.update_calls if c.get("state") == "1"]) == 1

@@ -225,6 +225,7 @@ class RestartStatus(str, Enum):
     NOT_RUNNING = "NOT_RUNNING"
     EXTERNALLY_DISABLED = "EXTERNALLY_DISABLED"
     NO_LONGER_RUNNING = "NO_LONGER_RUNNING"
+    PRE_WRITE_FAILED = "PRE_WRITE_FAILED"
     DISABLE_UNKNOWN = "DISABLE_UNKNOWN"
     DISABLE_UNCONFIRMED = "DISABLE_UNCONFIRMED"
     ENABLE_UNKNOWN = "ENABLE_UNKNOWN"
@@ -1804,6 +1805,72 @@ class CnncLegacyZhaoshangAdapter:
             raise TimeoutError("restart timeout must be positive")
         if resume_phase not in {None, "DISABLE_SENT", "DISABLE_CONFIRMED", "ENABLE_SENT"}:
             raise ValueError("restart resume phase is not recognized")
+        # The adapter owns the side-effect boundary: the protocol body marks
+        # the moment each remote write starts, and any exception escaping it
+        # is converted into an explicit outcome that names whether a write
+        # may have left — never left for the runtime bridge to guess from
+        # the exception type alone.
+        writes = {"disable": False, "enable": False}
+        try:
+            return self._restart_protocol(
+                job,
+                task_id,
+                task_number,
+                timeout_seconds,
+                resume_phase=resume_phase,
+                writes=writes,
+            )
+        except Exception as exc:  # noqa: BLE001 - converted into an outcome
+            return self._restart_escape_outcome(exc, resume_phase=resume_phase, writes=writes)
+
+    def _restart_escape_outcome(
+        self,
+        exc: BaseException,
+        *,
+        resume_phase: str | None,
+        writes: Mapping[str, bool],
+    ) -> LegacyRestartOutcome:
+        """Translate one escaped protocol exception into a boundary outcome.
+
+        The write flags are set immediately before the disable/enable calls,
+        so this always knows whether a side effect may have left: after the
+        enable call the outcome is ENABLE_UNKNOWN, after the disable call
+        DISABLE_UNKNOWN, and before both a provable zero-write failure
+        (pre-write transient, or permanent identity conflict).  Resumed
+        phases reconcile the already-durable direction.
+        """
+        diagnostic = f"restart raised {type(exc).__name__}: {exc}"
+        if writes.get("enable") or resume_phase == "ENABLE_SENT":
+            return LegacyRestartOutcome(
+                RestartStatus.ENABLE_UNKNOWN,
+                disable_confirmed=True,
+                observed_enabled=None,
+                diagnostic=diagnostic,
+            )
+        if writes.get("disable") or resume_phase in {"DISABLE_SENT", "DISABLE_CONFIRMED"}:
+            return LegacyRestartOutcome(
+                RestartStatus.DISABLE_UNKNOWN,
+                observed_enabled=None,
+                diagnostic=diagnostic,
+            )
+        from app.services.remote_running_recovery import _pre_write_restart_failure_status
+
+        return LegacyRestartOutcome(
+            RestartStatus(_pre_write_restart_failure_status(exc)),
+            observed_enabled=None,
+            diagnostic=diagnostic,
+        )
+
+    def _restart_protocol(
+        self,
+        job: PreparedLegacyJob,
+        task_id: str,
+        task_number: str,
+        timeout_seconds: float,
+        *,
+        resume_phase: str | None = None,
+        writes: dict[str, bool],
+    ) -> LegacyRestartOutcome:
         if not self._external_tool_path.is_file():
             raise FileNotFoundError("legacy Zhaoshang external tool is unavailable")
         deadline = self._monotonic() + float(timeout_seconds)
@@ -1945,6 +2012,9 @@ class CnncLegacyZhaoshangAdapter:
                     if remaining <= 0:
                         raise TimeoutError("restart deadline exhausted before disable write")
                     try:
+                        # Side-effect boundary: from this line on, an escape
+                        # may mean the disable POST left this process.
+                        writes["disable"] = True
                         disable_response = tool.disable_task(session, live_task_id)
                     except Exception:
                         try:
@@ -1981,6 +2051,9 @@ class CnncLegacyZhaoshangAdapter:
             if remaining <= 0:
                 raise TimeoutError("restart deadline exhausted before enable write")
             try:
+                # Side-effect boundary: from this line on, an escape may mean
+                # the enable POST left this process.
+                writes["enable"] = True
                 enable_response = tool.enable_task(session, live_task_id)
             except Exception:
                 try:
