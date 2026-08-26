@@ -696,17 +696,24 @@ def run_running_recovery_pass(
         # the adapter re-verifies the exact task/mall identity on every
         # lookup and never repeats the already-sent write direction — and
         # only fall through to fresh stall detection when no side effect is
-        # outstanding.
+        # outstanding.  Like the fresh stalled path, reconciliation is legal
+        # only for RUNNING jobs: a manual terminal keeps its stale phase and
+        # a race can leave one on a COMPLETED job (whose evidence is
+        # immutable), so a non-RUNNING state must never re-dispatch here.
         document = decode_recovery_evidence(job.get("recovery_evidence_json"))
         pending_restart = document.get("restart")
         if (
             restart_remote is not None
+            and str(job.get("state")) == "RUNNING"
             and isinstance(pending_restart, Mapping)
             and _text(pending_restart.get("phase")) in PENDING_RESTART_PHASES
         ):
             if not can_start():
                 # Reconciliation needs the minimal budget for one bounded
                 # callback; without it the next tick retries the phase.
+                # Defense-in-depth behind the loop-head gate: nothing between
+                # the two checks consumes budget today, but the guard keeps
+                # the branch self-contained if that ever changes.
                 continue
             outcome = _apply_restart(store, token, job, document, restart_remote, now=now)
             counters["recovery_restarts"] += int(bool(outcome.get("restarted")))

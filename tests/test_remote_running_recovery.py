@@ -1307,10 +1307,9 @@ def test_case_c3_failed_probe_writes_nothing_and_stays_harvestable(tmp_path) -> 
 # ---------------------------------------------------------------------------
 # Review round 3, Finding D (Important 4): a fresh restart is deferrable tail
 # work — after the probe spends budget, a stalled decision must re-check the
-# budget before dispatching any remote write.  Already-sent phases
-# (DISABLE_SENT / ENABLE_SENT) are reconciliation safety work and are NOT
-# deferred by this gate (SUBMIT_UNKNOWN reconcile-first parity): the loop's
-# own can_start entry check is their only budget gate.
+# budget before dispatching any remote write.  Since Round 4 the already-sent
+# phases reconcile in the pre-probe branch above (which carries its own
+# can_start gate) and never reach this fresh-write gate at all.
 # ---------------------------------------------------------------------------
 
 
@@ -2309,6 +2308,13 @@ def test_round4_b5_disable_sent_confirm_window_expiry_fails_closed(tmp_path) -> 
 
     assert restart.calls == [(job_id, "DISABLE_SENT")]
     assert store.get_remote_job(job_id)["state"] == "MANUAL_REQUIRED"
+    # The manual terminal keeps the stale DISABLE_SENT phase in its evidence
+    # document; no later pass may re-dispatch the restart callback for a job
+    # that already failed closed (round-4 review Critical 1).
+    again = _FakeRestart([dict(_CONFIRMED_RESTART_STEP)])
+    _run_pass(store, _unprovable_probe_payload(), again)
+    assert again.calls == []
+    assert store.get_remote_job(job_id)["state"] == "MANUAL_REQUIRED"
 
 
 def test_round4_b6_enable_sent_confirm_window_expiry_fails_closed(tmp_path) -> None:
@@ -2318,6 +2324,10 @@ def test_round4_b6_enable_sent_confirm_window_expiry_fails_closed(tmp_path) -> N
     _run_pass(store, _unprovable_probe_payload(), restart)
 
     assert restart.calls == [(job_id, "ENABLE_SENT")]
+    assert store.get_remote_job(job_id)["state"] == "MANUAL_REQUIRED"
+    again = _FakeRestart([dict(_CONFIRMED_RESTART_STEP)])
+    _run_pass(store, _unprovable_probe_payload(), again)
+    assert again.calls == []
     assert store.get_remote_job(job_id)["state"] == "MANUAL_REQUIRED"
 
 
@@ -2349,10 +2359,51 @@ def test_round4_b9_pending_reconciliation_defers_without_minimal_budget(tmp_path
     store, job_id = _pending_phase_store(tmp_path, "DISABLE_SENT")
     restart = _FakeRestart([dict(_CONFIRMED_RESTART_STEP)])
 
+    # Pins the loop-level §13 contract: without the minimal budget for even
+    # one bounded callback, reconciliation waits for the next tick (the
+    # reconcile branch's own can_start check is defense-in-depth behind the
+    # loop-head gate).
     _run_flagged_pass(store, _unprovable_probe_payload(), restart, can_start=lambda: False)
 
     assert restart.calls == []
     assert store.get_remote_job(job_id)["state"] == "RUNNING"
+
+
+# Round-4 review Critical 1: the reconcile branch must key on the RUNNING
+# state exactly like the fresh stalled path did (evaluate_running_stall
+# requires RUNNING).  A MANUAL_REQUIRED terminal keeps its stale pending
+# phase (mark_remote_manual clears nothing), and a race can leave a stale
+# phase on a COMPLETED job; neither may re-dispatch a callback, corrupt
+# immutable COMPLETED evidence, or crash the whole sweep.
+
+
+def test_round4_b10_manual_terminal_never_redispatches_pending_phase(tmp_path) -> None:
+    store, job_id = _pending_phase_store(tmp_path, "DISABLE_SENT", phase_age_minutes=20)
+    first = _FakeRestart([{"status": "DISABLE_UNCONFIRMED", "restarted": False, "observed_enabled": True}])
+
+    _run_pass(store, _unprovable_probe_payload(), first)
+
+    assert store.get_remote_job(job_id)["state"] == "MANUAL_REQUIRED"
+    second = _FakeRestart([dict(_CONFIRMED_RESTART_STEP)])
+    counters = _run_pass(store, _unprovable_probe_payload(), second)
+    assert second.calls == []
+    assert counters["recovery_restarts"] == 0
+    assert store.get_remote_job(job_id)["state"] == "MANUAL_REQUIRED"
+
+
+def test_round4_b11_completed_job_with_stale_pending_phase_is_inert(tmp_path) -> None:
+    store, job_id = _pending_phase_store(tmp_path, "DISABLE_SENT")
+    token = store.acquire_lease(BUSINESS_DATE, "complete-b11", ttl_seconds=300)
+    with store._transaction(immediate=True) as connection:
+        connection.execute("UPDATE remote_jobs SET state='COMPLETED' WHERE id=?", (job_id,))
+    store.release_lease(token)
+
+    restart = _FakeRestart([dict(_CONFIRMED_RESTART_STEP)])
+    counters = _run_pass(store, _unprovable_probe_payload(), restart)
+
+    assert restart.calls == []
+    assert counters["recovery_restarts"] == 0
+    assert store.get_remote_job(job_id)["state"] == "COMPLETED"
 
 
 # ---------------------------------------------------------------------------
