@@ -62,6 +62,7 @@ from app.services.legacy_zhaoshang_adapter import (
     LegacyProbeEvidenceError,
     PriorityStatus,
     ReconcileStatus,
+    RemoteTaskIdentityConflictError,
     RestartStatus,
     SubmitStatus,
 )
@@ -1449,6 +1450,15 @@ def legacy_zhaoshang_bridge(
             probe = adapter.probe_running_task(
                 prepared_job, task_id, task_number, float(timeout_seconds)
             )
+        except RemoteTaskIdentityConflictError:
+            # Round 7 IMPORTANT B: a PROVEN conflict between the live exact
+            # task and the durable remote identity is permanent, not a
+            # transient probe fault — the recovery pass fail-closes to manual
+            # on the first occurrence instead of counting toward the cap.
+            return {
+                "probe_identity_conflict": True,
+                "diagnostic": "probe raised RemoteTaskIdentityConflictError",
+            }
         except LegacyProbeEvidenceError:
             # Round 7 BLOCKER A: the probe completed at the transport level
             # but the adapter proved it carries no usable execution evidence

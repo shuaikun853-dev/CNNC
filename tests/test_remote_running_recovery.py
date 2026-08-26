@@ -3498,12 +3498,13 @@ _BRIDGE_REQUEST = {
 }
 
 
-def _bridge_probe(tmp_path, monkeypatch, task, session):
+def _bridge_probe(tmp_path, monkeypatch, task, session, tool=None):
     """Full production chain for the recovery probe: adapter (fake tool) -> bridge.
 
     Returns ``(probe_cb, durable)`` where ``durable`` is a reconstructable
     durable job row, so the test exercises reconstruct -> probe_running_task
-    -> envelope translation exactly like the tick does.
+    -> envelope translation exactly like the tick does.  ``tool`` overrides
+    the injected tool module (identity-conflict shapes).
     """
     from app.services.incremental_audit_runtime import legacy_zhaoshang_bridge, runtime_paths
     from app.services.legacy_zhaoshang_adapter import CnncLegacyZhaoshangAdapter
@@ -3524,7 +3525,7 @@ def _bridge_probe(tmp_path, monkeypatch, task, session):
     monkeypatch.setattr(
         type(adapter),
         "_load_module",
-        classmethod(lambda cls, path, name: _restart_tool_module(task, session)),
+        classmethod(lambda cls, path, name: tool or _restart_tool_module(task, session)),
     )
     _planner, _finalizer, _submitter, _harvester, probe_cb, _restart_cb = legacy_zhaoshang_bridge(
         adapter, paths=paths, business_date=BUSINESS_DATE
@@ -3790,3 +3791,203 @@ def test_round7_a11_unusable_probe_is_a_failure_not_a_streak_reset(tmp_path, mon
     _run_probe_pass(store, lambda job: _probe_payload(), None, now=NOW + timedelta(minutes=9))
     evidence = json.loads(str(store.get_remote_job(job_id)["recovery_evidence_json"]))
     assert evidence.get("probe_health") is None
+
+
+# ---------------------------------------------------------------------------
+# Round 7, IMPORTANT B: a PROVEN exact remote identity conflict must fail
+# closed on the FIRST occurrence — zero remote writes, immediate
+# MANUAL_REQUIRED with truthful probe evidence — instead of masquerading as
+# transient probe failure #1..#5.  Only proven conflicts qualify (live
+# id/number mismatch vs durable identity, non-unique exact lookup, mall
+# mismatch); malformed payloads and ordinary transport faults stay
+# transient probe failures.
+# ---------------------------------------------------------------------------
+
+
+def _conflict_tool(task, session, *, lookup_error: str | None = None, identity_error: str | None = None):
+    module = _restart_tool_module(task, session)
+
+    if lookup_error is not None:
+        def check_existing_task(session_, task_name, mall_code):
+            raise RuntimeError(lookup_error)
+
+        module.check_existing_task = staticmethod(check_existing_task)
+
+    if identity_error is not None:
+        def get_task_identity(task_, mall_code):
+            raise RuntimeError(identity_error)
+
+        module.get_task_identity = staticmethod(get_task_identity)
+
+    return module
+
+
+def test_round7_b1_live_task_id_mismatch_is_typed_conflict(tmp_path, monkeypatch) -> None:
+    from app.services.legacy_zhaoshang_adapter import RemoteTaskIdentityConflictError
+
+    task = _running_task_record(task_id="999999")
+    session = _RestartSession(task)
+    adapter, prepared = _prepared_job(tmp_path, monkeypatch, task, session)
+
+    with pytest.raises(RemoteTaskIdentityConflictError):
+        adapter.probe_running_task(prepared, TASK_ID, TASK_NUMBER, timeout_seconds=20.0)
+
+
+def test_round7_b2_live_task_number_mismatch_is_typed_conflict(tmp_path, monkeypatch) -> None:
+    from app.services.legacy_zhaoshang_adapter import RemoteTaskIdentityConflictError
+
+    task = _running_task_record(task_number="RW-20260825999999")
+    session = _RestartSession(task)
+    adapter, prepared = _prepared_job(tmp_path, monkeypatch, task, session)
+
+    with pytest.raises(RemoteTaskIdentityConflictError):
+        adapter.probe_running_task(prepared, TASK_ID, TASK_NUMBER, timeout_seconds=20.0)
+
+
+def test_round7_b3a_non_unique_exact_lookup_is_typed_conflict(tmp_path, monkeypatch) -> None:
+    from app.services.legacy_zhaoshang_adapter import RemoteTaskIdentityConflictError
+
+    task = _running_task_record()
+    session = _RestartSession(task)
+    tool = _conflict_tool(
+        task, session, lookup_error="精确任务不唯一: task_name=cnnc_current_opt_领先未来商城_61284593895349, mall_code=lxwl, count=2"
+    )
+    adapter, prepared = _prepared_job(tmp_path, monkeypatch, task, session)
+    monkeypatch.setattr(
+        type(adapter), "_load_module", classmethod(lambda cls, path, name: tool)
+    )
+
+    with pytest.raises(RemoteTaskIdentityConflictError):
+        adapter.probe_running_task(prepared, TASK_ID, TASK_NUMBER, timeout_seconds=20.0)
+
+
+def test_round7_b3b_lookup_mall_mismatch_is_typed_conflict(tmp_path, monkeypatch) -> None:
+    from app.services.legacy_zhaoshang_adapter import RemoteTaskIdentityConflictError
+
+    task = _running_task_record()
+    session = _RestartSession(task)
+    tool = _conflict_tool(
+        task, session, lookup_error="精确任务商城不匹配: task_name=cnnc_current_opt_领先未来商城_61284593895349, expected=lxwl, actual=['comix']"
+    )
+    adapter, prepared = _prepared_job(tmp_path, monkeypatch, task, session)
+    monkeypatch.setattr(
+        type(adapter), "_load_module", classmethod(lambda cls, path, name: tool)
+    )
+
+    with pytest.raises(RemoteTaskIdentityConflictError):
+        adapter.probe_running_task(prepared, TASK_ID, TASK_NUMBER, timeout_seconds=20.0)
+
+
+def test_round7_b3c_identity_mall_mismatch_is_typed_conflict(tmp_path, monkeypatch) -> None:
+    from app.services.legacy_zhaoshang_adapter import RemoteTaskIdentityConflictError
+
+    task = _running_task_record()
+    session = _RestartSession(task)
+    tool = _conflict_tool(
+        task, session, identity_error="商城标识不一致: expected=lxwl, actual=comix"
+    )
+    adapter, prepared = _prepared_job(tmp_path, monkeypatch, task, session)
+    monkeypatch.setattr(
+        type(adapter), "_load_module", classmethod(lambda cls, path, name: tool)
+    )
+
+    with pytest.raises(RemoteTaskIdentityConflictError):
+        adapter.probe_running_task(prepared, TASK_ID, TASK_NUMBER, timeout_seconds=20.0)
+
+
+def test_round7_b4_malformed_task_payload_stays_transient(tmp_path, monkeypatch) -> None:
+    from app.services.legacy_zhaoshang_adapter import RemoteTaskIdentityConflictError
+
+    task = _running_task_record()
+    session = _RestartSession(task)
+    tool = _conflict_tool(
+        task, session, identity_error="没有拿到 taskId/id，任务数据: {'taskName': 'cnnc_current_opt_领先未来商城_61284593895349'}"
+    )
+    adapter, prepared = _prepared_job(tmp_path, monkeypatch, task, session)
+    monkeypatch.setattr(
+        type(adapter), "_load_module", classmethod(lambda cls, path, name: tool)
+    )
+
+    # A payload missing its identity fields is unprovable, NOT a proven
+    # mismatch: it must stay an untyped transient failure.
+    with pytest.raises(RuntimeError) as excinfo:
+        adapter.probe_running_task(prepared, TASK_ID, TASK_NUMBER, timeout_seconds=20.0)
+    assert not isinstance(excinfo.value, RemoteTaskIdentityConflictError)
+
+
+def test_round7_b5_identity_conflict_is_immediate_zero_write_manual(tmp_path, monkeypatch) -> None:
+    task = _running_task_record()
+    session = _RestartSession(task)
+    tool = _conflict_tool(
+        task, session, lookup_error="精确任务不唯一: task_name=cnnc_current_opt_领先未来商城_61284593895349, mall_code=lxwl, count=2"
+    )
+    probe_cb, durable = _bridge_probe(tmp_path, monkeypatch, task, session, tool=tool)
+
+    outcome = probe_cb(durable, 60.0)
+    assert outcome["probe_identity_conflict"] is True
+    assert str(outcome["diagnostic"]).startswith("probe raised ")
+
+    store, job_id = _stalled_store(tmp_path / "state")
+    token = store.acquire_lease(BUSINESS_DATE, "seed-health", ttl_seconds=300)
+    evidence = _observations(4)
+    evidence["probe_health"] = {
+        "consecutive_failures": 3,
+        "last_failure_at": NOW.isoformat(timespec="seconds"),
+        "last_failure_reason": "probe raised TimeoutError",
+    }
+    store.update_remote_recovery_evidence(token, job_id, evidence)
+    store.release_lease(token)
+
+    probe_calls: list[int] = []
+
+    def probe(job: dict):
+        probe_calls.append(int(job["id"]))
+        return outcome
+
+    restart = _NeverRestart()
+    counters = _run_probe_pass(store, probe, restart)
+
+    # First occurrence: immediate manual, one probe, zero remote writes.
+    assert probe_calls == [job_id]
+    assert counters["recovery_probes"] == 0
+    assert counters["recovery_identity_manual"] == 1
+    assert restart.calls == []
+    job = store.get_remote_job(job_id)
+    assert job["state"] == "MANUAL_REQUIRED"
+    assert session.update_calls == []
+    # The durable remote identity is never re-bound.
+    assert str(job["remote_identity"]) == "lxwl|1269504|RW-20260825150224"
+    document = json.loads(str(job["recovery_evidence_json"]))
+    health = document["probe_health"]
+    assert health["identity_conflict"] is True
+    assert health["terminal_reason"] == "REMOTE_IDENTITY_CONFLICT"
+    # Historical transient failures are preserved, never faked into count=4.
+    assert health["consecutive_failures"] == 3
+    # A probe outcome never enters the restart protocol.
+    assert document["restart"] is None
+    assert "identity" in str(job["error_text"])
+
+
+def test_round7_b5b_post_restart_identity_conflict_preserves_restart_proof(tmp_path) -> None:
+    store, job_id = _recovered_store(tmp_path)
+    restart_evidence = json.loads(str(store.get_remote_job(job_id)["recovery_evidence_json"]))["restart"]
+
+    def probe(job: dict):
+        return {
+            "probe_identity_conflict": True,
+            "diagnostic": "probe raised RemoteTaskIdentityConflictError",
+        }
+
+    _run_probe_pass(store, probe, _NeverRestart())
+
+    job = store.get_remote_job(job_id)
+    assert job["state"] == "MANUAL_REQUIRED"
+    document = json.loads(str(job["recovery_evidence_json"]))
+    # The confirmed restart proof survives untouched.
+    preserved = document["restart"]
+    assert preserved["phase"] == "ENABLE_CONFIRMED"
+    assert preserved["disable_evidence"]["confirmed_disabled"] is True
+    assert preserved["enable_evidence"]["confirmed_enabled"] is True
+    assert preserved["recovery_at"] == restart_evidence["recovery_at"]
+    assert document["probe_health"]["identity_conflict"] is True
+    assert int(job["recovery_attempts"]) == 1

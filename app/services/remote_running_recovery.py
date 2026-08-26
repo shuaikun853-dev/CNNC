@@ -827,6 +827,7 @@ def run_running_recovery_pass(
         "recovery_restarts": 0,
         "recovery_exhausted": 0,
         "recovery_reconciled": 0,
+        "recovery_identity_manual": 0,
     }
     for job in store.list_remote_jobs(token):
         if not can_start():
@@ -892,6 +893,50 @@ def run_running_recovery_pass(
             continue
         counters["recovery_probe_attempts"] += 1
         probe = probe_remote(job)
+        identity_conflict = (
+            isinstance(probe, Mapping) and probe.get("probe_identity_conflict") is True
+        )
+        if identity_conflict:
+            # A PROVEN conflict between the live exact task and the durable
+            # remote identity is permanent and safety-critical: nobody may
+            # re-bind the identity, restart the task, or keep probing on the
+            # wrong assumption.  Fail closed to manual on the FIRST
+            # occurrence with zero remote writes (the probe is read-only).
+            # Probe-health terminal evidence is stored beside (never inside)
+            # ``restart`` — a probe outcome has not entered the restart
+            # protocol, so an already-confirmed restart proof must survive
+            # untouched.  Historical transient failures are preserved, never
+            # faked into a higher count.
+            document = decode_recovery_evidence(job.get("recovery_evidence_json"))
+            historical: int | None = None
+            previous_health = document.get("probe_health")
+            if isinstance(previous_health, Mapping):
+                try:
+                    historical = int(previous_health.get("consecutive_failures"))
+                except (TypeError, ValueError):
+                    historical = None
+            conflict_health: dict[str, Any] = {
+                "identity_conflict": True,
+                "terminal_reason": "REMOTE_IDENTITY_CONFLICT",
+                "observed_at": now.astimezone(UTC).isoformat(timespec="seconds"),
+                "diagnostic": _text(probe.get("diagnostic")) or "probe identity conflict",
+            }
+            if historical is not None:
+                conflict_health["consecutive_failures"] = historical
+            document["probe_health"] = conflict_health
+            store.mark_remote_recovery_probe_identity_manual(
+                token,
+                int(job["id"]),
+                remote_identity=_text(job.get("remote_identity")),
+                evidence=document,
+                error=(
+                    "remote stall recovery probe found the live exact task "
+                    "identity conflicts with the durable remote identity; "
+                    "manual review required"
+                ),
+            )
+            counters["recovery_identity_manual"] += 1
+            continue
         probe_failed = isinstance(probe, Mapping) and probe.get("probe_failed") is True
         if probe_failed or not isinstance(probe, Mapping):
             # A probe that ran but produced no legal read-only evidence is a

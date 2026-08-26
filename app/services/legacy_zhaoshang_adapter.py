@@ -1676,13 +1676,30 @@ class CnncLegacyZhaoshangAdapter:
             resolved_task_name, _batch_number = tool.build_browser_task_identifiers(
                 job.task_name, job.mall_key
             )
-            task = tool.check_existing_task(session, resolved_task_name, mall_code)
+            # Identity verification boundary (review round 7): the external
+            # tool's exact-task lookup fails with bare RuntimeError only for
+            # its two documented identity failures (_one_exact_task:
+            # 精确任务不唯一 / 精确任务商城不匹配 — extract_records never
+            # raises), and get_task_identity's 商城标识不一致 marker is the
+            # mall-mismatch proof.  Those are PROVEN conflicts with the
+            # durable remote identity and surface as the typed conflict; a
+            # malformed payload (没有拿到 ...) is unprovable, not a
+            # mismatch, and stays untyped so it keeps counting transient.
+            try:
+                task = tool.check_existing_task(session, resolved_task_name, mall_code)
+            except RuntimeError as exc:
+                raise RemoteTaskIdentityConflictError(str(exc)) from exc
             remote_calls = 1
             if task is None:
                 raise LegacyZhaoshangAdapterError("running task probe found no exact existing task")
-            live_task_id, live_task_number, mall_logo = tool.get_task_identity(task, mall_code)
+            try:
+                live_task_id, live_task_number, mall_logo = tool.get_task_identity(task, mall_code)
+            except RuntimeError as exc:
+                if "商城标识不一致" in str(exc):
+                    raise RemoteTaskIdentityConflictError(str(exc)) from exc
+                raise
             if str(live_task_id) != str(task_id) or str(live_task_number) != str(task_number):
-                raise LegacyZhaoshangAdapterError(
+                raise RemoteTaskIdentityConflictError(
                     "live task identity does not match the durable remote identity"
                 )
             remaining = deadline - self._monotonic()
