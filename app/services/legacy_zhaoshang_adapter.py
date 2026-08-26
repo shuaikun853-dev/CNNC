@@ -1688,6 +1688,19 @@ class CnncLegacyZhaoshangAdapter:
             )
             response.raise_for_status()
             remote_calls += 1
+        # Business-response gate (review round 5): a business-failed status
+        # or progress response (success=false / non-0000 rspCode) donates no
+        # evidence — its terminal marker text and ACTIVE-looking counters
+        # are stripped to the unprovable form before parsing.  Non-mapping
+        # payloads are stripped by the same check.
+        from app.services.remote_running_recovery import remote_business_response_ok
+
+        status_desc = _text(status.get("rspDesc")) if remote_business_response_ok(status) else ""
+        parsed_progress = dict(
+            tool.parse_task_progress_desc(
+                _text(progress_json.get("rspDesc")) if remote_business_response_ok(progress_json) else ""
+            )
+        )
         content_type = response.headers.get("Content-Type", "") or ""
         content_disposition = response.headers.get("Content-Disposition", "") or ""
         if (
@@ -1701,8 +1714,8 @@ class CnncLegacyZhaoshangAdapter:
                 task_number=str(live_task_number),
                 mall=mall_logo,
                 enabled=self._remote_is_enabled(task),
-                task_status_rsp_desc=_text(status.get("rspDesc")),
-                progress=dict(tool.parse_task_progress_desc(_text(progress_json.get("rspDesc")))),
+                task_status_rsp_desc=status_desc,
+                progress=dict(parsed_progress),
                 export_had_result=True,
                 export_count=None,
                 export_rsp_desc="",
@@ -1725,8 +1738,8 @@ class CnncLegacyZhaoshangAdapter:
                 task_number=str(live_task_number),
                 mall=mall_logo,
                 enabled=self._remote_is_enabled(task),
-                task_status_rsp_desc=_text(status.get("rspDesc")),
-                progress=dict(tool.parse_task_progress_desc(_text(progress_json.get("rspDesc")))),
+                task_status_rsp_desc=status_desc,
+                progress=dict(parsed_progress),
                 export_had_result=True,
                 export_count=None,
                 export_rsp_desc="",
@@ -1738,8 +1751,8 @@ class CnncLegacyZhaoshangAdapter:
                 task_number=str(live_task_number),
                 mall=mall_logo,
                 enabled=self._remote_is_enabled(task),
-                task_status_rsp_desc=_text(status.get("rspDesc")),
-                progress=dict(tool.parse_task_progress_desc(_text(progress_json.get("rspDesc")))),
+                task_status_rsp_desc=status_desc,
+                progress=dict(parsed_progress),
                 export_had_result=True,
                 export_count=None,
                 export_rsp_desc="",
@@ -1766,8 +1779,8 @@ class CnncLegacyZhaoshangAdapter:
             task_number=str(live_task_number),
             mall=mall_logo,
             enabled=self._remote_is_enabled(task),
-            task_status_rsp_desc=_text(status.get("rspDesc")),
-            progress=dict(tool.parse_task_progress_desc(_text(progress_json.get("rspDesc")))),
+            task_status_rsp_desc=status_desc,
+            progress=dict(parsed_progress),
             export_had_result=False,
             export_count=export_count,
             export_rsp_desc=_text(data.get("rspDesc")),
@@ -1992,14 +2005,20 @@ class CnncLegacyZhaoshangAdapter:
                 if remaining <= 0:
                     raise TimeoutError("restart deadline exhausted before status revalidation")
                 status = tool.query_task_status(session, live_task_id)
-                status_desc = _text(status.get("rspDesc")) if isinstance(status, Mapping) else ""
+                # Business-response gate: a failed status response's marker
+                # text is not trusted (same rule as the probe path).
+                from app.services.remote_running_recovery import remote_business_response_ok
+
+                status_desc = _text(status.get("rspDesc")) if remote_business_response_ok(status) else ""
                 remaining = deadline - self._monotonic()
                 if remaining <= 0:
                     raise TimeoutError("restart deadline exhausted before progress revalidation")
                 write_time_batch_number = _text(task.get("batchNumber")) or resolved_task_name
                 progress_json = tool.query_task_progress(session, write_time_batch_number)
+                # Business-response gate: counters from a failed progress
+                # response are unprovable and must not authorize the write.
                 progress_desc = (
-                    _text(progress_json.get("rspDesc")) if isinstance(progress_json, Mapping) else ""
+                    _text(progress_json.get("rspDesc")) if remote_business_response_ok(progress_json) else ""
                 )
                 execution_state = classify_remote_execution_state(
                     tool.parse_task_progress_desc(progress_desc), status_desc

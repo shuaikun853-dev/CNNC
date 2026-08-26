@@ -53,6 +53,31 @@ RUNNING_STALL_EXPORT_NO_PRICE_RSP_DESC = "未检索到商品价格信息"
 # total.  Anything unparseable, contradictory, or otherwise unprovable is
 # UNKNOWN and fails closed.
 TERMINAL_STATUS_MARKERS: tuple[str, ...] = ("本次任务执行完毕",)
+# Business-response evidence gate (review round 5): the external tool's own
+# write endpoints (auto_crawl_task.py enable/disable) accept a payload only
+# when ``success`` is not explicitly False and ``rspCode`` is absent or the
+# one proven success code "0000"; absent fields stay admissible because the
+# platform legitimately omits them.
+PROVEN_BUSINESS_SUCCESS_RSP_CODES: frozenset[str] = frozenset({"0000"})
+
+
+def remote_business_response_ok(payload: object) -> bool:
+    """Mirror the external tool's business-success rule for read evidence.
+
+    Only a business-successful status/progress response may donate evidence
+    (counters, terminal marker text); a ``success=false`` or non-``0000``
+    ``rspCode`` payload is stripped to its unprovable form by the callers so
+    it can never authorize stall proof or a fresh restart write.  Absent
+    ``success``/``rspCode`` fields remain admissible.
+    """
+    if not isinstance(payload, Mapping):
+        return False
+    if "success" in payload and payload.get("success") is not True:
+        return False
+    rsp_code = _text(payload.get("rspCode"))
+    if rsp_code and rsp_code not in PROVEN_BUSINESS_SUCCESS_RSP_CODES:
+        return False
+    return True
 
 
 class RemoteExecutionState(str, Enum):

@@ -748,6 +748,10 @@ class _RestartSession:
         fail_lookup_after_disable: bool = False,
         status_rsp_desc: str = "执行中",
         progress_rsp_desc: str = _ACTIVE_PROGRESS_RSP,
+        status_success: bool = True,
+        status_payload: object = None,
+        progress_success: bool = True,
+        progress_payload: object = None,
     ) -> None:
         self.task = task
         self.fail_disable = fail_disable
@@ -759,6 +763,10 @@ class _RestartSession:
         self.fail_lookup_after_disable = fail_lookup_after_disable
         self.status_rsp_desc = status_rsp_desc
         self.progress_rsp_desc = progress_rsp_desc
+        self.status_success = status_success
+        self.status_payload = status_payload
+        self.progress_success = progress_success
+        self.progress_payload = progress_payload
         self.update_calls: list[dict] = []
         self.post_timeouts: list[float | None] = []
         self.get_timeouts: list[float | None] = []
@@ -791,7 +799,11 @@ class _RestartSession:
         if "queryTaskStatus" in url:
             if self.fail_status:
                 raise TimeoutError("status response lost")
-            return _FakeRestartResponse({"rspDesc": self.status_rsp_desc, "success": True})
+            if self.status_payload is not None:
+                return _FakeRestartResponse(self.status_payload)
+            return _FakeRestartResponse(
+                {"rspDesc": self.status_rsp_desc, "success": self.status_success}
+            )
         if "queryList" in url:
             if self.fail_lookup or (
                 self.fail_lookup_after_enable and self._enable_posts_seen > 0
@@ -807,7 +819,11 @@ class _RestartSession:
         self.get_timeouts.append(timeout)
         if self.fail_progress:
             raise TimeoutError("progress response lost")
-        return _FakeRestartResponse({"rspDesc": self.progress_rsp_desc, "success": True})
+        if self.progress_payload is not None:
+            return _FakeRestartResponse(self.progress_payload)
+        return _FakeRestartResponse(
+            {"rspDesc": self.progress_rsp_desc, "success": self.progress_success}
+        )
 
 
 def _restart_tool_module(task: dict, session: _RestartSession):
@@ -2814,3 +2830,124 @@ def test_round5_b6_lock_overrun_past_deadline_dispatches_no_write(tmp_path, monk
     assert session.update_calls == []
     assert session.post_calls == 0
     assert session.get_calls == 0
+
+
+# ---------------------------------------------------------------------------
+# Round 5, IMPORTANT C: a business-failed status/progress response
+# (success=false / non-success rspCode) must never donate evidence — its
+# ACTIVE-looking counters cannot authorize stall proof or the fresh-restart
+# write gate, and its terminal marker text cannot be trusted either.  The
+# rule mirrors the external tool's own write-endpoint check
+# (auto_crawl_task.py: success is not False AND rspCode in {None, "0000"}).
+# ---------------------------------------------------------------------------
+
+
+def test_round5_c0_business_response_truth_table() -> None:
+    from app.services.remote_running_recovery import remote_business_response_ok
+
+    assert remote_business_response_ok({"success": True, "rspCode": "0000", "rspDesc": "x"})
+    assert remote_business_response_ok({"success": True})
+    # The platform legitimately omits fields; absent stays admissible.
+    assert remote_business_response_ok({"rspDesc": "总任务量：10条"})
+    assert remote_business_response_ok({})
+
+    assert not remote_business_response_ok(
+        {"success": False, "rspCode": "8888", "rspDesc": "总任务量：10条，待执行：4条"}
+    )
+    assert not remote_business_response_ok({"success": False})
+    assert not remote_business_response_ok({"success": "true"})
+    assert not remote_business_response_ok({"rspCode": "8888"})
+    assert not remote_business_response_ok("not-a-mapping")
+    assert not remote_business_response_ok(["not", "a", "mapping"])
+    assert not remote_business_response_ok(None)
+
+
+def test_round5_c1_failed_progress_counters_are_not_stall_evidence(tmp_path, monkeypatch) -> None:
+    task = _running_task_record()
+    session = _RestartSession(task, progress_success=False)
+    adapter, prepared = _prepared_job(tmp_path, monkeypatch, task, session)
+
+    probe = adapter.probe_running_task(prepared, TASK_ID, TASK_NUMBER, timeout_seconds=20.0)
+
+    # The business-failed response's ACTIVE-looking counters are stripped:
+    # the probe carries no provable progress at all.
+    assert probe.progress.get("total") is None
+
+    # Such an observation never proves a stall, so no restart write may be
+    # dispatched for it.
+    store, job_id = _stalled_store(tmp_path)
+    restart = _FakeRestart([{"status": "RESTARTED", "restarted": True}])
+    payload = {
+        "remote_task_id": probe.task_id,
+        "remote_task_number": probe.task_number,
+        "remote_mall": probe.mall,
+        "progress": dict(probe.progress),
+        "export_count": probe.export_count,
+        "export_rsp_desc": probe.export_rsp_desc,
+        "export_had_result": probe.export_had_result,
+        "task_status_rsp_desc": probe.task_status_rsp_desc,
+    }
+    _run_pass(store, payload, restart)
+    assert restart.calls == []
+    assert int(store.get_remote_job(job_id)["recovery_attempts"] or 0) == 0
+
+
+def test_round5_c2_healthy_active_progress_still_active(tmp_path, monkeypatch) -> None:
+    from app.services.remote_running_recovery import RemoteExecutionState, classify_remote_execution_state
+
+    task = _running_task_record()
+    session = _RestartSession(task)
+    adapter, prepared = _prepared_job(tmp_path, monkeypatch, task, session)
+
+    probe = adapter.probe_running_task(prepared, TASK_ID, TASK_NUMBER, timeout_seconds=20.0)
+
+    assert probe.progress["total"] == 10
+    assert (
+        classify_remote_execution_state(probe.progress, probe.task_status_rsp_desc)
+        is RemoteExecutionState.ACTIVE
+    )
+
+
+def test_round5_c3_failed_status_terminal_text_not_trusted(tmp_path, monkeypatch) -> None:
+    from app.services.remote_running_recovery import RemoteExecutionState, classify_remote_execution_state
+
+    task = _running_task_record()
+    session = _RestartSession(
+        task,
+        status_success=False,
+        status_rsp_desc="本次任务执行完毕",
+    )
+    adapter, prepared = _prepared_job(tmp_path, monkeypatch, task, session)
+
+    probe = adapter.probe_running_task(prepared, TASK_ID, TASK_NUMBER, timeout_seconds=20.0)
+
+    # The marker inside a business-failed response is stripped: the healthy
+    # progress alone decides, and it says ACTIVE.
+    assert probe.task_status_rsp_desc == ""
+    assert (
+        classify_remote_execution_state(probe.progress, probe.task_status_rsp_desc)
+        is RemoteExecutionState.ACTIVE
+    )
+
+
+def test_round5_c4_write_time_failed_progress_dispatches_no_write(tmp_path, monkeypatch) -> None:
+    task = _running_task_record()
+    session = _RestartSession(task, progress_success=False)
+    adapter, prepared = _prepared_job(tmp_path, monkeypatch, task, session)
+
+    outcome = adapter.restart_running_task(prepared, TASK_ID, TASK_NUMBER, timeout_seconds=20.0)
+
+    # The write gate re-queried progress and got a business failure: the
+    # state is unprovable, so the zero-write decline fires.
+    assert outcome.status.value == "NO_LONGER_RUNNING"
+    assert session.update_calls == []
+
+
+def test_round5_c5_non_mapping_payload_is_unknown(tmp_path, monkeypatch) -> None:
+    task = _running_task_record()
+    session = _RestartSession(task, progress_payload=["not", "a", "mapping"])
+    adapter, prepared = _prepared_job(tmp_path, monkeypatch, task, session)
+
+    probe = adapter.probe_running_task(prepared, TASK_ID, TASK_NUMBER, timeout_seconds=20.0)
+
+    assert probe.progress.get("total") is None
