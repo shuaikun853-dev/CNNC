@@ -42,7 +42,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\register_dashboard_a
   --host 127.0.0.1 --port 8765` 启动只读服务。
 - 可选参数:`-RepoRoot`(默认脚本上级目录)、`-PythonExe`(默认 `E:\Python314\python.exe`)、
   `-Port`(默认 `8765`)。
-- 注册后可用 `schtasks /query /tn CNNC-Dashboard-ReadOnly` 核对;该注册不影响现有审计计划任务。
+- 注册后用 `schtasks /query /tn CNNC-Dashboard-ReadOnly /xml`(或 `/v /fo list`)核对动作里
+  `-Command "Set-Location ..."` 的内层双引号完整(脚本已按 PS 5.1 原生传参规则转义,此处为复核);该注册不影响现有审计计划任务。
 
 ## 卸载(先预览,后 -Apply)
 

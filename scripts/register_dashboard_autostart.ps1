@@ -27,7 +27,10 @@ if (-not $Apply) {
     Write-Host "预览模式:未做任何更改。加 -Apply 才注册(不会影响现有审计计划任务)。"
     exit 0
 }
-schtasks /Create /TN $taskName /SC ONLOGON /TR $action /F | Out-Null
+# PS 5.1 向原生命令传参时不转义内嵌双引号,直接 /TR $action 会在内层引号处被拆断;
+# 先转义为 \",schtasks 实际收到的 /TR 值才与 $action(预览 JSON 所示动作)完全一致。
+$escapedAction = $action.Replace('"', '\"')
+schtasks /Create /TN $taskName /SC ONLOGON /TR $escapedAction /F | Out-Null
 if ($LASTEXITCODE -ne 0) {
     throw "schtasks create failed: $LASTEXITCODE"
 }
