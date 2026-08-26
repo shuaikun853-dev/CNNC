@@ -631,7 +631,7 @@ def test_legacy_bridge_rebuilds_persisted_job_and_fans_out_by_sku_url_identity(t
     first = _BridgeAdapter()
     paths = runtime_paths("2026-08-11", tmp_path / "runtime")
     paths.run_dir.mkdir(parents=True)
-    propose, finalize, submit, _harvest = legacy_zhaoshang_bridge(first, paths=paths, business_date="2026-08-11")
+    propose, finalize, submit, _harvest, _probe, _restart = legacy_zhaoshang_bridge(first, paths=paths, business_date="2026-08-11")
     rows = [
         {"vCommodityId": "v-a", "skuId": "sku-a", "extLink": "https://same.invalid/p"},
         {"vCommodityId": "v-b", "skuId": "sku-b", "extLink": "https://same.invalid/p"},
@@ -657,7 +657,7 @@ def test_legacy_bridge_rebuilds_persisted_job_and_fans_out_by_sku_url_identity(t
         ],
     }
     restarted = _BridgeAdapter()
-    _p2, _f2, _s2, harvest = legacy_zhaoshang_bridge(restarted, paths=paths, business_date="2026-08-11")
+    _p2, _f2, _s2, harvest, _pr2, _rs2 = legacy_zhaoshang_bridge(restarted, paths=paths, business_date="2026-08-11")
     outcome = harvest([durable_job], 10)[9]
     assert restarted.prepare_calls == 1
     assert restarted.submit_calls == 0
@@ -674,7 +674,7 @@ def test_legacy_bridge_rebuilds_persisted_job_and_fans_out_by_sku_url_identity(t
     # A crash after the durable intent/link checkpoint but before POST has no
     # in-memory prepared cache. The next tick can safely reconstruct once.
     fresh_submit = _BridgeAdapter()
-    _p3, _f3, submit_after_crash, _h3 = legacy_zhaoshang_bridge(
+    _p3, _f3, submit_after_crash, _h3, _pr3, _rs3 = legacy_zhaoshang_bridge(
         fresh_submit, paths=paths, business_date="2026-08-11"
     )
     assert submit_after_crash(durable_job, [], 10)["state"] == "SUBMITTED"
@@ -705,7 +705,7 @@ def test_legacy_bridge_emits_request_level_no_result_and_manual_markers(tmp_path
     adapter = PartialAdapter()
     paths = runtime_paths("2026-08-11", tmp_path / "runtime")
     paths.run_dir.mkdir(parents=True)
-    propose, finalize, _submit, harvest = legacy_zhaoshang_bridge(
+    propose, finalize, _submit, harvest, _probe, _restart = legacy_zhaoshang_bridge(
         adapter, paths=paths, business_date="2026-08-11"
     )
     rows = [
@@ -750,7 +750,7 @@ def test_legacy_bridge_finalizes_only_pending_subset_from_mixed_plan(tmp_path):
     adapter = _BridgeAdapter()
     paths = runtime_paths("2026-08-11", tmp_path / "runtime")
     paths.run_dir.mkdir(parents=True)
-    propose, finalize, _submit, _harvest = legacy_zhaoshang_bridge(
+    propose, finalize, _submit, _harvest, _probe, _restart = legacy_zhaoshang_bridge(
         adapter,
         paths=paths,
         business_date="2026-08-11",
@@ -785,7 +785,7 @@ def test_legacy_bridge_keeps_confirmed_submit_priority_pending_until_verified(tm
     paths = runtime_paths("2026-08-11", tmp_path / "runtime")
     paths.run_dir.mkdir(parents=True)
     adapter = PendingPriorityAdapter()
-    propose, finalize, submit, harvest = legacy_zhaoshang_bridge(
+    propose, finalize, submit, harvest, _probe, _restart = legacy_zhaoshang_bridge(
         adapter,
         paths=paths,
         business_date="2026-08-11",
@@ -838,7 +838,7 @@ def test_legacy_bridge_retries_transient_priority_on_same_remote_identity(tmp_pa
     paths = runtime_paths("2026-08-11", tmp_path / "runtime")
     paths.run_dir.mkdir(parents=True)
     adapter = RetryingPriorityAdapter()
-    propose, finalize, _submit, harvest = legacy_zhaoshang_bridge(
+    propose, finalize, _submit, harvest, _probe, _restart = legacy_zhaoshang_bridge(
         adapter,
         paths=paths,
         business_date="2026-08-11",
@@ -892,7 +892,7 @@ def test_legacy_bridge_sends_deterministic_priority_conflict_directly_to_manual(
     paths = runtime_paths("2026-08-11", tmp_path / "runtime")
     paths.run_dir.mkdir(parents=True)
     adapter = ConflictingPriorityAdapter()
-    propose, finalize, _submit, harvest = legacy_zhaoshang_bridge(
+    propose, finalize, _submit, harvest, _probe, _restart = legacy_zhaoshang_bridge(
         adapter,
         paths=paths,
         business_date="2026-08-11",
@@ -996,7 +996,7 @@ def test_legacy_bridge_honors_frozen_crawl_policy_and_fails_closed_on_mapping_dr
     paths = runtime_paths("2026-08-11", tmp_path / "runtime")
     paths.run_dir.mkdir(parents=True)
     adapter = MutableMappingAdapter()
-    propose, finalize, _submit, _harvest = legacy_zhaoshang_bridge(
+    propose, finalize, _submit, _harvest, _probe, _restart = legacy_zhaoshang_bridge(
         adapter, paths=paths, business_date="2026-08-11"
     )
     disabled = {
@@ -1035,7 +1035,7 @@ def test_legacy_task_name_is_stable_within_day_but_rolls_over_across_days(tmp_pa
     def task_name(day):
         paths = runtime_paths(day, tmp_path / "runtime")
         paths.run_dir.mkdir(parents=True, exist_ok=True)
-        propose, finalize, _submit, _harvest = legacy_zhaoshang_bridge(
+        propose, finalize, _submit, _harvest, _probe, _restart = legacy_zhaoshang_bridge(
             _BridgeAdapter(), paths=paths, business_date=day
         )
         plan = propose([{"row": row}], 10)[0]
@@ -1235,7 +1235,7 @@ def test_drain_only_default_dependencies_expose_only_existing_harvester(
     monkeypatch.setattr(
         runtime_module,
         "legacy_zhaoshang_bridge",
-        lambda *_args, **_kwargs: (object(), object(), object(), harvester),
+        lambda *_args, **_kwargs: (object(), object(), object(), harvester, None, None),
     )
 
     deps = runtime_module.build_drain_dependencies(
@@ -1532,7 +1532,7 @@ def test_missing_batch_state_bridge_uses_normal_state_document(tmp_path):
     paths = runtime_paths("2026-08-11", tmp_path / "runtime")
     paths.run_dir.mkdir(parents=True)
     adapter = _BridgeAdapter()
-    propose, finalize, _submit, _harvest = legacy_zhaoshang_bridge(
+    propose, finalize, _submit, _harvest, _probe, _restart = legacy_zhaoshang_bridge(
         adapter, paths=paths, business_date="2026-08-11"
     )
     row = {"vCommodityId": "v1", "skuId": "s1", "extLink": "https://item.invalid/1"}
@@ -1898,7 +1898,7 @@ def test_legacy_bridge_maps_not_attempted_to_dedicated_error(tmp_path):
     adapter = NotAttemptedAdapter()
     paths = runtime_paths("2026-08-11", tmp_path / "runtime")
     paths.run_dir.mkdir(parents=True)
-    propose, finalize, submit, _harvest = legacy_zhaoshang_bridge(
+    propose, finalize, submit, _harvest, _probe, _restart = legacy_zhaoshang_bridge(
         adapter, paths=paths, business_date="2026-08-11"
     )
     rows = [{"vCommodityId": "v-a", "skuId": "sku-a", "extLink": "https://same.invalid/p"}]

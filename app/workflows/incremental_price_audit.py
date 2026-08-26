@@ -19,6 +19,10 @@ from typing import Any, Callable, Mapping, Sequence
 from urllib import error
 
 from app.services.daily_audit_store import DailyAuditStore, LeaseToken, LeaseUnavailable, ProcessLock
+from app.services.remote_running_recovery import (
+    RECOVERY_CALLBACK_TIMEOUT_SECONDS,
+    run_running_recovery_pass,
+)
 from app.services.saas_audit_core import crawl_fingerprint, detail_fingerprint, model_fingerprint
 from app.services.title_match_model_adapter import (
     ModelCallRetryExhaustedError,
@@ -179,6 +183,14 @@ class TickDependencies:
     # tick before it claims or dispatches any new remote submission; existing
     # remote jobs stay harvestable so probes and exports continue.
     submit_gate: Callable[[], str | None] | None = None
+    # RUNNING-stall recovery seams. ``remote_recovery_probe`` is read-only and
+    # appends durable progress evidence; ``remote_recovery_restart`` performs
+    # the single exact disable->enable and is only wired under explicit
+    # remote-write authorization. Both receive a timeout derived from the
+    # tick's live remaining budget at call time. Both default to absent: the
+    # pass is a no-op.
+    remote_recovery_probe: Callable[[Mapping[str, Any], float], Mapping[str, Any] | None] | None = None
+    remote_recovery_restart: Callable[[Mapping[str, Any], str | None, float], Mapping[str, Any]] | None = None
     monotonic: Callable[[], float] = time.monotonic
     wall_clock: Callable[[], datetime] = lambda: datetime.now(UTC)
 
@@ -1319,6 +1331,37 @@ def run_incremental_tick(
                 store, token, deps, budget, counters, config,
                 skip_job_ids=swept_remote_jobs,
             )
+        if deps.remote_recovery_probe is not None and budget.can_start_heavy():
+            # Tail-position recovery: core intake (discovery/detail/model/
+            # submit/post-harvest) has already claimed its budget, and every
+            # recovery callback receives a timeout intersected with the
+            # tick's live remaining budget so the sweep can never starve it.
+            trace.append("running_recovery")
+
+            def _budget_recovery_probe(job: Mapping[str, Any]) -> Mapping[str, Any] | None:
+                return deps.remote_recovery_probe(
+                    job, budget.callback_timeout(RECOVERY_CALLBACK_TIMEOUT_SECONDS)
+                )
+
+            def _budget_recovery_restart(
+                job: Mapping[str, Any], resume_phase: str | None
+            ) -> Mapping[str, Any]:
+                return deps.remote_recovery_restart(
+                    job, resume_phase, budget.callback_timeout(RECOVERY_CALLBACK_TIMEOUT_SECONDS)
+                )
+
+            recovery_counters = run_running_recovery_pass(
+                store,
+                token,
+                probe_remote=_budget_recovery_probe,
+                restart_remote=(
+                    _budget_recovery_restart if deps.remote_recovery_restart is not None else None
+                ),
+                now=deps.wall_clock(),
+                can_start=lambda: budget.can_start_heavy(),
+            )
+            for key, value in recovery_counters.items():
+                counters[key] = counters.get(key, 0) + int(value)
         trace.append("checkpoint")
         backlog = _backlog(store, token, snapshot_items)
         waiting_source_count = False

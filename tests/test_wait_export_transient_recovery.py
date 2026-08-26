@@ -379,7 +379,7 @@ def _exporting_runner(seed: _E2ESeed):
 
 
 def _tick_with_bridge(store, tmp_path, seed, tick_index: int):
-    _plan, _finalize, submit, harvest = legacy_zhaoshang_bridge(
+    _plan, _finalize, submit, harvest, _probe, _restart = legacy_zhaoshang_bridge(
         seed.adapter,
         paths=type(
             "Paths",

@@ -59,8 +59,11 @@ from app.services.legacy_zhaoshang_adapter import (
     CnncLegacyZhaoshangAdapter,
     CrawlRequest,
     HarvestStatus,
+    LegacyProbeEvidenceError,
     PriorityStatus,
     ReconcileStatus,
+    RemoteTaskIdentityConflictError,
+    RestartStatus,
     SubmitStatus,
 )
 from app.services.remote_stall_breaker import remote_submit_pause_reason
@@ -1157,11 +1160,13 @@ def legacy_zhaoshang_bridge(
     paths: RuntimePaths,
     business_date: str,
     monotonic: Callable[[], float] = monotonic_time.monotonic,
-) -> tuple[Callable[[list[Mapping[str, Any]], float], list[CrawlPlan]], Callable[[CrawlPlan, tuple[CrawlMember, ...], float], CrawlPlan], Callable[[Mapping[str, Any], list[Mapping[str, Any]], float], Mapping[str, Any]], Callable[[list[Mapping[str, Any]], float], Mapping[int, Mapping[str, Any]]]]:
+) -> tuple[Callable[[list[Mapping[str, Any]], float], list[CrawlPlan]], Callable[[CrawlPlan, tuple[CrawlMember, ...], float], CrawlPlan], Callable[[Mapping[str, Any], list[Mapping[str, Any]], float], Mapping[str, Any]], Callable[[list[Mapping[str, Any]], float], Mapping[int, Mapping[str, Any]]], Callable[[Mapping[str, Any]], Mapping[str, Any] | None], Callable[[Mapping[str, Any], str | None], Mapping[str, Any]]]:
     """Bridge only legacy create-only and wait-export-only modes.
 
     No priority API is called here. The legacy tool retains its own controlled
     priority behaviour; this bridge neither imports nor invokes its SQL code.
+    The returned recovery pair exposes the read-only RUNNING probe and the
+    single exact disable->enable restart for the stall-recovery pass.
     """
     batch_state = paths.run_dir / "BATCH_STATE.md"
     prepared: dict[str, Any] = {}
@@ -1438,7 +1443,109 @@ def legacy_zhaoshang_bridge(
                 publish({"manual_error": "legacy wait-export-only requires manual review"})
         return results
 
-    return propose, finalize, submit, harvest
+    def recovery_probe(job: Mapping[str, Any], timeout_seconds: float) -> Mapping[str, Any] | None:
+        try:
+            prepared_job = reconstruct(job)
+            task_id, task_number = remote_identity_parts(prepared_job, job.get("remote_identity"))
+            probe = adapter.probe_running_task(
+                prepared_job, task_id, task_number, float(timeout_seconds)
+            )
+        except RemoteTaskIdentityConflictError:
+            # Round 7 IMPORTANT B: a PROVEN conflict between the live exact
+            # task and the durable remote identity is permanent, not a
+            # transient probe fault — the recovery pass fail-closes to manual
+            # on the first occurrence instead of counting toward the cap.
+            return {
+                "probe_identity_conflict": True,
+                "diagnostic": "probe raised RemoteTaskIdentityConflictError",
+            }
+        except LegacyProbeEvidenceError:
+            # Round 7 BLOCKER A: the probe completed at the transport level
+            # but the adapter proved it carries no usable execution evidence
+            # (business-failed/malformed/contradictory progress, no trusted
+            # terminal status, no actual export result).  This is a durable
+            # probe failure for the recovery pass, distinct from transient
+            # transport faults only by kind — both count toward the cap.
+            return {
+                "probe_failed": True,
+                "failure_kind": "UNUSABLE_EVIDENCE",
+                "diagnostic": "probe raised LegacyProbeEvidenceError",
+            }
+        except Exception as exc:
+            # A probe that cannot re-confirm the exact remote task proves
+            # nothing and never blocks the tick — but since Round 6 the
+            # failure is reported explicitly so the durable layer can count
+            # consecutive probe failures instead of retrying a permanent
+            # fault (expired refreshToken, missing tool) forever.  Only the
+            # exception TYPE is recorded; message bodies never enter
+            # durable storage.
+            return {"probe_failed": True, "diagnostic": f"probe raised {type(exc).__name__}"}
+        return {
+            "remote_mall": probe.mall,
+            "remote_task_id": probe.task_id,
+            "remote_task_number": probe.task_number,
+            "progress": dict(probe.progress),
+            "export_count": probe.export_count,
+            "export_rsp_desc": probe.export_rsp_desc,
+            "export_had_result": probe.export_had_result,
+            "task_status_rsp_desc": probe.task_status_rsp_desc,
+        }
+
+    def recovery_restart(
+        job: Mapping[str, Any], resume_phase: str | None, timeout_seconds: float
+    ) -> Mapping[str, Any]:
+        from app.services.remote_running_recovery import classify_restart_exception
+
+        try:
+            prepared_job = reconstruct(job)
+            task_id, task_number = remote_identity_parts(prepared_job, job.get("remote_identity"))
+        except Exception as exc:
+            # The exact local identity cannot be rebuilt: fail closed before
+            # any remote write is even considered.
+            return {
+                "status": "IDENTITY_CONFLICT",
+                "restarted": False,
+                "diagnostic": f"restart identity could not be reconstructed: {type(exc).__name__}",
+            }
+        try:
+            outcome = adapter.restart_running_task(
+                prepared_job,
+                task_id,
+                task_number,
+                float(timeout_seconds),
+                resume_phase=resume_phase,
+            )
+        except Exception as exc:
+            # Since Round 5 the production adapter converts its own escapes
+            # into explicit boundary outcomes (PRE_WRITE_FAILED for proven
+            # zero-write failures), so this branch is defense-in-depth for
+            # injected runners and unforeseen escapes only: the classifier
+            # keeps the resumed direction reconcile-only and can never
+            # authorize a fresh second write.
+            status = classify_restart_exception(exc, resume_phase)
+            return {
+                "status": status,
+                "restarted": False,
+                "observed_enabled": None,
+                "diagnostic": f"restart dispatch raised {type(exc).__name__}; awaiting phase reconciliation",
+            }
+        return {
+            "status": outcome.status.value,
+            "restarted": outcome.status is RestartStatus.RESTARTED,
+            "reconciled": resume_phase is not None,
+            "observed_enabled": outcome.observed_enabled,
+            "diagnostic": outcome.diagnostic,
+            "disable_evidence": {
+                "response": dict(outcome.disable_response) if outcome.disable_response else None,
+                "confirmed_disabled": outcome.disable_confirmed,
+            },
+            "enable_evidence": {
+                "response": dict(outcome.enable_response) if outcome.enable_response else None,
+                "confirmed_enabled": outcome.enable_confirmed,
+            },
+        }
+
+    return propose, finalize, submit, harvest, recovery_probe, recovery_restart
 
 
 def batch_zhaoshang_bridge(
@@ -1599,7 +1706,13 @@ def build_default_dependencies(
                 business_date=business_date,
             )
         else:
-            planner, finalizer, submitter, harvester = legacy_zhaoshang_bridge(legacy_adapter, paths=paths, business_date=business_date)
+            planner, finalizer, submitter, harvester, recovery_probe, recovery_restart = legacy_zhaoshang_bridge(legacy_adapter, paths=paths, business_date=business_date)
+            # The RUNNING-stall probe is read-only and safe for every tick;
+            # the single exact restart is a remote write and stays gated by
+            # the explicit remote-write authorization below.
+            dependencies.remote_recovery_probe = recovery_probe
+            if enable_zhaoshang:
+                dependencies.remote_recovery_restart = recovery_restart
         # Read-only wait/export and exact unknown-submit reconciliation remain
         # available on ordinary ticks. Only planner+submit are write-capable.
         dependencies.harvest = harvester
@@ -1623,7 +1736,7 @@ def build_drain_dependencies(
     if zhaoshang_backend != "legacy":
         raise RuntimeConfigurationError("drain-only requires the evidenced legacy export backend")
     adapter = CnncLegacyZhaoshangAdapter()
-    _planner, _finalizer, _submitter, harvester = legacy_zhaoshang_bridge(
+    _planner, _finalizer, _submitter, harvester, _probe, _restart = legacy_zhaoshang_bridge(
         adapter,
         paths=paths,
         business_date=business_date,

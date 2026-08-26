@@ -366,6 +366,10 @@ class DailyAuditStore:
                 connection.execute("ALTER TABLE remote_jobs ADD COLUMN harvest_attempts INTEGER NOT NULL DEFAULT 0")
             if "harvest_elapsed_seconds" not in columns:
                 connection.execute("ALTER TABLE remote_jobs ADD COLUMN harvest_elapsed_seconds REAL NOT NULL DEFAULT 0")
+            if "recovery_attempts" not in columns:
+                connection.execute("ALTER TABLE remote_jobs ADD COLUMN recovery_attempts INTEGER NOT NULL DEFAULT 0")
+            if "recovery_evidence_json" not in columns:
+                connection.execute("ALTER TABLE remote_jobs ADD COLUMN recovery_evidence_json TEXT")
             collision = connection.execute(
                 """SELECT run_id, TRIM(remote_identity) AS remote_identity, COUNT(*) AS collision_count
                    FROM remote_jobs
@@ -1142,6 +1146,85 @@ class DailyAuditStore:
     def mark_remote_manual(self, token: LeaseToken, job_id: int, error: str) -> dict[str, Any]:
         return self._set_job_state(token, job_id, "MANUAL_REQUIRED", error=error)
 
+    def mark_remote_zero_write_manual(
+        self,
+        token: LeaseToken,
+        job_id: int,
+        *,
+        remote_identity: str,
+        evidence: Mapping[str, Any],
+        error: str,
+    ) -> dict[str, Any]:
+        """Terminalize a proven zero-write recovery outcome atomically.
+
+        The truthful evidence document and the MANUAL_REQUIRED state must
+        land in ONE transaction: writing evidence and state separately could
+        crash between them and strand the write-ahead DISABLE_SENT phase (a
+        pending remote write that never happened) on a terminal job — after
+        a human requeue that fake pending phase would bypass the
+        EXTERNALLY_DISABLED guard and could auto-enable a task a human
+        deliberately disabled.  Legal only from RUNNING with an unburned
+        attempt and the exact confirmed remote identity.
+        """
+        from app.services.remote_running_recovery import encode_recovery_evidence
+
+        normalized_identity = str(remote_identity or "").strip()
+        with self._transaction(immediate=True) as connection:
+            self._validate_lease(connection, token)
+            job = self._job_for_lease(connection, token, job_id)
+            if str(job["state"]) != "RUNNING":
+                raise RemoteIntentConflict("zero-write manual requires the RUNNING state")
+            if int(job["recovery_attempts"] or 0) != 0:
+                raise RemoteIntentConflict("zero-write manual requires an unburned recovery attempt")
+            if not normalized_identity or str(job["remote_identity"] or "").strip() != normalized_identity:
+                raise RemoteIntentConflict("zero-write manual requires the exact confirmed remote identity")
+            connection.execute(
+                "UPDATE remote_jobs SET state='MANUAL_REQUIRED', recovery_evidence_json=?, error_text=?, updated_at=? WHERE id=?",
+                (encode_recovery_evidence(evidence), str(error), self._utcnow(), job_id),
+            )
+            return self._row(connection.execute("SELECT * FROM remote_jobs WHERE id=?", (job_id,)).fetchone())  # type: ignore[return-value]
+
+    def mark_remote_recovery_probe_identity_manual(
+        self,
+        token: LeaseToken,
+        job_id: int,
+        *,
+        remote_identity: str,
+        evidence: Mapping[str, Any],
+        error: str,
+    ) -> dict[str, Any]:
+        """Terminalize a probe-proven remote identity conflict atomically.
+
+        The truthful probe evidence (``probe_health.identity_conflict``), the
+        MANUAL_REQUIRED state, and the error text land in ONE transaction.
+        Legal from RUNNING with the exact confirmed remote identity —
+        REGARDLESS of ``recovery_attempts``: a post-restart probe may also
+        prove the conflict, and the caller's evidence document must preserve
+        the confirmed restart proof untouched (this method never derives or
+        overwrites ``restart``).  Zero remote writes by construction: the
+        transition records the outcome of a read-only probe.  The durable
+        ``remote_identity`` is never re-bound (exact-match precondition).
+        """
+        from app.services.remote_running_recovery import encode_recovery_evidence
+
+        normalized_identity = str(remote_identity or "").strip()
+        with self._transaction(immediate=True) as connection:
+            self._validate_lease(connection, token)
+            job = self._job_for_lease(connection, token, job_id)
+            if str(job["state"]) != "RUNNING":
+                raise RemoteIntentConflict(
+                    "recovery probe identity manual requires the RUNNING state"
+                )
+            if not normalized_identity or str(job["remote_identity"] or "").strip() != normalized_identity:
+                raise RemoteIntentConflict(
+                    "recovery probe identity manual requires the exact confirmed remote identity"
+                )
+            connection.execute(
+                "UPDATE remote_jobs SET state='MANUAL_REQUIRED', recovery_evidence_json=?, error_text=?, updated_at=? WHERE id=?",
+                (encode_recovery_evidence(evidence), str(error), self._utcnow(), job_id),
+            )
+            return self._row(connection.execute("SELECT * FROM remote_jobs WHERE id=?", (job_id,)).fetchone())  # type: ignore[return-value]
+
     def requeue_manual_priority_job(
         self,
         token: LeaseToken,
@@ -1266,6 +1349,301 @@ class DailyAuditStore:
             state = "MANUAL_REQUIRED" if manual else str(job["state"])
             connection.execute("UPDATE remote_jobs SET state=?, harvest_elapsed_seconds=?, error_text=?, updated_at=? WHERE id=?", (state, elapsed, error, self._utcnow(), job_id))
             return self._row(connection.execute("SELECT * FROM remote_jobs WHERE id=?", (job_id,)).fetchone())  # type: ignore[return-value]
+
+    def update_remote_recovery_evidence(self, token: LeaseToken, job_id: int, evidence: Mapping[str, Any]) -> dict[str, Any]:
+        """Persist the RUNNING-stall recovery evidence document for one job.
+
+        The evidence document is the only authority for progress observations
+        and restart phases; it never mutates ``result_json``/``error_text``
+        semantics.  Any state may record probe evidence, but the update is
+        fenced by the daily lease like every other durable write.
+        """
+        from app.services.remote_running_recovery import encode_recovery_evidence
+
+        encoded = encode_recovery_evidence(evidence)
+        with self._transaction(immediate=True) as connection:
+            self._validate_lease(connection, token)
+            job = self._job_for_lease(connection, token, job_id)
+            if str(job["state"]) == "COMPLETED":
+                raise RemoteIntentConflict("completed remote job evidence is immutable")
+            connection.execute(
+                "UPDATE remote_jobs SET recovery_evidence_json=?, updated_at=? WHERE id=?",
+                (encoded, self._utcnow(), job_id),
+            )
+            return self._row(connection.execute("SELECT * FROM remote_jobs WHERE id=?", (job_id,)).fetchone())  # type: ignore[return-value]
+
+    def record_remote_recovery_probe_failure(
+        self,
+        token: LeaseToken,
+        job_id: int,
+        *,
+        remote_identity: str,
+        failed_at: str,
+        failure_reason: str,
+    ) -> dict[str, Any]:
+        """Durably count one RUNNING-stall recovery-probe failure.
+
+        The increment is recomputed from the STORE's durable evidence
+        document (never a caller-held copy) and, once the consecutive count
+        reaches ``RECOVERY_MAX_CONSECUTIVE_PROBE_FAILURES``, the
+        MANUAL_REQUIRED state and its error land in the SAME transaction —
+        no crash window can leave a terminal manual job whose evidence
+        shows fewer failures, or a RUNNING job whose evidence already hit
+        the cap.  Probe health is stored beside (never inside)
+        ``restart``: a probe failure has not entered the restart protocol,
+        and reaching the cap must never fabricate a pending write phase.
+        """
+        from app.services.remote_running_recovery import (
+            RECOVERY_MAX_CONSECUTIVE_PROBE_FAILURES,
+            decode_recovery_evidence,
+            encode_recovery_evidence,
+        )
+
+        normalized_identity = str(remote_identity or "").strip()
+        reason = str(failure_reason or "").strip() or "probe callback returned no evidence"
+        with self._transaction(immediate=True) as connection:
+            self._validate_lease(connection, token)
+            job = self._job_for_lease(connection, token, job_id)
+            if str(job["state"]) != "RUNNING":
+                raise RemoteIntentConflict("recovery probe failure requires the RUNNING state")
+            if not normalized_identity or str(job["remote_identity"] or "").strip() != normalized_identity:
+                raise RemoteIntentConflict("recovery probe failure requires the exact confirmed remote identity")
+            document = decode_recovery_evidence(job["recovery_evidence_json"])
+            health = dict(document.get("probe_health") or {})
+            try:
+                consecutive = int(health.get("consecutive_failures") or 0) + 1
+            except (TypeError, ValueError):
+                consecutive = 1
+            document["probe_health"] = {
+                "consecutive_failures": consecutive,
+                "last_failure_at": str(failed_at or "").strip(),
+                "last_failure_reason": reason,
+            }
+            if consecutive >= RECOVERY_MAX_CONSECUTIVE_PROBE_FAILURES:
+                # The terminal error must match the durable restart history
+                # (review round 7): recovery_attempts==1 with a confirmed
+                # restart means post-restart probes failed — claiming "no
+                # restart was attempted" there would contradict the durable
+                # evidence.  Any other recovery_attempts/phase combination is
+                # an invariant anomaly and fails closed with the anomaly
+                # named, never with a fabricated history.
+                recovery_attempts = int(job["recovery_attempts"] or 0)
+                restart_phase = str((document.get("restart") or {}).get("phase") or "").strip()
+                if recovery_attempts == 0:
+                    headline = (
+                        f"remote stall recovery probe failed {consecutive} consecutive "
+                        f"times; no restart was attempted"
+                    )
+                elif recovery_attempts == 1 and restart_phase == "ENABLE_CONFIRMED":
+                    headline = (
+                        f"remote stall recovery probe failed {consecutive} consecutive "
+                        f"times; the single restart was already confirmed; "
+                        f"post-restart recovery probes did not produce usable evidence"
+                    )
+                else:
+                    headline = (
+                        f"remote stall recovery probe failed {consecutive} consecutive "
+                        f"times; inconsistent restart evidence "
+                        f"(recovery_attempts={recovery_attempts}, "
+                        f"restart phase={restart_phase or 'missing'})"
+                    )
+                connection.execute(
+                    "UPDATE remote_jobs SET state='MANUAL_REQUIRED', recovery_evidence_json=?, error_text=?, updated_at=? WHERE id=?",
+                    (
+                        encode_recovery_evidence(document),
+                        f"{headline}; last failure: {reason}",
+                        self._utcnow(),
+                        job_id,
+                    ),
+                )
+            else:
+                connection.execute(
+                    "UPDATE remote_jobs SET recovery_evidence_json=?, updated_at=? WHERE id=?",
+                    (encode_recovery_evidence(document), self._utcnow(), job_id),
+                )
+            return self._row(connection.execute("SELECT * FROM remote_jobs WHERE id=?", (job_id,)).fetchone())  # type: ignore[return-value]
+
+    def mark_remote_recovery_attempted(
+        self,
+        token: LeaseToken,
+        job_id: int,
+        *,
+        remote_identity: str,
+        evidence: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Burn the single automatic restart slot for one exact remote job.
+
+        The transition is legal only from ``RUNNING`` with a matching exact
+        remote identity and a previously unburned attempt, so a resumed
+        process can never authorize a second disable->enable.
+        """
+        from app.services.remote_running_recovery import encode_recovery_evidence, decode_recovery_evidence
+
+        normalized_identity = str(remote_identity or "").strip()
+        with self._transaction(immediate=True) as connection:
+            self._validate_lease(connection, token)
+            job = self._job_for_lease(connection, token, job_id)
+            if str(job["state"]) != "RUNNING":
+                raise RemoteIntentConflict("recovery attempt requires the RUNNING state")
+            if not normalized_identity or str(job["remote_identity"] or "").strip() != normalized_identity:
+                raise RemoteIntentConflict("recovery attempt requires the exact confirmed remote identity")
+            if int(job["recovery_attempts"] or 0) != 0:
+                raise RemoteIntentConflict("remote job already consumed its single recovery attempt")
+            document = decode_recovery_evidence(job["recovery_evidence_json"])
+            merged_restart = dict(document.get("restart") or {})
+            merged_restart.update(
+                {
+                    "phase": "ENABLE_CONFIRMED",
+                    "recovery_attempts": 1,
+                }
+            )
+            document["restart"] = merged_restart
+            connection.execute(
+                "UPDATE remote_jobs SET recovery_attempts=1, recovery_evidence_json=?, updated_at=? WHERE id=?",
+                (encode_recovery_evidence(document), self._utcnow(), job_id),
+            )
+            return self._row(connection.execute("SELECT * FROM remote_jobs WHERE id=?", (job_id,)).fetchone())  # type: ignore[return-value]
+
+    def mark_remote_recovery_exhausted(
+        self,
+        token: LeaseToken,
+        job_id: int,
+        *,
+        remote_identity: str,
+        evidence: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Move one RUNNING job to the local RECOVERY_EXHAUSTED terminal state.
+
+        This is a local business give-up, never a claim that the remote task
+        finished: the durable restart evidence must prove the single exact
+        disable->enable already ran and was confirmed before the day stops
+        waiting on this job.
+        """
+        from app.services.remote_running_recovery import (
+            decode_recovery_evidence,
+            encode_recovery_evidence,
+        )
+
+        normalized_identity = str(remote_identity or "").strip()
+        with self._transaction(immediate=True) as connection:
+            self._validate_lease(connection, token)
+            job = self._job_for_lease(connection, token, job_id)
+            document = decode_recovery_evidence(job["recovery_evidence_json"])
+            restart = document.get("restart") if isinstance(document.get("restart"), dict) else {}
+            if str(job["state"]) != "RUNNING":
+                raise RemoteIntentConflict("recovery exhaustion requires the RUNNING state")
+            if not normalized_identity or str(job["remote_identity"] or "").strip() != normalized_identity:
+                raise RemoteIntentConflict("recovery exhaustion requires the exact confirmed remote identity")
+            if int(job["recovery_attempts"] or 0) != 1:
+                raise RemoteIntentConflict("recovery exhaustion requires exactly one consumed recovery attempt")
+            if str(restart.get("phase") or "") != "ENABLE_CONFIRMED":
+                raise RemoteIntentConflict("recovery exhaustion requires confirmed disable and enable evidence")
+            disable_evidence = restart.get("disable_evidence")
+            enable_evidence = restart.get("enable_evidence")
+            if not (
+                isinstance(disable_evidence, dict)
+                and disable_evidence.get("confirmed_disabled") is True
+                and isinstance(enable_evidence, dict)
+                and enable_evidence.get("confirmed_enabled") is True
+            ):
+                raise RemoteIntentConflict(
+                    "recovery exhaustion requires disable_evidence.confirmed_disabled and "
+                    "enable_evidence.confirmed_enabled to both be true"
+                )
+            recovery_at = str(restart.get("recovery_at") or "").strip()
+            try:
+                datetime.fromisoformat(recovery_at)
+            except ValueError as exc:
+                raise RemoteIntentConflict(
+                    "recovery exhaustion requires a valid recovery timestamp"
+                ) from exc
+            merged = dict(evidence)
+            merged_restart = dict(merged.get("restart") or {})
+            merged_restart.setdefault("phase", "ENABLE_CONFIRMED")
+            merged_restart.setdefault("recovery_attempts", 1)
+            merged["restart"] = merged_restart
+            connection.execute(
+                "UPDATE remote_jobs SET state='RECOVERY_EXHAUSTED', recovery_evidence_json=?, error_text=?, updated_at=? WHERE id=?",
+                (
+                    encode_recovery_evidence(merged),
+                    "remote stall recovery exhausted after one confirmed disable->enable restart",
+                    self._utcnow(),
+                    job_id,
+                ),
+            )
+            return self._row(connection.execute("SELECT * FROM remote_jobs WHERE id=?", (job_id,)).fetchone())  # type: ignore[return-value]
+
+    def complete_crawl_work_recovery_exhausted(
+        self,
+        token: LeaseToken,
+        crawl_work_id: int,
+        *,
+        remote_job_id: int,
+        remote_identity: str,
+        reason: str,
+        restart_phase: str,
+        recovery_attempt: int,
+        recovery_at: str,
+        disable_confirmed: bool,
+        enable_confirmed: bool,
+        last_progress_signature: object,
+        export_count: object,
+        export_rsp_desc: str,
+    ) -> dict[str, Any]:
+        """Persist the auditable no-price outcome for one abandoned crawl."""
+        from app.services.remote_running_recovery import encode_recovery_evidence
+
+        normalized_reason = str(reason or "").strip()
+        normalized_identity = str(remote_identity or "").strip()
+        if not normalized_reason or not normalized_identity:
+            raise RemoteIntentConflict("recovery-exhausted crawl resolution requires exact evidence")
+        if int(recovery_attempt) != 1 or str(restart_phase or "").strip() != "ENABLE_CONFIRMED":
+            raise RemoteIntentConflict("recovery-exhausted crawl resolution requires the completed restart proof")
+        if not disable_confirmed or not enable_confirmed:
+            raise RemoteIntentConflict("recovery-exhausted crawl resolution requires confirmed disable and enable evidence")
+        evidence = encode_recovery_evidence(
+            {
+                "evidence_type": "REMOTE_STALL_RECOVERY_EXHAUSTED",
+                "no_result_reason": normalized_reason,
+                "page_price_source": "招商局（无采集结果）",
+                "page_price_status": "NO_RESULT",
+                "page_price_value": None,
+                "remote_identity": normalized_identity,
+                "remote_state": "RECOVERY_EXHAUSTED",
+                "recovery_attempt": 1,
+                "recovery_at": str(recovery_at or ""),
+                "disable_confirmed": True,
+                "enable_confirmed": True,
+                "post_recovery_harvest_checked": True,
+                "last_progress_signature": last_progress_signature,
+                "export_count": export_count,
+                "export_rspDesc": str(export_rsp_desc or ""),
+            }
+        )
+        with self._transaction(immediate=True) as connection:
+            self._validate_crawl_lease(connection, token, crawl_work_id)
+            work = connection.execute("SELECT * FROM crawl_work WHERE id=?", (crawl_work_id,)).fetchone()
+            assert work is not None
+            job = self._job_for_lease(connection, token, int(remote_job_id))
+            if (
+                int(work["remote_job_id"] or 0) != int(remote_job_id)
+                or str(job["remote_identity"] or "").strip() != normalized_identity
+                or job["state"] != "RECOVERY_EXHAUSTED"
+            ):
+                raise RemoteIntentConflict(
+                    "recovery-exhausted crawl resolution requires the exact abandoned remote job"
+                )
+            if work["state"] == "NO_RESULT":
+                if work["result_json"] != evidence or work["error_text"] != normalized_reason:
+                    raise RemoteIntentConflict("no-result crawl evidence is immutable")
+                return self._row(work)  # type: ignore[return-value]
+            if work["state"] in {"SUCCESS", "TERMINAL_FAILED"}:
+                raise RemoteIntentConflict("terminal crawl evidence is immutable")
+            connection.execute(
+                "UPDATE crawl_work SET state='NO_RESULT', result_json=?, error_text=?, updated_at=? WHERE id=?",
+                (evidence, normalized_reason, self._utcnow(), crawl_work_id),
+            )
+            return self._row(connection.execute("SELECT * FROM crawl_work WHERE id=?", (crawl_work_id,)).fetchone())  # type: ignore[return-value]
 
     def _set_job_state(self, token: LeaseToken, job_id: int, state: str, *, error: str | None = None, require_post_attempted: bool = False) -> dict[str, Any]:
         with self._transaction(immediate=True) as connection:

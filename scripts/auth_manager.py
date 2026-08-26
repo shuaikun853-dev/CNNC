@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import threading
+import time
 import urllib.error
 import urllib.request
 from contextlib import contextmanager
@@ -313,13 +314,38 @@ class AuthManager:
             raise ValueError(f"Unsupported auth system: {system}")
         return self._tokens_from_state(self._load_or_bootstrap_state(), system)
 
-    def _request_refresh(self, system: str, refresh_token: str) -> AuthTokens:
+    def _request_refresh(
+        self,
+        system: str,
+        refresh_token: str,
+        *,
+        timeout_seconds: float | None = None,
+        deadline: float | None = None,
+        monotonic: Callable[[], float] | None = None,
+    ) -> AuthTokens:
         config = SYSTEM_CONFIG[system]
         url = f"{config['refresh_url']}?{urlencode({'grantType': 'refresh_token', 'refreshToken': refresh_token})}"
         request = urllib.request.Request(url, method="POST")
         request.headers["Authorization"] = BASIC_AUTH
+        if deadline is not None:
+            # Absolute deadline (review round 5): lock waits and pre-HTTP
+            # work consume the same budget, so the HTTP only ever gets the
+            # live remainder — never a fresh copy of the initial budget the
+            # caller computed before those waits.
+            remaining = float(deadline) - (monotonic or time.monotonic)()
+            if not remaining > 0:
+                raise TimeoutError("auth refresh deadline exhausted before HTTP")
+            actual_timeout = min(30.0, remaining)
+        elif timeout_seconds is None:
+            actual_timeout = 30.0
+        else:
+            if not timeout_seconds > 0:
+                raise ValueError("auth refresh timeout_seconds must be positive")
+            # A bounded caller (e.g. the remote recovery callback) may only
+            # shrink the historical 30-second budget, never extend it.
+            actual_timeout = min(30.0, float(timeout_seconds))
         try:
-            with self.opener.open(request, timeout=30) as response:
+            with self.opener.open(request, timeout=actual_timeout) as response:
                 payload = json.loads(response.read().decode("utf-8", errors="replace"))
         except urllib.error.HTTPError as exc:
             if exc.code in {400, 401, 403}:
@@ -357,15 +383,36 @@ class AuthManager:
             self._atomic_write_state(state)
 
     def refresh(
-        self, system: str, *, stale_access_token: str | None = None
+        self,
+        system: str,
+        *,
+        stale_access_token: str | None = None,
+        timeout_seconds: float | None = None,
+        deadline: float | None = None,
+        monotonic: Callable[[], float] | None = None,
     ) -> AuthTokens:
         if system not in SYSTEM_CONFIG:
             raise ValueError(f"Unsupported auth system: {system}")
+        # The locks taken here are blocking (threading.RLock plus a process
+        # file lock; msvcrt LK_LOCK retries ~10 s on Windows, flock blocks
+        # on POSIX) and are NOT hard-cancelable — but their wait consumes
+        # the absolute deadline: _request_refresh recomputes the live
+        # remainder immediately before the HTTP and refuses to open at all
+        # once the deadline has passed.  _save_tokens after a successful
+        # refresh deliberately ignores the deadline: persisting the rotated
+        # refresh token is mandatory, and the recovery adapter re-checks
+        # its own callback deadline before any further remote call.
         with self._locked(system):
             current = self.get_tokens(system)
             if stale_access_token is not None and current.access_token != stale_access_token:
                 return current
-            tokens = self._request_refresh(system, current.refresh_token)
+            tokens = self._request_refresh(
+                system,
+                current.refresh_token,
+                timeout_seconds=timeout_seconds,
+                deadline=deadline,
+                monotonic=monotonic,
+            )
             self._save_tokens(system, tokens)
             if self.logger:
                 self.logger(f"[{SYSTEM_CONFIG[system]['label']}] Token refresh success")
@@ -397,11 +444,26 @@ class AuthManager:
         return inject_auth(parsed_curl, tokens, system)
 
     def export_environment(
-        self, system: str = "zhaoshang", *, refresh: bool = True
+        self,
+        system: str = "zhaoshang",
+        *,
+        refresh: bool = True,
+        timeout_seconds: float | None = None,
+        deadline: float | None = None,
+        monotonic: Callable[[], float] | None = None,
     ) -> dict[str, str]:
         if system != "zhaoshang":
             raise ValueError("Only Zhaoshang uses the BLADE_AUTH/COOKIE environment bridge")
-        tokens = self.refresh(system) if refresh else self.get_tokens(system)
+        tokens = (
+            self.refresh(
+                system,
+                timeout_seconds=timeout_seconds,
+                deadline=deadline,
+                monotonic=monotonic,
+            )
+            if refresh
+            else self.get_tokens(system)
+        )
         template = next(
             (
                 load_curl_command(path)
