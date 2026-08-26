@@ -65,6 +65,7 @@ R7 正在准备数据   [蓝]  detail.pending+running>0 ∨ model.pending+runnin
 ```
 
 - "数据准备完成" = detail.pending+running=0 ∧ model.pending+running=0(terminal/manual 不降低完成度,只进异常通道)。
+- **生产语义修正(2026-08-26 执行期裁定)**:R3(finalized)判定先于 R1 中的 recovery_exhausted——RECOVERY_EXHAUSTED 在出表后仍会在 status 中计数(属可接受终态收敛),若 R1 全面优先会把已完成的业务日误报为"需要人工处理";其余 R1 条件(remote.manual/crawl.manual/crawl.unplanned/model.terminal)在 FINALIZED 日按 readiness 门不可能非零,故该排序无副作用。
 - **存在明确异常(黄)不改主状态词**:remote.unknown>0 ∨ crawl.unknown>0 ∨ remote_health.stall_detected → 强制进入"需要关注"(黄)并写入解释句。
 - **系统自动恢复中(蓝)不改主状态词**:计入招商局摘要"自动恢复中 X"并写入解释句;仅 RECOVERY_EXHAUSTED 才升级红。
 - **解释句生成铁律(V1 冲突修复)**:存在任何"需要关注"项时,解释句必须逐项提及,禁止出现"无异常/无需人工处理"表述;无关注项时才允许"当前无需人工处理"。
