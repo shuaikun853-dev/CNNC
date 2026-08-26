@@ -43,12 +43,29 @@ def test_summary_200_etag_and_304(client, monkeypatch):
     monkeypatch.setattr(dashboard_api, "build_dashboard_summary", lambda **kw: dict(payload))
     r = client.get("/dashboard/api/summary")
     assert r.status_code == 200 and r.json()["overall"]["word"] == "正在准备数据"
+    assert r.headers["Cache-Control"] == "no-cache"
     etag = r.headers["ETag"]
     r2 = client.get("/dashboard/api/summary", headers={"If-None-Match": etag})
     assert r2.status_code == 304
+    assert r2.headers["Cache-Control"] == "no-cache"
 
 
 def test_no_write_endpoints(client):
     for method in ("post", "put", "delete", "patch"):
         r = getattr(client, method)("/dashboard/api/summary")
         assert r.status_code == 405
+
+
+def test_static_assets_served(client):
+    for name in ("index.html", "app.css", "app.js"):
+        r = client.get(f"/dashboard/static/{name}")
+        assert r.status_code == 200, name
+    css = client.get("/dashboard/static/app.css").text
+    js = client.get("/dashboard/static/app.js").text
+    html = client.get("/dashboard").text
+    assert "--ok" in css and "--err" in css          # 五色令牌
+    assert "visibilitychange" in js                   # 不可见暂停
+    assert "If-None-Match" in js                      # 304 支持
+    assert "cdn" not in css.lower() and "http://" not in css and "https://" not in css  # 零外链
+    for hook in ("hero", "attn", "stages", "zs", "final", "more", "jobs-table", "drawer", "tech", "conn-lost", "live", "refresh", "jobs-toggle"):
+        assert hook in html, hook

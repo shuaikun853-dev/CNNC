@@ -1,2 +1,75 @@
-<!DOCTYPE html><html lang="zh-CN"><meta charset="utf-8"><title>中核 STEP_1 每日价格审计</title>
-<body>中核 STEP_1 每日价格审计驾驶舱(加载中)</body></html>
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>中核 STEP_1 每日价格审计</title>
+<link rel="stylesheet" href="/dashboard/static/app.css">
+<script src="/dashboard/static/app.js" defer></script>
+</head>
+<body>
+<div class="conn-lost" id="conn-lost">⚠ 与服务器的连接已中断,正在自动重试…… 页面数据可能不是最新(以下为最后成功获取的数据)</div>
+<div class="wrap">
+
+<header class="top">
+  <h1>中核 STEP_1 每日价格审计</h1>
+  <span class="spacer"></span>
+  <button class="btn" id="refresh">刷新</button>
+</header>
+
+<!-- 第一屏五区块:主状态 / 需要关注 / 4 阶段 / 招商局摘要 / 最终表 -->
+<div class="hero gray" id="hero">
+  <div class="word">加载中…</div>
+  <p class="explain">正在从服务器获取今日状态……</p>
+  <div class="meta"><span><span class="dot" id="live-dot"></span><span id="live">实时 · 连接中…</span></span></div>
+</div>
+
+<div class="attn" id="attn">
+  <h2>需要关注</h2>
+  <div class="empty">✓ 当前无需人工处理</div>
+  <ol></ol>
+</div>
+
+<nav class="stages" id="stages"></nav>
+
+<div class="zs" id="zs">
+  <span class="lab">招商局</span>
+  <span class="counts"></span>
+  <button class="btn more" id="jobs-toggle">查看全部招商局任务 ↓</button>
+</div>
+
+<div class="final" id="final">
+  <div class="q">为什么还没出最终 Excel?</div>
+  <span class="why">正在获取……</span>
+</div>
+
+<!-- 二级详情(默认收起):任务全表 + 抽屉 + 技术详情 -->
+<div class="more-block" id="more">
+  <section class="card">
+    <h2>招商局远端任务 <span style="font-weight:400;color:var(--muted);font-size:12px">· 点击行查看任务详情</span></h2>
+    <table id="jobs-table">
+      <thead><tr><th>商城</th><th>任务</th><th>当前状态</th><th class="num">子任务</th><th class="num">采集轮次</th><th class="num">最后更新</th></tr></thead>
+      <tbody></tbody>
+    </table>
+    <aside class="drawer" id="drawer">
+      <h3>任务详情 <button class="btn" style="float:right;padding:0 8px" onclick="document.getElementById('drawer').classList.remove('show')">收起</button></h3>
+      <div class="sec"><div class="kv"></div></div>
+      <div class="sec"><b style="font-size:12px">恢复时间线</b>
+        <ul class="tl"></ul></div>
+      <div class="sec"><b style="font-size:12px">系统说明与建议</b>
+        <p class="note"></p></div>
+    </aside>
+  </section>
+
+  <section class="card">
+    <details class="tech" id="tech">
+      <summary style="cursor:pointer;color:var(--muted)">技术详情(内部状态原值 · 供工程师排查)</summary>
+      <pre></pre>
+    </details>
+  </section>
+</div>
+
+<footer>中核 STEP_1 每日价格审计 · 只读驾驶舱 · 数据来自本机 runtime 投影 · 本页面不执行任何写操作</footer>
+</div>
+</body>
+</html>

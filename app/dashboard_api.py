@@ -38,5 +38,5 @@ def dashboard_summary(request: Request, date: str = Query(default=None)) -> Resp
             "type": type(exc).__name__}) from exc
     etag = f'"{payload["fingerprint"]}"'
     if request.headers.get("if-none-match") == etag:
-        return Response(status_code=304, headers={"ETag": etag})
-    return JSONResponse(payload, headers={"ETag": etag})
+        return Response(status_code=304, headers={"ETag": etag, "Cache-Control": "no-cache"})
+    return JSONResponse(payload, headers={"ETag": etag, "Cache-Control": "no-cache"})
