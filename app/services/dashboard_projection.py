@@ -166,3 +166,93 @@ def _explanation(s: Mapping, attention: list, recovering: int, word: str) -> str
     if len(attention) > 3:
         parts.append(f"需要关注共 {len(attention)} 项。")
     return "".join(parts)
+
+
+import sqlite3
+from datetime import UTC, datetime
+from pathlib import Path
+
+from app.services.remote_running_recovery import (
+    RUNNING_PROBE_MIN_HARVEST_ATTEMPTS, RUNNING_PROBE_MIN_WALL_SECONDS,
+    decode_recovery_evidence,
+)
+
+_STATE_CN = {
+    "SUBMIT_INTENT": ("等待提交", "wait"), "PRIORITY_PENDING": ("等待提优", "wait"),
+    "SUBMITTED": ("等待执行", "wait"), "RUNNING": ("执行中", "run"), "EXPORTED": ("等待回收", "wait"),
+    "COMPLETED": ("已完成", "ok"), "SUBMIT_UNKNOWN": ("提交结果待确认", "warn"),
+    "MANUAL_REQUIRED": ("需要人工检查", "err"), "RECOVERY_EXHAUSTED": ("自动恢复已用尽", "err"),
+}
+
+
+def _parse_ts(value) -> datetime | None:
+    try:
+        m = datetime.fromisoformat(str(value or ""))
+        return m if m.tzinfo else m.replace(tzinfo=UTC)
+    except ValueError:
+        return None
+
+
+def project_remote_jobs(state_path: Path, business_date: str) -> list[dict]:
+    uri = f"file:{Path(state_path).resolve().as_posix()}?mode=ro"
+    con = sqlite3.connect(uri, uri=True); con.row_factory = sqlite3.Row
+    try:
+        run = con.execute("SELECT id FROM daily_runs WHERE business_date=?", (business_date,)).fetchone()
+        if run is None:
+            return []
+        run_id = int(run["id"])
+        counts = {int(r["remote_job_id"] or 0): (int(r["total"]), int(r["success"]))
+                  for r in con.execute(
+                      """SELECT remote_job_id, COUNT(*) AS total,
+                                SUM(CASE WHEN state='SUCCESS' THEN 1 ELSE 0 END) AS success
+                         FROM crawl_work WHERE run_id=? AND remote_job_id IS NOT NULL GROUP BY remote_job_id""",
+                      (run_id,))}
+        jobs = []
+        for row in con.execute("SELECT * FROM remote_jobs WHERE run_id=? ORDER BY id", (run_id,)):
+            evidence = decode_recovery_evidence(row["recovery_evidence_json"])
+            restart = evidence.get("restart")
+            recovering = str(row["state"]) == "RUNNING" and isinstance(restart, dict) \
+                and str(restart.get("phase")) == "ENABLE_CONFIRMED"
+            subtasks = None
+            for o in evidence.get("observations") or []:
+                sig = o.get("signature")
+                if isinstance(sig, list) and len(sig) == 6:
+                    subtasks = {"finished": int(sig[5]), "total": int(sig[0])}
+            cn, pill = _STATE_CN.get(str(row["state"]), (str(row["state"]), "warn"))
+            jobs.append({
+                "id": int(row["id"]), "mall_key": str(row["mall_key"] or ""),
+                "task_name": str(row["task_name"]), "state": str(row["state"]),
+                "state_cn": (cn + " · 自动恢复中") if recovering else cn,
+                "pill": "run" if recovering else pill, "subtasks": subtasks,
+                "created_at": row["created_at"], "updated_at": row["updated_at"],
+                "harvest_attempts": int(row["harvest_attempts"] or 0), "recovering": recovering,
+                "crawl_total": counts.get(int(row["id"]), (0, 0))[0],
+                "crawl_success": counts.get(int(row["id"]), (0, 0))[1],
+                "error_text": row["error_text"], "remote_identity": row["remote_identity"],
+                "recovery_evidence_json": row["recovery_evidence_json"],
+            })
+        return jobs
+    finally:
+        con.close()
+
+
+def project_recovery_timeline(job_row: Mapping) -> dict:
+    evidence = decode_recovery_evidence(job_row.get("recovery_evidence_json"))
+    state = str(job_row.get("state") or "")
+    created = _parse_ts(job_row.get("created_at"))
+    wall = (datetime.now(UTC) - created).total_seconds() if created else 0.0
+    attempts = int(job_row.get("harvest_attempts") or 0)
+    restart = evidence.get("restart")
+    if state == "RECOVERY_EXHAUSTED":
+        phase = "恢复已用尽"
+    elif state == "MANUAL_REQUIRED":
+        phase = "需要人工处理"
+    elif state == "RUNNING" and isinstance(restart, dict) and str(restart.get("phase")) == "ENABLE_CONFIRMED":
+        phase = "自动恢复中"
+    elif state == "RUNNING" and attempts >= RUNNING_PROBE_MIN_HARVEST_ATTEMPTS \
+            and wall >= RUNNING_PROBE_MIN_WALL_SECONDS:
+        phase = "观察中(≠异常)"
+    else:
+        phase = "正常采集"
+    return {"phase": phase, "observations": evidence.get("observations") or [],
+            "restart": restart, "probe_health": evidence.get("probe_health")}

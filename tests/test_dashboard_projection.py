@@ -123,3 +123,58 @@ def test_explanation_sentence_boundaries_no_reversal_reading():
 def test_final_text_surfaces_remote_intent_only_blocker():
     s = _status(final={**_status()["final"], "blocker_summary": {"remote_intent": 1}})
     assert "1 个任务已排队待提交" in compute_overall_status(s)["final_text"]
+
+
+import json
+import sqlite3
+from pathlib import Path
+
+from app.services.dashboard_projection import project_remote_jobs, project_recovery_timeline
+
+
+def _make_db(tmp_path: Path) -> Path:
+    db = tmp_path / "state.sqlite3"
+    con = sqlite3.connect(db)
+    con.executescript("""
+      CREATE TABLE daily_runs(id INTEGER PRIMARY KEY, business_date TEXT, state TEXT DEFAULT 'OPEN',
+        frozen_snapshot_id INTEGER, final_output_path TEXT, final_manifest_hash TEXT,
+        metrics_json TEXT DEFAULT '{}', lease_owner TEXT, lease_expires_at TEXT,
+        created_at TEXT, updated_at TEXT);
+      CREATE TABLE remote_jobs(id INTEGER PRIMARY KEY, run_id INTEGER, logical_key TEXT, task_name TEXT,
+        payload_hash TEXT, mall_key TEXT, input_path TEXT, result_path TEXT, payload_json TEXT,
+        state TEXT, post_attempted INTEGER, remote_identity TEXT, export_path TEXT, result_json TEXT,
+        error_text TEXT, harvest_attempts INTEGER DEFAULT 0, harvest_elapsed_seconds REAL DEFAULT 0,
+        recovery_attempts INTEGER DEFAULT 0, recovery_evidence_json TEXT, created_at TEXT, updated_at TEXT);
+      CREATE TABLE crawl_work(id INTEGER PRIMARY KEY, run_id INTEGER, mall_key TEXT, source_id TEXT,
+        sku_id TEXT, exact_url TEXT, backend_version TEXT, fingerprint TEXT, state TEXT,
+        remote_job_id INTEGER, result_json TEXT, error_text TEXT, updated_at TEXT);
+      INSERT INTO daily_runs(id, business_date) VALUES (1, '2026-08-26');
+      INSERT INTO remote_jobs(id, run_id, logical_key, task_name, payload_hash, mall_key, state,
+        remote_identity, harvest_attempts, recovery_attempts, recovery_evidence_json, created_at, updated_at)
+        VALUES (12, 1, 'k12', 'cnnc_current_opt_jd_1015', 'h', '京东商城', 'RUNNING', 'jd|88231|T1', 9, 1,
+        '{"version":1,"observations":[{"observed_at":"2026-08-26T02:58:00+00:00","progress":{"total":120,"pending":75,"running":0,"failed":0,"waiting_db":0,"finished":45},"signature":[120,75,0,0,0,45],"export_had_result":false,"export_count":0,"export_rsp_desc":"未检索到商品价格信息","task_status_rsp_desc":""}],"restart":{"phase":"ENABLE_CONFIRMED","recovery_at":"2026-08-26T02:53:00+00:00"},"probe_health":null}',
+        '2026-08-26T01:15:00+00:00', '2026-08-26T02:58:00+00:00');
+      INSERT INTO crawl_work(run_id, mall_key, source_id, sku_id, exact_url, backend_version, fingerprint, state, remote_job_id)
+        VALUES (1,'京东商城','a','s','u','legacy','f','SUCCESS',12),
+               (1,'京东商城','b','s2','u2','legacy','f','PENDING',12);
+    """)
+    con.commit(); con.close()
+    return db
+
+
+def test_project_remote_jobs_recovers_and_subtasks(tmp_path):
+    jobs = project_remote_jobs(_make_db(tmp_path), "2026-08-26")
+    assert len(jobs) == 1
+    j = jobs[0]
+    assert j["mall_key"] == "京东商城" and j["state"] == "RUNNING"
+    assert j["state_cn"] == "执行中 · 自动恢复中" and j["recovering"] is True
+    assert j["subtasks"] == {"finished": 45, "total": 120}
+    assert j["crawl_total"] == 2 and j["crawl_success"] == 1
+
+
+def test_recovery_timeline_phase_and_observations(tmp_path):
+    jobs = project_remote_jobs(_make_db(tmp_path), "2026-08-26")
+    tl = project_recovery_timeline(jobs[0])
+    assert tl["phase"] == "自动恢复中"
+    assert tl["observations"][0]["signature"][5] == 45
+    assert tl["restart"]["phase"] == "ENABLE_CONFIRMED"
