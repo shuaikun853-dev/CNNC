@@ -1146,6 +1146,44 @@ class DailyAuditStore:
     def mark_remote_manual(self, token: LeaseToken, job_id: int, error: str) -> dict[str, Any]:
         return self._set_job_state(token, job_id, "MANUAL_REQUIRED", error=error)
 
+    def mark_remote_zero_write_manual(
+        self,
+        token: LeaseToken,
+        job_id: int,
+        *,
+        remote_identity: str,
+        evidence: Mapping[str, Any],
+        error: str,
+    ) -> dict[str, Any]:
+        """Terminalize a proven zero-write recovery outcome atomically.
+
+        The truthful evidence document and the MANUAL_REQUIRED state must
+        land in ONE transaction: writing evidence and state separately could
+        crash between them and strand the write-ahead DISABLE_SENT phase (a
+        pending remote write that never happened) on a terminal job — after
+        a human requeue that fake pending phase would bypass the
+        EXTERNALLY_DISABLED guard and could auto-enable a task a human
+        deliberately disabled.  Legal only from RUNNING with an unburned
+        attempt and the exact confirmed remote identity.
+        """
+        from app.services.remote_running_recovery import encode_recovery_evidence
+
+        normalized_identity = str(remote_identity or "").strip()
+        with self._transaction(immediate=True) as connection:
+            self._validate_lease(connection, token)
+            job = self._job_for_lease(connection, token, job_id)
+            if str(job["state"]) != "RUNNING":
+                raise RemoteIntentConflict("zero-write manual requires the RUNNING state")
+            if int(job["recovery_attempts"] or 0) != 0:
+                raise RemoteIntentConflict("zero-write manual requires an unburned recovery attempt")
+            if not normalized_identity or str(job["remote_identity"] or "").strip() != normalized_identity:
+                raise RemoteIntentConflict("zero-write manual requires the exact confirmed remote identity")
+            connection.execute(
+                "UPDATE remote_jobs SET state='MANUAL_REQUIRED', recovery_evidence_json=?, error_text=?, updated_at=? WHERE id=?",
+                (encode_recovery_evidence(evidence), str(error), self._utcnow(), job_id),
+            )
+            return self._row(connection.execute("SELECT * FROM remote_jobs WHERE id=?", (job_id,)).fetchone())  # type: ignore[return-value]
+
     def requeue_manual_priority_job(
         self,
         token: LeaseToken,

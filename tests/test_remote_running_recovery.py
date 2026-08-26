@@ -3033,3 +3033,207 @@ def test_round5_pre_write_failed_never_withdraws_a_real_pending_phase(tmp_path) 
     _run_pass(store, _probe_payload(), restart, now=NOW + timedelta(minutes=2))
     evidence = json.loads(str(store.get_remote_job(job_id)["recovery_evidence_json"]))
     assert evidence["restart"]["phase"] == "DISABLE_SENT"
+
+
+# ---------------------------------------------------------------------------
+# Review round 6, BLOCKER A: the 5th consecutive PRE_WRITE_FAILED must leave
+# truthful terminal evidence.  The write-ahead DISABLE_SENT persisted before
+# the dispatch is a pending remote write that never happened; keeping it
+# durable on a MANUAL_REQUIRED job would let a later human requeue mistake
+# it for this protocol's own disable and auto-enable an externally disabled
+# task.
+# ---------------------------------------------------------------------------
+
+
+def _run_probe_pass(store, probe, restart, *, now: datetime = NOW) -> dict:
+    """Like _run_pass but takes a callable probe (failure envelopes)."""
+    token = store.acquire_lease(BUSINESS_DATE, "pass-probe", ttl_seconds=300)
+    try:
+        return run_running_recovery_pass(
+            store, token, probe_remote=probe, restart_remote=restart, now=now, can_start=lambda: True
+        )
+    finally:
+        store.release_lease(token)
+
+
+class _NeverRestart:
+    """Any call is a contract violation: paths that provably wrote nothing
+    (pre-write failures, probe failures) must dispatch no remote write."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[int, str | None]] = []
+
+    def __call__(self, job: dict, resume_phase: str | None) -> dict:
+        self.calls.append((int(job["id"]), resume_phase))
+        raise AssertionError("no remote write may be dispatched on this path")
+
+
+class _DangerAwareRestart:
+    """Mimics the adapter resume hazard: a resumed DISABLE_SENT phase on an
+    observed-disabled task is treated as "our own disable succeeded" and
+    proceeds straight to the enable write."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[int, str | None]] = []
+        self.enable_attempts = 0
+
+    def __call__(self, job: dict, resume_phase: str | None) -> dict:
+        self.calls.append((int(job["id"]), resume_phase))
+        if resume_phase in {"DISABLE_SENT", "DISABLE_CONFIRMED"}:
+            self.enable_attempts += 1
+            return {
+                "status": "RESTARTED",
+                "restarted": True,
+                "disable_evidence": {"confirmed_disabled": True},
+                "enable_evidence": {"confirmed_enabled": True},
+            }
+        return {"status": "EXTERNALLY_DISABLED", "restarted": False, "observed_enabled": False}
+
+
+def test_round6_a1_fifth_pre_write_failure_keeps_truthful_terminal_evidence(tmp_path) -> None:
+    from app.services.remote_running_recovery import RECOVERY_MAX_CONSECUTIVE_PRE_WRITE_FAILURES
+
+    store, job_id = _stalled_store(tmp_path)
+    restart = _FakeRestart(
+        [
+            {"status": "PRE_WRITE_FAILED", "restarted": False, "diagnostic": f"pre-write fault {index}"}
+            for index in range(1, RECOVERY_MAX_CONSECUTIVE_PRE_WRITE_FAILURES + 1)
+        ]
+    )
+
+    for index in range(RECOVERY_MAX_CONSECUTIVE_PRE_WRITE_FAILURES):
+        _run_pass(store, _probe_payload(), restart, now=NOW + timedelta(minutes=3 * index))
+        job = store.get_remote_job(job_id)
+        evidence = json.loads(str(job["recovery_evidence_json"]))
+        if index < RECOVERY_MAX_CONSECUTIVE_PRE_WRITE_FAILURES - 1:
+            assert job["state"] == "RUNNING"
+            assert evidence["restart"]["phase"] == "PRE_WRITE_FAILED"
+            assert evidence["restart"]["pre_write_failures"] == index + 1
+
+    job = store.get_remote_job(job_id)
+    evidence = json.loads(str(job["recovery_evidence_json"]))
+    assert job["state"] == "MANUAL_REQUIRED"
+    assert int(job["recovery_attempts"]) == 0
+    assert evidence["restart"]["phase"] == "PRE_WRITE_FAILED"
+    assert evidence["restart"]["phase"] not in ("DISABLE_SENT", "ENABLE_SENT")
+    assert evidence["restart"]["pre_write_failures"] == RECOVERY_MAX_CONSECUTIVE_PRE_WRITE_FAILURES
+    assert evidence["restart"]["failed_status"] == "PRE_WRITE_FAILED"
+    assert evidence["restart"]["diagnostic"] == "pre-write fault 5"
+    assert job["error_text"]
+    assert "no remote write was dispatched" in str(job["error_text"])
+
+
+def test_round6_a2_five_adapter_pre_write_failures_dispatch_zero_writes(tmp_path, monkeypatch) -> None:
+    task = _running_task_record()
+    session = _RestartSession(task)
+    adapter, prepared = _prepared_job(
+        tmp_path, monkeypatch, task, session, auth=_real_auth_manager(tmp_path, _TimingOutAuthOpener())
+    )
+
+    for _ in range(5):
+        outcome = adapter.restart_running_task(prepared, TASK_ID, TASK_NUMBER, timeout_seconds=10.0)
+        assert outcome.status.value == "PRE_WRITE_FAILED"
+
+    assert session.update_calls == []
+    assert session.post_calls == 0
+    assert session.get_calls == 0
+
+
+def test_round6_a4_terminal_diagnostic_is_the_fifth_real_failure(tmp_path) -> None:
+    from app.services.remote_running_recovery import RECOVERY_MAX_CONSECUTIVE_PRE_WRITE_FAILURES
+
+    store, job_id = _stalled_store(tmp_path)
+    restart = _FakeRestart(
+        [
+            {"status": "PRE_WRITE_FAILED", "restarted": False, "diagnostic": f"fault {index}"}
+            for index in range(1, RECOVERY_MAX_CONSECUTIVE_PRE_WRITE_FAILURES + 1)
+        ]
+    )
+
+    for index in range(RECOVERY_MAX_CONSECUTIVE_PRE_WRITE_FAILURES):
+        _run_pass(store, _probe_payload(), restart, now=NOW + timedelta(minutes=3 * index))
+
+    evidence = json.loads(str(store.get_remote_job(job_id)["recovery_evidence_json"]))
+    assert evidence["restart"]["diagnostic"] == "fault 5"
+    assert evidence["restart"]["phase"] == "PRE_WRITE_FAILED"
+
+
+def test_round6_requeue_after_pre_write_cap_never_resumes_stale_phase(tmp_path) -> None:
+    from app.services.remote_running_recovery import RECOVERY_MAX_CONSECUTIVE_PRE_WRITE_FAILURES
+
+    store, job_id = _stalled_store(tmp_path)
+    restart = _FakeRestart(
+        [{"status": "PRE_WRITE_FAILED", "restarted": False, "diagnostic": "auth expired"}]
+    )
+    for index in range(RECOVERY_MAX_CONSECUTIVE_PRE_WRITE_FAILURES):
+        _run_pass(store, _probe_payload(), restart, now=NOW + timedelta(minutes=3 * index))
+    assert store.get_remote_job(job_id)["state"] == "MANUAL_REQUIRED"
+    evidence = json.loads(str(store.get_remote_job(job_id)["recovery_evidence_json"]))
+    assert evidence["restart"]["phase"] == "PRE_WRITE_FAILED"
+
+    # The project's real human requeue path: MANUAL_REQUIRED -> SUBMITTED,
+    # then the ordinary harvest lifecycle returns the job to RUNNING.
+    token = store.acquire_lease(BUSINESS_DATE, "requeue", ttl_seconds=300)
+    store.requeue_manual_harvest_job(
+        token, job_id, remote_identity="lxwl|1269504|RW-20260825150224"
+    )
+    store.reconcile_remote_job(
+        token, job_id, remote_identity="lxwl|1269504|RW-20260825150224", state="RUNNING"
+    )
+    store.release_lease(token)
+    assert store.get_remote_job(job_id)["state"] == "RUNNING"
+
+    # The next pass must treat the job as a FRESH recovery: the truthful
+    # PRE_WRITE_FAILED record is not a pending remote write phase.
+    danger = _DangerAwareRestart()
+
+    def probe(job: dict) -> dict:
+        return _probe_payload()
+
+    _run_probe_pass(store, probe, danger, now=NOW + timedelta(minutes=30))
+    assert [resume_phase for _job_id, resume_phase in danger.calls] == [None]
+    job = store.get_remote_job(job_id)
+    assert job["state"] == "MANUAL_REQUIRED"
+    evidence = json.loads(str(job["recovery_evidence_json"]))
+    assert evidence["restart"]["phase"] not in ("DISABLE_SENT", "ENABLE_SENT")
+
+
+def test_round6_requeued_externally_disabled_task_is_never_auto_enabled(tmp_path) -> None:
+    from app.services.remote_running_recovery import RECOVERY_MAX_CONSECUTIVE_PRE_WRITE_FAILURES
+
+    store, job_id = _stalled_store(tmp_path)
+    restart = _FakeRestart(
+        [{"status": "PRE_WRITE_FAILED", "restarted": False, "diagnostic": "auth expired"}]
+    )
+    for index in range(RECOVERY_MAX_CONSECUTIVE_PRE_WRITE_FAILURES):
+        _run_pass(store, _probe_payload(), restart, now=NOW + timedelta(minutes=3 * index))
+    assert store.get_remote_job(job_id)["state"] == "MANUAL_REQUIRED"
+
+    def requeue_to_running() -> None:
+        token = store.acquire_lease(BUSINESS_DATE, "requeue-x", ttl_seconds=300)
+        store.requeue_manual_harvest_job(
+            token, job_id, remote_identity="lxwl|1269504|RW-20260825150224"
+        )
+        store.reconcile_remote_job(
+            token, job_id, remote_identity="lxwl|1269504|RW-20260825150224", state="RUNNING"
+        )
+        store.release_lease(token)
+
+    def probe(job: dict) -> dict:
+        return _probe_payload()
+
+    danger = _DangerAwareRestart()
+    # TWO full requeue cycles: after the first fresh EXTERNALLY_DISABLED the
+    # job goes manual again; a second requeue must still never resume a
+    # stale pending phase into the enable direction.
+    for cycle in range(2):
+        requeue_to_running()
+        assert store.get_remote_job(job_id)["state"] == "RUNNING"
+        _run_probe_pass(store, probe, danger, now=NOW + timedelta(minutes=30 * (cycle + 1)))
+        assert store.get_remote_job(job_id)["state"] == "MANUAL_REQUIRED"
+
+    assert danger.enable_attempts == 0
+    assert all(resume_phase is None for _job_id, resume_phase in danger.calls)
+    job = store.get_remote_job(job_id)
+    evidence = json.loads(str(job["recovery_evidence_json"]))
+    assert evidence["restart"]["phase"] not in ("DISABLE_SENT", "ENABLE_SENT")

@@ -590,11 +590,29 @@ def _apply_restart(
             except (TypeError, ValueError):
                 consecutive = 1
         if consecutive >= RECOVERY_MAX_CONSECUTIVE_PRE_WRITE_FAILURES:
-            store.mark_remote_manual(
+            # The write-ahead DISABLE_SENT persisted above must be withdrawn
+            # in the SAME transaction that enters MANUAL_REQUIRED: leaving a
+            # pending-remote-write phase that never happened on a terminal
+            # job would (after a human requeue) bypass the EXTERNALLY_DISABLED
+            # guard and could auto-enable a task a human disabled.
+            evidence["restart"] = {
+                "phase": "PRE_WRITE_FAILED",
+                "phase_at": now.astimezone(UTC).isoformat(timespec="seconds"),
+                "failed_status": status,
+                "pre_write_failures": consecutive,
+                "diagnostic": _text(outcome.get("diagnostic")) or status,
+                "manual_reason": "CONSECUTIVE_PRE_WRITE_FAILURE_LIMIT",
+            }
+            store.mark_remote_zero_write_manual(
                 token,
                 job_id,
-                f"remote stall recovery failed pre-write {consecutive} consecutive "
-                f"times; last failure: {_text(outcome.get('diagnostic')) or status}",
+                remote_identity=_text(job.get("remote_identity")),
+                evidence=evidence,
+                error=(
+                    f"remote stall recovery failed pre-write {consecutive} consecutive "
+                    f"times; no remote write was dispatched; last failure: "
+                    f"{_text(outcome.get('diagnostic')) or status}"
+                ),
             )
             return outcome
         evidence["restart"] = {
@@ -636,7 +654,31 @@ def _apply_restart(
             if status == "EXTERNALLY_DISABLED"
             else f"remote stall recovery exact identity failure: {status}"
         )
-        store.mark_remote_manual(token, job_id, f"{reason}; {_text(outcome.get('diagnostic'))}")
+        error = f"{reason}; {_text(outcome.get('diagnostic'))}"
+        if resume_phase is None:
+            # All three statuses are proven zero-write outcomes of a FRESH
+            # protocol: the write-ahead DISABLE_SENT above never became a
+            # real dispatch, so the same invariant as the pre-write cap
+            # applies — no fake pending phase may survive the terminal
+            # manual state (one transaction: evidence + state + error).
+            # Resumed phases keep their real dispatched direction and the
+            # plain manual transition.
+            evidence["restart"] = {
+                "phase": status,
+                "phase_at": now.astimezone(UTC).isoformat(timespec="seconds"),
+                "failed_status": status,
+                "diagnostic": _text(outcome.get("diagnostic")) or status,
+                "manual_reason": "ZERO_WRITE_OUTCOME",
+            }
+            store.mark_remote_zero_write_manual(
+                token,
+                job_id,
+                remote_identity=_text(job.get("remote_identity")),
+                evidence=evidence,
+                error=error,
+            )
+        else:
+            store.mark_remote_manual(token, job_id, error)
         return outcome
     if status == "NO_LONGER_RUNNING":
         # A zero-write decline: the adapter proved the exact task is not
