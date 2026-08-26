@@ -252,6 +252,28 @@ class LegacyPreSendFailure(LegacyZhaoshangAdapterError):
     """The legacy subprocess provably never started; no remote POST occurred."""
 
 
+class LegacyProbeEvidenceError(LegacyZhaoshangAdapterError):
+    """A read-only probe completed with no usable execution evidence.
+
+    Transport success (HTTP answered, no exception) does not by itself prove
+    anything about the remote task: a business-failed, malformed, or
+    contradictory progress payload with no trusted terminal status and no
+    actual export result leaves the execution state unprovable, so the probe
+    refuses to return it as a healthy result and surfaces this typed failure
+    instead.
+    """
+
+
+class RemoteTaskIdentityConflictError(LegacyZhaoshangAdapterError):
+    """The live exact task provably conflicts with the durable remote identity.
+
+    Raised only where the conflict is PROVEN (live task id/number mismatch
+    against the durable identity, a non-unique exact task lookup, or a mall
+    mismatch reported by the external tool).  Malformed payloads, timeouts,
+    and transport faults are NOT identity conflicts and stay untyped.
+    """
+
+
 @dataclass(frozen=True)
 class CrawlRequest:
     mall_key: str
@@ -1774,6 +1796,26 @@ class CnncLegacyZhaoshangAdapter:
                 raise LegacyZhaoshangAdapterError(
                     "export endpoint returned an unparseable count"
                 ) from exc
+        # Probe usability contract (review round 7): reaching this point means
+        # the export endpoint answered with NO actual result, so the only
+        # usable recovery evidence left is a provable execution state.  A
+        # business-failed/malformed/contradictory progress payload whose
+        # status carries no trusted terminal marker leaves the state UNKNOWN:
+        # returning a normal probe would let the runtime count transport
+        # success as probe success and keep the job RUNNING forever.  The
+        # three export_had_result=True early returns above are strong success
+        # evidence and never reach this gate.
+        from app.services.remote_running_recovery import (
+            RemoteExecutionState,
+            classify_remote_execution_state,
+        )
+
+        execution_state = classify_remote_execution_state(parsed_progress, status_desc)
+        if execution_state not in (RemoteExecutionState.ACTIVE, RemoteExecutionState.TERMINAL):
+            raise LegacyProbeEvidenceError(
+                "running task probe returned no usable execution evidence "
+                f"(execution_state={execution_state.value})"
+            )
         return RunningTaskProbe(
             task_id=str(live_task_id),
             task_number=str(live_task_number),

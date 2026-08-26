@@ -2869,30 +2869,23 @@ def test_round5_c0_business_response_truth_table() -> None:
 
 
 def test_round5_c1_failed_progress_counters_are_not_stall_evidence(tmp_path, monkeypatch) -> None:
+    from app.services.legacy_zhaoshang_adapter import LegacyProbeEvidenceError
+
     task = _running_task_record()
     session = _RestartSession(task, progress_success=False)
     adapter, prepared = _prepared_job(tmp_path, monkeypatch, task, session)
 
-    probe = adapter.probe_running_task(prepared, TASK_ID, TASK_NUMBER, timeout_seconds=20.0)
+    # Round 7 BLOCKER A: business-failed progress with no trusted terminal
+    # status and no actual export result is UNUSABLE evidence — the adapter
+    # must refuse to return it as a healthy probe Mapping.
+    with pytest.raises(LegacyProbeEvidenceError):
+        adapter.probe_running_task(prepared, TASK_ID, TASK_NUMBER, timeout_seconds=20.0)
 
-    # The business-failed response's ACTIVE-looking counters are stripped:
-    # the probe carries no provable progress at all.
-    assert probe.progress.get("total") is None
-
-    # Such an observation never proves a stall, so no restart write may be
-    # dispatched for it.
+    # A signature-less observation (legacy/injected shapes) still never
+    # proves a stall, so no restart write may be dispatched for it.
     store, job_id = _stalled_store(tmp_path)
     restart = _FakeRestart([{"status": "RESTARTED", "restarted": True}])
-    payload = {
-        "remote_task_id": probe.task_id,
-        "remote_task_number": probe.task_number,
-        "remote_mall": probe.mall,
-        "progress": dict(probe.progress),
-        "export_count": probe.export_count,
-        "export_rsp_desc": probe.export_rsp_desc,
-        "export_had_result": probe.export_had_result,
-        "task_status_rsp_desc": probe.task_status_rsp_desc,
-    }
+    payload = _probe_payload(progress={}, export_rsp_desc="查询失败")
     _run_pass(store, payload, restart)
     assert restart.calls == []
     assert int(store.get_remote_job(job_id)["recovery_attempts"] or 0) == 0
@@ -2950,13 +2943,17 @@ def test_round5_c4_write_time_failed_progress_dispatches_no_write(tmp_path, monk
 
 
 def test_round5_c5_non_mapping_payload_is_unknown(tmp_path, monkeypatch) -> None:
+    from app.services.legacy_zhaoshang_adapter import LegacyProbeEvidenceError
+
     task = _running_task_record()
     session = _RestartSession(task, progress_payload=["not", "a", "mapping"])
     adapter, prepared = _prepared_job(tmp_path, monkeypatch, task, session)
 
-    probe = adapter.probe_running_task(prepared, TASK_ID, TASK_NUMBER, timeout_seconds=20.0)
-
-    assert probe.progress.get("total") is None
+    # Round 7 BLOCKER A: a non-mapping progress payload with no terminal
+    # status fallback and no export result is unusable evidence, surfaced as
+    # the typed unusable-evidence failure instead of an empty probe Mapping.
+    with pytest.raises(LegacyProbeEvidenceError):
+        adapter.probe_running_task(prepared, TASK_ID, TASK_NUMBER, timeout_seconds=20.0)
 
 
 # ---------------------------------------------------------------------------
@@ -3477,3 +3474,319 @@ def test_round6_recovery_probe_bridge_reports_failure_envelope(tmp_path) -> None
 
     assert outcome["probe_failed"] is True
     assert str(outcome["diagnostic"]).startswith("probe raised ")
+
+
+# ---------------------------------------------------------------------------
+# Round 7, BLOCKER A: a transport-success Mapping is NOT a usable recovery
+# probe.  The adapter owns the usability contract (the layer with the least
+# information loss): a probe that completed with no reliable recovery
+# evidence — business-failed/malformed/contradictory progress AND no trusted
+# terminal status AND no actual export result — must surface as a typed
+# unusable-evidence failure, never as a healthy Mapping that clears the
+# durable probe-failure streak.  Reliable evidence (ACTIVE / TERMINAL
+# progress, terminal status marker, export_had_result) is a SUCCESS probe
+# even when the export answer is a legal no-price count=0.
+# ---------------------------------------------------------------------------
+
+_BRIDGE_REQUEST = {
+    "mall_key": "lxwl",
+    "mall_source_id": "34",
+    "mall_name": "领先未来商城",
+    "sku_id": "sku-1",
+    "url": "https://www.66123123.com/item/1",
+    "backend_version": "legacy-v1",
+}
+
+
+def _bridge_probe(tmp_path, monkeypatch, task, session):
+    """Full production chain for the recovery probe: adapter (fake tool) -> bridge.
+
+    Returns ``(probe_cb, durable)`` where ``durable`` is a reconstructable
+    durable job row, so the test exercises reconstruct -> probe_running_task
+    -> envelope translation exactly like the tick does.
+    """
+    from app.services.incremental_audit_runtime import legacy_zhaoshang_bridge, runtime_paths
+    from app.services.legacy_zhaoshang_adapter import CnncLegacyZhaoshangAdapter
+
+    paths = runtime_paths(BUSINESS_DATE, tmp_path / "runtime")
+    paths.run_dir.mkdir(parents=True, exist_ok=True)
+    batch_state = paths.run_dir / "BATCH_STATE.md"
+    batch_state.write_text("# batch\n", encoding="utf-8")
+    adapter = CnncLegacyZhaoshangAdapter(mappings=[], db_env_path=None, auth_manager=_FakeAuthManager())
+    prepared = adapter.prepare_job(
+        BUSINESS_DATE,
+        [type("Request", (), dict(_BRIDGE_REQUEST, identity=tuple(_BRIDGE_REQUEST.values())))()],
+        paths.run_dir / "input.xlsx",
+        paths.run_dir / "result.xlsx",
+        "cnnc_current_opt_领先未来商城_61284593895349",
+        batch_state,
+    )
+    monkeypatch.setattr(
+        type(adapter),
+        "_load_module",
+        classmethod(lambda cls, path, name: _restart_tool_module(task, session)),
+    )
+    _planner, _finalizer, _submitter, _harvester, probe_cb, _restart_cb = legacy_zhaoshang_bridge(
+        adapter, paths=paths, business_date=BUSINESS_DATE
+    )
+    durable = {
+        "id": 1,
+        "logical_key": prepared.logical_job_key,
+        "task_name": "cnnc_current_opt_领先未来商城_61284593895349",
+        "payload_hash": prepared.payload_sha256,
+        "payload_json": json.dumps({"requests": [dict(_BRIDGE_REQUEST)], "batch_state": str(batch_state)}),
+        "input_path": str(prepared.template_path),
+        "result_path": str(prepared.result_path),
+        "remote_identity": "lxwl|1269504|RW-20260825150224",
+    }
+    return probe_cb, durable
+
+
+class _DownloadExportSession(_RestartSession):
+    """exportTask answers with a real download URL instead of no-price."""
+
+    def post(self, url, json=None, timeout=None):
+        if "exportTask" in url:
+            return _FakeRestartResponse(
+                {"data": {"url": "https://files.invalid/export.xlsx"}, "success": True}
+            )
+        return super().post(url, json=json, timeout=timeout)
+
+
+def test_round7_a1_business_failed_progress_chain_is_durable_failure(tmp_path, monkeypatch) -> None:
+    from app.services.remote_running_recovery import RECOVERY_MAX_CONSECUTIVE_PROBE_FAILURES
+
+    task = _running_task_record()
+    session = _RestartSession(
+        task,
+        progress_success=False,
+        status_payload={"success": False, "rspCode": "8888", "rspDesc": "查询失败"},
+    )
+    probe_cb, durable = _bridge_probe(tmp_path, monkeypatch, task, session)
+
+    outcome = probe_cb(durable, 60.0)
+    # HTTP transport succeeded, but the probe carries no usable execution
+    # evidence: business-failed progress + business-failed status + count=0
+    # export.  The bridge must surface a typed unusable-evidence failure —
+    # today it returns a healthy-looking Mapping.
+    assert outcome["probe_failed"] is True
+    assert outcome["failure_kind"] == "UNUSABLE_EVIDENCE"
+
+    store, job_id = _stalled_store(tmp_path / "state")
+    restart = _NeverRestart()
+    for index in range(RECOVERY_MAX_CONSECUTIVE_PROBE_FAILURES):
+        _run_probe_pass(store, lambda job: outcome, restart, now=NOW + timedelta(minutes=3 * index))
+        if index < RECOVERY_MAX_CONSECUTIVE_PROBE_FAILURES - 1:
+            job = store.get_remote_job(job_id)
+            assert job["state"] == "RUNNING"
+            evidence = json.loads(str(job["recovery_evidence_json"]))
+            assert evidence["probe_health"]["consecutive_failures"] == index + 1
+    job = store.get_remote_job(job_id)
+    assert job["state"] == "MANUAL_REQUIRED"
+    assert restart.calls == []
+    assert int(job["recovery_attempts"]) == 0
+
+
+def test_round7_a2_failed_progress_plus_healthy_terminal_status_is_usable(tmp_path, monkeypatch) -> None:
+    task = _running_task_record()
+    session = _RestartSession(
+        task,
+        progress_success=False,
+        status_rsp_desc="本次任务执行完毕",
+    )
+    adapter, prepared = _prepared_job(tmp_path, monkeypatch, task, session)
+
+    probe = adapter.probe_running_task(prepared, TASK_ID, TASK_NUMBER, timeout_seconds=20.0)
+
+    # The trusted terminal marker alone is sufficient recovery evidence.
+    assert probe.task_status_rsp_desc == "本次任务执行完毕"
+    assert probe.progress.get("total") is None
+
+    store, job_id = _stalled_store(tmp_path / "state")
+    payload = {
+        "remote_task_id": probe.task_id,
+        "remote_task_number": probe.task_number,
+        "remote_mall": probe.mall,
+        "progress": dict(probe.progress),
+        "export_count": probe.export_count,
+        "export_rsp_desc": probe.export_rsp_desc,
+        "export_had_result": probe.export_had_result,
+        "task_status_rsp_desc": probe.task_status_rsp_desc,
+    }
+    _run_probe_pass(store, lambda job: payload, _NeverRestart())
+    evidence = json.loads(str(store.get_remote_job(job_id)["recovery_evidence_json"]))
+    assert evidence.get("probe_health") is None
+    assert len(evidence["observations"]) == 5
+
+
+def test_round7_a3_failed_progress_plus_export_result_is_usable(tmp_path, monkeypatch) -> None:
+    task = _running_task_record()
+    session = _DownloadExportSession(task, progress_success=False)
+    adapter, prepared = _prepared_job(tmp_path, monkeypatch, task, session)
+
+    probe = adapter.probe_running_task(prepared, TASK_ID, TASK_NUMBER, timeout_seconds=20.0)
+
+    assert probe.export_had_result is True
+    assert probe.progress.get("total") is None
+
+    store, job_id = _stalled_store(tmp_path / "state")
+    payload = {
+        "remote_task_id": probe.task_id,
+        "remote_task_number": probe.task_number,
+        "remote_mall": probe.mall,
+        "progress": dict(probe.progress),
+        "export_count": probe.export_count,
+        "export_rsp_desc": probe.export_rsp_desc,
+        "export_had_result": probe.export_had_result,
+        "task_status_rsp_desc": probe.task_status_rsp_desc,
+    }
+    _run_probe_pass(store, lambda job: payload, _NeverRestart())
+    evidence = json.loads(str(store.get_remote_job(job_id)["recovery_evidence_json"]))
+    assert evidence.get("probe_health") is None
+    assert len(evidence["observations"]) == 5
+
+
+def test_round7_a5_contradictory_progress_without_fallback_is_unusable(tmp_path, monkeypatch) -> None:
+    from app.services.legacy_zhaoshang_adapter import LegacyProbeEvidenceError
+
+    task = _running_task_record()
+    session = _RestartSession(
+        task,
+        progress_rsp_desc="总任务量：10条，待执行：0条，执行中：0条，失败：5条，待入库：0条，执行完成：10条",
+    )
+    adapter, prepared = _prepared_job(tmp_path, monkeypatch, task, session)
+
+    with pytest.raises(LegacyProbeEvidenceError):
+        adapter.probe_running_task(prepared, TASK_ID, TASK_NUMBER, timeout_seconds=20.0)
+
+
+def test_round7_a6_healthy_active_progress_is_usable(tmp_path, monkeypatch) -> None:
+    from app.services.remote_running_recovery import RemoteExecutionState, classify_remote_execution_state
+
+    task = _running_task_record()
+    session = _RestartSession(task)
+    adapter, prepared = _prepared_job(tmp_path, monkeypatch, task, session)
+
+    probe = adapter.probe_running_task(prepared, TASK_ID, TASK_NUMBER, timeout_seconds=20.0)
+
+    assert (
+        classify_remote_execution_state(probe.progress, probe.task_status_rsp_desc)
+        is RemoteExecutionState.ACTIVE
+    )
+
+
+def test_round7_a7_healthy_terminal_progress_is_usable_success_probe(tmp_path, monkeypatch) -> None:
+    task = _running_task_record()
+    session = _RestartSession(task, progress_rsp_desc=_TERMINAL_PROGRESS_RSP)
+    adapter, prepared = _prepared_job(tmp_path, monkeypatch, task, session)
+
+    probe = adapter.probe_running_task(prepared, TASK_ID, TASK_NUMBER, timeout_seconds=20.0)
+
+    assert probe.progress["finished"] == 10
+
+    store, job_id = _stalled_store(tmp_path / "state")
+    payload = {
+        "remote_task_id": probe.task_id,
+        "remote_task_number": probe.task_number,
+        "remote_mall": probe.mall,
+        "progress": dict(probe.progress),
+        "export_count": probe.export_count,
+        "export_rsp_desc": probe.export_rsp_desc,
+        "export_had_result": probe.export_had_result,
+        "task_status_rsp_desc": probe.task_status_rsp_desc,
+    }
+    _run_probe_pass(store, lambda job: payload, _NeverRestart())
+    evidence = json.loads(str(store.get_remote_job(job_id)["recovery_evidence_json"]))
+    # TERMINAL is success read evidence, never a probe failure.
+    assert evidence.get("probe_health") is None
+    assert len(evidence["observations"]) == 5
+
+
+def test_round7_a9_probe_health_reset_by_actual_export_result(tmp_path, monkeypatch) -> None:
+    task = _running_task_record()
+    session = _DownloadExportSession(task, progress_success=False)
+    adapter, prepared = _prepared_job(tmp_path, monkeypatch, task, session)
+
+    probe = adapter.probe_running_task(prepared, TASK_ID, TASK_NUMBER, timeout_seconds=20.0)
+    assert probe.export_had_result is True
+
+    store, job_id = _stalled_store(tmp_path / "state")
+    failing = lambda job: {"probe_failed": True, "diagnostic": "probe raised TimeoutError"}
+    _run_probe_pass(store, failing, None, now=NOW)
+    _run_probe_pass(store, failing, None, now=NOW + timedelta(minutes=3))
+    _run_probe_pass(store, failing, None, now=NOW + timedelta(minutes=6))
+    evidence = json.loads(str(store.get_remote_job(job_id)["recovery_evidence_json"]))
+    assert evidence["probe_health"]["consecutive_failures"] == 3
+
+    payload = {
+        "remote_task_id": probe.task_id,
+        "remote_task_number": probe.task_number,
+        "remote_mall": probe.mall,
+        "progress": dict(probe.progress),
+        "export_count": probe.export_count,
+        "export_rsp_desc": probe.export_rsp_desc,
+        "export_had_result": probe.export_had_result,
+        "task_status_rsp_desc": probe.task_status_rsp_desc,
+    }
+    _run_probe_pass(store, lambda job: payload, None, now=NOW + timedelta(minutes=9))
+    evidence = json.loads(str(store.get_remote_job(job_id)["recovery_evidence_json"]))
+    assert evidence.get("probe_health") is None
+
+
+def test_round7_a10_failed_status_terminal_text_plus_active_progress_is_active(tmp_path, monkeypatch) -> None:
+    task = _running_task_record()
+    session = _RestartSession(
+        task,
+        status_success=False,
+        status_rsp_desc="本次任务执行完毕",
+    )
+    adapter, prepared = _prepared_job(tmp_path, monkeypatch, task, session)
+
+    probe = adapter.probe_running_task(prepared, TASK_ID, TASK_NUMBER, timeout_seconds=20.0)
+
+    assert probe.task_status_rsp_desc == ""
+    assert probe.progress["total"] == 10
+
+    store, job_id = _stalled_store(tmp_path / "state")
+    payload = {
+        "remote_task_id": probe.task_id,
+        "remote_task_number": probe.task_number,
+        "remote_mall": probe.mall,
+        "progress": dict(probe.progress),
+        "export_count": probe.export_count,
+        "export_rsp_desc": probe.export_rsp_desc,
+        "export_had_result": probe.export_had_result,
+        "task_status_rsp_desc": probe.task_status_rsp_desc,
+    }
+    # No restart callback: this test is about probe usability, not the write
+    # gate (a healthy ACTIVE no-price observation may legitimately authorize
+    # the stall protocol on a stalled seed).
+    _run_probe_pass(store, lambda job: payload, None)
+    evidence = json.loads(str(store.get_remote_job(job_id)["recovery_evidence_json"]))
+    # Healthy ACTIVE progress keeps the probe usable despite the failed status.
+    assert evidence.get("probe_health") is None
+
+
+def test_round7_a11_unusable_probe_is_a_failure_not_a_streak_reset(tmp_path, monkeypatch) -> None:
+    task = _running_task_record()
+    session = _RestartSession(
+        task,
+        progress_success=False,
+        status_payload={"success": False, "rspCode": "8888", "rspDesc": "查询失败"},
+    )
+    probe_cb, durable = _bridge_probe(tmp_path, monkeypatch, task, session)
+    unusable = probe_cb(durable, 60.0)
+
+    store, job_id = _stalled_store(tmp_path / "state")
+    failing = lambda job: {"probe_failed": True, "diagnostic": "probe raised TimeoutError"}
+    _run_probe_pass(store, failing, None, now=NOW)
+    _run_probe_pass(store, failing, None, now=NOW + timedelta(minutes=3))
+    _run_probe_pass(store, lambda job: unusable, None, now=NOW + timedelta(minutes=6))
+    # The unusable probe must extend the streak to 3 — today the raw Mapping
+    # clears it instead.
+    evidence = json.loads(str(store.get_remote_job(job_id)["recovery_evidence_json"]))
+    assert evidence["probe_health"]["consecutive_failures"] == 3
+
+    _run_probe_pass(store, lambda job: _probe_payload(), None, now=NOW + timedelta(minutes=9))
+    evidence = json.loads(str(store.get_remote_job(job_id)["recovery_evidence_json"]))
+    assert evidence.get("probe_health") is None

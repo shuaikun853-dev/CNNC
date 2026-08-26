@@ -59,6 +59,7 @@ from app.services.legacy_zhaoshang_adapter import (
     CnncLegacyZhaoshangAdapter,
     CrawlRequest,
     HarvestStatus,
+    LegacyProbeEvidenceError,
     PriorityStatus,
     ReconcileStatus,
     RestartStatus,
@@ -1448,6 +1449,18 @@ def legacy_zhaoshang_bridge(
             probe = adapter.probe_running_task(
                 prepared_job, task_id, task_number, float(timeout_seconds)
             )
+        except LegacyProbeEvidenceError:
+            # Round 7 BLOCKER A: the probe completed at the transport level
+            # but the adapter proved it carries no usable execution evidence
+            # (business-failed/malformed/contradictory progress, no trusted
+            # terminal status, no actual export result).  This is a durable
+            # probe failure for the recovery pass, distinct from transient
+            # transport faults only by kind — both count toward the cap.
+            return {
+                "probe_failed": True,
+                "failure_kind": "UNUSABLE_EVIDENCE",
+                "diagnostic": "probe raised LegacyProbeEvidenceError",
+            }
         except Exception as exc:
             # A probe that cannot re-confirm the exact remote task proves
             # nothing and never blocks the tick — but since Round 6 the
