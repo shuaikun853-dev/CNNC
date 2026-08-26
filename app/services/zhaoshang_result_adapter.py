@@ -9,6 +9,14 @@ from openpyxl import load_workbook
 
 from app.services.saas_audit_core import normalize_cell_str, parse_decimal
 
+# Single source of truth for the Chinese classification literals. Both result
+# readers must emit identical semantics; the identity reader once carried
+# double-encoded mojibake copies of these strings (P1-1).
+PRICE_SOURCE_ZHAOSHANG = "招商局"
+PRICE_SOURCE_PRICE_NOT_VISIBLE = "招商局-价格不可见"
+RESULT_STATUS_SUCCESS = "成功"
+RESULT_STATUS_UNKNOWN = "未知"
+
 
 def normalize_result_url(value: Any) -> str:
     """The legacy result key is the exact URL after surrounding whitespace only."""
@@ -164,13 +172,13 @@ def read_zhaoshang_result_xlsx_by_identity(
             status = str(row[status_index]).strip() if 0 <= status_index < len(row) and row[status_index] is not None else ""
             reason = str(row[reason_index]).strip() if 0 <= reason_index < len(row) and row[reason_index] is not None else ""
             if price is not None and price > 0:
-                page_status, source = "OK", "鎷涘晢灞€"
+                page_status, source = "OK", PRICE_SOURCE_ZHAOSHANG
             elif price is not None and price == 0:
-                page_status, source = "PRICE_IS_ZERO", "鎷涘晢灞€"
-            elif "鎴愬姛" in status:
-                page_status, source = "PRICE_MISSING", "鎷涘晢灞€-浠锋牸涓嶅彲瑙?"
+                page_status, source = "PRICE_IS_ZERO", PRICE_SOURCE_ZHAOSHANG
+            elif RESULT_STATUS_SUCCESS in status:
+                page_status, source = "PRICE_MISSING", PRICE_SOURCE_PRICE_NOT_VISIBLE
             else:
-                page_status, source = "FAILED", "鎷涘晢灞€-" + (reason or status or "鏈煡")
+                page_status, source = "FAILED", PRICE_SOURCE_ZHAOSHANG + "-" + (reason or status or RESULT_STATUS_UNKNOWN)
             if identity in results:
                 raise ValueError("result workbook contains duplicate crawl identity")
             results[identity] = {
@@ -242,13 +250,13 @@ def read_zhaoshang_result_xlsx(
             status = str(row[status_index]).strip() if 0 <= status_index < len(row) and row[status_index] is not None else ""
             reason = str(row[reason_index]).strip() if 0 <= reason_index < len(row) and row[reason_index] is not None else ""
             if price is not None and price > 0:
-                page_status, source = "OK", "招商局"
+                page_status, source = "OK", PRICE_SOURCE_ZHAOSHANG
             elif price is not None and price == 0:
-                page_status, source = "PRICE_IS_ZERO", "招商局"
-            elif "成功" in status:
-                page_status, source = "PRICE_MISSING", "招商局-价格不可见"
+                page_status, source = "PRICE_IS_ZERO", PRICE_SOURCE_ZHAOSHANG
+            elif RESULT_STATUS_SUCCESS in status:
+                page_status, source = "PRICE_MISSING", PRICE_SOURCE_PRICE_NOT_VISIBLE
             else:
-                page_status, source = "FAILED", "招商局-" + (reason or status or "未知")
+                page_status, source = "FAILED", PRICE_SOURCE_ZHAOSHANG + "-" + (reason or status or RESULT_STATUS_UNKNOWN)
             results[url] = {"product_code": code, "page_price_value": price, "page_price_status": page_status, "page_price_source": source}
         return results
     finally:
