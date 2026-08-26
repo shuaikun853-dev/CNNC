@@ -62,23 +62,16 @@ python -m pytest tests\test_incremental_audit_operations.py -k "scheduler or sch
 python -m pytest tests\test_harvest_only.py -q  # 白天 harvest-only：无 discovery/Detail/Model/submit/finalize、本地 NOOP、全量 sweep、幂等
 python -m pytest tests\test_incremental_price_audit.py tests\test_incremental_audit_runtime.py -k "existing_remote_drain or drain_only" -q; python -m pytest tests\test_remote_running_recovery.py -q  # RUNNING 停滞判定/一次性精确重启/RECOVERY_EXHAUSTED 终态（全 fake adapter）
 python -m pytest tests\test_daily_audit_store.py tests\test_incremental_audit_runtime.py tests\test_incremental_audit_operations.py -k "process_lock or writer_lock or lock_conflict or lock_status or active_writer or materialization_remains" -q
-python -m pytest `
-  tests\test_daily_audit_store.py `
-  tests\test_cnnc_saas_snapshot_adapter.py `
-  tests\test_saas_audit_core.py `
-  tests\test_title_match_model_retry.py `
-  tests\test_incremental_price_audit.py `
-  tests\test_incremental_audit_runtime.py `
-  tests\test_harvest_only.py `
-  tests\test_incremental_audit_operations.py tests\test_incremental_audit_resilience.py tests\test_incremental_audit_recovery.py tests\test_scheduler_frequency_simulation.py `
-  tests\test_partial_exact_harvest.py `
-  tests\test_incremental_price_audit_finalize.py `
-  tests\test_incremental_production_readiness_audit.py `
-  tests\test_incremental_audit_materializer.py `
-  tests\test_legacy_zhaoshang_adapter.py `
+python -m pytest tests\test_daily_audit_store.py tests\test_cnnc_saas_snapshot_adapter.py tests\test_saas_audit_core.py tests\test_title_match_model_retry.py tests\test_incremental_price_audit.py tests\test_incremental_audit_runtime.py tests\test_harvest_only.py `
+  tests\test_incremental_audit_operations.py tests\test_incremental_audit_resilience.py tests\test_incremental_audit_recovery.py tests\test_scheduler_frequency_simulation.py tests\test_partial_exact_harvest.py `
+  tests\test_incremental_price_audit_finalize.py tests\test_incremental_production_readiness_audit.py tests\test_incremental_audit_materializer.py tests\test_legacy_zhaoshang_adapter.py `
   tests\test_incremental_price_audit_history.py tests\test_incremental_history_benchmark.py -q
 ```
 历史 fixture 缺失时，最后一项会 skip；不得用生产接口补齐它。
+### Dashboard 测试（只读看板）
+`tests\test_dashboard_projection.py`（投影/分级/日历/scheduler 降级/fingerprint）+ `tests\test_dashboard_api.py`（GET-only、400/503、ETag/304、自启脚本与 runbook 的 -Apply 门控）：
+`E:\Python314\python.exe -m pytest tests\test_dashboard_projection.py tests\test_dashboard_api.py -q --basetemp=runtime\pytest-tmp\dash`
+fixture 原则：只用 `tmp_path` 下的临时 SQLite/`daily_status.json` 或 monkeypatch 替身，不碰生产 `runtime\incremental_price_audit`；不注册真实计划任务，自启用例只读文本、从不执行 `-Apply`。
 ### 编译检查
 
 ```powershell

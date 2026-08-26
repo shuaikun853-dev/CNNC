@@ -69,3 +69,23 @@ def test_static_assets_served(client):
     assert "cdn" not in css.lower() and "http://" not in css and "https://" not in css  # 零外链
     for hook in ("hero", "attn", "stages", "zs", "final", "more", "jobs-table", "drawer", "tech", "conn-lost", "live", "refresh", "jobs-toggle"):
         assert hook in html, hook
+
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_autostart_scripts_exist_with_apply_gate():
+    reg = (ROOT / "scripts" / "register_dashboard_autostart.ps1").read_text(encoding="utf-8")
+    un = (ROOT / "scripts" / "unregister_dashboard_autostart.ps1").read_text(encoding="utf-8")
+    for text in (reg, un):
+        assert "CNNC-Dashboard-ReadOnly" in text
+        assert "CNNC-PriceAudit-Incremental" not in text        # 不触碰现有审计任务(字面名禁止)
+        assert "127.0.0.1" in text and "8765" in text
+    assert "-Apply" in reg and "预览" in reg
+    assert "-Apply" in un and "预览" in un
+
+
+def test_dashboard_runbook_exists():
+    text = (ROOT / "docs" / "runbooks" / "STEP_1_DASHBOARD.md").read_text(encoding="utf-8")
+    assert "只读" in text and "127.0.0.1" in text and "8765" in text
+    assert "-Apply" in text
