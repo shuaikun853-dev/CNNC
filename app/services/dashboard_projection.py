@@ -314,13 +314,16 @@ def _run_schtasks_query() -> bytes | None:
         proc = _subprocess.run(
             ["schtasks", "/query", "/tn", SCHEDULER_TASK_NAME, "/xml"],
             capture_output=True, timeout=10, check=False)
-    except OSError:
+    except (OSError, _subprocess.TimeoutExpired):
         return None
     return proc.stdout if proc.returncode == 0 and proc.stdout else None
 
 
 def project_scheduler_status() -> dict:
-    raw = _run_schtasks_query()
+    try:
+        raw = _run_schtasks_query()
+    except (OSError, _subprocess.TimeoutExpired):
+        return {"available": False}
     if raw is None:
         return {"available": False}
     try:

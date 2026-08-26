@@ -242,3 +242,14 @@ def test_scheduler_status_degrades(monkeypatch):
     monkeypatch.setattr(dp, "_run_schtasks_query", lambda: None)
     out = dp.project_scheduler_status()
     assert out == {"available": False}
+
+
+def test_scheduler_status_degrades_on_timeout(monkeypatch):
+    import subprocess as sp
+    import app.services.dashboard_projection as dp
+
+    def boom():
+        raise sp.TimeoutExpired(cmd=["schtasks"], timeout=10)
+
+    monkeypatch.setattr(dp, "_run_schtasks_query", boom)
+    assert dp.project_scheduler_status() == {"available": False}
