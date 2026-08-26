@@ -211,3 +211,34 @@ def test_recovery_timeline_plain_completed_is_normal(tmp_path):
     con.commit(); con.close()
     jobs = project_remote_jobs(db, "2026-08-26")
     assert project_recovery_timeline(jobs[0])["phase"] == "正常采集"
+
+
+from app.services.dashboard_projection import project_recent_days, _translate_task_result
+
+
+def test_recent_days_from_daily_status_json(tmp_path):
+    import json
+    (tmp_path / "2026-08-25").mkdir()
+    (tmp_path / "2026-08-25" / "daily_status.json").write_text(json.dumps({
+        "state": "FINALIZED", "final": {"finalized": True, "forced": False, "output_exists": True},
+        "crawl": {"no_result": 0}}), encoding="utf-8")
+    (tmp_path / "2026-08-24").mkdir()
+    (tmp_path / "2026-08-24" / "daily_status.json").write_text(json.dumps({
+        "state": "OPEN", "final": {"finalized": False, "forced": False}}), encoding="utf-8")
+    days = project_recent_days(tmp_path, n=3, today="2026-08-26")
+    assert {"date": "2026-08-25", "class": "ok"} in days
+    assert {"date": "2026-08-24", "class": "err"} in days
+    assert {"date": "2026-08-26", "class": "none"} in days
+
+
+def test_translate_task_result_known_codes():
+    assert "正在运行" in _translate_task_result(267009)
+    assert _translate_task_result(0).startswith("上次运行成功")
+    assert "未知" in _translate_task_result(-1)
+
+
+def test_scheduler_status_degrades(monkeypatch):
+    import app.services.dashboard_projection as dp
+    monkeypatch.setattr(dp, "_run_schtasks_query", lambda: None)
+    out = dp.project_scheduler_status()
+    assert out == {"available": False}

@@ -261,3 +261,81 @@ def project_recovery_timeline(job_row: Mapping) -> dict:
         phase = "正常采集"
     return {"phase": phase, "observations": evidence.get("observations") or [],
             "restart": restart, "probe_health": evidence.get("probe_health")}
+
+
+import json as _json
+import subprocess as _subprocess
+import xml.etree.ElementTree as _ET
+from datetime import date as _date, timedelta as _timedelta
+
+SCHEDULER_TASK_NAME = "CNNC-PriceAudit-Incremental"
+_RUNNING_CODES = {267009, 0x41301}
+
+
+def project_recent_days(runtime_root, n: int = 14, *, today: str | None = None) -> list[dict]:
+    root = Path(runtime_root)
+    start = _date.fromisoformat(today) if today else _date.today()
+    out: list[dict] = []
+    for i in range(n):
+        day = (start - _timedelta(days=i)).isoformat()
+        status_file = root / day / "daily_status.json"
+        if not status_file.is_file():
+            out.append({"date": day, "class": "none"}); continue
+        try:
+            data = _json.loads(status_file.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            out.append({"date": day, "class": "none"}); continue
+        final = data.get("final") or {}
+        if final.get("finalized"):
+            cls = "warn" if final.get("forced") or (data.get("crawl") or {}).get("no_result", 0) else "ok"
+        else:
+            cls = "err"
+        out.append({"date": day, "class": cls})
+    out.reverse()
+    return out
+
+
+def _translate_task_result(code) -> str:
+    try:
+        code = int(code)
+    except (TypeError, ValueError):
+        return f"结果码未知:{code}"
+    if code in _RUNNING_CODES:
+        return "当前计划任务正在运行"
+    if code == 0:
+        return "上次运行成功"
+    if code == 0x41306:
+        return "上次运行被终止"
+    return f"上次运行结果码 {code}(未知,详情见技术说明)"
+
+
+def _run_schtasks_query() -> bytes | None:
+    try:
+        proc = _subprocess.run(
+            ["schtasks", "/query", "/tn", SCHEDULER_TASK_NAME, "/xml"],
+            capture_output=True, timeout=10, check=False)
+    except OSError:
+        return None
+    return proc.stdout if proc.returncode == 0 and proc.stdout else None
+
+
+def project_scheduler_status() -> dict:
+    raw = _run_schtasks_query()
+    if raw is None:
+        return {"available": False}
+    try:
+        root = _ET.fromstring(raw)
+        ns = {"t": root.tag.split("}")[0].strip("{")} if root.tag.startswith("{") else {"t": ""}
+        def _text(tag: str):
+            el = root.find(f".//t:{tag}", ns)
+            return el.text.strip() if el is not None and el.text else None
+        result = _text("LastTaskResult")
+        code = int(result, 16) if result and result.lower().startswith("0x") else (int(result) if result and result.isdigit() else None)
+        return {"available": True,
+                "running": code in _RUNNING_CODES if code is not None else None,
+                "last_run": _text("LastRunTime"),
+                "last_result": result,
+                "last_result_cn": _translate_task_result(code) if code is not None else None,
+                "next_run": _text("NextRunTime")}
+    except (_ET.ParseError, ValueError, TypeError):
+        return {"available": False}
