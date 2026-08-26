@@ -138,6 +138,15 @@ RECOVERY_WRITE_CONFIRM_WINDOW_SECONDS = 900.0
 # pre-Round-5 confirmation window did — the cap counts consecutive
 # zero-write failures without guessing from the exception type.
 RECOVERY_MAX_CONSECUTIVE_PRE_WRITE_FAILURES = 5
+# Durable cap for persistent recovery-PROBE faults (expired refreshToken,
+# missing external tool, persistent transport outage): consecutive failures
+# of the read-only probe itself fail closed to manual so a permanently
+# broken probe cannot keep a job RUNNING forever.  Independent of the
+# pre-write constant — probe health and the restart protocol are different
+# stages, and only the RUNNING-stall recovery probe feeds this counter
+# (never harvest/submit/priority/discovery).  5 is an engineering safety
+# threshold, not a production-calibrated one.
+RECOVERY_MAX_CONSECUTIVE_PROBE_FAILURES = 5
 # Durable restart phases that already dispatched (or durably recorded) a
 # remote side effect.  A job carrying one of them is an EXISTING recovery
 # protocol: the next pass reconciles the phase against the live remote state
@@ -247,26 +256,36 @@ def canonical_progress_signature(progress: Mapping[str, Any]) -> tuple[int, ...]
 
 
 def decode_recovery_evidence(value: object) -> dict[str, Any]:
-    """Decode the durable recovery document; legacy/absent rows return a fresh one."""
+    """Decode the durable recovery document; legacy/absent rows return a fresh one.
+
+    ``probe_health`` (durable consecutive recovery-probe failures) is kept
+    strictly separate from ``restart``: a probe failure has not entered the
+    restart protocol.  Legacy documents predate the field and default to
+    ``None`` — a missing field is zero consecutive failures, never a cap.
+    """
     raw = _text(value)
     if not raw:
-        return {"version": 1, "observations": [], "restart": None}
+        return {"version": 1, "observations": [], "restart": None, "probe_health": None}
     try:
         decoded = json.loads(raw)
     except (TypeError, ValueError, json.JSONDecodeError):
-        return {"version": 1, "observations": [], "restart": None}
+        return {"version": 1, "observations": [], "restart": None, "probe_health": None}
     if not isinstance(decoded, dict):
-        return {"version": 1, "observations": [], "restart": None}
+        return {"version": 1, "observations": [], "restart": None, "probe_health": None}
     observations = decoded.get("observations")
     if not isinstance(observations, list):
         observations = []
     restart = decoded.get("restart")
     if not isinstance(restart, dict):
         restart = None
+    probe_health = decoded.get("probe_health")
+    if not isinstance(probe_health, dict):
+        probe_health = None
     return {
         "version": 1,
         "observations": [row for row in observations if isinstance(row, dict)],
         "restart": restart,
+        "probe_health": probe_health,
     }
 
 
@@ -873,10 +892,34 @@ def run_running_recovery_pass(
             continue
         counters["recovery_probe_attempts"] += 1
         probe = probe_remote(job)
-        if not isinstance(probe, Mapping):
+        probe_failed = isinstance(probe, Mapping) and probe.get("probe_failed") is True
+        if probe_failed or not isinstance(probe, Mapping):
+            # A probe that ran but produced no legal read-only evidence is a
+            # retryable fault — but a PERSISTENT one must fail closed, or a
+            # permanently broken probe (expired refreshToken, missing tool,
+            # transport outage) leaves the job RUNNING forever.  Counting is
+            # scoped to this recovery probe stage only; probe health lives
+            # beside (never inside) restart.phase because a probe failure
+            # has not entered the restart protocol.
+            store.record_remote_recovery_probe_failure(
+                token,
+                int(job["id"]),
+                remote_identity=_text(job.get("remote_identity")),
+                failed_at=now.astimezone(UTC).isoformat(timespec="seconds"),
+                failure_reason=(
+                    _text(probe.get("diagnostic"))
+                    if probe_failed
+                    else "probe callback returned no evidence"
+                ),
+            )
             continue
         counters["recovery_probes"] += 1
         evidence = decode_recovery_evidence(job.get("recovery_evidence_json"))
+        if evidence.get("probe_health") is not None:
+            # A legal observation proves the probe path works: the streak
+            # ends in the SAME evidence write that appends the observation
+            # (one transaction — no crash gap can resurrect the old count).
+            del evidence["probe_health"]
         evidence["observations"].append(observation_from_probe(probe, now=now))
         job = store.update_remote_recovery_evidence(token, int(job["id"]), evidence)
         decision = evaluate_running_stall(job, now=now)

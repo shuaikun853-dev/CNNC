@@ -1329,7 +1329,7 @@ def test_case_c2_failed_probes_share_the_allowance_with_successful_ones(tmp_path
     assert counters["recovery_probes"] == 2
 
 
-def test_case_c3_failed_probe_writes_nothing_and_stays_harvestable(tmp_path) -> None:
+def test_case_c3_failed_probe_records_probe_health_and_stays_harvestable(tmp_path) -> None:
     store = DailyAuditStore(tmp_path / "state.sqlite3")
     job_ids = _seed_candidate_jobs(store, 1)
 
@@ -1345,7 +1345,13 @@ def test_case_c3_failed_probe_writes_nothing_and_stays_harvestable(tmp_path) -> 
         store.release_lease(token)
     refreshed = store.get_remote_job(job_ids[0])
     assert refreshed["state"] == "RUNNING"
-    assert refreshed["recovery_evidence_json"] is None
+    # Round 6: a failed probe durably records probe_health (no observation,
+    # no restart-protocol phase) so a persistent probe fault cannot keep the
+    # job RUNNING forever; the job itself stays harvestable.
+    evidence = json.loads(str(refreshed["recovery_evidence_json"]))
+    assert evidence["observations"] == []
+    assert evidence["restart"] is None
+    assert evidence["probe_health"]["consecutive_failures"] == 1
 
 
 # ---------------------------------------------------------------------------
@@ -3237,3 +3243,237 @@ def test_round6_requeued_externally_disabled_task_is_never_auto_enabled(tmp_path
     job = store.get_remote_job(job_id)
     evidence = json.loads(str(job["recovery_evidence_json"]))
     assert evidence["restart"]["phase"] not in ("DISABLE_SENT", "ENABLE_SENT")
+
+
+# ---------------------------------------------------------------------------
+# Review round 6, IMPORTANT B: persistent recovery-probe failures must be
+# durably counted and eventually fail closed.  Probe health lives beside
+# (never inside) restart.phase: a probe failure has not entered the restart
+# protocol, and only the RUNNING-stall recovery probe stage feeds the
+# counter (never harvest/submit/priority/discovery).
+# ---------------------------------------------------------------------------
+
+
+def test_round6_b1_first_probe_failure_is_durable_and_running(tmp_path) -> None:
+    store, job_id = _stalled_store(tmp_path)
+
+    def failing_probe(job: dict):
+        return None  # legacy injected-callback failure shape
+
+    counters = _run_probe_pass(store, failing_probe, _NeverRestart())
+    assert counters["recovery_probe_attempts"] == 1
+    assert counters["recovery_probes"] == 0
+    job = store.get_remote_job(job_id)
+    assert job["state"] == "RUNNING"
+    evidence = json.loads(str(job["recovery_evidence_json"]))
+    assert evidence["probe_health"]["consecutive_failures"] == 1
+    assert evidence["probe_health"]["last_failure_reason"]
+    # A probe failure never enters the restart protocol.
+    assert evidence["restart"] is None
+
+
+def test_round6_b1b_bridge_failure_envelope_is_durable(tmp_path) -> None:
+    store, job_id = _stalled_store(tmp_path)
+
+    def failing_probe(job: dict):
+        return {"probe_failed": True, "diagnostic": "probe raised TimeoutError"}
+
+    counters = _run_probe_pass(store, failing_probe, _NeverRestart())
+    assert counters["recovery_probes"] == 0
+    job = store.get_remote_job(job_id)
+    assert job["state"] == "RUNNING"
+    evidence = json.loads(str(job["recovery_evidence_json"]))
+    assert evidence["probe_health"]["consecutive_failures"] == 1
+    assert evidence["probe_health"]["last_failure_reason"] == "probe raised TimeoutError"
+    assert evidence["restart"] is None
+
+
+def test_round6_b2_four_probe_failures_still_running(tmp_path) -> None:
+    from app.services.remote_running_recovery import RECOVERY_MAX_CONSECUTIVE_PROBE_FAILURES
+
+    store, job_id = _stalled_store(tmp_path)
+
+    def failing_probe(job: dict):
+        return {"probe_failed": True, "diagnostic": "probe raised AuthError"}
+
+    for index in range(RECOVERY_MAX_CONSECUTIVE_PROBE_FAILURES - 1):
+        _run_probe_pass(store, failing_probe, _NeverRestart(), now=NOW + timedelta(minutes=3 * index))
+    job = store.get_remote_job(job_id)
+    assert job["state"] == "RUNNING"
+    evidence = json.loads(str(job["recovery_evidence_json"]))
+    assert evidence["probe_health"]["consecutive_failures"] == RECOVERY_MAX_CONSECUTIVE_PROBE_FAILURES - 1
+
+
+def test_round6_b3_fifth_probe_failure_fails_closed_to_manual(tmp_path) -> None:
+    from app.services.remote_running_recovery import RECOVERY_MAX_CONSECUTIVE_PROBE_FAILURES
+
+    store, job_id = _stalled_store(tmp_path)
+    restart = _NeverRestart()
+
+    def failing_probe(job: dict):
+        return {"probe_failed": True, "diagnostic": "probe raised AuthError"}
+
+    for index in range(RECOVERY_MAX_CONSECUTIVE_PROBE_FAILURES):
+        _run_probe_pass(store, failing_probe, restart, now=NOW + timedelta(minutes=3 * index))
+
+    job = store.get_remote_job(job_id)
+    assert job["state"] == "MANUAL_REQUIRED"
+    evidence = json.loads(str(job["recovery_evidence_json"]))
+    assert evidence["probe_health"]["consecutive_failures"] == RECOVERY_MAX_CONSECUTIVE_PROBE_FAILURES
+    # Never fabricated into a pending remote-write phase: no restart was
+    # ever attempted, let alone dispatched.
+    assert evidence["restart"] is None
+    assert restart.calls == []
+    assert int(job["recovery_attempts"]) == 0
+    assert "no restart was attempted" in str(job["error_text"])
+
+
+def test_round6_legacy_evidence_without_probe_health_defaults_to_zero() -> None:
+    from app.services.remote_running_recovery import decode_recovery_evidence
+
+    decoded = decode_recovery_evidence(
+        json.dumps({"version": 1, "observations": [], "restart": None})
+    )
+    assert decoded["probe_health"] is None
+
+
+def test_round6_b4_probe_success_resets_failure_streak(tmp_path) -> None:
+    store, job_id = _stalled_store(tmp_path)
+
+    def failing_probe(job: dict):
+        return {"probe_failed": True, "diagnostic": "probe raised TimeoutError"}
+
+    def probe(job: dict):
+        return _probe_payload()
+
+    _run_probe_pass(store, failing_probe, _NeverRestart(), now=NOW)
+    _run_probe_pass(store, failing_probe, _NeverRestart(), now=NOW + timedelta(minutes=3))
+    job = store.get_remote_job(job_id)
+    assert json.loads(str(job["recovery_evidence_json"]))["probe_health"]["consecutive_failures"] == 2
+
+    counters = _run_probe_pass(store, probe, None, now=NOW + timedelta(minutes=6))
+    assert counters["recovery_probes"] == 1
+    job = store.get_remote_job(job_id)
+    evidence = json.loads(str(job["recovery_evidence_json"]))
+    assert evidence.get("probe_health") is None
+    assert len(evidence["observations"]) == 5  # 4 seeded + the fresh success
+
+
+def test_round6_b5_probe_failure_count_is_consecutive_not_lifetime(tmp_path) -> None:
+    store, job_id = _stalled_store(tmp_path)
+
+    def failing_probe(job: dict):
+        return {"probe_failed": True, "diagnostic": "blip"}
+
+    def probe(job: dict):
+        return _probe_payload()
+
+    _run_probe_pass(store, failing_probe, None, now=NOW)
+    _run_probe_pass(store, failing_probe, None, now=NOW + timedelta(minutes=3))
+    _run_probe_pass(store, probe, None, now=NOW + timedelta(minutes=6))  # reset
+    _run_probe_pass(store, failing_probe, None, now=NOW + timedelta(minutes=9))
+
+    evidence = json.loads(str(store.get_remote_job(job_id)["recovery_evidence_json"]))
+    assert evidence["probe_health"]["consecutive_failures"] == 1
+    assert evidence["restart"] is None
+
+
+def test_round6_b7_probe_failure_cap_per_tick_is_four(tmp_path) -> None:
+    store = DailyAuditStore(tmp_path / "state.sqlite3")
+    _seed_candidate_jobs(store, 10)
+    calls: list[int] = []
+
+    def failing_probe(job: dict):
+        calls.append(int(job["id"]))
+        return {"probe_failed": True, "diagnostic": "probe raised TimeoutError"}
+
+    token = store.acquire_lease(BUSINESS_DATE, "b7", ttl_seconds=300)
+    try:
+        counters = run_running_recovery_pass(
+            store, token, probe_remote=failing_probe, restart_remote=None, now=NOW, can_start=lambda: True
+        )
+    finally:
+        store.release_lease(token)
+    assert len(calls) == 4
+    assert counters["recovery_probe_attempts"] == 4
+    assert counters["recovery_probes"] == 0
+
+
+def test_round6_b8_probe_failures_do_not_break_fair_progression(tmp_path) -> None:
+    from app.services.remote_running_recovery import RECOVERY_MAX_CONSECUTIVE_PROBE_FAILURES
+
+    store = DailyAuditStore(tmp_path / "state.sqlite3")
+    job_ids = _seed_candidate_jobs(store, 10)
+
+    def failing_probe(job: dict):
+        return {"probe_failed": True, "diagnostic": "probe raised TimeoutError"}
+
+    # Five ticks: the first four candidates (id order) burn their whole
+    # consecutive budget and go manual; later candidates stay untouched.
+    for index in range(RECOVERY_MAX_CONSECUTIVE_PROBE_FAILURES):
+        _run_probe_pass(store, failing_probe, None, now=NOW + timedelta(minutes=3 * index))
+    states = {job_id: store.get_remote_job(job_id) for job_id in job_ids}
+    assert all(states[job_id]["state"] == "MANUAL_REQUIRED" for job_id in job_ids[:4])
+    assert all(states[job_id]["state"] == "RUNNING" for job_id in job_ids[4:])
+    assert all(states[job_id]["recovery_evidence_json"] is None for job_id in job_ids[4:])
+
+    # The next tick's four-probe allowance reaches the NEXT candidates.
+    probed: list[int] = []
+
+    def recording_probe(job: dict):
+        probed.append(int(job["id"]))
+        return {"probe_failed": True, "diagnostic": "probe raised TimeoutError"}
+
+    _run_probe_pass(store, recording_probe, None, now=NOW + timedelta(minutes=30))
+    assert probed == job_ids[4:8]
+
+
+def test_round6_probe_failure_manual_blocks_ordinary_finalize(tmp_path) -> None:
+    from app.workflows.incremental_price_audit_finalize import build_frozen_audit_artifact
+    from app.services.remote_running_recovery import RECOVERY_MAX_CONSECUTIVE_PROBE_FAILURES
+
+    store, job_id = _stalled_store(tmp_path)
+    _seed_linked_crawl(store, job_id)
+
+    def failing_probe(job: dict):
+        return {"probe_failed": True, "diagnostic": "probe raised AuthError"}
+
+    for index in range(RECOVERY_MAX_CONSECUTIVE_PROBE_FAILURES):
+        _run_probe_pass(store, failing_probe, None, now=NOW + timedelta(minutes=3 * index))
+    assert store.get_remote_job(job_id)["state"] == "MANUAL_REQUIRED"
+
+    _freeze(store)
+    token = store.acquire_lease(BUSINESS_DATE, "b-final", ttl_seconds=300)
+    try:
+        built = build_frozen_audit_artifact(store, token, output_identity="daily-final-test")
+    finally:
+        store.release_lease(token)
+    assert built.readiness.remote_manual >= 1
+    assert built.artifact is None
+
+
+def test_round6_recovery_probe_bridge_reports_failure_envelope(tmp_path) -> None:
+    from app.services.incremental_audit_runtime import legacy_zhaoshang_bridge, runtime_paths
+    from app.services.legacy_zhaoshang_adapter import CnncLegacyZhaoshangAdapter
+
+    paths = runtime_paths(BUSINESS_DATE, tmp_path / "runtime")
+    paths.run_dir.mkdir(parents=True, exist_ok=True)
+    adapter = CnncLegacyZhaoshangAdapter(mappings=[], db_env_path=None)
+    _planner, _finalizer, _submitter, _harvester, probe_cb, _restart_cb = legacy_zhaoshang_bridge(
+        adapter, paths=paths, business_date=BUSINESS_DATE
+    )
+    durable = {
+        "id": 1,
+        "logical_key": "missing",
+        "task_name": "cnnc_current_opt_领先未来商城_61284593895349",
+        "payload_hash": "hash",
+        "payload_json": json.dumps({"requests": [], "batch_state": str(paths.run_dir / "BATCH_STATE.md")}),
+        "input_path": None,
+        "result_path": None,
+        "remote_identity": "lxwl|1269504|RW-20260825150224",
+    }
+
+    outcome = probe_cb(durable, 60.0)
+
+    assert outcome["probe_failed"] is True
+    assert outcome["diagnostic"]

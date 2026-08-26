@@ -1331,6 +1331,73 @@ class DailyAuditStore:
             )
             return self._row(connection.execute("SELECT * FROM remote_jobs WHERE id=?", (job_id,)).fetchone())  # type: ignore[return-value]
 
+    def record_remote_recovery_probe_failure(
+        self,
+        token: LeaseToken,
+        job_id: int,
+        *,
+        remote_identity: str,
+        failed_at: str,
+        failure_reason: str,
+    ) -> dict[str, Any]:
+        """Durably count one RUNNING-stall recovery-probe failure.
+
+        The increment is recomputed from the STORE's durable evidence
+        document (never a caller-held copy) and, once the consecutive count
+        reaches ``RECOVERY_MAX_CONSECUTIVE_PROBE_FAILURES``, the
+        MANUAL_REQUIRED state and its error land in the SAME transaction —
+        no crash window can leave a terminal manual job whose evidence
+        shows fewer failures, or a RUNNING job whose evidence already hit
+        the cap.  Probe health is stored beside (never inside)
+        ``restart``: a probe failure has not entered the restart protocol,
+        and reaching the cap must never fabricate a pending write phase.
+        """
+        from app.services.remote_running_recovery import (
+            RECOVERY_MAX_CONSECUTIVE_PROBE_FAILURES,
+            decode_recovery_evidence,
+            encode_recovery_evidence,
+        )
+
+        normalized_identity = str(remote_identity or "").strip()
+        reason = str(failure_reason or "").strip() or "probe callback returned no evidence"
+        with self._transaction(immediate=True) as connection:
+            self._validate_lease(connection, token)
+            job = self._job_for_lease(connection, token, job_id)
+            if str(job["state"]) != "RUNNING":
+                raise RemoteIntentConflict("recovery probe failure requires the RUNNING state")
+            if not normalized_identity or str(job["remote_identity"] or "").strip() != normalized_identity:
+                raise RemoteIntentConflict("recovery probe failure requires the exact confirmed remote identity")
+            document = decode_recovery_evidence(job["recovery_evidence_json"])
+            health = dict(document.get("probe_health") or {})
+            try:
+                consecutive = int(health.get("consecutive_failures") or 0) + 1
+            except (TypeError, ValueError):
+                consecutive = 1
+            document["probe_health"] = {
+                "consecutive_failures": consecutive,
+                "last_failure_at": str(failed_at or "").strip(),
+                "last_failure_reason": reason,
+            }
+            if consecutive >= RECOVERY_MAX_CONSECUTIVE_PROBE_FAILURES:
+                connection.execute(
+                    "UPDATE remote_jobs SET state='MANUAL_REQUIRED', recovery_evidence_json=?, error_text=?, updated_at=? WHERE id=?",
+                    (
+                        encode_recovery_evidence(document),
+                        (
+                            f"remote stall recovery probe failed {consecutive} consecutive "
+                            f"times; no restart was attempted; last failure: {reason}"
+                        ),
+                        self._utcnow(),
+                        job_id,
+                    ),
+                )
+            else:
+                connection.execute(
+                    "UPDATE remote_jobs SET recovery_evidence_json=?, updated_at=? WHERE id=?",
+                    (encode_recovery_evidence(document), self._utcnow(), job_id),
+                )
+            return self._row(connection.execute("SELECT * FROM remote_jobs WHERE id=?", (job_id,)).fetchone())  # type: ignore[return-value]
+
     def mark_remote_recovery_attempted(
         self,
         token: LeaseToken,

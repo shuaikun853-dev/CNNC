@@ -1448,10 +1448,15 @@ def legacy_zhaoshang_bridge(
             probe = adapter.probe_running_task(
                 prepared_job, task_id, task_number, float(timeout_seconds)
             )
-        except Exception:
+        except Exception as exc:
             # A probe that cannot re-confirm the exact remote task proves
-            # nothing; it never blocks the tick and never counts as evidence.
-            return None
+            # nothing and never blocks the tick — but since Round 6 the
+            # failure is reported explicitly so the durable layer can count
+            # consecutive probe failures instead of retrying a permanent
+            # fault (expired refreshToken, missing tool) forever.  Only the
+            # exception TYPE is recorded; message bodies never enter
+            # durable storage.
+            return {"probe_failed": True, "diagnostic": f"probe raised {type(exc).__name__}"}
         return {
             "remote_mall": probe.mall,
             "remote_task_id": probe.task_id,
