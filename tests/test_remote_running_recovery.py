@@ -2194,3 +2194,162 @@ def test_round4_d4_marker_suffixed_failure_phrase_with_unknown_progress_is_unkno
 
     state = classify_remote_execution_state({}, "本次任务执行完毕失败")
     assert state is RemoteExecutionState.UNKNOWN
+
+
+# ---------------------------------------------------------------------------
+# Review round 4, BLOCKER B: a durable restart phase that already dispatched
+# a remote write (DISABLE_SENT / DISABLE_CONFIRMED / ENABLE_SENT) is an
+# EXISTING recovery protocol.  The next tick must reconcile it against the
+# live remote state WITHOUT re-proving the original stall: after the disable
+# the progress endpoint can never answer ACTIVE evidence again, so gating
+# reconciliation on decision.stalled wedges the durable phase forever (and
+# the 900-second fail-closed window inside _apply_restart never fires).
+# The adapter-side no-resend contracts stay proven by
+# test_adapter_restart_resume_disable_sent_never_disables_again (B2) and
+# test_adapter_restart_resume_enable_sent_never_writes.
+# ---------------------------------------------------------------------------
+
+
+_ROUND4_UNPROVABLE_PROGRESS = {
+    "total": 0,
+    "pending": 0,
+    "running": 0,
+    "failed": 0,
+    "waiting_db": 0,
+    "finished": 0,
+}
+
+
+def _unprovable_observations(count: int, *, end: datetime = NOW, span_minutes: int = 70) -> dict:
+    """Post-disable observations: the progress answer carries no usable counters."""
+    step = timedelta(minutes=span_minutes) / max(1, count - 1) if count > 1 else timedelta(0)
+    rows = []
+    for index in range(count):
+        moment = end - step * (count - 1 - index)
+        rows.append(
+            {
+                "observed_at": moment.isoformat(timespec="seconds"),
+                "progress": dict(_ROUND4_UNPROVABLE_PROGRESS),
+                "signature": None,
+                "export_count": 0,
+                "export_rsp_desc": NO_PRICE_RSP,
+                "export_had_result": False,
+                "task_status_rsp_desc": "",
+            }
+        )
+    return {"version": 1, "observations": rows, "restart": None}
+
+
+def _pending_phase_store(tmp_path, phase: str, *, phase_age_minutes: int = 0):
+    store = DailyAuditStore(tmp_path / "state.sqlite3")
+    job_id = _seed_running_job(store, attempts=15, age_minutes=180)
+    token = store.acquire_lease(BUSINESS_DATE, f"seed-b-{phase}", ttl_seconds=300)
+    evidence = _unprovable_observations(4)
+    evidence["restart"] = {
+        "phase": phase,
+        "phase_at": (NOW - timedelta(minutes=phase_age_minutes)).isoformat(timespec="seconds"),
+        "recovery_reason": "REMOTE_RUNNING_STALLED",
+    }
+    store.update_remote_recovery_evidence(token, job_id, evidence)
+    store.release_lease(token)
+    return store, job_id
+
+
+def _unprovable_probe_payload() -> dict:
+    return _probe_payload(progress=dict(_ROUND4_UNPROVABLE_PROGRESS), task_status_rsp_desc="")
+
+
+def test_round4_b1_disable_sent_with_unknown_progress_still_reconciles(tmp_path) -> None:
+    store, job_id = _pending_phase_store(tmp_path, "DISABLE_SENT")
+    restart = _FakeRestart([dict(_CONFIRMED_RESTART_STEP)])
+
+    _run_pass(store, _unprovable_probe_payload(), restart)
+
+    assert restart.calls == [(job_id, "DISABLE_SENT")]
+    assert int(store.get_remote_job(job_id)["recovery_attempts"]) == 1
+
+
+def test_round4_b3_enable_sent_with_unknown_progress_reconciles_without_resend(tmp_path) -> None:
+    store, job_id = _pending_phase_store(tmp_path, "ENABLE_SENT")
+    restart = _FakeRestart(
+        [
+            {
+                "status": "RESTARTED",
+                "restarted": True,
+                "reconciled": True,
+                "disable_evidence": {"confirmed_disabled": True},
+                "enable_evidence": {"confirmed_enabled": True, "reconciled": True},
+            }
+        ]
+    )
+
+    _run_pass(store, _unprovable_probe_payload(), restart)
+
+    assert restart.calls == [(job_id, "ENABLE_SENT")]
+    assert int(store.get_remote_job(job_id)["recovery_attempts"]) == 1
+    evidence = json.loads(str(store.get_remote_job(job_id)["recovery_evidence_json"]))
+    assert evidence["restart"]["phase"] == "ENABLE_CONFIRMED"
+
+
+def test_round4_b4_disable_confirmed_continues_legal_enable_phase(tmp_path) -> None:
+    store, job_id = _pending_phase_store(tmp_path, "DISABLE_CONFIRMED")
+    restart = _FakeRestart([dict(_CONFIRMED_RESTART_STEP)])
+
+    _run_pass(store, _unprovable_probe_payload(), restart)
+
+    assert restart.calls == [(job_id, "DISABLE_CONFIRMED")]
+    assert int(store.get_remote_job(job_id)["recovery_attempts"]) == 1
+
+
+def test_round4_b5_disable_sent_confirm_window_expiry_fails_closed(tmp_path) -> None:
+    store, job_id = _pending_phase_store(tmp_path, "DISABLE_SENT", phase_age_minutes=20)
+    restart = _FakeRestart([{"status": "DISABLE_UNCONFIRMED", "restarted": False, "observed_enabled": True}])
+
+    _run_pass(store, _unprovable_probe_payload(), restart)
+
+    assert restart.calls == [(job_id, "DISABLE_SENT")]
+    assert store.get_remote_job(job_id)["state"] == "MANUAL_REQUIRED"
+
+
+def test_round4_b6_enable_sent_confirm_window_expiry_fails_closed(tmp_path) -> None:
+    store, job_id = _pending_phase_store(tmp_path, "ENABLE_SENT", phase_age_minutes=20)
+    restart = _FakeRestart([{"status": "ENABLE_UNCONFIRMED", "restarted": False, "observed_enabled": False}])
+
+    _run_pass(store, _unprovable_probe_payload(), restart)
+
+    assert restart.calls == [(job_id, "ENABLE_SENT")]
+    assert store.get_remote_job(job_id)["state"] == "MANUAL_REQUIRED"
+
+
+def test_round4_b7_ordinary_non_stalled_job_without_pending_phase_is_untouched(tmp_path) -> None:
+    store = DailyAuditStore(tmp_path / "state.sqlite3")
+    _seed_running_job(store, attempts=2, age_minutes=35)
+    restart = _FakeRestart([dict(_CONFIRMED_RESTART_STEP)])
+
+    counters = _run_pass(store, _probe_payload(), restart)
+
+    assert restart.calls == []
+    assert counters["recovery_restarts"] == 0
+
+
+def test_round4_b8_pending_reconciliation_never_burns_a_second_attempt(tmp_path) -> None:
+    store, job_id = _pending_phase_store(tmp_path, "DISABLE_SENT")
+    first = _FakeRestart([dict(_CONFIRMED_RESTART_STEP)])
+
+    _run_pass(store, _unprovable_probe_payload(), first)
+
+    assert first.calls == [(job_id, "DISABLE_SENT")]
+    second = _FakeRestart([dict(_CONFIRMED_RESTART_STEP)])
+    _run_pass(store, _unprovable_probe_payload(), second, now=NOW + timedelta(minutes=2))
+    assert second.calls == []
+    assert int(store.get_remote_job(job_id)["recovery_attempts"]) == 1
+
+
+def test_round4_b9_pending_reconciliation_defers_without_minimal_budget(tmp_path) -> None:
+    store, job_id = _pending_phase_store(tmp_path, "DISABLE_SENT")
+    restart = _FakeRestart([dict(_CONFIRMED_RESTART_STEP)])
+
+    _run_flagged_pass(store, _unprovable_probe_payload(), restart, can_start=lambda: False)
+
+    assert restart.calls == []
+    assert store.get_remote_job(job_id)["state"] == "RUNNING"

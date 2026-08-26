@@ -107,6 +107,13 @@ RECOVERY_EXHAUSTED_MIN_POST_SPAN_SECONDS = 1800.0
 # the real remote state before any decision; after this window a still
 # contradictory remote state fails closed into manual review.
 RECOVERY_WRITE_CONFIRM_WINDOW_SECONDS = 900.0
+# Durable restart phases that already dispatched (or durably recorded) a
+# remote side effect.  A job carrying one of them is an EXISTING recovery
+# protocol: the next pass reconciles the phase against the live remote state
+# without re-proving the original stall (post-disable progress can never be
+# ACTIVE evidence again).  ENABLE_CONFIRMED is the completed proof, never a
+# pending phase; DECLINED is a zero-write withdrawal.
+PENDING_RESTART_PHASES: tuple[str, ...] = ("DISABLE_SENT", "DISABLE_CONFIRMED", "ENABLE_SENT")
 # Tick-budget bounds: recovery is tail work.  One probe or restart callback
 # may never outlive the tick's remaining budget (the configured 60s ceiling
 # is intersected with the live remaining time by the tick), and one Full
@@ -447,10 +454,7 @@ def _apply_restart(
         )
         return {"status": "MANUAL_REQUIRED", "restarted": False, "diagnostic": "incomplete durable ENABLE_CONFIRMED evidence"}
     resume_phase: str | None = None
-    if isinstance(restart, Mapping) and _text(restart.get("phase")) in {
-        "DISABLE_SENT",
-        "ENABLE_SENT",
-    }:
+    if isinstance(restart, Mapping) and _text(restart.get("phase")) in PENDING_RESTART_PHASES:
         resume_phase = _text(restart.get("phase"))
     else:
         evidence["restart"] = {
@@ -644,13 +648,15 @@ def run_running_recovery_pass(
 ) -> dict[str, int]:
     """One bounded recovery sweep over the durable RUNNING jobs.
 
-    Read-only probes append durable progress observations for every candidate.
-    A job whose evidence proves a stall may consume its single automatic
-    restart when (and only when) a restart callback is wired in; with no
-    callback the pass only records evidence and leaves the job RUNNING.
-    The sweep is bounded: ``can_start`` is re-checked before every candidate
-    and at most ``max_probe_candidates`` probes run per pass so the rest of
-    the tick's budget stays with core intake work.
+    Jobs carrying a durable pending restart phase (a remote write already
+    dispatched) reconcile that phase first, without re-proving the original
+    stall.  Ordinary RUNNING jobs get read-only probes appending durable
+    progress observations; a job whose evidence proves a stall may consume
+    its single automatic restart when (and only when) a restart callback is
+    wired in; with no callback the pass only records evidence and leaves the
+    job RUNNING.  The sweep is bounded: ``can_start`` is re-checked before
+    every candidate and at most ``max_probe_candidates`` probes run per pass
+    so the rest of the tick's budget stays with core intake work.
     """
     counters = {
         "recovery_probes": 0,
@@ -682,6 +688,29 @@ def run_running_recovery_pass(
                 export_count=last_observation.get("export_count"),
                 export_rsp_desc=_text(last_observation.get("export_rsp_desc")),
             )
+            continue
+        # Write-side-effect reconciliation first: a durable pending phase
+        # means a remote disable/enable already left this protocol, so the
+        # task's progress can never re-prove the original stall (a disabled
+        # task answers no ACTIVE evidence).  Reconcile the phase directly —
+        # the adapter re-verifies the exact task/mall identity on every
+        # lookup and never repeats the already-sent write direction — and
+        # only fall through to fresh stall detection when no side effect is
+        # outstanding.
+        document = decode_recovery_evidence(job.get("recovery_evidence_json"))
+        pending_restart = document.get("restart")
+        if (
+            restart_remote is not None
+            and isinstance(pending_restart, Mapping)
+            and _text(pending_restart.get("phase")) in PENDING_RESTART_PHASES
+        ):
+            if not can_start():
+                # Reconciliation needs the minimal budget for one bounded
+                # callback; without it the next tick retries the phase.
+                continue
+            outcome = _apply_restart(store, token, job, document, restart_remote, now=now)
+            counters["recovery_restarts"] += int(bool(outcome.get("restarted")))
+            counters["recovery_reconciled"] += int(bool(outcome.get("reconciled")))
             continue
         decision = evaluate_running_stall(job, now=now)
         if not decision["probe_candidate"]:
@@ -717,20 +746,19 @@ def run_running_recovery_pass(
                     "remote stall probe identity no longer matches the durable remote identity",
                 )
                 continue
-            document = decode_recovery_evidence(job.get("recovery_evidence_json"))
-            pending_restart = document.get("restart")
-            is_already_sent = (
-                isinstance(pending_restart, Mapping)
-                and _text(pending_restart.get("phase")) in {"DISABLE_SENT", "ENABLE_SENT"}
-            )
-            if not is_already_sent and not can_start():
+            if not can_start():
                 # A fresh restart is deferrable tail work: the probe may have
                 # consumed the remaining headroom, so the freshly saved
-                # observation waits for a tick with budget.  Already-sent
-                # phases are reconciliation safety work (no second write is
-                # ever dispatched for them) and must not be deferred here.
+                # observation waits for a tick with budget.
                 continue
-            outcome = _apply_restart(store, token, job, document, restart_remote, now=now)
+            outcome = _apply_restart(
+                store,
+                token,
+                job,
+                decode_recovery_evidence(job.get("recovery_evidence_json")),
+                restart_remote,
+                now=now,
+            )
             counters["recovery_restarts"] += int(bool(outcome.get("restarted")))
             counters["recovery_reconciled"] += int(bool(outcome.get("reconciled")))
     return counters
