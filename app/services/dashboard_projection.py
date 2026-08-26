@@ -149,9 +149,9 @@ def _explanation(s: Mapping, attention: list, recovering: int, word: str) -> str
     parts: list[str] = []
     if word == "需要人工处理":
         tops = ";".join(a["title"] for a in attention if a["level"] == "red") or "存在需要人工处理的问题"
-        parts.append(tops)
+        parts.append(tops + "。")
     else:
-        parts.append("当前无需人工处理" if not attention else ";".join(a["title"] for a in attention[:3]))
+        parts.append("当前无需人工处理。" if not attention else ";".join(a["title"] for a in attention[:3]) + "。")
     if word in ("正在等待招商局", "正在回收招商局结果"):
         seg = f"{counts['discovered']} 条数据的 Detail 与模型处理已全部完成,{r['running']} 个招商局远端任务执行中"
         if recovering:

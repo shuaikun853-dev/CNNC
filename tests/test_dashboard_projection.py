@@ -108,3 +108,18 @@ def test_final_text_natural_language_blockers():
     s = _status(final={**_status()["final"], "blocker_summary": {"remote_pending": 3, "remote_intent": 1, "remote_manual": 2}})
     out = compute_overall_status(s)
     assert "招商局" in out["final_text"] and "下一次 closeout" in out["final_text"]
+
+
+def test_explanation_sentence_boundaries_no_reversal_reading():
+    s = _status(remote={**_status()["remote"], "recovery_exhausted": 0, "unknown": 0})
+    s["crawl"]["unknown"] = 0
+    out = compute_overall_status(s)
+    assert "无需人工处理。" in out["explanation"]
+    assert not any(ch.isdigit() for ch in out["explanation"].split("无需人工处理")[-1][:1])
+    out_red = compute_overall_status(_status())
+    assert "自动恢复已用尽。" in out_red["explanation"]
+
+
+def test_final_text_surfaces_remote_intent_only_blocker():
+    s = _status(final={**_status()["final"], "blocker_summary": {"remote_intent": 1}})
+    assert "1 个任务已排队待提交" in compute_overall_status(s)["final_text"]
