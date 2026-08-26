@@ -105,6 +105,6 @@ def test_healthy_no_attention_single_line():
 
 
 def test_final_text_natural_language_blockers():
-    s = _status(final={**_status()["final"], "blocker_summary": {"remote_pending": 3, "remote_priority_pending": 1, "remote_manual": 2}})
+    s = _status(final={**_status()["final"], "blocker_summary": {"remote_pending": 3, "remote_intent": 1, "remote_manual": 2}})
     out = compute_overall_status(s)
     assert "招商局" in out["final_text"] and "下一次 closeout" in out["final_text"]

@@ -2,14 +2,7 @@
 """Read-only projections for the STEP_1 dashboard. Zero writes, zero network."""
 from __future__ import annotations
 
-from typing import Any, Mapping
-
-_STAGES = (
-    ("prep", "数据准备"),
-    ("zhaoshang", "招商局处理"),
-    ("closeout", "最终收口"),
-    ("publish", "最终出表"),
-)
+from typing import Mapping
 
 
 def _attention_items(s: Mapping) -> list[dict]:
@@ -111,7 +104,7 @@ def _final_text(s: Mapping) -> tuple[str, str]:
             text += ";文件存在校验:" + ("通过" if f["output_exists"] else "失败,请检查")
         return text + "。", state
     b = f.get("blocker_summary") or {}
-    mapping = [("remote_pending", "个招商局任务仍在执行/待回收"), ("remote_priority_pending", "个任务等待提优"),
+    mapping = [("remote_pending", "个招商局任务仍在执行/待回收"), ("remote_intent", "个任务已排队待提交"),
                ("remote_unknown", "个任务提交结果待确认"), ("remote_manual", "项招商局任务需人工"),
                ("model_pending", "条模型处理未完成"), ("model_terminal", "条模型终态失败"),
                ("detail_pending", "条 Detail 未完成"), ("crawl_pending", "条采集未完成"),
