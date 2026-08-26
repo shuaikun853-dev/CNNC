@@ -326,6 +326,15 @@ class ExportNoPriceProbe:
     remote_calls: int
 
 
+@dataclass(frozen=True)
+class TaskCompletionProbe:
+    """Read-only live evidence that one exact existing task finished all subtasks."""
+
+    task_status_rsp_desc: str
+    progress: Mapping[str, int]
+    remote_calls: int
+
+
 class _BoundedReadOnlySession:
     """Clamp legacy helper HTTP calls to the tick's remaining reconcile budget."""
 
@@ -410,6 +419,7 @@ class CnncLegacyZhaoshangAdapter:
         reconciler: Callable[[str, str, float], Mapping[str, Any] | None] | None = None,
         priority_runner: Callable[[PreparedLegacyJob, str, str, float], Any] | None = None,
         export_probe: Callable[[PreparedLegacyJob, str, str, float], Any] | None = None,
+        task_completion_probe: Callable[[PreparedLegacyJob, str, str, float], Any] | None = None,
         event_recorder: Callable[..., Any] | None = None,
         auth_manager: AuthManager | None = None,
         external_tool_path: Path = EXTERNAL_TOOL_PATH,
@@ -421,6 +431,7 @@ class CnncLegacyZhaoshangAdapter:
         self._reconciler = reconciler
         self._priority_runner = priority_runner
         self._export_probe = export_probe
+        self._task_completion_probe = task_completion_probe
         self._event_recorder = event_recorder
         self._auth_manager = auth_manager
         self._external_tool_path = Path(external_tool_path)
@@ -1414,13 +1425,54 @@ class CnncLegacyZhaoshangAdapter:
             return self._export_probe(job, task_id, task_number, timeout_seconds)
         return self._production_export_no_price_probe(job, task_id, task_number, timeout_seconds)
 
-    def _production_export_no_price_probe(
+    def probe_task_completion(
         self,
         job: PreparedLegacyJob,
         task_id: str,
         task_number: str,
         timeout_seconds: float,
-    ) -> ExportNoPriceProbe:
+    ) -> TaskCompletionProbe:
+        """Re-verify live that the exact existing task finished every subtask.
+
+        Read-only against the crawl platform: same task lookup, identity
+        check, status and progress queries as ``probe_export_no_price``,
+        without querying the export endpoint.  Callers use this to prove a
+        local export is final before any irreversible NO_RESULT write.
+        """
+        if self._task_completion_probe is not None:
+            return self._task_completion_probe(job, task_id, task_number, timeout_seconds)
+        return self._production_task_completion_probe(job, task_id, task_number, timeout_seconds)
+
+    def _production_task_completion_probe(
+        self,
+        job: PreparedLegacyJob,
+        task_id: str,
+        task_number: str,
+        timeout_seconds: float,
+    ) -> TaskCompletionProbe:
+        completion, _response = self._production_live_task_evidence(
+            job,
+            task_id,
+            task_number,
+            timeout_seconds,
+            query_export=False,
+        )
+        return completion
+
+    def _production_live_task_evidence(
+        self,
+        job: PreparedLegacyJob,
+        task_id: str,
+        task_number: str,
+        timeout_seconds: float,
+        *,
+        query_export: bool,
+    ) -> tuple[TaskCompletionProbe, Any]:
+        """Shared read-only task lookup, identity check, status and progress.
+
+        Optionally performs the export endpoint POST; the raw response is
+        returned for the export no-price analysis and is never written.
+        """
         if timeout_seconds <= 0:
             raise TimeoutError("export no-price probe timeout must be positive")
         if not self._external_tool_path.is_file():
@@ -1441,6 +1493,7 @@ class CnncLegacyZhaoshangAdapter:
         }
         if len(session_environment) != 2:
             raise LegacyZhaoshangAdapterError("legacy Zhaoshang session auth is unavailable")
+        response = None
         with _temporary_environment(session_environment):
             session = tool.build_session()
             mall_code = tool.priority_mall_code_for_key(job.mall_key)
@@ -1472,20 +1525,42 @@ class CnncLegacyZhaoshangAdapter:
             batch_number = _text(task.get("batchNumber")) or resolved_task_name
             progress_json = tool.query_task_progress(session, batch_number)
             remote_calls += 1
-            remaining = deadline - self._monotonic()
-            if remaining <= 0:
-                raise TimeoutError("export no-price probe deadline exhausted before export query")
-            response = session.post(
-                tool.EXPORT_TASK_URL,
-                json={
-                    "taskNumber": str(live_task_number),
-                    "taskId": str(live_task_id),
-                    "mallLogo": mall_logo,
-                },
-                timeout=min(60.0, remaining),
-            )
-            response.raise_for_status()
-            remote_calls += 1
+            if query_export:
+                remaining = deadline - self._monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("export no-price probe deadline exhausted before export query")
+                response = session.post(
+                    tool.EXPORT_TASK_URL,
+                    json={
+                        "taskNumber": str(live_task_number),
+                        "taskId": str(live_task_id),
+                        "mallLogo": mall_logo,
+                    },
+                    timeout=min(60.0, remaining),
+                )
+                response.raise_for_status()
+                remote_calls += 1
+        completion = TaskCompletionProbe(
+            task_status_rsp_desc=_text(status.get("rspDesc")),
+            progress=dict(tool.parse_task_progress_desc(_text(progress_json.get("rspDesc")))),
+            remote_calls=remote_calls,
+        )
+        return completion, response
+
+    def _production_export_no_price_probe(
+        self,
+        job: PreparedLegacyJob,
+        task_id: str,
+        task_number: str,
+        timeout_seconds: float,
+    ) -> ExportNoPriceProbe:
+        completion, response = self._production_live_task_evidence(
+            job,
+            task_id,
+            task_number,
+            timeout_seconds,
+            query_export=True,
+        )
         content_type = response.headers.get("Content-Type", "") or ""
         content_disposition = response.headers.get("Content-Disposition", "") or ""
         if (
@@ -1533,11 +1608,11 @@ class CnncLegacyZhaoshangAdapter:
                     "export endpoint returned an unparseable count"
                 ) from exc
         return ExportNoPriceProbe(
-            task_status_rsp_desc=_text(status.get("rspDesc")),
-            progress=dict(tool.parse_task_progress_desc(_text(progress_json.get("rspDesc")))),
+            task_status_rsp_desc=completion.task_status_rsp_desc,
+            progress=dict(completion.progress),
             export_rsp_desc=_text(data.get("rspDesc")),
             export_count=export_count,
-            remote_calls=remote_calls,
+            remote_calls=completion.remote_calls,
         )
 
     @classmethod

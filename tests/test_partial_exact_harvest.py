@@ -9,10 +9,40 @@ from openpyxl import Workbook
 
 from app.services import incremental_audit_recovery as recovery
 from app.services.daily_audit_store import DailyAuditStore
-from app.services.legacy_zhaoshang_adapter import CnncLegacyZhaoshangAdapter, CrawlRequest
+from app.services.legacy_zhaoshang_adapter import (
+    CnncLegacyZhaoshangAdapter,
+    CrawlRequest,
+    TaskCompletionProbe,
+)
 
 
 BUSINESS_DATE = "2026-08-14"
+
+
+def _completed_probe(
+    progress_overrides: dict | None = None,
+    *,
+    task_status_rsp_desc: str = "本次任务执行完毕",
+    remote_calls: int = 3,
+):
+    """Fake live probe matching the no_result.py completion contract."""
+    def probe(job, task_id, task_number, timeout_seconds):
+        assert (task_id, task_number) == ("task-id", "task-number")
+        progress = {
+            "total": len(job.requests),
+            "finished": len(job.requests),
+            "pending": 0,
+            "running": 0,
+            "failed": 0,
+            "waiting_db": 0,
+        }
+        progress.update(progress_overrides or {})
+        return TaskCompletionProbe(
+            task_status_rsp_desc=task_status_rsp_desc,
+            progress=progress,
+            remote_calls=remote_calls,
+        )
+    return probe
 
 
 def _write_partial_result(
@@ -57,13 +87,18 @@ def _seed_partial_job(
     foreign_rows: list[tuple[str, str, str, object]] | None = None,
     duplicate_sources: dict[int, tuple[str, ...]] | None = None,
     execution_numbers: list[str] | None = None,
+    task_completion_probe=None,
 ) -> tuple[DailyAuditStore, CnncLegacyZhaoshangAdapter, int, str, Path]:
     run_dir = tmp_path / "runtime" / BUSINESS_DATE
     run_dir.mkdir(parents=True)
     state_path = run_dir / "state.sqlite3"
     batch_state = run_dir / "BATCH_STATE.md"
     batch_state.write_text("# state\n", encoding="utf-8")
-    adapter = CnncLegacyZhaoshangAdapter(mappings=[], db_env_path=None)
+    adapter = CnncLegacyZhaoshangAdapter(
+        mappings=[],
+        db_env_path=None,
+        task_completion_probe=task_completion_probe,
+    )
     prepared = adapter.prepare_job(
         BUSINESS_DATE,
         requests,
@@ -207,7 +242,7 @@ def test_partial_exact_harvest_completes_unique_matches_and_exact_absences(
         for index, request in enumerate(requests[:matched])
     ]
     store, adapter, job_id, identity, state_path = _seed_partial_job(
-        tmp_path, requests, rows
+        tmp_path, requests, rows, task_completion_probe=_completed_probe()
     )
 
     result = _run(state_path, adapter, job_id, identity)
@@ -216,8 +251,11 @@ def test_partial_exact_harvest_completes_unique_matches_and_exact_absences(
     assert result["crawl_no_result"] == missing
     assert result["crawl_manual"] == 0
     assert result["remote_state"] == "COMPLETED"
-    assert result["remote_calls"] == 0
+    assert result["remote_calls"] == 3
     assert result["add_calls"] == 0
+    assert result["remote_completion_proven"] is True
+    assert result["progress"]["finished"] == expected
+    assert result["no_result_limit"] == 10
     crawls = store.crawl_work_for_job(job_id)
     assert [crawl["state"] for crawl in crawls].count("SUCCESS") == matched
     assert [crawl["state"] for crawl in crawls].count("NO_RESULT") == missing
@@ -241,7 +279,7 @@ def test_partial_exact_harvest_treats_candidate_columns_as_exported_aliases(tmp_
     ]
     rows.append(("base", "basePCS", shared_url, 99))
     store, adapter, job_id, identity, state_path = _seed_partial_job(
-        tmp_path, requests, rows
+        tmp_path, requests, rows, task_completion_probe=_completed_probe()
     )
 
     result = _run(state_path, adapter, job_id, identity)
@@ -264,7 +302,7 @@ def test_partial_exact_absence_does_not_borrow_sibling_sku_price(tmp_path):
     )
     rows = [("basePCS", "basePCS", shared_url, 12.3)]
     store, adapter, job_id, identity, state_path = _seed_partial_job(
-        tmp_path, requests, rows
+        tmp_path, requests, rows, task_completion_probe=_completed_probe()
     )
 
     result = _run(state_path, adapter, job_id, identity)
@@ -285,7 +323,8 @@ def test_partial_exact_harvest_filters_foreign_provenance_rows(tmp_path):
     current = [(requests[0].sku_id, requests[0].sku_id, requests[0].url, 10)]
     foreign = [(requests[1].sku_id, requests[1].sku_id, requests[1].url, 999)]
     store, adapter, job_id, identity, state_path = _seed_partial_job(
-        tmp_path, requests, current, foreign_rows=foreign
+        tmp_path, requests, current, foreign_rows=foreign,
+        task_completion_probe=_completed_probe(),
     )
 
     result = _run(state_path, adapter, job_id, identity)
@@ -420,7 +459,7 @@ def test_partial_exact_harvest_is_resumable_after_mid_write_crash(tmp_path, monk
         for index, request in enumerate(requests[:2])
     ]
     store, adapter, job_id, identity, state_path = _seed_partial_job(
-        tmp_path, requests, rows
+        tmp_path, requests, rows, task_completion_probe=_completed_probe()
     )
     original = DailyAuditStore.complete_partial_exact_crawl_work
     calls = 0
@@ -504,3 +543,142 @@ def test_partial_exact_harvest_does_not_fan_out_to_unbound_same_request(tmp_path
     assert result["crawl_success"] == 1
     assert store.get_crawl_work(int(unbound["id"]))["state"] == "PENDING"
     assert store.get_crawl_work(int(unbound["id"]))["remote_job_id"] is None
+
+
+def test_partial_exact_absence_without_remote_completion_proof_fails_closed(tmp_path):
+    """P1-2: absent workbook rows alone must never become irreversible NO_RESULT."""
+    requests = _requests(3)
+    rows = [
+        (request.sku_id, request.sku_id, request.url, index + 1)
+        for index, request in enumerate(requests[:2])
+    ]
+    store, _seed_adapter, job_id, identity, state_path = _seed_partial_job(
+        tmp_path, requests, rows
+    )
+    # No completion probe injected and the external tool is unavailable: the
+    # production probe path must fail deterministically (no auth, no network).
+    adapter = CnncLegacyZhaoshangAdapter(
+        mappings=[],
+        db_env_path=None,
+        external_tool_path=tmp_path / "missing_legacy_tool.py",
+    )
+
+    with pytest.raises(recovery.RecoveryRejected, match="completion probe"):
+        _run(state_path, adapter, job_id, identity)
+
+    crawls = store.crawl_work_for_job(job_id)
+    assert [crawl["state"] for crawl in crawls].count("NO_RESULT") == 0
+    assert store.get_remote_job(job_id)["state"] == "MANUAL_REQUIRED"
+
+
+def test_partial_exact_absence_with_unfinished_remote_progress_fails_closed(tmp_path):
+    """A: workbook gap + remote progress still running -> no NO_RESULT writes."""
+    requests = _requests(3)
+    rows = [
+        (request.sku_id, request.sku_id, request.url, index + 1)
+        for index, request in enumerate(requests[:2])
+    ]
+    probe = _completed_probe({"finished": 2, "pending": 1})
+    store, adapter, job_id, identity, state_path = _seed_partial_job(
+        tmp_path, requests, rows, task_completion_probe=probe
+    )
+
+    with pytest.raises(recovery.RecoveryRejected, match="progress is not fully completed"):
+        _run(state_path, adapter, job_id, identity)
+
+    crawls = store.crawl_work_for_job(job_id)
+    assert [crawl["state"] for crawl in crawls].count("NO_RESULT") == 0
+    assert store.get_remote_job(job_id)["state"] == "MANUAL_REQUIRED"
+
+
+def test_partial_exact_absence_with_unknown_remote_progress_fails_closed(tmp_path):
+    """B: workbook gap + unparsable/unknown progress -> no NO_RESULT writes."""
+    requests = _requests(3)
+    rows = [
+        (request.sku_id, request.sku_id, request.url, index + 1)
+        for index, request in enumerate(requests[:2])
+    ]
+
+    def unknown_progress(job, task_id, task_number, timeout_seconds):
+        return TaskCompletionProbe(
+            task_status_rsp_desc="本次任务执行完毕",
+            progress={},
+            remote_calls=3,
+        )
+
+    store, adapter, job_id, identity, state_path = _seed_partial_job(
+        tmp_path, requests, rows, task_completion_probe=unknown_progress
+    )
+
+    with pytest.raises(recovery.RecoveryRejected, match="progress is not fully completed"):
+        _run(state_path, adapter, job_id, identity)
+
+    crawls = store.crawl_work_for_job(job_id)
+    assert [crawl["state"] for crawl in crawls].count("NO_RESULT") == 0
+    assert store.get_remote_job(job_id)["state"] == "MANUAL_REQUIRED"
+
+
+def test_partial_exact_absence_with_identity_mismatch_fails_closed(tmp_path):
+    """C: workbook gap + live task identity mismatch -> no NO_RESULT writes."""
+    requests = _requests(3)
+    rows = [
+        (request.sku_id, request.sku_id, request.url, index + 1)
+        for index, request in enumerate(requests[:2])
+    ]
+
+    def mismatched(job, task_id, task_number, timeout_seconds):
+        raise RuntimeError(
+            "live task identity does not match the durable remote identity"
+        )
+
+    store, adapter, job_id, identity, state_path = _seed_partial_job(
+        tmp_path, requests, rows, task_completion_probe=mismatched
+    )
+
+    with pytest.raises(
+        recovery.RecoveryRejected, match="identity does not match"
+    ):
+        _run(state_path, adapter, job_id, identity)
+
+    crawls = store.crawl_work_for_job(job_id)
+    assert [crawl["state"] for crawl in crawls].count("NO_RESULT") == 0
+    assert store.get_remote_job(job_id)["state"] == "MANUAL_REQUIRED"
+
+
+def test_partial_exact_absence_over_no_result_cap_fails_closed(tmp_path):
+    """E: absent set larger than the business no-result cap -> whole recovery rejected."""
+    requests = _requests(12)
+    rows = []  # every row absent from the local workbook
+    probe = _completed_probe()
+    store, adapter, job_id, identity, state_path = _seed_partial_job(
+        tmp_path, requests, rows, task_completion_probe=probe
+    )
+
+    with pytest.raises(recovery.RecoveryRejected, match="no-result limit"):
+        _run(state_path, adapter, job_id, identity)
+
+    crawls = store.crawl_work_for_job(job_id)
+    assert [crawl["state"] for crawl in crawls].count("NO_RESULT") == 0
+    assert store.get_remote_job(job_id)["state"] == "MANUAL_REQUIRED"
+
+
+def test_partial_exact_absence_with_unfinished_task_status_fails_closed(tmp_path):
+    """Task not reporting the finished descriptor is not completion proof."""
+    requests = _requests(3)
+    rows = [
+        (request.sku_id, request.sku_id, request.url, index + 1)
+        for index, request in enumerate(requests[:2])
+    ]
+    probe = _completed_probe(task_status_rsp_desc="任务执行中")
+    store, adapter, job_id, identity, state_path = _seed_partial_job(
+        tmp_path, requests, rows, task_completion_probe=probe
+    )
+
+    with pytest.raises(
+        recovery.RecoveryRejected, match="does not confirm the task finished"
+    ):
+        _run(state_path, adapter, job_id, identity)
+
+    crawls = store.crawl_work_for_job(job_id)
+    assert [crawl["state"] for crawl in crawls].count("NO_RESULT") == 0
+    assert store.get_remote_job(job_id)["state"] == "MANUAL_REQUIRED"

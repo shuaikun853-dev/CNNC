@@ -15,9 +15,11 @@ from app.services.legacy_zhaoshang_adapter import (
     CrawlRequest,
     ExportNoPriceProbe,
     HarvestStatus,
+    PreparedLegacyJob,
     PriorityStatus,
     REMOTE_NOT_MATERIALIZED_DIAGNOSTICS,
     REMOTE_NOT_MATERIALIZED_LEGACY_DIAGNOSTIC,
+    TaskCompletionProbe,
     is_retryable_priority_error_diagnostic,
 )
 from app.services.saas_audit_core import model_fingerprint
@@ -25,9 +27,68 @@ from app.services.recovery.common import (
     RecoveryRejected,
     _acquire_recovery_lease,
 )
+from app.services.recovery.no_result import (
+    EXPORT_NO_PRICE_NO_RESULT_LIMIT,
+    EXPORT_NO_PRICE_TASK_FINISHED_DESC,
+)
 from app.services.recovery.validation import (
     validate_linked_crawls_against_remote_payload,
 )
+
+# Same live-probe budget the export no-price resolution grants its probe.
+PARTIAL_EXACT_COMPLETION_PROBE_TIMEOUT_SECONDS = 300.0
+
+
+def _require_remote_task_completion(
+    *,
+    adapter: CnncLegacyZhaoshangAdapter,
+    prepared: PreparedLegacyJob,
+    identity_parts: Sequence[str],
+    expected_count: int,
+) -> TaskCompletionProbe:
+    """Prove the exact remote task fully finished (no_result.py contract).
+
+    Local workbook absence alone never proves a remote NO_RESULT.  The only
+    admissible evidence mirrors ``run_remote_export_no_price_resolution``:
+    the live task must exist under its durable name, match the exact remote
+    identity, report the task-finished status, and show progress with every
+    expected subtask finished and nothing pending/running/failed/waiting.
+    Any weaker shape fails closed.
+    """
+    try:
+        completion = adapter.probe_task_completion(
+            prepared,
+            identity_parts[1],
+            identity_parts[2],
+            PARTIAL_EXACT_COMPLETION_PROBE_TIMEOUT_SECONDS,
+        )
+    except RecoveryRejected:
+        raise
+    except Exception as exc:
+        raise RecoveryRejected(
+            f"partial exact remote completion probe failed: {exc}"
+        ) from exc
+    if not isinstance(completion, TaskCompletionProbe):
+        raise RecoveryRejected("remote completion probe returned unexpected evidence")
+    if EXPORT_NO_PRICE_TASK_FINISHED_DESC not in str(completion.task_status_rsp_desc):
+        raise RecoveryRejected("remote task status does not confirm the task finished")
+    progress = dict(completion.progress or {})
+    progress_values = {
+        key: progress.get(key)
+        for key in ("total", "pending", "running", "failed", "waiting_db", "finished")
+    }
+    if (
+        progress_values["total"] != expected_count
+        or progress_values["finished"] != expected_count
+        or progress_values["pending"] != 0
+        or progress_values["running"] != 0
+        or progress_values["failed"] != 0
+        or progress_values["waiting_db"] != 0
+    ):
+        raise RecoveryRejected(
+            f"remote task progress is not fully completed: {progress_values}"
+        )
+    return completion
 
 
 
@@ -317,6 +378,35 @@ def run_partial_exact_harvest_recovery(
         if set(crawl_groups) != set(request_by_backend):
             raise RecoveryRejected("immutable payload and linked crawl identities are incomplete")
 
+        # P1-2: rows absent from the local workbook may only become the
+        # irreversible NO_RESULT terminal when the live remote task is
+        # proven fully finished and the business no-result cap holds.  Every
+        # check below runs before the first mutation so a rejection leaves
+        # the job and all crawls untouched.
+        pending_absent_ids = [
+            int(crawl["id"])
+            for backend_key, grouped_crawls in crawl_groups.items()
+            for crawl in grouped_crawls
+            if str(crawl["state"]) not in {"SUCCESS", "NO_RESULT", "TERMINAL_FAILED"}
+            and (backend_key[1], backend_key[2]) in classification.exact_absent
+        ]
+        remote_completion: TaskCompletionProbe | None = None
+        no_result_before: int | None = None
+        if pending_absent_ids:
+            remote_completion = _require_remote_task_completion(
+                adapter=adapter,
+                prepared=prepared,
+                identity_parts=identity_parts,
+                expected_count=len(prepared.requests),
+            )
+            no_result_before = len(store.list_crawl_work(token, states={"NO_RESULT"}))
+            if no_result_before + len(pending_absent_ids) > EXPORT_NO_PRICE_NO_RESULT_LIMIT:
+                raise RecoveryRejected(
+                    "partial exact harvest would exceed the business no-result limit "
+                    f"({no_result_before}+{len(pending_absent_ids)}>"
+                    f"{EXPORT_NO_PRICE_NO_RESULT_LIMIT})"
+                )
+
         # All global evidence and the complete classification are validated
         # before the first mutation. Row writes are intentionally independent
         # so an interrupted recovery can resume without rewriting terminals.
@@ -398,10 +488,20 @@ def run_partial_exact_harvest_recovery(
             "skipped_terminal": skipped_terminal,
             "manual_crawl_work_ids": manual_ids,
             "remote_state": str(final_job["state"]),
-            "remote_calls": 0,
+            "remote_calls": (
+                int(remote_completion.remote_calls)
+                if remote_completion is not None
+                else 0
+            ),
             "add_calls": 0,
             **dict(classification.validation_summary),
         }
+        if remote_completion is not None:
+            result["remote_completion_proven"] = True
+            result["task_status_rsp_desc"] = str(remote_completion.task_status_rsp_desc)
+            result["progress"] = dict(remote_completion.progress or {})
+            result["no_result_before"] = no_result_before
+            result["no_result_limit"] = EXPORT_NO_PRICE_NO_RESULT_LIMIT
         return result
     finally:
         store.release_lease(token)
