@@ -1420,14 +1420,38 @@ class DailyAuditStore:
                 "last_failure_reason": reason,
             }
             if consecutive >= RECOVERY_MAX_CONSECUTIVE_PROBE_FAILURES:
+                # The terminal error must match the durable restart history
+                # (review round 7): recovery_attempts==1 with a confirmed
+                # restart means post-restart probes failed — claiming "no
+                # restart was attempted" there would contradict the durable
+                # evidence.  Any other recovery_attempts/phase combination is
+                # an invariant anomaly and fails closed with the anomaly
+                # named, never with a fabricated history.
+                recovery_attempts = int(job["recovery_attempts"] or 0)
+                restart_phase = str((document.get("restart") or {}).get("phase") or "").strip()
+                if recovery_attempts == 0:
+                    headline = (
+                        f"remote stall recovery probe failed {consecutive} consecutive "
+                        f"times; no restart was attempted"
+                    )
+                elif recovery_attempts == 1 and restart_phase == "ENABLE_CONFIRMED":
+                    headline = (
+                        f"remote stall recovery probe failed {consecutive} consecutive "
+                        f"times; the single restart was already confirmed; "
+                        f"post-restart recovery probes did not produce usable evidence"
+                    )
+                else:
+                    headline = (
+                        f"remote stall recovery probe failed {consecutive} consecutive "
+                        f"times; inconsistent restart evidence "
+                        f"(recovery_attempts={recovery_attempts}, "
+                        f"restart phase={restart_phase or 'missing'})"
+                    )
                 connection.execute(
                     "UPDATE remote_jobs SET state='MANUAL_REQUIRED', recovery_evidence_json=?, error_text=?, updated_at=? WHERE id=?",
                     (
                         encode_recovery_evidence(document),
-                        (
-                            f"remote stall recovery probe failed {consecutive} consecutive "
-                            f"times; no restart was attempted; last failure: {reason}"
-                        ),
+                        f"{headline}; last failure: {reason}",
                         self._utcnow(),
                         job_id,
                     ),

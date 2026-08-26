@@ -3991,3 +3991,51 @@ def test_round7_b5b_post_restart_identity_conflict_preserves_restart_proof(tmp_p
     assert preserved["recovery_at"] == restart_evidence["recovery_at"]
     assert document["probe_health"]["identity_conflict"] is True
     assert int(job["recovery_attempts"]) == 1
+
+
+# ---------------------------------------------------------------------------
+# Round 7, MINOR C: the probe-failure cap error text must match the durable
+# restart history.  A post-restart probe failure (recovery_attempts==1,
+# ENABLE_CONFIRMED) must not claim "no restart was attempted".
+# ---------------------------------------------------------------------------
+
+
+def test_round7_c2_post_restart_probe_cap_error_is_truthful(tmp_path) -> None:
+    from app.services.remote_running_recovery import RECOVERY_MAX_CONSECUTIVE_PROBE_FAILURES
+
+    store, job_id = _recovered_store(tmp_path)
+
+    def failing_probe(job: dict):
+        return {"probe_failed": True, "diagnostic": "probe raised AuthError"}
+
+    for index in range(RECOVERY_MAX_CONSECUTIVE_PROBE_FAILURES):
+        _run_probe_pass(store, failing_probe, _NeverRestart(), now=NOW + timedelta(minutes=3 * index))
+
+    job = store.get_remote_job(job_id)
+    assert job["state"] == "MANUAL_REQUIRED"
+    error_text = str(job["error_text"])
+    assert "no restart was attempted" not in error_text
+    assert "already confirmed" in error_text
+    assert "post-restart" in error_text
+
+
+def test_round7_c3_post_restart_probe_cap_preserves_restart_evidence(tmp_path) -> None:
+    from app.services.remote_running_recovery import RECOVERY_MAX_CONSECUTIVE_PROBE_FAILURES
+
+    store, job_id = _recovered_store(tmp_path)
+
+    def failing_probe(job: dict):
+        return {"probe_failed": True, "diagnostic": "probe raised AuthError"}
+
+    for index in range(RECOVERY_MAX_CONSECUTIVE_PROBE_FAILURES):
+        _run_probe_pass(store, failing_probe, _NeverRestart(), now=NOW + timedelta(minutes=3 * index))
+
+    job = store.get_remote_job(job_id)
+    assert job["state"] == "MANUAL_REQUIRED"
+    document = json.loads(str(job["recovery_evidence_json"]))
+    restart = document["restart"]
+    assert restart["phase"] == "ENABLE_CONFIRMED"
+    assert restart["disable_evidence"]["confirmed_disabled"] is True
+    assert restart["enable_evidence"]["confirmed_enabled"] is True
+    assert restart["recovery_at"]
+    assert document["probe_health"]["consecutive_failures"] == RECOVERY_MAX_CONSECUTIVE_PROBE_FAILURES
