@@ -41,14 +41,15 @@
     const finalized = st.final && st.final.finalized;
     const active = (st.production_writer && st.production_writer.active) ||
       (st.final && st.final.computed_pending > 0 && !finalized);
-    const interval = finalized ? null : (active ? ACTIVE_MS : IDLE_MS);
-    if (interval) timer = setTimeout(poll, interval);
+    const interval = active ? ACTIVE_MS : IDLE_MS;
+    timer = setTimeout(poll, interval);
   }
   function render(p) {
     lastGenerated = p.generated_at;
     renderHero(p.overall); renderAttention(p.overall.attention);
     renderStages(p.overall.stages); renderZs(p.overall.zs_summary);
-    renderFinal(p.overall); renderJobs(p.jobs);
+    renderFinal(p.overall); renderMeta(p);
+    renderJobs(p.jobs);
     window._timelines = p.timelines;
     renderTech(p.status); schedule(p);
   }
@@ -82,7 +83,7 @@
         <div class="k">${s.name}</div>
         <div class="st">${s.state_word}</div><div class="num">${s.num}</div>
         <div class="sub">${(s.sub || []).map(([k, v]) =>
-          `<div><span>${k}</span><span>${v}</span></div>`).join("")}</div>
+          `<div><span>${k}</span><span>${esc(v)}</span></div>`).join("")}</div>
       </div>`).join("");
     document.querySelectorAll("#stages .stage").forEach((el) =>
       el.addEventListener("click", () => el.classList.toggle("open")));
@@ -103,6 +104,15 @@
     const f = $("#final");
     f.className = "final" + (o.final_state === "ok" ? " ok" : "");
     f.querySelector(".why").textContent = o.final_text;
+  }
+  function renderMeta(p) {
+    const st = p.status || {};
+    $("#bizdate").textContent = "Business date:" + (esc(st.business_date) || "—");
+    const s = p.scheduler || {};
+    $("#sched").textContent = !s.available ? "Scheduled task: unavailable" :
+      (s.running ? "Scheduled task: currently running" :
+       (s.last_result_cn ? "Scheduled task:" + s.last_result_cn :
+        (s.next_run ? "Scheduled task: next run " + String(s.next_run) : "Scheduled task: normal")));
   }
   function renderJobs(jobs) {
     $("#jobs-table tbody").innerHTML = (jobs || []).map((j) => `
@@ -130,7 +140,7 @@
       <b>恢复阶段</b><span>${esc(tl.phase || "—")}</span>
       <b>子任务进度</b><span>${j.subtasks ? j.subtasks.finished + " / " + j.subtasks.total : "—"}</span>`;
     $("#drawer .tl").innerHTML = (tl.observations || []).slice(-8).map((o) => `
-      <li><time>${(o.observed_at || "").slice(11, 16)}</time>进度 ${o.signature ? o.signature[5] + "/" + o.signature[0] : "—"} · 导出 ${o.export_count === 0 ? "无结果" : "有结果"}</li>`).join("");
+      <li><time>${(() => { const d = new Date(o.observed_at); return isNaN(d) ? "—" : d.toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit", timeZone: "Asia/Shanghai" }); })()}</time>进度 ${o.signature ? o.signature[5] + "/" + o.signature[0] : "—"} · 导出 ${o.export_count === 0 ? "无结果" : "有结果"}</li>`).join("");
     $("#drawer .note").textContent = "观察与探测不代表异常;仅“需要人工处理/恢复已用尽”需要人工介入。";
   }
   function renderTech(status) {

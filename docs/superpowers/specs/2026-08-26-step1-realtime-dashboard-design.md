@@ -122,3 +122,8 @@ R7 正在准备数据   [蓝]  detail.pending+running>0 ∨ model.pending+runnin
 ## 10. 交付与 Git
 
 仅 worktree 开发;完成=fresh 全相关套件+commit+push dev 分支后停止;不 merge、不部署、不 push prod、不改现有 Scheduler;生产 checkout 永不作开发目录。
+
+## 11. 实时行为(real-time behavior)
+
+- 前端条件轮询:活跃(生产写入器 active 或 final.computed_pending>0 且未 finalized)5 秒,否则 30 秒;ETag/304 稳态续排;页面不可见暂停、可见即补刷。
+- Execution-period ruling (2026-08-26 final review): FINALIZED no longer fully stops polling; instead switches to 30-second slow polling (serving always-on dashboards; cost ≈ one 304 per 30 seconds).

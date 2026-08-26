@@ -294,3 +294,16 @@ def test_fingerprint_ignores_generated_at():
     a = {"generated_at": "t1", "fingerprint": "", "data": {"x": 1}}
     b = {"generated_at": "t2", "fingerprint": "", "data": {"x": 1}}
     assert fingerprint_payload(a) == fingerprint_payload(b)
+
+
+def test_final_text_ok_and_missing_output_branches():
+    ok = _status(final={"pending": 0, "computed_pending": 0, "frozen": True, "finalized": True,
+                        "forced": False, "output_path": "x.xlsx", "output_exists": True,
+                        "manifest_recorded": True, "blocker_summary": {}})
+    out_ok = compute_overall_status(ok)
+    assert out_ok["final_state"] == "ok" and "已生成" in out_ok["final_text"] and "通过" in out_ok["final_text"]
+    missing = _status(final={"pending": 0, "computed_pending": 0, "frozen": True, "finalized": True,
+                             "forced": False, "output_path": "x.xlsx", "output_exists": False,
+                             "manifest_recorded": False, "blocker_summary": {}})
+    out_missing = compute_overall_status(missing)
+    assert "失败" in out_missing["final_text"]

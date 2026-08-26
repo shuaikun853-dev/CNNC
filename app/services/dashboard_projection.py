@@ -221,7 +221,7 @@ def project_remote_jobs(state_path: Path, business_date: str) -> list[dict]:
             cn, pill = _STATE_CN.get(str(row["state"]), (str(row["state"]), "warn"))
             jobs.append({
                 "id": int(row["id"]), "mall_key": str(row["mall_key"] or ""),
-                "task_name": str(row["task_name"]), "state": str(row["state"]),
+                "task_name": str(row["task_name"] or ""), "state": str(row["state"]),
                 "state_cn": (cn + " · 自动恢复中") if recovering else cn,
                 "pill": "run" if recovering else pill, "subtasks": subtasks,
                 "created_at": row["created_at"], "updated_at": row["updated_at"],
@@ -319,7 +319,7 @@ def _run_scheduler_probe() -> dict | None:
            "if (-not $t) { Write-Output '{}' ; exit 0 }; "
            "$i = Get-ScheduledTaskInfo -TaskName $t.TaskName -ErrorAction SilentlyContinue; "
            "[pscustomobject]@{ state = [string]$t.State; last_run = [string]$i.LastRunTime; "
-           "last_result = [int]$i.LastTaskResult; next_run = [string]$i.NextRunTime } | ConvertTo-Json -Compress"]
+           "last_result = if ($i) { [int]$i.LastTaskResult } else { -1 }; next_run = [string]$i.NextRunTime } | ConvertTo-Json -Compress"]
     try:
         proc = _subprocess.run(cmd, capture_output=True, timeout=10, check=False)
     except (OSError, _subprocess.TimeoutExpired):
