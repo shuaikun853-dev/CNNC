@@ -239,7 +239,8 @@ def test_translate_task_result_known_codes():
 
 def test_scheduler_status_degrades(monkeypatch):
     import app.services.dashboard_projection as dp
-    monkeypatch.setattr(dp, "_run_schtasks_query", lambda: None)
+    dp._scheduler_cache.update({"at": 0.0, "value": None})
+    monkeypatch.setattr(dp, "_run_scheduler_probe", lambda: None)
     out = dp.project_scheduler_status()
     assert out == {"available": False}
 
@@ -251,8 +252,20 @@ def test_scheduler_status_degrades_on_timeout(monkeypatch):
     def boom():
         raise sp.TimeoutExpired(cmd=["schtasks"], timeout=10)
 
-    monkeypatch.setattr(dp, "_run_schtasks_query", boom)
+    dp._scheduler_cache.update({"at": 0.0, "value": None})
+    monkeypatch.setattr(dp, "_run_scheduler_probe", boom)
     assert dp.project_scheduler_status() == {"available": False}
+
+
+def test_scheduler_status_from_powershell_probe(monkeypatch):
+    import app.services.dashboard_projection as dp
+    dp._scheduler_cache.update({"at": 0.0, "value": None})
+    monkeypatch.setattr(dp, "_run_scheduler_probe", lambda: {
+        "state": "Running", "last_run": "2026/8/26 9:15:00", "last_result": 267009,
+        "next_run": "2026/8/26 9:30:00"})
+    out = dp.project_scheduler_status()
+    assert out["available"] is True and out["running"] is True
+    assert "正在运行" in out["last_result_cn"]
 
 
 from app.services.dashboard_projection import build_dashboard_summary, fingerprint_payload

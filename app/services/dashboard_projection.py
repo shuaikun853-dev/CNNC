@@ -265,10 +265,9 @@ def project_recovery_timeline(job_row: Mapping) -> dict:
 
 import json as _json
 import subprocess as _subprocess
-import xml.etree.ElementTree as _ET
 from datetime import date as _date, timedelta as _timedelta
+from time import monotonic as _time_monotonic
 
-SCHEDULER_TASK_NAME = "CNNC-PriceAudit-Incremental"
 _RUNNING_CODES = {267009, 0x41301}
 
 
@@ -309,39 +308,52 @@ def _translate_task_result(code) -> str:
     return f"上次运行结果码 {code}(未知,详情见技术说明)"
 
 
-def _run_schtasks_query() -> bytes | None:
+_SCHEDULER_CACHE_SECONDS = 30.0
+_scheduler_cache: dict = {"at": 0.0, "value": None}
+
+
+def _run_scheduler_probe() -> dict | None:
+    """Read-only PowerShell Get-ScheduledTask/Get-ScheduledTaskInfo JSON probe."""
+    cmd = ["powershell", "-NoProfile", "-Command",
+           "$t = Get-ScheduledTask -TaskName 'CNNC-PriceAudit-Incremental' -ErrorAction SilentlyContinue; "
+           "if (-not $t) { Write-Output '{}' ; exit 0 }; "
+           "$i = Get-ScheduledTaskInfo -TaskName $t.TaskName -ErrorAction SilentlyContinue; "
+           "[pscustomobject]@{ state = [string]$t.State; last_run = [string]$i.LastRunTime; "
+           "last_result = [int]$i.LastTaskResult; next_run = [string]$i.NextRunTime } | ConvertTo-Json -Compress"]
     try:
-        proc = _subprocess.run(
-            ["schtasks", "/query", "/tn", SCHEDULER_TASK_NAME, "/xml"],
-            capture_output=True, timeout=10, check=False)
+        proc = _subprocess.run(cmd, capture_output=True, timeout=10, check=False)
     except (OSError, _subprocess.TimeoutExpired):
         return None
-    return proc.stdout if proc.returncode == 0 and proc.stdout else None
+    if proc.returncode != 0 or not proc.stdout:
+        return None
+    try:
+        data = _json.loads(proc.stdout.decode("utf-8-sig", errors="replace") or "{}")
+    except (ValueError, TypeError):
+        return None
+    return data or None
 
 
 def project_scheduler_status() -> dict:
+    now = _time_monotonic()
+    if _scheduler_cache["value"] is not None and now - _scheduler_cache["at"] < _SCHEDULER_CACHE_SECONDS:
+        return _scheduler_cache["value"]
+    data = None
     try:
-        raw = _run_schtasks_query()
-    except (OSError, _subprocess.TimeoutExpired):
-        return {"available": False}
-    if raw is None:
-        return {"available": False}
-    try:
-        root = _ET.fromstring(raw)
-        ns = {"t": root.tag.split("}")[0].strip("{")} if root.tag.startswith("{") else {"t": ""}
-        def _text(tag: str):
-            el = root.find(f".//t:{tag}", ns)
-            return el.text.strip() if el is not None and el.text else None
-        result = _text("LastTaskResult")
-        code = int(result, 16) if result and result.lower().startswith("0x") else (int(result) if result and result.isdigit() else None)
-        return {"available": True,
-                "running": code in _RUNNING_CODES if code is not None else None,
-                "last_run": _text("LastRunTime"),
-                "last_result": result,
-                "last_result_cn": _translate_task_result(code) if code is not None else None,
-                "next_run": _text("NextRunTime")}
-    except (_ET.ParseError, ValueError, TypeError):
-        return {"available": False}
+        data = _run_scheduler_probe()
+    except Exception:
+        data = None
+    if data is None:
+        result = {"available": False}
+    else:
+        code = int(data.get("last_result", -1))
+        result = {"available": True,
+                  "running": str(data.get("state", "")).lower() == "running" or code in _RUNNING_CODES,
+                  "last_run": str(data.get("last_run") or "") or None,
+                  "last_result": str(code),
+                  "last_result_cn": _translate_task_result(code),
+                  "next_run": str(data.get("next_run") or "") or None}
+    _scheduler_cache.update({"at": now, "value": result})
+    return result
 
 
 import hashlib as _hashlib
