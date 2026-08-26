@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import threading
+import time
 import urllib.error
 import urllib.request
 from contextlib import contextmanager
@@ -319,12 +320,23 @@ class AuthManager:
         refresh_token: str,
         *,
         timeout_seconds: float | None = None,
+        deadline: float | None = None,
+        monotonic: Callable[[], float] | None = None,
     ) -> AuthTokens:
         config = SYSTEM_CONFIG[system]
         url = f"{config['refresh_url']}?{urlencode({'grantType': 'refresh_token', 'refreshToken': refresh_token})}"
         request = urllib.request.Request(url, method="POST")
         request.headers["Authorization"] = BASIC_AUTH
-        if timeout_seconds is None:
+        if deadline is not None:
+            # Absolute deadline (review round 5): lock waits and pre-HTTP
+            # work consume the same budget, so the HTTP only ever gets the
+            # live remainder — never a fresh copy of the initial budget the
+            # caller computed before those waits.
+            remaining = float(deadline) - (monotonic or time.monotonic)()
+            if not remaining > 0:
+                raise TimeoutError("auth refresh deadline exhausted before HTTP")
+            actual_timeout = min(30.0, remaining)
+        elif timeout_seconds is None:
             actual_timeout = 30.0
         else:
             if not timeout_seconds > 0:
@@ -376,15 +388,30 @@ class AuthManager:
         *,
         stale_access_token: str | None = None,
         timeout_seconds: float | None = None,
+        deadline: float | None = None,
+        monotonic: Callable[[], float] | None = None,
     ) -> AuthTokens:
         if system not in SYSTEM_CONFIG:
             raise ValueError(f"Unsupported auth system: {system}")
+        # The locks taken here are blocking (threading.RLock plus a process
+        # file lock; msvcrt LK_LOCK retries ~10 s on Windows, flock blocks
+        # on POSIX) and are NOT hard-cancelable — but their wait consumes
+        # the absolute deadline: _request_refresh recomputes the live
+        # remainder immediately before the HTTP and refuses to open at all
+        # once the deadline has passed.  _save_tokens after a successful
+        # refresh deliberately ignores the deadline: persisting the rotated
+        # refresh token is mandatory, and the recovery adapter re-checks
+        # its own callback deadline before any further remote call.
         with self._locked(system):
             current = self.get_tokens(system)
             if stale_access_token is not None and current.access_token != stale_access_token:
                 return current
             tokens = self._request_refresh(
-                system, current.refresh_token, timeout_seconds=timeout_seconds
+                system,
+                current.refresh_token,
+                timeout_seconds=timeout_seconds,
+                deadline=deadline,
+                monotonic=monotonic,
             )
             self._save_tokens(system, tokens)
             if self.logger:
@@ -422,11 +449,18 @@ class AuthManager:
         *,
         refresh: bool = True,
         timeout_seconds: float | None = None,
+        deadline: float | None = None,
+        monotonic: Callable[[], float] | None = None,
     ) -> dict[str, str]:
         if system != "zhaoshang":
             raise ValueError("Only Zhaoshang uses the BLADE_AUTH/COOKIE environment bridge")
         tokens = (
-            self.refresh(system, timeout_seconds=timeout_seconds)
+            self.refresh(
+                system,
+                timeout_seconds=timeout_seconds,
+                deadline=deadline,
+                monotonic=monotonic,
+            )
             if refresh
             else self.get_tokens(system)
         )

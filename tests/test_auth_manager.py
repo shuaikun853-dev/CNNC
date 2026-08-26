@@ -439,3 +439,74 @@ def test_round4_refresh_passes_timeout_seconds_to_the_refresh_http(tmp_path):
 
     assert (tokens.access_token, tokens.refresh_token) == ("zs-b", "zs-r2")
     assert opener.timeouts == [2.5]
+
+
+# ---------------------------------------------------------------------------
+# Review round 5, IMPORTANT B: timeout_seconds is a STATIC budget — lock
+# waits and other pre-HTTP work do not consume it.  The recovery callback
+# instead passes an ABSOLUTE monotonic deadline; whatever time the lock
+# wait already burned, the refresh HTTP only ever gets the live remainder
+# (and none at all once the deadline has passed).  Callers that pass no
+# deadline keep the historical 30-second default.
+# ---------------------------------------------------------------------------
+
+
+def test_round5_b1_deadline_recomputed_after_elapsed_pre_work(tmp_path):
+    # 6 of the 8 deadline seconds were already consumed (e.g. by the auth
+    # lock wait) before the HTTP: the opener must receive <= 2 seconds,
+    # never the full 8 a static budget would hand it.
+    opener = TimeoutRecordingOpener(_rotated_response())
+    manager = _round4_manager(tmp_path, opener)
+
+    environment = manager.export_environment(
+        "zhaoshang", refresh=True, deadline=1008.0, monotonic=lambda: 1006.0
+    )
+
+    assert opener.timeouts and max(opener.timeouts) <= 2.0
+    assert environment["BLADE_AUTH"] == "bearer zs-b"
+
+
+def test_round5_b2_exhausted_deadline_sends_zero_auth_http(tmp_path):
+    # The deadline already passed before the HTTP: zero opener calls.
+    opener = TimeoutRecordingOpener(_rotated_response())
+    manager = _round4_manager(tmp_path, opener)
+
+    with pytest.raises(TimeoutError):
+        manager.export_environment(
+            "zhaoshang", refresh=True, deadline=1000.0, monotonic=lambda: 1005.0
+        )
+
+    assert opener.timeouts == []
+
+
+def test_round5_b3_no_deadline_keeps_the_default_30(tmp_path):
+    opener = TimeoutRecordingOpener(_rotated_response())
+    manager = _round4_manager(tmp_path, opener)
+
+    manager.export_environment("zhaoshang", refresh=True)
+
+    assert opener.timeouts == [30.0]
+
+
+def test_round5_b4_deadline_above_default_clamps_to_30(tmp_path):
+    opener = TimeoutRecordingOpener(_rotated_response())
+    manager = _round4_manager(tmp_path, opener)
+
+    manager.export_environment(
+        "zhaoshang", refresh=True, deadline=1000.0, monotonic=lambda: 950.0
+    )
+
+    assert opener.timeouts == [30.0]
+
+
+def test_round5_deadline_takes_precedence_over_static_timeout(tmp_path):
+    # Both are supplied (the adapter threads both): the recomputed live
+    # remainder wins over the static pre-lock budget.
+    opener = TimeoutRecordingOpener(_rotated_response())
+    manager = _round4_manager(tmp_path, opener)
+
+    manager.refresh(
+        "zhaoshang", timeout_seconds=8.0, deadline=1008.0, monotonic=lambda: 1007.5
+    )
+
+    assert opener.timeouts == [0.5]

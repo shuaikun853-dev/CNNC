@@ -1625,7 +1625,13 @@ class CnncLegacyZhaoshangAdapter:
         # before the bounded session exists, so it may only use the live
         # remaining time — never the AuthManager's full 30-second default.
         environment.update(
-            auth_manager.export_environment("zhaoshang", refresh=True, timeout_seconds=remaining)
+            auth_manager.export_environment(
+                "zhaoshang",
+                refresh=True,
+                timeout_seconds=remaining,
+                deadline=deadline,
+                monotonic=self._monotonic,
+            )
         )
         remaining = deadline - self._monotonic()
         if remaining <= 0:
@@ -1884,7 +1890,13 @@ class CnncLegacyZhaoshangAdapter:
         # before the bounded session exists, so it may only use the live
         # remaining time — never the AuthManager's full 30-second default.
         environment.update(
-            auth_manager.export_environment("zhaoshang", refresh=True, timeout_seconds=remaining)
+            auth_manager.export_environment(
+                "zhaoshang",
+                refresh=True,
+                timeout_seconds=remaining,
+                deadline=deadline,
+                monotonic=self._monotonic,
+            )
         )
         remaining = deadline - self._monotonic()
         if remaining <= 0:

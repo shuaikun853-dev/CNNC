@@ -889,7 +889,9 @@ def _restart_tool_module(task: dict, session: _RestartSession):
 
 
 class _FakeAuthManager:
-    def export_environment(self, system, refresh=False, timeout_seconds=None):
+    def export_environment(
+        self, system, refresh=False, timeout_seconds=None, deadline=None, monotonic=None
+    ):
         return {"BLADE_AUTH": "bearer fake", "COOKIE": "x-access-token=fake; refreshToken=fake"}
 
 
@@ -2747,3 +2749,68 @@ def test_round5_post_enable_confirm_timeout_is_enable_unknown(tmp_path, monkeypa
     assert outcome.status.value == "ENABLE_UNKNOWN"
     assert len([c for c in session.update_calls if c.get("state") == "0"]) == 1
     assert len([c for c in session.update_calls if c.get("state") == "1"]) == 1
+
+
+# ---------------------------------------------------------------------------
+# Round 5, IMPORTANT B: the auth refresh must run on the SAME absolute
+# callback deadline as the bounded session — the opener timeout is the live
+# remainder, never a fresh copy of the initial budget.
+# ---------------------------------------------------------------------------
+
+
+def test_round5_b5_auth_deadline_and_session_share_one_budget(tmp_path, monkeypatch) -> None:
+    task = _running_task_record()
+    session = _RestartSession(task)
+    opener = _RecordingAuthOpener()
+    clock = _SteppingClock(step=1.0)
+    adapter, prepared = _prepared_job(
+        tmp_path, monkeypatch, task, session, monotonic=clock, auth=_real_auth_manager(tmp_path, opener)
+    )
+
+    outcome = adapter.restart_running_task(prepared, TASK_ID, TASK_NUMBER, timeout_seconds=20.0)
+
+    assert outcome.status.value == "RESTARTED"
+    assert opener.timeouts, "the auth refresh must have issued its HTTP request"
+    # The refresh ran on the same absolute deadline: after two clock ticks
+    # (deadline computation + pre-auth check) its opener timeout is the live
+    # remainder (18 s), never a fresh 20 s.
+    assert max(opener.timeouts) <= 18.0
+    session_timeouts = _all_recorded_timeouts(session)
+    assert session_timeouts
+    # Every business request continues on the SAME deadline: the first one
+    # sees at most the post-auth remainder (16 s), and later ones shrink.
+    assert max(session_timeouts) <= 16.0
+
+
+def test_round5_b6_lock_overrun_past_deadline_dispatches_no_write(tmp_path, monkeypatch) -> None:
+    task = _running_task_record()
+    session = _RestartSession(task)
+    clock = _SteppingClock(step=0.0)
+
+    class _OverrunningAuthManager:
+        """Simulates an auth lock wait that blocks past the callback deadline.
+
+        The lock itself is not hard-cancelable (documented remaining risk);
+        what must hold is that nothing after it — no auth HTTP benefit and
+        no remote write — executes past the deadline.
+        """
+
+        def export_environment(
+            self, system, refresh=False, timeout_seconds=None, deadline=None, monotonic=None
+        ):
+            clock.value = clock.value + 60.0
+            return {
+                "BLADE_AUTH": "bearer fake",
+                "COOKIE": "x-access-token=fake; refreshToken=fake",
+            }
+
+    adapter, prepared = _prepared_job(
+        tmp_path, monkeypatch, task, session, monotonic=clock, auth=_OverrunningAuthManager()
+    )
+
+    outcome = adapter.restart_running_task(prepared, TASK_ID, TASK_NUMBER, timeout_seconds=10.0)
+
+    assert outcome.status.value == "PRE_WRITE_FAILED"
+    assert session.update_calls == []
+    assert session.post_calls == 0
+    assert session.get_calls == 0
