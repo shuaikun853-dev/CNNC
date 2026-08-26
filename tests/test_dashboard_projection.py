@@ -253,3 +253,31 @@ def test_scheduler_status_degrades_on_timeout(monkeypatch):
 
     monkeypatch.setattr(dp, "_run_schtasks_query", boom)
     assert dp.project_scheduler_status() == {"available": False}
+
+
+from app.services.dashboard_projection import build_dashboard_summary, fingerprint_payload
+
+
+def test_build_summary_end_to_end(tmp_path, monkeypatch):
+    (tmp_path / "day").mkdir()
+    db = _make_db(tmp_path / "day")
+    from app.services import dashboard_projection as dp
+    monkeypatch.setattr(dp, "collect_runtime_status", lambda **kw: _status())
+    monkeypatch.setattr(dp, "runtime_paths", lambda bd, root=None: type("P", (), {
+        "state_path": db, "run_dir": db.parent})())
+    monkeypatch.setattr(dp, "project_scheduler_status", lambda: {"available": False})
+    monkeypatch.setattr(dp, "project_recent_days", lambda root, n=14, **kw: [])
+    out = build_dashboard_summary("2026-08-26", tmp_path)
+    assert out["overall"]["word"] == "需要人工处理"
+    assert any(j["mall_key"] == "京东商城" for j in out["jobs"])
+    assert out["timelines"] and "12" in out["timelines"]
+    assert all("recovery_evidence_json" not in j for j in out["jobs"])
+    assert len(out["fingerprint"]) == 64
+    again = build_dashboard_summary("2026-08-26", tmp_path)
+    assert again["fingerprint"] == out["fingerprint"]  # 同数据同指纹
+
+
+def test_fingerprint_ignores_generated_at():
+    a = {"generated_at": "t1", "fingerprint": "", "data": {"x": 1}}
+    b = {"generated_at": "t2", "fingerprint": "", "data": {"x": 1}}
+    assert fingerprint_payload(a) == fingerprint_payload(b)

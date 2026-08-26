@@ -342,3 +342,39 @@ def project_scheduler_status() -> dict:
                 "next_run": _text("NextRunTime")}
     except (_ET.ParseError, ValueError, TypeError):
         return {"available": False}
+
+
+import hashlib as _hashlib
+from datetime import UTC as _UTC, datetime as _datetime
+
+from app.services.incremental_audit_runtime import DEFAULT_RUNTIME_ROOT, runtime_paths
+from app.services.incremental_audit_status import collect_runtime_status
+
+
+def fingerprint_payload(payload: Mapping) -> str:
+    body = {k: v for k, v in payload.items() if k not in ("generated_at", "fingerprint")}
+    return _hashlib.sha256(
+        _json.dumps(body, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
+        .encode("utf-8")).hexdigest()
+
+
+def build_dashboard_summary(business_date: str, runtime_root=DEFAULT_RUNTIME_ROOT) -> dict:
+    paths = runtime_paths(business_date, runtime_root)
+    status = collect_runtime_status(business_date=business_date, runtime_root=runtime_root)
+    jobs = project_remote_jobs(paths.state_path, business_date) if paths.state_path.is_file() else []
+    recovering = sum(1 for j in jobs if j["recovering"])
+    timelines: dict = {}
+    for j in jobs:
+        if j["recovering"] or j["pill"] in ("err", "warn"):
+            timelines[str(j["id"])] = project_recovery_timeline(j)
+    payload = {
+        "generated_at": _datetime.now(_UTC).isoformat(timespec="seconds"),
+        "overall": compute_overall_status(status, recovering=recovering),
+        "jobs": [{k: v for k, v in j.items() if k != "recovery_evidence_json"} for j in jobs],
+        "timelines": timelines,
+        "recent_days": project_recent_days(runtime_root, n=14),
+        "scheduler": project_scheduler_status(),
+        "status": status,
+    }
+    payload["fingerprint"] = fingerprint_payload(payload)
+    return payload
