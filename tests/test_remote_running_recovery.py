@@ -2951,3 +2951,85 @@ def test_round5_c5_non_mapping_payload_is_unknown(tmp_path, monkeypatch) -> None
     probe = adapter.probe_running_task(prepared, TASK_ID, TASK_NUMBER, timeout_seconds=20.0)
 
     assert probe.progress.get("total") is None
+
+
+# ---------------------------------------------------------------------------
+# Round 5 review follow-up: a pre-write failure is retryable, but a
+# PERSISTENT pre-write fault (expired refreshToken, missing external tool)
+# must eventually fail closed to manual review instead of retrying forever —
+# the pre-Round-5 behavior escalated within the 900 s confirmation window.
+# A consecutive-failure cap covers every permanent cause without guessing
+# from the exception type.
+# ---------------------------------------------------------------------------
+
+
+def test_round5_persistent_pre_write_failures_fail_closed_to_manual(tmp_path) -> None:
+    from app.services.remote_running_recovery import RECOVERY_MAX_CONSECUTIVE_PRE_WRITE_FAILURES
+
+    store, job_id = _stalled_store(tmp_path)
+    failure = {"status": "PRE_WRITE_FAILED", "restarted": False, "diagnostic": "auth expired"}
+    restart = _FakeRestart([failure] * RECOVERY_MAX_CONSECUTIVE_PRE_WRITE_FAILURES)
+
+    for index in range(RECOVERY_MAX_CONSECUTIVE_PRE_WRITE_FAILURES):
+        _run_pass(store, _probe_payload(), restart, now=NOW + timedelta(minutes=3 * index))
+        # Before the cap the job must stay fresh-eligible RUNNING.
+        if index < RECOVERY_MAX_CONSECUTIVE_PRE_WRITE_FAILURES - 1:
+            assert store.get_remote_job(job_id)["state"] == "RUNNING"
+
+    job = store.get_remote_job(job_id)
+    assert job["state"] == "MANUAL_REQUIRED"
+    assert int(job["recovery_attempts"] or 0) == 0
+    # Every attempt stayed a fresh restart (resume_phase=None): the fault
+    # was provably pre-write each time, so no side effect ever left.
+    assert restart.calls == [(job_id, None)] * RECOVERY_MAX_CONSECUTIVE_PRE_WRITE_FAILURES
+
+
+def test_round5_transient_pre_write_failures_reset_after_success(tmp_path) -> None:
+    store, job_id = _stalled_store(tmp_path)
+    restart = _FakeRestart(
+        [
+            {"status": "PRE_WRITE_FAILED", "restarted": False, "diagnostic": "blip 1"},
+            {"status": "PRE_WRITE_FAILED", "restarted": False, "diagnostic": "blip 2"},
+            {
+                "status": "RESTARTED",
+                "restarted": True,
+                "disable_evidence": {"confirmed_disabled": True},
+                "enable_evidence": {"confirmed_enabled": True},
+            },
+        ]
+    )
+
+    _run_pass(store, _probe_payload(), restart, now=NOW)
+    _run_pass(store, _probe_payload(), restart, now=NOW + timedelta(minutes=2))
+    job = store.get_remote_job(job_id)
+    evidence = json.loads(str(job["recovery_evidence_json"]))
+    assert evidence["restart"]["phase"] == "PRE_WRITE_FAILED"
+    assert evidence["restart"]["pre_write_failures"] == 2
+
+    _run_pass(store, _probe_payload(), restart, now=NOW + timedelta(minutes=4))
+    job = store.get_remote_job(job_id)
+    evidence = json.loads(str(job["recovery_evidence_json"]))
+    assert job["state"] == "RUNNING"
+    assert int(job["recovery_attempts"]) == 1
+    assert evidence["restart"]["phase"] == "ENABLE_CONFIRMED"
+    assert "pre_write_failures" not in evidence["restart"]
+
+
+def test_round5_pre_write_failed_never_withdraws_a_real_pending_phase(tmp_path) -> None:
+    # Defense-in-depth: a misbehaving injected runner returning
+    # PRE_WRITE_FAILED while a genuine dispatched phase is durable must not
+    # withdraw that write-ahead (which would authorize a second write).
+    store, job_id = _stalled_store(tmp_path)
+    restart = _FakeRestart(
+        [
+            {"status": "DISABLE_UNKNOWN", "restarted": False, "observed_enabled": True},
+            {"status": "PRE_WRITE_FAILED", "restarted": False, "diagnostic": "injected lie"},
+        ]
+    )
+    _run_pass(store, _probe_payload(), restart, now=NOW)
+    evidence = json.loads(str(store.get_remote_job(job_id)["recovery_evidence_json"]))
+    assert evidence["restart"]["phase"] == "DISABLE_SENT"
+
+    _run_pass(store, _probe_payload(), restart, now=NOW + timedelta(minutes=2))
+    evidence = json.loads(str(store.get_remote_job(job_id)["recovery_evidence_json"]))
+    assert evidence["restart"]["phase"] == "DISABLE_SENT"

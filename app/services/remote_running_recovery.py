@@ -132,6 +132,12 @@ RECOVERY_EXHAUSTED_MIN_POST_SPAN_SECONDS = 1800.0
 # the real remote state before any decision; after this window a still
 # contradictory remote state fails closed into manual review.
 RECOVERY_WRITE_CONFIRM_WINDOW_SECONDS = 900.0
+# A pre-write failure is retryable, but a PERSISTENT pre-write fault
+# (expired refreshToken, missing external tool, persistent transport
+# outage) must eventually fail closed to manual review like the
+# pre-Round-5 confirmation window did — the cap counts consecutive
+# zero-write failures without guessing from the exception type.
+RECOVERY_MAX_CONSECUTIVE_PRE_WRITE_FAILURES = 5
 # Durable restart phases that already dispatched (or durably recorded) a
 # remote side effect.  A job carrying one of them is an EXISTING recovery
 # protocol: the next pass reconciles the phase against the live remote state
@@ -511,6 +517,9 @@ def _apply_restart(
     if isinstance(restart, Mapping) and _text(restart.get("phase")) in PENDING_RESTART_PHASES:
         resume_phase = _text(restart.get("phase"))
     else:
+        # Captured before the write-ahead overwrite: the consecutive
+        # pre-write failure count lives in the previous zero-write record.
+        previous_restart = restart
         evidence["restart"] = {
             "phase": "DISABLE_SENT",
             "phase_at": now.astimezone(UTC).isoformat(timespec="seconds"),
@@ -558,18 +567,41 @@ def _apply_restart(
             token, job_id, remote_identity=_text(job.get("remote_identity")), evidence=finished
         )
         return outcome
-    if status == "PRE_WRITE_FAILED":
+    if status == "PRE_WRITE_FAILED" and resume_phase is None:
         # Zero-write proof: the adapter established that no remote write was
         # attempted (auth/lookup/status/progress/deadline all precede the
         # first write).  The write-ahead DISABLE_SENT must be withdrawn —
         # leaving it would force reconcile-only and waste the single
         # automatic recovery attempt on a transient fault.  The diagnostic
         # is kept durably; the attempt slot is NOT consumed; the job stays
-        # RUNNING so the next pass may re-enter fresh recovery.
+        # RUNNING so the next pass may re-enter fresh recovery.  Only a
+        # fresh protocol (resume_phase is None) may claim this proof: a
+        # PRE_WRITE_FAILED answer while a dispatched phase is durable must
+        # never withdraw that write-ahead.  A persistent fault fails closed
+        # to manual after the consecutive-failure cap so a permanent
+        # auth/tooling outage cannot retry silently forever.
+        previous = (
+            previous_restart if isinstance(previous_restart, Mapping) else {}
+        )
+        consecutive = 1
+        if _text(previous.get("phase")) == "PRE_WRITE_FAILED":
+            try:
+                consecutive = int(previous.get("pre_write_failures") or 0) + 1
+            except (TypeError, ValueError):
+                consecutive = 1
+        if consecutive >= RECOVERY_MAX_CONSECUTIVE_PRE_WRITE_FAILURES:
+            store.mark_remote_manual(
+                token,
+                job_id,
+                f"remote stall recovery failed pre-write {consecutive} consecutive "
+                f"times; last failure: {_text(outcome.get('diagnostic')) or status}",
+            )
+            return outcome
         evidence["restart"] = {
             "phase": "PRE_WRITE_FAILED",
             "phase_at": now.astimezone(UTC).isoformat(timespec="seconds"),
             "failed_status": status,
+            "pre_write_failures": consecutive,
             "diagnostic": _text(outcome.get("diagnostic")) or status,
         }
         store.update_remote_recovery_evidence(token, job_id, evidence)
