@@ -173,7 +173,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from app.services.remote_running_recovery import (
-    RUNNING_PROBE_MIN_HARVEST_ATTEMPTS, RUNNING_PROBE_MIN_WALL_SECONDS,
+    PENDING_RESTART_PHASES, RUNNING_PROBE_MIN_HARVEST_ATTEMPTS, RUNNING_PROBE_MIN_WALL_SECONDS,
     decode_recovery_evidence,
 )
 
@@ -243,15 +243,20 @@ def project_recovery_timeline(job_row: Mapping) -> dict:
     wall = (datetime.now(UTC) - created).total_seconds() if created else 0.0
     attempts = int(job_row.get("harvest_attempts") or 0)
     restart = evidence.get("restart")
+    phase_restart = str(restart.get("phase")) if isinstance(restart, dict) else ""
     if state == "RECOVERY_EXHAUSTED":
         phase = "恢复已用尽"
     elif state == "MANUAL_REQUIRED":
         phase = "需要人工处理"
-    elif state == "RUNNING" and isinstance(restart, dict) and str(restart.get("phase")) == "ENABLE_CONFIRMED":
+    elif state == "RUNNING" and phase_restart in PENDING_RESTART_PHASES:
+        phase = "已证明停滞(恢复进行中)"
+    elif state == "RUNNING" and phase_restart == "ENABLE_CONFIRMED":
         phase = "自动恢复中"
     elif state == "RUNNING" and attempts >= RUNNING_PROBE_MIN_HARVEST_ATTEMPTS \
             and wall >= RUNNING_PROBE_MIN_WALL_SECONDS:
         phase = "观察中(≠异常)"
+    elif phase_restart == "ENABLE_CONFIRMED":
+        phase = "恢复成功"
     else:
         phase = "正常采集"
     return {"phase": phase, "observations": evidence.get("observations") or [],

@@ -178,3 +178,36 @@ def test_recovery_timeline_phase_and_observations(tmp_path):
     assert tl["phase"] == "自动恢复中"
     assert tl["observations"][0]["signature"][5] == 45
     assert tl["restart"]["phase"] == "ENABLE_CONFIRMED"
+
+
+def test_recovery_timeline_stalled_pending_restart(tmp_path):
+    import sqlite3 as s3
+    db = _make_db(tmp_path)
+    con = s3.connect(db)
+    row = con.execute("SELECT recovery_evidence_json FROM remote_jobs WHERE id=12").fetchone()
+    ev = json.loads(row[0]); ev["restart"]["phase"] = "ENABLE_SENT"
+    con.execute("UPDATE remote_jobs SET recovery_evidence_json=? WHERE id=12", (json.dumps(ev, ensure_ascii=False),))
+    con.commit(); con.close()
+    jobs = project_remote_jobs(db, "2026-08-26")
+    assert project_recovery_timeline(jobs[0])["phase"] == "已证明停滞(恢复进行中)"
+
+
+def test_recovery_timeline_recovered_success(tmp_path):
+    import sqlite3 as s3
+    db = _make_db(tmp_path)
+    con = s3.connect(db)
+    con.execute("UPDATE remote_jobs SET state='COMPLETED' WHERE id=12")
+    con.commit(); con.close()
+    jobs = project_remote_jobs(db, "2026-08-26")
+    tl = project_recovery_timeline(jobs[0])
+    assert tl["phase"] == "恢复成功" and jobs[0]["recovering"] is False
+
+
+def test_recovery_timeline_plain_completed_is_normal(tmp_path):
+    import sqlite3 as s3
+    db = _make_db(tmp_path)
+    con = s3.connect(db)
+    con.execute("UPDATE remote_jobs SET state='COMPLETED', recovery_evidence_json=NULL WHERE id=12")
+    con.commit(); con.close()
+    jobs = project_remote_jobs(db, "2026-08-26")
+    assert project_recovery_timeline(jobs[0])["phase"] == "正常采集"
