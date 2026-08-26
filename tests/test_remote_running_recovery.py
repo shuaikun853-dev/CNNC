@@ -3476,4 +3476,4 @@ def test_round6_recovery_probe_bridge_reports_failure_envelope(tmp_path) -> None
     outcome = probe_cb(durable, 60.0)
 
     assert outcome["probe_failed"] is True
-    assert outcome["diagnostic"]
+    assert str(outcome["diagnostic"]).startswith("probe raised ")
