@@ -1617,7 +1617,15 @@ class CnncLegacyZhaoshangAdapter:
         tool = self._load_module(self._external_tool_path, "legacy_zhaoshang_running_probe")
         auth_manager = self._auth_manager or AuthManager()
         environment = internal_subprocess_env()
-        environment.update(auth_manager.export_environment("zhaoshang", refresh=True))
+        remaining = deadline - self._monotonic()
+        if remaining <= 0:
+            raise TimeoutError("legacy Zhaoshang probe deadline exhausted before auth refresh")
+        # The token-refresh HTTP is part of this callback's budget: it runs
+        # before the bounded session exists, so it may only use the live
+        # remaining time — never the AuthManager's full 30-second default.
+        environment.update(
+            auth_manager.export_environment("zhaoshang", refresh=True, timeout_seconds=remaining)
+        )
         remaining = deadline - self._monotonic()
         if remaining <= 0:
             raise TimeoutError("legacy Zhaoshang auth refresh exhausted the probe deadline")
@@ -1802,7 +1810,15 @@ class CnncLegacyZhaoshangAdapter:
         tool = self._load_module(self._external_tool_path, "legacy_zhaoshang_running_restart")
         auth_manager = self._auth_manager or AuthManager()
         environment = internal_subprocess_env()
-        environment.update(auth_manager.export_environment("zhaoshang", refresh=True))
+        remaining = deadline - self._monotonic()
+        if remaining <= 0:
+            raise TimeoutError("legacy Zhaoshang restart deadline exhausted before auth refresh")
+        # The token-refresh HTTP is part of this callback's budget: it runs
+        # before the bounded session exists, so it may only use the live
+        # remaining time — never the AuthManager's full 30-second default.
+        environment.update(
+            auth_manager.export_environment("zhaoshang", refresh=True, timeout_seconds=remaining)
+        )
         remaining = deadline - self._monotonic()
         if remaining <= 0:
             raise TimeoutError("legacy Zhaoshang auth refresh exhausted the restart deadline")

@@ -337,3 +337,105 @@ def test_non_idempotent_request_never_retries_after_401(tmp_path):
 
     assert len(business_opener.requests) == 1
     assert refresh_opener.requests == []
+
+
+# ---------------------------------------------------------------------------
+# Review round 4, BLOCKER C: the recovery callback deadline must bound the
+# token-refresh HTTP request itself.  export_environment -> refresh ->
+# _request_refresh performs exactly one network request on this chain (the
+# stale-token path returns without HTTP and the 401 retry lives in
+# request_json, a different chain), so one optional timeout parameter
+# covers the whole recovery call path.  Without it the default must stay
+# the historical 30 seconds for every existing caller.
+# ---------------------------------------------------------------------------
+
+
+class TimeoutRecordingOpener(QueueOpener):
+    """QueueOpener that also records the timeout each open() received."""
+
+    def __init__(self, *items):
+        super().__init__(*items)
+        self.timeouts: list[float] = []
+
+    def open(self, request: urllib.request.Request, timeout: float = 0):
+        self.timeouts.append(float(timeout))
+        return super().open(request, timeout)
+
+
+def _round4_manager(tmp_path, opener) -> "object":
+    from scripts.auth_manager import AuthManager
+
+    sources, _ = _sources(tmp_path)
+    state_path = tmp_path / "auth_state.json"
+    state_path.write_text(
+        json.dumps(
+            {
+                "saas": {"access_token": "saas-a", "refresh_token": "saas-r"},
+                "zhaoshang": {"access_token": "zs-a", "refresh_token": "zs-r"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    return AuthManager(state_path=state_path, curl_sources=sources, opener=opener)
+
+
+def _rotated_response() -> FakeResponse:
+    return FakeResponse({"data": {"accessToken": "zs-b", "refreshToken": "zs-r2"}})
+
+
+def test_round4_c4_default_refresh_keeps_the_30_second_timeout(tmp_path):
+    opener = TimeoutRecordingOpener(_rotated_response())
+    manager = _round4_manager(tmp_path, opener)
+
+    environment = manager.export_environment("zhaoshang", refresh=True)
+
+    assert opener.timeouts == [30.0]
+    assert "x-access-token=zs-b" in environment["COOKIE"]
+    assert environment["BLADE_AUTH"] == "bearer zs-b"
+
+
+def test_round4_c1_recovery_timeout_bounds_the_refresh_http(tmp_path):
+    opener = TimeoutRecordingOpener(_rotated_response())
+    manager = _round4_manager(tmp_path, opener)
+
+    manager.export_environment("zhaoshang", refresh=True, timeout_seconds=8)
+
+    assert opener.timeouts == [8.0]
+
+
+def test_round4_c2_partial_deadline_bounds_the_refresh_http(tmp_path):
+    opener = TimeoutRecordingOpener(_rotated_response())
+    manager = _round4_manager(tmp_path, opener)
+
+    manager.export_environment("zhaoshang", refresh=True, timeout_seconds=3.5)
+
+    assert opener.timeouts == [3.5]
+
+
+def test_round4_c3_non_positive_timeout_refuses_before_any_http(tmp_path):
+    opener = TimeoutRecordingOpener(_rotated_response())
+    manager = _round4_manager(tmp_path, opener)
+
+    with pytest.raises(ValueError):
+        manager.export_environment("zhaoshang", refresh=True, timeout_seconds=0.0)
+
+    assert opener.timeouts == []
+
+
+def test_round4_c3b_timeout_above_the_default_clamps_to_30(tmp_path):
+    opener = TimeoutRecordingOpener(_rotated_response())
+    manager = _round4_manager(tmp_path, opener)
+
+    manager.export_environment("zhaoshang", refresh=True, timeout_seconds=60.0)
+
+    assert opener.timeouts == [30.0]
+
+
+def test_round4_refresh_passes_timeout_seconds_to_the_refresh_http(tmp_path):
+    opener = TimeoutRecordingOpener(_rotated_response())
+    manager = _round4_manager(tmp_path, opener)
+
+    tokens = manager.refresh("zhaoshang", timeout_seconds=2.5)
+
+    assert (tokens.access_token, tokens.refresh_token) == ("zs-b", "zs-r2")
+    assert opener.timeouts == [2.5]

@@ -863,11 +863,11 @@ def _restart_tool_module(task: dict, session: _RestartSession):
 
 
 class _FakeAuthManager:
-    def export_environment(self, system, refresh=False):
+    def export_environment(self, system, refresh=False, timeout_seconds=None):
         return {"BLADE_AUTH": "bearer fake", "COOKIE": "x-access-token=fake; refreshToken=fake"}
 
 
-def _prepared_job(tmp_path, monkeypatch, task: dict, session: _RestartSession, monotonic=None):
+def _prepared_job(tmp_path, monkeypatch, task: dict, session: _RestartSession, monotonic=None, auth=None):
     from app.services.legacy_zhaoshang_adapter import CnncLegacyZhaoshangAdapter
 
     run_dir = tmp_path / "zhaoshang"
@@ -876,7 +876,7 @@ def _prepared_job(tmp_path, monkeypatch, task: dict, session: _RestartSession, m
     batch_state.write_text("# batch\n", encoding="utf-8")
     clock_kwargs = {"monotonic": monotonic} if monotonic is not None else {}
     adapter = CnncLegacyZhaoshangAdapter(
-        mappings=[], db_env_path=None, auth_manager=_FakeAuthManager(), **clock_kwargs
+        mappings=[], db_env_path=None, auth_manager=auth or _FakeAuthManager(), **clock_kwargs
     )
     prepared = adapter.prepare_job(
         BUSINESS_DATE,
@@ -2353,3 +2353,160 @@ def test_round4_b9_pending_reconciliation_defers_without_minimal_budget(tmp_path
 
     assert restart.calls == []
     assert store.get_remote_job(job_id)["state"] == "RUNNING"
+
+
+# ---------------------------------------------------------------------------
+# Review round 4, BLOCKER C (adapter side): the recovery probe/restart token
+# refresh happens BEFORE the bounded session exists, so the deadline must
+# bound the refresh HTTP itself through the real AuthManager network seam
+# (a recording opener over a real AuthManager instance, not the
+# _FakeAuthManager shortcut).  The refresh may only shrink — never extend —
+# the callback budget, and a refresh that times out must leave zero remote
+# writes.
+# ---------------------------------------------------------------------------
+
+
+class _FakeAuthHttpResponse:
+    def __init__(self, payload: dict) -> None:
+        self._body = json.dumps(payload).encode("utf-8")
+
+    def read(self) -> bytes:
+        return self._body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+
+class _RecordingAuthOpener:
+    """Records the timeout of every token-refresh HTTP request."""
+
+    def __init__(self) -> None:
+        self.timeouts: list[float] = []
+        self._response = _FakeAuthHttpResponse(
+            {"data": {"accessToken": "zs-b", "refreshToken": "zs-r2"}}
+        )
+
+    def open(self, request, timeout=None):
+        self.timeouts.append(float(timeout))
+        return self._response
+
+
+class _TimingOutAuthOpener(_RecordingAuthOpener):
+    def open(self, request, timeout=None):
+        self.timeouts.append(float(timeout))
+        raise TimeoutError("auth refresh transport hung")
+
+
+def _real_auth_manager(tmp_path, opener):
+    from scripts.auth_manager import AuthManager
+
+    state_path = tmp_path / "auth_state.json"
+    state_path.write_text(
+        json.dumps(
+            {
+                "saas": {"access_token": "saas-a", "refresh_token": "saas-r"},
+                "zhaoshang": {"access_token": "zs-a", "refresh_token": "zs-r"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    return AuthManager(
+        state_path=state_path,
+        curl_sources={"saas": (), "zhaoshang": ()},
+        opener=opener,
+        logger=None,
+    )
+
+
+def test_round4_c3_exhausted_probe_deadline_sends_no_auth_http(tmp_path, monkeypatch) -> None:
+    task = _running_task_record()
+    session = _RestartSession(task)
+    opener = _RecordingAuthOpener()
+    calls = {"count": 0}
+
+    def monotonic() -> float:
+        calls["count"] += 1
+        if calls["count"] <= 1:
+            return 1000.0
+        return 1100.0  # every later check sees an exhausted deadline
+
+    adapter, prepared = _prepared_job(
+        tmp_path, monkeypatch, task, session, monotonic=monotonic, auth=_real_auth_manager(tmp_path, opener)
+    )
+
+    with pytest.raises(TimeoutError):
+        adapter.probe_running_task(prepared, TASK_ID, TASK_NUMBER, timeout_seconds=8.0)
+
+    assert opener.timeouts == []
+    assert session.post_calls == 0
+    assert session.get_calls == 0
+
+
+def test_round4_c5_probe_auth_refresh_shares_the_callback_deadline(tmp_path, monkeypatch) -> None:
+    task = _running_task_record()
+    session = _RestartSession(task)
+    opener = _RecordingAuthOpener()
+    adapter, prepared = _prepared_job(
+        tmp_path,
+        monkeypatch,
+        task,
+        session,
+        monotonic=_SteppingClock(step=0.5),
+        auth=_real_auth_manager(tmp_path, opener),
+    )
+
+    adapter.probe_running_task(prepared, TASK_ID, TASK_NUMBER, timeout_seconds=12.0)
+
+    assert opener.timeouts, "the auth refresh must have issued its HTTP request"
+    assert max(opener.timeouts) <= 12.0
+    session_timeouts = _all_recorded_timeouts(session)
+    assert session_timeouts
+    # The refresh consumed part of the budget: every later business request
+    # must clamp to the post-refresh remaining time, never a fresh 12 seconds.
+    assert max(session_timeouts) <= 12.0 - 0.5
+
+
+def test_round4_c6_restart_auth_refresh_shares_the_callback_deadline(tmp_path, monkeypatch) -> None:
+    task = _running_task_record()
+    session = _RestartSession(task)
+    opener = _RecordingAuthOpener()
+    adapter, prepared = _prepared_job(
+        tmp_path,
+        monkeypatch,
+        task,
+        session,
+        monotonic=_SteppingClock(step=0.5),
+        auth=_real_auth_manager(tmp_path, opener),
+    )
+
+    adapter.restart_running_task(prepared, TASK_ID, TASK_NUMBER, timeout_seconds=20.0)
+
+    assert opener.timeouts, "the auth refresh must have issued its HTTP request"
+    assert max(opener.timeouts) <= 20.0
+    session_timeouts = _all_recorded_timeouts(session)
+    assert session_timeouts
+    # lookup + status + progress + disable + enable all share the one
+    # deadline with the refresh; none may see a fresh full budget.
+    assert max(session_timeouts) <= 20.0 - 0.5
+
+
+def test_round4_c7_auth_refresh_timeout_dispatches_no_remote_write(tmp_path, monkeypatch) -> None:
+    from scripts.auth_manager import AuthError
+
+    task = _running_task_record()
+    session = _RestartSession(task)
+    opener = _TimingOutAuthOpener()
+    adapter, prepared = _prepared_job(
+        tmp_path, monkeypatch, task, session, auth=_real_auth_manager(tmp_path, opener)
+    )
+
+    with pytest.raises(AuthError):
+        adapter.restart_running_task(prepared, TASK_ID, TASK_NUMBER, timeout_seconds=10.0)
+
+    assert opener.timeouts, "the refresh HTTP was attempted and timed out"
+    assert session.update_calls == []
+    assert session.post_calls == 0
+    assert session.get_calls == 0

@@ -313,13 +313,27 @@ class AuthManager:
             raise ValueError(f"Unsupported auth system: {system}")
         return self._tokens_from_state(self._load_or_bootstrap_state(), system)
 
-    def _request_refresh(self, system: str, refresh_token: str) -> AuthTokens:
+    def _request_refresh(
+        self,
+        system: str,
+        refresh_token: str,
+        *,
+        timeout_seconds: float | None = None,
+    ) -> AuthTokens:
         config = SYSTEM_CONFIG[system]
         url = f"{config['refresh_url']}?{urlencode({'grantType': 'refresh_token', 'refreshToken': refresh_token})}"
         request = urllib.request.Request(url, method="POST")
         request.headers["Authorization"] = BASIC_AUTH
+        if timeout_seconds is None:
+            actual_timeout = 30.0
+        else:
+            if not timeout_seconds > 0:
+                raise ValueError("auth refresh timeout_seconds must be positive")
+            # A bounded caller (e.g. the remote recovery callback) may only
+            # shrink the historical 30-second budget, never extend it.
+            actual_timeout = min(30.0, float(timeout_seconds))
         try:
-            with self.opener.open(request, timeout=30) as response:
+            with self.opener.open(request, timeout=actual_timeout) as response:
                 payload = json.loads(response.read().decode("utf-8", errors="replace"))
         except urllib.error.HTTPError as exc:
             if exc.code in {400, 401, 403}:
@@ -357,7 +371,11 @@ class AuthManager:
             self._atomic_write_state(state)
 
     def refresh(
-        self, system: str, *, stale_access_token: str | None = None
+        self,
+        system: str,
+        *,
+        stale_access_token: str | None = None,
+        timeout_seconds: float | None = None,
     ) -> AuthTokens:
         if system not in SYSTEM_CONFIG:
             raise ValueError(f"Unsupported auth system: {system}")
@@ -365,7 +383,9 @@ class AuthManager:
             current = self.get_tokens(system)
             if stale_access_token is not None and current.access_token != stale_access_token:
                 return current
-            tokens = self._request_refresh(system, current.refresh_token)
+            tokens = self._request_refresh(
+                system, current.refresh_token, timeout_seconds=timeout_seconds
+            )
             self._save_tokens(system, tokens)
             if self.logger:
                 self.logger(f"[{SYSTEM_CONFIG[system]['label']}] Token refresh success")
@@ -397,11 +417,19 @@ class AuthManager:
         return inject_auth(parsed_curl, tokens, system)
 
     def export_environment(
-        self, system: str = "zhaoshang", *, refresh: bool = True
+        self,
+        system: str = "zhaoshang",
+        *,
+        refresh: bool = True,
+        timeout_seconds: float | None = None,
     ) -> dict[str, str]:
         if system != "zhaoshang":
             raise ValueError("Only Zhaoshang uses the BLADE_AUTH/COOKIE environment bridge")
-        tokens = self.refresh(system) if refresh else self.get_tokens(system)
+        tokens = (
+            self.refresh(system, timeout_seconds=timeout_seconds)
+            if refresh
+            else self.get_tokens(system)
+        )
         template = next(
             (
                 load_curl_command(path)
