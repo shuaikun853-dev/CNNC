@@ -4,9 +4,11 @@
 //   P2-1  304 也是成功同步(不重渲染、不误显"最后同步 X 分钟前");
 //   P2-2  页面 hidden 真暂停(clearTimeout + 不再注册),visible 立即补刷;
 //         在途 poll 去重,人工刷新不产生重复轮询链。
-// 被测对象:app/static/dashboard/app.js 暴露的 createPollController(纯 seam)。
+// 覆盖 Independent Review Fix Round 2:
+//   P3    恢复时间线 signature 的安全渲染(safeProgressText)。
+// 被测对象:app/static/dashboard/app.js 暴露的 createPollController / safeProgressText。
 const path = require("path");
-const { createPollController } = require(
+const { createPollController, safeProgressText } = require(
   path.join(__dirname, "..", "..", "app", "static", "dashboard", "app.js"));
 
 let failed = 0;
@@ -162,12 +164,26 @@ async function test_offline_retry_then_recover() {
         h.counters.content === 1 && h.counters.sync === 1 && h.counters.offline === 1);
 }
 
+function test_safe_progress_text() {
+  check("P3 正常 signature 渲染 45/120", safeProgressText([120, 75, 0, 0, 0, 45]) === "45/120",
+        safeProgressText([120, 75, 0, 0, 0, 45]));
+  const evil = safeProgressText(["<img src=x onerror=alert(1)>", "75", 0, 0, 0, "45"]);
+  check("P3 恶意 signature 不作为 HTML 注入", evil === "—" && !String(evil).includes("<img"), evil);
+  check("P3 非数组 signature 返回占位",
+        safeProgressText(null) === "—" && safeProgressText("45/120") === "—");
+  check("P3 长度不足 signature 返回占位", safeProgressText([120, 75]) === "—");
+  check("P3 NaN/Infinity signature 返回占位",
+        safeProgressText([120, 75, 0, 0, 0, NaN]) === "—" &&
+        safeProgressText([Infinity, 1, 1, 1, 1, 1]) === "—");
+}
+
 (async () => {
   await test_304_keeps_sync_fresh_without_rerender();
   await test_hidden_pauses_and_visible_resumes();
   await test_schedule_refuses_when_hidden();
   await test_no_duplicate_poll_chains();
   await test_offline_retry_then_recover();
+  test_safe_progress_text();
   if (failed === 0) { console.log("ALL PASS"); process.exit(0); }
   console.error(failed + " failing checks");
   process.exit(1);

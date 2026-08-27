@@ -184,6 +184,17 @@
     document.querySelectorAll("#jobs-table tr.row").forEach((tr) =>
       tr.addEventListener("click", () => openDrawer(tr.dataset.id, jobs)));
   }
+  // P3(Review Fix Round 2):恢复时间线 signature 来自持久化 JSON,页面层不无条件
+  // 信任——显式 Number 转换 + Number.isFinite 校验,恶意/损坏内容只能得到"—",
+  // 永不作为 HTML 片段进入 innerHTML。
+  function safeProgressText(signature) {
+    if (!Array.isArray(signature) || signature.length < 6) return "—";
+    const finished = Number(signature[5]);
+    const total = Number(signature[0]);
+    if (!Number.isFinite(finished) || !Number.isFinite(total)) return "—";
+    return finished + "/" + total;
+  }
+
   function openDrawer(id, jobs) {
     const j = jobs.find((x) => String(x.id) === String(id));
     const tl = (window._timelines || {})[String(id)] || {};
@@ -196,7 +207,7 @@
       <b>恢复阶段</b><span>${esc(tl.phase || "—")}${tl.recovery_attempts > 0 ? " · 已执行 " + tl.recovery_attempts + " 次自动恢复" : ""}</span>
       <b>子任务进度</b><span>${j.subtasks ? j.subtasks.finished + " / " + j.subtasks.total : "—"}</span>`;
     $("#drawer .tl").innerHTML = (tl.observations || []).slice(-8).map((o) => `
-      <li><time>${(() => { const d = new Date(o.observed_at); return isNaN(d) ? "—" : d.toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit", timeZone: "Asia/Shanghai" }); })()}</time>进度 ${o.signature ? o.signature[5] + "/" + o.signature[0] : "—"} · 导出 ${o.export_count === 0 ? "无结果" : "有结果"}</li>`).join("");
+      <li><time>${(() => { const d = new Date(o.observed_at); return isNaN(d) ? "—" : d.toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit", timeZone: "Asia/Shanghai" }); })()}</time>进度 ${safeProgressText(o.signature)} · 导出 ${o.export_count === 0 ? "无结果" : "有结果"}</li>`).join("");
     $("#drawer .note").textContent = "观察与探测不代表异常;“需要人工检查”需要人工介入;“自动恢复已用尽”已按无采集结果安全收口,无需人工处理。";
   }
   function renderTech(status) {
@@ -215,7 +226,7 @@
     setInterval(updateLive, 1000);
     ctl.run();
   }
-  const api = { start, stop: () => ctl.stop(), createPollController };
+  const api = { start, stop: () => ctl.stop(), createPollController, safeProgressText };
   if (typeof window !== "undefined") { window.Dashboards = api; }
   if (typeof module !== "undefined" && module.exports) { module.exports = api; }
   if (typeof document !== "undefined") { document.addEventListener("DOMContentLoaded", start); }

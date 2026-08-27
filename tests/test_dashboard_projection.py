@@ -464,3 +464,48 @@ def test_rf1_summary_overall_reflects_exhausted_proof_validity(tmp_path, monkeyp
     out_invalid = build(_job_db(tmp_path / "i", state="RECOVERY_EXHAUSTED", post_attempted=1))
     assert out_invalid["overall"]["word"] == "需要人工处理"
     assert out_invalid["overall"]["color"] == "red"
+
+
+# ---- Review Fix Round 2(2026-08-27):detail.terminal 不阻塞等待最终收口 ----
+
+def _detail_terminal_day():
+    s = _cleared()
+    s["detail"] = {"pending": 0, "running": 0, "completed": 150, "terminal": 1, "attempts": 151}
+    return s
+
+
+def test_detail_terminal_does_not_block_waiting_final_closeout():
+    out = compute_overall_status(_detail_terminal_day())
+    assert out["word"] == "等待最终收口"
+    assert out["word"] != "正在准备数据"
+    assert out["word"] != "需要人工处理"
+    assert out["color"] != "red"
+
+
+def test_rf2_detail_terminal_yellow_attention_and_explanation_rule():
+    out = compute_overall_status(_detail_terminal_day())
+    item = next(a for a in out["attention"] if a["title"] == "Detail 有终态失败")
+    assert item["level"] == "yellow"
+    assert out["word"] == "等待最终收口"  # 黄色关注不升级红
+    assert "无需人工处理" not in out["explanation"]  # 解释句铁律
+    assert "Detail 有终态失败" in out["explanation"]
+
+
+def test_rf2_finalized_day_stays_green_with_detail_terminal_history():
+    s = _detail_terminal_day()
+    s["final"] = {"pending": 0, "computed_pending": 0, "frozen": True, "finalized": True,
+                  "forced": False, "output_path": "x.xlsx", "output_exists": True,
+                  "manifest_recorded": True, "blocker_summary": {}}
+    out = compute_overall_status(s)
+    assert out["word"] == "今日结果已生成" and out["color"] == "green"
+    assert not any(a["level"] == "red" for a in out["attention"])
+    assert any(a["title"] == "Detail 有终态失败" for a in out["attention"])  # 仅历史黄提示
+
+
+def test_rf2_empty_run_before_first_snapshot_shows_preparing_not_closeout():
+    s = _cleared()
+    s["counts"] = {"discovered": 0, "unique_items": 0, "new": 0, "changed": 0, "processed": 0}
+    s["detail"] = {"pending": 0, "running": 0, "completed": 0, "terminal": 0, "attempts": 0}
+    s["model"] = {"pending": 0, "running": 0, "completed": 0, "terminal": 0, "attempts": 0}
+    out = compute_overall_status(s)
+    assert out["word"] == "正在准备数据"  # 首个快照落地前的空窗不得宣称"已全部完成"

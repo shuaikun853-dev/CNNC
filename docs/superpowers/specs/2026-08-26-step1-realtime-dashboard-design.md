@@ -2,6 +2,7 @@
 
 - 日期:2026-08-26 · 修订:V2(首页信息架构按用户反馈整体重做:Current-stage-first + Exception-first + Progressive disclosure;后端架构不变)
 - 修订:V2.1(2026-08-27 Independent Review Fix Round 1):§4.2 R1 不再把合法 RECOVERY_EXHAUSTED 计入红色人工、新增 R4.5「等待最终收口」;§4.5 颜色口径同步;§8.2 服务常驻降为「登录自启一次」的 ACCEPTED_RISK;§11 隐藏暂停改为真实实现并由 node 行为测试覆盖
+- 修订:V2.2(2026-08-27 Independent Review Fix Round 2):R4.5 改以 final.computed_pending=0 为准(不含 detail.terminal,与生产 blocker truth 一致);detail.terminal 进黄色关注(终态证据、普通 finalize 放行、客户价留空保留失败证据);恢复时间线 observation signature 安全渲染(safeProgressText)
 - 状态:待用户重审(V1 的信息架构未通过;V2 重提)
 - 基线:BASE_BRANCH `origin/prod/closeout-20260818` @ `ccdd194c8dc1ecce7199cfc793b4a4596f61ec61`
 - 开发分支:`feat/step1-realtime-dashboard-20260826`(独立 worktree `E:\.A中核运维\cnnc-dashboard-dev`)
@@ -60,8 +61,10 @@ R1 需要人工处理   [红]  remote.manual>0 ∨ crawl.manual>0 ∨ crawl.unpl
 R2 今日无数据     [灰]  state=MISSING(工作日未开始/周末)
 R3 今日结果已生成 [绿]  final.finalized(forced=true 附黄提示"曾强制收尾")
 R4 正在最终收口   [蓝]  final.frozen ∧ ¬finalized
-R4.5 等待最终收口 [蓝]  数据准备完成 ∧ 招商局/采集子状态全清(unknown=0、detail.terminal=0)
-                        ∧ ¬frozen ∧ ¬finalized(业务工作已结束,等 18:00 口径冻结)
+R4.5 等待最终收口 [蓝]  counts.discovered>0 ∧ final.computed_pending=0 ∧ ¬frozen ∧ ¬finalized
+                        (直接采用生产 live blocker truth;detail.terminal 属终态证据、不在
+                        computed_pending 内、普通 finalize 放行,仅进黄色关注;discovered>0
+                        排除首个快照落地前的每日开市空窗)
 R5 正在回收招商局结果 [蓝] 数据准备完成 ∧ remote.awaiting_harvest>0
 R6 正在等待招商局 [蓝]  数据准备完成 ∧ 其余招商局子状态未清(intent/提优/执行)
 R7 正在准备数据   [蓝]  detail.pending+running>0 ∨ model.pending+running>0
@@ -91,7 +94,7 @@ R7 正在准备数据   [蓝]  detail.pending+running>0 ∨ model.pending+runnin
 
 ### 4.5 色彩(五色,单源 CSS 令牌 + 图标双通道)
 
-绿=完成/正常 · 蓝=当前运行(含自动恢复中) · 灰=等待/未开始 · 黄=系统可自动处理但值得关注(SUBMIT_UNKNOWN、断路器触发、提交待确认、合法 RECOVERY_EXHAUSTED 已安全收口) · 红=人工介入/明确阻塞(MANUAL_REQUIRED、证据不完整的 RECOVERY_EXHAUSTED、模型终态失败、crawl manual/unplanned)。不设青色恢复色系;断路器触发=黄 + 文案"系统已暂停新建任务以保护远端,属保护机制非故障"。(2026-08-27 修订:合法恢复用尽由红改黄,依据 §4.2 生产语义修正。)
+绿=完成/正常 · 蓝=当前运行(含自动恢复中) · 灰=等待/未开始 · 黄=系统可自动处理但值得关注(SUBMIT_UNKNOWN、断路器触发、提交待确认、合法 RECOVERY_EXHAUSTED 已安全收口、Detail 终态失败[不阻塞出表]) · 红=人工介入/明确阻塞(MANUAL_REQUIRED、证据不完整的 RECOVERY_EXHAUSTED、模型终态失败、crawl manual/unplanned)。不设青色恢复色系;断路器触发=黄 + 文案"系统已暂停新建任务以保护远端,属保护机制非故障"。(2026-08-27 修订:合法恢复用尽由红改黄,依据 §4.2 生产语义修正;Round 2 增补 Detail 终态失败=黄。)
 
 ## 5. 只读投影(与 V1 spec 相同)
 

@@ -7,6 +7,7 @@ from typing import Mapping
 
 def _attention_items(s: Mapping, recovery_exhausted_invalid: int = 0) -> list[dict]:
     r, c, m, h = s["remote"], s["crawl"], s["model"], s.get("remote_health", {})
+    d = s["detail"]
     items: list[dict] = []
     # P1-1:带合法 durable proof 的 RECOVERY_EXHAUSTED 是安全收口(关联 crawl 已转
     # NO_RESULT,ordinary finalize 放行),不是"需要人工处理";补采只是可选人工操作。
@@ -45,6 +46,15 @@ def _attention_items(s: Mapping, recovery_exhausted_invalid: int = 0) -> list[di
         items.append({"level": "red", "tag": "需人工", "title": "模型校验终态失败",
             "problem": "模型重试预算耗尽后仍失败。", "impact": "对应商品缺模型结论。",
             "system_action": "不再自动重试。", "suggestion": "可按手册 requeue-model-transient/recover-model 处理。"})
+    # Review Fix Round 2:detail.terminal 是终态证据,不在 computed_final_pending 内、
+    # 不阻塞普通 finalize(行以 _detail_failure() 客户价留空+失败证据进入最终表),
+    # 因此是非阻塞黄色关注——既不误报"正在准备数据",也不默默消失。
+    if d["terminal"]:
+        items.append({"level": "yellow", "tag": "关注", "title": "Detail 有终态失败",
+            "problem": "部分商品 Detail 请求已重试耗尽并进入终态失败。",
+            "impact": "不阻塞今日最终出表;对应商品客户价留空并保留失败证据,按现有可用信息继续收口。",
+            "system_action": "该 Detail 已停止自动重试,失败证据保留在 durable 状态中。",
+            "suggestion": "一般无需操作;如需补齐详情可在技术详情中查看对应失败记录。"})
     if r["unknown"] or c["unknown"]:
         items.append({"level": "yellow", "tag": "关注", "title": "任务提交结果待确认",
             "problem": "提交后结果未知,系统正按精确身份自动对账。",
@@ -147,17 +157,17 @@ def compute_overall_status(status: Mapping, *, recovering: int = 0,
     manual_needed = any((r["manual"], c["manual"], c["unplanned"], m["terminal"])) \
         or recovery_exhausted_invalid > 0
     zs_uncleared = any(r[k] for k in ("intent", "pending", "running", "exported")) or bool(c["pending"] + c["running"])
-    # P1-2:前置处理完成、招商局/采集全清(含 unknown 与 detail 终态)、未冻结未出表
-    # → 业务工作其实已结束,只是在等 18:00 口径冻结,不能误报"正在准备数据"。
-    zs_all_clear = (not zs_uncleared and not r["unknown"] and not c["unknown"]
-                    and not c["manual"] and not c["unplanned"] and not d["terminal"])
+    # Review Fix Round 2:等待收口门直接采用生产 live blocker truth——
+    # final.computed_pending(增量状态权威)不含 detail.terminal(终态证据,普通 finalize
+    # 放行),不在投影层维护第二套 blocker 判定;discovered>0 排除首个快照落地前的
+    # 每日开市空窗,避免把"发现还没开始"误报成"已全部完成"。
     if f["finalized"]:
         word, color = "今日结果已生成", "green"
     elif manual_needed:
         word, color = "需要人工处理", "red"
     elif f["frozen"]:
         word, color = "正在最终收口", "blue"
-    elif prep_pending == 0 and zs_all_clear:
+    elif status["counts"]["discovered"] > 0 and f["computed_pending"] == 0:
         word, color = "等待最终收口", "blue"
     elif prep_pending == 0 and r["awaiting_harvest"] > 0 and not r["pending"] and not r["running"]:
         word, color = "正在回收招商局结果", "blue"
