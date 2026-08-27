@@ -107,6 +107,7 @@
     renderJobs(p.jobs);
     window._timelines = p.timelines;
     renderTech(p.status);
+    fetchSaasFlow(false);  // 客户端 ≥55s 节流;服务端另有 60s cache + 刷新限流
   }
   function renderHero(o) {
     const h = $("#hero");
@@ -213,6 +214,146 @@
   function renderTech(status) {
     $("#tech pre").textContent = JSON.stringify(status, null, 2);
   }
+
+  // ---- SaaS 首次采集链路(独立只读诊断;失败只降级本面板,不影响 summary 轮询) ----
+  // 客户端节流 ≥55s + 服务端 60s cache/30s 强制刷新限流,绝不形成 5 秒级生产 DB 轮询。
+  const SF_FETCH_MIN_INTERVAL_MS = 55000;
+  let sfLastFetchAt = 0, sfInFlight = false;
+  const SF_STAGE_LABELS = {
+    TASK_NOT_CREATED: "未生成task", TASK_CREATED_NO_CENTRAL_RECORD: "task未进分控",
+    CENTRAL_NOT_ENQUEUED: "中控未入队", CENTRAL_ENQUEUED_WAITING: "已入队等待",
+    CRAWLER_EXECUTING: "正在执行", CRAWLER_FAILED: "爬虫失败", CALLBACK_LAG: "callback lag",
+    CALLBACK_DONE_NO_SEARCH: "callback后暂未search", MODEL_PENDING: "模型处理中",
+    INTERNET_SAME_PENDING_APPROVAL: "互联网同款待审批",
+    APPROVAL_OR_FINAL_CLOSURE_PENDING: "最终收口中",
+    INTERNET_CANDIDATES_ALL_NON_SAME: "互联网候选全部判非同款",
+    REFERENCE_SAME_ONLY: "只有参考链接同款", MODEL_DONE_NO_SAME: "模型完成无同款",
+    NO_INTERNET_CANDIDATE: "无互联网候选", NO_COMMODITY_LIST: "未进入采集列表",
+    EVIDENCE_INCOMPLETE: "证据不足",
+  };
+  const SF_GROWTH_LABELS = { NORMAL: "正常", LAG_WATCH: "增长落后观察", LAG_PERSISTING: "持续增长落后" };
+
+  async function fetchSaasFlow(force) {
+    if (sfInFlight) return;
+    const now = Date.now();
+    if (!force && now - sfLastFetchAt < SF_FETCH_MIN_INTERVAL_MS) return;
+    sfInFlight = true;
+    sfLastFetchAt = now;
+    try {
+      const url = force ? "/dashboard/api/saas-flow?refresh=1" : "/dashboard/api/saas-flow";
+      const res = await fetch(url);
+      if (!res.ok) throw new Error("HTTP " + res.status);
+      renderSaasFlow(await res.json());
+    } catch (e) {
+      const notice = $("#sf-notice");
+      if (notice) notice.textContent = "SaaS 链路诊断请求失败,稍后自动重试;主看板不受影响。";
+    } finally {
+      sfInFlight = false;
+    }
+  }
+
+  function sfGrowthText(g) {
+    if (!g) return "—";
+    if (!g.evaluated) return SF_GROWTH_LABELS.NORMAL + "(18:00 后不评估)";
+    return SF_GROWTH_LABELS[g.state] || g.state || "—";
+  }
+
+  function renderSaasFlow(p) {
+    const g = p.growth || {};
+    const chips = [
+      "客户 " + (g.customer_count ?? "—"),
+      "SaaS " + (g.saas_count ?? "—"),
+      "增长状态 " + sfGrowthText(g),
+      "主等待阶段 " + (p.stages && p.stages.dominant_stage ? p.stages.dominant_stage.label_zh : "—"),
+    ];
+    $("#sf-chips").textContent = chips.join(" · ");
+    const notice = $("#sf-notice");
+    if (p.status === "unconfigured") {
+      notice.textContent = "数据库诊断未配置(需本机 CNNC_DIAG_DB_* 只读账号);以下仅显示本地权威观察的增长判断。";
+    } else if (p.status === "unavailable") {
+      notice.textContent = "数据库诊断不可用(连接失败或超时);已降级,主看板不受影响。";
+    } else if (p.status === "rate_limited" || p.rate_limited) {
+      notice.textContent = "刷新过于频繁,已按限流返回上次缓存结果(强制刷新间隔 ≥30 秒)。";
+    } else if (p.status === "partial") {
+      notice.textContent = "部分查询失败已降级:" + (p.degraded_queries || []).join(", ") + ";其余分类仍有效。";
+    } else {
+      notice.textContent = "";
+    }
+    const growthBox = $("#sf-growth");
+    if (g.available) {
+      let text = "今日权威观察 " + (g.observation_count ?? 0) + " 次;最近一次 " +
+        (g.last_observed_at ? String(g.last_observed_at).replace("T", " ").slice(0, 19) : "—") +
+        ":客户 " + (g.customer_count ?? "—") + ",SaaS " + (g.saas_count ?? "—");
+      if (g.evaluated) text += ";本轮 客户 " + (g.customer_delta ?? 0) + " / SaaS " + (g.saas_delta ?? 0);
+      growthBox.textContent = text;
+      if (g.state === "LAG_WATCH" || g.state === "LAG_PERSISTING") {
+        const dist = sfTopStages(p.stages, 4);
+        growthBox.textContent += "。客户侧仍在新增,但 SaaS 数量本轮未增长;当前未收口链路主要分布于:" +
+          (dist.length ? dist.join("、") : "证据不足") + "。";
+      }
+    } else {
+      growthBox.textContent = "本地暂无今日权威观察序列(增量审计发现尚未运行),增长分叉判断待首次快照后可用。";
+    }
+    $("#sf-tree").innerHTML = sfTreeHtml(p.stages);
+    $("#sf-evidence").innerHTML = sfEvidenceHtml(p);
+    $("#sf-meta").textContent = p.cached ? "缓存结果(≤60 秒)" : "实时查询";
+  }
+
+  function sfStageLine(label, count, extra) {
+    return '<li><span>' + esc(label) + '</span><b>' + Number(count || 0) + '</b>' +
+      (extra ? '<i>' + esc(extra) + '</i>' : "") + "</li>";
+  }
+
+  function sfTreeHtml(stages) {
+    if (!stages) return "";
+    const crawler = stages.crawler_branch || {}, down = stages.downstream_branch || {};
+    const crawlerKeys = ["TASK_NOT_CREATED", "TASK_CREATED_NO_CENTRAL_RECORD", "CENTRAL_NOT_ENQUEUED",
+      "CENTRAL_ENQUEUED_WAITING", "CRAWLER_EXECUTING", "CRAWLER_FAILED", "CALLBACK_LAG"];
+    const downKeys = ["CALLBACK_DONE_NO_SEARCH", "MODEL_PENDING", "INTERNET_SAME_PENDING_APPROVAL",
+      "APPROVAL_OR_FINAL_CLOSURE_PENDING", "INTERNET_CANDIDATES_ALL_NON_SAME", "REFERENCE_SAME_ONLY",
+      "MODEL_DONE_NO_SAME", "NO_INTERNET_CANDIDATE"];
+    const graceNote = stages.callback_done_no_search_within_grace
+      ? "其中 " + stages.callback_done_no_search_within_grace + " 个在回调宽限期(" +
+        Math.round((stages.grace_seconds || 0) / 60) + " 分钟)内" : "";
+    return '<div class="sf-head">今日客户商品:' + Number(stages.customer_total || 0) +
+      " · 未最终收口:" + Number(stages.not_closed || 0) +
+      (stages.no_commodity_list ? " · 未进入采集列表:" + Number(stages.no_commodity_list) : "") + "</div>" +
+      '<ul class="sf-branch"><li class="bf">├─ 爬虫未回调:' + Number(stages.crawl_status_1 || 0) + "<ul>" +
+      crawlerKeys.map((k) => sfStageLine(SF_STAGE_LABELS[k], crawler[k])).join("") +
+      sfStageLine("证据不足", crawler.EVIDENCE_INCOMPLETE) + "</ul></li>" +
+      '<li class="bf">└─ 爬虫已回调:' + Number(stages.crawl_status_2 || 0) + "<ul>" +
+      downKeys.map((k) => sfStageLine(SF_STAGE_LABELS[k], down[k],
+        k === "CALLBACK_DONE_NO_SEARCH" ? graceNote : "")).join("") +
+      sfStageLine("证据不足", down.EVIDENCE_INCOMPLETE) + "</ul></li></ul>";
+  }
+
+  function sfEvidenceHtml(p) {
+    const stages = p.stages || {};
+    const parts = [];
+    if (stages.reference_pending_approval_total) {
+      parts.push("其中参考链接同款待人工审批 " + Number(stages.reference_pending_approval_total) + " 个商品");
+    }
+    const detail = stages.central_status_detail || [];
+    if (detail.length) {
+      parts.push("分控子任务状态(前 " + detail.length + " 组,batch/任务/队列态×数量):" +
+        detail.map((d) => esc(String(d.task_status) + "/" + String(d.queue_status) + " ×" + d.count))
+          .join("、"));
+    }
+    if (!parts.length) return "";
+    return "<p>" + parts.join("。</p><p>") + "。</p>";
+  }
+
+  function sfTopStages(stages, n) {
+    if (!stages) return [];
+    const merged = Object.assign({}, stages.crawler_branch || {}, stages.downstream_branch || {});
+    if (stages.no_commodity_list) merged.NO_COMMODITY_LIST = stages.no_commodity_list;
+    return Object.keys(merged)
+      .filter((k) => k !== "EVIDENCE_INCOMPLETE" && merged[k] > 0)
+      .sort((a, b) => merged[b] - merged[a])
+      .slice(0, n)
+      .map((k) => (SF_STAGE_LABELS[k] || k) + " " + merged[k]);
+  }
+
   function start() {
     document.addEventListener("visibilitychange", () => {
       if (document.visibilityState === "visible") ctl.onVisible();
@@ -223,6 +364,8 @@
       const m = $("#more"); m.classList.toggle("show");
       $("#jobs-toggle").textContent = m.classList.contains("show") ? "收起任务列表 ↑" : "查看全部招商局任务 ↓";
     });
+    const sfRefresh = $("#sf-refresh");
+    if (sfRefresh) sfRefresh.addEventListener("click", () => fetchSaasFlow(true));
     setInterval(updateLive, 1000);
     ctl.run();
   }

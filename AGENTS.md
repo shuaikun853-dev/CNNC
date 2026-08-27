@@ -43,7 +43,7 @@
 2. SaaS、中核、招商局请求必须绕过系统代理，使用现有无代理工具；排查认证前先排查代理、JSON 转义和中核请求头大小写。
 3. `crawlTaskManage/add` 是真实写接口。禁止用 `/add` 做 Token、`--help` 或连通性测试；第一次真实调用必须是用户要求的正式任务。
 4. 禁止调用中核或 SaaS 的审批、驳回、通过、保存、提交、推送接口。仅有三个窄例外：用户对指定第一步最终 Excel 二次明确授权后，可使用 `scripts/reject_saas_audit_excel.py` 处理 F 列红/黄色行，或使用 `scripts/approve_saas_audit_excel.py` 处理 F 列非红非黄色且当前仍待审的行；用户提供准确 SaaS 文档 ID 清单并明确要求补推时，可按 `docs/runbooks/SAAS_CONTROLLED_PUSH.md` 使用 `scripts/push_saas_commodity_price.py`。三个入口都必须先只读预览并锁定候选数和清单 SHA-256，再由用户对准确文件、数量、SHA-256 和动作二次授权；写请求逐次验证 `rspCode=0000`，发送后不得自动重试。补推必须先通过监控 query 将每个文档 ID 唯一映射到关系 `id`，用户声明已经手工发送但结果不确定的关系 `id` 必须标记为跳过，不得重发。一次授权不得跨动作、文件或批次沿用。
-5. 禁止执行任何 SQL，唯一例外是既有招商局工具对本轮当前任务执行的优先级范围查询及 `weight_type=-1` 参数化更新。
+5. 禁止执行任何 SQL,仅两个窄例外:既有招商局工具对本轮当前任务执行的优先级范围查询及 `weight_type=-1` 参数化更新;以及 `STEP_1 Dashboard SaaS Flow Diagnostic`(`app/services/saas_flow_diagnostic.py`)用指定只读数据库账号执行后端预定义、参数化 SELECT,scope 永久固定 `tenant_id=188605`、`commodity_pool_id=222`。浏览器与 API 不得提交或接受任何 SQL 文本、tenant、pool、schema、表名;只允许 SELECT/read-only CTE,禁止 UPDATE/DELETE/INSERT/REPLACE/MERGE/TRUNCATE/DROP/ALTER/CREATE 等一切 DML/DDL,也不提供执行 SQL、priority 调整、审批、驳回、重试、建任务等写入口。该例外不扩散到旧 `/diagnose` API、普通 workflow、STEP_2、STEP_3 或其他 Agent SQL;数据库故障只降级 SaaS Flow 面板,不影响主看板。
 6. 招商局优先级只能通过既有受控工具执行。必须以精确 task_name 取得 taskNumber 和配置 mall code，并传入本次 payload 的有效子任务数；用 mall 索引、marker 时间窗轮询到数量一致的子任务主键，再按主键当前读锁定和更新。不得把 taskNumber 当唯一标识，不得手写临时 SQL、放宽主键范围、改其他字段或试探其他表。
 7. 只有日志存在 `affected_rows>0` 才能报告“已提优”。若主键范围预查已全部为 `weight_type=-1`，只记录“已验证为最高优先级”的幂等状态，不称为本次提优。`task_status` 只表示采集进度，不得用于过滤 priority 查询或更新；无论任务正在执行还是已经完成，全部精确有效子任务都必须回读确认为 `weight_type=-1`。其他实际更新 0 行、回读不一致或异常必须暂停。
 8. 招商局失败、未覆盖、导出无价格或仍有缺价时，先生成清单并暂停。只有用户对本批次明确授权，才允许运行指定本地脚本。

@@ -5,7 +5,7 @@
 - Base SHA: `13b425eac95b290f0c554a763e9c49502c710c46`
 - Development branch: `feat/step1-saas-flow-diagnostic-20260827`
 - Scope: CNNC only, `tenant_id=188605`, `commodity_pool_id=222`
-- Status: implementation pending
+- Status: implemented on `feat/step1-saas-flow-diagnostic-20260827` (2026-08-27; investigation confirmed authoritative counts persist in `state.sqlite3` `snapshots.evidence_json` with `observed_at`, so growth detection reads existing durable evidence and the STEP_1 state machine is untouched)
 
 ## 1. Goal
 
