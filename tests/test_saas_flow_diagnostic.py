@@ -161,7 +161,7 @@ def test_registry_search_aggregates_are_grouped():
 def test_queries_always_use_fixed_pool_and_day_window():
     service, executed, _ = make_service({
         "pool_sync_standard_counts": [("0", 5)],
-        "open_crawl_status_counts": [],
+        "open_crawl_status_counts": [(1, 0, 0, 0, 0)],
         "crawl1_commodity_rows": [],
         "crawl2_search_flags": [],
     })
@@ -239,7 +239,7 @@ def test_single_query_failure_yields_partial_not_total_outage():
 
     service, executed, _ = make_service({
         "pool_sync_standard_counts": [("0", 3)],
-        "open_crawl_status_counts": [(1, 1), (2, 2)],
+        "open_crawl_status_counts": [(3, 0, 1, 2, 0)],
         "crawl1_commodity_rows": [(11, "C1")],
         "crawl1_task_rows": [(11, "SAAS-188605_701_1", 1)],
         "crawl1_central_rows": central_raises,
@@ -268,7 +268,7 @@ def test_all_core_queries_fail_is_unavailable():
 def test_cache_hit_within_ttl():
     service, _, calls = make_service({
         "pool_sync_standard_counts": [("0", 1)],
-        "open_crawl_status_counts": [],
+        "open_crawl_status_counts": [(1, 0, 0, 0, 0)],
         "crawl1_commodity_rows": [],
         "crawl2_search_flags": [],
     })
@@ -283,7 +283,7 @@ def test_cache_expiry_triggers_fresh_read():
     clock = FakeClock()
     service, _, calls = make_service({
         "pool_sync_standard_counts": [("0", 1)],
-        "open_crawl_status_counts": [],
+        "open_crawl_status_counts": [(1, 0, 0, 0, 0)],
         "crawl1_commodity_rows": [],
         "crawl2_search_flags": [],
     }, clock=clock)
@@ -297,7 +297,7 @@ def test_forced_refresh_is_rate_limited():
     clock = FakeClock()
     service, _, calls = make_service({
         "pool_sync_standard_counts": [("0", 1)],
-        "open_crawl_status_counts": [],
+        "open_crawl_status_counts": [(1, 0, 0, 0, 0)],
         "crawl1_commodity_rows": [],
         "crawl2_search_flags": [],
     }, clock=clock)
@@ -314,7 +314,7 @@ def test_forced_refresh_is_rate_limited():
 def test_payload_contains_fixed_scope_and_no_credentials():
     service, _, _ = make_service({
         "pool_sync_standard_counts": [("0", 1)],
-        "open_crawl_status_counts": [],
+        "open_crawl_status_counts": [(1, 0, 0, 0, 0)],
         "crawl1_commodity_rows": [],
         "crawl2_search_flags": [],
     })
@@ -330,7 +330,8 @@ def test_payload_contains_fixed_scope_and_no_credentials():
 
 FULL_CANNED = {
     "pool_sync_standard_counts": [("0", 4)],
-    "open_crawl_status_counts": [(1, 1), (2, 3)],
+    # 单行:(routing_open_total, no_commodity_list, crawl_status_1, crawl_status_2, crawl_status_other)
+    "open_crawl_status_counts": [(4, 0, 1, 3, 0)],
     "crawl1_commodity_rows": [(11, "C1")],
     "crawl1_task_rows": [(11, "SAAS-188605_701_1", 1)],
     "crawl1_central_rows": [("188605_701", "00", "00", None, None)],
@@ -366,14 +367,20 @@ def test_crawl_status_routes_into_separate_branches():
 
 
 def test_open_commodities_without_commodity_list_are_reported():
-    """IS_SYNC_STANDARD=0 但无 commodity_list 行的商品不能无声消失。"""
+    """R3:no_commodity_list 只来自 routing query 自身的 LEFT JOIN 报告;
+    pool 与 routing 两个 SELECT 的计数差只能标记 pool_vs_routing drift,不得推导 residual。"""
     canned = dict(FULL_CANNED)
-    canned["pool_sync_standard_counts"] = [("0", 6)]  # 6 个未收口
-    canned["open_crawl_status_counts"] = [(1, 1), (2, 3)]  # commodity_list 只有 4 个
+    canned["pool_sync_standard_counts"] = [("0", 6)]   # pool 时点:6 个未收口
+    canned["open_crawl_status_counts"] = [(4, 0, 1, 3, 0)]  # routing 时点:4 个,全部在采集列表
     service, _, _ = make_service(canned)
     payload = service.get_diagnostic("2026-08-27")
-    assert payload["stages"]["not_closed"] == 6
-    assert payload["stages"]["no_commodity_list"] == 2
+    stages = payload["stages"]
+    assert stages["not_closed"] == 6
+    assert stages["routing_open_total"] == 4
+    assert stages["no_commodity_list"] == 0            # 绝不从 6-4 推出 2
+    assert stages["snapshot_consistent"] is False
+    assert "pool_vs_routing" in stages["snapshot_drift"]
+    assert payload["status"] == "partial"
 
 
 # ---------------------------------------------------------------------------
@@ -648,7 +655,7 @@ def test_service_growth_uses_local_state_not_business_api(tmp_path):
         con.close()
     service, executed, _ = make_service({
         "pool_sync_standard_counts": [("0", 1)],
-        "open_crawl_status_counts": [],
+        "open_crawl_status_counts": [(1, 0, 0, 0, 0)],
         "crawl1_commodity_rows": [],
         "crawl2_search_flags": [],
     }, runtime_root=tmp_path, now_fn=lambda: BEFORE_CUTOFF)
@@ -764,7 +771,7 @@ def test_p1_1_crawler_incomplete_does_not_leak_into_downstream():
 def test_p1_1_downstream_incomplete_does_not_leak_into_crawler():
     canned = dict(FULL_CANNED)
     # 路由层称 crawl2=5,但 flags 查询只返回 3 行 → 2 个溢出落 downstream 证据不足
-    canned["open_crawl_status_counts"] = [(1, 1), (2, 5)]
+    canned["open_crawl_status_counts"] = [(6, 0, 1, 5, 0)]
     service, _, _ = make_service(canned)
     payload = service.get_diagnostic("2026-08-27")
     stages = payload["stages"]
@@ -781,7 +788,7 @@ def test_p1_2_central_query_failure_is_evidence_incomplete_not_no_central_record
 
     service, _, _ = make_service({
         "pool_sync_standard_counts": [("0", 2)],
-        "open_crawl_status_counts": [(1, 2)],
+        "open_crawl_status_counts": [(2, 0, 2, 0, 0)],
         "crawl1_commodity_rows": [(11, "C1"), (12, "C2")],
         "crawl1_task_rows": [(11, "SAAS-188605_701_1", 1), (12, "SAAS-188605_702_1", 1)],
         "crawl1_central_rows": central_raises,
@@ -838,7 +845,7 @@ def test_p1_3_case_b_pool_failure_is_not_business_zero():
 
     service, _, _ = make_service({
         "pool_sync_standard_counts": pool_raises,
-        "open_crawl_status_counts": [(1, 1), (2, 3)],
+        "open_crawl_status_counts": [(3, 0, 1, 2, 0)],
         "crawl1_commodity_rows": [(11, "C1")],
         "crawl1_task_rows": [(11, "SAAS-188605_701_1", 1)],
         "crawl1_central_rows": [("188605_701", "00", "00", None, None)],
@@ -853,12 +860,12 @@ def test_p1_3_case_b_pool_failure_is_not_business_zero():
     assert stages["closed_standard"] is None
     assert stages["closed_no_same"] is None
     assert stages["pool_counts_available"] is False
-    # 路由层成功,分支分类照常
+    # 路由层成功:routing 计数与 no_commodity_list 来自 routing query 自身,可用
     assert stages["crawl_status_available"] is True
     assert stages["crawl_status_1"] == 1
     assert stages["crawler_branch"]["CENTRAL_NOT_ENQUEUED"] == 1
-    # pool 失败时无法闭合 no_commodity_list
-    assert stages["no_commodity_list"] is None
+    assert stages["routing_open_total"] == 3
+    assert stages["no_commodity_list"] == 0
     assert "pool_sync_standard_counts" in payload["degraded_queries"]
 
 
@@ -906,7 +913,7 @@ def test_p1_7_concurrent_forced_refreshes_single_flight():
         time.sleep(0.05)
         return FakeConnection({
             "pool_sync_standard_counts": [("0", 1)],
-            "open_crawl_status_counts": [],
+            "open_crawl_status_counts": [(1, 0, 0, 0, 0)],
             "crawl1_commodity_rows": [],
             "crawl2_search_flags": [],
         }, [])
@@ -1004,7 +1011,7 @@ def test_r2_p1_1_a_crawl1_detail_exceeds_route_is_drift_not_contradiction():
     不得发布 sum(crawler_branch)>3 的矛盾数字;分支标记不可用 + drift 显式可见。"""
     service, _, _ = make_service({
         "pool_sync_standard_counts": [("0", 3)],
-        "open_crawl_status_counts": [(1, 3)],
+        "open_crawl_status_counts": [(3, 0, 3, 0, 0)],
         "crawl1_commodity_rows": [(i, f"C{i}") for i in range(1, 6)],  # 5 行 > 3
         "crawl1_task_rows": [],
         "crawl1_central_rows": [],
@@ -1023,7 +1030,7 @@ def test_r2_p1_1_a_crawl1_detail_exceeds_route_is_drift_not_contradiction():
 def test_r2_p1_1_b_crawl2_detail_exceeds_route_is_drift_not_contradiction():
     service, _, _ = make_service({
         "pool_sync_standard_counts": [("0", 3)],
-        "open_crawl_status_counts": [(2, 3)],
+        "open_crawl_status_counts": [(3, 0, 0, 3, 0)],
         "crawl1_commodity_rows": [],
         "crawl2_search_flags": [
             (i, 5, "2026-08-27 08:00:00", 0, 0, 0, 0, 0, 0, 0, 0, 0) for i in range(1, 6)
@@ -1043,7 +1050,7 @@ def test_r2_p1_1_c_route_gt_detail_still_overflow_evidence_incomplete():
     """route=5, detail=3:正向溢出(截断/查询窗口)仍按 EVIDENCE_INCOMPLETE 补齐,不冒充业务态。"""
     service, _, _ = make_service({
         "pool_sync_standard_counts": [("0", 5)],
-        "open_crawl_status_counts": [(2, 5)],
+        "open_crawl_status_counts": [(5, 0, 0, 5, 0)],
         "crawl1_commodity_rows": [],
         "crawl2_search_flags": [
             (21, 0, "2026-08-27 09:00:00", 0, 0, 0, 0, 0, 0, 0, 0, 0),
@@ -1085,7 +1092,7 @@ def test_r2_p1_2_mixed_valid_and_malformed_tasks_is_evidence_incomplete():
     """2 个合法 task + 1 个 malformed task → 证据集合不完整,不得进入业务分类。"""
     service, _, _ = make_service({
         "pool_sync_standard_counts": [("0", 1)],
-        "open_crawl_status_counts": [(1, 1)],
+        "open_crawl_status_counts": [(1, 0, 1, 0, 0)],
         "crawl1_commodity_rows": [(11, "C1")],
         "crawl1_task_rows": [
             (11, "SAAS-188605_701_1", 1),
@@ -1106,7 +1113,7 @@ def test_r2_p1_2_valid_tasks_with_empty_central_keeps_no_central_record():
     """全部 task 可解析、central 查询成功且确实无行 → 保留真实业务分类。"""
     service, _, _ = make_service({
         "pool_sync_standard_counts": [("0", 1)],
-        "open_crawl_status_counts": [(1, 1)],
+        "open_crawl_status_counts": [(1, 0, 1, 0, 0)],
         "crawl1_commodity_rows": [(11, "C1")],
         "crawl1_task_rows": [(11, "SAAS-188605_701_1", 1)],
         "crawl1_central_rows": [],  # 查询成功,确实没有分控行
@@ -1148,7 +1155,7 @@ def test_r2_p2_1_missing_state_file_is_no_observations(tmp_path):
     assert result["available"] is False and result["read_error"] is None
     assert result["observations"] == []
     service, _, _ = make_service({"pool_sync_standard_counts": [("0", 1)],
-                                  "open_crawl_status_counts": [],
+                                  "open_crawl_status_counts": [(1, 0, 0, 0, 0)],
                                   "crawl1_commodity_rows": [],
                                   "crawl2_search_flags": []},
                                  runtime_root=tmp_path, now_fn=lambda: BEFORE_CUTOFF)
@@ -1171,7 +1178,7 @@ def test_r2_p2_1_corrupted_sqlite_is_read_failed(tmp_path):
     day_dir.mkdir()
     (day_dir / "state.sqlite3").write_bytes(b"this is not a sqlite database at all")
     service, _, _ = make_service({"pool_sync_standard_counts": [("0", 1)],
-                                  "open_crawl_status_counts": [],
+                                  "open_crawl_status_counts": [(1, 0, 0, 0, 0)],
                                   "crawl1_commodity_rows": [],
                                   "crawl2_search_flags": []},
                                  runtime_root=tmp_path, now_fn=lambda: BEFORE_CUTOFF)
@@ -1207,7 +1214,7 @@ def test_r2_p2_2_central_failure_keeps_task_not_created_for_taskless_commodity()
 
     service, _, _ = make_service({
         "pool_sync_standard_counts": [("0", 2)],
-        "open_crawl_status_counts": [(1, 2)],
+        "open_crawl_status_counts": [(2, 0, 2, 0, 0)],
         "crawl1_commodity_rows": [(11, "CA"), (12, "CB")],
         "crawl1_task_rows": [(11, "SAAS-188605_701_1", 1)],  # 仅 A 有 task
         "crawl1_central_rows": central_raises,
@@ -1229,5 +1236,160 @@ def test_r2_invariants_summary():
     service, _, _ = make_service(dict(FULL_CANNED))
     stages = service.get_diagnostic("2026-08-27")["stages"]
     for key in ("pool_counts_available", "crawl_status_available", "snapshot_consistent",
-                "snapshot_drift", "pool_scope_total", "crawler_branch", "downstream_branch"):
+                "snapshot_drift", "pool_scope_total", "routing_open_total",
+                "crawler_branch", "downstream_branch"):
         assert key in stages, key
+
+
+# ===========================================================================
+# Review Fix Round 3 Closeout(P1 routing 单语句闭合 / P2 drift 辅助字段与
+# notice 三态 / 真实日历日期校验)
+# ===========================================================================
+
+
+# ---- P1:routing 层单语句闭合 + pool vs routing drift ----
+
+def test_r3_p1_a_pool_lt_routing_marks_drift_not_residual():
+    """pool 时点 not_closed=3,routing 时点 open=5(期间新增 2 条):
+    不得伪造 no_commodity_list=2;显式 pool_vs_routing drift。"""
+    service, _, _ = make_service({
+        "pool_sync_standard_counts": [("0", 3)],
+        "open_crawl_status_counts": [(5, 0, 2, 3, 0)],
+        "crawl1_commodity_rows": [(11, "C1"), (12, "C2")],
+        "crawl1_task_rows": [],
+        "crawl1_central_rows": [],
+        "crawl2_search_flags": [],
+    })
+    payload = service.get_diagnostic("2026-08-27")
+    stages = payload["stages"]
+    assert stages["snapshot_consistent"] is False
+    assert "pool_vs_routing" in stages["snapshot_drift"]
+    assert stages["no_commodity_list"] == 0
+    assert stages["not_closed"] == 3 and stages["routing_open_total"] == 5
+    assert payload["status"] == "partial"
+    # routing 自身闭合:2+3+0+0=5
+    assert stages["crawl_status_1"] + stages["crawl_status_2"] + \
+        stages["crawl_status_other"] + stages["no_commodity_list"] == stages["routing_open_total"]
+    # branch 仍可发布(自身 detail 未漂移)
+    assert stages["crawler_branch"] is not None
+
+
+def test_r3_p1_b_pool_gt_routing_marks_drift_not_residual():
+    """pool 时点 not_closed=5,routing 时点 open=3(期间 2 条完成收口):
+    不得从 5-3 推出 no_commodity_list=2。"""
+    service, _, _ = make_service({
+        "pool_sync_standard_counts": [("0", 5)],
+        "open_crawl_status_counts": [(3, 0, 1, 2, 0)],
+        "crawl1_commodity_rows": [(11, "C1")],
+        "crawl1_task_rows": [],
+        "crawl1_central_rows": [],
+        "crawl2_search_flags": [],
+    })
+    payload = service.get_diagnostic("2026-08-27")
+    stages = payload["stages"]
+    assert stages["no_commodity_list"] == 0
+    assert stages["snapshot_consistent"] is False
+    assert "pool_vs_routing" in stages["snapshot_drift"]
+    assert payload["status"] == "partial"
+
+
+def test_r3_p1_c_routing_statement_closes_internally():
+    """routing query 单语句内:no_cl + c1 + c2 + other == routing_open_total。"""
+    service, _, _ = make_service({
+        "pool_sync_standard_counts": [("0", 5)],
+        "open_crawl_status_counts": [(5, 1, 1, 2, 1)],
+        "crawl1_commodity_rows": [(11, "C1")],
+        "crawl1_task_rows": [],
+        "crawl1_central_rows": [],
+        "crawl2_search_flags": [],
+    })
+    stages = service.get_diagnostic("2026-08-27")["stages"]
+    assert stages["routing_open_total"] == 5
+    assert (stages["no_commodity_list"], stages["crawl_status_1"],
+            stages["crawl_status_2"], stages["crawl_status_other"]) == (1, 1, 2, 1)
+
+
+def test_r3_p1_d_no_commodity_list_only_from_routing_join():
+    """只有 routing query 的 LEFT JOIN 报告 no_cl=2 时才允许显示未进入采集列表=2。"""
+    service, _, _ = make_service({
+        "pool_sync_standard_counts": [("0", 4)],
+        "open_crawl_status_counts": [(4, 2, 1, 1, 0)],
+        "crawl1_commodity_rows": [(11, "C1")],
+        "crawl1_task_rows": [],
+        "crawl1_central_rows": [],
+        "crawl2_search_flags": [],
+    })
+    stages = service.get_diagnostic("2026-08-27")["stages"]
+    assert stages["no_commodity_list"] == 2
+    assert stages["snapshot_consistent"] is True  # pool(4) == routing(4)
+
+
+def test_r3_p1_e_consistent_when_pool_matches_routing_and_details_close():
+    service, _, _ = make_service(dict(FULL_CANNED))
+    payload = service.get_diagnostic("2026-08-27")
+    stages = payload["stages"]
+    assert stages["snapshot_consistent"] is True
+    assert stages["snapshot_drift"] == []
+    assert payload["status"] == "ok"
+    assert sum(stages["crawler_branch"].values()) == stages["crawl_status_1"]
+    assert sum(stages["downstream_branch"].values()) == stages["crawl_status_2"]
+
+
+# ---- P2:branch drift 时辅助字段 unavailable ----
+
+def test_r3_p2_drift_branch_aux_fields_are_none_not_zero():
+    # downstream drift(5 行 > routing 3):downstream 派生字段全部 None,不得冒充 0
+    service, _, _ = make_service({
+        "pool_sync_standard_counts": [("0", 3)],
+        "open_crawl_status_counts": [(3, 0, 0, 3, 0)],
+        "crawl1_commodity_rows": [],
+        "crawl2_search_flags": [
+            (i, 5, "2026-08-27 08:00:00", 0, 0, 0, 0, 0, 0, 0, 0, 0) for i in range(1, 6)
+        ],
+    })
+    stages = service.get_diagnostic("2026-08-27")["stages"]
+    assert stages["downstream_branch"] is None
+    assert stages["reference_pending_approval_total"] is None
+    assert stages["callback_done_no_search_within_grace"] is None
+
+    # crawler drift:routing c1=3 但 detail 返回 5 行 → crawler 派生 detail None
+    service, _, _ = make_service({
+        "pool_sync_standard_counts": [("0", 3)],
+        "open_crawl_status_counts": [(3, 0, 3, 0, 0)],
+        "crawl1_commodity_rows": [(i, f"C{i}") for i in range(1, 6)],
+        "crawl1_task_rows": [],
+        "crawl1_central_rows": [],
+        "crawl2_search_flags": [],
+    })
+    stages = service.get_diagnostic("2026-08-27")["stages"]
+    assert stages["crawler_branch"] is None
+    assert stages["central_status_detail"] is None
+
+
+def test_r3_p2_normal_branch_real_zero_stays_zero():
+    """正常 branch:真实 0 仍是 0,真实证据记录原样保留。"""
+    service, _, _ = make_service(dict(FULL_CANNED), now_fn=lambda: BEFORE_CUTOFF)
+    stages = service.get_diagnostic("2026-08-27")["stages"]
+    assert stages["crawler_branch"] is not None
+    # 查询成功且确有 1 条 00/00 分控记录 → detail 原样保留(真实空列表仍会是 [])
+    assert stages["central_status_detail"] == [
+        {"batch_num": "188605_701", "task_status": "00", "queue_status": "00", "count": 1}]
+    assert stages["reference_pending_approval_total"] == 0
+    assert stages["callback_done_no_search_within_grace"] == 0  # 09:59 入池 vs 14:00 检查,超出宽限
+
+
+# ---- Non-blocking:真实日历日期校验 ----
+
+def test_r3_date_validation_rejects_impossible_calendar_dates(client, monkeypatch):
+    _clear_service(monkeypatch)
+    for bad in ("2026-02-31", "2026-02-29", "2026-13-01", "2026-00-10"):
+        r = client.get(f"/dashboard/api/saas-flow?date={bad}")
+        assert r.status_code == 400, bad
+        assert r.json()["detail"]["error_code"] == "BAD_BUSINESS_DATE", bad
+    # 合法闰年接受(未配置 → 200 降级,而非 400/503)
+    r = client.get("/dashboard/api/saas-flow?date=2028-02-29")
+    assert r.status_code == 200
+    # summary 同一校验:非法日历日期 400,不得进入 503
+    r = client.get("/dashboard/api/summary?date=2026-02-31")
+    assert r.status_code == 400
+    assert r.json()["detail"]["error_code"] == "BAD_BUSINESS_DATE"

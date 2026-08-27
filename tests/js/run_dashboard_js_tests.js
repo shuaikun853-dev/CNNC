@@ -12,7 +12,7 @@
 // 被测对象:app/static/dashboard/app.js 暴露的 createPollController /
 // createSaasFlowPoller / safeProgressText。
 const path = require("path");
-const { createPollController, createSaasFlowPoller, safeProgressText } = require(
+const { createPollController, createSaasFlowPoller, safeProgressText, sfPartialNotice } = require(
   path.join(__dirname, "..", "..", "app", "static", "dashboard", "app.js"));
 
 let failed = 0;
@@ -259,6 +259,24 @@ async function test_sf_inflight_dedup() {
   check("P1-4 完成后仅一条排程链", clock.pending() === 1);
 }
 
+function test_sf_partial_notice_three_states() {
+  // R3 P2:pure query failure / pure snapshot drift / both 三态文案分开
+  const degradedOnly = sfPartialNotice(["crawl1_central_rows"], []);
+  check("R3 纯查询失败文案含降级与查询名",
+        degradedOnly.includes("部分诊断查询失败") && degradedOnly.includes("crawl1_central_rows"),
+        degradedOnly);
+  const driftOnly = sfPartialNotice([], ["pool_vs_routing"]);
+  check("R3 纯漂移文案不提查询失败且说明非业务异常",
+        driftOnly.includes("查询期间") && driftOnly.includes("不是业务异常") &&
+        !driftOnly.includes("查询失败"), driftOnly);
+  const both = sfPartialNotice(["crawl1_task_rows"], ["downstream_branch"]);
+  check("R3 双态文案同时提及失败与数据变化",
+        both.includes("部分查询失败") && both.includes("数据变化"), both);
+  check("R3 不得出现空列表拼接文案",
+        !sfPartialNotice([], []).includes("::") &&
+        !sfPartialNotice(["x"], []).includes(":;"));
+}
+
 (async () => {
   await test_304_keeps_sync_fresh_without_rerender();
   await test_hidden_pauses_and_visible_resumes();
@@ -269,6 +287,7 @@ async function test_sf_inflight_dedup() {
   await test_sf_polls_independently_of_summary_304();
   await test_sf_hidden_pauses_and_visible_resumes();
   await test_sf_inflight_dedup();
+  test_sf_partial_notice_three_states();
   if (failed === 0) { console.log("ALL PASS"); process.exit(0); }
   console.error(failed + " failing checks");
   process.exit(1);
