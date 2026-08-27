@@ -107,7 +107,8 @@
     renderJobs(p.jobs);
     window._timelines = p.timelines;
     renderTech(p.status);
-    fetchSaasFlow(false);  // 客户端 ≥55s 节流;服务端另有 60s cache + 刷新限流
+    // Review P1-4:SaaS Flow 有独立轮询生命周期,不再依赖 summary 的 200 render;
+    // summary 连续 304 时 SaaS Flow 仍按自身 ~60s 周期刷新。
   }
   function renderHero(o) {
     const h = $("#hero");
@@ -216,22 +217,41 @@
   }
 
   // ---- SaaS 首次采集链路(独立只读诊断;失败只降级本面板,不影响 summary 轮询) ----
-  // 客户端节流 ≥55s + 服务端 60s cache/30s 强制刷新限流,绝不形成 5 秒级生产 DB 轮询。
-  const SF_FETCH_MIN_INTERVAL_MS = 55000;
+  // Review P1-4:独立 polling 生命周期——页面 visible 时约每 60 秒自查询一次,
+  // hidden 停止,回前台立即补刷;与 summary 的 ETag/304 生命周期完全解耦。
+  // 服务端仍有 ≥60s cache 与 ≥30s 强刷限流,绝不形成 5 秒级生产 DB 轮询。
+  const SF_POLL_INTERVAL_MS = 60000;
+  const SF_FETCH_MIN_INTERVAL_MS = 55000;   // 双保险:即便轮询器被密集触发也不打接口
   let sfLastFetchAt = 0, sfInFlight = false;
-  const SF_STAGE_LABELS = {
-    TASK_NOT_CREATED: "未生成task", TASK_CREATED_NO_CENTRAL_RECORD: "task未进分控",
-    CENTRAL_NOT_ENQUEUED: "中控未入队", CENTRAL_ENQUEUED_WAITING: "已入队等待",
-    CRAWLER_EXECUTING: "正在执行", CRAWLER_FAILED: "爬虫失败", CALLBACK_LAG: "callback lag",
-    CALLBACK_DONE_NO_SEARCH: "callback后暂未search", MODEL_PENDING: "模型处理中",
-    INTERNET_SAME_PENDING_APPROVAL: "互联网同款待审批",
-    APPROVAL_OR_FINAL_CLOSURE_PENDING: "最终收口中",
-    INTERNET_CANDIDATES_ALL_NON_SAME: "互联网候选全部判非同款",
-    REFERENCE_SAME_ONLY: "只有参考链接同款", MODEL_DONE_NO_SAME: "模型完成无同款",
-    NO_INTERNET_CANDIDATE: "无互联网候选", NO_COMMODITY_LIST: "未进入采集列表",
-    EVIDENCE_INCOMPLETE: "证据不足",
-  };
-  const SF_GROWTH_LABELS = { NORMAL: "正常", LAG_WATCH: "增长落后观察", LAG_PERSISTING: "持续增长落后" };
+
+  function createSaasFlowPoller(deps) {
+    const st = { timer: null, inFlight: false };
+    function clearTimer() {
+      if (st.timer !== null) { deps.clearTimeout(st.timer); st.timer = null; }
+    }
+    function schedule() {
+      clearTimer();
+      if (!deps.visible()) return false;
+      st.timer = deps.setTimeout(() => { st.timer = null; run(); }, deps.intervalMs);
+      return true;
+    }
+    async function run() {
+      if (st.inFlight) return;
+      st.inFlight = true;
+      try {
+        await deps.poll();
+      } finally {
+        st.inFlight = false;
+      }
+      schedule();
+    }
+    return {
+      run, schedule,
+      onHidden: clearTimer,
+      onVisible: () => { if (!st.inFlight) run(); },
+      stop: clearTimer,
+    };
+  }
 
   async function fetchSaasFlow(force) {
     if (sfInFlight) return;
@@ -252,9 +272,38 @@
     }
   }
 
+  const sfPoller = createSaasFlowPoller({
+    poll: () => fetchSaasFlow(false),
+    visible: () => document.visibilityState === "visible",
+    setTimeout: (fn, ms) => setTimeout(fn, ms),
+    clearTimeout: (t) => clearTimeout(t),
+    intervalMs: SF_POLL_INTERVAL_MS,
+  });
+
+  const SF_STAGE_LABELS = {
+    TASK_NOT_CREATED: "未生成task", TASK_CREATED_NO_CENTRAL_RECORD: "task未进分控",
+    CENTRAL_NOT_ENQUEUED: "中控未入队", CENTRAL_ENQUEUED_WAITING: "已入队等待",
+    CRAWLER_EXECUTING: "正在执行", CRAWLER_FAILED: "爬虫失败", CALLBACK_LAG: "callback lag",
+    CALLBACK_DONE_NO_SEARCH: "callback后暂未search", MODEL_PENDING: "模型处理中",
+    INTERNET_SAME_PENDING_APPROVAL: "互联网同款待审批",
+    APPROVAL_OR_FINAL_CLOSURE_PENDING: "最终收口中",
+    INTERNET_CANDIDATES_ALL_NON_SAME: "互联网候选全部判非同款",
+    REFERENCE_SAME_ONLY: "只有参考链接同款", MODEL_DONE_NO_SAME: "模型完成无同款",
+    NO_INTERNET_CANDIDATE: "无互联网候选", NO_COMMODITY_LIST: "未进入采集列表",
+    EVIDENCE_INCOMPLETE: "证据不足",
+  };
+  // Review P2-2:区分"评估过=正常"与"证据不足/非评估时段",不把后者显示成"正常"
+  const SF_GROWTH_LABELS = { NORMAL: "正常", LAG_WATCH: "增长落后观察", LAG_PERSISTING: "持续增长落后" };
+  const SF_REASON_LABELS = {
+    NO_OBSERVATIONS: "暂无权威观察",
+    INSUFFICIENT_OBSERVATIONS: "观察次数不足(需至少两次)",
+    AFTER_CUTOFF: "正常(18:00 后不评估)",
+  };
+
   function sfGrowthText(g) {
     if (!g) return "—";
-    if (!g.evaluated) return SF_GROWTH_LABELS.NORMAL + "(18:00 后不评估)";
+    const reason = g.evaluation_reason || (g.evaluated ? "EVALUATED" : "");
+    if (reason && SF_REASON_LABELS[reason]) return SF_REASON_LABELS[reason];
     return SF_GROWTH_LABELS[g.state] || g.state || "—";
   }
 
@@ -275,12 +324,19 @@
     } else if (p.status === "rate_limited" || p.rate_limited) {
       notice.textContent = "刷新过于频繁,已按限流返回上次缓存结果(强制刷新间隔 ≥30 秒)。";
     } else if (p.status === "partial") {
-      notice.textContent = "部分查询失败已降级:" + (p.degraded_queries || []).join(", ") + ";其余分类仍有效。";
+      notice.textContent = "部分查询失败已降级:" + (p.degraded_queries || []).join(", ") + ";失败项按证据不足处理,不冒充业务 0。";
     } else {
       notice.textContent = "";
     }
     const growthBox = $("#sf-growth");
-    if (g.available) {
+    const reason = g.evaluation_reason || "";
+    if (reason === "NO_OBSERVATIONS") {
+      growthBox.textContent = "今日暂无权威观察(增量审计发现尚未运行),增长判断待首次快照后可用。";
+    } else if (reason === "INSUFFICIENT_OBSERVATIONS") {
+      growthBox.textContent = "今日权威观察仅 " + (g.observation_count ?? 0) +
+        " 次,需至少两次才能判断增长分叉;最近一次:客户 " + (g.customer_count ?? "—") +
+        ",SaaS " + (g.saas_count ?? "—") + "。";
+    } else if (g.available) {
       let text = "今日权威观察 " + (g.observation_count ?? 0) + " 次;最近一次 " +
         (g.last_observed_at ? String(g.last_observed_at).replace("T", " ").slice(0, 19) : "—") +
         ":客户 " + (g.customer_count ?? "—") + ",SaaS " + (g.saas_count ?? "—");
@@ -292,7 +348,7 @@
           (dist.length ? dist.join("、") : "证据不足") + "。";
       }
     } else {
-      growthBox.textContent = "本地暂无今日权威观察序列(增量审计发现尚未运行),增长分叉判断待首次快照后可用。";
+      growthBox.textContent = "本地暂无今日权威观察序列,增长分叉判断不可用。";
     }
     $("#sf-tree").innerHTML = sfTreeHtml(p.stages);
     $("#sf-evidence").innerHTML = sfEvidenceHtml(p);
@@ -306,6 +362,9 @@
 
   function sfTreeHtml(stages) {
     if (!stages) return "";
+    if (stages.crawl_status_available === false) {
+      return '<div class="sf-head">分层数据不可用(crawl_status 核心查询失败,不冒充业务 0)。</div>';
+    }
     const crawler = stages.crawler_branch || {}, down = stages.downstream_branch || {};
     const crawlerKeys = ["TASK_NOT_CREATED", "TASK_CREATED_NO_CENTRAL_RECORD", "CENTRAL_NOT_ENQUEUED",
       "CENTRAL_ENQUEUED_WAITING", "CRAWLER_EXECUTING", "CRAWLER_FAILED", "CALLBACK_LAG"];
@@ -315,9 +374,14 @@
     const graceNote = stages.callback_done_no_search_within_grace
       ? "其中 " + stages.callback_done_no_search_within_grace + " 个在回调宽限期(" +
         Math.round((stages.grace_seconds || 0) / 60) + " 分钟)内" : "";
-    return '<div class="sf-head">今日客户商品:' + Number(stages.customer_total || 0) +
-      " · 未最终收口:" + Number(stages.not_closed || 0) +
-      (stages.no_commodity_list ? " · 未进入采集列表:" + Number(stages.no_commodity_list) : "") + "</div>" +
+    // Review P1-6:SQL 池计数不是权威客户计数,只称"当日商品池记录";
+    // 权威客户/SaaS 数量只来自 growth.customer_count / growth.saas_count。
+    const head = "当日商品池记录:" +
+      (stages.pool_counts_available === false ? "不可用" : Number(stages.pool_scope_total || 0)) +
+      " · 未最终收口:" +
+      (stages.not_closed == null ? "不可用" : Number(stages.not_closed)) +
+      (stages.no_commodity_list ? " · 未进入采集列表:" + Number(stages.no_commodity_list) : "");
+    return '<div class="sf-head">' + esc(head) + "</div>" +
       '<ul class="sf-branch"><li class="bf">├─ 爬虫未回调:' + Number(stages.crawl_status_1 || 0) + "<ul>" +
       crawlerKeys.map((k) => sfStageLine(SF_STAGE_LABELS[k], crawler[k])).join("") +
       sfStageLine("证据不足", crawler.EVIDENCE_INCOMPLETE) + "</ul></li>" +
@@ -356,8 +420,8 @@
 
   function start() {
     document.addEventListener("visibilitychange", () => {
-      if (document.visibilityState === "visible") ctl.onVisible();
-      else ctl.onHidden();
+      if (document.visibilityState === "visible") { ctl.onVisible(); sfPoller.onVisible(); }
+      else { ctl.onHidden(); sfPoller.onHidden(); }
     });
     $("#refresh").addEventListener("click", () => ctl.run());
     $("#jobs-toggle").addEventListener("click", () => {
@@ -368,8 +432,10 @@
     if (sfRefresh) sfRefresh.addEventListener("click", () => fetchSaasFlow(true));
     setInterval(updateLive, 1000);
     ctl.run();
+    sfPoller.run();  // SaaS Flow 独立启动,不等 summary
   }
-  const api = { start, stop: () => ctl.stop(), createPollController, safeProgressText };
+  const api = { start, stop: () => { ctl.stop(); sfPoller.stop(); },
+    createPollController, createSaasFlowPoller, safeProgressText };
   if (typeof window !== "undefined") { window.Dashboards = api; }
   if (typeof module !== "undefined" && module.exports) { module.exports = api; }
   if (typeof document !== "undefined") { document.addEventListener("DOMContentLoaded", start); }

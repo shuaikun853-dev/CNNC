@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
+import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -332,10 +334,14 @@ FULL_CANNED = {
     "crawl1_commodity_rows": [(11, "C1")],
     "crawl1_task_rows": [(11, "SAAS-188605_701_1", 1)],
     "crawl1_central_rows": [("188605_701", "00", "00", None, None)],
+    # 列:commodity_list_id, search_rows, pool_created_at, model_pending,
+    #     has_internet_same, internet_pending_approval, same_approved,
+    #     has_reference_same, has_internet_candidate, reference_pending_approval,
+    #     has_model_verdict, same_rejected
     "crawl2_search_flags": [
-        (21, 0, "2026-08-27 09:00:00", 0, 0, 0, 0, 0, 0, 0, 0),
-        (22, 5, "2026-08-27 08:00:00", 0, 1, 1, 0, 0, 0, 0, 0),
-        (23, 5, "2026-08-27 08:00:00", 0, 0, 0, 0, 0, 1, 0, 0),
+        (21, 0, "2026-08-27 09:00:00", 0, 0, 0, 0, 0, 0, 0, 0, 0),
+        (22, 5, "2026-08-27 08:00:00", 0, 1, 1, 0, 0, 0, 0, 0, 0),
+        (23, 5, "2026-08-27 08:00:00", 0, 0, 0, 0, 0, 0, 1, 0, 0),
     ],
 }
 
@@ -443,7 +449,7 @@ def flags(**kw):
     base = {"search_rows": 5, "pool_created_at": "2026-08-27 08:00:00",
             "model_pending": 0, "has_internet_same": 0, "internet_pending_approval": 0,
             "same_approved": 0, "has_reference_same": 0, "has_internet_candidate": 0,
-            "reference_pending_approval": 0, "has_model_verdict": 0}
+            "reference_pending_approval": 0, "has_model_verdict": 0, "same_rejected": 0}
     base.update(kw)
     return base
 
@@ -726,3 +732,251 @@ def test_refresh_param_is_cache_flag_only(client, monkeypatch):
     assert r.status_code == 200
     r = client.get("/dashboard/api/saas-flow?date=2026-08-27&refresh=not-a-flag-value-anything")
     assert r.status_code == 400
+
+
+# ===========================================================================
+# Review Fix Round 1(findings P1-1..P2-2 + sync_state=2 边界)
+# ===========================================================================
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+# ---- P1-1:两个分支的 EVIDENCE_INCOMPLETE 独立计数,互不污染 ----
+
+def test_p1_1_crawler_incomplete_does_not_leak_into_downstream():
+    canned = dict(FULL_CANNED)
+    # central 返回未知状态(有 task、有分控行,但状态不可解释)→ crawler 证据不足
+    canned["crawl1_central_rows"] = [("188605_701", None, None, None, None)]
+    service, _, _ = make_service(canned)
+    payload = service.get_diagnostic("2026-08-27")
+    stages = payload["stages"]
+    assert stages["crawler_branch"]["EVIDENCE_INCOMPLETE"] == 1
+    assert stages["downstream_branch"]["EVIDENCE_INCOMPLETE"] == 0
+    # 两个分支分别闭合
+    assert sum(stages["crawler_branch"].values()) == stages["crawl_status_1"]
+    assert sum(stages["downstream_branch"].values()) == stages["crawl_status_2"]
+
+
+def test_p1_1_downstream_incomplete_does_not_leak_into_crawler():
+    canned = dict(FULL_CANNED)
+    # 路由层称 crawl2=5,但 flags 查询只返回 3 行 → 2 个溢出落 downstream 证据不足
+    canned["open_crawl_status_counts"] = [(1, 1), (2, 5)]
+    service, _, _ = make_service(canned)
+    payload = service.get_diagnostic("2026-08-27")
+    stages = payload["stages"]
+    assert stages["downstream_branch"]["EVIDENCE_INCOMPLETE"] == 2
+    assert stages["crawler_branch"]["EVIDENCE_INCOMPLETE"] == 0
+    assert sum(stages["downstream_branch"].values()) == stages["crawl_status_2"]
+
+
+# ---- P1-2:central 查询失败 = 证据不足,不是 task 未进分控 ----
+
+def test_p1_2_central_query_failure_is_evidence_incomplete_not_no_central_record():
+    def central_raises(params):
+        raise RuntimeError("central timeout")
+
+    service, _, _ = make_service({
+        "pool_sync_standard_counts": [("0", 2)],
+        "open_crawl_status_counts": [(1, 2)],
+        "crawl1_commodity_rows": [(11, "C1"), (12, "C2")],
+        "crawl1_task_rows": [(11, "SAAS-188605_701_1", 1), (12, "SAAS-188605_702_1", 1)],
+        "crawl1_central_rows": central_raises,
+        "crawl2_search_flags": [],
+    })
+    payload = service.get_diagnostic("2026-08-27")
+    assert payload["status"] == "partial"
+    assert "crawl1_central_rows" in payload["degraded_queries"]
+    crawler = payload["stages"]["crawler_branch"]
+    assert crawler["EVIDENCE_INCOMPLETE"] == 2
+    assert crawler["TASK_CREATED_NO_CENTRAL_RECORD"] == 0
+
+
+# ---- P1-3:核心查询失败 ≠ 业务 0 ----
+
+def test_p1_3_case_a_open_crawl_status_failure_is_not_business_zero():
+    def crawl_status_raises(params):
+        raise RuntimeError("crawl status timeout")
+
+    service, executed, _ = make_service({
+        "pool_sync_standard_counts": [("0", 4)],
+        "open_crawl_status_counts": crawl_status_raises,
+        "crawl1_commodity_rows": [(11, "C1")],
+        "crawl2_search_flags": [(21, 0, "2026-08-27 09:00:00", 0, 0, 0, 0, 0, 0, 0, 0, 0)],
+    })
+    payload = service.get_diagnostic("2026-08-27")
+    assert payload["status"] == "partial"
+    stages = payload["stages"]
+    # 查询失败不得表达为业务 0
+    assert stages["crawl_status_1"] is None
+    assert stages["crawl_status_2"] is None
+    assert stages["crawl_status_other"] is None
+    assert stages["crawl_status_available"] is False
+    # pool 计数仍可用且保留原语义名
+    assert stages["pool_counts_available"] is True
+    assert stages["pool_scope_total"] == 4
+    assert stages["not_closed"] == 4
+    # 不误算 no_commodity_list,不输出矛盾 branch total
+    assert stages["no_commodity_list"] is None
+    assert stages["crawler_branch"] is None
+    assert stages["downstream_branch"] is None
+    assert stages["dominant_stage"] is None
+    # 查询依赖:路由层失败后不再执行分支子查询
+    executed_names = {name for name, _ in executed}
+    assert "crawl1_commodity_rows" not in executed_names
+    assert "crawl1_task_rows" not in executed_names
+    assert "crawl2_search_flags" not in executed_names
+    assert "open_crawl_status_counts" in payload["degraded_queries"]
+
+
+def test_p1_3_case_b_pool_failure_is_not_business_zero():
+    def pool_raises(params):
+        raise RuntimeError("pool timeout")
+
+    service, _, _ = make_service({
+        "pool_sync_standard_counts": pool_raises,
+        "open_crawl_status_counts": [(1, 1), (2, 3)],
+        "crawl1_commodity_rows": [(11, "C1")],
+        "crawl1_task_rows": [(11, "SAAS-188605_701_1", 1)],
+        "crawl1_central_rows": [("188605_701", "00", "00", None, None)],
+        "crawl2_search_flags": [],
+    })
+    payload = service.get_diagnostic("2026-08-27")
+    assert payload["status"] == "partial"
+    stages = payload["stages"]
+    # 不能声称 customer/pool 总数为 0
+    assert stages["pool_scope_total"] is None
+    assert stages["not_closed"] is None
+    assert stages["closed_standard"] is None
+    assert stages["closed_no_same"] is None
+    assert stages["pool_counts_available"] is False
+    # 路由层成功,分支分类照常
+    assert stages["crawl_status_available"] is True
+    assert stages["crawl_status_1"] == 1
+    assert stages["crawler_branch"]["CENTRAL_NOT_ENQUEUED"] == 1
+    # pool 失败时无法闭合 no_commodity_list
+    assert stages["no_commodity_list"] is None
+    assert "pool_sync_standard_counts" in payload["degraded_queries"]
+
+
+# ---- P1-5:SaaS Flow 折叠摘要默认可见(不在 .more-block 内) ----
+
+def test_p1_5_saasflow_summary_visible_without_expanding_more():
+    html = (ROOT / "app" / "static" / "dashboard" / "index.html").read_text(encoding="utf-8")
+    sf_index = html.find('id="saasflow"')
+    more_index = html.find('class="more-block"')
+    assert sf_index != -1 and more_index != -1
+    assert sf_index < more_index, "#saasflow 必须移出默认 display:none 的 .more-block"
+    import re as _re
+    details = _re.search(r"<details[^>]*saasflow[^>]*>", html)
+    assert details is not None
+    assert "open" not in details.group(0), "默认折叠:details 不得带 open 属性"
+
+
+# ---- P1-6:SQL 池计数不得冒充权威客户计数 ----
+
+def test_p1_6_pool_count_not_named_customer_total():
+    service, _, _ = make_service(dict(FULL_CANNED))
+    payload = service.get_diagnostic("2026-08-27")
+    text = json.dumps(payload, ensure_ascii=False)
+    assert "customer_total" not in text
+    assert payload["stages"]["pool_scope_total"] == 4
+    js = (ROOT / "app" / "static" / "dashboard" / "app.js").read_text(encoding="utf-8")
+    html = (ROOT / "app" / "static" / "dashboard" / "index.html").read_text(encoding="utf-8")
+    assert "customer_total" not in js
+    assert "今日客户商品" not in js and "今日客户商品" not in html
+    assert "pool_scope_total" in js and "当日商品池记录" in js
+
+
+# ---- P1-7:并发强制刷新 single-flight ----
+
+def test_p1_7_concurrent_forced_refreshes_single_flight():
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    build_count = {"n": 0}
+    lock = threading.Lock()
+
+    def slow_factory(cfg):
+        with lock:
+            build_count["n"] += 1
+        time.sleep(0.05)
+        return FakeConnection({
+            "pool_sync_standard_counts": [("0", 1)],
+            "open_crawl_status_counts": [],
+            "crawl1_commodity_rows": [],
+            "crawl2_search_flags": [],
+        }, [])
+
+    service = diag.SaasFlowDiagnosticService(
+        config=diag.DiagDBConfig(host="db.example.internal", port=3306,
+                                 user="ro", password="secret-not-committed"),
+        connection_factory=slow_factory,
+        fresh_read_min_interval_seconds=30.0,
+        cache_ttl_seconds=60.0,
+    )
+    with ThreadPoolExecutor(max_workers=10) as pool:
+        results = list(pool.map(
+            lambda _: service.get_diagnostic("2026-08-27", force_refresh=True),
+            range(10)))
+    assert build_count["n"] == 1, f"并发强刷必须 single-flight,实际 build {build_count['n']} 次"
+    assert len(results) == 10 and all(isinstance(r, dict) and r.get("status") == "ok"
+                                      for r in results)
+    assert sum(1 for r in results if r.get("rate_limited")) == 9
+
+
+# ---- P2-1:强刷下限 clamp 到 30 秒 ----
+
+def test_p2_1_fresh_interval_env_clamps_to_30(monkeypatch):
+    monkeypatch.setenv("CNNC_DIAG_FRESH_MIN_INTERVAL_SECONDS", "5")
+    monkeypatch.setenv("CNNC_DIAG_CACHE_SECONDS", "10")
+    monkeypatch.delenv("CNNC_DIAG_DB_HOST", raising=False)
+    monkeypatch.delenv("CNNC_DIAG_DB_USER", raising=False)
+    monkeypatch.delenv("CNNC_DIAG_DB_PASSWORD", raising=False)
+    monkeypatch.setattr(diag, "_SERVICE_SINGLETON", None)
+    diag.get_saas_flow_diagnostic("2026-08-27")
+    service = diag._SERVICE_SINGLETON
+    assert service._fresh_min_interval == 30.0
+    assert service._cache_ttl_seconds == 60.0
+
+
+# ---- P2-2:evaluation_reason ----
+
+def test_p2_2_evaluation_reason_values():
+    no_obs = diag.evaluate_growth([], business_date="2026-08-27", now=BEFORE_CUTOFF)
+    assert no_obs["evaluation_reason"] == "NO_OBSERVATIONS"
+    one = diag.evaluate_growth(obs([0], [100], [50]), business_date="2026-08-27",
+                               now=BEFORE_CUTOFF)
+    assert one["evaluation_reason"] == "INSUFFICIENT_OBSERVATIONS"
+    ok = diag.evaluate_growth(obs([0, 15], [100, 110], [50, 55]),
+                              business_date="2026-08-27", now=BEFORE_CUTOFF)
+    assert ok["evaluation_reason"] == "EVALUATED"
+    after = diag.evaluate_growth(obs([0, 15], [100, 110], [50, 50]),
+                                 business_date="2026-08-27",
+                                 now=datetime(2026, 8, 27, 11, 0, tzinfo=UTC))
+    assert after["evaluation_reason"] == "AFTER_CUTOFF"
+
+
+def test_p2_2_frontend_distinguishes_reasons():
+    js = (ROOT / "app" / "static" / "dashboard" / "app.js").read_text(encoding="utf-8")
+    assert "NO_OBSERVATIONS" in js and "INSUFFICIENT_OBSERVATIONS" in js
+    assert "暂无权威观察" in js and "观察次数不足" in js
+
+
+# ---- §12:sync_state=2 已审批非同款的显式分类 ----
+
+def test_sync_state_2_internet_same_rejected_is_approval_closure_pending():
+    # 模型判互联网同款(model=1),人工审批为非同款(sync_state=2),未最终收口
+    record = flags(has_internet_same=1, has_internet_candidate=1, same_rejected=1)
+    assert diag.classify_downstream(record)["state"] == "APPROVAL_OR_FINAL_CLOSURE_PENDING"
+
+
+def test_sync_state_2_reference_same_rejected_is_approval_closure_pending():
+    # 参考链接同款(model=3)人工审批为非同款(sync_state=2)
+    record = flags(has_reference_same=1, same_rejected=1)
+    assert diag.classify_downstream(record)["state"] == "APPROVAL_OR_FINAL_CLOSURE_PENDING"
+
+
+def test_sync_state_2_pending_approval_still_dominates_rejected():
+    # 同商品同时存在待审批与已驳回:待审批是当前可操作阶段
+    record = flags(has_internet_same=1, internet_pending_approval=1, same_rejected=1)
+    assert diag.classify_downstream(record)["state"] == "INTERNET_SAME_PENDING_APPROVAL"
