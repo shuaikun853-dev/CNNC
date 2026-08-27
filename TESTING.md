@@ -71,6 +71,7 @@ python -m pytest tests\test_daily_audit_store.py tests\test_cnnc_saas_snapshot_a
 ### Dashboard 测试（只读看板）
 `tests\test_dashboard_projection.py`（投影/分级/日历/scheduler 降级/fingerprint）+ `tests\test_dashboard_api.py`（GET-only、400/503、ETag/304、自启脚本与 runbook 的 -Apply 门控）：
 `E:\Python314\python.exe -m pytest tests\test_dashboard_projection.py tests\test_dashboard_api.py -q --basetemp=runtime\pytest-tmp\dash`
+`tests\test_saas_flow_diagnostic.py`（SaaS 链路诊断：SQL registry 只读、降级/缓存/限流、分支分类、18:00 前增长分叉、summary 隔离；全部 fake connection/tmp SQLite，绝不连真实数据库）一并执行，命令追加该文件名即可。
 fixture 原则：只用 `tmp_path` 下的临时 SQLite/`daily_status.json` 或 monkeypatch 替身，不碰生产 `runtime\incremental_price_audit`；不注册真实计划任务，自启用例只读文本、从不执行 `-Apply`。
 ### 编译检查
 
