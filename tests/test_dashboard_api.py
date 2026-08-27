@@ -86,6 +86,40 @@ def test_autostart_scripts_exist_with_apply_gate():
     assert "-Apply" in un and "预览" in un
 
 
+# ---- Autostart Reliability Fix(2026-08-27):长期可用性 settings ----
+
+def test_autostart_register_uses_task_scheduler_cmdlets_with_full_settings():
+    reg = (ROOT / "scripts" / "register_dashboard_autostart.ps1").read_text(encoding="utf-8")
+    # 显式控制 settings 必须走 ScheduledTasks 模块,而不是 schtasks /Create
+    assert "Register-ScheduledTask" in reg
+    assert "New-ScheduledTaskAction" in reg and "New-ScheduledTaskTrigger" in reg
+    assert "New-ScheduledTaskSettingsSet" in reg
+    assert "schtasks /Create" not in reg
+    # 可靠性 settings(schtasks 默认 PT72H 时限 + 电池双禁 + 无重启,全部显式纠正)
+    assert "-ExecutionTimeLimit ([TimeSpan]::Zero)" in reg       # 无时限(PT0S)
+    assert "-AllowStartIfOnBatteries" in reg
+    assert "-DontStopIfGoingOnBatteries" in reg
+    assert "-MultipleInstances IgnoreNew" in reg
+    assert "-RestartCount 3" in reg                              # 异常退出自动拉起 3 次
+    assert "-RestartInterval (New-TimeSpan -Minutes 1)" in reg
+
+
+def test_autostart_register_preview_gate_precedes_any_write():
+    reg = (ROOT / "scripts" / "register_dashboard_autostart.ps1").read_text(encoding="utf-8")
+    gate = reg.find("if (-not $Apply)")
+    write = reg.find("Register-ScheduledTask")
+    assert gate != -1 and write != -1
+    assert gate < write, "默认 Preview 必须先于任何 Scheduler 写操作 exit"
+
+
+def test_autostart_register_preview_reports_full_target_config():
+    reg = (ROOT / "scripts" / "register_dashboard_autostart.ps1").read_text(encoding="utf-8")
+    for field in ("TaskName", "Executable", "Arguments", "WorkingDirectory", "Trigger",
+                  "ExecutionTimeLimit", "AllowStartIfOnBatteries", "DontStopIfGoingOnBatteries",
+                  "MultipleInstances", "RestartCount", "RestartInterval", "Apply"):
+        assert f'"{field}"' in reg or f"'{field}'" in reg, f"Preview 必须打印 {field}"
+
+
 def test_dashboard_runbook_exists():
     text = (ROOT / "docs" / "runbooks" / "STEP_1_DASHBOARD.md").read_text(encoding="utf-8")
     assert "只读" in text and "127.0.0.1" in text and "8765" in text

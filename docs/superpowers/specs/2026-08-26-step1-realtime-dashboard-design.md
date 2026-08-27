@@ -3,6 +3,7 @@
 - 日期:2026-08-26 · 修订:V2(首页信息架构按用户反馈整体重做:Current-stage-first + Exception-first + Progressive disclosure;后端架构不变)
 - 修订:V2.1(2026-08-27 Independent Review Fix Round 1):§4.2 R1 不再把合法 RECOVERY_EXHAUSTED 计入红色人工、新增 R4.5「等待最终收口」;§4.5 颜色口径同步;§8.2 服务常驻降为「登录自启一次」的 ACCEPTED_RISK;§11 隐藏暂停改为真实实现并由 node 行为测试覆盖
 - 修订:V2.2(2026-08-27 Independent Review Fix Round 2):R4.5 改以 final.computed_pending=0 为准(不含 detail.terminal,与生产 blocker truth 一致);detail.terminal 进黄色关注(终态证据、普通 finalize 放行、客户价留空保留失败证据);恢复时间线 observation signature 安全渲染(safeProgressText)
+- 修订:V2.3(2026-08-27 Autostart Reliability Fix,分支 fix/dashboard-autostart-reliability-20260827):§8.2 自启注册改经 Register-ScheduledTask 显式设置——无执行时限(PT0S)、电池可启不中断、IgnoreNew、异常退出自动拉起 3 次/间隔 1 分钟;收窄(但未消除)V2.1 的 ACCEPTED_RISK,预览/-Apply 门控不变
 - 状态:待用户重审(V1 的信息架构未通过;V2 重提)
 - 基线:BASE_BRANCH `origin/prod/closeout-20260818` @ `ccdd194c8dc1ecce7199cfc793b4a4596f61ec61`
 - 开发分支:`feat/step1-realtime-dashboard-20260826`(独立 worktree `E:\.A中核运维\cnnc-dashboard-dev`)
@@ -118,6 +119,7 @@ R7 正在准备数据   [蓝]  detail.pending+running>0 ∨ model.pending+runnin
 1. 服务绑定:`127.0.0.1` 仅本机。
 2. 服务常驻:**Scheduler 处于启用状态时,页面服务必须可用**。机制:为 Dashboard 服务增加独立的登录自启(独立计划任务或启动项),**绝不触碰现有 `CNNC-PriceAudit-Incremental` 任务**;注册同样走"预览→显式 -Apply"门控;具体形式在 writing-plans 阶段细化。
    - **V1 实际口径(2026-08-27 Review Fix Round 1 裁定 / ACCEPTED_RISK)**:登录自启只在每次登录时启动一次,不是进程 watchdog——uvicorn 中途退出后不会自动拉起,需重新登录或按 runbook 手动启动。曾评估 Task Scheduler restart-on-failure:`schtasks /Create` 命令行无法表达该设置,改用 `Register-ScheduledTask` 的 RestartCount/RestartInterval/ExecutionTimeLimit 组合属本轮无法在不执行 `-Apply` 的前提下验证的系统注册变更,不符合低风险门槛,故不强行实现;如后续需要持续可用,按本条重新立项并走预览→`-Apply` 门控。
+   - **V2.3 更新(2026-08-27 Autostart Reliability Fix,独立分支待评审)**:上述"重新立项"已完成——注册脚本改经 `Register-ScheduledTask` 显式设置 ExecutionTimeLimit=PT0S、AllowStartIfOnBatteries/DontStopIfGoingOnBatteries、MultipleInstances=IgnoreNew、RestartCount=3/RestartInterval=PT1M(仅非零退出码触发,干净退出不重启)。风险由"无任何自愈"收窄为"最多自愈 3 次";3 次用尽或无人登录时仍需人工,预览/-Apply 门控与"绝不触碰 CNNC-PriceAudit-Incremental"边界不变。
 
 ## 9. 验收标准(更新)
 
