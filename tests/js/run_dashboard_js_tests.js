@@ -10,9 +10,11 @@
 //   P1-4  SaaS Flow 独立轮询生命周期:summary 连续 304 仍按 ~60s 周期刷新;
 //         hidden 停止、visible 立即补刷;与 summary ETag/304 生命周期解耦。
 // 被测对象:app/static/dashboard/app.js 暴露的 createPollController /
-// createSaasFlowPoller / safeProgressText。
+// createSaasFlowPoller / safeProgressText / sfGrowthText。
+// 覆盖 SaaS Flow Round 4:
+//   P2-1  AFTER_CUTOFF 是"未评估",文案必须如实,不得显示成"正常"。
 const path = require("path");
-const { createPollController, createSaasFlowPoller, safeProgressText, sfPartialNotice } = require(
+const { createPollController, createSaasFlowPoller, safeProgressText, sfPartialNotice, sfGrowthText } = require(
   path.join(__dirname, "..", "..", "app", "static", "dashboard", "app.js"));
 
 let failed = 0;
@@ -277,6 +279,21 @@ function test_sf_partial_notice_three_states() {
         !sfPartialNotice(["x"], []).includes(":;"));
 }
 
+function test_sf_growth_after_cutoff_not_normal() {
+  // R4 P2-1:后端 evaluated=false + evaluation_reason=AFTER_CUTOFF 表示"18:00 后不进行
+  // 增长分叉判断"。前端文案必须明确传达"未评估/不再评估",不得出现"正常"。
+  const text = sfGrowthText({
+    available: true, evaluated: false, evaluation_reason: "AFTER_CUTOFF",
+    observation_count: 5, customer_count: 10, saas_count: 9,
+  });
+  check("R4 AFTER_CUTOFF 文案明确表示未评估/不再评估",
+        text.includes("不再评估") || text.includes("未评估"), text);
+  check("R4 AFTER_CUTOFF 文案不得包含\"正常\"", !text.includes("正常"), text);
+  // 防过度修正:真正评估过且 state=NORMAL 的仍显示"正常"
+  const evaluatedNormal = sfGrowthText({ available: true, evaluated: true, state: "NORMAL" });
+  check("R4 评估过的 NORMAL 状态仍显示\"正常\"", evaluatedNormal === "正常", evaluatedNormal);
+}
+
 (async () => {
   await test_304_keeps_sync_fresh_without_rerender();
   await test_hidden_pauses_and_visible_resumes();
@@ -288,6 +305,7 @@ function test_sf_partial_notice_three_states() {
   await test_sf_hidden_pauses_and_visible_resumes();
   await test_sf_inflight_dedup();
   test_sf_partial_notice_three_states();
+  test_sf_growth_after_cutoff_not_normal();
   if (failed === 0) { console.log("ALL PASS"); process.exit(0); }
   console.error(failed + " failing checks");
   process.exit(1);

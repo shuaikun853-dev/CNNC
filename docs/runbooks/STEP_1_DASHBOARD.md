@@ -9,8 +9,11 @@
 
 - 用途:在生产运行之外,随时用浏览器查看 STEP_1 当日状态,不需要登录任何业务系统。
 - **只读红线**:
-  - 零写入:服务不写任何文件、不发任何业务写请求;只读取
-    `runtime/incremental_price_audit/<业务日>/` 下的 `daily_status.json` 与 `state.sqlite3`。
+  - 零写入:服务不写任何文件、不发任何业务写请求。主 Dashboard 状态投影只读取
+    `runtime/incremental_price_audit/<业务日>/` 下的 `daily_status.json` 与 `state.sqlite3`;
+    唯一额外只读数据源为 SaaS Flow Diagnostic(见下文专节),通过指定只读数据库账号执行
+    后端预定义、固定 scope 的 SELECT(`tenant_id=188605`、`commodity_pool_id=222`),
+    不接受任意 SQL、不接受浏览器指定 tenant/pool/schema/表名、不执行 DML/DDL、无业务写入口。
   - GET-only:看板路由只接受 GET;POST/PUT/DELETE/PATCH 一律 405。
   - 不触碰现有审计计划任务:自启注册/卸载脚本只操作 `CNNC-Dashboard-ReadOnly` 一个任务名;
     页面 Scheduler 区对现有审计计划任务也只做 PowerShell Get-ScheduledTask/Get-ScheduledTaskInfo 只读查询(10 秒超时、30 秒缓存),查询失败即降级显示"不可用"。
@@ -79,6 +82,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\unregister_dashboard
 |---|---|
 | 监听地址 | 仅 `127.0.0.1:8765`(本机回环) |
 | 状态来源 | `runtime/incremental_price_audit/<业务日>/daily_status.json`、`state.sqlite3`(只读) |
+| SaaS Flow 诊断来源 | 指定只读数据库账号(`CNNC_DIAG_DB_*`)的后端预定义、固定 scope SELECT(`tenant_id=188605`、`commodity_pool_id=222`);详见下文专节 |
 | Scheduler 区 | 对现有审计计划任务做 PowerShell Get-ScheduledTask/Get-ScheduledTaskInfo 只读查询(10 秒超时、30 秒缓存) |
 | 刷新方式 | 前端按指纹条件轮询(ETag/304);页面不可见时暂停轮询 |
 

@@ -298,7 +298,7 @@
   const SF_REASON_LABELS = {
     NO_OBSERVATIONS: "暂无权威观察",
     INSUFFICIENT_OBSERVATIONS: "观察次数不足(需至少两次)",
-    AFTER_CUTOFF: "正常(18:00 后不评估)",
+    AFTER_CUTOFF: "18:00 后不再评估",
     OBSERVATION_READ_FAILED: "权威观察读取失败",
   };
 
@@ -461,7 +461,7 @@
     sfPoller.run();  // SaaS Flow 独立启动,不等 summary
   }
   const api = { start, stop: () => { ctl.stop(); sfPoller.stop(); },
-    createPollController, createSaasFlowPoller, safeProgressText, sfPartialNotice };
+    createPollController, createSaasFlowPoller, safeProgressText, sfPartialNotice, sfGrowthText };
   if (typeof window !== "undefined") { window.Dashboards = api; }
   if (typeof module !== "undefined" && module.exports) { module.exports = api; }
   if (typeof document !== "undefined") { document.addEventListener("DOMContentLoaded", start); }
