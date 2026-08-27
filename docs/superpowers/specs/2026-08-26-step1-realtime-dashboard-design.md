@@ -1,6 +1,7 @@
 # CNNC STEP_1 实时中文只读监控驾驶舱 — 设计 Spec(V2)
 
 - 日期:2026-08-26 · 修订:V2(首页信息架构按用户反馈整体重做:Current-stage-first + Exception-first + Progressive disclosure;后端架构不变)
+- 修订:V2.1(2026-08-27 Independent Review Fix Round 1):§4.2 R1 不再把合法 RECOVERY_EXHAUSTED 计入红色人工、新增 R4.5「等待最终收口」;§4.5 颜色口径同步;§8.2 服务常驻降为「登录自启一次」的 ACCEPTED_RISK;§11 隐藏暂停改为真实实现并由 node 行为测试覆盖
 - 状态:待用户重审(V1 的信息架构未通过;V2 重提)
 - 基线:BASE_BRANCH `origin/prod/closeout-20260818` @ `ccdd194c8dc1ecce7199cfc793b4a4596f61ec61`
 - 开发分支:`feat/step1-realtime-dashboard-20260826`(独立 worktree `E:\.A中核运维\cnnc-dashboard-dev`)
@@ -55,10 +56,12 @@ Scheduler 与现有 STEP_1 引擎(不动)
 ```
 R0 状态读取失败   [红]  SQLite/API 不可读(服务自身异常,与业务无关)
 R1 需要人工处理   [红]  remote.manual>0 ∨ crawl.manual>0 ∨ crawl.unplanned>0
-                        ∨ model.terminal>0 ∨ remote.recovery_exhausted>0
+                        ∨ model.terminal>0 ∨ recovery_exhausted 证据不完整>0
 R2 今日无数据     [灰]  state=MISSING(工作日未开始/周末)
 R3 今日结果已生成 [绿]  final.finalized(forced=true 附黄提示"曾强制收尾")
 R4 正在最终收口   [蓝]  final.frozen ∧ ¬finalized
+R4.5 等待最终收口 [蓝]  数据准备完成 ∧ 招商局/采集子状态全清(unknown=0、detail.terminal=0)
+                        ∧ ¬frozen ∧ ¬finalized(业务工作已结束,等 18:00 口径冻结)
 R5 正在回收招商局结果 [蓝] 数据准备完成 ∧ remote.awaiting_harvest>0
 R6 正在等待招商局 [蓝]  数据准备完成 ∧ 其余招商局子状态未清(intent/提优/执行)
 R7 正在准备数据   [蓝]  detail.pending+running>0 ∨ model.pending+running>0
@@ -66,6 +69,7 @@ R7 正在准备数据   [蓝]  detail.pending+running>0 ∨ model.pending+runnin
 
 - "数据准备完成" = detail.pending+running=0 ∧ model.pending+running=0(terminal/manual 不降低完成度,只进异常通道)。
 - **生产语义修正(2026-08-26 执行期裁定)**:R3(finalized)判定先于 R1 中的 recovery_exhausted——RECOVERY_EXHAUSTED 在出表后仍会在 status 中计数(属可接受终态收敛),若 R1 全面优先会把已完成的业务日误报为"需要人工处理";其余 R1 条件(remote.manual/crawl.manual/crawl.unplanned/model.terminal)在 FINALIZED 日按 readiness 门不可能非零,故该排序无副作用。
+- **生产语义修正(2026-08-27 Review Fix Round 1)**:带完整 durable proof(确认停用+确认启用+恢复时间+recovery_attempts=1,与 finalize `_valid_recovery_exhausted_evidence` 同一判定)的 RECOVERY_EXHAUSTED 是安全收口——关联 crawl 已转 NO_RESULT、不阻塞 ordinary finalize、不伪造价格,因此**不再等价于 MANUAL_REQUIRED**,按黄(关注)展示、补采仅属可选人工操作;仅当 proof 不合法(finalize 将判 remote_invalid、NON_TOLERABLE)时才按真实阻塞升级红色人工。
 - **存在明确异常(黄)不改主状态词**:remote.unknown>0 ∨ crawl.unknown>0 ∨ remote_health.stall_detected → 强制进入"需要关注"(黄)并写入解释句。
 - **系统自动恢复中(蓝)不改主状态词**:计入招商局摘要"自动恢复中 X"并写入解释句;仅 RECOVERY_EXHAUSTED 才升级红。
 - **解释句生成铁律(V1 冲突修复)**:存在任何"需要关注"项时,解释句必须逐项提及,禁止出现"无异常/无需人工处理"表述;无关注项时才允许"当前无需人工处理"。
@@ -87,7 +91,7 @@ R7 正在准备数据   [蓝]  detail.pending+running>0 ∨ model.pending+runnin
 
 ### 4.5 色彩(五色,单源 CSS 令牌 + 图标双通道)
 
-绿=完成/正常 · 蓝=当前运行(含自动恢复中) · 灰=等待/未开始 · 黄=系统可自动处理但值得关注(SUBMIT_UNKNOWN、断路器触发、提交待确认) · 红=人工介入/明确阻塞(MANUAL_REQUIRED、RECOVERY_EXHAUSTED、模型终态失败、crawl manual/unplanned)。不设青色恢复色系;断路器触发=黄 + 文案"系统已暂停新建任务以保护远端,属保护机制非故障"。
+绿=完成/正常 · 蓝=当前运行(含自动恢复中) · 灰=等待/未开始 · 黄=系统可自动处理但值得关注(SUBMIT_UNKNOWN、断路器触发、提交待确认、合法 RECOVERY_EXHAUSTED 已安全收口) · 红=人工介入/明确阻塞(MANUAL_REQUIRED、证据不完整的 RECOVERY_EXHAUSTED、模型终态失败、crawl manual/unplanned)。不设青色恢复色系;断路器触发=黄 + 文案"系统已暂停新建任务以保护远端,属保护机制非故障"。(2026-08-27 修订:合法恢复用尽由红改黄,依据 §4.2 生产语义修正。)
 
 ## 5. 只读投影(与 V1 spec 相同)
 
@@ -110,6 +114,7 @@ R7 正在准备数据   [蓝]  detail.pending+running>0 ∨ model.pending+runnin
 
 1. 服务绑定:`127.0.0.1` 仅本机。
 2. 服务常驻:**Scheduler 处于启用状态时,页面服务必须可用**。机制:为 Dashboard 服务增加独立的登录自启(独立计划任务或启动项),**绝不触碰现有 `CNNC-PriceAudit-Incremental` 任务**;注册同样走"预览→显式 -Apply"门控;具体形式在 writing-plans 阶段细化。
+   - **V1 实际口径(2026-08-27 Review Fix Round 1 裁定 / ACCEPTED_RISK)**:登录自启只在每次登录时启动一次,不是进程 watchdog——uvicorn 中途退出后不会自动拉起,需重新登录或按 runbook 手动启动。曾评估 Task Scheduler restart-on-failure:`schtasks /Create` 命令行无法表达该设置,改用 `Register-ScheduledTask` 的 RestartCount/RestartInterval/ExecutionTimeLimit 组合属本轮无法在不执行 `-Apply` 的前提下验证的系统注册变更,不符合低风险门槛,故不强行实现;如后续需要持续可用,按本条重新立项并走预览→`-Apply` 门控。
 
 ## 9. 验收标准(更新)
 
@@ -126,4 +131,5 @@ R7 正在准备数据   [蓝]  detail.pending+running>0 ∨ model.pending+runnin
 ## 11. 实时行为(real-time behavior)
 
 - 前端条件轮询:活跃(生产写入器 active 或 final.computed_pending>0 且未 finalized)5 秒,否则 30 秒;ETag/304 稳态续排;页面不可见暂停、可见即补刷。
+- (2026-08-27 Review Fix Round 1:隐藏暂停/回前台补刷/在途去重由 `tests/js/run_dashboard_js_tests.js` 的 node 行为测试证实;首页"实时·最后同步"角标基于最后一次成功 200 或 304,而非 payload generated_at,连续 304 不再误显"最后更新 X 分钟前"。)
 - Execution-period ruling (2026-08-26 final review): FINALIZED no longer fully stops polling; instead switches to 30-second slow polling (serving always-on dashboards; cost ≈ one 304 per 30 seconds).

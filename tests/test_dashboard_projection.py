@@ -24,10 +24,12 @@ def _status(**over):
 
 
 def test_r1_manual_wins_and_explanation_mentions_every_attention():
-    s = _status()
+    # Review Fix Round 1 后语义:MANUAL_REQUIRED 才是红色主状态;合法恢复用尽走黄。
+    s = _status(remote={**_status()["remote"], "manual": 1})
     out = compute_overall_status(s, recovering=1)
     assert out["word"] == "需要人工处理" and out["color"] == "red"
-    assert "自动恢复已用尽" in out["explanation"]
+    assert "招商局任务需要人工检查" in out["explanation"]
+    assert "自动恢复已用尽" in out["explanation"]  # 关注项逐项提及(红优先,取前 3)
     assert "无需人工处理" not in out["explanation"]
     assert [a["level"] for a in out["attention"]][0] == "red"
     assert any(a["level"] == "yellow" for a in out["attention"])  # SUBMIT_UNKNOWN→黄
@@ -116,8 +118,8 @@ def test_explanation_sentence_boundaries_no_reversal_reading():
     out = compute_overall_status(s)
     assert "无需人工处理。" in out["explanation"]
     assert not any(ch.isdigit() for ch in out["explanation"].split("无需人工处理")[-1][:1])
-    out_red = compute_overall_status(_status())
-    assert "自动恢复已用尽。" in out_red["explanation"]
+    out_red = compute_overall_status(_status(remote={**_status()["remote"], "manual": 1}))
+    assert "招商局任务需要人工检查" in out_red["explanation"]
 
 
 def test_final_text_surfaces_remote_intent_only_blocker():
@@ -281,10 +283,12 @@ def test_build_summary_end_to_end(tmp_path, monkeypatch):
     monkeypatch.setattr(dp, "project_scheduler_status", lambda: {"available": False})
     monkeypatch.setattr(dp, "project_recent_days", lambda root, n=14, **kw: [])
     out = build_dashboard_summary("2026-08-26", tmp_path)
-    assert out["overall"]["word"] == "需要人工处理"
+    # Review Fix Round 1 后语义:合法恢复用尽不再把整日推红;该日仍有 pending → 等待招商局。
+    assert out["overall"]["word"] == "正在等待招商局" and out["overall"]["color"] == "blue"
     assert any(j["mall_key"] == "京东商城" for j in out["jobs"])
     assert out["timelines"] and "12" in out["timelines"]
     assert all("recovery_evidence_json" not in j for j in out["jobs"])
+    assert next(j for j in out["jobs"] if j["id"] == 12)["recovery_attempts"] == 1
     assert len(out["fingerprint"]) == 64
     again = build_dashboard_summary("2026-08-26", tmp_path)
     assert again["fingerprint"] == out["fingerprint"]  # 同数据同指纹
@@ -307,3 +311,156 @@ def test_final_text_ok_and_missing_output_branches():
                              "manifest_recorded": False, "blocker_summary": {}})
     out_missing = compute_overall_status(missing)
     assert "失败" in out_missing["final_text"]
+
+
+# ---- Independent Review Fix Round 1(2026-08-27):P1-1 / P1-2 / P1-3 / P1-4 ----
+
+def _cleared(**over):
+    """前置工作全部完成、招商局/采集全部清零、未冻结未出表(等待 18:00 收口)。"""
+    s = _status(
+        crawl={"pending": 0, "running": 0, "completed": 45, "no_result": 30, "unplanned": 0,
+               "unknown": 0, "manual": 0, "waiting_submit": 0, "awaiting_priority": 0,
+               "awaiting_remote": 0, "blocked_manual": 0, "retryable": 0, "unclassified": 0},
+        remote={"intent": 0, "pending": 0, "running": 0, "exported": 0, "completed": 45,
+                "unknown": 0, "manual": 0, "awaiting_priority": 0, "awaiting_harvest": 0,
+                "recovery_exhausted": 0},
+        final={"pending": 0, "computed_pending": 0, "frozen": False, "finalized": False,
+               "forced": False, "output_path": None, "output_exists": False,
+               "manifest_recorded": False, "blocker_summary": {}},
+    )
+    return s
+
+
+def test_rf1_legal_recovery_exhausted_is_not_manual():
+    s = _status()  # 唯一"异常"计数是 remote.recovery_exhausted=1(合法 durable proof)
+    out = compute_overall_status(s)
+    assert out["word"] != "需要人工处理" and out["color"] != "red"
+    assert not any(a["level"] == "red" and "恢复已用尽" in a["title"] for a in out["attention"])
+    assert any(a["level"] == "yellow" and a["title"] == "自动恢复已用尽" for a in out["attention"])
+    assert out["zs_summary"]["manual"] == 0
+    assert out["zs_summary"]["recovery_exhausted"] == 1
+    assert out["stages"][1]["state"] != "bad"
+
+
+def test_rf1_invalid_recovery_exhausted_proof_is_red():
+    s = _status()
+    out = compute_overall_status(s, recovery_exhausted_invalid=1)
+    assert out["word"] == "需要人工处理" and out["color"] == "red"
+    assert any(a["level"] == "red" and "证据不完整" in a["title"] for a in out["attention"])
+    assert out["zs_summary"]["manual"] == 1
+    assert out["stages"][1]["state"] == "bad"
+
+
+def test_rf1_manual_required_still_red():
+    s = _status(remote={**_status()["remote"], "recovery_exhausted": 0, "manual": 2})
+    out = compute_overall_status(s)
+    assert out["word"] == "需要人工处理" and out["color"] == "red"
+    assert any(a["title"] == "招商局任务需要人工检查" and a["level"] == "red" for a in out["attention"])
+    assert [a["level"] for a in out["attention"]][0] == "red"
+
+
+def test_rf1_legal_exhausted_with_cleared_day_waits_closeout():
+    s = _cleared()
+    s["remote"]["recovery_exhausted"] = 1
+    out = compute_overall_status(s)
+    assert out["word"] == "等待最终收口" and out["color"] == "blue"
+    assert out["zs_summary"]["manual"] == 0 and out["zs_summary"]["recovery_exhausted"] == 1
+    assert out["stages"][1]["state"] == "done"
+
+
+def test_rf2_wait_final_closeout_when_all_cleared_before_freeze():
+    s = _cleared()
+    out = compute_overall_status(s)
+    assert out["word"] == "等待最终收口"
+    assert out["word"] != "正在准备数据"
+    assert "18:00" in out["explanation"]
+    assert out["stages"][1]["state"] == "done"
+    assert out["stages"][2]["state"] == "wait"
+
+
+def test_rf4_crawl_manual_impact_says_finalize_blocked():
+    s = _status(remote={**_status()["remote"], "recovery_exhausted": 0})
+    s["crawl"]["manual"] = 2
+    out = compute_overall_status(s)
+    assert out["word"] == "需要人工处理"
+    item = next(a for a in out["attention"] if a["title"] == "采集行需要人工处理")
+    assert "阻塞" in item["impact"] and "最终出表" in item["impact"]
+    assert "留空进入最终表" not in item["impact"]
+
+
+_PROVEN_RESTART = {
+    "phase": "ENABLE_CONFIRMED", "recovery_at": "2026-08-26T02:53:00+00:00",
+    "disable_evidence": {"confirmed_disabled": True},
+    "enable_evidence": {"confirmed_enabled": True},
+}
+
+
+def _job_db(tmp_path, *, state, post_attempted=0, restart_patch=None):
+    day = tmp_path / "day"
+    day.mkdir(parents=True, exist_ok=True)
+    db = _make_db(day)
+    con = sqlite3.connect(db)
+    if restart_patch is not None:
+        row = con.execute("SELECT recovery_evidence_json FROM remote_jobs WHERE id=12").fetchone()
+        ev = json.loads(row[0])
+        ev["restart"] = restart_patch
+        con.execute("UPDATE remote_jobs SET recovery_evidence_json=? WHERE id=12",
+                    (json.dumps(ev, ensure_ascii=False),))
+    con.execute("UPDATE remote_jobs SET state=?, post_attempted=? WHERE id=12", (state, post_attempted))
+    con.commit()
+    con.close()
+    return db
+
+
+def test_rf3_completed_recovered_job_keeps_timeline_at_summary_level(tmp_path, monkeypatch):
+    db = _job_db(tmp_path, state="COMPLETED")  # fixture 自带 recovery_attempts=1 + ENABLE_CONFIRMED
+    from app.services import dashboard_projection as dp
+    monkeypatch.setattr(dp, "collect_runtime_status", lambda **kw: _cleared())
+    monkeypatch.setattr(dp, "runtime_paths", lambda bd, root=None: type("P", (), {
+        "state_path": db, "run_dir": db.parent})())
+    monkeypatch.setattr(dp, "project_scheduler_status", lambda: {"available": False})
+    monkeypatch.setattr(dp, "project_recent_days", lambda root, n=14, **kw: [])
+    out = dp.build_dashboard_summary("2026-08-26", tmp_path)
+    tl = out["timelines"].get("12")
+    assert tl is not None, "COMPLETED 且已恢复的任务必须在 summary API 中保留 recovery timeline"
+    assert tl["phase"] == "恢复成功"
+    assert tl["recovery_attempts"] == 1
+    job = next(j for j in out["jobs"] if j["id"] == 12)
+    assert job["recovery_attempts"] == 1 and job["pill"] == "ok"
+
+
+def test_rf1_project_remote_jobs_marks_exhausted_proof_validity(tmp_path):
+    from app.workflows.incremental_price_audit_finalize import _valid_recovery_exhausted_evidence
+    valid_db = _job_db(tmp_path / "v", state="RECOVERY_EXHAUSTED", post_attempted=1,
+                       restart_patch=_PROVEN_RESTART)
+    jobs = project_remote_jobs(valid_db, "2026-08-26")
+    assert jobs[0]["recovery_exhausted_valid"] is True
+    assert jobs[0]["pill"] == "warn"
+    assert _valid_recovery_exhausted_evidence(jobs[0]) is True  # 与 finalize 权威判定一致
+    invalid_db = _job_db(tmp_path / "i", state="RECOVERY_EXHAUSTED", post_attempted=1)
+    jobs2 = project_remote_jobs(invalid_db, "2026-08-26")
+    assert jobs2[0]["recovery_exhausted_valid"] is False
+    assert jobs2[0]["pill"] == "err"
+    assert _valid_recovery_exhausted_evidence(jobs2[0]) is False
+
+
+def test_rf1_summary_overall_reflects_exhausted_proof_validity(tmp_path, monkeypatch):
+    from app.services import dashboard_projection as dp
+
+    def build(db):
+        st = _cleared()
+        st["remote"]["recovery_exhausted"] = 1
+        monkeypatch.setattr(dp, "collect_runtime_status", lambda **kw: st)
+        monkeypatch.setattr(dp, "runtime_paths", lambda bd, root=None: type("P", (), {
+            "state_path": db, "run_dir": db.parent})())
+        monkeypatch.setattr(dp, "project_scheduler_status", lambda: {"available": False})
+        monkeypatch.setattr(dp, "project_recent_days", lambda root, n=14, **kw: [])
+        return dp.build_dashboard_summary("2026-08-26", tmp_path)
+
+    out_valid = build(_job_db(tmp_path / "v", state="RECOVERY_EXHAUSTED", post_attempted=1,
+                              restart_patch=_PROVEN_RESTART))
+    assert out_valid["overall"]["word"] == "等待最终收口"
+    assert out_valid["overall"]["color"] != "red"
+    out_invalid = build(_job_db(tmp_path / "i", state="RECOVERY_EXHAUSTED", post_attempted=1))
+    assert out_invalid["overall"]["word"] == "需要人工处理"
+    assert out_invalid["overall"]["color"] == "red"

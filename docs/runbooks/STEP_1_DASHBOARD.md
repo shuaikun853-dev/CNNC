@@ -57,6 +57,15 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\unregister_dashboard
 
 `/Delete` 失败(例如任务本就不存在)时脚本以非零退出码报错。卸载同样不影响现有审计计划任务。
 
+## 可用性边界(V1,ACCEPTED_RISK)
+
+- 登录自启 = 每次登录时启动一次,**不是进程 watchdog**:uvicorn 中途退出后不会自动重启,
+  需重新登录或按"手动启动"重启服务(页面此时打不开只表示看板服务不在,不代表审计本身异常)。
+- 这是 V1 接受的风险(设计 spec §8.2,2026-08-27 Review Fix Round 1 裁定):不引入无法在
+  预览阶段验证的 Task Scheduler restart-on-failure 注册变更(`schtasks` 命令行表达不了该设置,
+  `Register-ScheduledTask` 方案必须 ` -Apply` 后才能验证);如需持续可用再单独立项、
+  仍走预览 → 显式 `-Apply` 门控。
+
 ## 数据来源与绑定
 
 | 项目 | 说明 |
