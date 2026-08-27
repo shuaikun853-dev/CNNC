@@ -120,6 +120,69 @@ def test_autostart_register_preview_reports_full_target_config():
         assert f'"{field}"' in reg or f"'{field}'" in reg, f"Preview 必须打印 {field}"
 
 
+def test_autostart_action_arguments_semantic(tmp_path):
+    """Final Quote Fix(2026-08-27):Preview 的 Arguments 必须含真实双引号、无字面 \",
+    且该构造可被 powershell.exe 命令行真实执行(无副作用 python 探针);
+    不注册 Scheduler、不执行 -Apply、不占 8765、不碰生产 runtime。"""
+    import json
+    import shutil
+    import subprocess
+
+    if not shutil.which("powershell"):
+        pytest.skip("powershell 不可用")
+
+    def decode_child(b):
+        # PowerShell 5.1 管道按控制台代码页输出(本机 GBK),ConvertTo-Json 不转义非 ASCII;
+        # 依次尝试 utf-8 / gbk,最终容错替换,保证任何主机都可解析出 JSON。
+        for enc in ("utf-8", "gbk"):
+            try:
+                return b.decode(enc)
+            except UnicodeDecodeError:
+                continue
+        return b.decode(errors="replace")
+
+    reg_path = ROOT / "scripts" / "register_dashboard_autostart.ps1"
+    reg = reg_path.read_text(encoding="utf-8")
+    # WorkingDirectory 已由 New-ScheduledTaskAction 显式设置,动作载荷不得再重复 Set-Location
+    assert "Set-Location" not in reg
+    # Principal 显式化:当前用户 Interactive(本地 help 无默认值描述,不以未证语义注册)
+    assert "New-ScheduledTaskPrincipal" in reg
+    # Restart 语义按微软公开口径表述,不再断言未经实机验证的退出码细分
+    assert "非零退出码" not in reg and "退出码 0" not in reg
+    runbook = (ROOT / "docs" / "runbooks" / "STEP_1_DASHBOARD.md").read_text(encoding="utf-8")
+    assert "判定为失败时" in runbook
+    assert "干净退出" not in runbook            # 被撤回的"退出码 0 绝不重启"断言不得残留
+
+    proc = subprocess.run(
+        ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(reg_path)],
+        capture_output=True, timeout=120, cwd=str(ROOT))
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    lines = decode_child(proc.stdout).splitlines()
+    start = next(i for i, l in enumerate(lines) if l.strip() == "{")
+    end = next(i for i, l in enumerate(lines) if l.strip() == "}")
+    preview = json.loads("\n".join(lines[start:end + 1]))
+    args = preview["Arguments"]
+    expected = ('-NoProfile -WindowStyle Hidden -Command '
+                '"& \'E:\\Python314\\python.exe\' -m uvicorn app.main:app '
+                '--host 127.0.0.1 --port 8765"')
+    assert args == expected, args
+    assert '"' in args                      # 真实双引号
+    assert '\\"' not in args                # 不得含字面 反斜杠+引号
+    assert preview["WorkingDirectory"] == str(ROOT)
+    assert "Principal" in preview
+
+    # 可执行性探针:与生产同构的 -Command "…" 载荷(无副作用 python 脚本),
+    # 经 cmd 透传给 powershell.exe 完整命令行解析执行(等价任务启动形态)。
+    probe_py = tmp_path / "dash_probe.py"
+    probe_py.write_text("print('DASH_PROBE_OK')", encoding="ascii")
+    cmdline = ('powershell.exe -NoProfile -WindowStyle Hidden -Command '
+               '"& \'E:\\Python314\\python.exe\' \'%s\'"' % probe_py.as_posix())
+    out = subprocess.run(cmdline, capture_output=True, timeout=120, shell=True)
+    stdout_text = decode_child(out.stdout)
+    assert out.returncode == 0, stdout_text + decode_child(out.stderr)
+    assert "DASH_PROBE_OK" in stdout_text
+
+
 def test_dashboard_runbook_exists():
     text = (ROOT / "docs" / "runbooks" / "STEP_1_DASHBOARD.md").read_text(encoding="utf-8")
     assert "只读" in text and "127.0.0.1" in text and "8765" in text

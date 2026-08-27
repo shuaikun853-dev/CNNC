@@ -42,10 +42,11 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\register_dashboard_a
   --host 127.0.0.1 --port 8765` 启动只读服务。
 - 可选参数:`-RepoRoot`(默认脚本上级目录)、`-PythonExe`(默认 `E:\Python314\python.exe`)、
   `-Port`(默认 `8765`)。
-- 注册经 `Register-ScheduledTask` 显式设置长期可用性(2026-08-27 Reliability Fix):
+- 注册经 `Register-ScheduledTask` 显式设置长期可用性(2026-08-27 Reliability Fix;同日
+  Final Quote Fix 简化 Action 载荷并显式当前用户 Interactive Principal):
   无执行时限(ExecutionTimeLimit=PT0S,覆盖默认 72 小时)、电池供电允许启动且不中断
   (AllowStartIfOnBatteries/DontStopIfGoingOnBatteries)、多实例 IgnoreNew、
-  服务异常退出(非零退出码)自动拉起最多 3 次、间隔 1 分钟;干净退出(退出码 0)不重启。
+  当 Task Scheduler 将该任务判定为失败时最多自动重启 3 次、每次间隔 1 分钟。
 - 注册后可用 `Export-ScheduledTask -TaskName CNNC-Dashboard-ReadOnly`(或
   `schtasks /query /tn CNNC-Dashboard-ReadOnly /xml`)核对动作与 settings;该注册不影响现有审计计划任务。
 
@@ -63,11 +64,11 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\unregister_dashboard
 
 ## 可用性边界(V1.3,2026-08-27 Reliability Fix 后)
 
-- 登录自启 + 受限自愈:注册时显式设置无执行时限、电池可启、**异常退出自动拉起最多 3 次
-  (间隔 1 分钟)**——uvicorn 崩溃(非零退出码)可自动恢复。
-- 仍**不是无限 watchdog**:3 次拉起额度用尽、或服务干净退出(退出码 0)、或长时间无人登录时,
-  页面服务不会自行恢复,需重新登录或按"手动启动"重启(页面打不开只表示看板服务不在,
-  不代表审计本身异常)。
+- 登录自启 + 受限自愈:注册时显式设置无执行时限、电池可启、当 Task Scheduler 将该任务
+  判定为失败时最多自动重启 3 次(间隔 1 分钟)——服务崩溃通常可自动恢复。
+- 仍**不是无限 watchdog**:自动重启额度(3 次)用尽、服务停止后不再被 Task Scheduler
+  判定为失败、或长时间无人登录时,页面服务不会自行恢复,需重新登录或按"手动启动"重启
+  (页面打不开只表示看板服务不在,不代表审计本身异常)。
 - 演进记录:V1 原为"登录自启一次、无任何自愈"(spec §8.2 ACCEPTED_RISK,2026-08-27
   Review Fix Round 1 裁定);Reliability Fix 以 `Register-ScheduledTask` 显式 settings
   收窄该风险(见"登录自启注册"节),仍保留预览 → 显式 `-Apply` 门控。
