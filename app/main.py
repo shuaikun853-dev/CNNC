@@ -424,3 +424,13 @@ async def workflow_knowledge(workflow_name: str, request: Request):
         "knowledge_files": knowledge_files,
         "snippets": [],
     }
+
+
+from pathlib import Path as _Path
+from starlette.staticfiles import StaticFiles as _StaticFiles
+from app.dashboard_api import router as _dashboard_router
+
+app.include_router(_dashboard_router)
+app.mount("/dashboard/static",
+          _StaticFiles(directory=_Path(__file__).resolve().parent / "static" / "dashboard"),
+          name="dashboard-static")
