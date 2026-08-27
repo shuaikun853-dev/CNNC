@@ -42,8 +42,13 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\register_dashboard_a
   --host 127.0.0.1 --port 8765` 启动只读服务。
 - 可选参数:`-RepoRoot`(默认脚本上级目录)、`-PythonExe`(默认 `E:\Python314\python.exe`)、
   `-Port`(默认 `8765`)。
-- 注册后用 `schtasks /query /tn CNNC-Dashboard-ReadOnly /xml`(或 `/v /fo list`)核对动作里
-  `-Command "Set-Location ..."` 的内层双引号完整(脚本已按 PS 5.1 原生传参规则转义,此处为复核);该注册不影响现有审计计划任务。
+- 注册经 `Register-ScheduledTask` 显式设置长期可用性(2026-08-27 Reliability Fix;同日
+  Final Quote Fix 简化 Action 载荷并显式当前用户 Interactive Principal):
+  无执行时限(ExecutionTimeLimit=PT0S,覆盖默认 72 小时)、电池供电允许启动且不中断
+  (AllowStartIfOnBatteries/DontStopIfGoingOnBatteries)、多实例 IgnoreNew、
+  当 Task Scheduler 将该任务判定为失败时最多自动重启 3 次、每次间隔 1 分钟。
+- 注册后可用 `Export-ScheduledTask -TaskName CNNC-Dashboard-ReadOnly`(或
+  `schtasks /query /tn CNNC-Dashboard-ReadOnly /xml`)核对动作与 settings;该注册不影响现有审计计划任务。
 
 ## 卸载(先预览,后 -Apply)
 
@@ -57,14 +62,16 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\unregister_dashboard
 
 `/Delete` 失败(例如任务本就不存在)时脚本以非零退出码报错。卸载同样不影响现有审计计划任务。
 
-## 可用性边界(V1,ACCEPTED_RISK)
+## 可用性边界(V1.3,2026-08-27 Reliability Fix 后)
 
-- 登录自启 = 每次登录时启动一次,**不是进程 watchdog**:uvicorn 中途退出后不会自动重启,
-  需重新登录或按"手动启动"重启服务(页面此时打不开只表示看板服务不在,不代表审计本身异常)。
-- 这是 V1 接受的风险(设计 spec §8.2,2026-08-27 Review Fix Round 1 裁定):不引入无法在
-  预览阶段验证的 Task Scheduler restart-on-failure 注册变更(`schtasks` 命令行表达不了该设置,
-  `Register-ScheduledTask` 方案必须 ` -Apply` 后才能验证);如需持续可用再单独立项、
-  仍走预览 → 显式 `-Apply` 门控。
+- 登录自启 + 受限自愈:注册时显式设置无执行时限、电池可启、当 Task Scheduler 将该任务
+  判定为失败时最多自动重启 3 次(间隔 1 分钟)——服务崩溃通常可自动恢复。
+- 仍**不是无限 watchdog**:自动重启额度(3 次)用尽、服务停止后不再被 Task Scheduler
+  判定为失败、或长时间无人登录时,页面服务不会自行恢复,需重新登录或按"手动启动"重启
+  (页面打不开只表示看板服务不在,不代表审计本身异常)。
+- 演进记录:V1 原为"登录自启一次、无任何自愈"(spec §8.2 ACCEPTED_RISK,2026-08-27
+  Review Fix Round 1 裁定);Reliability Fix 以 `Register-ScheduledTask` 显式 settings
+  收窄该风险(见"登录自启注册"节),仍保留预览 → 显式 `-Apply` 门控。
 
 ## 数据来源与绑定
 
