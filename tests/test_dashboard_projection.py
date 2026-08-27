@@ -270,6 +270,45 @@ def test_scheduler_status_from_powershell_probe(monkeypatch):
     assert "正在运行" in out["last_result_cn"]
 
 
+# ---- Hotfix(2026-08-27 晚):scheduler 探针 UInt32 结果码溢出 ----
+
+def test_scheduler_probe_uint32_result_code_translates_not_crashes(monkeypatch):
+    """LastTaskResult 是 UInt32:0x800710E0(触发重叠被拒)=2147946720 > Int32.MaxValue。
+    探针/翻译必须按数值正常处理,未知码给中文"未知"文案。"""
+    import app.services.dashboard_projection as dp
+    dp._scheduler_cache.update({"at": 0.0, "value": None})
+    monkeypatch.setattr(dp, "_run_scheduler_probe", lambda: {
+        "state": "Running", "last_run": "08/27/2026 18:25:25",
+        "last_result": 2147946720, "next_run": "08/27/2026 18:30:30"})
+    out = dp.project_scheduler_status()
+    assert out["available"] is True and out["running"] is True
+    assert out["last_result"] == "2147946720"
+    assert "未知" in out["last_result_cn"]
+
+
+def test_scheduler_probe_non_numeric_last_result_degrades_not_503(monkeypatch):
+    """PS 侧强转失败时该字段可能序列化成对象/字符串:必须降级为未知结果码,
+    绝不能让 TypeError 把整个 summary 接口打成 503(2026-08-27 18:2x 实况)。"""
+    import app.services.dashboard_projection as dp
+    for bad in ({}, {"error": "cast"}, "not-a-number", None):
+        dp._scheduler_cache.update({"at": 0.0, "value": None})
+        monkeypatch.setattr(dp, "_run_scheduler_probe", lambda bad=bad: {
+            "state": "Ready", "last_run": "08/27/2026 18:25:25",
+            "last_result": bad, "next_run": "08/27/2026 18:30:30"})
+        out = dp.project_scheduler_status()
+        assert out["available"] is True
+        assert out["last_result"] == "-1"
+        assert "未知" in out["last_result_cn"]
+
+
+def test_scheduler_probe_source_no_int32_cast():
+    import inspect
+    import app.services.dashboard_projection as dp
+    src = inspect.getsource(dp._run_scheduler_probe)
+    assert "[int64]" in src, "探针必须用 [int64] 承载 UInt32 结果码"
+    assert "[int]" not in src.replace("[int64]", ""), "不得残留 Int32 强转(会溢出)"
+
+
 from app.services.dashboard_projection import build_dashboard_summary, fingerprint_payload
 
 

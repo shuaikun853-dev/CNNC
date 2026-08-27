@@ -387,7 +387,7 @@ def _run_scheduler_probe() -> dict | None:
            "if (-not $t) { Write-Output '{}' ; exit 0 }; "
            "$i = Get-ScheduledTaskInfo -TaskName $t.TaskName -ErrorAction SilentlyContinue; "
            "[pscustomobject]@{ state = [string]$t.State; last_run = [string]$i.LastRunTime; "
-           "last_result = if ($i) { [int]$i.LastTaskResult } else { -1 }; next_run = [string]$i.NextRunTime } | ConvertTo-Json -Compress"]
+           "last_result = if ($i) { [int64]$i.LastTaskResult } else { -1 }; next_run = [string]$i.NextRunTime } | ConvertTo-Json -Compress"]
     try:
         proc = _subprocess.run(cmd, capture_output=True, timeout=10, check=False)
     except (OSError, _subprocess.TimeoutExpired):
@@ -413,7 +413,13 @@ def project_scheduler_status() -> dict:
     if data is None:
         result = {"available": False}
     else:
-        code = int(data.get("last_result", -1))
+        # Hotfix 2026-08-27:LastTaskResult 为 UInt32(如触发重叠被拒 0x800710E0=
+        # 2147946720,超 Int32);PS 侧强转异常时该字段还可能序列化成非数值。
+        # 探针形状永远不许把 summary 打成 503——非数值按未知结果码(-1)降级。
+        try:
+            code = int(data.get("last_result", -1))
+        except (TypeError, ValueError):
+            code = -1
         result = {"available": True,
                   "running": str(data.get("state", "")).lower() == "running" or code in _RUNNING_CODES,
                   "last_run": str(data.get("last_run") or "") or None,
