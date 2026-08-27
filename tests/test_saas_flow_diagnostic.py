@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import threading
 import time
@@ -1393,3 +1394,283 @@ def test_r3_date_validation_rejects_impossible_calendar_dates(client, monkeypatc
     r = client.get("/dashboard/api/summary?date=2026-02-31")
     assert r.status_code == 400
     assert r.json()["detail"]["error_code"] == "BAD_BUSINESS_DATE"
+
+
+# ===========================================================================
+# Cardinality Closeout(路由单位 = 唯一 MY_COMMODITY_ID,JOIN 行 ≠ 商品数)
+#
+# 以下测试用 tmp :memory: SQLite 执行 DIAG_SQL_REGISTRY 内的真实 SQL
+# (不连任何真实数据库):schema 名模拟 MySQL 的库名前缀,参数 %(name)s 转换为
+# SQLite 命名参数,IN 元组展开为字面量(仅测试代码,值全部来自测试自身)。
+# ===========================================================================
+
+def _sql_literal(value) -> str:
+    if isinstance(value, int):
+        return str(value)
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+class SqliteRegistryCursor:
+    """只执行 registry 内 SQL;%(name)s → :name,IN 元组 → 字面量元组。"""
+
+    def __init__(self, connection) -> None:
+        self._connection = connection
+        self._rows: list = []
+
+    def execute(self, sql: str, params: dict | None = None) -> None:
+        normalized = " ".join(sql.split())
+        matches = [name for name, text in diag.DIAG_SQL_REGISTRY.items()
+                   if " ".join(text.split()) == normalized]
+        assert matches, "attempted to execute SQL outside the predefined registry"
+        converted = sql
+        bound = dict(params or {})
+        for key, value in list(bound.items()):
+            if isinstance(value, (tuple, list)):
+                literal = "(" + ", ".join(_sql_literal(v) for v in value) + ")"
+                converted = converted.replace(f"%({key})s", literal)
+                bound.pop(key)
+        converted = re.sub(r"%\((\w+)\)s", r":\1", converted)
+        self._rows = self._connection.execute(converted, bound).fetchall()
+
+    def fetchall(self) -> list:
+        return list(self._rows)
+
+    def close(self) -> None:
+        pass
+
+
+def _sqlite_backend(pool_rows, cl_rows, task_rows=(), central_rows=(), search_rows=()):
+    import sqlite3 as _sqlite3
+
+    con = _sqlite3.connect(":memory:")
+    con.execute("ATTACH ':memory:' AS saas_onecode_price")
+    con.execute("ATTACH ':memory:' AS saas_compare_price")
+    con.execute("ATTACH ':memory:' AS central_control_sub_demo")
+    con.executescript("""
+        CREATE TABLE saas_onecode_price.commodity_pool_188605 (
+            COMMODITY_POOL_ID TEXT, IS_MONITOR INTEGER, IS_SYNC_STANDARD INTEGER,
+            CREATED_TIME TEXT, MY_COMMODITY_ID TEXT);
+        CREATE TABLE saas_compare_price.commodity_list_table_188605 (
+            id INTEGER PRIMARY KEY, commodity_id TEXT, crawl_status INTEGER);
+        CREATE TABLE saas_compare_price.task_table_188605 (
+            reference_id INTEGER, task_id TEXT, task_status TEXT, table_name TEXT);
+        CREATE TABLE central_control_sub_demo.s_task_info (
+            batch_num TEXT, task_status TEXT, queue_status TEXT,
+            enqueue_time TEXT, end_time TEXT, is_valid TEXT);
+        CREATE TABLE saas_compare_price.search_table_188605 (
+            id INTEGER PRIMARY KEY, commodity_list_id INTEGER,
+            audit_result TEXT, model_audit_result TEXT, sync_state INTEGER);
+    """)
+    con.executemany(
+        "INSERT INTO saas_onecode_price.commodity_pool_188605 VALUES (?,?,?,?,?)", pool_rows)
+    con.executemany(
+        "INSERT INTO saas_compare_price.commodity_list_table_188605 VALUES (?,?,?)", cl_rows)
+    con.executemany(
+        "INSERT INTO saas_compare_price.task_table_188605 VALUES (?,?,?,?)",
+        [(*row, "188605") for row in task_rows])
+    con.executemany(
+        "INSERT INTO central_control_sub_demo.s_task_info VALUES (?,?,?,?,?,'1')",
+        central_rows)
+    con.executemany(
+        "INSERT INTO saas_compare_price.search_table_188605 VALUES (?,?,?,?,?)", search_rows)
+    con.commit()
+    return con
+
+
+class SqliteRegistryConnection:
+    def __init__(self, pool_rows, cl_rows, task_rows=(), central_rows=(), search_rows=()):
+        self._con = _sqlite_backend(pool_rows, cl_rows, task_rows, central_rows, search_rows)
+
+    def cursor(self) -> SqliteRegistryCursor:
+        return SqliteRegistryCursor(self._con)
+
+    def close(self) -> None:
+        self._con.close()
+
+
+def pool_row(cid, *, created="2026-08-27 08:00:00", pool="222", monitor=1, sync=0):
+    return (pool, monitor, sync, created, cid)
+
+
+def cl_row(cl_id, cid, status):
+    return (cl_id, cid, status)
+
+
+def make_sqlite_service(pool_rows, cl_rows, task_rows=(), central_rows=(), search_rows=(),
+                        **kwargs):
+    conn = SqliteRegistryConnection(pool_rows, cl_rows, task_rows, central_rows, search_rows)
+    return diag.SaasFlowDiagnosticService(
+        config=diag.DiagDBConfig(host="db.example.internal", port=3306,
+                                 user="ro", password="secret-not-committed"),
+        connection_factory=lambda cfg: conn,
+        monotonic=kwargs.pop("clock", None) or FakeClock(),
+        now_fn=kwargs.pop("now_fn", None),
+        **kwargs)
+
+
+# ---- Test A: duplicate pool rows 只计 1 个商品 ----
+
+def test_card_a_duplicate_pool_rows_count_one_commodity():
+    service = make_sqlite_service(
+        pool_rows=[pool_row("C1"), pool_row("C1", created="2026-08-27 09:00:00")],
+        cl_rows=[])
+    stages = service.get_diagnostic("2026-08-27")["stages"]
+    assert stages["routing_open_total"] == 1
+    assert stages["no_commodity_list"] == 1
+
+
+# ---- Test B: duplicate pool + 单条 crawl1 cl,branch 只分类一次 ----
+
+def test_card_b_duplicate_pool_single_crawl1_classifies_once():
+    service = make_sqlite_service(
+        pool_rows=[pool_row("C1"), pool_row("C1", created="2026-08-27 09:00:00")],
+        cl_rows=[cl_row(11, "C1", 1)],
+        task_rows=[(11, "SAAS-188605_701_1", "01")],
+        central_rows=[("188605_701", "00", "00", None, None)])
+    stages = service.get_diagnostic("2026-08-27")["stages"]
+    assert stages["routing_open_total"] == 1
+    assert stages["crawl_status_1"] == 1
+    assert stages["crawler_branch"]["CENTRAL_NOT_ENQUEUED"] == 1
+    assert sum(stages["crawler_branch"].values()) == stages["crawl_status_1"] == 1
+
+
+# ---- Test C: 同商品两条同状态 commodity_list → evidence incomplete ----
+
+def test_card_c_duplicate_commodity_list_same_status_is_incomplete():
+    service = make_sqlite_service(
+        pool_rows=[pool_row("C2")],
+        cl_rows=[cl_row(101, "C2", 2), cl_row(102, "C2", 2)])
+    stages = service.get_diagnostic("2026-08-27")["stages"]
+    assert stages["routing_open_total"] == 1
+    assert stages["routing_evidence_incomplete"] == 1
+    assert stages["crawl_status_2"] == 0
+    assert stages["downstream_branch"] is not None
+    assert sum(stages["downstream_branch"].values()) == 0
+
+
+# ---- Test D: 同商品冲突状态(1 条 crawl1 + 1 条 crawl2)→ incomplete ----
+
+def test_card_d_conflicting_commodity_list_statuses_is_incomplete():
+    service = make_sqlite_service(
+        pool_rows=[pool_row("C3")],
+        cl_rows=[cl_row(111, "C3", 1), cl_row(112, "C3", 2)])
+    stages = service.get_diagnostic("2026-08-27")["stages"]
+    assert stages["routing_evidence_incomplete"] == 1
+    assert stages["crawl_status_1"] == 0
+    assert stages["crawl_status_2"] == 0
+    assert sum(stages["crawler_branch"].values()) == 0
+    assert sum(stages["downstream_branch"].values()) == 0
+
+
+# ---- Test E: 无 commodity_list → NO_COMMODITY_LIST ----
+
+def test_card_e_no_commodity_list_bucket():
+    service = make_sqlite_service(pool_rows=[pool_row("C4")], cl_rows=[])
+    stages = service.get_diagnostic("2026-08-27")["stages"]
+    assert stages["routing_open_total"] == 1
+    assert stages["no_commodity_list"] == 1
+
+
+# ---- Test F: 混合 5 商品完整闭合 ----
+
+def test_card_f_full_routing_closure_five_commodities():
+    service = make_sqlite_service(
+        pool_rows=[pool_row("C1"), pool_row("C2"), pool_row("C3"),
+                   pool_row("C4"), pool_row("C5")],
+        cl_rows=[cl_row(21, "C2", 1), cl_row(31, "C3", 2),
+                 cl_row(41, "C4", 9), cl_row(51, "C5", 1), cl_row(52, "C5", 2)],
+        now_fn=lambda: BEFORE_CUTOFF)
+    stages = service.get_diagnostic("2026-08-27")["stages"]
+    assert stages["routing_open_total"] == 5
+    assert stages["no_commodity_list"] == 1
+    assert stages["crawl_status_1"] == 1
+    assert stages["crawl_status_2"] == 1
+    assert stages["crawl_status_other"] == 1
+    assert stages["routing_evidence_incomplete"] == 1
+    # 闭合不变量:no_cl + c1 + c2 + other + incomplete == routing_open_total
+    assert (stages["no_commodity_list"] + stages["crawl_status_1"] + stages["crawl_status_2"]
+            + stages["crawl_status_other"] + stages["routing_evidence_incomplete"]) == 5
+    # branch 粒度与 routing 商品粒度一致:ambiguous 商品不进入正常分支
+    assert sum(stages["crawler_branch"].values()) == stages["crawl_status_1"]
+    assert sum(stages["downstream_branch"].values()) == stages["crawl_status_2"]
+    assert stages["downstream_branch"]["CALLBACK_DONE_NO_SEARCH"] == 1
+
+
+# ---- Test G: duplicate pool 不重复 cl.id / branch 分类 ----
+
+def test_card_g_crawl1_duplicate_pool_protection():
+    service = make_sqlite_service(
+        pool_rows=[pool_row("C1"), pool_row("C1", created="2026-08-27 09:00:00")],
+        cl_rows=[cl_row(11, "C1", 1)])
+    stages = service.get_diagnostic("2026-08-27")["stages"]
+    assert stages["crawler_branch"]["TASK_NOT_CREATED"] == 1
+    assert sum(stages["crawler_branch"].values()) == 1
+
+
+# ---- Test H: ambiguous 商品不得进入正常 crawler/downstream cohort ----
+
+def test_card_h_ambiguous_commodity_excluded_from_normal_branches():
+    service = make_sqlite_service(
+        pool_rows=[pool_row("C3")],
+        cl_rows=[cl_row(111, "C3", 1), cl_row(112, "C3", 2)],
+        task_rows=[(111, "SAAS-188605_701_1", "01")],
+        central_rows=[("188605_701", "00", "00", None, None)])
+    stages = service.get_diagnostic("2026-08-27")["stages"]
+    assert stages["routing_evidence_incomplete"] == 1
+    assert sum(stages["crawler_branch"].values()) == 0
+    assert sum(stages["downstream_branch"].values()) == 0
+
+
+# ---- Test I: crawl2 查询失败 → 辅助字段 None,不冒充 0 ----
+
+def test_card_i_crawl2_query_failure_auxiliary_none():
+    def crawl2_raises(params):
+        raise RuntimeError("crawl2 timeout")
+
+    service, _, _ = make_service({
+        "pool_sync_standard_counts": [("0", 3)],
+        "open_crawl_status_counts": [(3, 0, 0, 3, 0)],
+        "crawl1_commodity_rows": [],
+        "crawl2_search_flags": crawl2_raises,
+    })
+    stages = service.get_diagnostic("2026-08-27")["stages"]
+    # route 数量仍用 EVIDENCE_INCOMPLETE 表达
+    assert stages["downstream_branch"]["EVIDENCE_INCOMPLETE"] == 3
+    # 查询失败 != confirmed zero
+    assert stages["reference_pending_approval_total"] is None
+    assert stages["callback_done_no_search_within_grace"] is None
+
+
+# ---- Test J: central 查询失败 → central_status_detail None ----
+
+def test_card_j_central_query_failure_detail_none():
+    def central_raises(params):
+        raise RuntimeError("central query failed")
+
+    service, _, _ = make_service({
+        "pool_sync_standard_counts": [("0", 1)],
+        "open_crawl_status_counts": [(1, 0, 1, 0, 0)],
+        "crawl1_commodity_rows": [(11, "C1")],
+        "crawl1_task_rows": [(11, "SAAS-188605_701_1", 1)],
+        "crawl1_central_rows": central_raises,
+        "crawl2_search_flags": [],
+    })
+    stages = service.get_diagnostic("2026-08-27")["stages"]
+    assert stages["crawler_branch"]["EVIDENCE_INCOMPLETE"] == 1
+    assert stages["central_status_detail"] is None
+
+
+# ---- Test K: central 查询成功且真实无行 → [] ----
+
+def test_card_k_central_success_zero_rows_detail_empty_list():
+    service, _, _ = make_service({
+        "pool_sync_standard_counts": [("0", 1)],
+        "open_crawl_status_counts": [(1, 0, 1, 0, 0)],
+        "crawl1_commodity_rows": [(11, "C1")],
+        "crawl1_task_rows": [(11, "SAAS-188605_701_1", 1)],
+        "crawl1_central_rows": [],
+        "crawl2_search_flags": [],
+    })
+    stages = service.get_diagnostic("2026-08-27")["stages"]
+    assert stages["crawler_branch"]["TASK_CREATED_NO_CENTRAL_RECORD"] == 1
+    assert stages["central_status_detail"] == []

@@ -113,38 +113,77 @@ DIAG_SQL_REGISTRY: dict[str, str] = {
           AND c.CREATED_TIME < %(day_end)s
         GROUP BY c.IS_SYNC_STANDARD
     """,
-    # R3:未收口路由层单语句闭合——pool LEFT JOIN commodity_list 在同一 SELECT 内
-    # 统计 routing_open_total / no_commodity_list(cl.id IS NULL)/ crawl_status 分布;
-    # NO_COMMODITY_LIST 不再由跨 SELECT residual 推导(见 _build_stages)。
+    # Cardinality Closeout:路由单位 = 唯一 MY_COMMODITY_ID。pool scope 先商品级
+    # DISTINCT,再 LEFT JOIN 商品级预聚合(commodity_list_rows / status1_rows /
+    # status2_rows),每个商品只落一个 bucket:
+    #   0 条 commodity_list → no_commodity_list
+    #   >1 条 commodity_list → routing_evidence_incomplete(无已验证 current-row
+    #     选择规则,fail-safe,禁止 MAX/MIN(id)/最新时间/优先状态等猜测)
+    #   1 条 → 按其 crawl_status 落 crawl1 / crawl2 / other
+    # invariant:no_cl + c1 + c2 + other + incomplete == routing_open_total。
     "open_crawl_status_counts": """
         SELECT
             COUNT(*) AS routing_open_total,
-            SUM(cl.id IS NULL) AS no_commodity_list,
-            SUM(cl.id IS NOT NULL AND cl.crawl_status = 1) AS crawl_status_1,
-            SUM(cl.id IS NOT NULL AND cl.crawl_status = 2) AS crawl_status_2,
-            SUM(cl.id IS NOT NULL AND
-                (cl.crawl_status IS NULL OR cl.crawl_status NOT IN (1, 2))) AS crawl_status_other
-        FROM saas_onecode_price.commodity_pool_188605 c
-        LEFT JOIN saas_compare_price.commodity_list_table_188605 cl
-          ON cl.commodity_id = c.MY_COMMODITY_ID
-        WHERE c.COMMODITY_POOL_ID = %(pool_id)s
-          AND c.IS_MONITOR = 1
-          AND c.IS_SYNC_STANDARD = 0
-          AND c.CREATED_TIME >= %(day_start)s
-          AND c.CREATED_TIME < %(day_end)s
+            SUM(a.commodity_id IS NULL) AS no_commodity_list,
+            SUM(a.commodity_id IS NOT NULL AND a.commodity_list_rows = 1
+                AND a.status1_rows = 1) AS crawl_status_1,
+            SUM(a.commodity_id IS NOT NULL AND a.commodity_list_rows = 1
+                AND a.status2_rows = 1) AS crawl_status_2,
+            SUM(a.commodity_id IS NOT NULL AND a.commodity_list_rows = 1
+                AND a.status1_rows = 0 AND a.status2_rows = 0) AS crawl_status_other,
+            SUM(a.commodity_id IS NOT NULL AND a.commodity_list_rows > 1)
+                AS routing_evidence_incomplete
+        FROM (
+            SELECT DISTINCT c.MY_COMMODITY_ID AS MY_COMMODITY_ID
+            FROM saas_onecode_price.commodity_pool_188605 c
+            WHERE c.COMMODITY_POOL_ID = %(pool_id)s
+              AND c.IS_MONITOR = 1
+              AND c.IS_SYNC_STANDARD = 0
+              AND c.CREATED_TIME >= %(day_start)s
+              AND c.CREATED_TIME < %(day_end)s
+        ) p
+        LEFT JOIN (
+            SELECT cl.commodity_id AS commodity_id,
+                   COUNT(*) AS commodity_list_rows,
+                   COUNT(CASE WHEN cl.crawl_status = 1 THEN 1 END) AS status1_rows,
+                   COUNT(CASE WHEN cl.crawl_status = 2 THEN 1 END) AS status2_rows
+            FROM saas_compare_price.commodity_list_table_188605 cl
+            JOIN (
+                SELECT DISTINCT c2.MY_COMMODITY_ID AS MY_COMMODITY_ID
+                FROM saas_onecode_price.commodity_pool_188605 c2
+                WHERE c2.COMMODITY_POOL_ID = %(pool_id)s
+                  AND c2.IS_MONITOR = 1
+                  AND c2.IS_SYNC_STANDARD = 0
+                  AND c2.CREATED_TIME >= %(day_start)s
+                  AND c2.CREATED_TIME < %(day_end)s
+            ) sp ON sp.MY_COMMODITY_ID = cl.commodity_id
+            GROUP BY cl.commodity_id
+        ) a ON a.commodity_id = p.MY_COMMODITY_ID
     """,
-    # crawl_status=1 小集合的目标商品(有界:当日范围 + LIMIT)
+    # crawl_status=1 小集合的目标商品(有界:当日范围 + LIMIT)。
+    # Cardinality:EXISTS 定 pool scope(duplicate pool 行不再相乘);NOT EXISTS
+    # 排除多条 commodity_list 的 ambiguous 商品(routing 层已计 incomplete,
+    # 不得再进入正常 crawler branch)。每个 commodity_list_id 最多返回一次。
     "crawl1_commodity_rows": """
         SELECT cl.id AS commodity_list_id, cl.commodity_id AS commodity_id
         FROM saas_compare_price.commodity_list_table_188605 cl
-        JOIN saas_onecode_price.commodity_pool_188605 c
-          ON c.MY_COMMODITY_ID = cl.commodity_id
-        WHERE c.COMMODITY_POOL_ID = %(pool_id)s
-          AND c.IS_MONITOR = 1
-          AND c.IS_SYNC_STANDARD = 0
-          AND c.CREATED_TIME >= %(day_start)s
-          AND c.CREATED_TIME < %(day_end)s
-          AND cl.crawl_status = 1
+        WHERE cl.crawl_status = 1
+          AND EXISTS (
+              SELECT 1
+              FROM saas_onecode_price.commodity_pool_188605 c
+              WHERE c.COMMODITY_POOL_ID = %(pool_id)s
+                AND c.IS_MONITOR = 1
+                AND c.IS_SYNC_STANDARD = 0
+                AND c.CREATED_TIME >= %(day_start)s
+                AND c.CREATED_TIME < %(day_end)s
+                AND c.MY_COMMODITY_ID = cl.commodity_id
+          )
+          AND NOT EXISTS (
+              SELECT 1
+              FROM saas_compare_price.commodity_list_table_188605 cl2
+              WHERE cl2.commodity_id = cl.commodity_id
+                AND cl2.id <> cl.id
+          )
         LIMIT 2001
     """,
     # 仅对 crawl1 小集合精确查 task(绝不与 search_table 同句 JOIN)
@@ -164,11 +203,14 @@ DIAG_SQL_REGISTRY: dict[str, str] = {
         WHERE s.is_valid = '1'
           AND s.batch_num IN %(batch_nums)s
     """,
-    # crawl_status=2 商品的 search/model/审批 flag 聚合(search_table 只聚合、不与 task JOIN)
+    # crawl_status=2 商品的 search/model/审批 flag 聚合(search_table 只聚合、不与 task JOIN)。
+    # Cardinality:JOIN 商品级去重后的 pool 聚合(每商品一行,duplicate pool 行不再
+    # 放大 search_rows);NOT EXISTS 排除多条 commodity_list 的 ambiguous 商品,
+    # 与 routing 层 incomplete bucket 保持 branch closure 一致。
     "crawl2_search_flags": """
         SELECT cl.id AS commodity_list_id,
                COUNT(s.id) AS search_rows,
-               MIN(c.CREATED_TIME) AS pool_created_at,
+               MIN(pc.pool_created_at) AS pool_created_at,
                MAX(s.audit_result IS NULL OR s.audit_result IN ('-1', '-2')) AS model_pending,
                MAX(s.audit_result = '2' AND s.model_audit_result = '1') AS has_internet_same,
                MAX(s.audit_result = '2' AND s.model_audit_result = '1' AND s.sync_state = 1)
@@ -182,16 +224,26 @@ DIAG_SQL_REGISTRY: dict[str, str] = {
                    AS reference_pending_approval,
                MAX(s.audit_result IN ('2', '3', '0')) AS has_model_verdict
         FROM saas_compare_price.commodity_list_table_188605 cl
-        JOIN saas_onecode_price.commodity_pool_188605 c
-          ON c.MY_COMMODITY_ID = cl.commodity_id
+        JOIN (
+            SELECT c.MY_COMMODITY_ID AS commodity_id,
+                   MIN(c.CREATED_TIME) AS pool_created_at
+            FROM saas_onecode_price.commodity_pool_188605 c
+            WHERE c.COMMODITY_POOL_ID = %(pool_id)s
+              AND c.IS_MONITOR = 1
+              AND c.IS_SYNC_STANDARD = 0
+              AND c.CREATED_TIME >= %(day_start)s
+              AND c.CREATED_TIME < %(day_end)s
+            GROUP BY c.MY_COMMODITY_ID
+        ) pc ON pc.commodity_id = cl.commodity_id
         LEFT JOIN saas_compare_price.search_table_188605 s
           ON s.commodity_list_id = cl.id
-        WHERE c.COMMODITY_POOL_ID = %(pool_id)s
-          AND c.IS_MONITOR = 1
-          AND c.IS_SYNC_STANDARD = 0
-          AND c.CREATED_TIME >= %(day_start)s
-          AND c.CREATED_TIME < %(day_end)s
-          AND cl.crawl_status = 2
+        WHERE cl.crawl_status = 2
+          AND NOT EXISTS (
+              SELECT 1
+              FROM saas_compare_price.commodity_list_table_188605 cl2
+              WHERE cl2.commodity_id = cl.commodity_id
+                AND cl2.id <> cl.id
+          )
         GROUP BY cl.id
         LIMIT 2001
     """,
@@ -200,7 +252,8 @@ DIAG_SQL_REGISTRY: dict[str, str] = {
 QUERY_COLUMNS: dict[str, tuple[str, ...]] = {
     "pool_sync_standard_counts": ("is_sync_standard", "commodity_count"),
     "open_crawl_status_counts": ("routing_open_total", "no_commodity_list",
-                                 "crawl_status_1", "crawl_status_2", "crawl_status_other"),
+                                 "crawl_status_1", "crawl_status_2", "crawl_status_other",
+                                 "routing_evidence_incomplete"),
     "crawl1_commodity_rows": ("commodity_list_id", "commodity_id"),
     "crawl1_task_rows": ("commodity_list_id", "task_id", "task_status"),
     "crawl1_central_rows": ("batch_num", "task_status", "queue_status", "enqueue_time", "end_time"),
@@ -722,6 +775,7 @@ class SaasFlowDiagnosticService:
         if crawl_failed:
             routing_open_total = crawl1_total = crawl2_total = crawl_other = None
             no_commodity_list: int | None = None
+            routing_incomplete: int | None = None
         else:
             crawl_row = crawl_rows[0] if crawl_rows else {}
             routing_open_total = int(crawl_row.get("routing_open_total") or 0)
@@ -729,6 +783,7 @@ class SaasFlowDiagnosticService:
             crawl1_total = int(crawl_row.get("crawl_status_1") or 0)
             crawl2_total = int(crawl_row.get("crawl_status_2") or 0)
             crawl_other = int(crawl_row.get("crawl_status_other") or 0)
+            routing_incomplete = int(crawl_row.get("routing_evidence_incomplete") or 0)
 
         # Review P1-1:两个分支各自独立计数,同名 EVIDENCE_INCOMPLETE 不共享。
         crawler_counts: dict[str, int] | None = _empty_counts(CRAWLER_BRANCH_CLASSES)
@@ -750,6 +805,8 @@ class SaasFlowDiagnosticService:
             crawl1_rows = run("crawl1_commodity_rows", {})
             if "crawl1_commodity_rows" in degraded:
                 crawler_counts["EVIDENCE_INCOMPLETE"] += crawl1_total or 0
+                # P2:查询失败 ≠ 真实无分控行,central 明细证据不可用
+                central_detail = None
             elif len(crawl1_rows) > (crawl1_total or 0):
                 crawler_counts = None
                 central_detail = None  # R3 P2:drift 分支的派生证据不可用,不冒充空列表
@@ -774,6 +831,10 @@ class SaasFlowDiagnosticService:
                 if batches:
                     central_rows = run("crawl1_central_rows", {"batch_nums": tuple(sorted(batches))})
                     central_failed = "crawl1_central_rows" in degraded
+                if task_failed or central_failed:
+                    # P2:task/central 查询失败 → central 证据链不可用,不冒充空列表;
+                    # 只有查询成功且真实无行才允许 [](见 detail 组装)。
+                    central_detail = None
                 central_by_batch: dict[str, list[dict[str, Any]]] = {}
                 for row in central_rows:
                     central_by_batch.setdefault(_as_str(row.get("batch_num")), []).append(row)
@@ -814,6 +875,9 @@ class SaasFlowDiagnosticService:
             crawl2_rows = run("crawl2_search_flags", {})
             if "crawl2_search_flags" in degraded:
                 downstream_counts["EVIDENCE_INCOMPLETE"] += crawl2_total or 0
+                # P2:查询失败 ≠ confirmed zero,派生辅助计数不可用,不得保留 0
+                reference_pending_total = None
+                callback_no_search_within_grace = None
             elif len(crawl2_rows) > (crawl2_total or 0):
                 downstream_counts = None
                 # R3 P2:drift 分支的派生计数不可用,不冒充 0
@@ -868,6 +932,9 @@ class SaasFlowDiagnosticService:
             "crawl_status_1": crawl1_total,
             "crawl_status_2": crawl2_total,
             "crawl_status_other": crawl_other,
+            # Cardinality:>1 条 commodity_list 的商品(无已验证 current-row 规则);
+            # 只是 routing 层证据计数,不是业务故障 stage,不参与 dominant
+            "routing_evidence_incomplete": routing_incomplete,
             "grace_seconds": self._grace_seconds,
             "crawler_branch": crawler_counts,
             "downstream_branch": downstream_counts,
