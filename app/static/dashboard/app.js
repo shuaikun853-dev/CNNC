@@ -309,6 +309,20 @@
     return SF_GROWTH_LABELS[g.state] || g.state || "—";
   }
 
+  // R3 P2:partial 顶部 notice 三态——查询失败 / 取证漂移 / 两者都有;
+  // 纯函数 seam(tests/js 直接驱动),绝不出现"部分查询失败:;"空列表文案。
+  function sfPartialNotice(degradedQueries, snapshotDrift) {
+    const degraded = (degradedQueries || []).length > 0;
+    const drift = (snapshotDrift || []).length > 0;
+    if (degraded && drift) {
+      return "部分查询失败,同时检测到查询期间数据变化;相关结果已降级,约 60 秒后重新取证。";
+    }
+    if (degraded) {
+      return "部分诊断查询失败,相关证据已降级,不冒充业务 0:" + (degradedQueries || []).join(", ") + "。";
+    }
+    return "查询期间生产数据发生变化,本轮部分诊断按取证时点漂移处理;约 60 秒后自动重新取证。这不是业务异常。";
+  }
+
   function renderSaasFlow(p) {
     const g = p.growth || {};
     const chips = [
@@ -319,6 +333,7 @@
     ];
     $("#sf-chips").textContent = chips.join(" · ");
     const notice = $("#sf-notice");
+    const driftList = (p.stages && p.stages.snapshot_drift) || [];
     if (p.status === "unconfigured") {
       notice.textContent = "数据库诊断未配置(需本机 CNNC_DIAG_DB_* 只读账号);以下仅显示本地权威观察的增长判断。";
     } else if (p.status === "unavailable") {
@@ -326,7 +341,7 @@
     } else if (p.status === "rate_limited" || p.rate_limited) {
       notice.textContent = "刷新过于频繁,已按限流返回上次缓存结果(强制刷新间隔 ≥30 秒)。";
     } else if (p.status === "partial") {
-      notice.textContent = "部分查询失败已降级:" + (p.degraded_queries || []).join(", ") + ";失败项按证据不足处理,不冒充业务 0。";
+      notice.textContent = sfPartialNotice(p.degraded_queries, driftList);
     } else {
       notice.textContent = "";
     }
@@ -446,7 +461,7 @@
     sfPoller.run();  // SaaS Flow 独立启动,不等 summary
   }
   const api = { start, stop: () => { ctl.stop(); sfPoller.stop(); },
-    createPollController, createSaasFlowPoller, safeProgressText };
+    createPollController, createSaasFlowPoller, safeProgressText, sfPartialNotice };
   if (typeof window !== "undefined") { window.Dashboards = api; }
   if (typeof module !== "undefined" && module.exports) { module.exports = api; }
   if (typeof document !== "undefined") { document.addEventListener("DOMContentLoaded", start); }

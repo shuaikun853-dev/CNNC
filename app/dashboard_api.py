@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import re
+from datetime import date
 from pathlib import Path
 
 from fastapi import APIRouter, HTTPException, Query, Request, Response
@@ -18,6 +19,17 @@ _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 _SAAS_FLOW_ALLOWED_PARAMS = frozenset({"date", "refresh"})
 
 
+def _valid_business_date(value: str) -> bool:
+    """格式 + 真实日历日期(2026-02-31/2026-13-01 等一律 400,不得落入 503)。"""
+    if not _DATE_RE.match(value):
+        return False
+    try:
+        date.fromisoformat(value)
+    except ValueError:
+        return False
+    return True
+
+
 def _today() -> str:
     from app.services.incremental_audit_runtime import business_date_in_shanghai
     return business_date_in_shanghai()
@@ -31,9 +43,9 @@ def dashboard_index() -> FileResponse:
 @router.get("/api/summary")
 def dashboard_summary(request: Request, date: str = Query(default=None)) -> Response:
     business_date = date or _today()
-    if not _DATE_RE.match(business_date):
+    if not _valid_business_date(business_date):
         raise HTTPException(status_code=400, detail={
-            "error_code": "BAD_BUSINESS_DATE", "message": "business_date 必须为 YYYY-MM-DD"})
+            "error_code": "BAD_BUSINESS_DATE", "message": "business_date 必须为合法的 YYYY-MM-DD 日历日期"})
     try:
         payload = build_dashboard_summary(business_date=business_date)
     except Exception as exc:  # 只读投影失败统一降级,不暴露堆栈
@@ -67,9 +79,9 @@ def dashboard_saas_flow(
         raise HTTPException(status_code=400, detail={
             "error_code": "BAD_REFRESH_PARAM", "message": "refresh 仅接受 1"})
     business_date = date or _today()
-    if not _DATE_RE.match(business_date):
+    if not _valid_business_date(business_date):
         raise HTTPException(status_code=400, detail={
-            "error_code": "BAD_BUSINESS_DATE", "message": "business_date 必须为 YYYY-MM-DD"})
+            "error_code": "BAD_BUSINESS_DATE", "message": "business_date 必须为合法的 YYYY-MM-DD 日历日期"})
     try:
         payload = get_saas_flow_diagnostic(business_date, force_refresh=refresh == "1")
     except Exception as exc:  # 诊断失败只降级本面板,不暴露堆栈/凭据

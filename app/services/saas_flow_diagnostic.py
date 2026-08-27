@@ -113,18 +113,25 @@ DIAG_SQL_REGISTRY: dict[str, str] = {
           AND c.CREATED_TIME < %(day_end)s
         GROUP BY c.IS_SYNC_STANDARD
     """,
-    # 未收口商品的 crawl_status 分布(crawl_status=1/2 路由的第一层)
+    # R3:未收口路由层单语句闭合——pool LEFT JOIN commodity_list 在同一 SELECT 内
+    # 统计 routing_open_total / no_commodity_list(cl.id IS NULL)/ crawl_status 分布;
+    # NO_COMMODITY_LIST 不再由跨 SELECT residual 推导(见 _build_stages)。
     "open_crawl_status_counts": """
-        SELECT cl.crawl_status AS crawl_status, COUNT(*) AS commodity_count
-        FROM saas_compare_price.commodity_list_table_188605 cl
-        JOIN saas_onecode_price.commodity_pool_188605 c
-          ON c.MY_COMMODITY_ID = cl.commodity_id
+        SELECT
+            COUNT(*) AS routing_open_total,
+            SUM(cl.id IS NULL) AS no_commodity_list,
+            SUM(cl.id IS NOT NULL AND cl.crawl_status = 1) AS crawl_status_1,
+            SUM(cl.id IS NOT NULL AND cl.crawl_status = 2) AS crawl_status_2,
+            SUM(cl.id IS NOT NULL AND
+                (cl.crawl_status IS NULL OR cl.crawl_status NOT IN (1, 2))) AS crawl_status_other
+        FROM saas_onecode_price.commodity_pool_188605 c
+        LEFT JOIN saas_compare_price.commodity_list_table_188605 cl
+          ON cl.commodity_id = c.MY_COMMODITY_ID
         WHERE c.COMMODITY_POOL_ID = %(pool_id)s
           AND c.IS_MONITOR = 1
           AND c.IS_SYNC_STANDARD = 0
           AND c.CREATED_TIME >= %(day_start)s
           AND c.CREATED_TIME < %(day_end)s
-        GROUP BY cl.crawl_status
     """,
     # crawl_status=1 小集合的目标商品(有界:当日范围 + LIMIT)
     "crawl1_commodity_rows": """
@@ -192,7 +199,8 @@ DIAG_SQL_REGISTRY: dict[str, str] = {
 
 QUERY_COLUMNS: dict[str, tuple[str, ...]] = {
     "pool_sync_standard_counts": ("is_sync_standard", "commodity_count"),
-    "open_crawl_status_counts": ("crawl_status", "commodity_count"),
+    "open_crawl_status_counts": ("routing_open_total", "no_commodity_list",
+                                 "crawl_status_1", "crawl_status_2", "crawl_status_other"),
     "crawl1_commodity_rows": ("commodity_list_id", "commodity_id"),
     "crawl1_task_rows": ("commodity_list_id", "task_id", "task_status"),
     "crawl1_central_rows": ("batch_num", "task_status", "queue_status", "enqueue_time", "end_time"),
@@ -709,26 +717,33 @@ class SaasFlowDiagnosticService:
             not_closed = sync_counts.get("0", 0)
             closed_standard = sync_counts.get("1", 0)
             closed_no_same = sync_counts.get("2", 0)
+        # R3:路由层计数与 no_commodity_list 全部来自 routing query 同一语句,
+        # 不再用 pool 的 not_closed 跨 SELECT 推 residual。
         if crawl_failed:
-            crawl1_total = crawl2_total = crawl_other = None
+            routing_open_total = crawl1_total = crawl2_total = crawl_other = None
+            no_commodity_list: int | None = None
         else:
-            crawl_counts = {_as_str(row.get("crawl_status")): int(row.get("commodity_count") or 0)
-                            for row in crawl_rows}
-            crawl1_total = crawl_counts.get("1", 0)
-            crawl2_total = crawl_counts.get("2", 0)
-            crawl_other = sum(count for status, count in crawl_counts.items()
-                              if status not in ("1", "2"))
+            crawl_row = crawl_rows[0] if crawl_rows else {}
+            routing_open_total = int(crawl_row.get("routing_open_total") or 0)
+            no_commodity_list = int(crawl_row.get("no_commodity_list") or 0)
+            crawl1_total = int(crawl_row.get("crawl_status_1") or 0)
+            crawl2_total = int(crawl_row.get("crawl_status_2") or 0)
+            crawl_other = int(crawl_row.get("crawl_status_other") or 0)
 
         # Review P1-1:两个分支各自独立计数,同名 EVIDENCE_INCOMPLETE 不共享。
         crawler_counts: dict[str, int] | None = _empty_counts(CRAWLER_BRANCH_CLASSES)
         downstream_counts: dict[str, int] | None = _empty_counts(DOWNSTREAM_BRANCH_CLASSES)
-        central_detail: dict[tuple[str, str, str], int] = {}
+        central_detail: dict[tuple[str, str, str], int] | None = {}
         reference_pending_total: int | None = 0
         callback_no_search_within_grace: int | None = 0
         now_sh = self._now_fn().astimezone(SHANGHAI).replace(tzinfo=None)
         # Review R2 P1-1:多条 SELECT 不是同一快照;detail 行数超过路由快照 = 反向漂移,
         # 该分支本轮不发布确定性分类(不截断多出商品、不覆盖 route total)。
+        # Review R3 P1:pool 与 routing 两个 SELECT 之间的计数差同样只标记 drift,
+        # 绝不解释成 NO_COMMODITY_LIST / 数据丢失 / 业务异常。
         snapshot_drift: list[str] = []
+        if not pool_failed and not crawl_failed and not_closed != routing_open_total:
+            snapshot_drift.append("pool_vs_routing")
 
         if not crawl_failed:
             # ---- Branch A: crawl_status = 1 → task → exact batch → 分控 ----
@@ -737,6 +752,7 @@ class SaasFlowDiagnosticService:
                 crawler_counts["EVIDENCE_INCOMPLETE"] += crawl1_total or 0
             elif len(crawl1_rows) > (crawl1_total or 0):
                 crawler_counts = None
+                central_detail = None  # R3 P2:drift 分支的派生证据不可用,不冒充空列表
                 snapshot_drift.append("crawler_branch")
             else:
                 ids = [int(row["commodity_list_id"]) for row in crawl1_rows[:MAX_CRAWL1_COMMODITIES]]
@@ -800,6 +816,9 @@ class SaasFlowDiagnosticService:
                 downstream_counts["EVIDENCE_INCOMPLETE"] += crawl2_total or 0
             elif len(crawl2_rows) > (crawl2_total or 0):
                 downstream_counts = None
+                # R3 P2:drift 分支的派生计数不可用,不冒充 0
+                reference_pending_total = None
+                callback_no_search_within_grace = None
                 snapshot_drift.append("downstream_branch")
             else:
                 classified = 0
@@ -819,20 +838,19 @@ class SaasFlowDiagnosticService:
             downstream_counts = None
             reference_pending_total = None
             callback_no_search_within_grace = None
+            central_detail = None
 
-        # no_commodity_list 只在 pool 与 crawl 两层计数都可用时才可闭合
-        no_commodity_list: int | None = None
-        if not pool_failed and not crawl_failed:
-            no_commodity_list = max(0, not_closed - (crawl1_total + crawl2_total + crawl_other))
         dominant = None
         if crawler_counts is not None and downstream_counts is not None:
             dominant = _dominant_stage(crawler_counts, downstream_counts, no_commodity_list)
-        detail = [
-            {"batch_num": batch, "task_status": task_status, "queue_status": queue_status,
-             "count": number}
-            for (batch, task_status, queue_status), number in
-            sorted(central_detail.items(), key=lambda item: (-item[1], item[0]))[:MAX_CENTRAL_DETAIL_ROWS]
-        ]
+        detail = None
+        if central_detail is not None:
+            detail = [
+                {"batch_num": batch, "task_status": task_status, "queue_status": queue_status,
+                 "count": number}
+                for (batch, task_status, queue_status), number in
+                sorted(central_detail.items(), key=lambda item: (-item[1], item[0]))[:MAX_CENTRAL_DETAIL_ROWS]
+            ]
         stages = {
             # Review P1-6:SQL 池计数不得冒充权威客户计数(权威计数在 growth.customer_count)
             "pool_counts_available": not pool_failed,
@@ -844,6 +862,8 @@ class SaasFlowDiagnosticService:
             "not_closed": not_closed,
             "closed_standard": closed_standard,
             "closed_no_same": closed_no_same,
+            # R3:routing 层权威基数(routing query 单语句自洽,不依赖 pool 时点)
+            "routing_open_total": routing_open_total,
             "no_commodity_list": no_commodity_list,
             "crawl_status_1": crawl1_total,
             "crawl_status_2": crawl2_total,
