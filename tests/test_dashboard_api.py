@@ -218,3 +218,27 @@ def test_rf_p2_2_poll_pause_behavior_via_node():
                           timeout=60, cwd=str(ROOT))
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert "ALL PASS" in proc.stdout
+
+
+# ---- Hotfix review fix(2026-08-27):Scheduler probe 故障隔离的 API 契约 ----
+
+def test_rf_probe_fault_containment_api_stays_200(client, monkeypatch):
+    """Scheduler probe 无论返回什么坏形状/坏值,只能降级 scheduler 块,
+    /dashboard/api/summary 必须保持 200。测试边界:走真实 build_dashboard_summary
+    (本 worktree 无业务日 runtime → MISSING 真实分支),仅 monkeypatch 探针本身,
+    每轮重置 30 秒缓存;不 mock build_dashboard_summary 整体。"""
+    import app.services.dashboard_projection as dp
+    malformed = [None, [], ["unexpected"], "unexpected", 123, True,
+                 {"last_result": {}}, {"last_result": float("inf")},
+                 {"state": "Running", "last_result": 2147946720,
+                  "last_run": "08/27/2026 18:25:25", "next_run": "08/27/2026 18:30:30"}]
+    for bad in malformed:
+        dp._scheduler_cache.update({"at": 0.0, "value": None})
+        monkeypatch.setattr(dp, "_run_scheduler_probe", lambda bad=bad: bad)
+        r = client.get("/dashboard/api/summary")
+        assert r.status_code == 200, (bad, r.status_code)
+        body = r.json()
+        assert body["overall"]["word"]            # summary 主体正常产出
+        assert "scheduler" in body                # scheduler 块结构仍在
+        sched = body["scheduler"]
+        assert isinstance(sched.get("available"), bool)
