@@ -293,11 +293,13 @@
     EVIDENCE_INCOMPLETE: "证据不足",
   };
   // Review P2-2:区分"评估过=正常"与"证据不足/非评估时段",不把后者显示成"正常"
+  // Review R2 P2-1:本地观察读取失败另有专用文案,不冒充"暂无观察"
   const SF_GROWTH_LABELS = { NORMAL: "正常", LAG_WATCH: "增长落后观察", LAG_PERSISTING: "持续增长落后" };
   const SF_REASON_LABELS = {
     NO_OBSERVATIONS: "暂无权威观察",
     INSUFFICIENT_OBSERVATIONS: "观察次数不足(需至少两次)",
     AFTER_CUTOFF: "正常(18:00 后不评估)",
+    OBSERVATION_READ_FAILED: "权威观察读取失败",
   };
 
   function sfGrowthText(g) {
@@ -330,7 +332,9 @@
     }
     const growthBox = $("#sf-growth");
     const reason = g.evaluation_reason || "";
-    if (reason === "NO_OBSERVATIONS") {
+    if (reason === "OBSERVATION_READ_FAILED") {
+      growthBox.textContent = "权威观察读取失败,增长判断暂不可用(本地状态文件异常;约 60 秒后自动重试)。";
+    } else if (reason === "NO_OBSERVATIONS") {
       growthBox.textContent = "今日暂无权威观察(增量审计发现尚未运行),增长判断待首次快照后可用。";
     } else if (reason === "INSUFFICIENT_OBSERVATIONS") {
       growthBox.textContent = "今日权威观察仅 " + (g.observation_count ?? 0) +
@@ -365,6 +369,8 @@
     if (stages.crawl_status_available === false) {
       return '<div class="sf-head">分层数据不可用(crawl_status 核心查询失败,不冒充业务 0)。</div>';
     }
+    const drift = stages.snapshot_drift || [];
+    const driftNote = "查询期间数据变化,本轮该分支分类暂不发布(约 60 秒后自动重新取证;这是取证时点问题,不是业务异常)";
     const crawler = stages.crawler_branch || {}, down = stages.downstream_branch || {};
     const crawlerKeys = ["TASK_NOT_CREATED", "TASK_CREATED_NO_CENTRAL_RECORD", "CENTRAL_NOT_ENQUEUED",
       "CENTRAL_ENQUEUED_WAITING", "CRAWLER_EXECUTING", "CRAWLER_FAILED", "CALLBACK_LAG"];
@@ -381,14 +387,19 @@
       " · 未最终收口:" +
       (stages.not_closed == null ? "不可用" : Number(stages.not_closed)) +
       (stages.no_commodity_list ? " · 未进入采集列表:" + Number(stages.no_commodity_list) : "");
+    const crawlerHtml = stages.crawler_branch === null
+      ? '<li class="bf">├─ 爬虫未回调:' + (drift.includes("crawler_branch") ? esc(driftNote) : "本轮不可用") + "</li>"
+      : '<li class="bf">├─ 爬虫未回调:' + Number(stages.crawl_status_1 || 0) + "<ul>" +
+        crawlerKeys.map((k) => sfStageLine(SF_STAGE_LABELS[k], crawler[k])).join("") +
+        sfStageLine("证据不足", crawler.EVIDENCE_INCOMPLETE) + "</ul></li>";
+    const downHtml = stages.downstream_branch === null
+      ? '<li class="bf">└─ 爬虫已回调:' + (drift.includes("downstream_branch") ? esc(driftNote) : "本轮不可用") + "</li>"
+      : '<li class="bf">└─ 爬虫已回调:' + Number(stages.crawl_status_2 || 0) + "<ul>" +
+        downKeys.map((k) => sfStageLine(SF_STAGE_LABELS[k], down[k],
+          k === "CALLBACK_DONE_NO_SEARCH" ? graceNote : "")).join("") +
+        sfStageLine("证据不足", down.EVIDENCE_INCOMPLETE) + "</ul></li>";
     return '<div class="sf-head">' + esc(head) + "</div>" +
-      '<ul class="sf-branch"><li class="bf">├─ 爬虫未回调:' + Number(stages.crawl_status_1 || 0) + "<ul>" +
-      crawlerKeys.map((k) => sfStageLine(SF_STAGE_LABELS[k], crawler[k])).join("") +
-      sfStageLine("证据不足", crawler.EVIDENCE_INCOMPLETE) + "</ul></li>" +
-      '<li class="bf">└─ 爬虫已回调:' + Number(stages.crawl_status_2 || 0) + "<ul>" +
-      downKeys.map((k) => sfStageLine(SF_STAGE_LABELS[k], down[k],
-        k === "CALLBACK_DONE_NO_SEARCH" ? graceNote : "")).join("") +
-      sfStageLine("证据不足", down.EVIDENCE_INCOMPLETE) + "</ul></li></ul>";
+      '<ul class="sf-branch">' + crawlerHtml + downHtml + "</ul>";
   }
 
   function sfEvidenceHtml(p) {

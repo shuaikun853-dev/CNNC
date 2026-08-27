@@ -336,8 +336,8 @@ FULL_CANNED = {
     "crawl1_central_rows": [("188605_701", "00", "00", None, None)],
     # 列:commodity_list_id, search_rows, pool_created_at, model_pending,
     #     has_internet_same, internet_pending_approval, same_approved,
-    #     has_reference_same, has_internet_candidate, reference_pending_approval,
-    #     has_model_verdict, same_rejected
+    #     approval_non_same_exists, has_reference_same, has_internet_candidate,
+    #     reference_pending_approval, has_model_verdict
     "crawl2_search_flags": [
         (21, 0, "2026-08-27 09:00:00", 0, 0, 0, 0, 0, 0, 0, 0, 0),
         (22, 5, "2026-08-27 08:00:00", 0, 1, 1, 0, 0, 0, 0, 0, 0),
@@ -449,7 +449,8 @@ def flags(**kw):
     base = {"search_rows": 5, "pool_created_at": "2026-08-27 08:00:00",
             "model_pending": 0, "has_internet_same": 0, "internet_pending_approval": 0,
             "same_approved": 0, "has_reference_same": 0, "has_internet_candidate": 0,
-            "reference_pending_approval": 0, "has_model_verdict": 0, "same_rejected": 0}
+            "reference_pending_approval": 0, "has_model_verdict": 0,
+            "approval_non_same_exists": 0}
     base.update(kw)
     return base
 
@@ -590,10 +591,12 @@ def test_growth_series_reader_uses_real_store_schema(tmp_path):
         con.commit()
     finally:
         con.close()
-    series = diag.read_observation_series(tmp_path / "state.sqlite3", "2026-08-27")
+    result = diag.read_observation_series(tmp_path / "state.sqlite3", "2026-08-27")
+    series = result["observations"]
+    assert result["read_error"] is None and result["available"] is True
     assert [(o["customer_count"], o["saas_count"]) for o in series] == [(100, 50), (110, 50), (120, 50)]
-    result = diag.evaluate_growth(series, business_date="2026-08-27", now=BEFORE_CUTOFF)
-    assert result["state"] == "LAG_PERSISTING"
+    growth = diag.evaluate_growth(series, business_date="2026-08-27", now=BEFORE_CUTOFF)
+    assert growth["state"] == "LAG_PERSISTING"
 
 
 def test_growth_series_reader_skips_rows_without_counts(tmp_path):
@@ -616,7 +619,8 @@ def test_growth_series_reader_skips_rows_without_counts(tmp_path):
         con.commit()
     finally:
         con.close()
-    series = diag.read_observation_series(tmp_path / "state.sqlite3", "2026-08-27")
+    result = diag.read_observation_series(tmp_path / "state.sqlite3", "2026-08-27")
+    series = result["observations"]
     assert len(series) == 1 and series[0]["customer_count"] == 8
 
 
@@ -960,23 +964,270 @@ def test_p2_2_frontend_distinguishes_reasons():
     js = (ROOT / "app" / "static" / "dashboard" / "app.js").read_text(encoding="utf-8")
     assert "NO_OBSERVATIONS" in js and "INSUFFICIENT_OBSERVATIONS" in js
     assert "暂无权威观察" in js and "观察次数不足" in js
+    # R2 P2-1:读取失败 ≠ 无观察,前端有专用文案
+    assert "OBSERVATION_READ_FAILED" in js and "权威观察读取失败" in js
+    # R2 P1-1:snapshot drift 有用户可读解释,不冒充业务异常
+    assert "查询期间数据变化" in js
 
 
-# ---- §12:sync_state=2 已审批非同款的显式分类 ----
+# ---- §12(R1):sync_state=2 已审批非同款的显式分类 ----
+# R2 P1-3:flag 更名 approval_non_same_exists,语义覆盖 model=0/1/2/3 + sync_state=2
 
 def test_sync_state_2_internet_same_rejected_is_approval_closure_pending():
     # 模型判互联网同款(model=1),人工审批为非同款(sync_state=2),未最终收口
-    record = flags(has_internet_same=1, has_internet_candidate=1, same_rejected=1)
+    record = flags(has_internet_same=1, has_internet_candidate=1, approval_non_same_exists=1)
     assert diag.classify_downstream(record)["state"] == "APPROVAL_OR_FINAL_CLOSURE_PENDING"
 
 
 def test_sync_state_2_reference_same_rejected_is_approval_closure_pending():
     # 参考链接同款(model=3)人工审批为非同款(sync_state=2)
-    record = flags(has_reference_same=1, same_rejected=1)
+    record = flags(has_reference_same=1, approval_non_same_exists=1)
     assert diag.classify_downstream(record)["state"] == "APPROVAL_OR_FINAL_CLOSURE_PENDING"
 
 
 def test_sync_state_2_pending_approval_still_dominates_rejected():
     # 同商品同时存在待审批与已驳回:待审批是当前可操作阶段
-    record = flags(has_internet_same=1, internet_pending_approval=1, same_rejected=1)
+    record = flags(has_internet_same=1, internet_pending_approval=1, approval_non_same_exists=1)
     assert diag.classify_downstream(record)["state"] == "INTERNET_SAME_PENDING_APPROVAL"
+
+
+# ===========================================================================
+# Review Fix Round 2(P1-1 snapshot drift / P1-2 batch 解析 / P1-3 sync=2 覆盖
+# / P2-1 观察读取失败 / P2-2 混合 task-central 失败)
+# ===========================================================================
+
+
+# ---- P1-1:多 SELECT snapshot drift ----
+
+def test_r2_p1_1_a_crawl1_detail_exceeds_route_is_drift_not_contradiction():
+    """路由快照 crawl1=3,detail 查询返回 5 行(查询期间 1→2 迁移):
+    不得发布 sum(crawler_branch)>3 的矛盾数字;分支标记不可用 + drift 显式可见。"""
+    service, _, _ = make_service({
+        "pool_sync_standard_counts": [("0", 3)],
+        "open_crawl_status_counts": [(1, 3)],
+        "crawl1_commodity_rows": [(i, f"C{i}") for i in range(1, 6)],  # 5 行 > 3
+        "crawl1_task_rows": [],
+        "crawl1_central_rows": [],
+        "crawl2_search_flags": [],
+    })
+    payload = service.get_diagnostic("2026-08-27")
+    stages = payload["stages"]
+    assert payload["status"] == "partial"
+    assert stages["snapshot_consistent"] is False
+    assert "crawler_branch" in stages["snapshot_drift"]
+    assert stages["crawler_branch"] is None          # 本轮不发布确定性分类
+    if stages["downstream_branch"] is not None:      # 未漂移分支不发布矛盾数字
+        assert sum(stages["downstream_branch"].values()) <= stages["crawl_status_2"]
+
+
+def test_r2_p1_1_b_crawl2_detail_exceeds_route_is_drift_not_contradiction():
+    service, _, _ = make_service({
+        "pool_sync_standard_counts": [("0", 3)],
+        "open_crawl_status_counts": [(2, 3)],
+        "crawl1_commodity_rows": [],
+        "crawl2_search_flags": [
+            (i, 5, "2026-08-27 08:00:00", 0, 0, 0, 0, 0, 0, 0, 0, 0) for i in range(1, 6)
+        ],  # 5 行 > 3
+    })
+    payload = service.get_diagnostic("2026-08-27")
+    stages = payload["stages"]
+    assert payload["status"] == "partial"
+    assert stages["snapshot_consistent"] is False
+    assert "downstream_branch" in stages["snapshot_drift"]
+    assert stages["downstream_branch"] is None
+    if stages["crawler_branch"] is not None:
+        assert sum(stages["crawler_branch"].values()) <= stages["crawl_status_1"]
+
+
+def test_r2_p1_1_c_route_gt_detail_still_overflow_evidence_incomplete():
+    """route=5, detail=3:正向溢出(截断/查询窗口)仍按 EVIDENCE_INCOMPLETE 补齐,不冒充业务态。"""
+    service, _, _ = make_service({
+        "pool_sync_standard_counts": [("0", 5)],
+        "open_crawl_status_counts": [(2, 5)],
+        "crawl1_commodity_rows": [],
+        "crawl2_search_flags": [
+            (21, 0, "2026-08-27 09:00:00", 0, 0, 0, 0, 0, 0, 0, 0, 0),
+            (22, 5, "2026-08-27 08:00:00", 0, 1, 1, 0, 0, 0, 0, 0, 0),
+            (23, 5, "2026-08-27 08:00:00", 0, 0, 0, 0, 0, 0, 1, 0, 0),
+        ],
+    })
+    payload = service.get_diagnostic("2026-08-27")
+    stages = payload["stages"]
+    assert stages["snapshot_consistent"] is True and stages["snapshot_drift"] == []
+    assert stages["downstream_branch"]["EVIDENCE_INCOMPLETE"] == 2
+    assert sum(stages["downstream_branch"].values()) == stages["crawl_status_2"] == 5
+
+
+def test_r2_p1_1_d_consistent_input_closes_both_branches():
+    service, _, _ = make_service(dict(FULL_CANNED))
+    payload = service.get_diagnostic("2026-08-27")
+    stages = payload["stages"]
+    assert payload["status"] == "ok"
+    assert stages["snapshot_consistent"] is True
+    assert sum(stages["crawler_branch"].values()) == stages["crawl_status_1"] == 1
+    assert sum(stages["downstream_branch"].values()) == stages["crawl_status_2"] == 3
+    # 两分支 EVIDENCE_INCOMPLETE 依然独立
+    assert stages["crawler_branch"]["EVIDENCE_INCOMPLETE"] == 0
+    assert stages["downstream_branch"]["EVIDENCE_INCOMPLETE"] == 0
+
+
+# ---- P1-2:task_id / batch 严格解析 ----
+
+def test_r2_p1_2_malformed_task_ids_never_produce_batches():
+    for bad in ("BROKEN", "FOO_123", "SAAS-", "SAAS-999999_123_1", "", None,
+                "SAAS-188605_279774", "SAAS-188605__1"):
+        assert diag._batch_from_task_id(bad) is None, bad
+    assert diag._batch_from_task_id("SAAS-188605_704827316150657024_279774") == \
+        "188605_704827316150657024"
+
+
+def test_r2_p1_2_mixed_valid_and_malformed_tasks_is_evidence_incomplete():
+    """2 个合法 task + 1 个 malformed task → 证据集合不完整,不得进入业务分类。"""
+    service, _, _ = make_service({
+        "pool_sync_standard_counts": [("0", 1)],
+        "open_crawl_status_counts": [(1, 1)],
+        "crawl1_commodity_rows": [(11, "C1")],
+        "crawl1_task_rows": [
+            (11, "SAAS-188605_701_1", 1),
+            (11, "SAAS-188605_702_1", 1),
+            (11, "FOO_123", 1),
+        ],
+        "crawl1_central_rows": [("188605_701", "00", "00", None, None)],
+        "crawl2_search_flags": [],
+    })
+    payload = service.get_diagnostic("2026-08-27")
+    crawler = payload["stages"]["crawler_branch"]
+    assert crawler["EVIDENCE_INCOMPLETE"] == 1
+    assert crawler["TASK_CREATED_NO_CENTRAL_RECORD"] == 0
+    assert crawler["CENTRAL_NOT_ENQUEUED"] == 0
+
+
+def test_r2_p1_2_valid_tasks_with_empty_central_keeps_no_central_record():
+    """全部 task 可解析、central 查询成功且确实无行 → 保留真实业务分类。"""
+    service, _, _ = make_service({
+        "pool_sync_standard_counts": [("0", 1)],
+        "open_crawl_status_counts": [(1, 1)],
+        "crawl1_commodity_rows": [(11, "C1")],
+        "crawl1_task_rows": [(11, "SAAS-188605_701_1", 1)],
+        "crawl1_central_rows": [],  # 查询成功,确实没有分控行
+        "crawl2_search_flags": [],
+    })
+    payload = service.get_diagnostic("2026-08-27")
+    crawler = payload["stages"]["crawler_branch"]
+    assert crawler["TASK_CREATED_NO_CENTRAL_RECORD"] == 1
+    assert crawler["EVIDENCE_INCOMPLETE"] == 0
+
+
+# ---- P1-3:sync_state=2 覆盖全部 model_audit_result ----
+
+def test_r2_p1_3_model0_sync2_is_approval_closure_pending():
+    # 互联网候选(model=0)人工审批为非同款
+    record = flags(has_internet_candidate=1, approval_non_same_exists=1)
+    assert diag.classify_downstream(record)["state"] == "APPROVAL_OR_FINAL_CLOSURE_PENDING"
+
+
+def test_r2_p1_3_model2_sync2_is_approval_closure_pending():
+    # 参考链接候选(model=2)人工审批为非同款
+    record = flags(has_model_verdict=1, approval_non_same_exists=1)
+    assert diag.classify_downstream(record)["state"] == "APPROVAL_OR_FINAL_CLOSURE_PENDING"
+
+
+def test_r2_p1_3_model1_and_model3_sync2_stable():
+    assert diag.classify_downstream(
+        flags(has_internet_same=1, has_internet_candidate=1,
+              approval_non_same_exists=1))["state"] == "APPROVAL_OR_FINAL_CLOSURE_PENDING"
+    assert diag.classify_downstream(
+        flags(has_reference_same=1, approval_non_same_exists=1))["state"] == \
+        "APPROVAL_OR_FINAL_CLOSURE_PENDING"
+
+
+# ---- P2-1:SQLite 观察读取失败 ≠ NO_OBSERVATIONS ----
+
+def test_r2_p2_1_missing_state_file_is_no_observations(tmp_path):
+    result = diag.read_observation_series(tmp_path / "absent.sqlite3", "2026-08-27")
+    assert result["available"] is False and result["read_error"] is None
+    assert result["observations"] == []
+    service, _, _ = make_service({"pool_sync_standard_counts": [("0", 1)],
+                                  "open_crawl_status_counts": [],
+                                  "crawl1_commodity_rows": [],
+                                  "crawl2_search_flags": []},
+                                 runtime_root=tmp_path, now_fn=lambda: BEFORE_CUTOFF)
+    growth = service.get_diagnostic("2026-08-27")["growth"]
+    assert growth["evaluation_reason"] == "NO_OBSERVATIONS"
+
+
+def test_r2_p2_1_empty_store_is_no_observations(tmp_path):
+    from app.services.daily_audit_store import DailyAuditStore
+    day_dir = tmp_path / "2026-08-27"
+    day_dir.mkdir()
+    DailyAuditStore(day_dir / "state.sqlite3")
+    result = diag.read_observation_series(day_dir / "state.sqlite3", "2026-08-27")
+    assert result["available"] is True and result["read_error"] is None
+    assert result["observations"] == []
+
+
+def test_r2_p2_1_corrupted_sqlite_is_read_failed(tmp_path):
+    day_dir = tmp_path / "2026-08-27"
+    day_dir.mkdir()
+    (day_dir / "state.sqlite3").write_bytes(b"this is not a sqlite database at all")
+    service, _, _ = make_service({"pool_sync_standard_counts": [("0", 1)],
+                                  "open_crawl_status_counts": [],
+                                  "crawl1_commodity_rows": [],
+                                  "crawl2_search_flags": []},
+                                 runtime_root=tmp_path, now_fn=lambda: BEFORE_CUTOFF)
+    payload = service.get_diagnostic("2026-08-27")
+    growth = payload["growth"]
+    assert growth["evaluation_reason"] == "OBSERVATION_READ_FAILED"
+    assert growth["evaluated"] is False and growth["available"] is False
+    # 只暴露安全错误类型,不泄漏路径/SQL/堆栈
+    text = json.dumps(payload, ensure_ascii=False)
+    assert str(tmp_path) not in text and "sqlite3" not in growth.get("read_error", "")
+
+
+def test_r2_p2_1_missing_schema_is_read_failed(tmp_path):
+    day_dir = tmp_path / "2026-08-27"
+    day_dir.mkdir()
+    con = sqlite3.connect(str(day_dir / "state.sqlite3"))  # 合法 DB 但没有 snapshots 表
+    con.execute("CREATE TABLE unrelated (id INTEGER)")
+    con.commit()
+    con.close()
+    result = diag.read_observation_series(day_dir / "state.sqlite3", "2026-08-27")
+    assert result["available"] is False
+    assert result["read_error"]  # 安全错误类型,非空
+    assert result["observations"] == []
+
+
+# ---- P2-2:central 失败不得覆盖已确定的 TASK_NOT_CREATED ----
+
+def test_r2_p2_2_central_failure_keeps_task_not_created_for_taskless_commodity():
+    """A 有 task(batch 查询导致 central 整体失败)→ EVIDENCE_INCOMPLETE;
+    B 无 task → TASK_NOT_CREATED(该判断不依赖 central 查询)。"""
+    def central_raises(params):
+        raise RuntimeError("central timeout")
+
+    service, _, _ = make_service({
+        "pool_sync_standard_counts": [("0", 2)],
+        "open_crawl_status_counts": [(1, 2)],
+        "crawl1_commodity_rows": [(11, "CA"), (12, "CB")],
+        "crawl1_task_rows": [(11, "SAAS-188605_701_1", 1)],  # 仅 A 有 task
+        "crawl1_central_rows": central_raises,
+        "crawl2_search_flags": [],
+    })
+    payload = service.get_diagnostic("2026-08-27")
+    crawler = payload["stages"]["crawler_branch"]
+    assert crawler["EVIDENCE_INCOMPLETE"] == 1   # A:有 task,central 失败
+    assert crawler["TASK_NOT_CREATED"] == 1      # B:无 task,结论确定
+    assert payload["status"] == "partial"
+    assert "crawl1_central_rows" in payload["degraded_queries"]
+
+
+# ---- §8 invariants 汇总 ----
+
+def test_r2_invariants_summary():
+    """§8:query failure≠0 / malformed≠task未进分控 / SQLite 失败≠无观察 / 分支独立闭合 /
+    drift 不输出矛盾数字 —— 由上方各专项测试覆盖;此处固化 payload 字段契约。"""
+    service, _, _ = make_service(dict(FULL_CANNED))
+    stages = service.get_diagnostic("2026-08-27")["stages"]
+    for key in ("pool_counts_available", "crawl_status_available", "snapshot_consistent",
+                "snapshot_drift", "pool_scope_total", "crawler_branch", "downstream_branch"):
+        assert key in stages, key

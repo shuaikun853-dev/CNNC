@@ -168,8 +168,7 @@ DIAG_SQL_REGISTRY: dict[str, str] = {
                    AS internet_pending_approval,
                MAX(s.audit_result = '2' AND s.model_audit_result IN ('1', '3') AND s.sync_state = 0)
                    AS same_approved,
-               MAX(s.audit_result = '2' AND s.model_audit_result IN ('1', '3') AND s.sync_state = 2)
-                   AS same_rejected,
+               MAX(s.sync_state = 2) AS approval_non_same_exists,
                MAX(s.audit_result = '2' AND s.model_audit_result = '3') AS has_reference_same,
                MAX(s.model_audit_result IN ('0', '1')) AS has_internet_candidate,
                MAX(s.audit_result = '2' AND s.model_audit_result = '3' AND s.sync_state = 1)
@@ -200,7 +199,7 @@ QUERY_COLUMNS: dict[str, tuple[str, ...]] = {
     "crawl2_search_flags": (
         "commodity_list_id", "search_rows", "pool_created_at", "model_pending",
         "has_internet_same", "internet_pending_approval", "same_approved",
-        "same_rejected", "has_reference_same", "has_internet_candidate",
+        "approval_non_same_exists", "has_reference_same", "has_internet_candidate",
         "reference_pending_approval", "has_model_verdict",
     ),
 }
@@ -381,11 +380,12 @@ def classify_downstream(
     - "互联网候选全部判非同款"优先于"只有参考链接同款":2026-08-27 生产实测
       75/89 的参考链接同款商品同时存在互联网非同款候选,互联网侧证据是页面
       不增长的更直接解释。
-    - sync_state=2(已审批-非同款,[FRONTEND] 前端语义)按 spec 对
-      APPROVAL_OR_FINAL_CLOSURE_PENDING 的定义("审批/结果已经存在,但
-      IS_SYNC_STANDARD 尚未最终关闭")处理:人工审批结果存在、收口未完成;
-      不解释为任何未验证后台状态。待审批(sync_state=1)与已驳回同时存在时,
-      待审批优先(它是当前可操作阶段)。
+    - approval_non_same_exists(任一 sync_state=2 行)按 [FRONTEND] 前端语义
+      ("已审批-非同款")与 spec 对 APPROVAL_OR_FINAL_CLOSURE_PENDING 的定义
+      ("审批/结果已经存在,但 IS_SYNC_STANDARD 尚未最终关闭")处理:覆盖
+      model_audit_result=0/1/2/3 全部组合——人工审批结果已存在、收口未完成;
+      不解释为任何未验证后台状态,也不新增 sync_state 3/4 逻辑。待审批
+      (sync_state=1)与已审批非同款同时存在时,待审批优先(当前可操作阶段)。
     """
     now_naive: datetime | None = None
     if now is not None:
@@ -402,7 +402,7 @@ def classify_downstream(
         state = "INTERNET_SAME_PENDING_APPROVAL"
     elif _truthy_flag(record.get("same_approved")):
         state = "APPROVAL_OR_FINAL_CLOSURE_PENDING"
-    elif _truthy_flag(record.get("same_rejected")):
+    elif _truthy_flag(record.get("approval_non_same_exists")):
         state = "APPROVAL_OR_FINAL_CLOSURE_PENDING"
     elif _truthy_flag(record.get("model_pending")):
         state = "MODEL_PENDING"
@@ -485,25 +485,32 @@ def evaluate_growth(
     return result
 
 
-def read_observation_series(state_path: Path | str, business_date: str) -> list[dict[str, Any]]:
-    """读取该业务日已持久化的权威观察序列(只读 URI,绝不写入)。"""
+def read_observation_series(state_path: Path | str, business_date: str) -> dict[str, Any]:
+    """读取该业务日已持久化的权威观察序列(只读 URI,绝不写入)。
+
+    Review R2 P2-1:读取失败(损坏/schema 缺失/query error)绝不折叠成"无观察"。
+    返回 {"available", "read_error", "observations"};read_error 只含安全异常
+    类型名(如 DatabaseError),不含本地路径、SQL 文本或堆栈。
+    文件不存在 → available=False 且 read_error=None(真的还没有观察)。
+    """
     path = Path(state_path)
     if not path.is_file():
-        return []
+        return {"available": False, "read_error": None, "observations": []}
     uri = f"file:{path.resolve().as_posix()}?mode=ro"
-    connection = sqlite3.connect(uri, uri=True)
     try:
-        rows = connection.execute(
-            """SELECT s.observed_at AS observed_at, s.evidence_json AS evidence_json
-               FROM snapshots s JOIN daily_runs r ON r.id = s.run_id
-               WHERE r.business_date = ?
-               ORDER BY s.observed_at, s.id""",
-            (business_date,),
-        ).fetchall()
-    except sqlite3.Error:
-        return []
-    finally:
-        connection.close()
+        connection = sqlite3.connect(uri, uri=True)
+        try:
+            rows = connection.execute(
+                """SELECT s.observed_at AS observed_at, s.evidence_json AS evidence_json
+                   FROM snapshots s JOIN daily_runs r ON r.id = s.run_id
+                   WHERE r.business_date = ?
+                   ORDER BY s.observed_at, s.id""",
+                (business_date,),
+            ).fetchall()
+        finally:
+            connection.close()
+    except sqlite3.Error as exc:
+        return {"available": False, "read_error": type(exc).__name__, "observations": []}
     series: list[dict[str, Any]] = []
     for observed_at, evidence_json in rows:
         try:
@@ -515,7 +522,7 @@ def read_observation_series(state_path: Path | str, business_date: str) -> list[
             continue
         series.append({"observed_at": str(observed_at), "customer_count": customer_count,
                        "saas_count": saas_count})
-    return series
+    return {"available": True, "read_error": None, "observations": series}
 
 
 # ---------------------------------------------------------------------------
@@ -627,13 +634,31 @@ class SaasFlowDiagnosticService:
                     pass
         payload["stages"] = stages
         payload["degraded_queries"] = degraded
-        payload["status"] = "unavailable" if stages is None else ("partial" if degraded else "ok")
+        payload["status"] = "unavailable" if stages is None else (
+            "partial" if (degraded or stages.get("snapshot_drift")) else "ok")
         return payload
 
     def _build_growth(self, business_date: str) -> dict[str, Any]:
         paths = runtime_paths(business_date, self._runtime_root)
-        series = read_observation_series(paths.state_path, business_date)
-        return evaluate_growth(series, business_date=business_date, now=self._now_fn())
+        result = read_observation_series(paths.state_path, business_date)
+        if result["read_error"]:
+            # 读取失败 ≠ 无观察:明确降级,不伪装 NORMAL/NO_OBSERVATIONS
+            return {
+                "available": False,
+                "evaluated": False,
+                "evaluation_reason": "OBSERVATION_READ_FAILED",
+                "read_error": result["read_error"],  # 仅安全异常类型名
+                "state": "NORMAL",
+                "customer_count": 0,
+                "saas_count": 0,
+                "customer_delta": 0,
+                "saas_delta": 0,
+                "consecutive_lag_intervals": 0,
+                "observation_count": 0,
+                "last_observed_at": None,
+            }
+        return evaluate_growth(result["observations"], business_date=business_date,
+                               now=self._now_fn())
 
     def _query(self, connection: Any, name: str, params: dict[str, Any]) -> list[dict[str, Any]]:
         sql = DIAG_SQL_REGISTRY[name]
@@ -701,14 +726,20 @@ class SaasFlowDiagnosticService:
         reference_pending_total: int | None = 0
         callback_no_search_within_grace: int | None = 0
         now_sh = self._now_fn().astimezone(SHANGHAI).replace(tzinfo=None)
+        # Review R2 P1-1:多条 SELECT 不是同一快照;detail 行数超过路由快照 = 反向漂移,
+        # 该分支本轮不发布确定性分类(不截断多出商品、不覆盖 route total)。
+        snapshot_drift: list[str] = []
 
         if not crawl_failed:
             # ---- Branch A: crawl_status = 1 → task → exact batch → 分控 ----
             crawl1_rows = run("crawl1_commodity_rows", {})
-            ids = [int(row["commodity_list_id"]) for row in crawl1_rows[:MAX_CRAWL1_COMMODITIES]]
             if "crawl1_commodity_rows" in degraded:
                 crawler_counts["EVIDENCE_INCOMPLETE"] += crawl1_total or 0
+            elif len(crawl1_rows) > (crawl1_total or 0):
+                crawler_counts = None
+                snapshot_drift.append("crawler_branch")
             else:
+                ids = [int(row["commodity_list_id"]) for row in crawl1_rows[:MAX_CRAWL1_COMMODITIES]]
                 task_rows: list[dict[str, Any]] = []
                 task_failed = False
                 if ids:
@@ -720,7 +751,7 @@ class SaasFlowDiagnosticService:
                 batches: set[str] = set()
                 for row in task_rows:
                     batch = _batch_from_task_id(_as_str(row.get("task_id")))
-                    if batch:
+                    if batch is not None:
                         batches.add(batch)
                 central_rows: list[dict[str, Any]] = []
                 central_failed = False
@@ -735,14 +766,25 @@ class SaasFlowDiagnosticService:
                     central_detail[key] = central_detail.get(key, 0) + 1
                 for commodity_list_id in ids:
                     tasks = tasks_by_commodity.get(commodity_list_id, [])
-                    # Review P1-2:task/central 查询失败只能证明证据不足,
-                    # 绝不落 TASK_CREATED_NO_CENTRAL_RECORD。
-                    if task_failed or central_failed:
+                    # Review R2 P2-2 决策序(逐级,不整体降级):
+                    if task_failed:
                         crawler_counts["EVIDENCE_INCOMPLETE"] += 1
                         continue
-                    commodity_batches = {_batch_from_task_id(_as_str(t.get("task_id")))
-                                         for t in tasks} - {""}
-                    central_for_commodity = [row for batch in commodity_batches
+                    if not tasks:
+                        crawler_counts["TASK_NOT_CREATED"] += 1  # 不依赖 central 查询
+                        continue
+                    commodity_batches = [_batch_from_task_id(_as_str(t.get("task_id")))
+                                         for t in tasks]
+                    if any(batch is None for batch in commodity_batches):
+                        # Review R2 P1-2:malformed task 证据 ≠ task 未进分控;
+                        # 混合合法/malformed 同样证据集合不完整
+                        crawler_counts["EVIDENCE_INCOMPLETE"] += 1
+                        continue
+                    if central_failed:
+                        crawler_counts["EVIDENCE_INCOMPLETE"] += 1
+                        continue
+                    unique_batches = list(dict.fromkeys(commodity_batches))
+                    central_for_commodity = [row for batch in unique_batches
                                              for row in central_by_batch.get(batch, [])]
                     crawler_counts[classify_crawler_branch({
                         "task_count": len(tasks),
@@ -754,18 +796,21 @@ class SaasFlowDiagnosticService:
 
             # ---- Branch B: crawl_status = 2 → search/model/审批 ----
             crawl2_rows = run("crawl2_search_flags", {})
-            classified = 0
-            for row in crawl2_rows[:MAX_CRAWL2_COMMODITIES]:
-                verdict = classify_downstream(row, now=now_sh, grace_seconds=self._grace_seconds)
-                downstream_counts[verdict["state"]] += 1
-                classified += 1
-                if verdict["state"] == "CALLBACK_DONE_NO_SEARCH" and verdict["within_grace"]:
-                    callback_no_search_within_grace += 1
-                if _truthy_flag(row.get("reference_pending_approval")):
-                    reference_pending_total += 1
             if "crawl2_search_flags" in degraded:
                 downstream_counts["EVIDENCE_INCOMPLETE"] += crawl2_total or 0
+            elif len(crawl2_rows) > (crawl2_total or 0):
+                downstream_counts = None
+                snapshot_drift.append("downstream_branch")
             else:
+                classified = 0
+                for row in crawl2_rows[:MAX_CRAWL2_COMMODITIES]:
+                    verdict = classify_downstream(row, now=now_sh, grace_seconds=self._grace_seconds)
+                    downstream_counts[verdict["state"]] += 1
+                    classified += 1
+                    if verdict["state"] == "CALLBACK_DONE_NO_SEARCH" and verdict["within_grace"]:
+                        callback_no_search_within_grace += 1
+                    if _truthy_flag(row.get("reference_pending_approval")):
+                        reference_pending_total += 1
                 overflow = (crawl2_total or 0) - classified
                 if overflow > 0:
                     downstream_counts["EVIDENCE_INCOMPLETE"] += overflow
@@ -792,6 +837,9 @@ class SaasFlowDiagnosticService:
             # Review P1-6:SQL 池计数不得冒充权威客户计数(权威计数在 growth.customer_count)
             "pool_counts_available": not pool_failed,
             "crawl_status_available": not crawl_failed,
+            # Review R2 P1-1:多 SELECT 快照一致性显式可见;drift 是取证时点问题,不是业务异常
+            "snapshot_consistent": not snapshot_drift,
+            "snapshot_drift": snapshot_drift,
             "pool_scope_total": pool_scope_total,
             "not_closed": not_closed,
             "closed_standard": closed_standard,
@@ -812,14 +860,19 @@ class SaasFlowDiagnosticService:
         return stages, degraded
 
 
-def _batch_from_task_id(task_id: str) -> str:
-    """SAAS-188605_704827316150657024_279774 → 188605_704827316150657024(sql_ops KB §3.4)。"""
+# 权威已验证 task_id 形态(sql_ops KB §3.4):SAAS-188605_<batch>_<suffix>,
+# 例 SAAS-188605_704827316150657024_279774 → batch 188605_704827316150657024。
+# Review R2 P1-2:tenant 固定 188605、batch/suffix 必须非空;解析不出→None,绝不产伪 batch。
+_TASK_ID_RE = re.compile(r"^SAAS-188605_[^_\s]+_.+$")
+
+
+def _batch_from_task_id(task_id: str) -> str | None:
+    """严格校验;无法验证时返回 None(malformed 证据),而不是看似合法的 batch。"""
     if not task_id:
-        return ""
-    stripped = task_id.replace("SAAS-", "", 1)
-    parts = stripped.split("_")
-    if len(parts) < 2:
-        return ""
+        return None
+    if not _TASK_ID_RE.match(task_id):
+        return None
+    parts = task_id[len("SAAS-"):].split("_")
     return "_".join(parts[:2])
 
 
