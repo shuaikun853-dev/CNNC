@@ -410,15 +410,21 @@ def project_scheduler_status() -> dict:
         data = _run_scheduler_probe()
     except Exception:
         data = None
+    # Review fix:探针可能输出"合法 JSON 但非 dict 顶层"([] / 字符串 / 数字 / bool),
+    # json.loads 不报错而 data.get 会 AttributeError 逃逸。Scheduler 只是附属只读观测:
+    # 任何坏形状一律按探针失败降级 unavailable,绝不拖垮 summary。
+    if not isinstance(data, Mapping):
+        data = None
     if data is None:
         result = {"available": False}
     else:
         # Hotfix 2026-08-27:LastTaskResult 为 UInt32(如触发重叠被拒 0x800710E0=
         # 2147946720,超 Int32);PS 侧强转异常时该字段还可能序列化成非数值。
-        # 探针形状永远不许把 summary 打成 503——非数值按未知结果码(-1)降级。
+        # 探针形状永远不许把 summary 打成 503——非数值按未知结果码(-1)降级;
+        # OverflowError 对应 json.loads 接受的 Infinity→int() 溢出。
         try:
             code = int(data.get("last_result", -1))
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             code = -1
         result = {"available": True,
                   "running": str(data.get("state", "")).lower() == "running" or code in _RUNNING_CODES,
