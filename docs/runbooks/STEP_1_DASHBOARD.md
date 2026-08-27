@@ -84,10 +84,10 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\unregister_dashboard
 
 ## SaaS 首次采集链路(生产 DB 只读诊断)
 
-- **这是什么**:二级折叠面板(`SaaS 首次采集链路`),回答"18:00 前客户侧持续新增、但 SaaS 页面数量不涨时,新增数据主要停在哪个阶段"。
+- **这是什么**:一级可见的折叠面板(`SaaS 首次采集链路`,默认收起、展开才显示阶段树),回答"18:00 前客户侧持续新增、但 SaaS 页面数量不涨时,新增数据主要停在哪个阶段"。页面顶部"客户/SaaS"计数只来自权威增长观察;SQL 商品池计数单独标注为"当日商品池记录",不冒充权威客户数。
 - **只读范围**:仅通过指定只读数据库账号(`CNNC_DIAG_DB_*`)执行后端预定义、参数化 SELECT(`app/services/saas_flow_diagnostic.py` 的 SQL registry);scope 永久固定 `tenant_id=188605`、`commodity_pool_id=222`,不接受浏览器/API 提交的任何 SQL、tenant、pool、schema、表名;无任何写操作、无 priority 调整、无审批/驳回/重试/建任务入口。诊断链以 `IS_SYNC_STANDARD=0` → `crawl_status`(1=爬虫未回调走 task/分控链,2=已回调走 search/model/审批链)为准,字段语义来自 `docs/sql_ops` KB。
 - **18:00 前增长分叉**:增长判断只复用当日 `state.sqlite3` 中已持久化的权威观察序列(`snapshots.observed_at` + `evidence_json` 的 customer/saas 计数),不额外调用客户/SaaS 业务 API;上海时间 18:00 后不再评估。同一业务日连续一个区间"客户增、SaaS 不增"为 `增长落后观察`,连续两个及以上为 `持续增长落后`;触发时面板并列展示各阶段分布,不会仅凭计数差异断言"SaaS 丢数据"。
-- **缓存与限流**:后端 ≥60 秒缓存(CNNC_DIAG_CACHE_SECONDS,下限 60);"刷新 SaaS 链路"按钮触发受限强制读取,间隔 <30 秒(CNNC_DIAG_FRESH_MIN_INTERVAL_SECONDS,下限 10)按限流返回缓存;前端另有 ≥55 秒节流,绝不形成 5 秒级生产 DB 轮询。查询均带 connect/read 超时、当日固定窗口、有界结果集。
+- **缓存与限流**:后端 ≥60 秒缓存(CNNC_DIAG_CACHE_SECONDS,下限 60);"刷新 SaaS 链路"按钮触发受限强制读取,间隔 <30 秒(CNNC_DIAG_FRESH_MIN_INTERVAL_SECONDS,下限 30,env 配更低被钳制)按限流返回缓存;强制刷新另有服务端 single-flight,并发刷新只触发一次生产查询。前端 SaaS Flow 有独立 ~60 秒轮询周期(visible 轮询/hidden 停止/回前台补刷),不依赖 summary 的 200/304 生命周期,也绝不形成 5 秒级生产 DB 轮询。查询均带 connect/read 超时、当日固定窗口、有界结果集;核心查询失败时相关计数显示"不可用",不冒充业务 0。
 - **降级**:`CNNC_DIAG_DB_*` 未配置时面板显示"数据库诊断未配置"(增长判断仍可用);连接失败/超时/查询失败只降级本面板(整体 unavailable 或部分查询 partial),`/dashboard/api/summary` 与页面其余区域完全不受影响。DB 凭据只从进程环境变量或 ignored 的 `data/CNNC_DIAG_DB.env` 读取,不进 Git、日志或 API 响应。
 
 ## 排障

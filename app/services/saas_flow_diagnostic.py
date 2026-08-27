@@ -24,6 +24,7 @@ import json
 import os
 import re
 import sqlite3
+import threading
 import time
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -46,7 +47,7 @@ DEFAULT_GRACE_SECONDS = 1800  # callback 后暂无 search 的宽限窗口(基于
 DEFAULT_CACHE_TTL_SECONDS = 60.0
 DEFAULT_FRESH_READ_MIN_INTERVAL_SECONDS = 30.0
 MIN_CACHE_TTL_SECONDS = 60.0        # 生产要求:至少 60 秒缓存,禁止 5 秒级 DB 轮询
-MIN_FRESH_READ_INTERVAL_SECONDS = 10.0
+MIN_FRESH_READ_INTERVAL_SECONDS = 30.0  # 强制刷新间隔下限与文档/UI 声明一致,env 不可降破
 MAX_CRAWL1_COMMODITIES = 2000       # 有界结果集:单日 crawl_status=1 目标商品上限
 MAX_CRAWL2_COMMODITIES = 2000
 MAX_CENTRAL_DETAIL_ROWS = 50        # evidence 明细展示上限
@@ -167,6 +168,8 @@ DIAG_SQL_REGISTRY: dict[str, str] = {
                    AS internet_pending_approval,
                MAX(s.audit_result = '2' AND s.model_audit_result IN ('1', '3') AND s.sync_state = 0)
                    AS same_approved,
+               MAX(s.audit_result = '2' AND s.model_audit_result IN ('1', '3') AND s.sync_state = 2)
+                   AS same_rejected,
                MAX(s.audit_result = '2' AND s.model_audit_result = '3') AS has_reference_same,
                MAX(s.model_audit_result IN ('0', '1')) AS has_internet_candidate,
                MAX(s.audit_result = '2' AND s.model_audit_result = '3' AND s.sync_state = 1)
@@ -197,8 +200,8 @@ QUERY_COLUMNS: dict[str, tuple[str, ...]] = {
     "crawl2_search_flags": (
         "commodity_list_id", "search_rows", "pool_created_at", "model_pending",
         "has_internet_same", "internet_pending_approval", "same_approved",
-        "has_reference_same", "has_internet_candidate", "reference_pending_approval",
-        "has_model_verdict",
+        "same_rejected", "has_reference_same", "has_internet_candidate",
+        "reference_pending_approval", "has_model_verdict",
     ),
 }
 
@@ -372,11 +375,17 @@ def classify_downstream(
 ) -> dict[str, Any]:
     """crawl_status=2 商品分类(单商品单桶),返回 {state, within_grace}。
 
-    决策顺序:无 search(grace) > 互联网同款待审批 > 已审批待收口 > 模型处理中
-    > 互联网候选全部判非同款 > 只有参考链接同款 > 模型完成无同款 > 无互联网候选
-    > 证据不足。其中"互联网候选全部判非同款"优先于"只有参考链接同款":
-    2026-08-27 生产实测 75/89 的参考链接同款商品同时存在互联网非同款候选,
-    互联网侧证据是页面不增长的更直接解释。
+    决策顺序:无 search(grace) > 互联网同款待审批 > 已审批-同款待收口
+    > 已审批-非同款待收口 > 模型处理中 > 互联网候选全部判非同款
+    > 只有参考链接同款 > 模型完成无同款 > 无互联网候选 > 证据不足。
+    - "互联网候选全部判非同款"优先于"只有参考链接同款":2026-08-27 生产实测
+      75/89 的参考链接同款商品同时存在互联网非同款候选,互联网侧证据是页面
+      不增长的更直接解释。
+    - sync_state=2(已审批-非同款,[FRONTEND] 前端语义)按 spec 对
+      APPROVAL_OR_FINAL_CLOSURE_PENDING 的定义("审批/结果已经存在,但
+      IS_SYNC_STANDARD 尚未最终关闭")处理:人工审批结果存在、收口未完成;
+      不解释为任何未验证后台状态。待审批(sync_state=1)与已驳回同时存在时,
+      待审批优先(它是当前可操作阶段)。
     """
     now_naive: datetime | None = None
     if now is not None:
@@ -392,6 +401,8 @@ def classify_downstream(
     if _truthy_flag(record.get("internet_pending_approval")):
         state = "INTERNET_SAME_PENDING_APPROVAL"
     elif _truthy_flag(record.get("same_approved")):
+        state = "APPROVAL_OR_FINAL_CLOSURE_PENDING"
+    elif _truthy_flag(record.get("same_rejected")):
         state = "APPROVAL_OR_FINAL_CLOSURE_PENDING"
     elif _truthy_flag(record.get("model_pending")):
         state = "MODEL_PENDING"
@@ -436,6 +447,8 @@ def evaluate_growth(
     result: dict[str, Any] = {
         "available": bool(series),
         "evaluated": False,
+        # 明确区分"评估过=正常"与"证据不足/非评估时段",前端绝不把后者显示成"正常"
+        "evaluation_reason": "NO_OBSERVATIONS" if not series else "INSUFFICIENT_OBSERVATIONS",
         "state": "NORMAL",
         "customer_count": series[-1]["customer_count"] if series else 0,
         "saas_count": series[-1]["saas_count"] if series else 0,
@@ -446,9 +459,13 @@ def evaluate_growth(
         "last_observed_at": series[-1]["observed_at"] if series else None,
         "cutoff_at": cutoff.isoformat(),
     }
-    if current >= cutoff or len(series) < 2:
+    if current >= cutoff:
+        result["evaluation_reason"] = "AFTER_CUTOFF"
+        return result
+    if len(series) < 2:
         return result
     result["evaluated"] = True
+    result["evaluation_reason"] = "EVALUATED"
     intervals: list[tuple[int, int]] = []
     for previous, item in zip(series, series[1:]):
         intervals.append((item["customer_count"] - previous["customer_count"],
@@ -505,8 +522,8 @@ def read_observation_series(state_path: Path | str, business_date: str) -> list[
 # 诊断服务
 # ---------------------------------------------------------------------------
 
-def _empty_branch_counts() -> dict[str, int]:
-    return {name: 0 for name in (*CRAWLER_BRANCH_CLASSES, *DOWNSTREAM_BRANCH_CLASSES)}
+def _empty_counts(classes: Sequence[str]) -> dict[str, int]:
+    return {name: 0 for name in classes}
 
 
 class SaasFlowDiagnosticService:
@@ -534,30 +551,47 @@ class SaasFlowDiagnosticService:
         self._now_fn = now_fn or (lambda: datetime.now(UTC))
         self._cache: dict[str, tuple[float, dict[str, Any]]] = {}
         self._last_fresh_read_at = -float("inf")
+        # single-flight:同一时间只允许一个 fresh DB diagnostic build;
+        # 并发请求在锁内二次检查缓存/限流,复用已有结果(Review P1-7)。
+        self._build_lock = threading.Lock()
 
     # -- 公共入口 -----------------------------------------------------------
 
     def get_diagnostic(self, business_date: str, *, force_refresh: bool = False) -> dict[str, Any]:
+        payload = self._cached_or_limited(business_date, force_refresh)
+        if payload is not None:
+            return payload
+        with self._build_lock:
+            # 双检:等锁期间其他线程可能已完成 build
+            payload = self._cached_or_limited(business_date, force_refresh)
+            if payload is not None:
+                return payload
+            payload = self._build(business_date)
+            payload["cached"] = False
+            payload["rate_limited"] = False
+            now = self._monotonic()
+            self._cache[business_date] = (now, payload)
+            self._last_fresh_read_at = now
+            return dict(payload)
+
+    def _cached_or_limited(self, business_date: str, force_refresh: bool) -> dict[str, Any] | None:
+        """命中缓存或被限流时返回可复用 payload,需要 fresh build 时返回 None。"""
         now = self._monotonic()
         cached = self._cache.get(business_date)
-        if cached is not None:
-            cached_at, payload = cached
-            if force_refresh and now - self._last_fresh_read_at < self._fresh_min_interval:
-                blocked = dict(payload)
-                blocked["cached"] = True
-                blocked["rate_limited"] = True
-                return blocked
-            if not force_refresh and now - cached_at < self._cache_ttl_seconds:
-                fresh = dict(payload)
-                fresh["cached"] = True
-                fresh["rate_limited"] = False
-                return fresh
-        payload = self._build(business_date)
-        payload["cached"] = False
-        payload["rate_limited"] = False
-        self._cache[business_date] = (now, payload)
-        self._last_fresh_read_at = now
-        return dict(payload)
+        if cached is None:
+            return None
+        cached_at, payload = cached
+        if force_refresh and now - self._last_fresh_read_at < self._fresh_min_interval:
+            blocked = dict(payload)
+            blocked["cached"] = True
+            blocked["rate_limited"] = True
+            return blocked
+        if not force_refresh and now - cached_at < self._cache_ttl_seconds:
+            fresh = dict(payload)
+            fresh["cached"] = True
+            fresh["rate_limited"] = False
+            return fresh
+        return None
 
     # -- 组装 ---------------------------------------------------------------
 
@@ -634,95 +668,120 @@ class SaasFlowDiagnosticService:
 
         sync_rows = run("pool_sync_standard_counts", {})
         crawl_rows = run("open_crawl_status_counts", {})
-        if "pool_sync_standard_counts" in degraded and "open_crawl_status_counts" in degraded:
+        # Review P1-3:查询失败 ≠ 业务 0。核心查询失败的聚合一律 None
+        # (证据不可用),绝不编造 0;下游分支查询存在依赖,路由层失败即跳过。
+        pool_failed = "pool_sync_standard_counts" in degraded
+        crawl_failed = "open_crawl_status_counts" in degraded
+        if pool_failed and crawl_failed:
             return None, degraded
 
-        sync_counts = {_as_str(row.get("is_sync_standard")): int(row.get("commodity_count") or 0)
-                       for row in sync_rows}
-        customer_total = sum(sync_counts.values())
-        not_closed = sync_counts.get("0", 0)
-        crawl_counts = {_as_str(row.get("crawl_status")): int(row.get("commodity_count") or 0)
-                        for row in crawl_rows}
-        crawl1_total = crawl_counts.get("1", 0)
-        crawl2_total = crawl_counts.get("2", 0)
-        crawl_other = sum(count for status, count in crawl_counts.items()
-                          if status not in ("1", "2"))
+        if pool_failed:
+            pool_scope_total = not_closed = closed_standard = closed_no_same = None
+        else:
+            sync_counts = {_as_str(row.get("is_sync_standard")): int(row.get("commodity_count") or 0)
+                           for row in sync_rows}
+            pool_scope_total = sum(sync_counts.values())
+            not_closed = sync_counts.get("0", 0)
+            closed_standard = sync_counts.get("1", 0)
+            closed_no_same = sync_counts.get("2", 0)
+        if crawl_failed:
+            crawl1_total = crawl2_total = crawl_other = None
+        else:
+            crawl_counts = {_as_str(row.get("crawl_status")): int(row.get("commodity_count") or 0)
+                            for row in crawl_rows}
+            crawl1_total = crawl_counts.get("1", 0)
+            crawl2_total = crawl_counts.get("2", 0)
+            crawl_other = sum(count for status, count in crawl_counts.items()
+                              if status not in ("1", "2"))
 
-        now_sh = self._now_fn().astimezone(SHANGHAI).replace(tzinfo=None)
-        counts = _empty_branch_counts()
+        # Review P1-1:两个分支各自独立计数,同名 EVIDENCE_INCOMPLETE 不共享。
+        crawler_counts: dict[str, int] | None = _empty_counts(CRAWLER_BRANCH_CLASSES)
+        downstream_counts: dict[str, int] | None = _empty_counts(DOWNSTREAM_BRANCH_CLASSES)
         central_detail: dict[tuple[str, str, str], int] = {}
-        reference_pending_total = 0
-        callback_no_search_within_grace = 0
+        reference_pending_total: int | None = 0
+        callback_no_search_within_grace: int | None = 0
+        now_sh = self._now_fn().astimezone(SHANGHAI).replace(tzinfo=None)
 
-        # ---- Branch A: crawl_status = 1 → task → exact batch → 分控 ----
-        crawl1_rows = run("crawl1_commodity_rows", {})
-        ids = [int(row["commodity_list_id"]) for row in crawl1_rows[:MAX_CRAWL1_COMMODITIES]]
-        if "crawl1_commodity_rows" in degraded:
-            counts["EVIDENCE_INCOMPLETE"] += crawl1_total
+        if not crawl_failed:
+            # ---- Branch A: crawl_status = 1 → task → exact batch → 分控 ----
+            crawl1_rows = run("crawl1_commodity_rows", {})
+            ids = [int(row["commodity_list_id"]) for row in crawl1_rows[:MAX_CRAWL1_COMMODITIES]]
+            if "crawl1_commodity_rows" in degraded:
+                crawler_counts["EVIDENCE_INCOMPLETE"] += crawl1_total or 0
+            else:
+                task_rows: list[dict[str, Any]] = []
+                task_failed = False
+                if ids:
+                    task_rows = run("crawl1_task_rows", {"commodity_list_ids": tuple(ids)})
+                    task_failed = "crawl1_task_rows" in degraded
+                tasks_by_commodity: dict[int, list[dict[str, Any]]] = {}
+                for row in task_rows:
+                    tasks_by_commodity.setdefault(int(row["commodity_list_id"]), []).append(row)
+                batches: set[str] = set()
+                for row in task_rows:
+                    batch = _batch_from_task_id(_as_str(row.get("task_id")))
+                    if batch:
+                        batches.add(batch)
+                central_rows: list[dict[str, Any]] = []
+                central_failed = False
+                if batches:
+                    central_rows = run("crawl1_central_rows", {"batch_nums": tuple(sorted(batches))})
+                    central_failed = "crawl1_central_rows" in degraded
+                central_by_batch: dict[str, list[dict[str, Any]]] = {}
+                for row in central_rows:
+                    central_by_batch.setdefault(_as_str(row.get("batch_num")), []).append(row)
+                    key = (_as_str(row.get("batch_num")), _as_str(row.get("task_status")),
+                           _as_str(row.get("queue_status")))
+                    central_detail[key] = central_detail.get(key, 0) + 1
+                for commodity_list_id in ids:
+                    tasks = tasks_by_commodity.get(commodity_list_id, [])
+                    # Review P1-2:task/central 查询失败只能证明证据不足,
+                    # 绝不落 TASK_CREATED_NO_CENTRAL_RECORD。
+                    if task_failed or central_failed:
+                        crawler_counts["EVIDENCE_INCOMPLETE"] += 1
+                        continue
+                    commodity_batches = {_batch_from_task_id(_as_str(t.get("task_id")))
+                                         for t in tasks} - {""}
+                    central_for_commodity = [row for batch in commodity_batches
+                                             for row in central_by_batch.get(batch, [])]
+                    crawler_counts[classify_crawler_branch({
+                        "task_count": len(tasks),
+                        "central": central_for_commodity,
+                    })] += 1
+                overflow = (crawl1_total or 0) - len(ids)
+                if overflow > 0:
+                    crawler_counts["EVIDENCE_INCOMPLETE"] += overflow
+
+            # ---- Branch B: crawl_status = 2 → search/model/审批 ----
+            crawl2_rows = run("crawl2_search_flags", {})
+            classified = 0
+            for row in crawl2_rows[:MAX_CRAWL2_COMMODITIES]:
+                verdict = classify_downstream(row, now=now_sh, grace_seconds=self._grace_seconds)
+                downstream_counts[verdict["state"]] += 1
+                classified += 1
+                if verdict["state"] == "CALLBACK_DONE_NO_SEARCH" and verdict["within_grace"]:
+                    callback_no_search_within_grace += 1
+                if _truthy_flag(row.get("reference_pending_approval")):
+                    reference_pending_total += 1
+            if "crawl2_search_flags" in degraded:
+                downstream_counts["EVIDENCE_INCOMPLETE"] += crawl2_total or 0
+            else:
+                overflow = (crawl2_total or 0) - classified
+                if overflow > 0:
+                    downstream_counts["EVIDENCE_INCOMPLETE"] += overflow
         else:
-            task_rows: list[dict[str, Any]] = []
-            task_failed = False
-            if ids:
-                task_rows = run("crawl1_task_rows", {"commodity_list_ids": tuple(ids)})
-                task_failed = "crawl1_task_rows" in degraded
-            tasks_by_commodity: dict[int, list[dict[str, Any]]] = {}
-            for row in task_rows:
-                tasks_by_commodity.setdefault(int(row["commodity_list_id"]), []).append(row)
-            batches: set[str] = set()
-            for row in task_rows:
-                batch = _batch_from_task_id(_as_str(row.get("task_id")))
-                if batch:
-                    batches.add(batch)
-            central_rows: list[dict[str, Any]] = []
-            central_failed = False
-            if batches:
-                central_rows = run("crawl1_central_rows", {"batch_nums": tuple(sorted(batches))})
-                central_failed = "crawl1_central_rows" in degraded
-            central_by_batch: dict[str, list[dict[str, Any]]] = {}
-            for row in central_rows:
-                central_by_batch.setdefault(_as_str(row.get("batch_num")), []).append(row)
-                key = (_as_str(row.get("batch_num")), _as_str(row.get("task_status")),
-                       _as_str(row.get("queue_status")))
-                central_detail[key] = central_detail.get(key, 0) + 1
-            for commodity_list_id in ids:
-                tasks = tasks_by_commodity.get(commodity_list_id, [])
-                if task_failed:
-                    counts["EVIDENCE_INCOMPLETE"] += 1
-                    continue
-                commodity_batches = {_batch_from_task_id(_as_str(t.get("task_id")))
-                                     for t in tasks} - {""}
-                central_for_commodity = [row for batch in commodity_batches
-                                         for row in central_by_batch.get(batch, [])]
-                if central_failed:
-                    central_for_commodity = []
-                counts[classify_crawler_branch({
-                    "task_count": len(tasks),
-                    "central": central_for_commodity,
-                })] += 1
-            overflow = crawl1_total - len(ids)
-            if overflow > 0:
-                counts["EVIDENCE_INCOMPLETE"] += overflow
+            crawler_counts = None
+            downstream_counts = None
+            reference_pending_total = None
+            callback_no_search_within_grace = None
 
-        # ---- Branch B: crawl_status = 2 → search/model/审批 ----
-        crawl2_rows = run("crawl2_search_flags", {})
-        classified = 0
-        for row in crawl2_rows[:MAX_CRAWL2_COMMODITIES]:
-            verdict = classify_downstream(row, now=now_sh, grace_seconds=self._grace_seconds)
-            counts[verdict["state"]] += 1
-            classified += 1
-            if verdict["state"] == "CALLBACK_DONE_NO_SEARCH" and verdict["within_grace"]:
-                callback_no_search_within_grace += 1
-            if _truthy_flag(row.get("reference_pending_approval")):
-                reference_pending_total += 1
-        if "crawl2_search_flags" in degraded:
-            counts["EVIDENCE_INCOMPLETE"] += crawl2_total
-        else:
-            overflow = crawl2_total - classified
-            if overflow > 0:
-                counts["EVIDENCE_INCOMPLETE"] += overflow
-
-        no_commodity_list = max(0, not_closed - (crawl1_total + crawl2_total + crawl_other))
-        dominant = _dominant_stage(counts, no_commodity_list)
+        # no_commodity_list 只在 pool 与 crawl 两层计数都可用时才可闭合
+        no_commodity_list: int | None = None
+        if not pool_failed and not crawl_failed:
+            no_commodity_list = max(0, not_closed - (crawl1_total + crawl2_total + crawl_other))
+        dominant = None
+        if crawler_counts is not None and downstream_counts is not None:
+            dominant = _dominant_stage(crawler_counts, downstream_counts, no_commodity_list)
         detail = [
             {"batch_num": batch, "task_status": task_status, "queue_status": queue_status,
              "count": number}
@@ -730,17 +789,20 @@ class SaasFlowDiagnosticService:
             sorted(central_detail.items(), key=lambda item: (-item[1], item[0]))[:MAX_CENTRAL_DETAIL_ROWS]
         ]
         stages = {
-            "customer_total": customer_total,
+            # Review P1-6:SQL 池计数不得冒充权威客户计数(权威计数在 growth.customer_count)
+            "pool_counts_available": not pool_failed,
+            "crawl_status_available": not crawl_failed,
+            "pool_scope_total": pool_scope_total,
             "not_closed": not_closed,
-            "closed_standard": sync_counts.get("1", 0),
-            "closed_no_same": sync_counts.get("2", 0),
+            "closed_standard": closed_standard,
+            "closed_no_same": closed_no_same,
             "no_commodity_list": no_commodity_list,
             "crawl_status_1": crawl1_total,
             "crawl_status_2": crawl2_total,
             "crawl_status_other": crawl_other,
             "grace_seconds": self._grace_seconds,
-            "crawler_branch": {name: counts[name] for name in CRAWLER_BRANCH_CLASSES},
-            "downstream_branch": {name: counts[name] for name in DOWNSTREAM_BRANCH_CLASSES},
+            "crawler_branch": crawler_counts,
+            "downstream_branch": downstream_counts,
             "callback_done_no_search_within_grace": callback_no_search_within_grace,
             "reference_pending_approval_total": reference_pending_total,
             "central_status_detail": detail,
@@ -761,9 +823,15 @@ def _batch_from_task_id(task_id: str) -> str:
     return "_".join(parts[:2])
 
 
-def _dominant_stage(counts: Mapping[str, int], no_commodity_list: int) -> dict[str, Any] | None:
-    candidates = {**{k: v for k, v in counts.items() if k != "EVIDENCE_INCOMPLETE"},
-                  "NO_COMMODITY_LIST": no_commodity_list}
+def _dominant_stage(crawler_counts: Mapping[str, int], downstream_counts: Mapping[str, int],
+                    no_commodity_list: int | None) -> dict[str, Any] | None:
+    candidates: dict[str, int] = {}
+    for counts in (crawler_counts, downstream_counts):
+        for key, value in counts.items():
+            if key != "EVIDENCE_INCOMPLETE":
+                candidates[key] = value
+    if no_commodity_list:
+        candidates["NO_COMMODITY_LIST"] = no_commodity_list
     best_key = max(sorted(candidates), key=lambda key: candidates[key]) \
         if any(candidates.values()) else None
     if not best_key:

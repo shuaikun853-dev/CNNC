@@ -6,9 +6,13 @@
 //         在途 poll 去重,人工刷新不产生重复轮询链。
 // 覆盖 Independent Review Fix Round 2:
 //   P3    恢复时间线 signature 的安全渲染(safeProgressText)。
-// 被测对象:app/static/dashboard/app.js 暴露的 createPollController / safeProgressText。
+// 覆盖 SaaS Flow Diagnostic Review Fix Round 1:
+//   P1-4  SaaS Flow 独立轮询生命周期:summary 连续 304 仍按 ~60s 周期刷新;
+//         hidden 停止、visible 立即补刷;与 summary ETag/304 生命周期解耦。
+// 被测对象:app/static/dashboard/app.js 暴露的 createPollController /
+// createSaasFlowPoller / safeProgressText。
 const path = require("path");
-const { createPollController, safeProgressText } = require(
+const { createPollController, createSaasFlowPoller, safeProgressText } = require(
   path.join(__dirname, "..", "..", "app", "static", "dashboard", "app.js"));
 
 let failed = 0;
@@ -177,6 +181,84 @@ function test_safe_progress_text() {
         safeProgressText([Infinity, 1, 1, 1, 1, 1]) === "—");
 }
 
+// ---- SaaS Flow Diagnostic Review Fix P1-4:独立轮询生命周期 ----
+
+function makeSfHarness(clock) {
+  const polls = [];
+  const counters = { poll: 0 };
+  const deps = {
+    visible: () => true,
+    setTimeout: clock.setTimeout,
+    clearTimeout: clock.clearTimeout,
+    intervalMs: 60000,
+    poll: () => { counters.poll += 1; const d = deferred(); polls.push(d); return d.promise; },
+  };
+  return { polls, counters, deps };
+}
+
+async function test_sf_polls_independently_of_summary_304() {
+  const h = makeHarness();            // summary 控制器(5s 延迟)
+  const clock = h.clock;
+  const sf = makeSfHarness(clock);    // 共享同一 fake clock,60s 周期
+  const sfPoller = createSaasFlowPoller(sf.deps);
+  const ctl = createPollController(h.deps);
+
+  sfPoller.run();
+  ctl.run();
+  await sf.polls[0].resolve({ ok: true });
+  await h.polls[0].resolve({ status: 200, payload: { generated_at: "t0" } });
+  await flush();
+
+  let resolvedSummary = 1;
+  let resolvedSf = 1;
+  // 推进 125 秒:summary 全程 304(数据指纹不变),SaaS Flow 必须仍按自身周期刷新
+  for (let i = 0; i < 25; i += 1) {
+    clock.advance(5000);
+    while (resolvedSummary < h.polls.length) { h.polls[resolvedSummary].resolve({ status: 304 }); resolvedSummary += 1; }
+    while (resolvedSf < sf.polls.length) { sf.polls[resolvedSf].resolve({ ok: true }); resolvedSf += 1; }
+    await flush();
+  }
+  check("P1-4 summary 连续 304 不再重渲染", h.counters.content === 1, JSON.stringify(h.counters));
+  check("P1-4 SaaS Flow 120+ 秒内独立刷新 >=3 次", sf.counters.poll >= 3, JSON.stringify(sf.counters));
+  check("P1-4 SaaS Flow 只有一条排程链", clock.pending() === 2);  // summary 5s + sf 60s 各一个 timer
+}
+
+async function test_sf_hidden_pauses_and_visible_resumes() {
+  const clock = makeClock();
+  const sf = makeSfHarness(clock);
+  let visible = true;
+  sf.deps.visible = () => visible;
+  const sfPoller = createSaasFlowPoller(sf.deps);
+  sfPoller.run();
+  await sf.polls[0].resolve({ ok: true });
+  await flush();
+  check("P1-4 SaaS Flow 可见时排下一次 60s", clock.pending() === 1);
+  visible = false;
+  sfPoller.onHidden();
+  check("P1-4 hidden 清除 SaaS Flow timer", clock.pending() === 0);
+  clock.advance(600000);
+  check("P1-4 hidden 期间 SaaS Flow 不轮询", sf.counters.poll === 1, JSON.stringify(sf.counters));
+  visible = true;
+  sfPoller.onVisible();
+  check("P1-4 回前台立即补刷 SaaS Flow", sf.counters.poll === 2);
+  await sf.polls[1].resolve({ ok: true });
+  await flush();
+  check("P1-4 补刷后恢复排程", clock.pending() === 1);
+}
+
+async function test_sf_inflight_dedup() {
+  const clock = makeClock();
+  const sf = makeSfHarness(clock);
+  const sfPoller = createSaasFlowPoller(sf.deps);
+  sfPoller.run();
+  sfPoller.run();  // 在途时重复触发
+  await flush();
+  check("P1-4 SaaS Flow 在途 poll 去重", sf.counters.poll === 1, JSON.stringify(sf.counters));
+  await sf.polls[0].resolve({ ok: true });
+  await flush();
+  check("P1-4 完成后仅一条排程链", clock.pending() === 1);
+}
+
 (async () => {
   await test_304_keeps_sync_fresh_without_rerender();
   await test_hidden_pauses_and_visible_resumes();
@@ -184,6 +266,9 @@ function test_safe_progress_text() {
   await test_no_duplicate_poll_chains();
   await test_offline_retry_then_recover();
   test_safe_progress_text();
+  await test_sf_polls_independently_of_summary_304();
+  await test_sf_hidden_pauses_and_visible_resumes();
+  await test_sf_inflight_dedup();
   if (failed === 0) { console.log("ALL PASS"); process.exit(0); }
   console.error(failed + " failing checks");
   process.exit(1);
