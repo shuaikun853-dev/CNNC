@@ -66,6 +66,15 @@ class AuthoritativeSnapshot:
     source_label: str | None = None
 
 
+@dataclass(frozen=True)
+class LiveSourceCounts:
+    """R3 BUG A:Dashboard 实时 count-only 读数(单页 limit=1,零分页、零 rows)。"""
+
+    observed_at_utc: datetime
+    saas_count: int
+    customer_count: int
+
+
 class SnapshotFetchExhausted(RuntimeError):
     def __init__(
         self,
@@ -404,6 +413,44 @@ class CnncSaasSnapshotAdapter:
             customer_count=customer_count,
             page_evidence=(*saas_pages, *customer_pages),
             source_label=source_label,
+        )
+
+    def fetch_counts(self, *, max_elapsed_seconds: float | None = None) -> LiveSourceCounts:
+        """R3 BUG A:轻量 count-only 读取(page=1 limit=1,读 response.count)。
+
+        复用 fetch() 的全部契约:endpoint/scope 校验、SaaS auth 只读路径、
+        有限 retry(max_attempts_per_page)与绝对 deadline;绝不翻页、不收集
+        rows——Dashboard 每 ~60 秒刷新只需要两个数字。失败抛类型化异常
+        (SnapshotFetchExhausted / RuntimeError / ValueError),由调用方降级为
+        unavailable,绝不冒充 0。
+        """
+        if max_elapsed_seconds is not None:
+            try:
+                max_elapsed_seconds = float(max_elapsed_seconds)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("max_elapsed_seconds must be positive and finite") from exc
+            if not math.isfinite(max_elapsed_seconds) or max_elapsed_seconds <= 0:
+                raise ValueError("max_elapsed_seconds must be positive and finite")
+        saas_body, customer_body = self._validate_scope()
+        started_at = self._monotonic()
+        deadline = started_at + min(
+            self.policy.max_elapsed_seconds,
+            max_elapsed_seconds or self.policy.max_elapsed_seconds,
+        )
+        saas_payload = self._request_page(
+            "saas", 1, self._saas_config,
+            {**saas_body, "page": 1, "limit": 1}, deadline, started_at,
+        )
+        saas_count = self._count_from_response(saas_payload, "saas")
+        customer_payload = self._request_page(
+            "customer", 1, self._customer_config,
+            {**customer_body, "page": 1, "limit": 1}, deadline, started_at,
+        )
+        customer_count = self._count_from_response(customer_payload, "customer")
+        return LiveSourceCounts(
+            observed_at_utc=datetime.now(timezone.utc),
+            saas_count=saas_count,
+            customer_count=customer_count,
         )
 
 

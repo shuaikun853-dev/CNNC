@@ -33,6 +33,7 @@ from typing import Any, Callable, Mapping, Sequence
 
 from app.services.incremental_audit_runtime import (
     DEFAULT_RUNTIME_ROOT,
+    PROJECT_DATA_ROOT,
     SHANGHAI,
     cutoff_for_business_date,
     runtime_paths,
@@ -59,6 +60,11 @@ MAX_CRAWL1_EXECUTION_NUMBERS = 2000  # 有界:单轮 callback 查询 execution_n
 # R2 Review P2:all_batches 独立硬上限(与 commodities/executions 同为 fail-safe 有界),
 # 防止多 batch 商品放大 WHERE batch_num IN (...);截断按 item 级降级,见 _build_stages。
 MAX_CRAWL1_BATCHES = 2000
+
+# R3 BUG A(2026-08-28):Dashboard 顶部实时读数走独立 count-only 只读链
+# (CnncSaasSnapshotAdapter.fetch_counts,page=1 limit=1,零分页);每次 fresh build
+# 最多一轮,失败绝不冒充 0,也绝不拖累 DB stages。wall timeout 取 10~15s 量级。
+DEFAULT_LIVE_COUNTS_TIMEOUT_SECONDS = 12.0
 
 DEFAULT_DB_ENV_PATH = Path(__file__).resolve().parents[2] / "data" / "CNNC_DIAG_DB.env"
 
@@ -777,6 +783,7 @@ class SaasFlowDiagnosticService:
         cache_ttl_seconds: float = DEFAULT_CACHE_TTL_SECONDS,
         fresh_read_min_interval_seconds: float = DEFAULT_FRESH_READ_MIN_INTERVAL_SECONDS,
         now_fn: Callable[[], datetime] | None = None,
+        live_counts_fetcher: Callable[[], Mapping[str, Any]] | None = None,
     ) -> None:
         self._config = config
         self._connection_factory = connection_factory or _default_connection_factory
@@ -786,6 +793,7 @@ class SaasFlowDiagnosticService:
         self._cache_ttl_seconds = float(cache_ttl_seconds)
         self._fresh_min_interval = float(fresh_read_min_interval_seconds)
         self._now_fn = now_fn or (lambda: datetime.now(UTC))
+        self._live_counts_fetcher = live_counts_fetcher
         self._cache: dict[str, tuple[float, dict[str, Any]]] = {}
         self._last_fresh_read_at = -float("inf")
         # single-flight:同一时间只允许一个 fresh DB diagnostic build;
@@ -840,6 +848,9 @@ class SaasFlowDiagnosticService:
             "configured": self._config is not None,
             "cached": False,
             "rate_limited": False,
+            # R3 BUG A:每次 fresh build 恰好一轮 count-only 实时读取;缓存命中
+            # 直接复用 payload(含上轮 live_counts),绝不重复打 live API。
+            "live_counts": self._build_live_counts(),
             "growth": self._build_growth(business_date),
             "stages": None,
             "degraded_queries": [],
@@ -895,6 +906,33 @@ class SaasFlowDiagnosticService:
             }
         return evaluate_growth(result["observations"], business_date=business_date,
                                now=self._now_fn())
+
+    def _build_live_counts(self) -> dict[str, Any]:
+        """R3 BUG A:实时 count-only 读数的独立降级边界。
+
+        失败/未配置 → available=False 且计数为 None(绝不冒充 0,也绝不拖累
+        DB stages / growth);错误只保留安全异常类型名,不带消息、凭据或路径。
+        """
+        unavailable: dict[str, Any] = {
+            "available": False, "customer_count": None, "saas_count": None,
+            "observed_at": None,
+        }
+        if self._live_counts_fetcher is None:
+            return {**unavailable, "error": {"type": "NOT_CONFIGURED"}}
+        try:
+            counts = dict(self._live_counts_fetcher() or {})
+            if counts.get("available") is True:
+                return {
+                    "available": True,
+                    "customer_count": int(counts["customer_count"]),
+                    "saas_count": int(counts["saas_count"]),
+                    "observed_at": counts.get("observed_at"),
+                }
+            error = counts.get("error") or {}
+            return {**unavailable,
+                    "error": {"type": str(error.get("type") or "UNAVAILABLE")}}
+        except Exception as exc:  # 实时链失败只降级本字段
+            return {**unavailable, "error": {"type": type(exc).__name__}}
 
     def _query(self, connection: Any, name: str, params: dict[str, Any]) -> list[dict[str, Any]]:
         sql = DIAG_SQL_REGISTRY[name]
@@ -1133,6 +1171,12 @@ class SaasFlowDiagnosticService:
             "not_closed": not_closed,
             "closed_standard": closed_standard,
             "closed_no_same": closed_no_same,
+            # R3 BUG B:显式派生收口拆分(71 = 21 已收口 + 50 未收口),
+            # 禁止前端用 pool_scope_total - not_closed 残差冒充"已最终收口";
+            # 未知 IS_SYNC_STANDARD 值单独计入 pool_state_other,fail-safe 可见。
+            "closed_total": None if pool_failed else (closed_standard + closed_no_same),
+            "pool_state_other": None if pool_failed else (
+                pool_scope_total - not_closed - closed_standard - closed_no_same),
             # R3:routing 层权威基数(routing query 单语句自洽,不依赖 pool 时点)
             "routing_open_total": routing_open_total,
             "no_commodity_list": no_commodity_list,
@@ -1204,11 +1248,38 @@ def _env_float(name: str, default: float, minimum: float) -> float:
     return max(minimum, value)
 
 
+def default_live_counts_fetcher(data_root: Path | str | None = None) -> dict[str, Any]:
+    """R3 BUG A 默认实时读取器:复用 PriceAudit 同一权威 curl 配置。
+
+    - 配置来源:data/latest_saas_sameAudit_queryAll.curl + data/latest_cnnc_query.curl
+      (gitignored,绝不复制进 Git/日志/API;缺失 → CONFIG_MISSING 快速返回);
+    - count-only(page=1 limit=1,零分页),绝对 deadline 12 秒;
+    - SaaS 侧沿用 AuthManager 只读请求路径;返回值只含 count/时间,无凭据。
+    """
+    from app.services.cnnc_saas_snapshot_adapter import CnncSaasSnapshotAdapter
+    from scripts.auth_manager import AuthManager
+
+    root = Path(data_root) if data_root is not None else PROJECT_DATA_ROOT
+    saas_curl = root / "latest_saas_sameAudit_queryAll.curl"
+    customer_curl = root / "latest_cnnc_query.curl"
+    if not saas_curl.is_file() or not customer_curl.is_file():
+        return {"available": False, "customer_count": None, "saas_count": None,
+                "observed_at": None, "error": {"type": "CONFIG_MISSING"}}
+    adapter = CnncSaasSnapshotAdapter(saas_curl, customer_curl,
+                                       auth_manager=AuthManager())
+    counts = adapter.fetch_counts(
+        max_elapsed_seconds=DEFAULT_LIVE_COUNTS_TIMEOUT_SECONDS)
+    return {"available": True, "customer_count": counts.customer_count,
+            "saas_count": counts.saas_count,
+            "observed_at": counts.observed_at_utc.isoformat(timespec="seconds")}
+
+
 def get_saas_flow_diagnostic(business_date: str, *, force_refresh: bool = False) -> dict[str, Any]:
     global _SERVICE_SINGLETON
     if _SERVICE_SINGLETON is None:
         _SERVICE_SINGLETON = SaasFlowDiagnosticService(
             config=resolve_diag_db_config(),
+            live_counts_fetcher=default_live_counts_fetcher,
             cache_ttl_seconds=_env_float("CNNC_DIAG_CACHE_SECONDS",
                                          DEFAULT_CACHE_TTL_SECONDS, MIN_CACHE_TTL_SECONDS),
             fresh_read_min_interval_seconds=_env_float(

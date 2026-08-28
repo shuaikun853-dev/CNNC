@@ -80,7 +80,8 @@ _DEFAULT_CONFIG = object()  # sentinel:区分“未传 config”与“显式传 
 
 
 def make_service(canned: dict, *, config=_DEFAULT_CONFIG, clock=None, runtime_root=None,
-                 grace_seconds=1800, ttl=60.0, fresh_min_interval=30.0, now_fn=None):
+                 grace_seconds=1800, ttl=60.0, fresh_min_interval=30.0, now_fn=None,
+                 live_fetcher=None):
     clock = clock or FakeClock()
     executed: list = []
     conn = FakeConnection(canned, executed)
@@ -102,6 +103,7 @@ def make_service(canned: dict, *, config=_DEFAULT_CONFIG, clock=None, runtime_ro
         cache_ttl_seconds=ttl,
         fresh_read_min_interval_seconds=fresh_min_interval,
         now_fn=now_fn,
+        live_counts_fetcher=live_fetcher,
     )
     return service, executed, calls
 
@@ -2395,4 +2397,171 @@ def test_r2_dominant_uses_new_crawler_states():
     })
     stages = service.get_diagnostic("2026-08-27")["stages"]
     assert stages["dominant_stage"]["key"] == "CALLBACK_IN_FLIGHT"
-    assert stages["dominant_stage"]["label_zh"] == "回调进行中"
+
+
+# ===========================================================================
+# Round 3(2026-08-28)
+#   BUG A:顶部实时数冒用历史 observation snapshot(growth.customer_count);
+#         新增 live_counts(count-only 独立只读链),增长序列原样保留。
+#   BUG B:商品池数量视觉闭合(closed_total / pool_state_other 后端派生)。
+# ===========================================================================
+
+def _live_payload(customer=66, saas=0):
+    return {"available": True, "customer_count": customer, "saas_count": saas,
+            "observed_at": "2026-08-28T06:30:00+00:00"}
+
+
+def test_r3_live_counts_included_on_fresh_build(tmp_path):
+    """A5:live fetcher 的 count 进入 payload.live_counts;DB stages 不受影响;
+    历史增长序列独立(live 可用而本地无观察时 growth 明确 NO_OBSERVATIONS)。"""
+    service, _, _ = make_service(dict(FULL_CANNED), runtime_root=tmp_path,
+                                 now_fn=lambda: BEFORE_CUTOFF,
+                                 live_fetcher=lambda: _live_payload())
+    payload = service.get_diagnostic("2026-08-27")
+    assert payload["status"] == "ok"
+    assert payload["live_counts"]["available"] is True
+    assert payload["live_counts"]["customer_count"] == 66
+    assert payload["live_counts"]["saas_count"] == 0
+    assert payload["live_counts"]["observed_at"]
+    # 历史增长序列原样保留且与实时数分离:本地无观察 ≠ 客户 0/66
+    assert payload["growth"]["available"] is False
+    assert payload["growth"]["evaluation_reason"] == "NO_OBSERVATIONS"
+    assert payload["stages"]["crawler_branch"]["CALLBACK_IN_FLIGHT"] == 1
+
+
+def test_r3_live_counts_cached_response_does_not_refetch():
+    """A7:缓存命中(≤60s TTL)不重复打 live API;缓存里保留上次 live 读数。"""
+    calls = []
+
+    def fetcher():
+        calls.append(1)
+        return _live_payload()
+
+    clock = FakeClock()
+    service, _, _ = make_service(dict(FULL_CANNED), clock=clock, live_fetcher=fetcher)
+    first = service.get_diagnostic("2026-08-27")
+    clock.advance(30.0)  # TTL 内
+    second = service.get_diagnostic("2026-08-27")
+    assert first["cached"] is False and second["cached"] is True
+    assert len(calls) == 1
+    assert second["live_counts"]["customer_count"] == 66
+
+
+def test_r3_live_counts_failure_degrades_not_zero():
+    """A6(service 级):live 失败 → available=False、计数 None(绝不冒充 0),
+    stages 照常;错误只含安全异常类型名。"""
+    def boom():
+        raise RuntimeError("network down")
+
+    service, _, _ = make_service(dict(FULL_CANNED), live_fetcher=boom)
+    payload = service.get_diagnostic("2026-08-27")
+    live = payload["live_counts"]
+    assert live["available"] is False
+    assert live["customer_count"] is None and live["saas_count"] is None
+    assert live["observed_at"] is None
+    assert live["error"] == {"type": "RuntimeError"}
+    assert payload["status"] == "ok"
+    assert payload["stages"]["crawler_branch"]["CALLBACK_IN_FLIGHT"] == 1
+
+
+def test_r3_live_counts_without_fetcher_unavailable_not_fake_zero():
+    """未注入 live fetcher → 明确 unavailable,不是客户 0/SaaS 0。"""
+    service, _, _ = make_service(dict(FULL_CANNED))
+    live = service.get_diagnostic("2026-08-27")["live_counts"]
+    assert live["available"] is False
+    assert live["customer_count"] is None and live["saas_count"] is None
+
+
+def test_r3_live_counts_attempted_even_when_db_unconfigured():
+    """DB 未配置时 live_counts 仍独立可得(两条链互不拖累)。"""
+    service, _, _ = make_service({}, config=None, live_fetcher=lambda: _live_payload())
+    payload = service.get_diagnostic("2026-08-27")
+    assert payload["status"] == "unconfigured"
+    assert payload["live_counts"]["available"] is True
+    assert payload["live_counts"]["customer_count"] == 66
+
+
+def test_r3_default_live_fetcher_unavailable_when_curl_config_missing(tmp_path):
+    """A6(默认 fetcher):生产 ignored curl 配置缺失 → available=False 快速返回。"""
+    result = diag.default_live_counts_fetcher(data_root=tmp_path)
+    assert result["available"] is False
+    assert result["customer_count"] is None and result["saas_count"] is None
+    assert result["error"]["type"] == "CONFIG_MISSING"
+
+
+def test_r3_endpoint_live_counts_and_failure_scope(client, monkeypatch, tmp_path):
+    """A6(endpoint 级):live 失败 → 200 + live_counts.available=False + stages 正常。"""
+    import app.services.saas_flow_diagnostic as mod
+
+    def boom():
+        raise RuntimeError("live endpoint down")
+
+    service, _, _ = make_service(dict(FULL_CANNED), runtime_root=tmp_path,
+                                 live_fetcher=boom)
+    monkeypatch.setattr(mod, "_SERVICE_SINGLETON", service)
+    r = client.get("/dashboard/api/saas-flow?date=2026-08-27")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["live_counts"]["available"] is False
+    assert body["live_counts"]["customer_count"] is None
+    assert body["stages"]["crawler_branch"]["CALLBACK_IN_FLIGHT"] == 1
+    assert body["growth"]["available"] is False  # 历史序列仍在且未被实时数污染
+
+
+def test_r3_endpoint_live_counts_served_on_success(client, monkeypatch):
+    import app.services.saas_flow_diagnostic as mod
+
+    service, _, _ = make_service(dict(FULL_CANNED), live_fetcher=lambda: _live_payload(66, 0))
+    monkeypatch.setattr(mod, "_SERVICE_SINGLETON", service)
+    r = client.get("/dashboard/api/saas-flow?date=2026-08-27")
+    assert r.status_code == 200
+    live = r.json()["live_counts"]
+    assert live["available"] is True and live["customer_count"] == 66 and live["saas_count"] == 0
+
+
+# ---- R3 BUG B:pool closure 派生字段 ----
+
+def _pool_canned(sync_rows):
+    return {
+        "pool_sync_standard_counts": sync_rows,
+        "open_crawl_status_counts": [(50, 1, 0, 49, 0)],
+        "crawl1_commodity_rows": [],
+        "crawl2_search_flags": [(21, 0, "2026-08-27 09:00:00", 0, 0, 0, 0, 0, 0, 0, 0, 0)] * 49,
+    }
+
+
+def test_r3_pool_closure_fields_derived():
+    """B1:71=50 未收口 + 15 closed_standard + 6 closed_no_same → closed_total=21,other=0。"""
+    service, _, _ = make_service(_pool_canned([("0", 50), ("1", 15), ("2", 6)]))
+    stages = service.get_diagnostic("2026-08-27")["stages"]
+    assert stages["pool_scope_total"] == 71
+    assert stages["not_closed"] == 50
+    assert stages["closed_total"] == 21
+    assert stages["pool_state_other"] == 0
+
+
+def test_r3_unknown_pool_state_not_folded_into_closed():
+    """B5:未知 IS_SYNC_STANDARD 值单独进 pool_state_other,不得并入已最终收口。"""
+    service, _, _ = make_service(
+        _pool_canned([("0", 50), ("1", 15), ("2", 6), ("3", 2)]))
+    stages = service.get_diagnostic("2026-08-27")["stages"]
+    assert stages["pool_scope_total"] == 73
+    assert stages["closed_total"] == 21
+    assert stages["pool_state_other"] == 2
+
+
+def test_r3_pool_failure_closure_fields_none_not_zero():
+    """pool 查询失败 → 派生字段 None,不冒充 0。"""
+    def pool_raises(params):
+        raise RuntimeError("pool timeout")
+
+    service, _, _ = make_service({
+        "pool_sync_standard_counts": pool_raises,
+        "open_crawl_status_counts": [(50, 1, 0, 49, 0)],
+        "crawl1_commodity_rows": [],
+        "crawl2_search_flags": [],
+    })
+    stages = service.get_diagnostic("2026-08-27")["stages"]
+    assert stages["closed_total"] is None
+    assert stages["pool_state_other"] is None
+    assert stages["pool_counts_available"] is False

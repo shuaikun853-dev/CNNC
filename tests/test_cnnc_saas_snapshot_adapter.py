@@ -312,3 +312,82 @@ def test_serialization_contract_preserves_order_and_duplicates():
 
     assert saas == {"rspCode": "0000", "count": 2, "rows": [{"vCommodityId": "a"}, {"vCommodityId": "a"}], "success": True}
     assert customer == {"rspCode": "0000", "count": 1, "rows": [{"documentId": "c"}], "success": True}
+
+
+# ---- R3 BUG A:Dashboard live count-only 契约(单页、limit=1、零分页) ----
+
+def test_fetch_counts_single_page_per_side_with_limit_one():
+    """A1/A2/A5:count-only 每侧只请求 page=1 limit=1,count 来自 response.count,
+    绝不因 count > 返回行数而翻页。"""
+    adapter, opener = _adapter(
+        [_ok([{"vCommodityId": "a"}], 66), _ok([{"documentId": "c"}], 3)])
+
+    counts = adapter.fetch_counts()
+
+    assert (counts.saas_count, counts.customer_count) == (66, 3)
+    assert len(opener.requests) == 2  # 每侧恰好一页,零翻页
+    bodies = [json.loads(r.data.decode("utf-8")) for r in opener.requests]
+    assert [(b["page"], b["limit"]) for b in bodies] == [(1, 1), (1, 1)]
+    assert bodies[0]["tenantId"] == "188605" and bodies[0]["commodityPoolId"] == "222"
+    assert bodies[1]["sassCheckStatuss"] == ["0"]
+    assert counts.observed_at_utc is not None
+
+
+def test_fetch_counts_scope_mismatch_fails_before_network():
+    """A3/A4:count-only 同样先过 scope 校验,不放松 endpoint/filter 契约。"""
+    opener = _Opener([])
+    adapter = CnncSaasSnapshotAdapter(
+        _saas_config(tenantId="other"),
+        _customer_config(sassCheckStatuss=["1", "0"]),
+        opener=opener,
+    )
+
+    with pytest.raises(ValueError, match="tenant"):
+        adapter.fetch_counts()
+
+    assert opener.requests == []
+
+
+def test_fetch_counts_transport_failure_is_typed_and_bounded():
+    """live count 失败必须是类型化异常且尝试次数有界(无翻页、无无限 retry)。"""
+    adapter, opener = _adapter([TimeoutError("one"), TimeoutError("two"), TimeoutError("three")])
+
+    with pytest.raises(SnapshotFetchExhausted) as caught:
+        adapter.fetch_counts(max_elapsed_seconds=12)
+
+    assert caught.value.side == "saas" and caught.value.page == 1
+    assert len(opener.requests) == 3  # 受 max_attempts_per_page 约束
+
+
+def test_fetch_counts_deadline_exhaustion_makes_no_request():
+    """绝对 deadline 已过时零请求快速失败(wall timeout 独立、有限)。"""
+    ticks = iter((0.0, 20.0))  # started_at=0,deadline=10;_request_page 首读 20 → 已过期
+    adapter, opener = _adapter(
+        [], monotonic=lambda: next(ticks), policy=SnapshotFetchPolicy(max_elapsed_seconds=10))
+
+    with pytest.raises(SnapshotFetchExhausted):
+        adapter.fetch_counts(max_elapsed_seconds=12)
+
+    assert opener.requests == []
+
+
+def test_fetch_counts_reuses_auth_manager_read_only_saas_path():
+    """SaaS 侧 count-only 仍走 auth_manager 只读请求路径。"""
+    class _AuthManager:
+        def __init__(self):
+            self.calls = []
+
+        def request_json(self, system, request_factory, **kwargs):
+            request = request_factory()
+            self.calls.append((system, json.loads(request.data.decode("utf-8")), kwargs))
+            return _ok([], 0)
+
+    auth_manager = _AuthManager()
+    adapter, opener = _adapter([_ok([], 5)], auth_manager=auth_manager)
+
+    counts = adapter.fetch_counts()
+
+    assert counts.customer_count == 5
+    assert auth_manager.calls[0][0] == "saas"
+    assert auth_manager.calls[0][2]["read_only"] is True
+    assert len(opener.requests) == 1  # customer 直连

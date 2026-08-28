@@ -313,6 +313,58 @@
     return SF_GROWTH_LABELS[g.state] || g.state || "—";
   }
 
+  // R3 BUG A:用户可见观察时间统一 Asia/Shanghai(UTC+8 固定偏移,无夏令时)。
+  // 后端持久化/返回的都是显式 UTC ISO-8601(带 +00:00);禁止 replace("T"," ")
+  // .slice() 把 UTC 外观冒充北京时间。
+  function formatShanghaiDateTime(iso) {
+    if (!iso) return "—";
+    const parsed = new Date(iso);
+    if (isNaN(parsed.getTime())) return "—";
+    const shifted = new Date(parsed.getTime() + 8 * 60 * 60 * 1000);
+    const pad = (n) => (n < 10 ? "0" + n : String(n));
+    return shifted.getUTCFullYear() + "-" + pad(shifted.getUTCMonth() + 1) + "-" +
+      pad(shifted.getUTCDate()) + " " + pad(shifted.getUTCHours()) + ":" +
+      pad(shifted.getUTCMinutes()) + ":" + pad(shifted.getUTCSeconds());
+  }
+
+  // R3 BUG A:顶部 chips 只用 live_counts(当前只读接口数);增长状态仍来自
+  // 历史权威观察序列。live 不可用必须显式"暂不可用",绝不 fallback 到历史快照数。
+  function sfChipsText(live, growth, stages) {
+    const l = live || {};
+    const ok = l.available === true && l.customer_count != null && l.saas_count != null;
+    return [
+      "客户实时 " + (ok ? Number(l.customer_count) : "暂不可用"),
+      "SaaS实时 " + (ok ? Number(l.saas_count) : "暂不可用"),
+      "增长状态 " + sfGrowthText(growth),
+      "主等待阶段 " + (stages && stages.dominant_stage ? stages.dominant_stage.label_zh : "—"),
+    ].join(" · ");
+  }
+
+  // R3 BUG A:历史增量审计观察说明(与顶部实时读数分离);时间统一上海时区。
+  function sfGrowthHistoryText(g) {
+    if (!g) return "";
+    const reason = g.evaluation_reason || "";
+    if (reason === "OBSERVATION_READ_FAILED") {
+      return "权威观察读取失败,增长判断暂不可用(本地状态文件异常;约 60 秒后自动重试)。";
+    }
+    if (reason === "NO_OBSERVATIONS") {
+      return "今日暂无权威观察(增量审计发现尚未运行),增长判断待首次快照后可用。";
+    }
+    if (reason === "INSUFFICIENT_OBSERVATIONS") {
+      return "今日权威观察仅 " + (g.observation_count ?? 0) +
+        " 次,需至少两次才能判断增长分叉;最近一次:客户 " + (g.customer_count ?? "—") +
+        ",SaaS " + (g.saas_count ?? "—") + "。";
+    }
+    if (g.available) {
+      let text = "今日增量审计权威观察 " + (g.observation_count ?? 0) + " 次;最近快照 " +
+        formatShanghaiDateTime(g.last_observed_at) +
+        ":客户 " + (g.customer_count ?? "—") + ",SaaS " + (g.saas_count ?? "—");
+      if (g.evaluated) text += ";本轮 客户 " + (g.customer_delta ?? 0) + " / SaaS " + (g.saas_delta ?? 0);
+      return text + "。";
+    }
+    return "本地暂无今日权威观察序列,增长分叉判断不可用。";
+  }
+
   // R3 P2:partial 顶部 notice 三态——查询失败 / 取证漂移 / 两者都有;
   // 纯函数 seam(tests/js 直接驱动),绝不出现"部分查询失败:;"空列表文案。
   function sfPartialNotice(degradedQueries, snapshotDrift) {
@@ -329,13 +381,7 @@
 
   function renderSaasFlow(p) {
     const g = p.growth || {};
-    const chips = [
-      "客户 " + (g.customer_count ?? "—"),
-      "SaaS " + (g.saas_count ?? "—"),
-      "增长状态 " + sfGrowthText(g),
-      "主等待阶段 " + (p.stages && p.stages.dominant_stage ? p.stages.dominant_stage.label_zh : "—"),
-    ];
-    $("#sf-chips").textContent = chips.join(" · ");
+    $("#sf-chips").textContent = sfChipsText(p.live_counts, g, p.stages);
     const notice = $("#sf-notice");
     const driftList = (p.stages && p.stages.snapshot_drift) || [];
     if (p.status === "unconfigured") {
@@ -350,32 +396,19 @@
       notice.textContent = "";
     }
     const growthBox = $("#sf-growth");
-    const reason = g.evaluation_reason || "";
-    if (reason === "OBSERVATION_READ_FAILED") {
-      growthBox.textContent = "权威观察读取失败,增长判断暂不可用(本地状态文件异常;约 60 秒后自动重试)。";
-    } else if (reason === "NO_OBSERVATIONS") {
-      growthBox.textContent = "今日暂无权威观察(增量审计发现尚未运行),增长判断待首次快照后可用。";
-    } else if (reason === "INSUFFICIENT_OBSERVATIONS") {
-      growthBox.textContent = "今日权威观察仅 " + (g.observation_count ?? 0) +
-        " 次,需至少两次才能判断增长分叉;最近一次:客户 " + (g.customer_count ?? "—") +
-        ",SaaS " + (g.saas_count ?? "—") + "。";
-    } else if (g.available) {
-      let text = "今日权威观察 " + (g.observation_count ?? 0) + " 次;最近一次 " +
-        (g.last_observed_at ? String(g.last_observed_at).replace("T", " ").slice(0, 19) : "—") +
-        ":客户 " + (g.customer_count ?? "—") + ",SaaS " + (g.saas_count ?? "—");
-      if (g.evaluated) text += ";本轮 客户 " + (g.customer_delta ?? 0) + " / SaaS " + (g.saas_delta ?? 0);
-      growthBox.textContent = text;
-      if (g.state === "LAG_WATCH" || g.state === "LAG_PERSISTING") {
-        const dist = sfTopStages(p.stages, 4);
-        growthBox.textContent += "。客户侧仍在新增,但 SaaS 数量本轮未增长;当前未收口链路主要分布于:" +
-          (dist.length ? dist.join("、") : "证据不足") + "。";
-      }
-    } else {
-      growthBox.textContent = "本地暂无今日权威观察序列,增长分叉判断不可用。";
+    growthBox.textContent = sfGrowthHistoryText(g);
+    if (g.available && (g.state === "LAG_WATCH" || g.state === "LAG_PERSISTING")) {
+      const dist = sfTopStages(p.stages, 4);
+      growthBox.textContent += "。客户侧仍在新增,但 SaaS 数量本轮未增长;当前未收口链路主要分布于:" +
+        (dist.length ? dist.join("、") : "证据不足") + "。";
     }
     $("#sf-tree").innerHTML = sfTreeHtml(p.stages);
     $("#sf-evidence").innerHTML = sfEvidenceHtml(p);
-    $("#sf-meta").textContent = p.cached ? "缓存结果(≤60 秒)" : "实时查询";
+    const live = p.live_counts || {};
+    $("#sf-meta").textContent = (p.cached ? "缓存结果(≤60 秒)" : "实时查询") +
+      (live.available
+        ? " · 实时计数 " + formatShanghaiDateTime(live.observed_at)
+        : " · 实时计数暂不可用");
   }
 
   function sfStageLine(label, count, extra) {
@@ -401,19 +434,44 @@
       ? "其中 " + stages.callback_done_no_search_within_grace + " 个在回调宽限期(" +
         Math.round((stages.grace_seconds || 0) / 60) + " 分钟)内" : "";
     // Review P1-6:SQL 池计数不是权威客户计数,只称"当日商品池记录";
-    // 权威客户/SaaS 数量只来自 growth.customer_count / growth.saas_count。
-    // UI Hotfix P1:routing_evidence_incomplete 是 fail-safe 证据分类(同一商品
-    // 多条 commodity_list、无法可靠选择 current row),不是业务故障;数量 > 0
-    // 必须可见,且不得计入 crawl_status_1/2 或正常分支。
+    // 权威客户/SaaS 数量只来自 live_counts(顶部 chips)与历史权威观察。
+    // R3 BUG B:商品池数量必须视觉闭合(71 = 已最终收口 21 + 未最终收口 50)。
+    // closed_total / pool_state_other 来自后端派生,禁止 JS 用
+    // pool_scope_total - not_closed 残差冒充"已最终收口";未收口子树必须
+    // 覆盖全部非 0 routing bucket(other/路由证据不足),不为好看隐藏任何桶。
     const head = "当日商品池记录:" +
-      (stages.pool_counts_available === false ? "不可用" : Number(stages.pool_scope_total || 0)) +
-      " · 未最终收口:" +
-      (stages.not_closed == null ? "不可用" : Number(stages.not_closed)) +
-      (stages.no_commodity_list ? " · 未进入采集列表:" + Number(stages.no_commodity_list) : "") +
-      (stages.routing_evidence_incomplete
-        ? " · 路由证据不足(同商品存在多条采集记录,无法可靠确定当前记录):" +
-          Number(stages.routing_evidence_incomplete)
-        : "");
+      (stages.pool_counts_available === false ? "不可用" : Number(stages.pool_scope_total || 0));
+    let poolHtml;
+    if (stages.pool_counts_available === false || stages.closed_total == null ||
+        stages.not_closed == null) {
+      poolHtml = '<li class="bf">商品池收口拆分不可用(池计数查询失败,不冒充业务 0)。</li>';
+    } else {
+      const routingLines = [
+        sfStageLine("未进入采集列表", stages.no_commodity_list),
+        sfStageLine("爬虫链路未完成", stages.crawl_status_1),
+        sfStageLine("爬虫已回调", stages.crawl_status_2),
+      ];
+      if (stages.crawl_status_other) {
+        routingLines.push(sfStageLine("其他采集状态", stages.crawl_status_other));
+      }
+      if (stages.routing_evidence_incomplete) {
+        routingLines.push(sfStageLine(
+          "路由证据不足(同商品存在多条采集记录,无法可靠确定当前记录)",
+          stages.routing_evidence_incomplete));
+      }
+      if (drift.includes("pool_vs_routing")) {
+        // R3 B6:池基数与路由基数来自不同取证时点,显示双侧数量,不硬凑闭合
+        routingLines.push('<li class="bf">阶段分布基数:' +
+          Number(stages.routing_open_total || 0) +
+          ';查询期间数据变化,本轮暂不强制对账(约 60 秒后自动重新取证)</li>');
+      }
+      poolHtml = '<li class="bf">├─ 已最终收口:' + Number(stages.closed_total) + "</li>" +
+        (stages.pool_state_other
+          ? '<li class="bf">├─ 其他池状态:' + Number(stages.pool_state_other) + "</li>"
+          : "") +
+        '<li class="bf">└─ 未最终收口:' + Number(stages.not_closed) +
+        "<ul>" + routingLines.join("") + "</ul></li>";
+    }
     // R2 Review P1-3:父节点语义。crawl_status=1 的子状态已包含
     // CALLBACK_DONE_SAAS_PENDING(回调已完成,SaaS尚未推进),旧的"未回调"
     // 父标签与之自相矛盾;改为按链路进度命名的"爬虫链路未完成"。
@@ -430,6 +488,7 @@
           k === "CALLBACK_DONE_NO_SEARCH" ? graceNote : "")).join("") +
         sfStageLine("证据不足", down.EVIDENCE_INCOMPLETE) + "</ul></li>";
     return '<div class="sf-head">' + esc(head) + "</div>" +
+      '<ul class="sf-branch">' + poolHtml + "</ul>" +
       '<ul class="sf-branch">' + crawlerHtml + downHtml + "</ul>";
   }
 
@@ -472,7 +531,7 @@
   }
   const api = { start, stop: () => { ctl.stop(); sfPoller.stop(); },
     createPollController, createSaasFlowPoller, safeProgressText, sfPartialNotice,
-    sfTreeHtml, sfGrowthText };
+    sfTreeHtml, sfGrowthText, sfChipsText, sfGrowthHistoryText, formatShanghaiDateTime };
   if (typeof window !== "undefined") { window.Dashboards = api; }
   if (typeof module !== "undefined" && module.exports) { module.exports = api; }
   if (typeof document !== "undefined") { document.addEventListener("DOMContentLoaded", start); }
