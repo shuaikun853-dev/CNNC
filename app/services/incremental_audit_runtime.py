@@ -127,11 +127,16 @@ _MODEL_CONFIGURATION_KEYS = (
 # Optional incremental-runtime tuning knobs.  Deliberately NOT part of
 # _MODEL_CONFIGURATION_KEYS: the required gate must stay "all three secrets
 # present"; these tune the bounded parallel model dispatcher and are read
-# env-first, then data/model.env, then defaults.  (The legacy work_01 path
-# reads TITLE_MATCH_MODEL_CONCURRENCY / TITLE_MATCH_MODEL_BATCH_CONCURRENCY
-# from the process environment only and never sees data/model.env.)
+# env-first, then data/model.env, then defaults.  The incremental batch size
+# uses its own TITLE_MATCH_MODEL_INCREMENTAL_BATCH_SIZE name because the
+# legacy work_01 path already owns TITLE_MATCH_MODEL_BATCH_SIZE in the
+# process environment (default 30) — reusing that name would let a
+# historical data/model.env entry silently re-tune STEP_1 on upgrade, so the
+# incremental runtime never reads the work_01 key.  (work_01 reads
+# TITLE_MATCH_MODEL_CONCURRENCY / TITLE_MATCH_MODEL_BATCH_CONCURRENCY from
+# the process environment only and never sees data/model.env.)
 _MODEL_RUNTIME_TUNING_KEYS = (
-    "TITLE_MATCH_MODEL_BATCH_SIZE",
+    "TITLE_MATCH_MODEL_INCREMENTAL_BATCH_SIZE",
     "TITLE_MATCH_MODEL_MAX_CONCURRENCY",
 )
 _BATCH_STATE_START = "<!-- incremental-runtime-state:start -->"
@@ -1194,15 +1199,26 @@ def _model_batch_worker(rows: list[Mapping[str, Any]], timeout_seconds: float) -
 
 
 def _runtime_model_batch_size(path: Path | None = None) -> int:
-    raw = _read_model_runtime_tuning(path).get("TITLE_MATCH_MODEL_BATCH_SIZE", "")
+    """Rows per model batch; default 10.  Tuned through the incremental-only
+    TITLE_MATCH_MODEL_INCREMENTAL_BATCH_SIZE (process environment first, then
+    data/model.env); anything absent/0/negative or non-integer fails closed.
+
+    The work_01 key TITLE_MATCH_MODEL_BATCH_SIZE is deliberately NOT read
+    here — a historical data/model.env value written for work_01 (default 30)
+    must never silently activate on the incremental pipeline."""
+    raw = _read_model_runtime_tuning(path).get("TITLE_MATCH_MODEL_INCREMENTAL_BATCH_SIZE", "")
     if not raw:
         return 10
     try:
         value = int(raw)
     except ValueError as exc:
-        raise RuntimeConfigurationError("TITLE_MATCH_MODEL_BATCH_SIZE must be a positive integer") from exc
+        raise RuntimeConfigurationError(
+            "TITLE_MATCH_MODEL_INCREMENTAL_BATCH_SIZE must be a positive integer"
+        ) from exc
     if value <= 0:
-        raise RuntimeConfigurationError("TITLE_MATCH_MODEL_BATCH_SIZE must be a positive integer")
+        raise RuntimeConfigurationError(
+            "TITLE_MATCH_MODEL_INCREMENTAL_BATCH_SIZE must be a positive integer"
+        )
     return value
 
 

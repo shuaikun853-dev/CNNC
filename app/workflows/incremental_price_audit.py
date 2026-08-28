@@ -63,6 +63,9 @@ class TickConfig:
     # from the durable failure timestamp.
     model_max_attempts: int = 8
     model_max_elapsed_seconds: float = 900
+    # Rows per model batch; production composes it through the
+    # incremental-only TITLE_MATCH_MODEL_INCREMENTAL_BATCH_SIZE key (the
+    # work_01 TITLE_MATCH_MODEL_BATCH_SIZE name is never read here).
     model_batch_size: int = 10
     # Upper bound on concurrently inflight model batch HTTP calls.  Durable
     # claim/checkpoint and every SQLite write stay on the calling thread; only

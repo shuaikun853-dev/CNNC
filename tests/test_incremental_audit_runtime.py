@@ -1696,7 +1696,7 @@ def test_incremental_model_tuning_model_env_override_reaches_tick_config(tmp_pat
         "TITLE_MATCH_MODEL_BASE_URL=https://model.invalid/v1\n"
         "TITLE_MATCH_MODEL_NAME=file-model\n"
         "TITLE_MATCH_MODEL_MAX_CONCURRENCY=8\n"
-        "TITLE_MATCH_MODEL_BATCH_SIZE=20\n",
+        "TITLE_MATCH_MODEL_INCREMENTAL_BATCH_SIZE=20\n",
         encoding="utf-8",
     )
 
@@ -1713,13 +1713,53 @@ def test_incremental_model_tuning_model_env_override_reaches_tick_config(tmp_pat
     assert captured[0].model_batch_size == 20
 
 
+def test_incremental_model_tuning_ignores_work01_batch_size_key_in_model_env(tmp_path, monkeypatch):
+    """R3 P1-B: the work_01 key TITLE_MATCH_MODEL_BATCH_SIZE must never tune
+    the incremental pipeline.  A historical data/model.env entry written for
+    work_01 (default 30) stays inert for STEP_1 — silently activating it on
+    upgrade would be a production configuration drift."""
+    captured, data_root = _capture_tick_configs(monkeypatch, tmp_path)
+    (data_root / "model.env").write_text(
+        "TITLE_MATCH_MODEL_BATCH_SIZE=30\n",
+        encoding="utf-8",
+    )
+
+    run_runtime_command(
+        "tick",
+        business_date="2026-08-11",
+        runtime_root=tmp_path / "runtime",
+        dependencies=_dependencies([]),
+    )
+
+    assert captured[0].model_batch_size == 10
+    assert captured[0].model_max_concurrency == 6
+
+
+def test_incremental_model_tuning_ignores_work01_batch_size_key_in_process_env(tmp_path, monkeypatch):
+    """R3 P1-B: same isolation for the process environment — the incremental
+    runtime only reads its own TITLE_MATCH_MODEL_INCREMENTAL_BATCH_SIZE name."""
+    captured, _data_root = _capture_tick_configs(monkeypatch, tmp_path)
+    monkeypatch.setenv("TITLE_MATCH_MODEL_BATCH_SIZE", "30")
+
+    run_runtime_command(
+        "tick",
+        business_date="2026-08-11",
+        runtime_root=tmp_path / "runtime",
+        dependencies=_dependencies([]),
+    )
+
+    assert captured[0].model_batch_size == 10
+
+
 def test_incremental_model_tuning_environment_beats_model_env(tmp_path, monkeypatch):
     captured, data_root = _capture_tick_configs(monkeypatch, tmp_path)
     (data_root / "model.env").write_text(
-        "TITLE_MATCH_MODEL_MAX_CONCURRENCY=8\n",
+        "TITLE_MATCH_MODEL_MAX_CONCURRENCY=8\n"
+        "TITLE_MATCH_MODEL_INCREMENTAL_BATCH_SIZE=20\n",
         encoding="utf-8",
     )
     monkeypatch.setenv("TITLE_MATCH_MODEL_MAX_CONCURRENCY", "7")
+    monkeypatch.setenv("TITLE_MATCH_MODEL_INCREMENTAL_BATCH_SIZE", "15")
 
     run_runtime_command(
         "tick",
@@ -1729,6 +1769,7 @@ def test_incremental_model_tuning_environment_beats_model_env(tmp_path, monkeypa
     )
 
     assert captured[0].model_max_concurrency == 7
+    assert captured[0].model_batch_size == 15
 
 
 @pytest.mark.parametrize(
@@ -1740,6 +1781,27 @@ def test_incremental_model_tuning_invalid_values_fail_closed(tmp_path, monkeypat
     _captured, data_root = _capture_tick_configs(monkeypatch, tmp_path)
     (data_root / "model.env").write_text(
         f"TITLE_MATCH_MODEL_MAX_CONCURRENCY={raw}\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(runtime_module.RuntimeConfigurationError):
+        run_runtime_command(
+            "tick",
+            business_date="2026-08-11",
+            runtime_root=tmp_path / "runtime",
+            dependencies=_dependencies([]),
+        )
+
+
+@pytest.mark.parametrize(
+    "raw",
+    ["0", "-3", "not-an-int", "8.5"],
+    ids=("zero", "negative", "not-an-int", "float"),
+)
+def test_incremental_model_tuning_invalid_batch_size_fails_closed(tmp_path, monkeypatch, raw):
+    _captured, data_root = _capture_tick_configs(monkeypatch, tmp_path)
+    (data_root / "model.env").write_text(
+        f"TITLE_MATCH_MODEL_INCREMENTAL_BATCH_SIZE={raw}\n",
         encoding="utf-8",
     )
 

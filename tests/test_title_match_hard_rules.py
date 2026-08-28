@@ -119,6 +119,53 @@ def test_equivalent_model_spellings_do_not_veto(query_str, sku_name):
 
 
 # ---------------------------------------------------------------------------
+# R3 P1-A — separator-only model spelling is an equivalence, not a conflict
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize(
+    ("query_str", "sku_name"),
+    [
+        # A space is a model-internal connector just like -/_//: a strong
+        # code whose components are space-joined in the candidate title is
+        # the same code ("忽略空格" per the prompt), not a missing model.
+        ("闪迪 G50-2TB 移动固态硬盘", "闪迪 G50 2TB 移动固态硬盘"),
+        ("得力 DS-320 订书机", "得力 DS 320 订书机"),
+        ("惠普 AR-EP65 硒鼓", "惠普 AR EP65 硒鼓"),
+        ("闪迪 G50_2TB 移动固态硬盘", "闪迪 G50 2TB 移动固态硬盘"),
+        ("闪迪 G50/2TB 移动固态硬盘", "闪迪 G50 2TB 移动固态硬盘"),
+        # The separator tolerance composes with the validated TB<->T flex.
+        ("闪迪 G50-2TB 移动固态硬盘", "闪迪 G50 2T 移动固态硬盘"),
+        # Separator deletion (fused spelling) stays equivalent.
+        ("得力 DS-320 订书机", "得力 DS320 订书机"),
+        ("闪迪 G50-2TB 移动固态硬盘", "闪迪 G502TB 移动固态硬盘"),
+    ],
+    ids=(
+        "hyphen-vs-space",
+        "hyphen-vs-space-ds320",
+        "hyphen-vs-space-ar-ep65",
+        "underscore-vs-space",
+        "slash-vs-space",
+        "space-composes-with-tb-t",
+        "fused-ds320",
+        "fused-g502tb",
+    ),
+)
+def test_separator_only_model_spelling_does_not_veto(query_str, sku_name):
+    assert evaluate_same_hard_rules(query_str, sku_name) is None
+
+
+def test_standard_model_codes_present_is_separator_tolerant():
+    from app.services.title_match_hard_rules import standard_model_codes_present
+
+    assert standard_model_codes_present("闪迪 G50-2TB 移动固态硬盘", "闪迪 G50 2TB 移动固态硬盘") is True
+    assert standard_model_codes_present("得力 DS-320 订书机", "得力 DS 320 订书机") is True
+    # The tolerance stays boundary-aware: a longer digit run around the same
+    # components (DS 320 inside DS 3200) is a different code and still fails
+    # to prove presence.
+    assert standard_model_codes_present("得力 DS-320 订书机", "得力 DS 3200 订书机") is False
+
+
+# ---------------------------------------------------------------------------
 # R2 — multi-pack single-sided / conflicting
 # ---------------------------------------------------------------------------
 
@@ -400,3 +447,17 @@ def test_veto_keeps_model_self_assessment_as_evidence(monkeypatch):
         # The override itself is explicit in the human-readable fields.
         assert "硬规则否决(R1:" in result.reason
         assert any("hard-rule veto" in point for point in result.risk_points)
+
+
+def test_separator_equivalent_same_survives_both_paths(monkeypatch):
+    """R3 P1-A parity: a correct model SAME over a separator-only spelling
+    difference must survive the hard-rule double-insurance on BOTH the
+    single and the batch path."""
+    single, batched = _both_paths(
+        monkeypatch,
+        "得力 DS-320 订书机",
+        "得力 DS 320 订书机",
+        _SAME_JSON,
+    )
+    assert single.match_result == "SAME"
+    assert batched.match_result == "SAME"
