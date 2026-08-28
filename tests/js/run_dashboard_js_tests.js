@@ -305,8 +305,8 @@ function test_sf_tree_shows_routing_evidence_incomplete() {
   check("P1 文案必须体现证据不足语义(同商品存在多条采集记录/无法可靠确定当前记录)",
         head.includes("同商品存在多条采集记录") || head.includes("无法可靠确定"), head);
   check("P1 不得把 3 加进正常分支计数",
-        html.includes("爬虫未回调:1") && html.includes("爬虫已回调:1") &&
-        !html.includes("爬虫未回调:4") && !html.includes("爬虫已回调:4"), html);
+        html.includes("爬虫链路未完成:1") && html.includes("爬虫已回调:1") &&
+        !html.includes("爬虫链路未完成:4") && !html.includes("爬虫已回调:4"), html);
   check("P1 routing 文案不得误标为系统错误/数据丢失/爬虫失败/未生成任务",
         !head.includes("系统错误") && !head.includes("数据丢失") &&
         !head.includes("爬虫失败") && !head.includes("未生成任务"), head);
@@ -350,7 +350,32 @@ function test_r2_crawler_tree_uses_callback_evidence_labels() {
   const html = sfTreeHtml(stages);
   check("R2 阶段树渲染新状态(未生成task/回调进行中)",
         html.includes("未生成task") && html.includes("回调进行中") &&
-        html.includes("爬虫未回调:2"), html);
+        html.includes("爬虫链路未完成:2"), html);
+}
+
+// ---- R2 Review P1-3:父节点标签语义(爬虫未回调 → 爬虫链路未完成) ----
+
+function test_r2_review_p1_3_parent_label_no_contradiction() {
+  const fs = require("fs");
+  const js = fs.readFileSync(
+    path.join(__dirname, "..", "..", "app", "static", "dashboard", "app.js"), "utf-8");
+  check("P1-3 新父标签「爬虫链路未完成」必须存在", js.includes("爬虫链路未完成"));
+  check("P1-3 旧父标签「爬虫未回调」不得再出现在页面主逻辑",
+        !js.includes("爬虫未回调"));
+  // 子状态 CALLBACK_DONE_SAAS_PENDING 挂在新父节点下不再自相矛盾
+  const stages = {
+    crawl_status_available: true, pool_counts_available: true,
+    snapshot_consistent: true, snapshot_drift: [],
+    pool_scope_total: 2, not_closed: 2, crawl_status_1: 2, crawl_status_2: 0,
+    grace_seconds: 1800,
+    crawler_branch: { CALLBACK_DONE_SAAS_PENDING: 2 },
+    downstream_branch: {},
+  };
+  const html = sfTreeHtml(stages);
+  check("P1-3 「回调已完成，SaaS尚未推进」归类于「爬虫链路未完成」父节点",
+        html.includes("爬虫链路未完成:2") &&
+        html.includes("回调已完成，SaaS尚未推进") &&
+        !html.includes("爬虫未回调"), html);
 }
 
 (async () => {
@@ -367,6 +392,7 @@ function test_r2_crawler_tree_uses_callback_evidence_labels() {
   test_sf_tree_shows_routing_evidence_incomplete();
   test_sf_growth_after_cutoff_text_not_normal();
   test_r2_crawler_tree_uses_callback_evidence_labels();
+  test_r2_review_p1_3_parent_label_no_contradiction();
   if (failed === 0) { console.log("ALL PASS"); process.exit(0); }
   console.error(failed + " failing checks");
   process.exit(1);

@@ -414,9 +414,13 @@
         ? " · 路由证据不足(同商品存在多条采集记录,无法可靠确定当前记录):" +
           Number(stages.routing_evidence_incomplete)
         : "");
+    // R2 Review P1-3:父节点语义。crawl_status=1 的子状态已包含
+    // CALLBACK_DONE_SAAS_PENDING(回调已完成,SaaS尚未推进),旧的"未回调"
+    // 父标签与之自相矛盾;改为按链路进度命名的"爬虫链路未完成"。
+    // crawl_status=2 的"爬虫已回调"不受影响。
     const crawlerHtml = stages.crawler_branch === null
-      ? '<li class="bf">├─ 爬虫未回调:' + (drift.includes("crawler_branch") ? esc(driftNote) : "本轮不可用") + "</li>"
-      : '<li class="bf">├─ 爬虫未回调:' + Number(stages.crawl_status_1 || 0) + "<ul>" +
+      ? '<li class="bf">├─ 爬虫链路未完成:' + (drift.includes("crawler_branch") ? esc(driftNote) : "本轮不可用") + "</li>"
+      : '<li class="bf">├─ 爬虫链路未完成:' + Number(stages.crawl_status_1 || 0) + "<ul>" +
         crawlerKeys.map((k) => sfStageLine(SF_STAGE_LABELS[k], crawler[k])).join("") +
         sfStageLine("证据不足", crawler.EVIDENCE_INCOMPLETE) + "</ul></li>";
     const downHtml = stages.downstream_branch === null

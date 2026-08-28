@@ -139,7 +139,7 @@ This check must not claim that SaaS is broken merely because counts differ. One 
 
 Example:
 
-> 客户侧仍在新增，但 SaaS 数量本轮未增长。当前新增链路正在分布于以下阶段：爬虫未回调 X、已回调待模型 X、互联网候选全部判非同款 X、待人工审批 X……
+> 客户侧仍在新增，但 SaaS 数量本轮未增长。当前新增链路正在分布于以下阶段：爬虫链路未完成 X、已回调待模型 X、互联网候选全部判非同款 X、待人工审批 X……
 
 Do not use wording such as “SaaS 丢数据” unless the evidence proves an actual missing handoff/record.
 

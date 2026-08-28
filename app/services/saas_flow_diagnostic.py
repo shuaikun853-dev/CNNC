@@ -56,6 +56,9 @@ MIN_FRESH_READ_INTERVAL_SECONDS = 30.0  # 强制刷新间隔下限与文档/UI �
 MAX_CRAWL1_COMMODITIES = 2000       # 有界结果集:单日 crawl_status=1 目标商品上限
 MAX_CRAWL2_COMMODITIES = 2000
 MAX_CRAWL1_EXECUTION_NUMBERS = 2000  # 有界:单轮 callback 查询 execution_number 上限
+# R2 Review P2:all_batches 独立硬上限(与 commodities/executions 同为 fail-safe 有界),
+# 防止多 batch 商品放大 WHERE batch_num IN (...);截断按 item 级降级,见 _build_stages。
+MAX_CRAWL1_BATCHES = 2000
 
 DEFAULT_DB_ENV_PATH = Path(__file__).resolve().parents[2] / "data" / "CNNC_DIAG_DB.env"
 
@@ -453,6 +456,24 @@ CALLBACK_PUSH_STATE_SUCCESS = "0000"   # completed 表 = 回调成功终态
 CALLBACK_PUSH_STATE_IN_FLIGHT = "8888"  # active 表 = 在途/尚未完成
 
 
+def _normalize_is_call(raw: Any) -> int | None:
+    """R2 Review P1-1:is_call 只接受明确的 0/"0"/1/"1"。
+
+    生产语义(sql_ops KB 取证):0=未回调,1=已回调;MySQL 实际列类型只会让
+    pymysql 返回 int 或 str。其余一切值(None/空串/"2"/2/-1/"abc"/bool/float)
+    都是证据缺失 → None(调用方按 EVIDENCE_INCOMPLETE 处理),绝不借
+    Python truthiness 或 `or 0` 兜底成业务 0/1。bool 先于 int 判断:
+    isinstance(True, int) 为真,不得无意识落入 0/1 相等语义。
+    """
+    if isinstance(raw, bool):
+        return None
+    if isinstance(raw, int) and raw in (0, 1):
+        return raw
+    if isinstance(raw, str) and raw in ("0", "1"):
+        return int(raw)
+    return None
+
+
 def _normalize_execution_state(
     is_call_values: set[int],
     active_push_states: set[str],
@@ -486,12 +507,17 @@ def classify_crawler_callback(record: Mapping[str, Any]) -> str:
     输入(由 _build_stages 组装):
       task_count / task_failed / malformed / batches(派生 batch 集合) /
       spider_failed / spider_rows(本商品 batch 的推送记录) /
+      batches_truncated(本商品 batch 未完整进入有界 spider 查询) /
       callback_failed / callback_rows(本商品 execution 的回调记录) /
       exes_truncated(execution 超出有界查询上限)
 
-    决策序(fail-safe 优先):查询失败/解析失败 > 未生成task > 推送记录缺失
-    (全部 batch 无记录才算;部分覆盖=证据不足)> 字段缺失 > 逐 execution
-    归一化 > item 聚合。
+    决策序(逐级依赖:task → spider push → callback;R2 Review P1-2:
+    callback 是下游证据,查询失败只能降级依赖 callback 的商品,不得反向
+    污染上游已确定状态):
+      task 查询失败/未生成task/malformed → spider 查询失败 → batch 截断
+      → 推送记录缺失(全部 batch 无记录才算;部分覆盖=证据不足)
+      → 字段缺失/execution 截断 → callback 查询失败 → 逐 execution 归一化
+      → item 聚合。
     """
     if record.get("task_failed"):
         return "EVIDENCE_INCOMPLETE"
@@ -499,10 +525,15 @@ def classify_crawler_callback(record: Mapping[str, Any]) -> str:
         return "TASK_NOT_CREATED"  # 不依赖推送/回调查询
     if record.get("malformed"):
         return "EVIDENCE_INCOMPLETE"
-    if record.get("spider_failed") or record.get("callback_failed"):
+    if record.get("spider_failed"):
         return "EVIDENCE_INCOMPLETE"
     batches = {str(b) for b in (record.get("batches") or ())}
     if not batches:
+        return "EVIDENCE_INCOMPLETE"
+    if record.get("batches_truncated"):
+        # R2 Review P2:本商品有 batch 未进入有界 spider 查询,记录缺失可能
+        # 是截断造成——既不得冒充 PUSH_RECORD_NOT_FOUND,也不得进入
+        # "部分覆盖"业务语义
         return "EVIDENCE_INCOMPLETE"
     rows = [r for r in (record.get("spider_rows") or [])
             if _as_str(r.get("batch_num")) in batches]
@@ -515,12 +546,16 @@ def classify_crawler_callback(record: Mapping[str, Any]) -> str:
         return "EVIDENCE_INCOMPLETE"
     if record.get("exes_truncated"):
         return "EVIDENCE_INCOMPLETE"
+    # R2 Review P1-2:走到这里才证明本商品存在完整 spider push 证据,
+    # callback 查询失败只在此之后降级(callback 是下游证据)
+    if record.get("callback_failed"):
+        return "EVIDENCE_INCOMPLETE"
 
     is_call_by_exe: dict[str, set[int]] = {}
     for r in rows:
-        try:
-            call_flag = int(r.get("is_call") or 0)
-        except (TypeError, ValueError):
+        # R2 Review P1-1:缺值/未知值是证据缺失,不是业务 0(禁止 `or 0` 兜底)
+        call_flag = _normalize_is_call(r.get("is_call"))
+        if call_flag is None:
             return "EVIDENCE_INCOMPLETE"
         is_call_by_exe.setdefault(_as_str(r["exe_number"]), set()).add(call_flag)
     active_by_exe: dict[str, set[str]] = {}
@@ -988,10 +1023,17 @@ class SaasFlowDiagnosticService:
 
                 spider_rows: list[dict[str, Any]] = []
                 spider_failed = False
-                if all_batches and not task_failed:
+                # R2 Review P2:all_batches 必须有独立硬上限,防止无界
+                # WHERE batch_num IN (...)。截断不静默:batch 未完整进入
+                # 有界查询的商品在 item 级降级为证据不足(见 batches_truncated),
+                # 未受截断的商品照常分类;不整体放弃 crawl1 branch。
+                batches_truncated = len(all_batches) > MAX_CRAWL1_BATCHES
+                bounded_batches = sorted(all_batches)[:MAX_CRAWL1_BATCHES]
+                bounded_batch_set = set(bounded_batches)
+                if bounded_batches and not task_failed:
                     # batch_num 为 varchar,string 绑定(生产实测走 index_batch_nim)
                     spider_rows = run("crawl1_spider_task_rows",
-                                      {"batch_nums": tuple(sorted(all_batches))})
+                                      {"batch_nums": tuple(bounded_batches)})
                     spider_failed = "crawl1_spider_task_rows" in degraded
                 spider_by_batch: dict[str, list[dict[str, Any]]] = {}
                 for row in spider_rows:
@@ -1029,6 +1071,8 @@ class SaasFlowDiagnosticService:
                         "batches": item_batches,
                         "spider_failed": spider_failed,
                         "spider_rows": item_rows,
+                        "batches_truncated": batches_truncated
+                        and not item_batches <= bounded_batch_set,
                         "callback_failed": callback_failed,
                         "callback_rows": [r for exe in sorted(item_exes)
                                           for r in callback_by_exe.get(exe, [])],

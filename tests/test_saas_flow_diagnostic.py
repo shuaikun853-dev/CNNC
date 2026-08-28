@@ -568,6 +568,149 @@ def test_classify_exes_truncated_is_evidence_incomplete():
         "EVIDENCE_INCOMPLETE"
 
 
+# ---- R2 Review(2026-08-28)P1-1:is_call 缺值/未知值 ≠ 业务 0 ----
+
+def test_r2_review_p1_1_is_call_missing_or_unknown_values_are_evidence_incomplete():
+    """原实现 `int(r.get("is_call") or 0)`:None/"" 经 `or 0` 被当成未回调(0),
+    可误分类为 CALLBACK_IN_FLIGHT / PUSH_CONFIRMED_NO_CALLBACK_RECORD。
+    fail-safe 契约:关键证据缺失 ≠ 业务状态 0。"""
+    for bad in (None, "", "abc", 2, "2", -1, True, False):
+        record = item_record(spider_rows=[{"batch_num": "B1", "exe_number": "E1",
+                                           "is_call": bad}])
+        assert diag.classify_crawler_callback(record) == "EVIDENCE_INCOMPLETE", repr(bad)
+    # 与 push_state 组合也绝不借缺值兜底成"在途/无记录"
+    for bad in (None, "", "2"):
+        record = item_record(callback_rows=[], spider_rows=[
+            {"batch_num": "B1", "exe_number": "E1", "is_call": bad}])
+        assert diag.classify_crawler_callback(record) == "EVIDENCE_INCOMPLETE", repr(bad)
+
+
+def test_r2_review_p1_1_is_call_explicit_zero_one_accepted():
+    """只有明确的 0/"0"/1/"1"(MySQL 实际 int/varchar 表征)按业务值解释。"""
+    assert diag.classify_crawler_callback(item_record(
+        spider_rows=[{"batch_num": "B1", "exe_number": "E1", "is_call": 0}])) == \
+        "CALLBACK_IN_FLIGHT"
+    assert diag.classify_crawler_callback(item_record(
+        spider_rows=[{"batch_num": "B1", "exe_number": "E1", "is_call": "0"}],
+        callback_rows=[])) == "PUSH_CONFIRMED_NO_CALLBACK_RECORD"
+    done = [{"execution_number": "E1", "push_state": "0000", "callback_source": "completed"}]
+    assert diag.classify_crawler_callback(item_record(
+        spider_rows=[{"batch_num": "B1", "exe_number": "E1", "is_call": 1}],
+        callback_rows=done)) == "CALLBACK_DONE_SAAS_PENDING"
+    assert diag.classify_crawler_callback(item_record(
+        spider_rows=[{"batch_num": "B1", "exe_number": "E1", "is_call": "1"}],
+        callback_rows=done)) == "CALLBACK_DONE_SAAS_PENDING"
+
+
+# ---- R2 Review P1-2:callback 查询失败的影响范围收窄到依赖 callback 的商品 ----
+
+def test_r2_review_p1_2_callback_failure_does_not_pollute_upstream_states():
+    """callback 是下游证据。上游不依赖 callback 的确定状态
+    (PUSH_RECORD_NOT_FOUND / TASK_NOT_CREATED)不受全局 callback 失败污染。"""
+    assert diag.classify_crawler_callback(
+        item_record(spider_rows=[], callback_rows=[], callback_failed=True)) == \
+        "PUSH_RECORD_NOT_FOUND"
+    assert diag.classify_crawler_callback(
+        item_record(task_count=0, batches=set(), spider_rows=[], callback_failed=True)) == \
+        "TASK_NOT_CREATED"
+    # 存在完整 spider push 证据的商品仍按原契约降级(下游证据缺失)
+    assert diag.classify_crawler_callback(item_record(callback_failed=True)) == \
+        "EVIDENCE_INCOMPLETE"
+
+
+def test_r2_review_p1_2_callback_failure_scope_item_level_integration():
+    """集成锁定(_build_stages 级):全局 crawl1_callback_rows 查询失败只降级
+    依赖 callback 证据的 ITEM;无 spider 推送记录的 ITEM 保持
+    PUSH_RECORD_NOT_FOUND;payload partial、degraded 含该查询、分支闭合。"""
+    def callback_raises(params):
+        raise RuntimeError("callback query failed")
+
+    service, _, _ = make_service({
+        "pool_sync_standard_counts": [("0", 2)],
+        "open_crawl_status_counts": [(2, 0, 2, 0, 0)],
+        # ITEM_A:task 存在、spider 查询成功、无推送记录(不产生 execution)
+        # ITEM_B:task + 推送记录 + execution_number
+        "crawl1_commodity_rows": [(11, "CA"), (12, "CB")],
+        "crawl1_task_rows": [(11, "SAAS-188605_701_1", 1), (12, "SAAS-188605_702_1", 1)],
+        "crawl1_spider_task_rows": [("188605_702", "E2", 0)],
+        "crawl1_callback_rows": callback_raises,
+        "crawl2_search_flags": [],
+    })
+    payload = service.get_diagnostic("2026-08-27")
+    assert payload["status"] == "partial"
+    assert "crawl1_callback_rows" in payload["degraded_queries"]
+    crawler = payload["stages"]["crawler_branch"]
+    assert crawler["PUSH_RECORD_NOT_FOUND"] == 1   # ITEM_A 上游确定状态
+    assert crawler["EVIDENCE_INCOMPLETE"] == 1     # ITEM_B 依赖 callback → 降级
+    assert sum(crawler.values()) == payload["stages"]["crawl_status_1"] == 2
+
+
+# ---- R2 Review P2:all_batches 独立硬上限 + item 级截断 fail-safe ----
+
+def test_r2_review_p2_batches_truncated_is_evidence_incomplete():
+    """batch 未完整进入有界 spider 查询的商品:即使查到的部分无任何记录,
+    也只能证据不足——缺失可能是截断造成,不得冒充 PUSH_RECORD_NOT_FOUND。"""
+    assert diag.classify_crawler_callback(
+        item_record(batches_truncated=True)) == "EVIDENCE_INCOMPLETE"
+    assert diag.classify_crawler_callback(
+        item_record(batches_truncated=True, spider_rows=[], callback_rows=[])) == \
+        "EVIDENCE_INCOMPLETE"
+
+
+def test_r2_review_p2_batches_within_cap_classify_normally():
+    """A/F:batch 总数在上限内时行为与无上限时完全一致,参数全为 str。"""
+    service, executed, _ = make_service({
+        "pool_sync_standard_counts": [("0", 2)],
+        "open_crawl_status_counts": [(2, 0, 2, 0, 0)],
+        "crawl1_commodity_rows": [(11, "CA"), (12, "CB")],
+        "crawl1_task_rows": [(11, "SAAS-188605_701_1", 1), (12, "SAAS-188605_702_1", 1)],
+        "crawl1_spider_task_rows": [("188605_701", "E1", 0), ("188605_702", "E2", 0)],
+        "crawl1_callback_rows": [("E1", "8888", "active"), ("E2", "8888", "active")],
+        "crawl2_search_flags": [],
+    })
+    stages = service.get_diagnostic("2026-08-27")["stages"]
+    spider_calls = [params for name, params in executed
+                    if name == "crawl1_spider_task_rows"]
+    assert len(spider_calls) == 1 and len(spider_calls[0]["batch_nums"]) == 2
+    assert all(isinstance(v, str) for v in spider_calls[0]["batch_nums"])
+    assert stages["crawler_branch"]["CALLBACK_IN_FLIGHT"] == 2
+    assert sum(stages["crawler_branch"].values()) == stages["crawl_status_1"] == 2
+
+
+def test_r2_review_p2_batch_cap_bounds_params_and_item_level_fail_safe():
+    """B/C/D/E:商品 B 拥有 MAX+1 个 batch → 超出部分被有界查询截断。
+    SQL IN 参数长度 ≤ 上限;受截断 ITEM → 证据不足(不冒充 PUSH_RECORD_NOT_FOUND);
+    未受截断 ITEM 照常分类(在途 / 未发现记录);crawler branch 闭合。"""
+    extra_batches = ["188605_B%06d" % j for j in range(diag.MAX_CRAWL1_BATCHES + 1)]
+    task_rows = [(11, "SAAS-188605_A_1", 1), (13, "SAAS-188605_AA_1", 1)]
+    # B 的 task_id:SAAS-188605_<batch 后缀>_1 → batch = 188605_Bxxxxxx
+    task_rows += [(12, "SAAS-188605_%s_1" % b[len("188605_"):], 1)
+                  for b in extra_batches]
+    service, executed, _ = make_service({
+        "pool_sync_standard_counts": [("0", 3)],
+        "open_crawl_status_counts": [(3, 0, 3, 0, 0)],
+        "crawl1_commodity_rows": [(11, "CA"), (12, "CB"), (13, "CC")],
+        "crawl1_task_rows": task_rows,
+        # 只返回 A 的推送记录:B 截断证据不足;C 无记录 → PUSH_RECORD_NOT_FOUND
+        "crawl1_spider_task_rows": [("188605_A", "EA", 0)],
+        "crawl1_callback_rows": [("EA", "8888", "active")],
+        "crawl2_search_flags": [],
+    })
+    payload = service.get_diagnostic("2026-08-27")
+    stages = payload["stages"]
+    spider_calls = [params for name, params in executed
+                    if name == "crawl1_spider_task_rows"]
+    assert len(spider_calls) == 1
+    bounded = spider_calls[0]["batch_nums"]
+    assert len(bounded) <= diag.MAX_CRAWL1_BATCHES            # B:参数有界
+    assert all(isinstance(v, str) for v in bounded)           # F:全为 str
+    crawler = stages["crawler_branch"]
+    assert crawler["CALLBACK_IN_FLIGHT"] == 1                 # D:A 未受截断
+    assert crawler["PUSH_RECORD_NOT_FOUND"] == 1              # D:C 未受截断
+    assert crawler["EVIDENCE_INCOMPLETE"] == 1                # C:B 受截断
+    assert sum(crawler.values()) == stages["crawl_status_1"] == 3  # E:闭合
+
+
 # ---------------------------------------------------------------------------
 # E. downstream 分类(crawl_status=2)
 # ---------------------------------------------------------------------------
