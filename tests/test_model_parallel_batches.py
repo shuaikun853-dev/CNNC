@@ -30,6 +30,10 @@ from app.workflows.incremental_price_audit import (
 
 
 BATCH_LATENCY_SECONDS = 0.25
+# Long enough that the first dispatched wave of six is fully executing at
+# once (settling/claim pacing is orders of magnitude below it), so the
+# observed executing-overlap ceiling is deterministic, not settle-limited.
+SATURATION_LATENCY_SECONDS = 1.0
 PROVIDER_LATENCY_SECONDS = 12.0
 DESIGN_DEADLINE_SECONDS = 120.0
 
@@ -141,11 +145,14 @@ def _run_rows(deps, rows, config, tmp_path):
 def test_parallel_model_batches_meet_scaled_wall_clock_target(tmp_path, row_count):
     """Direct MODEL-stage benchmark: real sleeps, real SQLite, real threads.
 
-    Wall clock = ceil(batches / concurrency) * provider_latency + bounded fixed
-    SQLite overhead.  At the real provider latency (12s per 10-row batch,
-    concurrency 6) the arithmetic gives ceil(50/6)=9 waves * 12s = 108s for 500
-    rows; the measured fixed overhead below (sub-2s for 500 rows) keeps the
-    total inside the 120s design deadline.
+    Acceptance evidence, all observed (never configured-then-assumed):
+
+    * the executing-overlap ceiling (callbacks simultaneously inside the
+      provider call) must reach exactly the configured concurrency — the
+      first dispatched wave runs all six batches for the full latency, so
+      this is deterministic rather than settle-pacing dependent;
+    * the 12s-latency projection uses that observed effective concurrency:
+      wall clock = ceil(batches / observed) * 12s + measured fixed overhead.
     """
     from app.workflows.incremental_price_audit import (
         TickBudget,
@@ -169,11 +176,12 @@ def test_parallel_model_batches_meet_scaled_wall_clock_target(tmp_path, row_coun
 
     def model_batch(batch, timeout):
         with tracker:
-            time.sleep(BATCH_LATENCY_SECONDS)
+            time.sleep(SATURATION_LATENCY_SECONDS)
             return {index: {"match_result": "SAME"} for index, _row in enumerate(batch)}
 
-    config = _tick_config(batch_size=10, concurrency=6, budget=600, reserve=60)
-    budget = TickBudget(time.monotonic(), 600, 60, time.monotonic)
+    configured_concurrency = 6
+    config = _tick_config(batch_size=10, concurrency=configured_concurrency, budget=900, reserve=90)
+    budget = TickBudget(time.monotonic(), 900, 90, time.monotonic)
     counters: dict[str, int] = {}
 
     started = time.monotonic()
@@ -184,25 +192,34 @@ def test_parallel_model_batches_meet_scaled_wall_clock_target(tmp_path, row_coun
     works = store.list_stage_work(store.acquire_lease("2026-08-11", "inspect", 30), stage="MODEL")
     assert len(works) == row_count
     assert all(work["state"] == "SUCCESS" for work in works)
-    assert tracker.max_inflight > 1, "model batches must actually run concurrently"
-    assert tracker.max_inflight <= 6, "concurrency must stay bounded"
-    expected_batches = math.ceil(row_count / 10)
-    waves = math.ceil(expected_batches / 6)
-    http_floor = waves * BATCH_LATENCY_SECONDS
-    fixed_overhead = elapsed - http_floor
-    # The fixed SQLite overhead must stay small and must not scale with rows'
-    # HTTP latency: at the real 12s provider latency the design target is
-    # waves * 12s + fixed_overhead <= 120s.
-    assert waves * PROVIDER_LATENCY_SECONDS + fixed_overhead <= DESIGN_DEADLINE_SECONDS, (
-        f"{row_count} rows: waves={waves} fixed_overhead={fixed_overhead:.2f}s"
+
+    observed_effective = tracker.max_inflight
+    assert observed_effective == configured_concurrency, (
+        f"executing overlap {observed_effective} never saturated {configured_concurrency} workers"
     )
-    assert counters["model_max_inflight"] >= tracker.max_inflight
-    assert counters["model_max_inflight"] <= 6
+    assert observed_effective <= configured_concurrency, "concurrency must stay bounded"
+
+    expected_batches = math.ceil(row_count / 10)
+    waves = math.ceil(expected_batches / observed_effective)
+    http_floor = waves * SATURATION_LATENCY_SECONDS
+    fixed_overhead = elapsed - http_floor
+    # The fixed SQLite overhead must stay small and must not scale with the
+    # rows' HTTP latency: at the real 12s provider latency the design target
+    # is waves * 12s + fixed_overhead <= 120s, projected from the OBSERVED
+    # effective concurrency.
+    projection = waves * PROVIDER_LATENCY_SECONDS + fixed_overhead
+    assert projection <= DESIGN_DEADLINE_SECONDS, (
+        f"{row_count} rows: waves={waves} observed={observed_effective} "
+        f"fixed_overhead={fixed_overhead:.2f}s projection={projection:.1f}s"
+    )
+    assert counters["model_max_inflight"] >= observed_effective
+    assert counters["model_max_inflight"] <= configured_concurrency
     print(
-        f"rows={row_count} batch_size=10 concurrency=6 batches={expected_batches} "
-        f"max_inflight={tracker.max_inflight} elapsed_seconds={elapsed:.3f} "
+        f"rows={row_count} batch_size=10 configured_concurrency={configured_concurrency} "
+        f"observed_max_inflight={observed_effective} latency={SATURATION_LATENCY_SECONDS}s "
+        f"batches={expected_batches} waves={waves} elapsed_seconds={elapsed:.3f} "
         f"fixed_overhead_seconds={fixed_overhead:.3f} "
-        f"design_projection_12s={waves * PROVIDER_LATENCY_SECONDS + fixed_overhead:.1f}s"
+        f"projection_at_12s={projection:.1f}s"
     )
 
 

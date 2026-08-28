@@ -64,10 +64,6 @@ def _normalize_for_tokens(text: str) -> str:
     return upper
 
 
-def _alnum(text: str) -> str:
-    return re.sub(r"[^A-Z0-9]", "", _to_halfwidth(text).upper())
-
-
 def _strong_model_tokens(normalized: str) -> list[str]:
     """Tokens strong enough to anchor a single-sided veto.
 
@@ -93,15 +89,11 @@ def _is_strong_token(token: str) -> bool:
     return len(token) >= 5 and not _YEAR_RE.match(token)
 
 
-def _equivalent_model_forms(token: str) -> list[str]:
-    """Spelling-equivalent forms: separators removed, storage suffix flexed,
-    and a short purely-alphabetic brand prefix shed (SATA-91403 ≡ 91403,
-    AR-EP65 ⊇ EP65) when the remainder is itself a strong code.
-
-    Substring containment over the alnum-normalized candidate title then also
-    covers connector variants (G50-2TB vs G50 2TB) and storage suffixes
-    (2T ⊆ 2TB, G50-2TB vs G50-2T).
-    """
+def _equivalent_model_forms(token: str) -> set[str]:
+    """Spelling-equivalent forms of one model code: separators removed,
+    storage suffix flexed (2T/2TB, G50-2TB vs G50-2T) and a short purely
+    alphabetic brand prefix shed (SATA-91403 ≡ 91403, AR-EP65 ⊇ EP65) when
+    the remainder is itself a strong code."""
     compact = token.replace("-", "").replace("_", "").replace("/", "")
     forms = {compact}
     prefix_match = re.match(r"^[A-Z]{2,4}(?=[0-9])", compact)
@@ -117,22 +109,70 @@ def _equivalent_model_forms(token: str) -> list[str]:
                 forms.add(stem + "T")
     if compact.endswith("T") and not compact.endswith(("AT", "ET", "GT", "ST", "XT")):
         forms.add(compact[:-1] + "TB")
-    return sorted(forms)
+    return forms
+
+
+def _brand_fused(longer: str, shorter: str) -> bool:
+    """True when ``longer`` is exactly a 2-8 letter brand word fused onto
+    ``shorter`` (SATA91403 ⊇ 91403, BIZHUB225I ⊇ 225I).  The boundary must be
+    letter-to-code, so DN200 never fuses with DN20 and 914030 never fuses
+    with 91403: the extra characters there are digits, i.e. a different
+    model code, not a brand prefix."""
+    if len(longer) <= len(shorter) or not longer.endswith(shorter):
+        return False
+    prefix = longer[: len(longer) - len(shorter)]
+    return 2 <= len(prefix) <= 8 and prefix.isalpha()
+
+
+def _model_codes_equivalent(query_token: str, sku_token: str) -> bool:
+    """Token-level exact-equivalence: same normalized code, storage-suffix or
+    brand-prefix variant of the same code — never a mere substring.
+
+    This is what keeps DN20 from matching DN200 and 91403 from matching
+    914030 while SATA-91403 still matches 91403."""
+    query_forms = _equivalent_model_forms(query_token)
+    sku_forms = _equivalent_model_forms(sku_token)
+    if query_forms & sku_forms:
+        return True
+    return any(
+        _brand_fused(longer, shorter)
+        for longer in sku_forms
+        for shorter in query_forms
+    ) or any(
+        _brand_fused(longer, shorter)
+        for longer in query_forms
+        for shorter in sku_forms
+    )
+
+
+def standard_model_codes_present(query_str: str, sku_name: str) -> bool:
+    """True when every strong model code of the standard title has an
+    exactly-equivalent code in the candidate title.
+
+    This is the deterministic form of prompt rule 7's "除非标题已明确当前
+    SKU 就是 query_str 的目标型号" branch; the shared risk-word guard uses it
+    instead of trusting the word list alone.
+    """
+    query_tokens = _strong_model_tokens(_normalize_for_tokens(query_str))
+    if not query_tokens:
+        return False
+    sku_tokens = _strong_model_tokens(_normalize_for_tokens(sku_name))
+    return all(
+        any(_model_codes_equivalent(token, sku_token) for sku_token in sku_tokens)
+        for token in query_tokens
+    )
 
 
 def _model_code_veto(query_str: str, sku_name: str) -> str | None:
     query_tokens = _strong_model_tokens(_normalize_for_tokens(query_str))
     if not query_tokens:
         return None
-    sku_alnum = _alnum(sku_name)
-    missing = [
-        token
-        for token in query_tokens
-        if not any(form in sku_alnum for form in _equivalent_model_forms(token))
-    ]
-    if missing:
-        return f"标准侧明确型号 {','.join(missing)} 在候选标题缺失或冲突"
-    return None
+    # Candidate-side token extraction plus exact-equivalence comparison: a
+    # raw substring hit (DN20 inside DN200) is a different model, not the
+    # same one, so containment alone must never satisfy the rule.
+    if standard_model_codes_present(query_str, sku_name):
+        return None
+    return f"标准侧明确型号 {','.join(query_tokens)} 在候选标题缺失或冲突"
 
 
 # ---------------------------------------------------------------------------

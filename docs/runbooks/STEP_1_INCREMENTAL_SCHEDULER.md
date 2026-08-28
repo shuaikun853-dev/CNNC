@@ -108,6 +108,26 @@ powershell -NoProfile -File scripts\register_incremental_price_audit_tasks.ps1 `
   -Apply
 ```
 
+### Deployment gate:注册脚本修改后必须重新 Apply（2026-08-28 Review Round 1）
+
+**已经注册的 Windows Task 不会因为仓库里 `register_incremental_price_audit_tasks.ps1` 的代码更新而自动改变
+Action/Principal/Settings。** 任何对注册脚本的修改（含本轮加入的
+`-NoProfile -NonInteractive -WindowStyle Hidden` Action 参数）部署到生产目录后，必须重新执行上面的
+`Register-ScheduledTask ... -Apply` 流程，否则线上任务仍以旧参数运行。重新 Apply 前先跑预览核对
+Arguments,再 `-Apply`,然后用 `status_incremental_price_audit_tasks.ps1` 复核。
+
+生产重新注册后的验收清单（全部通过才算部署完成）：
+
+1. `status_incremental_price_audit_tasks.ps1` 输出的 `Arguments` 含
+   `-NoProfile -NonInteractive -WindowStyle Hidden`（三者都在 `-File` 之前）。
+2. 自动触发（或手动 Start-ScheduledTask）后,桌面/任务栏**无可见 scheduled PowerShell 窗口**。
+3. Python child 正常运行：`scheduler_logs\YYYY-MM-DD.log` 出现该轮 START/END 结构化行与 python 输出。
+4. 用户关闭任意无关 PowerShell/CMD 窗口,production task 不受影响（任务树仍在,日志持续追加）。
+5. 用户在自己终端里 Ctrl+C 复制/中断操作,不影响 production task（无共享控制台）。
+6. `scheduler_logs` 正常:按业务日追加、UTF-8 无 BOM、外部可并发读取。
+7. Task Scheduler `LastTaskResult` 正常:成功轮次为 0;超时轮次为 124 且日志含 `TIMEOUT phase=...`;
+   退出码 70/74 仅对应启动失败/日志写失败并在日志中有对应诊断行。
+
 脚本固定使用 legacy 招商局 backend、`MultipleInstances=IgnoreNew`、三重复 trigger 加 20:35 一次性
 Safety Closeout（白天 15 分钟、17:00-17:55 与 18:00-20:00 每 5 分钟、20:35 一次）和 32 分钟硬上限。
 若发现旧的 `-Tick` / `-Finalize` 双任务仍存在，注册会拒绝继续，而不会暗中删除或制造竞争任务。

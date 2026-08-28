@@ -9,7 +9,10 @@ from urllib import error, request
 from pydantic import Field
 
 from app.schemas.workflow import StrictModel
-from app.services.title_match_hard_rules import evaluate_same_hard_rules
+from app.services.title_match_hard_rules import (
+    evaluate_same_hard_rules,
+    standard_model_codes_present,
+)
 
 
 class TitleMatchModelRequest(StrictModel):
@@ -32,7 +35,11 @@ class TitleMatchModelResult(StrictModel):
 
 ALLOWED_RESULTS = frozenset({"SAME", "NOT_SAME", "MANUAL_REVIEW", "MODEL_UNAVAILABLE"})
 ALLOWED_MODEL_MATCH = frozenset({"exact", "partial", "mismatch", "unknown"})
-RISK_TERMS = ("替代款", "通用", "适用", "升级款")
+# Substitute wording that must fail a model SAME closed.  "适用" is
+# deliberately NOT in this tuple: prompt rule 7 already treats 适用机型 on
+# consumables as normal product description, and the historic single-path
+# blanket downgrade produced false MANUAL_REVIEW there.
+SUBSTITUTE_RISK_TERMS = ("替代款", "通用", "升级款")
 DEFAULT_MODEL_MAX_ATTEMPTS = 3
 DEFAULT_MODEL_MAX_ELAPSED_SECONDS = 300.0
 
@@ -116,7 +123,7 @@ _PROMPT_RULES = (
     "10. 上游字段 model_audit_result、is_match 仅作为输入记录，不得作为同款依据；即使二者都是 1，也必须独立按以上标题规则判断。\n"
     "\n"
     "输出决策规则：\n"
-    "- 输出 SAME：品牌一致或明确同义；型号一致或等价；商品本体一致；核心规格、容量、尺寸、颜色、功率、材质、包装数量/套装数量一致；关键标识字段（品牌、型号、容量、尺寸、功率、包装数量）双侧都有明确表达且一致；sku_name 多出的信息只是正常补充、营销词、适用机型、标准配置或更具体描述，不与 query_str 冲突；无主品与配件/耗材/赠品冲突。\n"
+    "- 输出 SAME：品牌一致或明确同义；型号一致或等价；商品本体一致；核心规格、容量、尺寸、颜色、功率、材质、包装数量/套装数量一致；凡 query_str 已明确表达的关键标识字段（品牌、型号、容量、尺寸、功率、包装数量），sku_name 必须存在对应的明确表达且一致；query_str 本身未表达的字段不要求 sku_name 凭空补齐，也不得仅因商品本身不存在功率/容量等字段而输出 MANUAL_REVIEW（品牌等字段按各自专门规则执行）；sku_name 多出的信息只是正常补充、营销词、适用机型、标准配置或更具体描述，不与 query_str 冲突；无主品与配件/耗材/赠品冲突。\n"
     "- 输出 NOT_SAME：品牌明确不同；型号明确不同；商品本体明确不同；核心规格/容量/尺寸/功率/颜色/包装数量明确冲突；主商品与配件/耗材/服务明显不一致；包装数量明显不同。\n"
     "- 输出 MANUAL_REVIEW：品牌或型号缺失无法确认；只部分命中目标型号；多规格/多型号/可选但当前 SKU 不明确；存在替代/通用/升级/定制/额外配件/套餐风险但无法仅凭标题确认是否冲突；query_str 或 sku_name 信息不足以稳定判断。\n"
     "\n"
@@ -239,14 +246,7 @@ def _parse_model_response(raw: str, sku_name: str) -> TitleMatchModelResult:
         data = _decode_model_choices(data)
     if "is_same" in data:
         return _result_from_binary_value(data.get("is_same"), raw)
-    result = _result_from_model_dict(data, raw)
-    if any(term in sku_name for term in RISK_TERMS) and result.match_result == "SAME":
-        result = result.model_copy(update={
-            "match_result": "MANUAL_REVIEW",
-            "risk_points": [*result.risk_points, "标题含替代款/通用/适用/升级款风险词"],
-            "reason": result.reason or "标题含风险词，需人工确认是否为原型号同款",
-        })
-    return result
+    return _result_from_model_dict(data, raw)
 
 
 def _model_timeout_seconds(default: float = 30.0) -> float:
@@ -479,6 +479,15 @@ def _apply_hard_rule_veto(req: TitleMatchModelRequest, result: TitleMatchModelRe
     Historically validated hard rules (model-code single-sided, multi-pack
     single-sided) veto a SAME verdict with an explicit reason; every other
     verdict stands unchanged and the veto never manufactures a SAME.
+
+    Field policy (P2-3 review): downstream business decisions consume only
+    ``match_result`` — ``confidence``/``reason``/``risk_points`` surface as
+    evidence text in the audit trail, and ``model_match``/``spec_match``/
+    ``brand_match`` have no consumer at all.  The veto therefore only changes
+    ``match_result``/``reason``/``risk_points`` and deliberately retains the
+    model's own per-field self-assessment and confidence: they document what
+    the model claimed before the override, and the appended reason/risk
+    marker keeps the evidence trail self-explanatory.
     """
     if result.match_result != "SAME":
         return result
@@ -490,6 +499,41 @@ def _apply_hard_rule_veto(req: TitleMatchModelRequest, result: TitleMatchModelRe
         "reason": f"{result.reason};硬规则否决({veto_reason})",
         "risk_points": [*result.risk_points, f"hard-rule veto: {veto_reason}"],
     })
+
+
+def _apply_substitute_risk_guard(req: TitleMatchModelRequest, result: TitleMatchModelResult) -> TitleMatchModelResult:
+    """Shared risk-word guard: substitute wording fails a model SAME closed.
+
+    Prompt rule 7 keeps its "除非标题已明确当前 SKU 就是 query_str 的目标
+    型号" escape, verified deterministically here (the standard title's strong
+    model codes must be present in the candidate) instead of trusting the word
+    list alone.  "适用机型" is not a trigger — prompt rule 7 already treats it
+    as normal consumable description.
+    """
+    if result.match_result != "SAME":
+        return result
+    if not any(term in req.sku_name for term in SUBSTITUTE_RISK_TERMS):
+        return result
+    if standard_model_codes_present(req.query_str, req.sku_name):
+        return result
+    return result.model_copy(update={
+        "match_result": "MANUAL_REVIEW",
+        "risk_points": [*result.risk_points, "标题含替代款/通用/升级款风险词"],
+        "reason": result.reason or "标题含风险词，需人工确认是否为原型号同款",
+    })
+
+
+def _apply_shared_post_validation(req: TitleMatchModelRequest, result: TitleMatchModelResult) -> TitleMatchModelResult:
+    """One post-validation pipeline for BOTH the single and the batch path.
+
+    Same input plus same model JSON must produce the same final business
+    verdict regardless of the calling mode.  Order matters: the hard-rule
+    veto runs first (a proven different product is NOT_SAME, a stronger and
+    more specific conclusion than a risk-word review); the risk-word guard
+    then only sees whatever is still SAME.
+    """
+    result = _apply_hard_rule_veto(req, result)
+    return _apply_substitute_risk_guard(req, result)
 
 
 def call_title_match_model(
@@ -512,7 +556,7 @@ def call_title_match_model(
     }
     def _call_and_parse(effective_timeout_seconds: float) -> TitleMatchModelResult:
         raw = _post_model_payload(payload, timeout_seconds=effective_timeout_seconds)
-        return _apply_hard_rule_veto(req, _parse_model_response(raw, req.sku_name))
+        return _apply_shared_post_validation(req, _parse_model_response(raw, req.sku_name))
 
     return _retry_model_call(
         "single title match model call",
@@ -551,7 +595,7 @@ def call_title_match_model_batch(
         if missing_indexes:
             raise ModelResponseContractError(f"批量模型响应缺少结果 indexes={missing_indexes}")
         return {
-            index: _apply_hard_rule_veto(requests[index], result)
+            index: _apply_shared_post_validation(requests[index], result)
             for index, result in parsed.items()
         }
 

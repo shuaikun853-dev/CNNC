@@ -27,15 +27,30 @@ from app.services.title_match_model_adapter import (
 @pytest.mark.parametrize(
     ("query_str", "sku_name"),
     [
-        # AR-EP65 vs EP-25: explicit conflicting model numbers.
+        # 惠普 AR-EP65 硒鼓 原装
         ("惠普 AR-EP65 硒鼓 原装", "惠普 EP-25 硒鼓 原装"),
         # Explicit model present, candidate title never expresses it.
         ("世达 SATA 91403 两用批头", "世达 螺丝刀两用批头组套"),
         # Capacity explicitly on one side only.
         ("爱国者 U盘 128G 黑色", "爱国者 U盘 黑色"),
         ("得力 订书机 DS-320 中号", "得力 订书机 大号"),
+        # Prefix collisions: a longer *different* model code that merely
+        # contains the query's code as a substring is NOT the same model.
+        ("球阀 DN20 黄铜", "球阀 DN200 黄铜"),
+        ("得力 订书机 DS-320", "得力 订书机 DS-3200"),
+        ("硒鼓 EP65 适配", "硒鼓 EP650 适配"),
+        ("世达 批头 91403", "世达 批头 914030"),
     ],
-    ids=("ar-ep65-vs-ep25", "model-missing", "capacity-missing", "another-model-missing"),
+    ids=(
+        "ar-ep65-vs-ep25",
+        "model-missing",
+        "capacity-missing",
+        "another-model-missing",
+        "dn20-vs-dn200",
+        "ds320-vs-ds3200",
+        "ep65-vs-ep650",
+        "91403-vs-914030",
+    ),
 )
 def test_model_code_single_side_or_conflict_vetoes_same(query_str, sku_name):
     reason = evaluate_same_hard_rules(query_str, sku_name)
@@ -232,7 +247,105 @@ def test_prompt_version_invalidates_with_tightened_rules():
     import app.services.title_match_model_adapter as adapter
 
     assert adapter.TITLE_MATCH_PROMPT_VERSION.startswith("sha256:")
-    # The single-sided clause and the tightened SAME line are part of the
-    # hashed template, so any later edit flips the version automatically.
+    # The single-sided clause and the conditional key-field requirement are
+    # part of the hashed template, so any later edit flips the version
+    # automatically.
     assert "单边缺失" in adapter._PROMPT_TEMPLATE
-    assert "双侧都有明确表达且一致" in adapter._PROMPT_TEMPLATE
+    # P2-1 contract: the key-field SAME requirement is conditional on what
+    # query_str actually expresses — the old unconditional "双侧都有明确表达"
+    # phrasing (which read as "every product must carry capacity/power
+    # fields on both sides") must not come back.
+    assert "凡 query_str 已明确表达的关键标识字段" in adapter._PROMPT_TEMPLATE
+    assert "不要求 sku_name 凭空补齐" in adapter._PROMPT_TEMPLATE
+    assert "不得仅因商品本身不存在功率/容量等字段而输出 MANUAL_REVIEW" in adapter._PROMPT_TEMPLATE
+    assert "双侧都有明确表达" not in adapter._PROMPT_TEMPLATE
+
+
+# ---------------------------------------------------------------------------
+# P2-2: single/batch post-validation parity
+# ---------------------------------------------------------------------------
+
+_SAME_JSON = json.dumps(
+    {"match_result": "SAME", "model_match": "exact", "confidence": 0.95}
+)
+_SAME_BATCH_JSON = json.dumps(
+    {"results": [{"index": 0, "match_result": "SAME", "model_match": "exact", "confidence": 0.95}]}
+)
+
+
+def _both_paths(monkeypatch, query_str, sku_name, model_json):
+    """Run one input through the single and the batch call with the same
+    model verdict JSON and return both final results."""
+    import app.services.title_match_model_adapter as adapter
+
+    _configure_env(monkeypatch)
+
+    def fake_post(payload, timeout_seconds=None):
+        content = payload["messages"][0]["content"]
+        if "逐条判断待判断数据" in content:
+            return _SAME_BATCH_JSON
+        return model_json
+
+    monkeypatch.setattr(adapter, "_post_model_payload", fake_post)
+    single = call_title_match_model(
+        TitleMatchModelRequest(query_str=query_str, sku_name=sku_name)
+    )
+    batch = call_title_match_model_batch(
+        [TitleMatchModelRequest(query_str=query_str, sku_name=sku_name)]
+    )
+    return single, batch[0]
+
+
+@pytest.mark.parametrize(
+    ("query_str", "sku_name", "expected"),
+    [
+        # 适用机型 on a consumable is normal description (prompt rule 7):
+        # the adapter-level blanket risk-word downgrade for 适用 is gone on
+        # BOTH paths, so a correct model SAME survives.  (The work_01 final
+        # approval gate keeps its own conservative 适用 handling — that layer
+        # applies equally to every verdict and is out of scope here.)
+        ("惠普 88A 硒鼓 原装", "惠普88A硒鼓 适用HP M126 打印机", "SAME"),
+        # Substitute wording without a confirmed target model fails closed
+        # on BOTH paths.
+        ("订书机 中号 办公", "通用型订书机 中号 办公", "MANUAL_REVIEW"),
+        # Prompt rule 7 escape, deterministic form: the substitute word is
+        # present but the query's strong model code is provably in the title.
+        ("世达 91403 两用批头", "91403 通用批头 两用", "SAME"),
+    ],
+    ids=("适用机型-not-an-adapter-risk", "通用-no-model-confirmed", "通用-model-confirmed"),
+)
+def test_single_and_batch_paths_agree_on_post_validation(monkeypatch, query_str, sku_name, expected):
+    single, batched = _both_paths(monkeypatch, query_str, sku_name, _SAME_JSON)
+    assert single.match_result == expected
+    assert batched.match_result == expected
+    # The visible business fields agree too, not just the verdict code.
+    assert single.reason == batched.reason
+    assert single.risk_points == batched.risk_points
+
+
+def test_veto_keeps_model_self_assessment_as_evidence(monkeypatch):
+    """P2-3: the veto changes only match_result/reason/risk_points.
+
+    Downstream business decisions consume only match_result (confidence/
+    reason/risk_points surface as audit evidence; model_match/spec_match/
+    brand_match have no consumer).  The retained model self-assessment
+    documents what the model claimed before the override, and the appended
+    reason/risk marker keeps the evidence trail self-explanatory — so the
+    veto must not silently rewrite those retained fields.
+    """
+    single, batched = _both_paths(
+        monkeypatch,
+        "惠普 AR-EP65 硒鼓 原装",
+        "惠普 EP-25 硒鼓 原装",
+        _SAME_JSON,
+    )
+    for result in (single, batched):
+        assert result.match_result == "NOT_SAME"
+        # Model self-assessment retained verbatim as evidence of what the
+        # model claimed before the deterministic override.
+        assert result.model_match == "exact"
+        assert result.spec_match is None or result.spec_match is not False
+        assert result.confidence == 0.95
+        # The override itself is explicit in the human-readable fields.
+        assert "硬规则否决(R1:" in result.reason
+        assert any("hard-rule veto" in point for point in result.risk_points)
