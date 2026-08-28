@@ -5,7 +5,10 @@ classes fail-close a model SAME:
 
 * R1 model-code single-sided / conflicting — the standard product carries an
   explicit strong model code (AR-EP65, 91403, G50-2TB, DN20, ...) that the
-  candidate title does not express in any equivalent spelling;
+  candidate title does not express in any equivalent spelling;  the standard
+  side extracts codes separator-aware ("DS 320" is the code DS320, not two
+  unrelated words) through a conservative pairwise fusion with wholesale-
+  collapse guards;
 * R2 multi-pack single-sided / conflicting — one title carries an explicit
   multi-piece packaging count ("1000枚/盒", "50片/盒", "4支/套", "800片/箱",
   "四色套装4支") that the other title neither matches nor expresses.
@@ -143,6 +146,100 @@ def _model_codes_equivalent(query_token: str, sku_token: str) -> bool:
     return bool(_equivalent_model_forms(query_token) & _equivalent_model_forms(sku_token))
 
 
+# Query-side separator-aware extraction.  _MODEL_TOKEN_RE never spans a
+# space, so the standard title "得力 DS 320 订书机" would yield no strong
+# token at all (DS has no digit, 320 is too short) — every verdict on such a
+# query is a vacuous pass and standard_model_codes_present stays False.
+# Closing that hole requires fusing separator-joined pieces, which must stay
+# conservative: a limited, pairwise, left-to-right fusion of ADJACENT weak
+# pieces, accepted only when the fused form is provably code-shaped.  Each
+# guard below rejects one historically real fabrication class:
+#   * either piece strong alone -> never re-fuse an already complete code
+#     (SATA 91403 / bizhub 225i keep their current extraction untouched);
+#   * fused form without letters -> adjacent counts ("1000 800") stay counts;
+#   * last piece without a digit -> marketing-word tails ("G502 HERO");
+#   * piece shaped like a spaced measure ("70g", "2T") -> specs, not codes;
+#   * pure-letter unit piece first ("MM 300") -> unit-before-number spec;
+#   * digit-bearing first piece with a pure-digit second ("2TB 7200rpm")
+#     -> capacity followed by a spin speed/count, not one code;
+#   * any alphabetic run longer than 4 inside the fused form ("HP LaserJet
+#     1020") -> English-word series names never wholesale-collapse.
+_MAX_FUSED_LETTER_RUN = 4
+_SPEC_MEASURE_PIECE_RE = re.compile(r"\d+(?:\.\d+)?[GWTVALMK]")
+_UNIT_ABBREVIATION_WORDS = frozenset(_UNIT_LETTERS.split("|")) | {
+    "G", "W", "V", "A", "M", "T", "L", "K", "TB", "GB", "MB",
+}
+_ALNUM_PIECE_RE = re.compile(r"[A-Z0-9]+")
+_PIECE_SEPARATOR_RE = re.compile(r"[-_/ ]+")
+
+
+def _max_letter_run(form: str) -> int:
+    return max((len(run) for run in re.findall(r"[A-Z]+", form)), default=0)
+
+
+def _fusable_pair(first: str, second: str) -> bool:
+    if _is_strong_token(first) or _is_strong_token(second):
+        return False
+    compact = first + second
+    if not _is_strong_token(compact):
+        return False
+    if not any(character.isalpha() for character in compact):
+        return False
+    if not any(character.isdigit() for character in second):
+        return False
+    if _SPEC_MEASURE_PIECE_RE.fullmatch(first) or _SPEC_MEASURE_PIECE_RE.fullmatch(second):
+        return False
+    if first.isalpha() and first in _UNIT_ABBREVIATION_WORDS:
+        return False
+    if any(character.isdigit() for character in first) and not any(
+        character.isalpha() for character in second
+    ):
+        return False
+    return _max_letter_run(compact) <= _MAX_FUSED_LETTER_RUN
+
+
+def _spaced_fusion_tokens(text: str) -> list[str]:
+    """Greedy left-to-right fusion of adjacent separator-joined weak pieces.
+
+    Runs on the raw (unit-preserving) upper text — a spaced trailing
+    capacity ("G50 2TB") is stripped as a standalone spec before token
+    extraction, so only this pass can see it."""
+    raw = _to_halfwidth(text).upper()
+    pieces = [
+        (match.group(0), match.start(), match.end())
+        for match in _ALNUM_PIECE_RE.finditer(raw)
+    ]
+    tokens: list[str] = []
+    index = 0
+    while index + 1 < len(pieces):
+        first, _first_start, first_end = pieces[index]
+        second, second_start, _second_end = pieces[index + 1]
+        between = raw[first_end:second_start]
+        if between and _PIECE_SEPARATOR_RE.fullmatch(between) and _fusable_pair(first, second):
+            tokens.append(first + second)
+            index += 2
+            continue
+        index += 1
+    return tokens
+
+
+def _query_strong_model_tokens(query_str: str) -> list[str]:
+    """Strong model codes of the standard title: single tokens plus the
+    conservative spaced fusions, deduplicated by canonical form (DS-320 and
+    its fused spelling are one code, not two)."""
+    tokens = _strong_model_tokens(_normalize_for_tokens(query_str))
+    known_forms: set[str] = set()
+    for token in tokens:
+        known_forms |= _equivalent_model_forms(token)
+    for fused in _spaced_fusion_tokens(query_str):
+        fused_forms = _equivalent_model_forms(fused)
+        if fused_forms & known_forms:
+            continue
+        tokens.append(fused)
+        known_forms |= fused_forms
+    return tokens
+
+
 # Separator tolerance for candidate titles, symmetric over the compact
 # canonical form.  A strong query code collapses to its compact form
 # (DS-320 -> DS320; validated TB<->T and SATA/BIZHUB prefix flexes included
@@ -197,16 +294,18 @@ def standard_model_codes_present(query_str: str, sku_name: str) -> bool:
 
     This is the deterministic form of prompt rule 7's "除非标题已明确当前
     SKU 就是 query_str 的目标型号" branch; the shared risk-word guard uses it
-    instead of trusting the word list alone.
+    instead of trusting the word list alone.  The standard side uses the
+    separator-aware extractor so a spaced spelling ("DS 320") proves its
+    model instead of vacuously extracting nothing.
     """
-    query_tokens = _strong_model_tokens(_normalize_for_tokens(query_str))
+    query_tokens = _query_strong_model_tokens(query_str)
     if not query_tokens:
         return False
     return all(_model_code_expressed(token, sku_name) for token in query_tokens)
 
 
 def _model_code_veto(query_str: str, sku_name: str) -> str | None:
-    query_tokens = _strong_model_tokens(_normalize_for_tokens(query_str))
+    query_tokens = _query_strong_model_tokens(query_str)
     if not query_tokens:
         return None
     # Candidate-side token extraction plus exact-equivalence comparison: a

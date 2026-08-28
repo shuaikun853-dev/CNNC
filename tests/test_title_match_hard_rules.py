@@ -275,6 +275,108 @@ def test_collision_is_direction_invariant(left, right):
 
 
 # ---------------------------------------------------------------------------
+# R5 — query-side separator-aware strong model extraction (no vacuous passes)
+# ---------------------------------------------------------------------------
+
+def test_spaced_query_codes_are_truly_extracted():
+    """The MOST important contract: a separator-spaced standard title must
+    genuinely recognize its model code — standard_model_codes_present must
+    be True, not a vacuous evaluate()==None ride on an empty query token
+    set."""
+    from app.services.title_match_hard_rules import standard_model_codes_present
+
+    assert standard_model_codes_present("得力 DS 320 订书机", "得力 DS320 订书机") is True
+    assert standard_model_codes_present("闪迪 G50 2TB 移动固态硬盘", "闪迪 G50-2TB 移动固态硬盘") is True
+
+
+@pytest.mark.parametrize(
+    ("query_str", "sku_name"),
+    [
+        # A spaced query that now recognizes its code must also genuinely
+        # veto real conflicts instead of vacuously passing.
+        ("得力 DS 320 订书机", "得力 DS 3200 订书机"),
+        ("得力 DS 320 订书机", "得力 大号订书机"),
+        # G50 2TB == G50-2TB == G502TB contract => the bare stem G50 2 conflicts.
+        ("闪迪 G50 2TB 移动固态硬盘", "闪迪 G50 2 移动固态硬盘"),
+    ],
+    ids=("spaced-ds320-vs-ds3200", "spaced-ds320-vs-generic", "spaced-capacity-vs-stem"),
+)
+def test_spaced_query_collisions_now_veto(query_str, sku_name):
+    reason = evaluate_same_hard_rules(query_str, sku_name)
+    assert reason is not None and reason.startswith("R1:"), reason
+
+
+@pytest.mark.parametrize(
+    ("left", "right"),
+    _SYMMETRY_SAFE_PAIRS,
+    ids=(
+        "ds320-hyphen",
+        "ds320-space",
+        "g502tb-hyphen",
+        "g502tb-space",
+        "g502t-hyphen-tb",
+        "sata-shed",
+        "bizhub-shed",
+    ),
+)
+def test_safe_pairs_prove_presence_in_both_directions(left, right):
+    """Direction-invariance must be REAL: both sides prove the model code is
+    present, never passing vacuously on an unextractable query."""
+    from app.services.title_match_hard_rules import standard_model_codes_present
+
+    assert standard_model_codes_present(left, right) is True
+    assert standard_model_codes_present(right, left) is True
+    assert evaluate_same_hard_rules(left, right) is None
+    assert evaluate_same_hard_rules(right, left) is None
+
+
+def test_english_series_titles_are_not_wholesale_fused():
+    """False-positive protection: brand + ordinary English series word +
+    number must never collapse into a giant fused code.  The letter-run
+    guard (every alphabetic run in a fused form <= 4) rejects the
+    LASERJET run, so no HPLASERJET1020 / LASERJET1020 token can appear,
+    and a plain same-family candidate stays veto-free."""
+    from app.services.title_match_hard_rules import _query_strong_model_tokens
+
+    tokens = _query_strong_model_tokens("惠普 HP LaserJet 1020 激光打印机")
+    assert tokens == [], tokens
+    assert evaluate_same_hard_rules("惠普 HP LaserJet 1020 激光打印机", "惠普 1020 激光打印机") is None
+
+
+def test_marketing_words_and_measure_tails_never_fuse():
+    """More false-positive guards: a marketing word after a code (G502 HERO)
+    and spec-shaped pieces (A4 70g grammage, 2TB 7200rpm spin speed,
+    adjacent counts 1000 800, unit-before-number MM 300) must not fuse
+    into fabricated codes."""
+    from app.services.title_match_hard_rules import _query_strong_model_tokens
+
+    assert _query_strong_model_tokens("罗技 G502 HERO 有线鼠标") == ["G502"]
+    assert _query_strong_model_tokens("复印纸 A4 70g 500张/包") == []
+    assert _query_strong_model_tokens("硬盘 2TB 7200转 3.5英寸") == []
+    assert _query_strong_model_tokens("标签 1000 800枚装") == []
+    assert _query_strong_model_tokens("胶带 MM 300 宽") == []
+    # And the reordered-spec candidate stays veto-free (no A470G fabrication).
+    assert evaluate_same_hard_rules("复印纸 A4 70g 500张/包", "复印纸 70g A4 每包500张") is None
+
+
+def test_spaced_query_risk_guard_escape_parity(monkeypatch):
+    """standard_model_codes_present also powers the substitute-risk guard
+    escape.  A spaced query whose model the candidate provably carries must
+    keep the model's SAME verdict on BOTH paths — a failed query-side
+    extraction would fabricate a MANUAL_REVIEW here."""
+    single, batched = _both_paths(
+        monkeypatch,
+        "得力 DS 320 订书机",
+        "DS320 通用订书机 中号 办公",
+        _SAME_JSON,
+    )
+    assert single.match_result == "SAME"
+    assert batched.match_result == "SAME"
+    assert single.reason == batched.reason
+    assert single.risk_points == batched.risk_points
+
+
+# ---------------------------------------------------------------------------
 # R2 — multi-pack single-sided / conflicting
 # ---------------------------------------------------------------------------
 
