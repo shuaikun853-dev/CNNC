@@ -41,6 +41,11 @@ from app.services.incremental_audit_runtime import (
 TENANT_ID = "188605"
 POOL_ID = "222"
 
+# Fix B(R1 性能修复 2026-08-28):连接死亡级 MySQL 错误。命中后当前连接必须
+# 废弃并重建供后续查询使用;失败查询本身绝不重试。其余 SQL 错误(1142 权限/
+# 1146 表缺失/1054 列/1064 语法等)不代表连接死亡,不得触发重建。
+CONNECTION_KILLING_MYSQL_ERRNOS = frozenset({2006, 2013})
+
 CONNECT_TIMEOUT_SECONDS = 5
 READ_TIMEOUT_SECONDS = 15
 DEFAULT_GRACE_SECONDS = 1800  # callback 后暂无 search 的宽限窗口(基于入池时间近似)
@@ -367,6 +372,51 @@ def _default_connection_factory(config: DiagDBConfig):
     )
 
 
+def _is_connection_killing_error(exc: BaseException) -> bool:
+    """仅凭异常 args[0] 的 MySQL errno 判定连接死亡;绝不解析错误字符串。"""
+    args = getattr(exc, "args", ())
+    if args and isinstance(args[0], int) and args[0] in CONNECTION_KILLING_MYSQL_ERRNOS:
+        return True
+    return False
+
+
+class _RecyclingConnection:
+    """Fix B:连接故障隔离——正常路径全程复用一个连接;只有 2006/2013 杀死
+    连接后才废弃死连接(尽力 close)并重建一个。重建失败保持 None,后续
+    查询按 degraded 处理,不反复重试 factory。所有连接都保证 best-effort close。
+    """
+
+    def __init__(self, connection: Any, factory: Callable[[DiagDBConfig], Any],
+                 config: DiagDBConfig | None) -> None:
+        self._connection = connection
+        self._factory = factory
+        self._config = config
+
+    @property
+    def connection(self) -> Any:
+        return self._connection
+
+    def replace_after_connection_kill(self) -> None:
+        dead, self._connection = self._connection, None
+        if dead is not None:
+            try:
+                dead.close()
+            except Exception:
+                pass
+        try:
+            self._connection = self._factory(self._config)
+        except Exception:
+            self._connection = None
+
+    def close(self) -> None:
+        current, self._connection = self._connection, None
+        if current is not None:
+            try:
+                current.close()
+            except Exception:
+                pass
+
+
 # ---------------------------------------------------------------------------
 # 纯分类函数
 # ---------------------------------------------------------------------------
@@ -680,15 +730,21 @@ class SaasFlowDiagnosticService:
             payload["status"] = "unconfigured"
             return payload
         connection = None
+        pool: _RecyclingConnection | None = None
         try:
             connection = self._connection_factory(self._config)
-            stages, degraded = self._build_stages(connection, business_date)
+            pool = _RecyclingConnection(connection, self._connection_factory, self._config)
+            connection = None  # 所有权移交 pool(pool 可能中途换成新连接)
+            stages, degraded = self._build_stages(pool, business_date)
         except Exception as exc:  # 连接层失败:只降级本面板,凭据/DSN 不进 payload
             payload["status"] = "unavailable"
             payload["error"] = {"type": type(exc).__name__}
             return payload
         finally:
-            if connection is not None:
+            # Fix B:关闭的是"当前活跃"连接(pool 内部可能已替换),死连接早已被尽力 close
+            if pool is not None:
+                pool.close()
+            elif connection is not None:
                 try:
                     connection.close()
                 except Exception:
@@ -736,7 +792,8 @@ class SaasFlowDiagnosticService:
         columns = QUERY_COLUMNS[name]
         return [dict(zip(columns, row)) for row in rows]
 
-    def _build_stages(self, connection: Any, business_date: str) -> tuple[dict[str, Any] | None, list[str]]:
+    def _build_stages(self, pool: _RecyclingConnection,
+                      business_date: str) -> tuple[dict[str, Any] | None, list[str]]:
         degraded: list[str] = []
         day = datetime.fromisoformat(business_date).date()
         base_params = {
@@ -746,10 +803,19 @@ class SaasFlowDiagnosticService:
         }
 
         def run(name: str, params: dict[str, Any]) -> list[dict[str, Any]]:
+            # Fix B:连接死亡后重建失败 → pool.connection 为 None,后续查询
+            # 直接降级(不重试 factory、不把未执行查询伪装成空结果)。
+            connection = pool.connection
+            if connection is None:
+                degraded.append(name)
+                return []
             try:
                 return self._query(connection, name, {**base_params, **params})
-            except Exception:
+            except Exception as exc:
                 degraded.append(name)
+                if _is_connection_killing_error(exc):
+                    # 只废弃死连接并重建给"下一条"查询用;本查询绝不重试
+                    pool.replace_after_connection_kill()
                 return []
 
         sync_rows = run("pool_sync_standard_counts", {})
@@ -816,7 +882,12 @@ class SaasFlowDiagnosticService:
                 task_rows: list[dict[str, Any]] = []
                 task_failed = False
                 if ids:
-                    task_rows = run("crawl1_task_rows", {"commodity_list_ids": tuple(ids)})
+                    # Fix A(R1):task_table.reference_id 是 varchar(255)。int 绑定会让
+                    # MySQL 对列做数值转换、idx_reference_id 失效(生产 EXPLAIN:
+                    # key=idx_table_name/rows≈59 万,8~9s);按列原生类型字符串绑定后
+                    # key=idx_reference_id、rows≈95、0.06s(行集一致,2026-08-28 实测)。
+                    task_rows = run("crawl1_task_rows",
+                                    {"commodity_list_ids": tuple(str(i) for i in ids)})
                     task_failed = "crawl1_task_rows" in degraded
                 tasks_by_commodity: dict[int, list[dict[str, Any]]] = {}
                 for row in task_rows:

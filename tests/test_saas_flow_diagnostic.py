@@ -1674,3 +1674,222 @@ def test_card_k_central_success_zero_rows_detail_empty_list():
     stages = service.get_diagnostic("2026-08-27")["stages"]
     assert stages["crawler_branch"]["TASK_CREATED_NO_CENTRAL_RECORD"] == 1
     assert stages["central_status_detail"] == []
+
+
+# ===========================================================================
+# Performance Fix Round 1(2026-08-28)
+#   Fix A:crawl1_task_rows 参数类型修正——reference_id 为 varchar(255),传 int
+#         会让 MySQL 对列做数值转换、索引失效(EXPLAIN key=idx_table_name/
+#         key=NULL,rows≈59万~118万);字符串绑定后 key=idx_reference_id、
+#         rows≈95、8~9s → 0.06s(生产只读实测,行集一致)。SQL 文本不变,
+#         不用 FORCE INDEX(hint 方案已被生产 EXPLAIN 证伪:仍全表扫)。
+#   Fix B:连接故障隔离——2006/2013 杀死连接后废弃并重建,后续 query 不被
+#         死连接连带 degraded;失败 query 本身绝不重试。
+# ===========================================================================
+
+CRAWL1_CHAIN_CANNED = {
+    "pool_sync_standard_counts": [("0", 1)],
+    "open_crawl_status_counts": [(1, 0, 1, 0, 0)],
+    "crawl1_commodity_rows": [(11, "C1")],
+    "crawl1_task_rows": [(11, "SAAS-188605_701_1", 1)],
+}
+
+
+class _FakeMySQLError(Exception):
+    """形似 pymysql OperationalError:args = (errno, message)。"""
+
+
+def _make_multi_conn_service(conn_canned_list, factory_side_effect=None):
+    """factory 按序返回给定 FakeConnection;可注入第 N 次调用抛异常。"""
+    conns = [FakeConnection(canned, []) for canned in conn_canned_list]
+    remaining = list(conns)
+    calls = {"connect": 0}
+
+    def factory(cfg):
+        calls["connect"] += 1
+        if factory_side_effect is not None:
+            error = factory_side_effect(calls["connect"])
+            if error is not None:
+                raise error
+        if remaining:
+            return remaining.pop(0)
+        raise AssertionError("unexpected extra connection factory call")
+
+    service = diag.SaasFlowDiagnosticService(
+        config=diag.DiagDBConfig(host="db.example.internal", port=3306,
+                                 user="ro", password="secret-not-committed"),
+        connection_factory=factory,
+        monotonic=FakeClock(),
+    )
+    return service, conns, calls
+
+
+# ---- Fix A 契约 ----
+
+def test_r1_fix_a_task_sql_contract_unchanged():
+    sql = diag.DIAG_SQL_REGISTRY["crawl1_task_rows"]
+    # 生产 EXPLAIN 证伪 FORCE INDEX(hint 下仍 type=ALL 全表扫),不得引入
+    assert "FORCE INDEX" not in sql and "USE INDEX" not in sql
+    # WHERE 条件逐字保留
+    assert "t.table_name = '188605'" in sql
+    assert "t.reference_id IN %(commodity_list_ids)s" in sql
+    assert diag.QUERY_COLUMNS["crawl1_task_rows"] == (
+        "commodity_list_id", "task_id", "task_status")
+    assert diag.validate_readonly_statement(sql) == []
+
+
+def test_r1_fix_a_task_params_bound_as_native_column_type_strings():
+    """reference_id 是 varchar(255):int 绑定会让 MySQL 弃用 idx_reference_id
+    (生产 EXPLAIN rows≈59 万);必须以字符串绑定(实测 rows≈95)。"""
+    canned = dict(CRAWL1_CHAIN_CANNED)
+    canned["crawl1_central_rows"] = [("188605_701", "00", "00", None, None)]
+    canned["crawl2_search_flags"] = []
+    service, executed, _ = make_service(canned)
+    payload = service.get_diagnostic("2026-08-27")
+    assert payload["status"] == "ok"
+    bound = [params["commodity_list_ids"] for name, params in executed
+             if name == "crawl1_task_rows"]
+    assert bound and all(isinstance(v, str) for v in bound[0])
+
+
+# ---- Fix B:连接故障隔离 ----
+
+def test_r1_fix_b_is_connection_killing_error_classification():
+    assert diag._is_connection_killing_error(_FakeMySQLError(2013, "lost")) is True
+    assert diag._is_connection_killing_error(_FakeMySQLError(2006, "gone")) is True
+    # 普通 SQL 错误绝不能当连接死亡(否则会疯狂重连)
+    for errno in (1142, 1146, 1054, 1064, 1044):
+        assert diag._is_connection_killing_error(_FakeMySQLError(errno, "x")) is False
+    assert diag._is_connection_killing_error(RuntimeError("boom")) is False
+    assert diag._is_connection_killing_error(_FakeMySQLError("2013", "str-errno")) is False
+
+
+def test_r1_fix_b_2013_discards_connection_next_query_succeeds():
+    """central 2013 超时杀死连接 → crawl2 必须通过新连接正常执行,
+    不再被连带 degraded;central 本身只执行一次(绝不重试)。"""
+    conn1_canned = dict(CRAWL1_CHAIN_CANNED)
+    central_attempts = {"n": 0}
+
+    def central_2013(params):
+        central_attempts["n"] += 1
+        raise _FakeMySQLError(2013, "Lost connection to MySQL server during query")
+
+    conn1_canned["crawl1_central_rows"] = central_2013
+    conn2_canned = {"crawl2_search_flags": [(21, 0, "2026-08-27 09:00:00",
+                                             0, 0, 0, 0, 0, 0, 0, 0, 0)]}
+    service, conns, calls = _make_multi_conn_service([conn1_canned, conn2_canned])
+    payload = service.get_diagnostic("2026-08-27")
+    assert payload["degraded_queries"] == ["crawl1_central_rows"]
+    assert payload["status"] == "partial"
+    assert calls["connect"] == 2
+    # 死连接与替换连接都 best-effort close,无泄漏
+    assert conns[0].closed is True and conns[1].closed is True
+    # central 只尝试过一次(绝不重试);crawl2 在新连接上成功
+    assert central_attempts["n"] == 1
+    assert "crawl1_central_rows" not in [name for name, _ in conns[1]._executed]
+    assert "crawl2_search_flags" in [name for name, _ in conns[1]._executed]
+    # routing 证据保留,central 失败语义不变(证据不足,非业务 0)
+    stages = payload["stages"]
+    assert stages["crawl_status_1"] == 1
+    assert stages["crawler_branch"]["EVIDENCE_INCOMPLETE"] == 1
+
+
+def test_r1_fix_b_2006_also_triggers_reconnect():
+    conn1_canned = dict(CRAWL1_CHAIN_CANNED)
+
+    def task_2006(params):
+        raise _FakeMySQLError(2006, "MySQL server has gone away")
+
+    conn1_canned["crawl1_task_rows"] = task_2006
+    conn2_canned = {"crawl1_central_rows": [], "crawl2_search_flags": []}
+    service, conns, calls = _make_multi_conn_service([conn1_canned, conn2_canned])
+    payload = service.get_diagnostic("2026-08-27")
+    assert payload["degraded_queries"] == ["crawl1_task_rows"]
+    assert calls["connect"] == 2
+    assert conns[0].closed is True and conns[1].closed is True
+    # task 失败 → 商品级 TASK 分类不可用,但 crawl2 仍正常执行
+    assert payload["stages"]["crawler_branch"]["EVIDENCE_INCOMPLETE"] == 1
+    assert "crawl2_search_flags" not in payload["degraded_queries"]
+
+
+def test_r1_fix_b_ordinary_sql_error_does_not_reconnect():
+    """1142 等 SQL 错误不是连接死亡:不得触发换连接/重建。"""
+    conn1_canned = dict(CRAWL1_CHAIN_CANNED)
+
+    def central_1142(params):
+        raise _FakeMySQLError(1142, "SELECT command denied")
+
+    conn1_canned["crawl1_central_rows"] = central_1142
+    # routing 层 crawl2=0:crawl2 查询成功但返回空(避免 detail>route 假 drift)
+    conn1_canned["crawl2_search_flags"] = []
+    service, conns, calls = _make_multi_conn_service([conn1_canned])
+    payload = service.get_diagnostic("2026-08-27")
+    assert payload["degraded_queries"] == ["crawl1_central_rows"]
+    assert calls["connect"] == 1  # 没有重建连接
+    # crawl2 在同一连接上继续执行成功(不在 degraded)
+    assert "crawl2_search_flags" in [name for name, _ in conns[0]._executed]
+    assert payload["stages"]["downstream_branch"] is not None
+    assert sum(payload["stages"]["downstream_branch"].values()) == 0
+
+
+def test_r1_fix_b_replacement_failure_degrades_safely():
+    """central 2013 后重建连接也失败:已有证据保留,后续诊断降级,
+    不 500、不伪造业务 0、不泄漏凭据。"""
+    conn1_canned = dict(CRAWL1_CHAIN_CANNED)
+
+    def central_2013(params):
+        raise _FakeMySQLError(2013, "Lost connection to MySQL server during query")
+
+    conn1_canned["crawl1_central_rows"] = central_2013
+
+    def second_call_fails(call_number):
+        return ConnectionError("reconnect refused") if call_number == 2 else None
+
+    service, conns, calls = _make_multi_conn_service(
+        [conn1_canned], factory_side_effect=second_call_fails)
+    payload = service.get_diagnostic("2026-08-27")
+    assert payload["status"] == "partial"  # 安全降级,不是 5xx
+    assert payload["degraded_queries"] == ["crawl1_central_rows", "crawl2_search_flags"]
+    # 已取得的 routing 证据不丢失
+    assert payload["stages"]["routing_open_total"] == 1
+    assert payload["stages"]["crawl_status_1"] == 1
+    # crawl2 未被伪造为零计数:分支为 EVIDENCE_INCOMPLETE 表达(无 crawl2 数据)
+    text = json.dumps(payload, ensure_ascii=False)
+    assert "secret-not-committed" not in text
+    assert calls["connect"] == 2
+    assert conns[0].closed is True
+
+
+def test_r1_fix_b_dead_connection_close_failure_is_tolerated():
+    """死连接 close() 抛异常也必须被容忍,替换连接照常创建。"""
+
+    class CloseExplodes(FakeConnection):
+        def close(self):
+            self.closed = True
+            raise RuntimeError("close failed")
+
+    conn1_canned = dict(CRAWL1_CHAIN_CANNED)
+
+    def central_2013(params):
+        raise _FakeMySQLError(2013, "lost")
+
+    conn1_canned["crawl1_central_rows"] = central_2013
+    conn1 = CloseExplodes(conn1_canned, [])
+    conn2 = FakeConnection({"crawl2_search_flags": []}, [])
+    calls = {"connect": 0}
+    conns = [conn1, conn2]
+
+    def factory(cfg):
+        calls["connect"] += 1
+        return conns.pop(0)
+
+    service = diag.SaasFlowDiagnosticService(
+        config=diag.DiagDBConfig(host="db.example.internal", port=3306,
+                                 user="ro", password="secret-not-committed"),
+        connection_factory=factory,
+        monotonic=FakeClock(),
+    )
+    payload = service.get_diagnostic("2026-08-27")
+    assert payload["degraded_queries"] == ["crawl1_central_rows"]
+    assert calls["connect"] == 2
+    assert conn2.closed is True  # 替换连接被正确关闭
