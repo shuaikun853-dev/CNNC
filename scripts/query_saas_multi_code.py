@@ -24,6 +24,7 @@ except ModuleNotFoundError:  # Direct invocation from scripts/.
 ROOT = Path(__file__).resolve().parents[1]
 TENANT_ID = "188605"
 COMMODITY_POOL_ID = "222"
+MONITOR_BATCH_SIZE = 100
 
 
 def parse_document_ids(text: str) -> list[str]:
@@ -35,6 +36,12 @@ def parse_document_ids(text: str) -> list[str]:
             seen.add(document_id)
             result.append(document_id)
     return result
+
+
+def chunked(items: list[str], size: int) -> list[list[str]]:
+    if size < 1:
+        raise ValueError("batch size must be positive")
+    return [items[index : index + size] for index in range(0, len(items), size)]
 
 
 def response_rows(response: dict[str, Any]) -> list[dict[str, Any]]:
@@ -144,14 +151,24 @@ def main() -> int:
         raise RuntimeError(f"unexpected tenant/pool scope: {scope}")
 
     auth = AuthManager()
-    monitor_payload = dict(monitor_body)
-    monitor_payload.update({"commodityId": " ".join(document_ids), "page": 1, "limit": len(document_ids)})
-    monitor_rows = response_rows(request_json(auth, monitor_curl, monitor_payload))
-    mapping = {
-        str(row.get("commodityId")): str(row.get("myCommodityId"))
-        for row in monitor_rows
-        if row.get("commodityId") and row.get("myCommodityId")
-    }
+    mapping: dict[str, str] = {}
+    for document_id_batch in chunked(document_ids, MONITOR_BATCH_SIZE):
+        monitor_payload = dict(monitor_body)
+        monitor_payload.update(
+            {
+                "commodityId": " ".join(document_id_batch),
+                "page": 1,
+                "limit": MONITOR_BATCH_SIZE,
+            }
+        )
+        monitor_rows = response_rows(request_json(auth, monitor_curl, monitor_payload))
+        mapping.update(
+            {
+                str(row.get("commodityId")): str(row.get("myCommodityId"))
+                for row in monitor_rows
+                if row.get("commodityId") and row.get("myCommodityId")
+            }
+        )
     missing = [document_id for document_id in document_ids if document_id not in mapping]
 
     relation_curl = {**relation_curl, "body": relation_body}
