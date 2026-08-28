@@ -25,6 +25,12 @@ from app.services.recovery.common import (
     RecoveryRejected,
     _acquire_recovery_lease,
 )
+from app.services.recovery.no_result import (
+    EXPORT_NO_PRICE_CRAWL_REASON,
+    EXPORT_NO_PRICE_NO_RESULT_LIMIT,
+    EXPORT_NO_PRICE_RSP_DESC,
+    EXPORT_NO_PRICE_TASK_FINISHED_DESC,
+)
 from app.services.recovery.validation import (
     validate_linked_crawls_against_remote_payload,
 )
@@ -200,8 +206,19 @@ def run_partial_exact_harvest_recovery(
     remote_job_id: int,
     remote_identity: str,
     adapter: CnncLegacyZhaoshangAdapter,
+    timeout_seconds: float = 300.0,
 ) -> dict[str, Any]:
-    """Persist only deterministic identities from one existing partial export."""
+    """Persist only deterministic identities from one existing partial export.
+
+    A row missing from the local workbook (exact_absent) is not terminal
+    evidence by itself: the invariant is WORKBOOK_ABSENT != NO_RESULT_PROVEN.
+    Before any absent identity may be persisted as the irreversible NO_RESULT
+    crawl state, the exact remote task must be live-probed and confirm the
+    finished-task / fully-completed-progress / exact-no-price-export /
+    zero-export-count contract; every weaker shape fails closed before the
+    first durable mutation.  When every absent crawl is already terminal the
+    probe is skipped, so idempotent reruns make zero remote calls.
+    """
     path = Path(state_path)
     if not path.is_file():
         raise RecoveryRejected(f"state database does not exist: {path}")
@@ -209,6 +226,8 @@ def run_partial_exact_harvest_recovery(
     identity_parts = expected_identity.split("|")
     if len(identity_parts) != 3 or not all(identity_parts):
         raise RecoveryRejected("exact remote identity is required")
+    if timeout_seconds <= 0:
+        raise RecoveryRejected("partial exact absent probe timeout must be positive")
 
     store = DailyAuditStore(path)
     run = store.get_run(business_date)
@@ -317,6 +336,88 @@ def run_partial_exact_harvest_recovery(
         if set(crawl_groups) != set(request_by_backend):
             raise RecoveryRejected("immutable payload and linked crawl identities are incomplete")
 
+        # WORKBOOK_ABSENT != NO_RESULT_PROVEN: the irreversible NO_RESULT state
+        # may only be written for absent identities after live remote evidence
+        # confirms the finished/no-price/zero-count contract. Every check below
+        # runs before the first durable mutation, so rejection leaves the job
+        # and every crawl untouched and the operation can simply be retried.
+        absent_terminal_states = {"SUCCESS", "NO_RESULT", "TERMINAL_FAILED"}
+        pending_absent_crawls = [
+            crawl
+            for backend_key, grouped_crawls in crawl_groups.items()
+            if (backend_key[1], backend_key[2]) in classification.exact_absent
+            for crawl in grouped_crawls
+            if str(crawl["state"]) not in absent_terminal_states
+        ]
+        absent_evidence: dict[str, Any] = {}
+        probe_remote_calls = 0
+        if pending_absent_crawls:
+            no_result_before = len(store.list_crawl_work(token, states={"NO_RESULT"}))
+            if (
+                no_result_before + len(pending_absent_crawls)
+                > EXPORT_NO_PRICE_NO_RESULT_LIMIT
+            ):
+                raise RecoveryRejected(
+                    "partial exact absent no-result writes would exceed the business "
+                    "no-result limit "
+                    f"({no_result_before}+{len(pending_absent_crawls)}"
+                    f">{EXPORT_NO_PRICE_NO_RESULT_LIMIT})"
+                )
+            try:
+                probe = adapter.probe_export_no_price(
+                    prepared,
+                    identity_parts[1],
+                    identity_parts[2],
+                    timeout_seconds,
+                )
+            except RecoveryRejected:
+                raise
+            except Exception as exc:
+                raise RecoveryRejected(
+                    f"partial exact absent no-result probe failed: {exc}"
+                ) from exc
+            if not isinstance(probe, ExportNoPriceProbe):
+                raise RecoveryRejected("export no-price probe returned unexpected evidence")
+            if EXPORT_NO_PRICE_TASK_FINISHED_DESC not in str(probe.task_status_rsp_desc):
+                raise RecoveryRejected(
+                    "remote task status does not confirm the task finished: "
+                    f"{probe.task_status_rsp_desc!r}"
+                )
+            progress = dict(probe.progress or {})
+            expected_count = len(prepared.requests)
+            progress_values = {
+                key: progress.get(key)
+                for key in ("total", "pending", "running", "failed", "waiting_db", "finished")
+            }
+            if (
+                progress_values["total"] != expected_count
+                or progress_values["finished"] != expected_count
+                or progress_values["pending"] != 0
+                or progress_values["running"] != 0
+                or progress_values["failed"] != 0
+                or progress_values["waiting_db"] != 0
+            ):
+                raise RecoveryRejected(
+                    f"remote task progress is not fully completed: {progress_values}"
+                )
+            if str(probe.export_rsp_desc) != EXPORT_NO_PRICE_RSP_DESC:
+                raise RecoveryRejected(
+                    f"export response is not the exact no-price semantic: {probe.export_rsp_desc!r}"
+                )
+            if int(probe.export_count) != 0:
+                raise RecoveryRejected(
+                    f"export response contains rows (count={probe.export_count})"
+                )
+            probe_remote_calls = int(probe.remote_calls)
+            absent_evidence = {
+                "no_result_before": no_result_before,
+                "no_result_limit": EXPORT_NO_PRICE_NO_RESULT_LIMIT,
+                "task_status_rsp_desc": str(probe.task_status_rsp_desc),
+                "progress": progress_values,
+                "export_rsp_desc": str(probe.export_rsp_desc),
+                "export_count": int(probe.export_count),
+            }
+
         # All global evidence and the complete classification are validated
         # before the first mutation. Row writes are intentionally independent
         # so an interrupted recovery can resume without rewriting terminals.
@@ -351,6 +452,7 @@ def run_partial_exact_harvest_recovery(
                         remote_job_id=int(remote_job_id),
                         remote_identity=expected_identity,
                         result_path=str(prepared.result_path),
+                        reason=EXPORT_NO_PRICE_CRAWL_REASON,
                     )
                     written_no_result += current_state != "NO_RESULT"
                 else:
@@ -398,9 +500,10 @@ def run_partial_exact_harvest_recovery(
             "skipped_terminal": skipped_terminal,
             "manual_crawl_work_ids": manual_ids,
             "remote_state": str(final_job["state"]),
-            "remote_calls": 0,
+            "remote_calls": probe_remote_calls,
             "add_calls": 0,
             **dict(classification.validation_summary),
+            **absent_evidence,
         }
         return result
     finally:
