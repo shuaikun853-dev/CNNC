@@ -1097,6 +1097,23 @@ def _temporary_model_environment(configuration: Mapping[str, str]):
                 os.environ[key] = value
 
 
+def _export_model_environment(configuration: Mapping[str, str]) -> None:
+    """Idempotently export model configuration for concurrent batch workers.
+
+    The batch callback fans out over a bounded thread pool once
+    TITLE_MATCH_MODEL_MAX_CONCURRENCY exceeds one, and mutate-then-restore of
+    ``os.environ`` would race between threads.  The export only fills keys that
+    are absent from the environment — an explicit environment pin keeps its
+    value (the same precedence ``_read_model_configuration`` applies) — and
+    writing the same resolved value twice is benign, so no lock is required.
+    The scheduled process is one-shot, so leaving the keys exported is safe.
+    """
+    for key, value in configuration.items():
+        if os.environ.get(key, "").strip():
+            continue
+        os.environ[key] = str(value)
+
+
 def _persistable_model_result(result: Any) -> Mapping[str, Any]:
     payload = result.model_dump(mode="json")
     payload.pop("raw_response", None)
@@ -1131,13 +1148,13 @@ def _model_batch_worker(rows: list[Mapping[str, Any]], timeout_seconds: float) -
         )
         for row in rows
     ]
-    with _temporary_model_environment(configuration):
-        results = call_title_match_model_batch(
-            requests,
-            timeout_seconds=max(0.001, timeout_seconds),
-            max_attempts=3,
-            max_elapsed_seconds=max(0.001, timeout_seconds),
-        )
+    _export_model_environment(configuration)
+    results = call_title_match_model_batch(
+        requests,
+        timeout_seconds=max(0.001, timeout_seconds),
+        max_attempts=3,
+        max_elapsed_seconds=max(0.001, timeout_seconds),
+    )
     return {index: _persistable_model_result(result) for index, result in results.items()}
 
 
@@ -1151,6 +1168,21 @@ def _runtime_model_batch_size() -> int:
         raise RuntimeConfigurationError("TITLE_MATCH_MODEL_BATCH_SIZE must be a positive integer") from exc
     if value <= 0:
         raise RuntimeConfigurationError("TITLE_MATCH_MODEL_BATCH_SIZE must be a positive integer")
+    return value
+
+
+def _runtime_model_max_concurrency() -> int:
+    """Bounded parallel model batch HTTP calls; validated by the offline
+    300/500-row benchmarks in tests/test_model_parallel_batches.py."""
+    raw = os.environ.get("TITLE_MATCH_MODEL_MAX_CONCURRENCY", "").strip()
+    if not raw:
+        return 6
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise RuntimeConfigurationError("TITLE_MATCH_MODEL_MAX_CONCURRENCY must be a positive integer") from exc
+    if value <= 0:
+        raise RuntimeConfigurationError("TITLE_MATCH_MODEL_MAX_CONCURRENCY must be a positive integer")
     return value
 
 
@@ -1913,6 +1945,7 @@ def _run_runtime_command_locked(
         model_prompt_version=TITLE_MATCH_PROMPT_VERSION,
         model_schema_version=TITLE_MATCH_SCHEMA_VERSION,
         model_batch_size=10 if lifecycle_only else _runtime_model_batch_size(),
+        model_max_concurrency=1 if lifecycle_only else _runtime_model_max_concurrency(),
         **(
             {"source_stability_seconds": source_stability_seconds}
             if source_stability_seconds is not None

@@ -144,7 +144,9 @@ def test_tick_order_idempotency_and_duplicate_membership(tmp_path):
     second = run_incremental_tick(store, ProcessLock(tmp_path / "tick.lock"), config, deps)
 
     assert first.outcome == "WAITING_REMOTE"
-    assert list(first.phase_trace[:4]) == ["recover", "harvest", "discover", "detail"]
+    # Crawl submission now precedes MODEL: remote work is already pending while
+    # the model retry backlog keeps the stage rows claimable.
+    assert list(first.phase_trace[:5]) == ["recover", "harvest", "discover", "submit", "detail"]
     assert events.count("harvest") == 3
     assert events.count("detail:doc-1") == 1
     assert events.count("model:doc-1") == 1
@@ -1021,15 +1023,14 @@ def test_model_preprocessing_stops_traversing_when_local_work_reaches_reserve(tm
         requests.append([str(row["skuId"]) for row in batch])
         or {index: {"match_result": "SAME"} for index, _row_value in enumerate(batch)}
     )
-    original_ensure = store.ensure_stage_work
+    original_ensure_batch = store.ensure_stage_work_batch
 
-    def advancing_ensure(token, audit_item_id, stage, fingerprint):
-        work = original_ensure(token, audit_item_id, stage, fingerprint)
-        if stage == "MODEL":
-            clock.advance(6)
-        return work
+    def advancing_ensure_batch(token, entries):
+        works = original_ensure_batch(token, entries)
+        clock.advance(6 * len(entries))
+        return works
 
-    store.ensure_stage_work = advancing_ensure
+    store.ensure_stage_work_batch = advancing_ensure_batch
 
     summary = run_incremental_tick(
         store,
@@ -1046,10 +1047,16 @@ def test_model_preprocessing_stops_traversing_when_local_work_reaches_reserve(tm
     token = store.acquire_lease("2026-08-11", "inspect", 30)
     models = store.list_stage_work(token, stage="MODEL")
     store.release_lease(token)
-    assert len(models) == 3
+    # The batched grouping transaction advances the clock past the reserve, so
+    # no MODEL batch is dispatched at all; the durable rows stay claimable for
+    # the next tick.
+    assert len(models) == 4
     assert requests == []
     assert summary.backlog["stage_pending"] == 8
-    assert summary.outcome == "BUDGET_EXHAUSTED"
+    # MODEL traversal hit the reserve, but the crawl submissions made before
+    # MODEL leave durable remote work pending, so the tick reports the remote
+    # wait rather than a pure budget stop.
+    assert summary.outcome == "WAITING_REMOTE"
 
 
 @pytest.mark.parametrize(
@@ -1365,7 +1372,7 @@ def test_transient_model_failure_is_retryable_by_the_next_tick(tmp_path, failure
     after_second = store.list_stage_work(token, stage="MODEL")[0]
     store.release_lease(token)
 
-    assert first.outcome == "PENDING_RETRY"
+    assert first.outcome == "WAITING_REMOTE"
     assert after_first["state"] == "RETRYABLE_FAILED"
     assert after_first["retryable"] == 1
     assert after_first["attempts"] == 1
@@ -1444,7 +1451,7 @@ def test_transient_model_retry_stops_at_the_durable_attempt_ceiling(tmp_path):
     model = store.list_stage_work(token, stage="MODEL")[0]
     store.release_lease(token)
 
-    assert first.outcome == "PENDING_RETRY"
+    assert first.outcome == "WAITING_REMOTE"
     assert second.outcome == "MANUAL_REVIEW_REQUIRED"
     assert third.outcome == "MANUAL_REVIEW_REQUIRED"
     assert model["state"] == "TERMINAL_FAILED"
@@ -1509,8 +1516,12 @@ def test_model_retry_success_plans_once_without_reclaiming_existing_success(tmp_
     assert model_batches == [["doc-retry"], ["doc-ok"], ["doc-retry"]]
     assert all(work["state"] == "SUCCESS" for work in models)
     assert len(crawls) == 2
-    assert len(jobs) == 2
-    assert submit_calls == 2
+    # Crawl planning happens before MODEL, so both rows were planned and
+    # submitted together in the first tick; the later MODEL retry success must
+    # not re-plan or re-submit anything.
+    assert len(jobs) == 1
+    assert submit_calls == 1
+    assert all(crawl["remote_job_id"] == jobs[0]["id"] for crawl in crawls)
 
 
 def test_retryable_model_backlog_survives_a_later_snapshot_and_plans_once(tmp_path):
@@ -1569,7 +1580,7 @@ def test_retryable_model_backlog_survives_a_later_snapshot_and_plans_once(tmp_pa
     jobs = store.list_remote_jobs(token)
     store.release_lease(token)
 
-    assert first.outcome == "PENDING_RETRY"
+    assert first.outcome == "WAITING_REMOTE"
     assert second.outcome == "WAITING_REMOTE"
     assert third.outcome == "WAITING_REMOTE"
     assert model_batches == [["doc-retry"], ["doc-current", "doc-retry"]]
@@ -1581,8 +1592,11 @@ def test_retryable_model_backlog_survives_a_later_snapshot_and_plans_once(tmp_pa
         ("doc-current", "sku-current"),
         ("doc-retry", "sku-retry"),
     }
-    assert len(jobs) == 1
-    assert submit_calls == 1
+    # Each snapshot planned its own crawl work exactly once (tick 1: the retry
+    # row, tick 2: the newly discovered current row); the MODEL retry backlog
+    # never re-triggers a plan or a second remote submit for either row.
+    assert len(jobs) == 2
+    assert submit_calls == 2
 
 
 def test_linked_submit_intent_crash_resumes_exactly_once_without_replanning(tmp_path):

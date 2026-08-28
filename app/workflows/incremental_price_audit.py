@@ -12,6 +12,8 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import queue
+import threading
 import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -62,6 +64,12 @@ class TickConfig:
     model_max_attempts: int = 8
     model_max_elapsed_seconds: float = 900
     model_batch_size: int = 10
+    # Upper bound on concurrently inflight model batch HTTP calls.  Durable
+    # claim/checkpoint and every SQLite write stay on the calling thread; only
+    # the per-batch HTTP callback fans out.  The default of 1 keeps the exact
+    # serial behaviour; production composes its benchmarked value through
+    # TITLE_MATCH_MODEL_MAX_CONCURRENCY.
+    model_max_concurrency: int = 1
     external_timeout_seconds: float = 60
     snapshot_discovery_timeout_seconds: float = 180
     model_name: str = "title-match"
@@ -108,6 +116,8 @@ class TickConfig:
             raise ValueError("stage attempt limits must be positive")
         if self.model_batch_size <= 0:
             raise ValueError("model batch size must be positive")
+        if self.model_max_concurrency <= 0:
+            raise ValueError("model max concurrency must be positive")
         if self.detail_max_elapsed_seconds <= 0 or self.model_max_elapsed_seconds <= 0:
             raise ValueError("stage elapsed limits must be positive")
         if (
@@ -650,80 +660,225 @@ def _stage_model_batches(
     counters: dict[str, int],
     wall_clock: Callable[[], datetime] | None = None,
 ) -> None:
-    """Claim/reuse durable MODEL work and make at most one HTTP call per batch."""
+    """Claim/reuse durable MODEL work and make at most one HTTP call per batch.
+
+    Durable claims, lease renewals and completion/failure writes always happen
+    on the calling thread.  When ``config.model_max_concurrency`` exceeds one,
+    the per-batch HTTP callbacks fan out over a bounded thread pool; each batch
+    is claimed before dispatch and checkpointed by the caller as its future
+    settles, so SQLite stays single-writer and no worker ever touches the
+    store.  A budget stop only prevents new dispatches — already inflight
+    batches run to their bounded timeout and are still checkpointed.
+    """
     grouped: dict[str, list[tuple[Mapping[str, Any], Mapping[str, Any]]]] = {}
+    entries: list[tuple[int, str, str]] = []
+    fingerprints: dict[int, str] = {}
     for item in items:
-        if not budget.can_start_heavy():
-            break
         fingerprint = model_fingerprint(
             item["row"], config.model_name, config.model_prompt_version, config.model_schema_version,
         )
-        work = store.ensure_stage_work(token, int(item["id"]), "MODEL", fingerprint)
-        reused = store.reuse_successful_stage_work(token, int(work["id"]))
-        if reused is None and work["state"] != "SUCCESS":
-            grouped.setdefault(fingerprint, []).append((item, work))
+        entries.append((int(item["id"]), "MODEL", fingerprint))
+        fingerprints[int(item["id"])] = fingerprint
+    # One batched transaction for ensure+reuse keeps hundreds of rows from
+    # paying one fsync commit each; the lease-owning thread stays the only
+    # writer.
+    if not entries or not budget.can_start_heavy():
+        return
+    ensured = store.ensure_stage_work_batch(token, entries)
+    reuse_ids = [
+        int(work["id"])
+        for item_id, work in ensured.items()
+        if work["state"] != "SUCCESS"
+    ]
+    reused = store.reuse_successful_stage_work_batch(token, reuse_ids) if reuse_ids else {}
+    for item in items:
+        item_id = int(item["id"])
+        work = ensured[item_id]
+        reused_work = reused.get(int(work["id"]))
+        if reused_work is not None:
+            work = reused_work
+        if reused_work is None and work["state"] != "SUCCESS":
+            grouped.setdefault(fingerprints[item_id], []).append((item, work))
 
-    groups = list(grouped.values())
-    for start in range(0, len(groups), config.model_batch_size):
-        if not budget.can_start_heavy():
-            return
-        claimed_groups: list[list[tuple[Mapping[str, Any], Mapping[str, Any]]]] = []
-        for group in groups[start:start + config.model_batch_size]:
-            if not budget.can_start_heavy():
-                break
-            claimed: list[tuple[Mapping[str, Any], Mapping[str, Any]]] = []
-            for item, work in group:
-                if not budget.can_start_heavy():
-                    break
-                if _durable_retry_backoff_blocks_claim(
-                    work, wall_clock or (lambda: datetime.now(UTC))
-                ):
-                    continue
-                current = store.claim_stage_work(
-                    token, int(work["id"]), max_attempts=config.model_max_attempts,
+    def claim_groups(group: list[tuple[Mapping[str, Any], Mapping[str, Any]]]) -> list[tuple[Mapping[str, Any], Mapping[str, Any]]]:
+        item_by_work_id = {int(work["id"]): item for item, work in group}
+        # RETRYABLE_FAILED rows still inside their durable backoff window must
+        # not be reclaimed; the batched claim keeps that spacing.
+        eligible_ids = [
+            int(work["id"])
+            for _item, work in group
+            if not _durable_retry_backoff_blocks_claim(
+                work, wall_clock or (lambda: datetime.now(UTC))
+            )
+        ]
+        if not eligible_ids:
+            return []
+        claimed_rows = store.claim_stage_work_batch(
+            token,
+            eligible_ids,
+            max_attempts=config.model_max_attempts,
+            max_elapsed_seconds=config.model_max_elapsed_seconds,
+        )
+        return [(item_by_work_id[int(row["id"])], row) for row in claimed_rows]
+
+    def settle_batch(
+        claimed_groups: list[list[tuple[Mapping[str, Any], Mapping[str, Any]]]],
+        elapsed: float,
+        outcome: tuple[str, Any],
+    ) -> None:
+        kind, payload = outcome
+        if kind == "error":
+            exc = payload
+            retryable = _is_retryable_model_failure(exc)
+            store.fail_stage_work_batch(
+                token,
+                [
+                    (int(work["id"]), elapsed, _safe_error(exc), retryable)
+                    for group in claimed_groups
+                    for _item, work in group
+                ],
+                max_attempts=config.model_max_attempts,
+                max_elapsed_seconds=config.model_max_elapsed_seconds,
+            )
+        else:
+            results = payload
+            completions: list[tuple[int, Any]] = []
+            overruns: list[tuple[int, float, str, bool]] = []
+            for index, group in enumerate(claimed_groups):
+                for _item, work in group:
+                    if float(work["elapsed_seconds"]) + elapsed > config.model_max_elapsed_seconds:
+                        overruns.append((int(work["id"]), elapsed, "stage callback exceeded elapsed limit", False))
+                    else:
+                        completions.append((int(work["id"]), results[index]))
+            if completions:
+                store.complete_stage_work_batch(token, completions)
+            if overruns:
+                store.fail_stage_work_batch(
+                    token, overruns,
+                    max_attempts=config.model_max_attempts,
                     max_elapsed_seconds=config.model_max_elapsed_seconds,
                 )
-                if current is not None:
-                    claimed.append((item, current))
-            if claimed:
-                claimed_groups.append(claimed)
-        if not claimed_groups:
-            continue
-        stage_remaining = min(
-            config.model_max_elapsed_seconds - float(work["elapsed_seconds"])
-            for group in claimed_groups for _item, work in group
-        )
-        timeout = budget.callback_timeout(config.external_timeout_seconds, stage_remaining)
-        started = budget.monotonic()
-        store.renew_lease(token, max(1, budget.remaining() + budget.reserve_seconds))
+        counters["model_attempts"] = counters.get("model_attempts", 0) + 1
+        counters["model_batches"] = counters.get("model_batches", 0) + 1
+
+    def dispatch_callback(claimed_groups: list[list[tuple[Mapping[str, Any], Mapping[str, Any]]]], timeout: float) -> tuple[str, Any]:
         try:
             results = callback([group[0][0]["row"] for group in claimed_groups], timeout)
             expected_indexes = set(range(len(claimed_groups)))
-            if set(results) != expected_indexes:
+            if not isinstance(results, Mapping) or set(results) != expected_indexes:
                 raise ValueError("model_batch must return exactly one result for every request index")
-        except Exception as exc:
+            return ("ok", results)
+        except Exception as exc:  # settled by the caller on the main thread
+            return ("error", exc)
+
+    groups = list(grouped.values())
+    batches = [
+        groups[start:start + config.model_batch_size]
+        for start in range(0, len(groups), config.model_batch_size)
+    ]
+    if not batches:
+        return
+    concurrency = max(1, min(int(config.model_max_concurrency), len(batches)))
+    if concurrency == 1:
+        for batch in batches:
+            if not budget.can_start_heavy():
+                return
+            claimed_groups = [claim_groups(group) for group in batch]
+            claimed_groups = [claimed for claimed in claimed_groups if claimed]
+            if not claimed_groups:
+                continue
+            stage_remaining = min(
+                config.model_max_elapsed_seconds - float(work["elapsed_seconds"])
+                for group in claimed_groups for _item, work in group
+            )
+            timeout = budget.callback_timeout(config.external_timeout_seconds, stage_remaining)
+            started = budget.monotonic()
+            store.renew_lease(token, max(1, budget.remaining() + budget.reserve_seconds))
+            outcome = dispatch_callback(claimed_groups, timeout)
             elapsed = budget.monotonic() - started
-            retryable = _is_retryable_model_failure(exc)
-            for group in claimed_groups:
-                for _item, work in group:
-                    store.fail_stage_work(
-                        token, int(work["id"]), elapsed_seconds=elapsed, error=_safe_error(exc),
-                        retryable=retryable,
-                        max_attempts=config.model_max_attempts, max_elapsed_seconds=config.model_max_elapsed_seconds,
-                    )
-            continue
-        elapsed = budget.monotonic() - started
-        for index, group in enumerate(claimed_groups):
-            for _item, work in group:
-                if float(work["elapsed_seconds"]) + elapsed > config.model_max_elapsed_seconds:
-                    store.fail_stage_work(
-                        token, int(work["id"]), elapsed_seconds=elapsed, error="stage callback exceeded elapsed limit",
-                        retryable=False, max_attempts=config.model_max_attempts,
-                        max_elapsed_seconds=config.model_max_elapsed_seconds,
-                    )
-                else:
-                    store.complete_stage_work(token, int(work["id"]), results[index])
-        counters["model_attempts"] += 1
+            settle_batch(claimed_groups, elapsed, outcome)
+        return
+
+    max_inflight = 0
+    inflight: dict[int, tuple[list[list[tuple[Mapping[str, Any], Mapping[str, Any]]]], float]] = {}
+    completed: dict[int, tuple[str, Any]] = {}
+    completed_lock = threading.Lock()
+    completed_event = threading.Event()
+    # ThreadPoolExecutor's idle-semaphore heuristic under-spawns workers when
+    # dispatches are paced by main-thread claim transactions, silently halving
+    # real concurrency against a slow provider.  Explicit worker threads keep
+    # the concurrency bound exact.
+    work_queue: queue.SimpleQueue[tuple[int, list[list[tuple[Mapping[str, Any], Mapping[str, Any]]]], float] | None] = queue.SimpleQueue()
+    fatal_error: list[BaseException] = []
+
+    def batch_worker() -> None:
+        while True:
+            entry = work_queue.get()
+            if entry is None:
+                return
+            sequence, claimed_groups, timeout = entry
+            try:
+                outcome = dispatch_callback(claimed_groups, timeout)
+            except BaseException as exc:  # re-raised on the lease-owning thread
+                with completed_lock:
+                    fatal_error.append(exc)
+                completed_event.set()
+                return
+            with completed_lock:
+                completed[sequence] = outcome
+            completed_event.set()
+
+    workers = [
+        threading.Thread(target=batch_worker, name="model-batch-worker", daemon=True)
+        for _ in range(concurrency)
+    ]
+    batch_index = 0
+    try:
+        for worker in workers:
+            worker.start()
+        sequence = 0
+        while inflight or batch_index < len(batches):
+            while (
+                batch_index < len(batches)
+                and len(inflight) < concurrency
+                and budget.can_start_heavy()
+            ):
+                batch = batches[batch_index]
+                batch_index += 1
+                claimed_groups = [claimed for claimed in (claim_groups(group) for group in batch) if claimed]
+                if not claimed_groups:
+                    continue
+                stage_remaining = min(
+                    config.model_max_elapsed_seconds - float(work["elapsed_seconds"])
+                    for group in claimed_groups for _item, work in group
+                )
+                timeout = budget.callback_timeout(config.external_timeout_seconds, stage_remaining)
+                started = budget.monotonic()
+                store.renew_lease(token, max(1, budget.remaining() + budget.reserve_seconds))
+                work_queue.put((sequence, claimed_groups, timeout))
+                inflight[sequence] = (claimed_groups, started)
+                sequence += 1
+                max_inflight = max(max_inflight, len(inflight))
+            if not inflight:
+                break
+            completed_event.wait(timeout=0.05)
+            completed_event.clear()
+            with completed_lock:
+                if fatal_error:
+                    raise fatal_error[0]
+                ready = sorted(completed)
+                outcomes = [(item, completed.pop(item)) for item in ready]
+            for item, outcome in outcomes:
+                claimed_groups, started = inflight.pop(item)
+                elapsed = budget.monotonic() - started
+                settle_batch(claimed_groups, elapsed, outcome)
+    finally:
+        for _worker in workers:
+            work_queue.put(None)
+        join_deadline = config.external_timeout_seconds + 5.0
+        for worker in workers:
+            worker.join(timeout=join_deadline)
+    counters["model_max_inflight"] = max(counters.get("model_max_inflight", 0), max_inflight)
 
 
 def _submit(
@@ -734,15 +889,24 @@ def _submit(
     deps: TickDependencies,
     budget: TickBudget,
     counters: dict[str, int],
-) -> None:
+) -> bool:
+    """Plan and dispatch crawl work; report whether the pass ran to completion.
+
+    Returns ``True`` only when the submit capability was wired, the remote-stall
+    gate allowed planning, and the planning loop finished without a budget
+    stop — i.e. the planner had a full execution opportunity for the items it
+    was given.  The caller persists that evidence as the durable
+    ``submit_pass_snapshot_id`` metric so status can tell a still-pending
+    planning window from a proven unplannable row.
+    """
     if deps.submit_crawl is None or not budget.can_start_heavy():
-        return
+        return False
     # The gate must run before any claim: a claimed submission that is then
     # abandoned would durably burn post_attempted evidence as SUBMIT_UNKNOWN.
     gate_reason = deps.submit_gate() if deps.submit_gate is not None else None
     if gate_reason:
         counters["submit_paused"] = counters.get("submit_paused", 0) + 1
-        return
+        return False
 
     def dispatch(job: Mapping[str, Any], crawls: Sequence[Mapping[str, Any]]) -> None:
         if not budget.can_start_heavy():
@@ -779,23 +943,23 @@ def _submit(
     # never rebuild a template or send a second logical job.
     for pending_intent in store.list_remote_jobs(token, states={"SUBMIT_INTENT"}):
         if not budget.can_start_heavy():
-            return
+            return False
         bound = store.crawl_work_for_job(int(pending_intent["id"]))
         if bound:
             dispatch(pending_intent, bound)
     if deps.plan_crawl is None or not budget.can_start_heavy():
-        return
+        return True
     store.renew_lease(token, max(1, budget.remaining() + budget.reserve_seconds))
     plans = deps.plan_crawl(eligible_items, budget.callback_timeout(config.external_timeout_seconds))
     for plan in plans:
         if not budget.can_start_heavy():
-            return
+            return False
         crawls: list[Mapping[str, Any]] = []
         pending_members: list[CrawlMember] = []
         seen_crawl_ids: set[int] = set()
         for member in plan.members:
             if not budget.can_start_heavy():
-                return
+                return False
             fingerprint = crawl_fingerprint(member.row, member.mall_key, config.business_date, member.backend_version)
             crawl = store.ensure_crawl_work(
                 token, member.mall_key, member.sku_id, member.exact_url, member.backend_version, fingerprint, source_id=member.source_id,
@@ -829,13 +993,14 @@ def _submit(
             # turn that local work into a durable remote intent once the tick
             # has crossed its heavy-work reserve; the next tick can reuse it.
             if not budget.can_start_heavy():
-                return
+                return False
         job = store.prepare_remote_intent(
             token, plan.logical_key, plan.task_name, plan.payload_hash, mall_key=plan.mall_key,
             input_path=plan.input_path, result_path=plan.result_path, payload_json=plan.payload_json,
         )
         crawls = store.link_crawl_work_batch_to_remote_job(token, [int(crawl["id"]) for crawl in crawls], int(job["id"]))
         dispatch(job, crawls)
+    return True
 
 
 def _backlog(
@@ -1288,6 +1453,16 @@ def run_incremental_tick(
         )
         snapshot_items = items
 
+        # Crawl planning/submission precedes DETAIL and MODEL on purpose: the
+        # crawl request is derived only from the discovered row (extLink /
+        # vendor mapping / frozen __crawl_* policy), never from stage results,
+        # so the remote Zhaoshang task should start crawling while the local
+        # MODEL pass still runs in parallel wall-clock.  MODEL state is not an
+        # eligibility gate for crawl-required rows.
+        trace.append("submit")
+        if budget.can_start_heavy() and _submit(store, token, items, config, deps, budget, counters):
+            counters["submit_pass_snapshot_id"] = snapshot_id or 0
+
         trace.append("detail")
         for item in items:
             if not budget.can_start_heavy():
@@ -1313,14 +1488,6 @@ def run_incremental_tick(
                     retry_backoff=True,
                     wall_clock=deps.wall_clock,
                 )
-        trace.append("submit")
-        if budget.can_start_heavy():
-            model_by_item = {int(work["audit_item_id"]): work for work in store.list_stage_work(token, stage="MODEL")}
-            eligible = [
-                item for item in model_items
-                if model_by_item.get(int(item["id"]), {}).get("state") == "SUCCESS"
-            ]
-            _submit(store, token, eligible, config, deps, budget, counters)
         if counters["crawl_submitted"] and budget.can_start_heavy() and store.list_remote_jobs(
             token, states=_HARVESTABLE_REMOTE_STATES
         ):

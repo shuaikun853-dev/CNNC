@@ -45,7 +45,14 @@ function Quote-CommandArgument([string] $Value) {
 }
 
 $runnerArguments = @(
+    # Hidden + NonInteractive keeps the scheduled top-level PowerShell off the
+    # user's desktop: closing a visible console window took down the whole
+    # kill-on-close job object (and with it the Python tick) on 2026-08-28.
+    # The principal stays Interactive/Limited: S4U would need re-validated
+    # network/cookie/profile access first.
     "-NoProfile",
+    "-NonInteractive",
+    "-WindowStyle", "Hidden",
     "-ExecutionPolicy", "Bypass",
     "-File", (Quote-CommandArgument $runnerPath),
     "-RepoRoot", (Quote-CommandArgument $repo),

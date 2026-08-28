@@ -41,8 +41,10 @@ SQLite 仅有七张 checkpoint 表：`daily_runs`、`snapshots`、`audit_items`�
 |---|---|
 | Task name | `CNNC-PriceAudit-Incremental` |
 | Program | Windows PowerShell |
+| Arguments | `-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File <runner> ...`（隐藏窗口:自动触发不弹窗,用户关闭可见 PowerShell 窗口不再误杀 job object 内的 Python tick;2026-08-28 事故后加固） |
 | Runner | `scripts\run_incremental_price_audit_scheduled.ps1` |
 | Start in | 仓库根目录 |
+| Principal | 注册时的交互用户,`LogonType Interactive` + `RunLevel Limited`(S4U 需先验证网络/cookie/profile,未验证不切换) |
 | Trigger | 每周一至周五共四个 trigger：09:00 起每 15 分钟唤醒至 16:45；17:00 起每 5 分钟唤醒至 17:55；18:00 起每 5 分钟唤醒至 20:00；另加 20:35 一次性 Safety Closeout（最后一次自动启动 20:35） |
 | Multiple instances | **IgnoreNew** |
 | Application budget | tick/harvest-only **720 秒**；closeout **1680 秒** |

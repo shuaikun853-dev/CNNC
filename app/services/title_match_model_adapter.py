@@ -2,12 +2,14 @@ import json
 import hashlib
 import math
 import os
+import random
 import time
 from urllib import error, request
 
 from pydantic import Field
 
 from app.schemas.workflow import StrictModel
+from app.services.title_match_hard_rules import evaluate_same_hard_rules
 
 
 class TitleMatchModelRequest(StrictModel):
@@ -105,7 +107,7 @@ _PROMPT_RULES = (
     "1. 品牌：如果 query_str 有品牌，sku_name 必须出现相同品牌或明确同义品牌。品牌明确不同直接 NOT_SAME。query_str 有品牌但 sku_name 缺品牌时，一般输出 MANUAL_REVIEW；但如果 sku_name 的型号极强且商品本体完全一致，可以输出 MANUAL_REVIEW，不得直接 SAME。query_str 无品牌而 sku_name 有品牌时，不因品牌多出直接否，继续核对其他属性。\n"
     "2. 型号：如果 query_str 有型号、订货号、物料型号、系列型号或明确编号，sku_name 必须完整包含同一型号或等价写法。型号明确不同直接 NOT_SAME。型号只缺少品牌前缀或连接符不同，例如 91403 与 SATA-91403、G50-2TB 与 G50-2T，可视为 exact。sku_name 前半部分出现多个同系列型号用于页面引流，但后半部分明确落到 query_str 的目标型号/目标规格时，不要仅因多型号营销词直接判人工复核；如果无法确认当前 SKU 选中的就是目标型号，则输出 MANUAL_REVIEW。\n"
     "3. 商品本体：商品本体必须一致，但允许更具体或同义表达。例如金属直板尺/钢直尺/钢板尺可视为同类，电脑桌/升降桌/电动电脑桌可视为同类，U盘/固态U盘/高速固态盘在品牌型号容量一致时可视为同类，彩色多功能一体机/彩色复合机/打印复印扫描一体机在品牌型号一致时可视为同类，切割片/砂轮切割片/不锈钢切割片在品牌尺寸规格一致且无明确冲突时可视为同类。主商品与明显配件、耗材、服务、赠品、替代件不是同款；如果标题同时包含主商品和可能的配件，但目标商品型号明确，需要判断该配件是否改变销售内容，不能简单否定。\n"
-    "4. 核心规格：sku_name 必须与 query_str 中的核心规格一致，包括容量、尺寸、长度、宽度、厚度、颜色、功率、电压、转速、目数、打印规格、套装数量等。候选标题缺少非核心补充参数，但品牌型号唯一且无冲突时，可以输出 SAME；不要因为 sku_name 未写 query_str 括号中的全部技术参数就直接判非同款。若核心规格明确冲突，输出 NOT_SAME；若目标规格只部分命中且存在多规格可选，输出 MANUAL_REVIEW。\n"
+    "4. 核心规格：sku_name 必须与 query_str 中的核心规格一致，包括容量、尺寸、长度、宽度、厚度、颜色、功率、电压、转速、目数、打印规格、套装数量等。候选标题缺少非核心补充参数，但品牌型号唯一且无冲突时，可以输出 SAME；不要因为 sku_name 未写 query_str 括号中的全部技术参数就直接判非同款。若核心规格明确冲突，输出 NOT_SAME；若目标规格只部分命中且存在多规格可选，输出 MANUAL_REVIEW。关键字段（型号、容量、尺寸、功率、包装数量）在 query_str 中明确存在而 sku_name 完全缺失该字段表达时，属于单边缺失：不得输出 SAME，应输出 NOT_SAME 或 MANUAL_REVIEW。\n"
     "5. 包装数量/套装数量：包装数量必须严格一致。例如 query_str 为 1片，sku_name 为 4片试用装、50片/盒、800片/箱，属于包装数量不一致，输出 NOT_SAME 或 MANUAL_REVIEW。query_str 为 四色套装 4支/套，sku_name 也表达四色套装、黑色+彩色组合、黑色1100页+彩色900页*3，可视为数量一致。\n"
     "6. 销售单位/计量单位：销售单位是辅助判断，不是商品本体。对于单件实物商品，个/把/件/台/张/片 这类销售单位差异，不得单独作为 NOT_SAME 理由；当品牌、型号、核心规格、包装数量一致时，可视为 spec_match=true。query_str 中经常同时出现“销售单位”和括号内“计量单位”，如果二者冲突，例如销售单位为台但计量单位为个、销售单位为张但计量单位为个、销售单位为片但计量单位为个，应优先参考更贴近商品本体的销售单位，不要因为 query_str 自身单位冲突直接判非同款。瓶、套、盒、箱、包等涉及包装口径的单位要谨慎，若包装数量不一致则不得 SAME。\n"
     "7. 风险词处理：sku_name 出现“替代、通用、兼容、升级、升级款、替换、改款、定制、客户定制、可选、随机、多规格、多型号”等词时，通常输出 MANUAL_REVIEW，除非标题已明确当前 SKU 就是 query_str 的目标型号和目标规格。sku_name 出现“适用”时不要一律判风险：如果商品是硒鼓、墨盒、耗材、配件，且品牌/系列/套装数量一致，“适用机型”通常是正常商品说明，可以输出 SAME；如果 query_str 是主机设备而 sku_name 只是适用某设备的配件，则输出 MANUAL_REVIEW 或 NOT_SAME。\n"
@@ -114,7 +116,7 @@ _PROMPT_RULES = (
     "10. 上游字段 model_audit_result、is_match 仅作为输入记录，不得作为同款依据；即使二者都是 1，也必须独立按以上标题规则判断。\n"
     "\n"
     "输出决策规则：\n"
-    "- 输出 SAME：品牌一致或明确同义；型号一致或等价；商品本体一致；核心规格、容量、尺寸、颜色、功率、包装数量/套装数量一致；sku_name 多出的信息只是正常补充、营销词、适用机型、标准配置或更具体描述，不与 query_str 冲突。\n"
+    "- 输出 SAME：品牌一致或明确同义；型号一致或等价；商品本体一致；核心规格、容量、尺寸、颜色、功率、材质、包装数量/套装数量一致；关键标识字段（品牌、型号、容量、尺寸、功率、包装数量）双侧都有明确表达且一致；sku_name 多出的信息只是正常补充、营销词、适用机型、标准配置或更具体描述，不与 query_str 冲突；无主品与配件/耗材/赠品冲突。\n"
     "- 输出 NOT_SAME：品牌明确不同；型号明确不同；商品本体明确不同；核心规格/容量/尺寸/功率/颜色/包装数量明确冲突；主商品与配件/耗材/服务明显不一致；包装数量明显不同。\n"
     "- 输出 MANUAL_REVIEW：品牌或型号缺失无法确认；只部分命中目标型号；多规格/多型号/可选但当前 SKU 不明确；存在替代/通用/升级/定制/额外配件/套餐风险但无法仅凭标题确认是否冲突；query_str 或 sku_name 信息不足以稳定判断。\n"
     "\n"
@@ -372,12 +374,18 @@ def _retry_model_call(
             ) from None
         sleep_seconds = min(retry_sleep, remaining_seconds)
         if sleep_seconds > 0:
+            # Jittered spacing: under bounded concurrent batch calls a 429 or
+            # 5xx burst must not retry in lockstep and amplify into a retry
+            # storm against the provider.
+            jittered = min(
+                sleep_seconds * (0.75 + 0.5 * random.random()), remaining_seconds
+            )
             print(
-                f"[model] {operation_name} failed attempt={attempt}, retry after {sleep_seconds}s: "
+                f"[model] {operation_name} failed attempt={attempt}, retry after {jittered:.3f}s: "
                 f"{_safe_failure_label(last_cause)}",
                 flush=True,
             )
-            time.sleep(sleep_seconds)
+            time.sleep(jittered)
 
     raise ModelCallRetryExhaustedError(
         operation_name,
@@ -465,6 +473,25 @@ def _post_model_payload(payload: dict, timeout_seconds: float | None = None) -> 
         return resp.read().decode("utf-8")
 
 
+def _apply_hard_rule_veto(req: TitleMatchModelRequest, result: TitleMatchModelResult) -> TitleMatchModelResult:
+    """Deterministic double-insurance: a model SAME can still fail closed.
+
+    Historically validated hard rules (model-code single-sided, multi-pack
+    single-sided) veto a SAME verdict with an explicit reason; every other
+    verdict stands unchanged and the veto never manufactures a SAME.
+    """
+    if result.match_result != "SAME":
+        return result
+    veto_reason = evaluate_same_hard_rules(req.query_str, req.sku_name)
+    if veto_reason is None:
+        return result
+    return result.model_copy(update={
+        "match_result": "NOT_SAME",
+        "reason": f"{result.reason};硬规则否决({veto_reason})",
+        "risk_points": [*result.risk_points, f"hard-rule veto: {veto_reason}"],
+    })
+
+
 def call_title_match_model(
     req: TitleMatchModelRequest,
     timeout_seconds: float | None = None,
@@ -485,7 +512,7 @@ def call_title_match_model(
     }
     def _call_and_parse(effective_timeout_seconds: float) -> TitleMatchModelResult:
         raw = _post_model_payload(payload, timeout_seconds=effective_timeout_seconds)
-        return _parse_model_response(raw, req.sku_name)
+        return _apply_hard_rule_veto(req, _parse_model_response(raw, req.sku_name))
 
     return _retry_model_call(
         "single title match model call",
@@ -523,7 +550,10 @@ def call_title_match_model_batch(
         missing_indexes = [index for index in range(len(requests)) if index not in parsed]
         if missing_indexes:
             raise ModelResponseContractError(f"批量模型响应缺少结果 indexes={missing_indexes}")
-        return parsed
+        return {
+            index: _apply_hard_rule_veto(requests[index], result)
+            for index, result in parsed.items()
+        }
 
     return _retry_model_call(
         "batch title match model call",

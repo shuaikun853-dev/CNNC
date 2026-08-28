@@ -83,8 +83,10 @@ def _stages(s: Mapping, finalized: bool, recovery_exhausted_invalid: int = 0) ->
     h = s.get("remote_health", {})
     legal_exhausted = max(0, r["recovery_exhausted"] - recovery_exhausted_invalid)
     prep_pending = d["pending"] + d["running"] + m["pending"] + m["running"]
+    # planning_pending 是"尚未轮到规划"的正常暂态,只计入未完成,不进 zs_bad(需人工)。
     zs_uncleared = any(r[k] for k in ("intent", "pending", "running", "exported", "unknown", "manual")) \
-        or any(c[k] for k in ("pending", "running", "unplanned", "unknown", "manual"))
+        or any(c[k] for k in ("pending", "running", "unplanned", "unknown", "manual")) \
+        or bool(c.get("planning_pending", 0))
     zs_bad = bool(r["manual"] or recovery_exhausted_invalid or c["manual"] or c["unplanned"])
     zs_yellow = bool(r["unknown"] or c["unknown"] or h.get("stall_detected"))
     uniq = s["counts"]["unique_items"]
@@ -138,7 +140,8 @@ def _final_text(s: Mapping) -> tuple[str, str]:
                ("remote_unknown", "个任务提交结果待确认"), ("remote_manual", "项招商局任务需人工"),
                ("model_pending", "条模型处理未完成"), ("model_terminal", "条模型终态失败"),
                ("detail_pending", "条 Detail 未完成"), ("crawl_pending", "条采集未完成"),
-               ("crawl_unplanned", "条必爬行未规划"), ("crawl_unknown", "条采集提交待确认"), ("crawl_manual", "条采集需人工")]
+               ("crawl_unplanned", "条必爬行未规划"), ("crawl_planning_pending", "条必爬行待规划"),
+               ("crawl_unknown", "条采集提交待确认"), ("crawl_manual", "条采集需人工")]
     parts = [f"{b[key]} {phrase}" for key, phrase in mapping if b.get(key, 0) > 0]
     if not parts:
         parts = ["全部阻塞已清零,等待下一次 closeout 自动出表"]
@@ -156,7 +159,9 @@ def compute_overall_status(status: Mapping, *, recovering: int = 0,
     # P1-1:合法 RECOVERY_EXHAUSTED 不再计入 manual;proof 不合法的才按真实阻塞升级红。
     manual_needed = any((r["manual"], c["manual"], c["unplanned"], m["terminal"])) \
         or recovery_exhausted_invalid > 0
-    zs_uncleared = any(r[k] for k in ("intent", "pending", "running", "exported")) or bool(c["pending"] + c["running"])
+    zs_uncleared = any(r[k] for k in ("intent", "pending", "running", "exported")) or bool(
+        c["pending"] + c["running"] + c.get("planning_pending", 0)
+    )
     # Review Fix Round 2:等待收口门直接采用生产 live blocker truth——
     # final.computed_pending(增量状态权威)不含 detail.terminal(终态证据,普通 finalize
     # 放行),不在投影层维护第二套 blocker 判定;discovered>0 排除首个快照落地前的

@@ -270,8 +270,11 @@ def test_backoff_and_attempts_survive_process_restart(tmp_path):
 
 def test_model_contract_and_fingerprint_semantics_are_unchanged():
     # The business prompt, result schema and successful parse outputs must not
-    # change while the retry classification is widened.
-    assert TITLE_MATCH_PROMPT_VERSION == "sha256:3562b17fed313556e5e93dba407407cb363db87d971b9de00a8e730e1abc1a4a"
+    # change while the retry classification is widened.  The prompt pin moved
+    # once on 2026-08-28: the SAME hard-rule double-insurance tightened the
+    # prompt (单边缺失 clause + 双侧表达 SAME requirement), which is exactly the
+    # content-addressed cache-invalidation this assertion guards.
+    assert TITLE_MATCH_PROMPT_VERSION == "sha256:5b3fa9d149fc089e8c44e5b3d9ca974a018a1e322f872d0b64ac34eff9df8144"
     assert TITLE_MATCH_SCHEMA_VERSION == "sha256:d596ebe5295054569aa9e0d9cb18af5c6f65d46d2f0d3e1df76e03b097da6e62"
 
     import app.services.title_match_model_adapter as adapter

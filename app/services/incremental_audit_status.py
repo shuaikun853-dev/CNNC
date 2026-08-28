@@ -65,6 +65,7 @@ def _empty_blocker_summary() -> dict[str, int]:
         "model_terminal": 0,
         "crawl_pending": 0,
         "crawl_unplanned": 0,
+        "crawl_planning_pending": 0,
         "crawl_unknown": 0,
         "crawl_manual": 0,
         "remote_intent": 0,
@@ -104,7 +105,7 @@ def _empty_status(
         "model": _empty_stage(),
         "crawl": {
             "pending": 0, "running": 0, "completed": 0, "no_result": 0,
-            "unplanned": 0, "unknown": 0, "manual": 0,
+            "unplanned": 0, "planning_pending": 0, "unknown": 0, "manual": 0,
             **_empty_crawl_pending_breakdown(),
         },
         "remote": {
@@ -193,8 +194,11 @@ def _next_actions(status: dict[str, Any]) -> list[str]:
         return ["inspect required snapshot rows without crawl work; do not finalize or submit without explicit authorization"]
     if status["final"]["frozen"]:
         return ["rerun finite finalize to drain frozen-snapshot work and materialize once ready"]
-    if status["crawl"]["pending"] or status["crawl"]["unplanned"]:
-        return ["run a shadow tick to advance read-only work, or explicitly authorize remote writes for crawl submission"]
+    if status["crawl"]["pending"] or status["crawl"]["planning_pending"]:
+        return [
+            "run the next tick so crawl planning and pending crawl work can advance; "
+            "required rows without crawl work are not yet a manual blocker"
+        ]
     return ["run the next finite shadow tick; run finalize at or after the 18:00 cutoff"]
 
 
@@ -331,6 +335,23 @@ def collect_runtime_status(
             metrics = json.loads(str(run["metrics_json"] or "{}"))
         except (TypeError, ValueError, json.JSONDecodeError):
             metrics = {}
+        # A required row without crawl work is only a real blocker once the
+        # planner provably had a full execution opportunity for exactly this
+        # target snapshot (a completed submit pass, recorded durably as the
+        # submit_pass_snapshot_id metric) — or once the run is frozen, where
+        # the finalize gate must never tolerate unresolved required crawls.
+        # Before that it is the normal transient window in which crawl
+        # planning simply has not run yet, not a manual condition.
+        planner_had_chance = bool(
+            run["frozen_snapshot_id"] is not None
+            or (
+                target_snapshot_id is not None
+                and int(metrics.get("submit_pass_snapshot_id") or 0) == int(target_snapshot_id)
+            )
+        )
+        crawl_planning_pending = crawl_unplanned if not planner_had_chance else 0
+        if not planner_had_chance:
+            crawl_unplanned = 0
     finally:
         connection.close()
 
@@ -341,6 +362,7 @@ def collect_runtime_status(
         "completed": crawl_states.get("SUCCESS", 0),
         "no_result": crawl_states.get("NO_RESULT", 0),
         "unplanned": crawl_unplanned,
+        "planning_pending": crawl_planning_pending,
         "unknown": crawl_states.get("SUBMIT_UNKNOWN", 0),
         "manual": crawl_states.get("TERMINAL_FAILED", 0)
         + crawl_states.get("MANUAL_REQUIRED", 0),
@@ -365,7 +387,8 @@ def collect_runtime_status(
     computed_final_pending = (
         detail["pending"] + detail["running"]
         + model["pending"] + model["running"] + model["terminal"]
-        + crawl["pending"] + crawl["running"] + crawl["unplanned"] + crawl["unknown"] + crawl["manual"]
+        + crawl["pending"] + crawl["running"] + crawl["unplanned"]
+        + crawl["planning_pending"] + crawl["unknown"] + crawl["manual"]
         + remote["intent"] + remote["pending"] + remote["running"]
         + remote["exported"] + remote["unknown"] + remote["manual"]
     )
@@ -421,6 +444,7 @@ def collect_runtime_status(
                 "model_terminal": model["terminal"],
                 "crawl_pending": crawl["pending"] + crawl["running"],
                 "crawl_unplanned": crawl["unplanned"],
+                "crawl_planning_pending": crawl["planning_pending"],
                 "crawl_unknown": crawl["unknown"],
                 "crawl_manual": crawl["manual"],
                 "remote_intent": remote["intent"],

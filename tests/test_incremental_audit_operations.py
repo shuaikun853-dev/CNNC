@@ -211,6 +211,13 @@ def test_status_reports_no_result_as_nonblocking_business_outcome(tmp_path):
 
 
 def test_status_counts_required_snapshot_rows_without_crawl_work_as_unplanned(tmp_path):
+    """Shadow day (no submit capability wired): the required row without crawl
+    work is the normal planning-pending transient, not a manual condition.
+
+    The run records no completed submit pass for the snapshot, so status must
+    keep it out of ``crawl.unplanned`` (the true manual blocker bucket) while
+    still counting it inside computed_pending.
+    """
     root = tmp_path / "runtime"
     dependencies = _dependencies()
     dependencies = TickDependencies(
@@ -243,10 +250,12 @@ def test_status_counts_required_snapshot_rows_without_crawl_work_as_unplanned(tm
 
     status = collect_runtime_status(business_date=BUSINESS_DATE, runtime_root=root)
 
-    assert status["crawl"]["unplanned"] == 1
+    assert status["crawl"]["planning_pending"] == 1
+    assert status["crawl"]["unplanned"] == 0
     assert status["final"]["computed_pending"] == 1
     assert status["next_actions"] == [
-        "inspect required snapshot rows without crawl work; do not finalize or submit without explicit authorization"
+        "run the next tick so crawl planning and pending crawl work can advance; "
+        "required rows without crawl work are not yet a manual blocker"
     ]
 
 
@@ -362,6 +371,7 @@ def test_status_final_blocker_summary_decomposes_computed_pending(tmp_path):
         "model_terminal": 0,
         "crawl_pending": 5,
         "crawl_unplanned": 0,
+        "crawl_planning_pending": 0,
         "crawl_unknown": 0,
         "crawl_manual": 0,
         "remote_intent": 0,
@@ -849,6 +859,50 @@ def test_scheduler_scripts_preview_weekday_production_plan_without_mutation():
     assert "-EnableRemoteWrites" in task["Arguments"]
     assert unregister_plan["Applied"] is False
     assert unregister_plan["TaskNames"] == ["CNNC-PriceAudit-Incremental"]
+
+
+def test_scheduler_task_action_never_creates_a_visible_console_window():
+    """2026-08-28 production incident contract: closing a visible scheduled
+    PowerShell window killed the kill-on-close job object and with it the
+    Python tick.  The registered action must therefore run hidden and
+    non-interactive, and the runner must contain no prompt that could hang
+    under -NonInteractive.  The principal deliberately stays Interactive
+    (low-privilege): switching to S4U would require re-validating network,
+    cookie and profile access first and is out of scope here.
+    """
+    root = Path(__file__).resolve().parents[1]
+    register = root / "scripts/register_incremental_price_audit_tasks.ps1"
+    runner = root / "scripts/run_incremental_price_audit_scheduled.ps1"
+
+    registered = _run_powershell_script(register, ["-EnableRemoteWrites"])
+    assert registered.returncode == 0, registered.stderr.decode("utf-8", errors="replace")
+    plan = json.loads(registered.stdout.decode("utf-8-sig"))
+    assert plan["Applied"] is False
+    task = plan["Tasks"][0]
+
+    command = str(task["Command"]).lower()
+    assert command.endswith("powershell.exe"), command
+    arguments = task["Arguments"]
+    assert "-NoProfile" in arguments
+    assert "-NonInteractive" in arguments
+    assert "-WindowStyle Hidden" in arguments
+    # The isolation flags must precede -File so the runner itself is launched
+    # into an already-hidden, non-interactive host.
+    assert arguments.index("-NonInteractive") < arguments.index("-File")
+    assert arguments.index("-WindowStyle") < arguments.index("-File")
+
+    # The runner must not rely on any interactive host feature: stdout is
+    # already redirected into scheduler_logs by design.
+    runner_text = runner.read_text(encoding="utf-8-sig")
+    for forbidden in ("Read-Host", "$Host.UI.Prompt", "[void][console]::readkey", "Pause "):
+        assert forbidden not in runner_text, forbidden
+
+    # Principal stays the validated Interactive/Limited identity; do not
+    # silently switch logon types.
+    register_text = register.read_text(encoding="utf-8-sig")
+    assert "LogonType Interactive" in register_text
+    assert "LogonType S4U" not in register_text
+    assert "RunLevel Limited" in register_text
 
 
 def test_scheduled_runner_routes_hours_without_running_python(tmp_path):

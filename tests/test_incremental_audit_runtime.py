@@ -1568,21 +1568,25 @@ def test_model_configuration_load_does_not_mutate_process_environment(tmp_path, 
     assert all(name not in os.environ for name in names)
 
 
-def test_model_batch_worker_restores_temporary_model_environment(monkeypatch):
+def test_model_batch_worker_exports_model_environment_once(monkeypatch):
     configuration = {
         "TITLE_MATCH_MODEL_API_KEY": "secret",
         "TITLE_MATCH_MODEL_BASE_URL": "https://model.invalid/v1",
         "TITLE_MATCH_MODEL_NAME": "model-name",
     }
+    # Pre-register restores as empty strings: monkeypatch.delenv on an absent
+    # variable registers no teardown, and the apply-once export must not leak
+    # into later tests in this process.
     for name in configuration:
-        monkeypatch.delenv(name, raising=False)
+        monkeypatch.setenv(name, "")
     monkeypatch.setattr(
         "app.services.incremental_audit_runtime._load_model_configuration",
         lambda: configuration,
     )
+    seen: list[dict[str, str | None]] = []
 
     def call(requests, **_kwargs):
-        assert {name: os.environ.get(name) for name in configuration} == configuration
+        seen.append({name: os.environ.get(name) for name in configuration})
         return {
             index: TitleMatchModelResult(match_result="SAME", confidence=1, model_match="exact")
             for index in range(len(requests))
@@ -1592,7 +1596,46 @@ def test_model_batch_worker_restores_temporary_model_environment(monkeypatch):
     result = _model_batch_worker([{"queryStr": "q", "skuName": "s"}], 5)
 
     assert result[0]["match_result"] == "SAME"
-    assert all(name not in os.environ for name in configuration)
+    # During the (possibly concurrent) batch call the resolved configuration
+    # is visible in the environment.
+    assert seen == [configuration]
+    # Apply-once export: batch workers run concurrently and a
+    # mutate-then-restore context would race between threads, so the resolved
+    # values stay exported for this one-shot process instead of being undone.
+    assert {name: os.environ.get(name) for name in configuration} == configuration
+
+
+def test_model_batch_worker_never_overwrites_an_explicit_env_pin(monkeypatch):
+    configuration = {
+        "TITLE_MATCH_MODEL_API_KEY": "file-key",
+        "TITLE_MATCH_MODEL_BASE_URL": "https://model.invalid/v1",
+        "TITLE_MATCH_MODEL_NAME": "file-model",
+    }
+    monkeypatch.setenv("TITLE_MATCH_MODEL_NAME", "pinned-model")
+    # See above: pre-register teardown restores so the export cannot leak.
+    monkeypatch.setenv("TITLE_MATCH_MODEL_API_KEY", "")
+    monkeypatch.setenv("TITLE_MATCH_MODEL_BASE_URL", "")
+    monkeypatch.setattr(
+        "app.services.incremental_audit_runtime._load_model_configuration",
+        lambda: configuration,
+    )
+    seen: list[dict[str, str | None]] = []
+
+    def call(requests, **_kwargs):
+        seen.append(dict(os.environ))
+        return {
+            index: TitleMatchModelResult(match_result="SAME", confidence=1, model_match="exact")
+            for index in range(len(requests))
+        }
+
+    monkeypatch.setattr("app.services.incremental_audit_runtime.call_title_match_model_batch", call)
+    _model_batch_worker([{"queryStr": "q", "skuName": "s"}], 5)
+
+    # The explicit environment pin keeps its value (same precedence as
+    # _read_model_configuration); only absent keys are filled from the file.
+    assert seen[0]["TITLE_MATCH_MODEL_NAME"] == "pinned-model"
+    assert seen[0]["TITLE_MATCH_MODEL_API_KEY"] == "file-key"
+    assert seen[0]["TITLE_MATCH_MODEL_BASE_URL"] == "https://model.invalid/v1"
 
 
 def test_runtime_uses_configured_model_name_in_tick_config(tmp_path, monkeypatch):

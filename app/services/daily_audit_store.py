@@ -983,6 +983,111 @@ class DailyAuditStore:
             connection.execute("UPDATE stage_work SET state=?, elapsed_seconds=?, retryable=?, error_text=?, claimed_at=NULL, updated_at=? WHERE id=?", (state, total, 0 if terminal else 1, error, self._utcnow(), work_id))
             return self._row(connection.execute("SELECT * FROM stage_work WHERE id=?", (work_id,)).fetchone())  # type: ignore[return-value]
 
+    # ---- Batched stage-work transitions -------------------------------------
+    # Same per-row semantics and validations as the single-row methods above,
+    # but the whole batch commits in one transaction.  The bounded-parallel
+    # MODEL pass checkpoints hundreds of rows per tick; per-row fsync commits
+    # dominate its wall clock otherwise.  All calls stay on the lease-owning
+    # thread — batching never introduces a second writer.
+
+    def ensure_stage_work_batch(self, token: LeaseToken, entries: Sequence[tuple[int, str, str]]) -> dict[int, dict[str, Any]]:
+        """Batched ensure_stage_work keyed by audit_item_id."""
+        now = self._utcnow()
+        results: dict[int, dict[str, Any]] = {}
+        with self._transaction(immediate=True) as connection:
+            self._validate_lease(connection, token)
+            for audit_item_id, stage, fingerprint in entries:
+                item = connection.execute("SELECT run_id FROM audit_items WHERE id=?", (audit_item_id,)).fetchone()
+                if item is None or int(item["run_id"]) != token.run_id:
+                    raise ValueError("stage work must belong to the leased daily run")
+                work = connection.execute("SELECT * FROM stage_work WHERE audit_item_id=? AND stage=?", (audit_item_id, stage)).fetchone()
+                if work is None:
+                    cursor = connection.execute("INSERT INTO stage_work(audit_item_id, stage, fingerprint, updated_at) VALUES (?, ?, ?, ?)", (audit_item_id, stage, fingerprint, now))
+                    work = connection.execute("SELECT * FROM stage_work WHERE id=?", (cursor.lastrowid,)).fetchone()
+                elif work["fingerprint"] != fingerprint:
+                    connection.execute(
+                        """UPDATE stage_work SET fingerprint=?, state='PENDING', attempts=0, elapsed_seconds=0,
+                           retryable=1, error_text=NULL, result_json=NULL, claimed_at=NULL, updated_at=? WHERE id=?""",
+                        (fingerprint, now, work["id"]),
+                    )
+                    work = connection.execute("SELECT * FROM stage_work WHERE id=?", (work["id"],)).fetchone()
+                results[audit_item_id] = self._row(work)  # type: ignore[index]
+        return results
+
+    def reuse_successful_stage_work_batch(self, token: LeaseToken, work_ids: Sequence[int]) -> dict[int, dict[str, Any] | None]:
+        """Batched reuse_successful_stage_work keyed by work id."""
+        results: dict[int, dict[str, Any] | None] = {}
+        with self._transaction(immediate=True) as connection:
+            for work_id in work_ids:
+                self._validate_stage_lease(connection, token, work_id)
+                target = connection.execute("SELECT * FROM stage_work WHERE id=?", (work_id,)).fetchone()
+                assert target is not None
+                if target["state"] == "SUCCESS":
+                    results[work_id] = self._row(target)
+                    continue
+                if target["state"] == "RECOVERED_PENDING_REVIEW":
+                    results[work_id] = None
+                    continue
+                source = connection.execute(
+                    """SELECT s.* FROM stage_work s JOIN audit_items a ON a.id=s.audit_item_id
+                       WHERE a.run_id=? AND s.stage=? AND s.fingerprint=? AND s.state='SUCCESS' AND s.id<>?
+                       ORDER BY s.id LIMIT 1""",
+                    (token.run_id, target["stage"], target["fingerprint"], work_id),
+                ).fetchone()
+                if source is None:
+                    results[work_id] = None
+                    continue
+                connection.execute(
+                    """UPDATE stage_work SET state='SUCCESS', retryable=0, result_json=?, error_text=NULL,
+                       claimed_at=NULL, updated_at=? WHERE id=?""",
+                    (source["result_json"], self._utcnow(), work_id),
+                )
+                results[work_id] = self._row(connection.execute("SELECT * FROM stage_work WHERE id=?", (work_id,)).fetchone())
+        return results
+
+    def claim_stage_work_batch(self, token: LeaseToken, work_ids: Sequence[int], *, max_attempts: int, max_elapsed_seconds: float) -> list[dict[str, Any]]:
+        """Batched claim_stage_work; returns only the rows actually claimed, in order."""
+        now = self._utcnow()
+        claimed: list[dict[str, Any]] = []
+        with self._transaction(immediate=True) as connection:
+            self._validate_lease(connection, token)
+            for work_id in work_ids:
+                work = connection.execute("SELECT s.*, a.run_id FROM stage_work s JOIN audit_items a ON a.id=s.audit_item_id WHERE s.id=?", (work_id,)).fetchone()
+                if work is None or int(work["run_id"]) != token.run_id:
+                    raise ValueError("stage work must belong to the leased daily run")
+                if work["state"] not in {"PENDING", "RETRYABLE_FAILED"}:
+                    continue
+                if int(work["attempts"]) >= max_attempts or float(work["elapsed_seconds"]) >= max_elapsed_seconds:
+                    connection.execute("UPDATE stage_work SET state='TERMINAL_FAILED', retryable=0, updated_at=? WHERE id=?", (now, work_id))
+                    continue
+                connection.execute("UPDATE stage_work SET state='CLAIMED', attempts=attempts+1, claimed_at=?, updated_at=? WHERE id=?", (now, now, work_id))
+                claimed.append(self._row(connection.execute("SELECT * FROM stage_work WHERE id=?", (work_id,)).fetchone()))  # type: ignore[arg-type]
+        return claimed
+
+    def complete_stage_work_batch(self, token: LeaseToken, completions: Sequence[tuple[int, Any]]) -> None:
+        """Batched complete_stage_work; every row must still be CLAIMED."""
+        with self._transaction(immediate=True) as connection:
+            for work_id, result in completions:
+                self._validate_stage_lease(connection, token, work_id)
+                work = connection.execute("SELECT state FROM stage_work WHERE id=?", (work_id,)).fetchone()
+                if work is None or work["state"] != "CLAIMED":
+                    raise ValueError("only claimed stage work can be completed")
+                connection.execute("UPDATE stage_work SET state='SUCCESS', retryable=0, result_json=?, error_text=NULL, claimed_at=NULL, updated_at=? WHERE id=?", (self._canonical_json(result), self._utcnow(), work_id))
+
+    def fail_stage_work_batch(self, token: LeaseToken, failures: Sequence[tuple[int, float, str, bool]], *, max_attempts: int, max_elapsed_seconds: float) -> None:
+        """Batched fail_stage_work; entries are (work_id, elapsed, error, retryable)."""
+        with self._transaction(immediate=True) as connection:
+            for work_id, elapsed_seconds, error_text, retryable in failures:
+                self._validate_stage_lease(connection, token, work_id)
+                work = connection.execute("SELECT * FROM stage_work WHERE id=?", (work_id,)).fetchone()
+                assert work is not None
+                if work["state"] != "CLAIMED":
+                    raise ValueError("only claimed stage work can be failed")
+                total = float(work["elapsed_seconds"]) + max(0, elapsed_seconds)
+                terminal = not retryable or int(work["attempts"]) >= max_attempts or total >= max_elapsed_seconds
+                state = "TERMINAL_FAILED" if terminal else "RETRYABLE_FAILED"
+                connection.execute("UPDATE stage_work SET state=?, elapsed_seconds=?, retryable=?, error_text=?, claimed_at=NULL, updated_at=? WHERE id=?", (state, total, 0 if terminal else 1, error_text, self._utcnow(), work_id))
+
     def recover_claimed_stage_work(self, token: LeaseToken) -> int:
         with self._transaction(immediate=True) as connection:
             self._validate_lease(connection, token)
