@@ -359,6 +359,22 @@ class DailyAuditStore:
                     updated_at TEXT NOT NULL,
                     UNIQUE(run_id, mall_key, source_id, sku_id, exact_url, backend_version)
                 );
+                CREATE TABLE IF NOT EXISTS remote_job_replacements (
+                    id INTEGER PRIMARY KEY,
+                    run_id INTEGER NOT NULL REFERENCES daily_runs(id) ON DELETE CASCADE,
+                    old_remote_job_id INTEGER NOT NULL REFERENCES remote_jobs(id),
+                    new_remote_job_id INTEGER NOT NULL REFERENCES remote_jobs(id),
+                    rebuild_action_id TEXT NOT NULL,
+                    reason TEXT NOT NULL DEFAULT '',
+                    status TEXT NOT NULL DEFAULT 'ACTIVE',
+                    old_batch_number TEXT NOT NULL DEFAULT '',
+                    new_batch_number TEXT NOT NULL DEFAULT '',
+                    stop_evidence_json TEXT NOT NULL DEFAULT '{}',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(run_id, old_remote_job_id),
+                    UNIQUE(rebuild_action_id)
+                );
                 """
             )
             columns = {row["name"] for row in connection.execute("PRAGMA table_info(remote_jobs)")}
@@ -1212,6 +1228,157 @@ class DailyAuditStore:
                 rows = connection.execute(f"SELECT * FROM remote_jobs WHERE run_id=? AND state IN ({placeholders}) ORDER BY id", (token.run_id, *sorted(states))).fetchall()
             else:
                 rows = connection.execute("SELECT * FROM remote_jobs WHERE run_id=? ORDER BY id", (token.run_id,)).fetchall()
+            return [self._row(row) for row in rows]  # type: ignore[list-item]
+
+    def supersede_remote_job_to_replacement(
+        self,
+        token: LeaseToken,
+        *,
+        old_job_id: int,
+        replacement_logical_key: str,
+        replacement_task_name: str,
+        replacement_payload_hash: str,
+        replacement_input_path: str,
+        replacement_result_path: str,
+        replacement_payload_json: Any,
+        mall_key: str,
+        action_id: str,
+        reason: str,
+        old_batch_number: str,
+        new_batch_number: str,
+        stop_evidence: Mapping[str, Any],
+        eligible_crawl_ids: Sequence[int],
+    ) -> dict[str, Any]:
+        """Retire one manual-rebuild target by recording its durable replacement.
+
+        One BEGIN IMMEDIATE transaction moves the non-terminal crawl evidence
+        of the old job to a fresh SUBMIT_INTENT job, records the replacement
+        lineage (action id, batch numbers, stop evidence) and marks the old
+        job SUPERSEDED without touching its accumulated error/recovery
+        evidence.  Every precondition is checked inside the transaction, so a
+        rejected rebuild leaves zero durable writes behind.
+        """
+        ids = list(dict.fromkeys(int(crawl_id) for crawl_id in eligible_crawl_ids))
+        with self._transaction(immediate=True) as connection:
+            self._validate_lease(connection, token)
+            old_job = connection.execute("SELECT * FROM remote_jobs WHERE id=?", (old_job_id,)).fetchone()
+            if old_job is None or int(old_job["run_id"]) != token.run_id:
+                raise ValueError("old remote job must belong to the leased daily run")
+            existing_replacement = connection.execute(
+                "SELECT id FROM remote_job_replacements WHERE run_id=? AND old_remote_job_id=?",
+                (token.run_id, old_job_id),
+            ).fetchone()
+            if existing_replacement is not None or str(old_job["state"]) == "SUPERSEDED":
+                raise RemoteIntentConflict("remote job already has a replacement")
+            reserved = connection.execute(
+                "SELECT id FROM remote_jobs WHERE run_id=? AND task_name=?",
+                (token.run_id, replacement_task_name),
+            ).fetchone()
+            if reserved is not None:
+                raise RemoteIntentConflict("replacement task name is already reserved")
+            if not ids:
+                raise ValueError("no eligible crawl work to migrate")
+            placeholders = ",".join("?" for _ in ids)
+            crawl_rows = connection.execute(f"SELECT * FROM crawl_work WHERE id IN ({placeholders}) ORDER BY id", ids).fetchall()
+            if len(crawl_rows) != len(ids) or any(int(row["run_id"]) != token.run_id for row in crawl_rows):
+                raise ValueError("eligible crawl work must belong to the leased daily run")
+            for row in crawl_rows:
+                if row["remote_job_id"] is None or int(row["remote_job_id"]) != old_job_id:
+                    raise RemoteIntentConflict("crawl work is not bound to the superseded remote job")
+                if str(row["state"]) in {"SUCCESS", "NO_RESULT", "TERMINAL_FAILED"}:
+                    raise RemoteIntentConflict("terminal crawl evidence cannot be migrated")
+            now = self._utcnow()
+            try:
+                cursor = connection.execute(
+                    """INSERT INTO remote_jobs(
+                           run_id, logical_key, task_name, payload_hash, mall_key,
+                           input_path, result_path, payload_json, state, post_attempted,
+                           created_at, updated_at
+                       )
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'SUBMIT_INTENT', 0, ?, ?)""",
+                    (
+                        token.run_id,
+                        replacement_logical_key,
+                        replacement_task_name,
+                        replacement_payload_hash,
+                        mall_key,
+                        replacement_input_path,
+                        replacement_result_path,
+                        self._canonical_json(replacement_payload_json),
+                        now,
+                        now,
+                    ),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise RemoteIntentConflict(
+                    "replacement intent conflicts with existing remote job evidence"
+                ) from exc
+            new_job_id = int(cursor.lastrowid)
+            cursor = connection.execute(
+                """INSERT INTO remote_job_replacements(
+                       run_id, old_remote_job_id, new_remote_job_id, rebuild_action_id,
+                       reason, status, old_batch_number, new_batch_number,
+                       stop_evidence_json, created_at, updated_at
+                   )
+                   VALUES (?, ?, ?, ?, ?, 'ACTIVE', ?, ?, ?, ?, ?)""",
+                (
+                    token.run_id,
+                    old_job_id,
+                    new_job_id,
+                    action_id,
+                    reason,
+                    old_batch_number,
+                    new_batch_number,
+                    self._canonical_json(stop_evidence),
+                    now,
+                    now,
+                ),
+            )
+            replacement_id = int(cursor.lastrowid)
+            connection.execute(
+                "UPDATE remote_jobs SET state='SUPERSEDED', updated_at=? WHERE id=?",
+                (now, old_job_id),
+            )
+            connection.execute(
+                f"""UPDATE crawl_work SET remote_job_id=?, state='PENDING',
+                       error_text=NULL, result_json=NULL, updated_at=?
+                   WHERE id IN ({placeholders})""",
+                (new_job_id, now, *ids),
+            )
+            return {
+                "old_job": self._row(connection.execute("SELECT * FROM remote_jobs WHERE id=?", (old_job_id,)).fetchone()),
+                "new_job": self._row(connection.execute("SELECT * FROM remote_jobs WHERE id=?", (new_job_id,)).fetchone()),
+                "replacement": self._row(connection.execute("SELECT * FROM remote_job_replacements WHERE id=?", (replacement_id,)).fetchone()),
+                "migrated_crawl_count": len(ids),
+            }
+
+    def get_replacement_for_job(self, old_job_id: int) -> dict[str, Any] | None:
+        """Lease-free read of the replacement that retired this old job."""
+        with self._reader() as connection:
+            return self._row(
+                connection.execute(
+                    "SELECT * FROM remote_job_replacements WHERE old_remote_job_id=? ORDER BY id LIMIT 1",
+                    (old_job_id,),
+                ).fetchone()
+            )
+
+    def get_replacement_of_job(self, new_job_id: int) -> dict[str, Any] | None:
+        """Lease-free read of the replacement lineage behind this new job."""
+        with self._reader() as connection:
+            return self._row(
+                connection.execute(
+                    "SELECT * FROM remote_job_replacements WHERE new_remote_job_id=? ORDER BY id LIMIT 1",
+                    (new_job_id,),
+                ).fetchone()
+            )
+
+    def list_remote_replacements(self, run_id: int) -> list[dict[str, Any]]:
+        """Lease-free read of every replacement recorded for one daily run."""
+        with self._reader() as connection:
+            rows = connection.execute(
+                "SELECT * FROM remote_job_replacements WHERE run_id=? ORDER BY id",
+                (run_id,),
+            ).fetchall()
             return [self._row(row) for row in rows]  # type: ignore[list-item]
 
     def claim_remote_submission(self, token: LeaseToken, job_id: int) -> dict[str, Any] | None:

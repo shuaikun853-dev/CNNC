@@ -1241,6 +1241,13 @@ def _runtime_model_max_concurrency(path: Path | None = None) -> int:
     return value
 
 
+def _logical_key_matches_rebuild(logical_key: str, natural_key: str) -> bool:
+    """A manual rebuild replacement persists the natural adapter logical key
+    plus a '#rebuild#' action-id suffix, so reconstruction accepts that exact
+    suffix family in addition to the unchanged natural key."""
+    return logical_key == natural_key or logical_key.startswith(f"{natural_key}#rebuild#")
+
+
 def legacy_zhaoshang_bridge(
     adapter: CnncLegacyZhaoshangAdapter,
     *,
@@ -1366,7 +1373,7 @@ def legacy_zhaoshang_bridge(
         rebuilt = adapter.prepare_job(
             business_date, requests, input_path, result_path, str(job["task_name"]), batch_path
         )
-        if rebuilt.logical_job_key != logical_key or rebuilt.payload_sha256 != str(job.get("payload_hash") or ""):
+        if not _logical_key_matches_rebuild(logical_key, rebuilt.logical_job_key) or rebuilt.payload_sha256 != str(job.get("payload_hash") or ""):
             raise ValueError("durable legacy job evidence does not match immutable payload")
         prepared[logical_key] = rebuilt
         return rebuilt

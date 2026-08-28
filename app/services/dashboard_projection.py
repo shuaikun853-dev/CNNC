@@ -123,7 +123,8 @@ def _stages(s: Mapping, finalized: bool, recovery_exhausted_invalid: int = 0) ->
     stages.append({"key": "publish", "name": "最终出表", "state": "done" if finalized else "wait",
         "state_word": "✓ 完成" if finalized else "○ 等待",
         "num": "已生成" if finalized else "阻塞清零后自动",
-        "sub": [("输出文件", s["final"]["output_path"] or "未生成")]})
+        # 阶段卡只显示文件名;完整路径仍在 payload.status.final.output_path。
+        "sub": [("输出文件", Path(s["final"]["output_path"]).name if s["final"]["output_path"] else "未生成")]})
     return stages
 
 
@@ -236,6 +237,7 @@ _STATE_CN = {
     "SUBMITTED": ("等待执行", "wait"), "RUNNING": ("执行中", "run"), "EXPORTED": ("等待回收", "wait"),
     "COMPLETED": ("已完成", "ok"), "SUBMIT_UNKNOWN": ("提交结果待确认", "warn"),
     "MANUAL_REQUIRED": ("需要人工检查", "err"), "RECOVERY_EXHAUSTED": ("自动恢复已用尽", "err"),
+    "SUPERSEDED": ("已被人工重建替代", "warn"),
 }
 
 
@@ -245,6 +247,35 @@ def _parse_ts(value) -> datetime | None:
         return m if m.tzinfo else m.replace(tzinfo=UTC)
     except ValueError:
         return None
+
+
+def _replacement_summary(con, job_id: int) -> dict | None:
+    """Read-only lookup of the manual rebuild replacement that retired a job.
+
+    Older state databases may predate the replacements table; any read
+    failure just skips the annotation (the job itself still projects).
+    """
+    try:
+        row = con.execute(
+            """SELECT r.new_remote_job_id AS replacement_job_id, r.new_batch_number,
+                      r.status, r.reason, r.created_at,
+                      j.task_name AS new_task_name
+               FROM remote_job_replacements r
+               LEFT JOIN remote_jobs j ON j.id = r.new_remote_job_id
+               WHERE r.old_remote_job_id=? ORDER BY r.id LIMIT 1""",
+            (job_id,)).fetchone()
+    except sqlite3.Error:
+        return None
+    if row is None:
+        return None
+    return {
+        "replacement_job_id": int(row["replacement_job_id"]),
+        "new_task_name": str(row["new_task_name"] or ""),
+        "new_batch_number": str(row["new_batch_number"] or ""),
+        "status": str(row["status"] or ""),
+        "reason": str(row["reason"] or ""),
+        "created_at": row["created_at"],
+    }
 
 
 def project_remote_jobs(state_path: Path, business_date: str) -> list[dict]:
@@ -295,6 +326,7 @@ def project_remote_jobs(state_path: Path, business_date: str) -> list[dict]:
                 "crawl_success": counts.get(int(row["id"]), (0, 0))[1],
                 "error_text": row["error_text"], "remote_identity": row["remote_identity"],
                 "recovery_evidence_json": row["recovery_evidence_json"],
+                "superseded_by": _replacement_summary(con, int(row["id"])),
             })
         return jobs
     finally:
@@ -455,7 +487,20 @@ def fingerprint_payload(payload: Mapping) -> str:
         .encode("utf-8")).hexdigest()
 
 
-def build_dashboard_summary(business_date: str, runtime_root=DEFAULT_RUNTIME_ROOT) -> dict:
+_PROBE_DISABLED_STATUS = {
+    "available": False,
+    "error_code": "PROBE_DISABLED",
+    "classification": None,
+    "progress": None,
+    "observed_at": None,
+    "stale": False,
+    "conflict": False,
+}
+
+
+def build_dashboard_summary(
+    business_date: str, runtime_root=DEFAULT_RUNTIME_ROOT, *, progress_service=None
+) -> dict:
     paths = runtime_paths(business_date, runtime_root)
     status = collect_runtime_status(business_date=business_date, runtime_root=runtime_root)
     jobs = project_remote_jobs(paths.state_path, business_date) if paths.state_path.is_file() else []
@@ -471,11 +516,25 @@ def build_dashboard_summary(business_date: str, runtime_root=DEFAULT_RUNTIME_ROO
         if j["recovering"] or j["pill"] in ("err", "warn") \
                 or j["recovery_attempts"] > 0 or _has_restart_evidence(j):
             timelines[str(j["id"])] = project_recovery_timeline(j)
+    # Read-only live progress overlay: any probe failure degrades to the
+    # per-job unavailable shape; it can never fail the summary itself.
+    progress_map: dict = {}
+    if progress_service is not None:
+        try:
+            progress_map = progress_service.snapshot(
+                [{"id": j["id"], "task_name": j["task_name"],
+                  "remote_identity": j["remote_identity"], "state": j["state"]}
+                 for j in jobs]
+            ) or {}
+        except Exception:
+            progress_map = {}
     payload = {
         "generated_at": _datetime.now(_UTC).isoformat(timespec="seconds"),
         "overall": compute_overall_status(status, recovering=recovering,
                                           recovery_exhausted_invalid=recovery_exhausted_invalid),
-        "jobs": [{k: v for k, v in j.items() if k != "recovery_evidence_json"} for j in jobs],
+        "jobs": [{**{k: v for k, v in j.items() if k != "recovery_evidence_json"},
+                  "live_progress": dict(progress_map.get(str(j["id"])) or _PROBE_DISABLED_STATUS)}
+                 for j in jobs],
         "timelines": timelines,
         "recent_days": project_recent_days(runtime_root, n=14),
         "scheduler": project_scheduler_status(),

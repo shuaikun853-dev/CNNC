@@ -30,6 +30,11 @@ from app.services.incremental_audit_runtime import (
     run_remote_wait_export_recovery_command,
     run_runtime_command,
 )
+from app.services.dashboard_manual_ops import (
+    REBUILD_SUCCESS_OUTCOMES,
+    run_manual_rebuild_command,
+    run_manual_reexport_command,
+)
 from app.services.incremental_audit_recovery import RecoveryRejected
 from app.services.incremental_audit_status import (
     collect_production_writer_status,
@@ -229,6 +234,26 @@ def build_parser() -> argparse.ArgumentParser:
     harvest_existing.add_argument("--remote-job-id", type=int, required=True)
     harvest_existing.add_argument("--remote-identity", required=True)
     harvest_existing.add_argument("--timeout-seconds", type=float, default=300.0)
+    reexport_existing = subparsers.add_parser("reexport-existing-remote")
+    _add_common_arguments(reexport_existing, allow_remote_writes=False)
+    reexport_existing.add_argument("--remote-job-id", type=int, required=True)
+    reexport_existing.add_argument("--remote-identity", required=True)
+    reexport_existing.add_argument("--timeout-seconds", type=float, default=180.0)
+    reexport_existing.add_argument(
+        "--action-id",
+        default=None,
+        help=argparse.SUPPRESS,
+    )
+    rebuild_remote = subparsers.add_parser("rebuild-remote-task")
+    _add_common_arguments(rebuild_remote, allow_remote_writes=False)
+    rebuild_remote.add_argument("--remote-job-id", type=int, required=True)
+    rebuild_remote.add_argument("--remote-identity", required=True)
+    rebuild_remote.add_argument("--timeout-seconds", type=float, default=120.0)
+    rebuild_remote.add_argument(
+        "--action-id",
+        default=None,
+        help=argparse.SUPPRESS,
+    )
     recover_wait_export = subparsers.add_parser("recover-remote-wait-export")
     _add_common_arguments(recover_wait_export, allow_remote_writes=False)
     recover_wait_export.add_argument("--remote-job-id", type=int, required=True)
@@ -326,6 +351,49 @@ def main(argv: list[str] | None = None) -> int:
         )
         print(json.dumps(result, ensure_ascii=False, sort_keys=True))
         return 0 if result.get("outcome") in {"FORCE_FINALIZED", "ALREADY_FINALIZED"} else 2
+    if args.command == "reexport-existing-remote":
+        try:
+            reexport = run_manual_reexport_command(
+                business_date=business_date,
+                runtime_root=args.runtime_root,
+                remote_job_id=args.remote_job_id,
+                remote_identity=args.remote_identity,
+                timeout_seconds=args.timeout_seconds,
+                action_id=args.action_id,
+            )
+        except Exception as exc:
+            print(json.dumps({
+                "business_date": business_date,
+                "outcome": "REEXPORT_REJECTED" if isinstance(exc, RecoveryRejected) else "RECOVERY_FAILED",
+                "error_type": type(exc).__name__,
+            }, ensure_ascii=False, sort_keys=True))
+            return 2
+        print(json.dumps(reexport, ensure_ascii=False, sort_keys=True))
+        return 0 if reexport.get("outcome") in {
+            "REEXPORT_COMPLETED",
+            "REEXPORT_COMPLETED_NO_RESULT",
+            "REEXPORT_STILL_RUNNING",
+            "REEXPORT_MANUAL",
+        } else 2
+    if args.command == "rebuild-remote-task":
+        try:
+            rebuild = run_manual_rebuild_command(
+                business_date=business_date,
+                runtime_root=args.runtime_root,
+                remote_job_id=args.remote_job_id,
+                remote_identity=args.remote_identity,
+                timeout_seconds=args.timeout_seconds,
+                action_id=args.action_id,
+            )
+        except Exception as exc:
+            print(json.dumps({
+                "business_date": business_date,
+                "outcome": "REBUILD_REJECTED" if isinstance(exc, RecoveryRejected) else "RECOVERY_FAILED",
+                "error_type": type(exc).__name__,
+            }, ensure_ascii=False, sort_keys=True))
+            return 2
+        print(json.dumps(rebuild, ensure_ascii=False, sort_keys=True))
+        return 0 if rebuild.get("outcome") in REBUILD_SUCCESS_OUTCOMES else 2
     if args.command in {
         "recover-model",
         "requeue-model-transient",

@@ -132,3 +132,32 @@ details.saasflow .sf-hint{font-size:11px;color:var(--faint);margin-left:auto}
 .sf-actions{margin-top:8px;display:flex;align-items:center;gap:10px}
 .sf-meta{font-size:11px;color:var(--faint)}
 @media (max-width:860px){.stages{grid-template-columns:repeat(2,1fr)}}
+/* ---- 本机受控操作台(2026-08-28):布局防御 + 操作按钮 + 实时进度 ---- */
+/* 长路径/长标识在窄容器内必须折行,不得撑破 1100px 主容器与 860px 断点 */
+.stage .sub div>span:last-child,.final-output span,td.mono,.drawer .kv span.mono,.rebuild-confirm{overflow-wrap:anywhere;word-break:break-word;min-width:0}
+/* 表格内保持单行截断(完整值在 Drawer 完整显示),不改 table-layout */
+td.mono{max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.break-all{overflow-wrap:anywhere;word-break:break-all}
+.err-warn{color:var(--warn);font-weight:600}
+.jobs-actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:6px}
+.jobs-actions button[disabled],.final-actions button[disabled]{opacity:.6;cursor:wait}
+.btn.danger{border-color:var(--err);color:var(--err)}
+.btn.danger:hover{border-color:#b91c1c;background:var(--err-soft)}
+.action-status{font-size:12px;color:var(--muted);margin-top:6px;overflow-wrap:anywhere}
+.rebuild-confirm{margin-top:8px;padding:8px 10px;border:1px solid var(--err);border-radius:var(--radius);background:var(--err-soft);font-size:12px}
+.rebuild-confirm p{margin:0 0 8px}
+.rebuild-confirm .btn{margin-right:8px}
+.final-actions{display:flex;align-items:center;gap:10px;margin-top:6px;flex-wrap:wrap}
+#closeout-status{font-size:12.5px;color:var(--muted);overflow-wrap:anywhere}
+.final-output{display:flex;align-items:center;gap:8px;margin-top:6px;flex-wrap:wrap;font-size:12.5px}
+.final-output .lab{color:var(--muted);font-size:12px}
+.final-output .mono{color:var(--text)}
+.drawer .lp-body{margin-top:4px}
+.drawer .lp-head{display:flex;align-items:center;gap:8px;margin:2px 0 4px;flex-wrap:wrap}
+.drawer .lp-ago{color:var(--faint);font-size:11px}
+.drawer .lp-rows div{display:flex;justify-content:space-between;padding:1px 0;font-size:12px;color:var(--muted)}
+.drawer .lp-note{font-size:11.5px;color:var(--faint);margin:4px 0 0}
+.drawer .lp-warn{color:var(--warn);margin:2px 0 0}
+.oplog{list-style:none;margin:0;padding:0;font-size:12px}
+.oplog li{padding:2px 0;color:var(--muted)}
+.oplog time{color:var(--faint);font-family:var(--mono);font-size:11px;margin-right:6px}

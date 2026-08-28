@@ -408,7 +408,7 @@ def run_partial_exact_harvest_recovery(
         process_lock.release()
 
 
-def run_existing_remote_harvest(
+def _existing_remote_harvest_core(
     *,
     state_path: Path | str,
     lock_path: Path | str,
@@ -417,8 +417,40 @@ def run_existing_remote_harvest(
     remote_identity: str,
     adapter: CnncLegacyZhaoshangAdapter,
     timeout_seconds: float,
+    admissible_states: frozenset[str],
+    allow_manual_requeue: bool,
+    manual_requeue_diagnostics: frozenset[str],
+    source_scope: str,
+    operation: str,
+    attempt_headroom: int = 1,
 ) -> dict[str, Any]:
-    """Wait/export and backfill one exact existing remote job without create."""
+    """Shared wait/export + backfill core for one exact existing remote job.
+
+    The harvest protocol body (ProcessLock + durable lease, immutable payload
+    reconstruction, evidence checks, frozen-source fan-out validation, claim,
+    bounded wait-export, and every durable backfill) is parameterized only by:
+
+    - ``admissible_states``: the durable job states this channel may enter from;
+    - ``allow_manual_requeue`` + ``manual_requeue_diagnostics``: whether a
+      MANUAL_REQUIRED job carrying one of the exact persisted diagnostics may
+      be requeued to SUBMITTED first (post_attempted and exact identity are
+      still mandatory; the requeue happens only after every local validation
+      passes and it never dispatches a remote operation);
+    - ``source_scope``: ``"frozen"`` requires the run's frozen snapshot;
+      ``"latest"`` prefers the frozen snapshot and otherwise falls back to the
+      run's latest observed snapshot (manual re-export must work before the
+      freeze), and neither existing rejects;
+    - ``operation``: the diagnostic prefix used in operator-facing reasons;
+    - ``attempt_headroom``: extra harvest attempts granted over the durable
+      count for this invocation.  The recovery channel keeps the historical
+      ``+1`` cap exactly as before the extraction; only the manual re-export
+      wrapper passes ``+2`` so a zero-result export followed by one immediate
+      operator click stays harvestable instead of cap-flipping straight back
+      to MANUAL_REQUIRED.
+
+    Everything else is kept verbatim from the original single-purpose
+    implementation.
+    """
     path = Path(state_path)
     if not path.is_file():
         raise RecoveryRejected(f"state database does not exist: {path}")
@@ -431,11 +463,26 @@ def run_existing_remote_harvest(
 
     store = DailyAuditStore(path)
     run = store.get_run(business_date)
-    if run is None or run.get("frozen_snapshot_id") is None:
-        raise RecoveryRejected("existing harvest requires the frozen daily run")
+    snapshot_id: int | None = None
+    if source_scope == "frozen":
+        if run is None or run.get("frozen_snapshot_id") is None:
+            raise RecoveryRejected(f"{operation} requires the frozen daily run")
+        snapshot_id = int(run["frozen_snapshot_id"])
+    elif source_scope == "latest":
+        if run is not None:
+            if run.get("frozen_snapshot_id") is not None:
+                snapshot_id = int(run["frozen_snapshot_id"])
+            else:
+                latest = store.latest_snapshot(business_date)
+                if latest is not None:
+                    snapshot_id = int(latest["id"])
+        if snapshot_id is None:
+            raise RecoveryRejected("re-export requires an authoritative snapshot scope")
+    else:
+        raise RecoveryRejected(f"unknown snapshot source scope: {source_scope}")
     frozen_sources = {
         str(item["row"].get("vCommodityId") or item["row"].get("documentId") or "").strip()
-        for item in store.ordered_snapshot_items(int(run["frozen_snapshot_id"]))
+        for item in store.ordered_snapshot_items(snapshot_id)
     }
     process_lock = ProcessLock(lock_path)
     token = _acquire_recovery_lease(
@@ -451,12 +498,20 @@ def run_existing_remote_harvest(
             raise RecoveryRejected(
                 f"remote job id does not exist in this run: {remote_job_id}"
             )
-        if job["state"] not in {"SUBMITTED", "RUNNING"}:
-            raise RecoveryRejected(
-                f"remote job id {remote_job_id} is not harvestable: {job['state']}"
-            )
+        needs_manual_requeue = False
+        if job["state"] not in admissible_states:
+            if (
+                allow_manual_requeue
+                and job["state"] == "MANUAL_REQUIRED"
+                and str(job.get("error_text") or "").strip() in manual_requeue_diagnostics
+            ):
+                needs_manual_requeue = True
+            else:
+                raise RecoveryRejected(
+                    f"remote job id {remote_job_id} is not harvestable: {job['state']}"
+                )
         if not int(job["post_attempted"]):
-            raise RecoveryRejected("existing harvest requires durable POST evidence")
+            raise RecoveryRejected(f"{operation} requires durable POST evidence")
         if str(job.get("remote_identity") or "").strip() != expected_identity:
             raise RecoveryRejected("remote identity does not exactly match durable state")
 
@@ -469,7 +524,7 @@ def run_existing_remote_harvest(
         input_path = Path(str(job.get("input_path") or ""))
         result_path = Path(str(job.get("result_path") or ""))
         if not batch_state.is_file() or not input_path.is_file() or not result_path.parent.is_dir():
-            raise RecoveryRejected("existing harvest requires every durable local path")
+            raise RecoveryRejected(f"{operation} requires every durable local path")
         prepared = adapter.prepare_job(
             business_date,
             requests,
@@ -490,7 +545,7 @@ def run_existing_remote_harvest(
 
         crawls = store.crawl_work_for_job(int(remote_job_id))
         validate_linked_crawls_against_remote_payload(
-            operation="existing harvest",
+            operation=operation,
             requests=prepared.requests,
             crawls=crawls,
             frozen_sources=frozen_sources,
@@ -498,9 +553,22 @@ def run_existing_remote_harvest(
             run_id=token.run_id,
         )
         if any(crawl["state"] in {"NO_RESULT", "TERMINAL_FAILED"} for crawl in crawls):
-            raise RecoveryRejected("existing harvest cannot overwrite terminal crawl evidence")
+            raise RecoveryRejected(f"{operation} cannot overwrite terminal crawl evidence")
 
-        max_attempts = int(job["harvest_attempts"]) + 1
+        if needs_manual_requeue:
+            # Every local validation has passed: only now may the confirmed
+            # MANUAL job return to the harvestable state.  The requeue never
+            # dispatches a remote operation.
+            store.requeue_manual_harvest_job(
+                token,
+                int(remote_job_id),
+                remote_identity=expected_identity,
+            )
+        # Headroom is caller-scoped: the recovery channel keeps the historical
+        # +1 cap; the manual re-export wrapper passes +2 so a zero-result
+        # export followed by one immediate re-export click stays harvestable
+        # instead of cap-flipping straight back to MANUAL_REQUIRED.
+        max_attempts = int(job["harvest_attempts"]) + max(1, int(attempt_headroom))
         max_elapsed_seconds = (
             float(job["harvest_elapsed_seconds"]) + timeout_seconds + 60.0
         )
@@ -681,3 +749,36 @@ def run_existing_remote_harvest(
     finally:
         store.release_lease(token)
         process_lock.release()
+
+
+def run_existing_remote_harvest(
+    *,
+    state_path: Path | str,
+    lock_path: Path | str,
+    business_date: str,
+    remote_job_id: int,
+    remote_identity: str,
+    adapter: CnncLegacyZhaoshangAdapter,
+    timeout_seconds: float,
+) -> dict[str, Any]:
+    """Wait/export and backfill one exact existing remote job without create.
+
+    Thin wrapper over the shared core: only SUBMITTED/RUNNING jobs of the
+    frozen daily run, no manual requeue, historical ``+1`` attempt cap —
+    semantics are identical to the pre-extraction implementation.
+    """
+    return _existing_remote_harvest_core(
+        state_path=state_path,
+        lock_path=lock_path,
+        business_date=business_date,
+        remote_job_id=remote_job_id,
+        remote_identity=remote_identity,
+        adapter=adapter,
+        timeout_seconds=timeout_seconds,
+        admissible_states=frozenset({"SUBMITTED", "RUNNING"}),
+        allow_manual_requeue=False,
+        manual_requeue_diagnostics=frozenset(),
+        source_scope="frozen",
+        operation="existing harvest",
+        attempt_headroom=1,
+    )

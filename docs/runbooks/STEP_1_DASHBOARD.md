@@ -1,22 +1,40 @@
-# 第一步:只读实时看板(STEP_1 Dashboard)
+# 第一步:实时看板与本机受控操作台(STEP_1 Dashboard)
 
-> 这是 CNNC STEP_1 只读看板的运行手册。看板通过 FastAPI 提供 `http://127.0.0.1:8765/dashboard/`
-> 单页视图,展示当日审计总状态、阶段进展、招商局任务表、近 14 天日历与计划任务状态。
+> 这是 CNNC STEP_1 看板的运行手册。看板通过 FastAPI 提供 `http://127.0.0.1:8765/dashboard/`
+> 单页视图,展示当日审计总状态、阶段进展、招商局任务表(含远端实时子任务进度)、近 14 天日历
+> 与计划任务状态;并提供**仅本机、带严格门禁、可审计**的人工操作(立即收口/重新导出/重建任务)。
 > 仓库提供登录自启的注册/卸载脚本,但两者默认预览,必须显式传 `-Apply` 才会改系统;
 > 自启任务只新增/删除 `CNNC-Dashboard-ReadOnly`,不读取、不修改现有审计计划任务。
 
-## 用途与只读红线
+## 用途与读写红线(2026-08-28 操作台升级后)
 
-- 用途:在生产运行之外,随时用浏览器查看 STEP_1 当日状态,不需要登录任何业务系统。
-- **只读红线**:
-  - 零写入:服务不写任何文件、不发任何业务写请求。主 Dashboard 状态投影只读取
-    `runtime/incremental_price_audit/<业务日>/` 下的 `daily_status.json` 与 `state.sqlite3`;
-    SaaS Flow Diagnostic 是唯一额外的只读数据源(见下文专节),使用指定只读数据库账号
+- 用途:在生产运行之外,随时用浏览器查看 STEP_1 当日状态,不需要登录任何业务系统;
+  出现"任务卡住 0/18、爬虫修好后需要重新导出"等情况时,直接在页面完成受控人工操作。
+- **读红线(不变)**:
+  - 主 Dashboard 状态投影只读取 `runtime/incremental_price_audit/<业务日>/` 下的
+    `daily_status.json` 与 `state.sqlite3`;SaaS Flow Diagnostic 使用指定只读数据库账号
     执行后端预定义、参数化、固定 scope 的 SELECT。
-  - GET-only:看板路由只接受 GET;POST/PUT/DELETE/PATCH 一律 405。
+  - 招商局实时子任务进度(queryTaskProgress)是只读远端观测:服务器按 durable
+    task_name(=批次号)查询,带缓存/限流/single-flight/超时;查询结果**不写回**
+    SQLite 业务状态,单任务查询失败只降级该行显示,绝不拖垮 `/api/summary`。
   - 不触碰现有审计计划任务:自启注册/卸载脚本只操作 `CNNC-Dashboard-ReadOnly` 一个任务名;
     页面 Scheduler 区对现有审计计划任务也只做 PowerShell Get-ScheduledTask/Get-ScheduledTaskInfo 只读查询(10 秒超时、30 秒缓存),查询失败即降级显示"不可用"。
   - 只绑定 `127.0.0.1:8765`,不监听其他网卡,不提供远程访问。
+- **写边界(新增,仅本机受控 operator actions)**:
+  - Dashboard 主状态读取仍为只读;**仅**以下明确 operator actions 允许本机受控写:
+    manual closeout(立即收口)、exact re-export(重新导出)、explicit rebuild(重建任务)。
+  - **页面轮询本身不会产生任何业务写**;所有业务写都要求用户在页面上明确点击按钮。
+  - POST 路由全部要求:Host/Origin 本机校验 + `X-Dashboard-Action-Token`(进程启动时
+    生成,页面经 `/dashboard/api/operator-context` 获取)+ 严格 JSON schema
+    (不接受客户端提交任何 taskName/batchNumber/路径/远端身份;服务器一律从 durable
+    state 重新取权威值)。
+  - 写操作经现有 CLI 子进程执行(`closeout` / `reexport-existing-remote` /
+    `rebuild-remote-task`),完全复用既有 ProcessLock、durable lease、exact identity、
+    immutable payload、fail-closed 语义;每次操作落审计文件
+    `<业务日>/dashboard_actions.jsonl`。
+  - 重新导出绝不创建新招商局任务;重建必须先安全停用旧任务(确认不会双跑)并生成
+    新的 taskName==batchNumber(≠旧值),eligible 采集行原子迁移,旧任务转 SUPERSEDED
+    保留全部证据、不再阻塞 finalize。
 
 ## 手动启动
 
@@ -92,6 +110,31 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\unregister_dashboard
 - **缓存与限流**:后端 ≥60 秒缓存(CNNC_DIAG_CACHE_SECONDS,下限 60);"刷新 SaaS 链路"按钮触发受限强制读取,间隔 <30 秒(CNNC_DIAG_FRESH_MIN_INTERVAL_SECONDS,下限 30,env 配更低被钳制)按限流返回缓存;强制刷新另有服务端 single-flight,并发刷新只触发一次生产查询。前端 SaaS Flow 有独立 ~60 秒轮询周期(visible 轮询/hidden 停止/回前台补刷),不依赖 summary 的 200/304 生命周期,也绝不形成 5 秒级生产 DB 轮询。查询均带 connect/read 超时、当日固定窗口、有界结果集;核心查询失败时相关计数显示"不可用",不冒充业务 0。
 - **降级**:`CNNC_DIAG_DB_*` 未配置时面板显示"数据库诊断未配置"(增长判断仍可用);连接失败/超时/查询失败只降级本面板(整体 unavailable 或部分查询 partial),`/dashboard/api/summary` 与页面其余区域完全不受影响。DB 凭据只从进程环境变量或 ignored 的 `data/CNNC_DIAG_DB.env` 读取,不进 Git、日志或 API 响应。
 
+## 本机人工操作台(2026-08-28)
+
+招商局任务 Drawer 与最终收口卡提供四个受控操作。所有操作只在用户点击后发生;
+按钮按任务状态启用;每次操作的启动/结果都写入 `<业务日>/dashboard_actions.jsonl`。
+
+| 操作 | 入口 | 语义 | 关键规则 |
+|---|---|---|---|
+| 刷新任务进度 | 任务 Drawer | 对该任务 exact batchNumber 执行一次受限 queryTaskProgress | 只读;同任务 10 秒限流;结果不写业务状态 |
+| 重新导出 | 任务 Drawer | 对当前已有任务再次执行 wait/export/harvest | 绝不创建新任务;执行前强制 progress 预检(TERMINAL 立即导出/ACTIVE 有界探测并如实提示/UNKNOWN 拒绝并返回 `REMOTE_PROGRESS_UNKNOWN`);此前导出 0 条不阻止再次执行 |
+| 重建任务 | 任务 Drawer(二次确认) | 停用旧任务→迁移未完成采集→创建 replacement | 新 taskName==新 batchNumber(自动生成,≠旧值,`cnnc_current_opt_<商城>_<14位数字>` 形态);旧任务 ACTIVE 时必须先 disable 并确认(否则 `OLD_TASK_STILL_ACTIVE`/`OLD_TASK_STOP_UNCONFIRMED`);SUCCESS/终态采集行绝不迁移;旧任务转 SUPERSEDED 不再阻塞 finalize,证据全部保留;同一动作幂等,绝不双发 create |
+| 立即收口 | 最终收口卡 | 正常生产 closeout(非 force-finalize) | 完全复用 `run_runtime_command("closeout", invocation="manual")`:ProcessLock 冲突→`ALREADY_RUNNING`,已出表→`ALREADY_FINALIZED`,阻塞未清→`BLOCKED`(绝不绕过 blocker);页面显示"收口中…"并轮询结果,不阻塞 HTTP |
+
+结果语义(重新导出):`REEXPORT_COMPLETED`(取得有效结果,N 条)/`REEXPORT_COMPLETED_NO_RESULT`
+(任务已结束但导出 0 条,可稍后再点)/`REEXPORT_STILL_RUNNING`(任务仍在执行,本次未取得最终导出)/
+`REMOTE_PROGRESS_UNKNOWN` 等错误码(未执行导出,页面给出明确类别)。
+
+常见错误码:`TASK_BATCH_CONFLICT`(任务名称/批次号在当日存在重复,无法安全确定远端任务)、
+`IDENTITY_MISMATCH`/`INVALID_REMOTE_STATE`(durable 身份与请求不符或证据不完整)、
+`STALE_ACTION`(任务状态在打开页面后已变化,刷新后重试)、`ACTION_IN_FLIGHT`(同类操作进行中)、
+`LOCK_CONFLICT`(生产 writer 锁被占)、`REBUILD_CONFIRM_REQUIRED`(重建必须二次确认)。
+
+CLI 等价命令(与页面按钮走同一实现,供脚本/应急):
+`python scripts/incremental_price_audit.py reexport-existing-remote --remote-job-id N --remote-identity "mall|id|number"`
+`python scripts/incremental_price_audit.py rebuild-remote-task --remote-job-id N --remote-identity "mall|id|number"`
+
 ## 排障
 
 | 症状 | 含义 | 处理 |
@@ -101,3 +144,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\unregister_dashboard
 | Scheduler 区显示"不可用" | 对现有审计计划任务的 `schtasks` 只读查询失败或超时,已降级 | 不影响页面其余区域;可手动 `schtasks /query` 核对计划任务本身 |
 | `HTTP 400`(日期参数) | `?date=` 不是 `YYYY-MM-DD` | 使用 `YYYY-MM-DD` 格式或省略参数(默认上海业务日) |
 | 浏览器打不开页面 | 服务未启动或未注册自启 | 按"手动启动"启动,或按"登录自启注册"先预览再 `-Apply`;核对 `http://127.0.0.1:8765/dashboard/` 地址 |
+| 子任务列显示"远端进度暂不可用"/"含 N 条采集" | 招商局实时进度查询失败(登录过期/超时/工具缺失)或从未成功过 | 只影响该行显示;点【刷新任务进度】重试;持续失败核对招商局登录与外部工具;本地"含 N 条采集"是绑定数,不是远端完成数 |
+| 操作按钮全部禁用并提示"操作台不可用" | `/dashboard/api/operator-context` 获取令牌失败 | 刷新页面;确认服务来自本仓库(令牌随服务进程生成) |
+| 操作返回 403(INVALID_ACTION_TOKEN) | 页面令牌与服务进程不一致(服务重启过) | 刷新页面重新获取令牌 |
+| 操作返回 409(STALE_ACTION) | 打开页面期间任务状态已被调度器推进 | 刷新页面后重新点击 |
