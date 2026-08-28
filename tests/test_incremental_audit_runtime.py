@@ -1658,6 +1658,110 @@ def test_runtime_uses_configured_model_name_in_tick_config(tmp_path, monkeypatch
     assert captured == ["deployed-model-name"]
 
 
+def _capture_tick_configs(monkeypatch, tmp_path):
+    captured: list[TickConfig] = []
+
+    def run_tick(_store, _lock, config, _dependencies, *, finalize):
+        captured.append(config)
+        return TickSummary("COMPLETED", (), {}, {}, None)
+
+    monkeypatch.setattr(runtime_module, "run_incremental_tick", run_tick)
+    for key in runtime_module._MODEL_RUNTIME_TUNING_KEYS:
+        monkeypatch.delenv(key, raising=False)
+    data_root = tmp_path / "data"
+    data_root.mkdir()
+    monkeypatch.setattr(runtime_module, "PROJECT_DATA_ROOT", data_root)
+    return captured, data_root
+
+
+def test_incremental_model_tuning_defaults_without_env_or_model_env(tmp_path, monkeypatch):
+    captured, _data_root = _capture_tick_configs(monkeypatch, tmp_path)
+
+    run_runtime_command(
+        "tick",
+        business_date="2026-08-11",
+        runtime_root=tmp_path / "runtime",
+        dependencies=_dependencies([]),
+    )
+
+    assert len(captured) == 1
+    assert captured[0].model_batch_size == 10
+    assert captured[0].model_max_concurrency == 6
+
+
+def test_incremental_model_tuning_model_env_override_reaches_tick_config(tmp_path, monkeypatch):
+    captured, data_root = _capture_tick_configs(monkeypatch, tmp_path)
+    (data_root / "model.env").write_text(
+        "TITLE_MATCH_MODEL_API_KEY=file-key\n"
+        "TITLE_MATCH_MODEL_BASE_URL=https://model.invalid/v1\n"
+        "TITLE_MATCH_MODEL_NAME=file-model\n"
+        "TITLE_MATCH_MODEL_MAX_CONCURRENCY=8\n"
+        "TITLE_MATCH_MODEL_BATCH_SIZE=20\n",
+        encoding="utf-8",
+    )
+
+    run_runtime_command(
+        "tick",
+        business_date="2026-08-11",
+        runtime_root=tmp_path / "runtime",
+        dependencies=_dependencies([]),
+    )
+
+    # The data/model.env values (previously silently ignored for these keys)
+    # genuinely reach the production TickConfig composition.
+    assert captured[0].model_max_concurrency == 8
+    assert captured[0].model_batch_size == 20
+
+
+def test_incremental_model_tuning_environment_beats_model_env(tmp_path, monkeypatch):
+    captured, data_root = _capture_tick_configs(monkeypatch, tmp_path)
+    (data_root / "model.env").write_text(
+        "TITLE_MATCH_MODEL_MAX_CONCURRENCY=8\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("TITLE_MATCH_MODEL_MAX_CONCURRENCY", "7")
+
+    run_runtime_command(
+        "tick",
+        business_date="2026-08-11",
+        runtime_root=tmp_path / "runtime",
+        dependencies=_dependencies([]),
+    )
+
+    assert captured[0].model_max_concurrency == 7
+
+
+@pytest.mark.parametrize(
+    "raw",
+    ["0", "-3", "not-an-int", "8.5"],
+    ids=("zero", "negative", "not-an-int", "float"),
+)
+def test_incremental_model_tuning_invalid_values_fail_closed(tmp_path, monkeypatch, raw):
+    _captured, data_root = _capture_tick_configs(monkeypatch, tmp_path)
+    (data_root / "model.env").write_text(
+        f"TITLE_MATCH_MODEL_MAX_CONCURRENCY={raw}\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(runtime_module.RuntimeConfigurationError):
+        run_runtime_command(
+            "tick",
+            business_date="2026-08-11",
+            runtime_root=tmp_path / "runtime",
+            dependencies=_dependencies([]),
+        )
+
+
+def test_model_runtime_tuning_keys_are_not_part_of_the_required_gate(tmp_path, monkeypatch):
+    """Optional tuning keys must not widen the required-configuration gate."""
+    assert runtime_module._MODEL_RUNTIME_TUNING_KEYS
+    assert not set(runtime_module._MODEL_RUNTIME_TUNING_KEYS) & set(runtime_module._MODEL_CONFIGURATION_KEYS)
+    # A model.env carrying ONLY the tuning keys is still an incomplete
+    # required configuration.
+    values = runtime_module._read_model_configuration(tmp_path / "missing.env")
+    assert values == {}
+
+
 def test_runtime_uses_content_addressed_model_contract_versions(tmp_path, monkeypatch):
     captured = []
 

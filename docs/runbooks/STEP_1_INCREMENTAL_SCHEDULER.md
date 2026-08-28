@@ -108,6 +108,22 @@ powershell -NoProfile -File scripts\register_incremental_price_audit_tasks.ps1 `
   -Apply
 ```
 
+### 模型吞吐调参(可选,2026-08-28 Review Round 2 收口)
+
+增量 STEP_1 有界并发模型批处理(tick 内 MODEL 阶段)支持两个可选调参键:
+
+| 键 | 默认 | 生效位置与优先级 |
+|---|---|---|
+| `TITLE_MATCH_MODEL_MAX_CONCURRENCY` | 6 | 进程环境变量 > `data/model.env` > 默认;只作用于增量流水线 |
+| `TITLE_MATCH_MODEL_BATCH_SIZE` | 10 | 进程环境变量 > `data/model.env` > 默认;进程环境变量同时影响 work_01 旧路径,`data/model.env` 只影响增量流水线 |
+
+要点:
+
+* 这两个键是 **optional runtime tuning**,不属于"API_KEY/BASE_URL/MODEL_NAME 三键必须齐"的 required 配置门;缺省完全合法。
+* 无效值(非数字、0、负数)一律 **fail closed**:tick 构建 `TickConfig` 时直接抛 `RuntimeConfigurationError`,不会静默回退。
+* work_01 旧批量路径不读 `data/model.env`,其并发变量为 `TITLE_MATCH_MODEL_CONCURRENCY` / `TITLE_MATCH_MODEL_BATCH_CONCURRENCY`(仅进程环境变量),与增量的 `MAX_CONCURRENCY` 是不同键,互不影响。
+* scheduler 生产可操作路径:修改 `data/model.env`(或注册任务的 runner 环境)后,下一轮 tick 自动以新值构建 `TickConfig`;无需重新注册任务。默认 6 经离线饱和基准验证(observed max_inflight=6,500 行 12s/批延迟设计投影 ≤120s),调大前先确认模型侧限流能力。
+
 ### Deployment gate:注册脚本修改后必须重新 Apply（2026-08-28 Review Round 1）
 
 **已经注册的 Windows Task 不会因为仓库里 `register_incremental_price_audit_tasks.ps1` 的代码更新而自动改变

@@ -509,17 +509,25 @@ def _apply_substitute_risk_guard(req: TitleMatchModelRequest, result: TitleMatch
     model codes must be present in the candidate) instead of trusting the word
     list alone.  "适用机型" is not a trigger — prompt rule 7 already treats it
     as normal consumable description.
+
+    The final ``reason`` must match the final verdict: the model's original
+    SAME rationale is preserved verbatim as evidence, and the downgrade cause
+    is appended so an auditor never reads a SAME justification under a
+    MANUAL_REVIEW verdict.
     """
     if result.match_result != "SAME":
         return result
-    if not any(term in req.sku_name for term in SUBSTITUTE_RISK_TERMS):
+    hit_terms = [term for term in SUBSTITUTE_RISK_TERMS if term in req.sku_name]
+    if not hit_terms:
         return result
     if standard_model_codes_present(req.query_str, req.sku_name):
         return result
+    downgrade = f"标题含{'/'.join(hit_terms)}风险词，最终降级人工确认"
+    original_reason = str(result.reason or "").strip()
     return result.model_copy(update={
         "match_result": "MANUAL_REVIEW",
-        "risk_points": [*result.risk_points, "标题含替代款/通用/升级款风险词"],
-        "reason": result.reason or "标题含风险词，需人工确认是否为原型号同款",
+        "risk_points": [*result.risk_points, f"标题含{'/'.join(hit_terms)}风险词"],
+        "reason": f"{original_reason}；{downgrade}" if original_reason else downgrade,
     })
 
 

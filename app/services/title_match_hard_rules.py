@@ -27,9 +27,18 @@ import unicodedata
 # ---------------------------------------------------------------------------
 
 
-_UNIT_LETTERS = "MM|CM|KM|KG|MG|ML|TB|GB|MB|W|V|A|MAH|WH|KWH|RPM|PPI|DPI|NM|UM"
+_UNIT_LETTERS = "MM|CM|KM|KG|MG|ML|W|V|A|MAH|WH|KWH|RPM|PPI|DPI|NM|UM"
 _MEASURE_RE = re.compile(
     rf"(?<![A-Z0-9])(\d+(?:\.\d+)?)\s*({_UNIT_LETTERS})(?![A-Z0-9])",
+    re.IGNORECASE,
+)
+# Standalone storage capacities ("1TB 7200转") are specs, but a storage unit
+# hanging off a hyphen/slash-joined code segment (G50-2TB) is part of the
+# model code: the wider negative lookbehind keeps code-internal storage
+# suffixes intact for the token extractor.
+_STORAGE_UNIT_LETTERS = "TB|GB|MB"
+_STORAGE_RE = re.compile(
+    rf"(?<![A-Z0-9_/\-])(\d+(?:\.\d+)?)\s*({_STORAGE_UNIT_LETTERS})(?![A-Z0-9])",
     re.IGNORECASE,
 )
 # CJK measure/count suffixes: "1100页", "4支", "3米", "50克", "12伏", "60帧"...
@@ -60,6 +69,7 @@ def _normalize_for_tokens(text: str) -> str:
     """
     upper = _to_halfwidth(text).upper()
     upper = _MEASURE_RE.sub(" ", upper)
+    upper = _STORAGE_RE.sub(" ", upper)
     upper = _CJK_QUANTITY_RE.sub(" ", upper)
     return upper
 
@@ -89,60 +99,48 @@ def _is_strong_token(token: str) -> bool:
     return len(token) >= 5 and not _YEAR_RE.match(token)
 
 
+# The ONLY model-code prefixes that may ever be shed from a fused token.
+# A letter prefix by itself is not brand evidence (AB-12345 vs CD-12345 are
+# different products; an unknown ABDN20/XX91403/ADEP65 fusion cannot be
+# verified), so prefix shedding is restricted to series prefixes explicitly
+# validated by this project's regression suite.  Anything unlisted fails
+# closed: the hard rule is the double-insurance, not a brand guesser.
+_VALIDATED_SERIES_PREFIXES = ("SATA", "BIZHUB")
+
+
 def _equivalent_model_forms(token: str) -> set[str]:
-    """Spelling-equivalent forms of one model code: separators removed,
-    storage suffix flexed (2T/2TB, G50-2TB vs G50-2T) and a short purely
-    alphabetic brand prefix shed (SATA-91403 ≡ 91403, AR-EP65 ⊇ EP65) when
-    the remainder is itself a strong code."""
+    """Spelling-equivalent forms of one model code.
+
+    Universal normalization lives here: separators removed, uppercased, and
+    the one validated storage-suffix flex TB<->T (G50-2TB == G50-2T,
+    1TB == 1T).  Stripping a storage suffix down to a bare stem (G50-2TB ->
+    G502, ABC128GB -> ABC128) is NOT an equivalence — that deletes the
+    capacity — and GB/MB have no validated flex at all.  Prefix shedding is
+    limited to _VALIDATED_SERIES_PREFIXES with a strong remainder
+    (SATA-91403 == 91403, BIZHUB225I == 225I)."""
     compact = token.replace("-", "").replace("_", "").replace("/", "")
     forms = {compact}
-    prefix_match = re.match(r"^[A-Z]{2,4}(?=[0-9])", compact)
-    if prefix_match is not None:
-        remainder = compact[prefix_match.end():]
-        if _is_strong_token(remainder):
-            forms.add(remainder)
-    for suffix in ("TB", "GB", "MB"):
-        if compact.endswith(suffix):
-            stem = compact[: -len(suffix)]
-            forms.add(stem)
-            if suffix == "TB":
-                forms.add(stem + "T")
-    if compact.endswith("T") and not compact.endswith(("AT", "ET", "GT", "ST", "XT")):
+    for prefix in _VALIDATED_SERIES_PREFIXES:
+        if compact.startswith(prefix):
+            remainder = compact[len(prefix):]
+            if _is_strong_token(remainder):
+                forms.add(remainder)
+    if compact.endswith("TB"):
+        forms.add(compact[:-2] + "T")
+    elif compact.endswith("T") and not compact.endswith(("AT", "ET", "GT", "ST", "XT")):
         forms.add(compact[:-1] + "TB")
     return forms
 
 
-def _brand_fused(longer: str, shorter: str) -> bool:
-    """True when ``longer`` is exactly a 2-8 letter brand word fused onto
-    ``shorter`` (SATA91403 ⊇ 91403, BIZHUB225I ⊇ 225I).  The boundary must be
-    letter-to-code, so DN200 never fuses with DN20 and 914030 never fuses
-    with 91403: the extra characters there are digits, i.e. a different
-    model code, not a brand prefix."""
-    if len(longer) <= len(shorter) or not longer.endswith(shorter):
-        return False
-    prefix = longer[: len(longer) - len(shorter)]
-    return 2 <= len(prefix) <= 8 and prefix.isalpha()
-
-
 def _model_codes_equivalent(query_token: str, sku_token: str) -> bool:
-    """Token-level exact-equivalence: same normalized code, storage-suffix or
-    brand-prefix variant of the same code — never a mere substring.
+    """Token-level exact-equivalence: same normalized code, the validated
+    TB<->T storage flex, or a validated series prefix shed — never a mere
+    substring and never a guessed brand prefix.
 
-    This is what keeps DN20 from matching DN200 and 91403 from matching
-    914030 while SATA-91403 still matches 91403."""
-    query_forms = _equivalent_model_forms(query_token)
-    sku_forms = _equivalent_model_forms(sku_token)
-    if query_forms & sku_forms:
-        return True
-    return any(
-        _brand_fused(longer, shorter)
-        for longer in sku_forms
-        for shorter in query_forms
-    ) or any(
-        _brand_fused(longer, shorter)
-        for longer in query_forms
-        for shorter in sku_forms
-    )
+    This is what keeps DN20 from matching DN200, 91403 from matching 914030,
+    AB-12345 from matching CD-12345 and G50-2TB from matching G50-2, while
+    SATA-91403 still matches 91403 and G50-2TB still matches G50-2T."""
+    return bool(_equivalent_model_forms(query_token) & _equivalent_model_forms(sku_token))
 
 
 def standard_model_codes_present(query_str: str, sku_name: str) -> bool:

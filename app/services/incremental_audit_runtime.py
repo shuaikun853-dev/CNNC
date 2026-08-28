@@ -124,6 +124,16 @@ _MODEL_CONFIGURATION_KEYS = (
     "TITLE_MATCH_MODEL_BASE_URL",
     "TITLE_MATCH_MODEL_NAME",
 )
+# Optional incremental-runtime tuning knobs.  Deliberately NOT part of
+# _MODEL_CONFIGURATION_KEYS: the required gate must stay "all three secrets
+# present"; these tune the bounded parallel model dispatcher and are read
+# env-first, then data/model.env, then defaults.  (The legacy work_01 path
+# reads TITLE_MATCH_MODEL_CONCURRENCY / TITLE_MATCH_MODEL_BATCH_CONCURRENCY
+# from the process environment only and never sees data/model.env.)
+_MODEL_RUNTIME_TUNING_KEYS = (
+    "TITLE_MATCH_MODEL_BATCH_SIZE",
+    "TITLE_MATCH_MODEL_MAX_CONCURRENCY",
+)
 _BATCH_STATE_START = "<!-- incremental-runtime-state:start -->"
 _BATCH_STATE_END = "<!-- incremental-runtime-state:end -->"
 FINALIZE_MATERIALIZE_RESERVE_SECONDS = 60.0
@@ -1055,16 +1065,41 @@ def _read_model_configuration(path: Path | None = None) -> dict[str, str]:
         for key in _MODEL_CONFIGURATION_KEYS
         if os.environ.get(key, "").strip()
     }
-    if path.is_file():
-        for raw_line in path.read_text(encoding="utf-8").splitlines():
-            line = raw_line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            key, value = line.split("=", 1)
-            key = key.strip()
-            parsed_value = value.strip().strip('"').strip("'")
-            if key in _MODEL_CONFIGURATION_KEYS and key not in values and parsed_value:
-                values[key] = parsed_value
+    for key, parsed_value in _parse_env_file(path).items():
+        if key in _MODEL_CONFIGURATION_KEYS and key not in values and parsed_value:
+            values[key] = parsed_value
+    return values
+
+
+def _parse_env_file(path: Path) -> dict[str, str]:
+    if not path.is_file():
+        return {}
+    parsed: dict[str, str] = {}
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        parsed_value = value.strip().strip('"').strip("'")
+        if key and parsed_value:
+            parsed[key] = parsed_value
+    return parsed
+
+
+def _read_model_runtime_tuning(path: Path | None = None) -> dict[str, str]:
+    """Optional dispatcher tuning: process environment wins, then
+    data/model.env; only keys actually present are returned."""
+    if path is None:
+        path = PROJECT_DATA_ROOT / "model.env"
+    values = {
+        key: os.environ[key].strip()
+        for key in _MODEL_RUNTIME_TUNING_KEYS
+        if os.environ.get(key, "").strip()
+    }
+    for key, parsed_value in _parse_env_file(path).items():
+        if key in _MODEL_RUNTIME_TUNING_KEYS and key not in values:
+            values[key] = parsed_value
     return values
 
 
@@ -1158,8 +1193,8 @@ def _model_batch_worker(rows: list[Mapping[str, Any]], timeout_seconds: float) -
     return {index: _persistable_model_result(result) for index, result in results.items()}
 
 
-def _runtime_model_batch_size() -> int:
-    raw = os.environ.get("TITLE_MATCH_MODEL_BATCH_SIZE", "").strip()
+def _runtime_model_batch_size(path: Path | None = None) -> int:
+    raw = _read_model_runtime_tuning(path).get("TITLE_MATCH_MODEL_BATCH_SIZE", "")
     if not raw:
         return 10
     try:
@@ -1171,10 +1206,14 @@ def _runtime_model_batch_size() -> int:
     return value
 
 
-def _runtime_model_max_concurrency() -> int:
+def _runtime_model_max_concurrency(path: Path | None = None) -> int:
     """Bounded parallel model batch HTTP calls; validated by the offline
-    300/500-row benchmarks in tests/test_model_parallel_batches.py."""
-    raw = os.environ.get("TITLE_MATCH_MODEL_MAX_CONCURRENCY", "").strip()
+    300/500-row benchmarks in tests/test_model_parallel_batches.py.
+
+    Tunable per deployment through TITLE_MATCH_MODEL_MAX_CONCURRENCY (process
+    environment first, then data/model.env); anything absent/0/negative or
+    non-integer fails closed."""
+    raw = _read_model_runtime_tuning(path).get("TITLE_MATCH_MODEL_MAX_CONCURRENCY", "")
     if not raw:
         return 6
     try:

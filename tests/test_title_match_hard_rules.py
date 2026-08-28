@@ -40,6 +40,20 @@ from app.services.title_match_model_adapter import (
         ("得力 订书机 DS-320", "得力 订书机 DS-3200"),
         ("硒鼓 EP65 适配", "硒鼓 EP650 适配"),
         ("世达 批头 91403", "世达 批头 914030"),
+        # A letter prefix is NOT brand evidence on its own: different
+        # two-letter prefixes are different products, and an unknown fused
+        # prefix is unverifiable.  Only the explicitly validated series
+        # prefixes (SATA, BIZHUB) may ever be shed.
+        ("AB-12345 型号测试", "CD-12345 型号测试"),
+        ("HP-12345 打印机", "EP-12345 打印机"),
+        ("球阀 DN20 黄铜", "球阀 ABDN20 黄铜"),
+        ("世达 批头 91403", "世达 批头 XX91403"),
+        ("硒鼓 EP65", "硒鼓 ADEP65"),
+        # Stripping a storage suffix must never delete the capacity: TB may
+        # flex to T, but G50-2TB is NOT G50-2/G502 and ABC128GB is NOT ABC128.
+        ("闪迪 G50-2TB 移动固态硬盘", "闪迪 G50-2 移动固态硬盘"),
+        ("闪迪 G50-2TB 移动固态硬盘", "闪迪 G502 移动固态硬盘"),
+        ("ABC128GB 打印纸", "ABC128 打印纸"),
     ],
     ids=(
         "ar-ep65-vs-ep25",
@@ -50,6 +64,14 @@ from app.services.title_match_model_adapter import (
         "ds320-vs-ds3200",
         "ep65-vs-ep650",
         "91403-vs-914030",
+        "ab12345-vs-cd12345",
+        "hp12345-vs-ep12345",
+        "dn20-vs-abdn20",
+        "91403-vs-xx91403",
+        "ep65-vs-adep65",
+        "g50-2tb-vs-g50-2",
+        "g50-2tb-vs-g502",
+        "abc128gb-vs-abc128",
     ),
 )
 def test_model_code_single_side_or_conflict_vetoes_same(query_str, sku_name):
@@ -69,6 +91,9 @@ def test_model_code_single_side_or_conflict_vetoes_same(query_str, sku_name):
         # Metric unit equivalence: 500mm = 50cm = 0.5m.
         ("钢直尺 500mm 不锈钢", "钢板尺 50cm 不锈钢"),
         ("钢直尺 500mm 不锈钢", "钢直尺 0.5m 不锈钢"),
+        # Spec ranges are not model codes: the measurement strip keeps
+        # range tails out of the token extractor even with separators.
+        ("钢直尺 100-150mm 不锈钢", "钢直尺 100-150毫米 不锈钢"),
         # Pure-letter words (sensor/marketing names) never anchor a veto.
         ("罗技 G502 HERO 有线鼠标", "罗技 G502 有线鼠标"),
         # Same code, different case and separators.
@@ -83,6 +108,7 @@ def test_model_code_single_side_or_conflict_vetoes_same(query_str, sku_name):
         "tb-t-equiv",
         "mm-cm-equiv",
         "mm-m-equiv",
+        "spec-range-mm",
         "pure-letter-not-strong",
         "case-separator-equiv",
         "short-code-weak",
@@ -268,9 +294,6 @@ def test_prompt_version_invalidates_with_tightened_rules():
 _SAME_JSON = json.dumps(
     {"match_result": "SAME", "model_match": "exact", "confidence": 0.95}
 )
-_SAME_BATCH_JSON = json.dumps(
-    {"results": [{"index": 0, "match_result": "SAME", "model_match": "exact", "confidence": 0.95}]}
-)
 
 
 def _both_paths(monkeypatch, query_str, sku_name, model_json):
@@ -279,11 +302,13 @@ def _both_paths(monkeypatch, query_str, sku_name, model_json):
     import app.services.title_match_model_adapter as adapter
 
     _configure_env(monkeypatch)
+    single_payload = json.loads(model_json)
+    batch_payload = json.dumps({"results": [dict(single_payload, index=0)]})
 
     def fake_post(payload, timeout_seconds=None):
         content = payload["messages"][0]["content"]
         if "逐条判断待判断数据" in content:
-            return _SAME_BATCH_JSON
+            return batch_payload
         return model_json
 
     monkeypatch.setattr(adapter, "_post_model_payload", fake_post)
@@ -319,6 +344,32 @@ def test_single_and_batch_paths_agree_on_post_validation(monkeypatch, query_str,
     assert single.match_result == expected
     assert batched.match_result == expected
     # The visible business fields agree too, not just the verdict code.
+    assert single.reason == batched.reason
+    assert single.risk_points == batched.risk_points
+
+
+def test_substitute_downgrade_reason_matches_final_verdict(monkeypatch):
+    """P2-A: a SAME downgraded by the risk guard must carry a reason that
+    explains the MANUAL_REVIEW verdict, while preserving the model's original
+    rationale verbatim as evidence."""
+    model_json = json.dumps(
+        {"match_result": "SAME", "model_match": "exact", "confidence": 0.95, "reason": "品牌型号规格一致"}
+    )
+    single, batched = _both_paths(
+        monkeypatch,
+        "订书机 中号 办公",
+        "通用型订书机 中号 办公",
+        model_json,
+    )
+    for result in (single, batched):
+        assert result.match_result == "MANUAL_REVIEW"
+        # Original model rationale preserved verbatim...
+        assert "品牌型号规格一致" in result.reason
+        # ...and the downgrade cause is explicit, so the reason matches the
+        # final verdict instead of reading as a SAME justification.
+        assert "通用" in result.reason
+        assert "降级人工确认" in result.reason
+        assert any("通用" in point and "风险词" in point for point in result.risk_points)
     assert single.reason == batched.reason
     assert single.risk_points == batched.risk_points
 
