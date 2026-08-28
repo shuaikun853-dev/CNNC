@@ -164,13 +164,13 @@ def read_zhaoshang_result_xlsx_by_identity(
             status = str(row[status_index]).strip() if 0 <= status_index < len(row) and row[status_index] is not None else ""
             reason = str(row[reason_index]).strip() if 0 <= reason_index < len(row) and row[reason_index] is not None else ""
             if price is not None and price > 0:
-                page_status, source = "OK", "鎷涘晢灞€"
+                page_status, source = "OK", "招商局"
             elif price is not None and price == 0:
-                page_status, source = "PRICE_IS_ZERO", "鎷涘晢灞€"
-            elif "鎴愬姛" in status:
-                page_status, source = "PRICE_MISSING", "鎷涘晢灞€-浠锋牸涓嶅彲瑙?"
+                page_status, source = "PRICE_IS_ZERO", "招商局"
+            elif "成功" in status:
+                page_status, source = "PRICE_MISSING", "招商局-价格不可见"
             else:
-                page_status, source = "FAILED", "鎷涘晢灞€-" + (reason or status or "鏈煡")
+                page_status, source = "FAILED", "招商局-" + (reason or status or "未知")
             if identity in results:
                 raise ValueError("result workbook contains duplicate crawl identity")
             results[identity] = {
