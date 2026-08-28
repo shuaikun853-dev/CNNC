@@ -166,6 +166,115 @@ def test_standard_model_codes_present_is_separator_tolerant():
 
 
 # ---------------------------------------------------------------------------
+# R4 P1 — separator symmetry: fused query codes meet separator-inserted
+# candidates, and verdicts never depend on direction
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize(
+    ("query_str", "sku_name"),
+    [
+        # The query code itself is fused (DS320/G502TB/AREP65): the candidate
+        # may still realize it with separators inserted anywhere.
+        ("得力 DS320 订书机", "得力 DS 320 订书机"),
+        ("得力 DS320 订书机", "得力 DS-320 订书机"),
+        ("闪迪 G502TB 移动固态硬盘", "闪迪 G50 2TB 移动固态硬盘"),
+        # Fused T flex meets hyphenated TB (the TB<->T flex composes with
+        # separator tolerance in the fused direction too).
+        ("闪迪 G502T 移动固态硬盘", "闪迪 G50-2TB 移动固态硬盘"),
+        ("惠普 AREP65 硒鼓", "惠普 AR EP65 硒鼓"),
+    ],
+    ids=(
+        "fused-ds320-vs-space",
+        "fused-ds320-vs-hyphen",
+        "fused-g502tb-vs-space",
+        "fused-g502t-vs-hyphen-tb",
+        "fused-arep65-vs-space",
+    ),
+)
+def test_fused_query_code_matches_separator_inserted_candidate(query_str, sku_name):
+    assert evaluate_same_hard_rules(query_str, sku_name) is None
+
+
+# The separator equivalence class is closed: any two spellings of one code
+# are the same code in BOTH directions.
+_DS320_SPELLINGS = ("DS320", "DS 320", "DS-320", "DS_320", "DS/320")
+
+
+@pytest.mark.parametrize(
+    ("left", "right"),
+    [(a, b) for a in _DS320_SPELLINGS for b in _DS320_SPELLINGS],
+    ids=[f"{a!r}-vs-{b!r}" for a in _DS320_SPELLINGS for b in _DS320_SPELLINGS],
+)
+def test_ds320_separator_equivalence_class_is_closed(left, right):
+    assert evaluate_same_hard_rules(f"得力 {left} 订书机", f"得力 {right} 订书机") is None
+    assert evaluate_same_hard_rules(f"得力 {right} 订书机", f"得力 {left} 订书机") is None
+
+
+_SYMMETRY_SAFE_PAIRS = (
+    ("得力 DS320 订书机", "得力 DS-320 订书机"),
+    ("得力 DS320 订书机", "得力 DS 320 订书机"),
+    ("闪迪 G502TB 移动固态硬盘", "闪迪 G50-2TB 移动固态硬盘"),
+    ("闪迪 G502TB 移动固态硬盘", "闪迪 G50 2TB 移动固态硬盘"),
+    ("闪迪 G502T 移动固态硬盘", "闪迪 G50-2TB 移动固态硬盘"),
+    ("世达 SATA-91403 批头", "世达 91403 批头"),
+    ("柯尼卡 bizhub225i 复印机", "柯尼卡 bizhub 225i 复印机"),
+)
+
+
+@pytest.mark.parametrize(
+    ("left", "right"),
+    _SYMMETRY_SAFE_PAIRS,
+    ids=(
+        "ds320-hyphen",
+        "ds320-space",
+        "g502tb-hyphen",
+        "g502tb-space",
+        "g502t-hyphen-tb",
+        "sata-shed",
+        "bizhub-shed",
+    ),
+)
+def test_safe_equivalence_is_direction_invariant(left, right):
+    assert evaluate_same_hard_rules(left, right) is None
+    assert evaluate_same_hard_rules(right, left) is None
+
+
+_SYMMETRY_COLLISION_PAIRS = (
+    ("得力 DS320 订书机", "得力 DS3200 订书机"),
+    ("球阀 DN20 黄铜", "球阀 DN200 黄铜"),
+    ("硒鼓 EP65", "硒鼓 EP650"),
+    ("世达 批头 91403", "世达 批头 914030"),
+    ("得力 DS320 订书机", "得力 ABDS320 订书机"),
+    ("世达 批头 91403", "世达 批头 XX91403"),
+    ("闪迪 G502TB 移动固态硬盘", "闪迪 G502 移动固态硬盘"),
+    ("闪迪 G502TB 移动固态硬盘", "闪迪 G50-2 移动固态硬盘"),
+    ("ABC128GB 打印纸", "ABC128 打印纸"),
+)
+
+
+@pytest.mark.parametrize(
+    ("left", "right"),
+    _SYMMETRY_COLLISION_PAIRS,
+    ids=(
+        "ds320-vs-ds3200",
+        "dn20-vs-dn200",
+        "ep65-vs-ep650",
+        "91403-vs-914030",
+        "ds320-vs-abds320",
+        "91403-vs-xx91403",
+        "g502tb-vs-g502",
+        "g502tb-vs-g50-2",
+        "abc128gb-vs-abc128",
+    ),
+)
+def test_collision_is_direction_invariant(left, right):
+    forward = evaluate_same_hard_rules(left, right)
+    backward = evaluate_same_hard_rules(right, left)
+    assert forward is not None and forward.startswith("R1:"), forward
+    assert backward is not None and backward.startswith("R1:"), backward
+
+
+# ---------------------------------------------------------------------------
 # R2 — multi-pack single-sided / conflicting
 # ---------------------------------------------------------------------------
 

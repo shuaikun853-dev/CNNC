@@ -143,42 +143,29 @@ def _model_codes_equivalent(query_token: str, sku_token: str) -> bool:
     return bool(_equivalent_model_forms(query_token) & _equivalent_model_forms(sku_token))
 
 
-# Separator tolerance for candidate titles.  The components of a code are the
-# code's own -/_//-separated segments (DS-320 -> DS + 320); in the candidate
-# the components may be joined by any mix of connector characters — spaces
-# included ("忽略空格" per the prompt) — or fused outright, but the whole run
-# must sit on strict alnum boundaries.  The boundary checks are what keep
-# this from being a substring match (DS 320 inside DS 3200, EP65 inside
-# ADEP65, G50-2TB vs G50-2 all stay conflicts), and because the components
-# come from an already-validated strong query token, ordinary adjacent title
-# words can never be fused into a code that was not there.
-_COMPONENT_JOIN_RE = r"[-_/ ]*"
-_COMPONENT_SPLIT_RE = re.compile(r"[-_/]+")
+# Separator tolerance for candidate titles, symmetric over the compact
+# canonical form.  A strong query code collapses to its compact form
+# (DS-320 -> DS320; validated TB<->T and SATA/BIZHUB prefix flexes included
+# via _equivalent_model_forms), and the candidate title proves the code when
+# a strictly alnum-bounded run of characters — with any mix of [-_/ ]
+# connector characters (or none) between them — deletes down to exactly that
+# compact form.  This is direction-symmetric: it does not matter which side
+# fused the code and which side inserted separators.  The boundary checks
+# are what keep it from being a substring match (DS 320 inside DS 3200, EP65
+# inside ADEP65, 91403 inside XX91403, G502TB vs G50-2 all stay conflicts),
+# and because the run must equal an already-validated strong query code
+# exactly, ordinary adjacent title words can never be fused into a code.
+_SEPARATOR_TOLERANCE_RE = r"[-_/ ]*"
 
 
-def _component_sequences(token: str) -> list[tuple[str, ...]]:
-    """Separator-component views of one model code, including the validated
-    TB<->T flex applied to the trailing component (G50-2TB -> (G50, 2T))."""
-    base = tuple(part for part in _COMPONENT_SPLIT_RE.split(token) if part)
-    if not base:
-        return []
-    sequences = {base}
-    last = base[-1]
-    if last.endswith("TB"):
-        sequences.add(base[:-1] + (last[:-2] + "T",))
-    elif last.endswith("T") and not last.endswith(("AT", "ET", "GT", "ST", "XT")):
-        sequences.add(base[:-1] + (last[:-1] + "TB",))
-    return sorted(sequences)
-
-
-def _component_boundary_pattern(components: tuple[str, ...]) -> re.Pattern[str]:
-    body = _COMPONENT_JOIN_RE.join(re.escape(part) for part in components)
+def _separator_insensitive_pattern(form: str) -> re.Pattern[str]:
+    body = _SEPARATOR_TOLERANCE_RE.join(re.escape(character) for character in form)
     return re.compile(rf"(?<![A-Z0-9]){body}(?![A-Z0-9])")
 
 
-def _expressed_componentwise(token: str, sku_name: str) -> bool:
+def _expressed_separator_insensitive(token: str, sku_name: str) -> bool:
     """Does the candidate title express the code as a boundary-delimited run
-    of the code's own components, connector-joined or fused?
+    whose separator deletion equals one of the code's canonical forms?
 
     Searched on the raw (unit-preserving) candidate text: a space-joined
     trailing capacity ("G50 2TB") is stripped as a standalone spec before
@@ -187,20 +174,21 @@ def _expressed_componentwise(token: str, sku_name: str) -> bool:
     if not text:
         return False
     return any(
-        _component_boundary_pattern(sequence).search(text)
-        for sequence in _component_sequences(token)
+        _separator_insensitive_pattern(form).search(text)
+        for form in _equivalent_model_forms(token)
     )
 
 
 def _model_code_expressed(token: str, sku_name: str) -> bool:
     """A strong query code is expressed when a candidate strong token is
     exactly equivalent (fused spellings, TB<->T, validated prefix shed) OR
-    the candidate text realizes the code's own components boundary-aware
-    with connector characters between them."""
+    the candidate text realizes one of the code's canonical forms as a
+    boundary-delimited run with connector characters allowed anywhere
+    between its characters."""
     sku_tokens = _strong_model_tokens(_normalize_for_tokens(sku_name))
     if any(_model_codes_equivalent(token, sku_token) for sku_token in sku_tokens):
         return True
-    return _expressed_componentwise(token, sku_name)
+    return _expressed_separator_insensitive(token, sku_name)
 
 
 def standard_model_codes_present(query_str: str, sku_name: str) -> bool:
