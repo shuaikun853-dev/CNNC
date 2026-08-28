@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 from pathlib import Path
 
@@ -669,21 +670,22 @@ def _fake_tool_module(task_record, session):
 
         @staticmethod
         def parse_task_progress_desc(rsp_desc):
-            values = {
-                "总任务量": "total",
-                "待执行": "pending",
-                "执行中": "running",
-                "失败": "failed",
-                "待入库": "waiting_db",
-                "执行完成": "finished",
+            # Mirror of the real tool's regex contract [：:](\d+)条; do not widen.
+            def get_num(label):
+                pattern = rf"{label}[：:](\d+)条"
+                match = re.search(pattern, rsp_desc)
+                if not match:
+                    return None
+                return int(match.group(1))
+
+            return {
+                "total": get_num("总任务量"),
+                "pending": get_num("待执行"),
+                "running": get_num("执行中"),
+                "failed": get_num("失败"),
+                "waiting_db": get_num("待入库"),
+                "finished": get_num("执行完成"),
             }
-            summary = {}
-            for label, key in values.items():
-                marker = f"{label}："
-                if marker in rsp_desc:
-                    head = rsp_desc.split(marker, 1)[1]
-                    summary[key] = int(head.split("条", 1)[0])
-            return summary
 
     return _Module
 

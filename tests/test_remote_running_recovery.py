@@ -7,6 +7,7 @@ Zhaoshang platform or the production SQLite state.
 from __future__ import annotations
 
 import json
+import re
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -873,21 +874,22 @@ def _restart_tool_module(task: dict, session: _RestartSession):
 
         @staticmethod
         def parse_task_progress_desc(rsp_desc):
-            values = {
-                "总任务量": "total",
-                "待执行": "pending",
-                "执行中": "running",
-                "失败": "failed",
-                "待入库": "waiting_db",
-                "执行完成": "finished",
+            # Mirror of the real tool's regex contract [：:](\d+)条; do not widen.
+            def get_num(label):
+                pattern = rf"{label}[：:](\d+)条"
+                match = re.search(pattern, rsp_desc)
+                if not match:
+                    return None
+                return int(match.group(1))
+
+            return {
+                "total": get_num("总任务量"),
+                "pending": get_num("待执行"),
+                "running": get_num("执行中"),
+                "failed": get_num("失败"),
+                "waiting_db": get_num("待入库"),
+                "finished": get_num("执行完成"),
             }
-            summary = {}
-            for label, key in values.items():
-                marker = f"{label}："
-                if marker in rsp_desc:
-                    head = rsp_desc.split(marker, 1)[1]
-                    summary[key] = int(head.split("条", 1)[0])
-            return summary
 
         @staticmethod
         def disable_task(session, task_id):
@@ -1536,11 +1538,36 @@ def test_adapter_probe_running_task_reports_progress_and_export(tmp_path, monkey
     assert probe.export_rsp_desc == NO_PRICE_RSP
 
 
-def test_default_dependencies_wire_probe_and_write_gated_restart(tmp_path) -> None:
+def test_default_dependencies_wire_probe_and_write_gated_restart(
+    tmp_path, monkeypatch
+) -> None:
+    import app.services.incremental_audit_runtime as runtime_module
     from app.services.incremental_audit_runtime import (
         build_default_dependencies,
         runtime_paths,
     )
+
+    # The snapshot/detail curl templates are gitignored local production
+    # inputs; build the wiring against a synthetic data root injected through
+    # the same PROJECT_DATA_ROOT global build_default_dependencies resolves.
+    # The wiring assertions hold identically on machines with real data/.
+    synthetic_data_root = tmp_path / "project" / "data"
+    synthetic_data_root.mkdir(parents=True)
+    for curl_name in (
+        "latest_saas_sameAudit_queryAll.curl",
+        "latest_cnnc_query.curl",
+        "detail_request.curl",
+    ):
+        (synthetic_data_root / curl_name).write_text(
+            f"curl https://synthetic.invalid/{curl_name}", encoding="utf-8"
+        )
+    (synthetic_data_root / "model.env").write_text(
+        "TITLE_MATCH_MODEL_API_KEY=synthetic-key\n"
+        "TITLE_MATCH_MODEL_BASE_URL=https://synthetic.invalid/v1\n"
+        "TITLE_MATCH_MODEL_NAME=synthetic-model\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(runtime_module, "PROJECT_DATA_ROOT", synthetic_data_root)
 
     paths = runtime_paths(BUSINESS_DATE, tmp_path / "runtime")
     read_only = build_default_dependencies(
