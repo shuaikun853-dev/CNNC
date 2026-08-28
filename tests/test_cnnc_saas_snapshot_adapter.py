@@ -391,3 +391,87 @@ def test_fetch_counts_reuses_auth_manager_read_only_saas_path():
     assert auth_manager.calls[0][0] == "saas"
     assert auth_manager.calls[0][2]["read_only"] is True
     assert len(opener.requests) == 1  # customer 直连
+
+
+# ---- R3 GitHub Review P1:live count 链禁止自动 token refresh ----
+
+def test_r3_p1_fetch_counts_saas_path_forbids_auto_refresh():
+    """count-only 路径必须传 allow_refresh=False:401/认证失败直接降级,
+    绝不进入 refresh()(阻塞锁 + 30s refresh HTTP 会击穿 12s wall 预算)。"""
+    class _AuthManager:
+        def __init__(self):
+            self.calls = []
+
+        def request_json(self, system, request_factory, **kwargs):
+            self.calls.append(kwargs)
+            return _ok([], 4)
+
+    auth_manager = _AuthManager()
+    adapter, _opener = _adapter([_ok([], 5)], auth_manager=auth_manager)
+
+    counts = adapter.fetch_counts()
+
+    assert counts.saas_count == 4 and counts.customer_count == 5
+    assert auth_manager.calls[0]["allow_refresh"] is False
+    assert auth_manager.calls[0]["read_only"] is True
+
+
+def test_r3_p1_fetch_snapshot_path_keeps_auto_refresh_default():
+    """PriceAudit 权威快照(fetch)不受本修复影响:认证刷新行为保持默认允许。"""
+    class _AuthManager:
+        def __init__(self):
+            self.calls = []
+
+        def request_json(self, system, request_factory, **kwargs):
+            self.calls.append(kwargs)
+            return _ok([], 0)
+
+    auth_manager = _AuthManager()
+    adapter, _opener = _adapter([_ok([], 0)], auth_manager=auth_manager)
+
+    adapter.fetch()
+
+    # 显式 True 或省略(默认 True)都合法;绝不允许 fetch() 路径静默变 False
+    assert auth_manager.calls[0].get("allow_refresh", True) is True
+
+
+def test_r3_p1_fetch_counts_real_auth_401_no_refresh_single_http(tmp_path):
+    """端到端:真实 AuthManager + 业务 401 → fetch_counts 抛 AuthError,
+    refresh HTTP 零次、业务 HTTP 恰一次、auth_state 不被轮换。"""
+    import io
+    from scripts.auth_manager import AuthManager, AuthError
+
+    state_path = tmp_path / "auth_state.json"
+    state_path.write_text(json.dumps({
+        "saas": {"access_token": "live-a", "refresh_token": "live-r"},
+        "zhaoshang": {"access_token": "zs-a", "refresh_token": "zs-r"},
+    }), encoding="utf-8")
+
+    class _ForbiddenRefreshOpener:
+        def __init__(self):
+            self.requests = []
+
+        def open(self, request, timeout=0):
+            self.requests.append(request)
+            raise AssertionError("token refresh HTTP must not happen on live-count path")
+
+    refresh_opener = _ForbiddenRefreshOpener()
+    auth_manager = AuthManager(
+        state_path=state_path,
+        curl_sources={"saas": (), "zhaoshang": ()},
+        opener=refresh_opener,
+    )
+    http_401 = error.HTTPError(
+        "https://saasportal.iio.com/improxy/saas/iio2/sameAudit/queryAll",
+        401, "Unauthorized", None, io.BytesIO(b"{}"))
+    adapter, opener = _adapter([http_401], auth_manager=auth_manager)
+
+    with pytest.raises(AuthError) as caught:
+        adapter.fetch_counts(max_elapsed_seconds=12)
+
+    assert "live-a" not in str(caught.value) and "live-r" not in str(caught.value)
+    assert refresh_opener.requests == []
+    assert len(opener.requests) == 1  # 仅首次业务 HTTP,无第二次重试
+    assert json.loads(state_path.read_text(encoding="utf-8"))["saas"] == {
+        "access_token": "live-a", "refresh_token": "live-r",
+    }

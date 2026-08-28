@@ -2565,3 +2565,51 @@ def test_r3_pool_failure_closure_fields_none_not_zero():
     assert stages["closed_total"] is None
     assert stages["pool_state_other"] is None
     assert stages["pool_counts_available"] is False
+
+
+# ---- R3 GitHub Review P1:live 链认证失败只降级 live_counts ----
+
+def test_r3_p1e_live_counts_auth_error_degrades_only_live_preserves_stages(tmp_path):
+    """P1-E(service 级):AuthError(401/认证失败且禁止刷新)→ live unavailable
+    (错误只含类型名),DB stages/growth 原样,status 不因 live 失败变 unavailable。"""
+    from scripts.auth_manager import AuthError
+
+    def auth_rejected():
+        raise AuthError("SaaS 认证失败(HTTP 401);本次调用禁止自动刷新 Token")
+
+    service, _, _ = make_service(dict(FULL_CANNED), runtime_root=tmp_path,
+                                 now_fn=lambda: BEFORE_CUTOFF,
+                                 live_fetcher=auth_rejected)
+    payload = service.get_diagnostic("2026-08-27")
+    live = payload["live_counts"]
+    assert live["available"] is False
+    assert live["customer_count"] is None and live["saas_count"] is None
+    assert live["observed_at"] is None
+    assert live["error"] == {"type": "AuthError"}
+    assert payload["status"] == "ok"
+    assert payload["stages"]["crawler_branch"]["CALLBACK_IN_FLIGHT"] == 1
+    assert payload["growth"]["available"] is False  # 历史观察序列独立、未被污染
+
+
+def test_r3_p1e_endpoint_auth_failure_live_down_http_200(client, monkeypatch, tmp_path):
+    """P1-E(endpoint 级):live 认证失败 → /dashboard/api/saas-flow 仍 200,
+    live_counts 降级,stages/growth 照常。"""
+    from scripts.auth_manager import AuthError
+    import app.services.saas_flow_diagnostic as mod
+
+    def auth_rejected():
+        raise AuthError("SaaS 认证失败(响应报文);本次调用禁止自动刷新 Token")
+
+    service, _, _ = make_service(dict(FULL_CANNED), runtime_root=tmp_path,
+                                 live_fetcher=auth_rejected)
+    monkeypatch.setattr(mod, "_SERVICE_SINGLETON", service)
+    r = client.get("/dashboard/api/saas-flow?date=2026-08-27")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["live_counts"]["available"] is False
+    assert body["live_counts"]["error"] == {"type": "AuthError"}
+    assert body["status"] == "ok"
+    assert body["stages"]["crawler_branch"]["CALLBACK_IN_FLIGHT"] == 1
+    assert body["growth"]["available"] is False
+    # P1-F:整包响应绝不携带任何 token 片段
+    assert "live-r" not in r.text and "live-a" not in r.text

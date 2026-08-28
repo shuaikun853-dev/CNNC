@@ -418,8 +418,15 @@
 
   function sfTreeHtml(stages) {
     if (!stages) return "";
-    if (stages.crawl_status_available === false) {
-      return '<div class="sf-head">分层数据不可用(crawl_status 核心查询失败,不冒充业务 0)。</div>';
+    // R3 Review P2:pool 证据与 routing 证据独立降级——任一侧查询失败只隐藏
+    // 该侧,可靠的另一侧必须保留(pool OK/routing 失败 → 仍显示 71/21/50 +
+    // 「阶段分布暂不可用」;pool 失败/routing OK → 池拆分不可用 + 独立展示
+    // 阶段分布基数与 routing 拆分)。两者都失败才整体 unavailable。
+    const poolOk = stages.pool_counts_available !== false &&
+      stages.closed_total != null && stages.not_closed != null;
+    const routingOk = stages.crawl_status_available !== false;
+    if (!poolOk && !routingOk) {
+      return '<div class="sf-head">分层数据不可用(池计数与采集路由核心查询均失败,不冒充业务 0)。</div>';
     }
     const drift = stages.snapshot_drift || [];
     const driftNote = "查询期间数据变化,本轮该分支分类暂不发布(约 60 秒后自动重新取证;这是取证时点问题,不是业务异常)";
@@ -441,16 +448,13 @@
     // 覆盖全部非 0 routing bucket(other/路由证据不足),不为好看隐藏任何桶。
     const head = "当日商品池记录:" +
       (stages.pool_counts_available === false ? "不可用" : Number(stages.pool_scope_total || 0));
-    let poolHtml;
-    if (stages.pool_counts_available === false || stages.closed_total == null ||
-        stages.not_closed == null) {
-      poolHtml = '<li class="bf">商品池收口拆分不可用(池计数查询失败,不冒充业务 0)。</li>';
-    } else {
-      const routingLines = [
+    const routingLines = [];
+    if (routingOk) {
+      routingLines.push(
         sfStageLine("未进入采集列表", stages.no_commodity_list),
         sfStageLine("爬虫链路未完成", stages.crawl_status_1),
-        sfStageLine("爬虫已回调", stages.crawl_status_2),
-      ];
+        sfStageLine("爬虫已回调", stages.crawl_status_2)
+      );
       if (stages.crawl_status_other) {
         routingLines.push(sfStageLine("其他采集状态", stages.crawl_status_other));
       }
@@ -465,12 +469,23 @@
           Number(stages.routing_open_total || 0) +
           ';查询期间数据变化,本轮暂不强制对账(约 60 秒后自动重新取证)</li>');
       }
+    }
+    let poolHtml;
+    if (!poolOk) {
+      // R3 P2 场景2:池拆分不可用,但可靠的 routing 证据独立展示
+      poolHtml = '<li class="bf">商品池收口拆分不可用(池计数查询失败,不冒充业务 0)。</li>' +
+        '<li class="bf">└─ 阶段分布基数:' + Number(stages.routing_open_total || 0) +
+        "<ul>" + routingLines.join("") + "</ul></li>";
+    } else {
+      const routingChild = routingOk
+        ? "<ul>" + routingLines.join("") + "</ul>"
+        : '<ul><li class="bf">阶段分布暂不可用(采集路由查询失败,不冒充业务 0)</li></ul>';
       poolHtml = '<li class="bf">├─ 已最终收口:' + Number(stages.closed_total) + "</li>" +
         (stages.pool_state_other
           ? '<li class="bf">├─ 其他池状态:' + Number(stages.pool_state_other) + "</li>"
           : "") +
         '<li class="bf">└─ 未最终收口:' + Number(stages.not_closed) +
-        "<ul>" + routingLines.join("") + "</ul></li>";
+        routingChild + "</li>";
     }
     // R2 Review P1-3:父节点语义。crawl_status=1 的子状态已包含
     // CALLBACK_DONE_SAAS_PENDING(回调已完成,SaaS尚未推进),旧的"未回调"

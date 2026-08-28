@@ -63,7 +63,12 @@ MAX_CRAWL1_BATCHES = 2000
 
 # R3 BUG A(2026-08-28):Dashboard 顶部实时读数走独立 count-only 只读链
 # (CnncSaasSnapshotAdapter.fetch_counts,page=1 limit=1,零分页);每次 fresh build
-# 最多一轮,失败绝不冒充 0,也绝不拖累 DB stages。wall timeout 取 10~15s 量级。
+# 最多一轮,失败绝不冒充 0,也绝不拖累 DB stages。
+# R3 Review P1 真实契约(不夸大):12 秒是业务 API 网络读取的绝对预算——每次
+# HTTP timeout 收敛到剩余预算、重试次数受 max_attempts_per_page 约束、重试
+# 间隔受剩余预算约束;本链禁止 token refresh(无 refresh HTTP、无认证锁等待,
+# 401/认证失败直接降级 unavailable)。本地 auth_state.json 读取(文件存在时
+# 为无锁单次文件读)不在此预算内。
 DEFAULT_LIVE_COUNTS_TIMEOUT_SECONDS = 12.0
 
 DEFAULT_DB_ENV_PATH = Path(__file__).resolve().parents[2] / "data" / "CNNC_DIAG_DB.env"
@@ -1253,8 +1258,11 @@ def default_live_counts_fetcher(data_root: Path | str | None = None) -> dict[str
 
     - 配置来源:data/latest_saas_sameAudit_queryAll.curl + data/latest_cnnc_query.curl
       (gitignored,绝不复制进 Git/日志/API;缺失 → CONFIG_MISSING 快速返回);
-    - count-only(page=1 limit=1,零分页),绝对 deadline 12 秒;
-    - SaaS 侧沿用 AuthManager 只读请求路径;返回值只含 count/时间,无凭据。
+    - count-only(page=1 limit=1,零分页),业务 API 网络读取绝对预算 12 秒
+      (R3 Review P1:不包含本地 auth_state 读取;禁止 token refresh,401/认证
+      失败直接抛 AuthError 由 _build_live_counts 降级,绝不触发 token rotation);
+    - SaaS 侧走 AuthManager 只读请求路径(allow_refresh=False);
+      返回值只含 count/时间,无凭据。
     """
     from app.services.cnnc_saas_snapshot_adapter import CnncSaasSnapshotAdapter
     from scripts.auth_manager import AuthManager

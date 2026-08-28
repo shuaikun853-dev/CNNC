@@ -510,3 +510,121 @@ def test_round5_deadline_takes_precedence_over_static_timeout(tmp_path):
     )
 
     assert opener.timeouts == [0.5]
+
+
+# ---------------------------------------------------------------------------
+# Round 3 GitHub Review P1 (2026-08-28): the Dashboard live-count chain claims
+# a bounded wall budget, but request_json's 401 / auth-failure retry path
+# called refresh() with NO deadline (blocking auth locks + up to 30s refresh
+# HTTP + a second business HTTP).  allow_refresh=False (Dashboard only) must
+# fail typed WITHOUT any token refresh; the default True keeps every existing
+# caller (PriceAudit snapshot, export, push, query, reject) byte-identical.
+# ---------------------------------------------------------------------------
+
+
+def _r3_state(tmp_path: Path) -> Path:
+    state_path = tmp_path / "auth_state.json"
+    state_path.write_text(
+        json.dumps(
+            {
+                "saas": {"access_token": "live-a", "refresh_token": "live-r"},
+                "zhaoshang": {"access_token": "zs-a", "refresh_token": "zs-r"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    return state_path
+
+
+def _r3_business_request():
+    return urllib.request.Request(
+        "http://saasportal.iio.com/improxy/read", data=b"{}", method="POST"
+    )
+
+
+class _ForbiddenRefreshOpener(QueueOpener):
+    """Any refresh HTTP on this opener means the no-refresh contract broke."""
+
+    def open(self, request: urllib.request.Request, timeout: float = 0):
+        raise AssertionError("token refresh HTTP must not happen (allow_refresh=False)")
+
+
+def test_r3_p1a_401_with_allow_refresh_false_fails_typed_without_refresh(tmp_path):
+    from scripts.auth_manager import AuthManager, AuthError
+
+    sources, _ = _sources(tmp_path)
+    state_path = _r3_state(tmp_path)
+    manager = AuthManager(
+        state_path=state_path,
+        curl_sources=sources,
+        opener=_ForbiddenRefreshOpener(),
+    )
+    business_opener = QueueOpener(_http_401())
+
+    with pytest.raises(AuthError) as caught:
+        manager.request_json(
+            "saas",
+            _r3_business_request,
+            read_only=True,
+            opener=business_opener,
+            allow_refresh=False,
+        )
+
+    assert "401" in str(caught.value)
+    assert "live-a" not in str(caught.value) and "live-r" not in str(caught.value)
+    assert len(business_opener.requests) == 1  # no second business HTTP
+    assert _state(state_path)["saas"] == {
+        "access_token": "live-a", "refresh_token": "live-r",
+    }
+
+
+def test_r3_p1b_auth_failure_payload_with_allow_refresh_false_never_refreshes(tmp_path):
+    from scripts.auth_manager import AuthManager, AuthError
+
+    sources, _ = _sources(tmp_path)
+    state_path = _r3_state(tmp_path)
+    manager = AuthManager(
+        state_path=state_path,
+        curl_sources=sources,
+        opener=_ForbiddenRefreshOpener(),
+    )
+    business_opener = QueueOpener(
+        FakeResponse({"rspCode": "3333", "rspDesc": "session ended"})
+    )
+
+    with pytest.raises(AuthError) as caught:
+        manager.request_json(
+            "saas",
+            _r3_business_request,
+            read_only=True,
+            opener=business_opener,
+            allow_refresh=False,
+        )
+
+    assert "live-a" not in str(caught.value) and "live-r" not in str(caught.value)
+    assert len(business_opener.requests) == 1
+    assert _state(state_path)["saas"]["refresh_token"] == "live-r"
+
+
+def test_r3_p1d_valid_token_with_allow_refresh_false_returns_payload_once(tmp_path):
+    from scripts.auth_manager import AuthManager
+
+    sources, _ = _sources(tmp_path)
+    manager = AuthManager(
+        state_path=_r3_state(tmp_path),
+        curl_sources=sources,
+        opener=_ForbiddenRefreshOpener(),
+    )
+    business_opener = QueueOpener(FakeResponse({"rspCode": "0000", "count": 66}))
+
+    result = manager.request_json(
+        "saas",
+        _r3_business_request,
+        read_only=True,
+        opener=business_opener,
+        allow_refresh=False,
+    )
+
+    assert result == {"rspCode": "0000", "count": 66}
+    assert len(business_opener.requests) == 1
+    assert "x-access-token=live-a" in business_opener.requests[0].get_header("Cookie")

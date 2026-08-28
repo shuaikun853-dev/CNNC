@@ -495,9 +495,15 @@ class AuthManager:
         read_only: bool,
         opener: Any | None = None,
         timeout: float = 60,
+        allow_refresh: bool = True,
     ) -> dict[str, Any]:
+        # R3 Review P1(2026-08-28):allow_refresh=False 供 Dashboard live count
+        # 这类 wall-budget 敏感的只读链使用——401/认证失败 payload 直接类型化
+        # 失败,绝不进入 refresh()(阻塞认证锁 + 最长 30s 的 refresh HTTP +
+        # 第二次业务 HTTP 会击穿调用方的绝对 deadline)。默认 True,
+        # 所有既有调用方(PriceAudit 快照/export/push/query/reject)行为不变。
         direct_opener = opener or internal_direct_opener()
-        attempts = 2 if read_only else 1
+        attempts = 2 if read_only and allow_refresh else 1
         stale_access = ""
         for attempt in range(attempts):
             tokens = self.get_tokens(system)
@@ -510,24 +516,34 @@ class AuthManager:
                         response.read().decode("utf-8", errors="replace")
                     )
             except urllib.error.HTTPError as exc:
-                if read_only and attempt == 0 and exc.code == 401:
+                if read_only and allow_refresh and attempt == 0 and exc.code == 401:
                     if self.logger:
                         self.logger(
                             f"[{SYSTEM_CONFIG[system]['label']}] access token rejected; refreshing once"
                         )
                     self.refresh(system, stale_access_token=stale_access)
                     continue
+                if not allow_refresh and exc.code == 401:
+                    raise AuthError(
+                        f"{SYSTEM_CONFIG[system]['label']} 认证失败(HTTP 401);"
+                        "本次调用禁止自动刷新 Token,由调用方降级"
+                    ) from None
                 raise
             if not isinstance(payload, dict):
                 raise AuthError("业务接口响应必须是 JSON 对象")
             if _payload_is_auth_failure(payload):
-                if read_only and attempt == 0:
+                if read_only and allow_refresh and attempt == 0:
                     if self.logger:
                         self.logger(
                             f"[{SYSTEM_CONFIG[system]['label']}] access token rejected; refreshing once"
                         )
                     self.refresh(system, stale_access_token=stale_access)
                     continue
+                if not allow_refresh:
+                    raise AuthError(
+                        f"{SYSTEM_CONFIG[system]['label']} 认证失败(响应报文);"
+                        "本次调用禁止自动刷新 Token,由调用方降级"
+                    ) from None
                 raise AuthError(
                     f"{SYSTEM_CONFIG[system]['label']} 认证失败，单次刷新重试后仍未恢复"
                 )

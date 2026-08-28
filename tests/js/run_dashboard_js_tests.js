@@ -485,6 +485,71 @@ function test_r3_round2_contract_preserved_in_new_tree() {
         !html.includes("爬虫未回调"), html);
 }
 
+// ---- R3 GitHub Review P2:pool 证据与 routing 证据独立降级 ----
+
+function test_r3_p2_pool_ok_routing_fail_shows_pool_closure() {
+  // 场景1:pool 成功(71/21/50 可靠)、routing 查询失败 → pool 闭合数据必须保留,
+  // routing 层显示「阶段分布暂不可用」,绝不把 null 渲染成 0。
+  const html = sfTreeHtml(r3PoolStagesFixture({
+    crawl_status_available: false,
+    routing_open_total: null, no_commodity_list: null,
+    crawl_status_1: null, crawl_status_2: null, crawl_status_other: null,
+    routing_evidence_incomplete: null,
+    callback_done_no_search_within_grace: null,
+    crawler_branch: null, downstream_branch: null,
+  }));
+  check("R3 P2 场景1 pool 可用:71/21/50 仍完整显示",
+        html.includes("当日商品池记录:71") && html.includes("已最终收口:21") &&
+        html.includes("未最终收口:50"), html);
+  check("R3 P2 场景1 routing 不可用显示阶段分布暂不可用",
+        html.includes("阶段分布暂不可用"), html);
+  check("R3 P2 场景1 不得把不可用 routing 字段渲染成 0",
+        !html.includes("未进入采集列表") &&
+        !html.includes("爬虫链路未完成</span><b>") &&
+        !html.includes("爬虫已回调</span><b>") &&
+        !html.includes("其他采集状态") && !html.includes("路由证据不足"), html);
+  check("R3 P2 场景1 detail 分支明确本轮不可用,不冒充分类",
+        html.includes("本轮不可用"), html);
+}
+
+function test_r3_p2_pool_fail_routing_ok_preserves_routing() {
+  // 场景2:pool 查询失败、routing 成功(基数 50 + 1/0/49 可靠)→
+  // 池侧拆分不可用,但 routing 证据仍完整可见。
+  const html = sfTreeHtml(r3PoolStagesFixture({
+    pool_counts_available: false,
+    pool_scope_total: null, not_closed: null, closed_standard: null,
+    closed_no_same: null, closed_total: null, pool_state_other: null,
+  }));
+  check("R3 P2 场景2 pool 失败:头部不可用 + 收口拆分不可用",
+        html.includes("当日商品池记录:不可用") &&
+        html.includes("商品池收口拆分不可用"), html);
+  check("R3 P2 场景2 routing 证据仍完整可见(基数 50 + 1/0/49)",
+        html.includes("阶段分布基数:50") &&
+        html.includes("未进入采集列表</span><b>1</b>") &&
+        html.includes("爬虫链路未完成</span><b>0</b>") &&
+        html.includes("爬虫已回调</span><b>49</b>"), html);
+  check("R3 P2 场景2 不得出现池侧数字冒充",
+        !html.includes("已最终收口:21") && !html.includes("未最终收口:50"), html);
+}
+
+function test_r3_p2_both_fail_whole_evidence_unavailable() {
+  // 场景3:pool 与 routing 都失败 → 整体分层 evidence unavailable,
+  // 文案必须点名两类查询,不渲染任何池/路由数字。
+  const html = sfTreeHtml(r3PoolStagesFixture({
+    pool_counts_available: false, crawl_status_available: false,
+    pool_scope_total: null, not_closed: null, closed_total: null,
+    pool_state_other: null, routing_open_total: null, no_commodity_list: null,
+    crawl_status_1: null, crawl_status_2: null, crawl_status_other: null,
+    routing_evidence_incomplete: null,
+    crawler_branch: null, downstream_branch: null,
+  }));
+  check("R3 P2 场景3 双失败:整体不可用且文案点名池计数与路由查询",
+        html.includes("分层数据不可用") && html.includes("池计数"), html);
+  check("R3 P2 场景3 不得渲染任何池/路由数字",
+        !html.includes("已最终收口") && !html.includes("未最终收口") &&
+        !html.includes("阶段分布基数"), html);
+}
+
 (async () => {
   await test_304_keeps_sync_fresh_without_rerender();
   await test_hidden_pauses_and_visible_resumes();
@@ -506,6 +571,9 @@ function test_r3_round2_contract_preserved_in_new_tree() {
   test_r3_pool_closure_other_and_unknown_visible();
   test_r3_pool_routing_drift_no_fake_closure();
   test_r3_round2_contract_preserved_in_new_tree();
+  test_r3_p2_pool_ok_routing_fail_shows_pool_closure();
+  test_r3_p2_pool_fail_routing_ok_preserves_routing();
+  test_r3_p2_both_fail_whole_evidence_unavailable();
   if (failed === 0) { console.log("ALL PASS"); process.exit(0); }
   console.error(failed + " failing checks");
   process.exit(1);

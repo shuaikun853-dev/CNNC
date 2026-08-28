@@ -270,6 +270,7 @@ class CnncSaasSnapshotAdapter:
         payload: Mapping[str, Any],
         deadline: float,
         started_at: float,
+        allow_refresh: bool = True,
     ) -> dict[str, Any]:
         attempts = 0
         last_cause: BaseException | None = None
@@ -291,6 +292,7 @@ class CnncSaasSnapshotAdapter:
                         read_only=True,
                         opener=self._opener,
                         timeout=timeout,
+                        allow_refresh=allow_refresh,
                     )
                 else:
                     with self._opener.open(factory(), timeout=timeout) as response:
@@ -423,6 +425,12 @@ class CnncSaasSnapshotAdapter:
         rows——Dashboard 每 ~60 秒刷新只需要两个数字。失败抛类型化异常
         (SnapshotFetchExhausted / RuntimeError / ValueError),由调用方降级为
         unavailable,绝不冒充 0。
+
+        R3 Review P1:本路径传 allow_refresh=False——SaaS 401/认证失败直接
+        抛 AuthError 降级,绝不进入 AuthManager.refresh()(阻塞认证锁 +
+        30s refresh HTTP 会击穿 wall 预算,也不该由只读诊断触发 token rotation)。
+        业务 API 网络读取总预算 = max_elapsed_seconds(每次 HTTP timeout 收敛
+        到剩余预算);本地 auth_state.json 读取(文件存在时无锁)不在此预算内。
         """
         if max_elapsed_seconds is not None:
             try:
@@ -440,11 +448,13 @@ class CnncSaasSnapshotAdapter:
         saas_payload = self._request_page(
             "saas", 1, self._saas_config,
             {**saas_body, "page": 1, "limit": 1}, deadline, started_at,
+            allow_refresh=False,
         )
         saas_count = self._count_from_response(saas_payload, "saas")
         customer_payload = self._request_page(
             "customer", 1, self._customer_config,
             {**customer_body, "page": 1, "limit": 1}, deadline, started_at,
+            allow_refresh=False,
         )
         customer_count = self._count_from_response(customer_payload, "customer")
         return LiveSourceCounts(
