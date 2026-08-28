@@ -112,6 +112,7 @@ def _empty_status(
             "completed": 0, "unknown": 0, "manual": 0,
             "awaiting_priority": 0, "awaiting_harvest": 0,
             "recovery_exhausted": 0,
+            "superseded": 0,
         },
         "final": {
             "pending": 0, "computed_pending": 0, "frozen": False, "finalized": False,
@@ -361,6 +362,9 @@ def collect_runtime_status(
         # Local give-up terminal: the remote task was never completed; the
         # business decided to stop waiting after one confirmed restart.
         "recovery_exhausted": remote_states.get("RECOVERY_EXHAUSTED", 0),
+        # Historical task durably replaced by a manual rebuild; the
+        # replacement job carries the remaining work, so this never blocks.
+        "superseded": remote_states.get("SUPERSEDED", 0),
     }
     computed_final_pending = (
         detail["pending"] + detail["running"]

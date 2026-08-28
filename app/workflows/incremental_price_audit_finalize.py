@@ -402,6 +402,10 @@ def build_frozen_audit_artifact(
         )
         crawls_by_key.setdefault(key, []).append(crawl)
     remote_jobs = {int(job["id"]): job for job in store.list_remote_jobs(token)}
+    replacements_by_old = {
+        int(replacement["old_remote_job_id"]): replacement
+        for replacement in store.list_remote_replacements(token.run_id)
+    }
 
     counts = {
         "frozen_rows": len(items),
@@ -602,6 +606,16 @@ def build_frozen_audit_artifact(
             # A local give-up is acceptable only with its complete durable
             # recovery proof; anything less stays an invalid-state blocker.
             if remote_job is not None and _valid_recovery_exhausted_evidence(remote_job):
+                continue
+            counts["remote_invalid"] += 1
+            continue
+        if state == "SUPERSEDED":
+            # A manual rebuild durably retired this task; its replacement job
+            # carries the remaining work, so the old task neither blocks nor
+            # counts as pending/manual. Without a recorded replacement whose
+            # new job still exists, SUPERSEDED is not trusted evidence.
+            replacement = replacements_by_old.get(job_id)
+            if replacement is not None and int(replacement["new_remote_job_id"]) in remote_jobs:
                 continue
             counts["remote_invalid"] += 1
             continue

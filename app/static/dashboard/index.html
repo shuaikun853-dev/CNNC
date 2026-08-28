@@ -41,6 +41,15 @@
 <div class="final" id="final">
   <div class="q">为什么还没出最终 Excel?</div>
   <span class="why">正在获取……</span>
+  <div class="final-actions" id="final-actions">
+    <button class="btn" id="closeout-btn">立即收口</button>
+    <span class="final-status" id="closeout-status"></span>
+  </div>
+  <div class="final-output" id="final-output" style="display:none">
+    <span class="lab">输出位置</span>
+    <span class="mono break-all" id="final-output-path"></span>
+    <button class="btn" id="copy-path">复制路径</button>
+  </div>
 </div>
 
 <!-- SaaS 首次采集链路(一级可见的折叠卡;展开才显示阶段树,满足渐进披露) -->
@@ -72,9 +81,26 @@
     </table>
     <aside class="drawer" id="drawer">
       <h3>任务详情 <button class="btn" style="float:right;padding:0 8px" onclick="document.getElementById('drawer').classList.remove('show')">收起</button></h3>
+      <div class="sec" id="drawer-live"><b style="font-size:12px">当前实时进度</b><div class="lp-body"></div></div>
       <div class="sec"><div class="kv"></div></div>
-      <div class="sec"><b style="font-size:12px">恢复时间线</b>
+      <div class="sec">
+        <b style="font-size:12px">人工操作</b>
+        <div class="jobs-actions">
+          <button class="btn" id="btn-refresh-progress">刷新任务进度</button>
+          <button class="btn" id="btn-reexport">重新导出</button>
+          <button class="btn" id="btn-rebuild">重建任务</button>
+        </div>
+        <div class="action-status" id="action-status"></div>
+        <div class="rebuild-confirm" id="rebuild-confirm" style="display:none">
+          <p class="rc-text"></p>
+          <button class="btn danger" id="btn-rebuild-ok">确认重建</button>
+          <button class="btn" id="btn-rebuild-cancel">取消</button>
+        </div>
+      </div>
+      <div class="sec"><b style="font-size:12px">历史恢复时间线</b>
         <ul class="tl"></ul></div>
+      <div class="sec"><b style="font-size:12px">操作记录</b>
+        <ul class="oplog" id="drawer-oplog"></ul></div>
       <div class="sec"><b style="font-size:12px">系统说明与建议</b>
         <p class="note"></p></div>
     </aside>
@@ -88,7 +114,7 @@
   </section>
 </div>
 
-<footer>中核 STEP_1 每日价格审计 · 只读驾驶舱 · 数据来自本机 runtime 投影及 SaaS Flow 只读诊断 · 本页面不执行任何写操作</footer>
+<footer>中核 STEP_1 每日价格审计 · 数据来自本机 runtime 投影及 SaaS Flow 只读诊断 · 主状态读取只读;仅人工操作按钮触发受控写</footer>
 </div>
 </body>
 </html>

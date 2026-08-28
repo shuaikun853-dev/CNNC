@@ -54,11 +54,12 @@
 
   let etag = null, lastSyncAt = null;
 
-  function fmtAgoMs(ms) {
-    const s = Math.max(0, (Date.now() - ms) / 1000);
+  function fmtAgoSeconds(s) {
     return s < 60 ? `${Math.round(s)} 秒前` : `${Math.round(s / 60)} 分钟前`;
   }
+  function fmtAgoMs(ms) { return fmtAgoSeconds(Math.max(0, (Date.now() - ms) / 1000)); }
   function fmtAgo(iso) { return fmtAgoMs(new Date(iso).getTime()); }
+  function fmtAgoAt(iso, nowMs) { return fmtAgoSeconds(Math.max(0, (nowMs - new Date(iso).getTime()) / 1000)); }
   function setLive(ok, text) {
     $("#live").textContent = text;
     $("#live-dot").className = "dot" + (ok ? "" : " err");
@@ -103,7 +104,7 @@
   function render(p) {
     renderHero(p.overall); renderAttention(p.overall.attention);
     renderStages(p.overall.stages); renderZs(p.overall.zs_summary);
-    renderFinal(p.overall); renderMeta(p);
+    renderFinal(p.overall, p.status); renderMeta(p);
     renderJobs(p.jobs);
     window._timelines = p.timelines;
     renderTech(p.status);
@@ -140,7 +141,7 @@
         <div class="k">${s.name}</div>
         <div class="st">${s.state_word}</div><div class="num">${s.num}</div>
         <div class="sub">${(s.sub || []).map(([k, v]) =>
-          `<div><span>${k}</span><span>${esc(v)}</span></div>`).join("")}</div>
+          `<div><span>${k}</span><span>${esc(outputDisplayName(v))}</span></div>`).join("")}</div>
       </div>`).join("");
     document.querySelectorAll("#stages .stage").forEach((el) =>
       el.addEventListener("click", () => el.classList.toggle("open")));
@@ -158,10 +159,25 @@
     counts.innerHTML = map.map(([k, lab, cls]) =>
       `<span><span class="lab">${lab}</span><b class="${cls}">${z[k] ?? 0}</b></span>`).join("");
   }
-  function renderFinal(o) {
+  function renderFinal(o, status) {
     const f = $("#final");
     f.className = "final" + (o.final_state === "ok" ? " ok" : "");
     f.querySelector(".why").textContent = o.final_text;
+    // 已 finalized(final_state != "pending",含 forced)不显示收口按钮
+    const finalized = o.final_state !== "pending";
+    const actionsBox = $("#final-actions");
+    if (actionsBox) actionsBox.style.display = finalized ? "none" : "";
+    // 输出位置:完整路径仅在已出表且 payload 提供时显示(可选中复制)
+    const outBox = $("#final-output");
+    const outputPath = status && status.final && status.final.output_path;
+    if (outBox) {
+      if (finalized && outputPath) {
+        outBox.style.display = "";
+        $("#final-output-path").textContent = outputPath;
+      } else {
+        outBox.style.display = "none";
+      }
+    }
   }
   function renderMeta(p) {
     const st = p.status || {};
@@ -173,16 +189,18 @@
         (s.next_run ? "下次运行:" + String(s.next_run) : "计划任务:正常")));
   }
   function renderJobs(jobs) {
-    $("#jobs-table tbody").innerHTML = (jobs || []).map((j) => `
+    $("#jobs-table tbody").innerHTML = (jobs || []).map((j) => {
+      const cell = jobProgressCell(j);
+      return `
       <tr class="row" data-id="${j.id}">
         <td><span class="sw pill-${j.pill}"></span>${esc(j.mall_key)}</td>
         <td class="mono">#${j.id} · ${esc(String(j.task_name).slice(0, 18))}…</td>
         <td><span class="pill ${j.pill}">${j.pill === "ok" ? "✓" : j.pill === "err" ? "✕" :
           j.pill === "warn" ? "?" : "○"} ${esc(j.state_cn)}</span></td>
-        <td class="num">${j.subtasks ? j.subtasks.finished + " / " + j.subtasks.total : "—"}</td>
+        <td class="num${cell.cls ? " " + cell.cls : ""}">${esc(cell.text)}</td>
         <td class="num">${j.harvest_attempts} 次</td>
         <td class="num">${j.updated_at ? fmtAgo(j.updated_at) : "—"}</td>
-      </tr>`).join("");
+      </tr>`; }).join("");
     document.querySelectorAll("#jobs-table tr.row").forEach((tr) =>
       tr.addEventListener("click", () => openDrawer(tr.dataset.id, jobs)));
   }
@@ -197,20 +215,497 @@
     return finished + "/" + total;
   }
 
+  // ---- 本机受控操作台(2026-08-28)纯逻辑 seam(tests/js 直测,无 DOM) ----
+  // jobs[i].live_progress 形状(projection + progress probe):
+  //   {available, classification:"REMOTE_ACTIVE"|"REMOTE_TERMINAL"|"REMOTE_UNKNOWN"|null,
+  //    progress:{total,pending,running,failed,waiting_db,finished}|null,
+  //    observed_at, stale, conflict, error_code}
+  // 铁律:子任务进度绝不输出裸 "—",所有分支都必须可解释。
+  function jobProgressCell(job) {
+    const lp = (job && job.live_progress) || null;
+    const crawlTotal = Number((job && job.crawl_total) || 0);
+    if (lp && lp.conflict) return { text: "名称重复,无法安全确定", cls: "err-warn" };
+    if (lp && lp.available && lp.progress && Number(lp.progress.total) > 0) {
+      const total = Number(lp.progress.total);
+      const finished = Number(lp.progress.finished);
+      const failed = Number(lp.progress.failed || 0);
+      if (lp.classification === "REMOTE_TERMINAL") {
+        if (failed > 0) {
+          return { text: "⚠ " + (finished + failed) + "/" + total + "(失败 " + failed + ")", cls: "err-warn" };
+        }
+        return { text: "✓ " + finished + "/" + total, cls: "ok" };
+      }
+      return { text: finished + "/" + total, cls: "" };
+    }
+    if (lp && lp.available && !lp.progress) return { text: "远端进度暂不可用", cls: "err-warn" };
+    if (lp && !lp.available && lp.error_code && lp.error_code !== "PROBE_DISABLED") {
+      return { text: "远端进度暂不可用", cls: "err-warn" };
+    }
+    if (crawlTotal > 0) return { text: "含 " + crawlTotal + " 条采集", cls: "" };
+    return { text: "未开始", cls: "" };
+  }
+
+  const LP_CLASS_CN = { REMOTE_ACTIVE: "执行中", REMOTE_TERMINAL: "已结束", REMOTE_UNKNOWN: "未知" };
+  // Drawer 实时进度块的数据源(纯函数):conflict → 重复说明;不可用 → 占位 + 本地绑定数;
+  // 可用 → classification 中文 + 六行 breakdown + observed/stale + 汇总句。
+  function progressDetail(liveProgress, crawlTotal, nowMs) {
+    if (nowMs === undefined) nowMs = Date.now();
+    const lp = liveProgress || {};
+    const localTotal = Number(crawlTotal || 0);
+    if (lp.conflict) {
+      return { conflict: true, available: false, crawlTotal: localTotal,
+        text: "任务名称/批次号存在重复,无法安全确定远端任务" };
+    }
+    if (!lp.available || !lp.progress) {
+      return { conflict: false, available: false, crawlTotal: localTotal,
+        text: "远端进度暂不可用" };
+    }
+    const p = lp.progress;
+    const failed = Number(p.failed || 0);
+    const rows = [["总数", Number(p.total) || 0], ["已完成", Number(p.finished) || 0],
+      ["执行中", Number(p.running) || 0], ["待执行", Number(p.pending) || 0],
+      ["待入库", Number(p.waiting_db) || 0], ["失败", failed]];
+    let summary = "远端执行状态未知";
+    if (lp.classification === "REMOTE_TERMINAL") {
+      summary = failed > 0 ? "远端任务已结束,其中失败 " + failed + " 个子任务" : "远端任务已全部完成";
+    } else if (lp.classification === "REMOTE_ACTIVE") {
+      summary = "远端任务执行中";
+    }
+    const observedText = lp.observed_at
+      ? "最后远端进度 " + fmtAgoAt(lp.observed_at, nowMs) + (lp.stale ? "(缓存)" : "")
+      : "";
+    return {
+      conflict: false, available: true, crawlTotal: localTotal,
+      classCn: LP_CLASS_CN[lp.classification] || String(lp.classification || "未知"),
+      cls: lp.classification === "REMOTE_TERMINAL" ? "ok"
+        : (lp.classification === "REMOTE_ACTIVE" ? "run" : "wait"),
+      rows, observedText, summary,
+    };
+  }
+
+  // 阶段卡/输出位置的文件名防御:服务端已只发布文件名,若历史缓存仍带
+  // 完整路径(含 / 或 \),只显示最后一段,绝不撑坏布局。
+  function outputDisplayName(v) {
+    const s = String(v ?? "");
+    const cut = Math.max(s.lastIndexOf("/"), s.lastIndexOf("\\"));
+    return cut === -1 ? s : s.slice(cut + 1);
+  }
+
+  // ---- 操作结果文案映射(白名单;未知码原样透传由调用方 esc) ----
+  const ACTION_ERROR_TEXT = {
+    INVALID_ACTION_TOKEN: "操作令牌失效,请刷新页面",
+    INVALID_REMOTE_STATE: "该任务缺少可用的精确远端身份",
+    ACTION_IN_FLIGHT: "同类型操作正在执行,请等待其完成",
+  };
+  function _blockersSummary(outcome) {
+    const b = outcome && outcome.publication_blocked;
+    if (!b) return "";
+    if (typeof b === "string") return b;
+    if (Array.isArray(b)) return b.join("、");
+    if (typeof b === "object") {
+      if (Array.isArray(b.blockers)) return b.blockers.join("、");
+      return Object.keys(b).join("、");
+    }
+    return String(b);
+  }
+  function closeoutOutcomeText(oc) {
+    // 运行句柄带 result_code;durable 记录只带 {outcome, publication, publication_blocked},
+    // 与服务端 _closeout_result_code 同规则推导兜底。
+    let code = oc.result_code || "";
+    if (!code) {
+      const raw = String(oc.outcome || "");
+      if (raw === "ALREADY_FINALIZED" || raw === "ALREADY_RUNNING") code = raw;
+      else if (raw === "CLOSEOUT_DEADLINE") code = "DEADLINE";
+      else if (oc.publication) code = "FINALIZED";
+      else if (oc.publication_blocked) code = "BLOCKED";
+    }
+    if (code === "FINALIZED") return "✓ 最终 Excel 已生成";
+    if (code === "ALREADY_FINALIZED") return "今日已完成最终出表";
+    if (code === "ALREADY_RUNNING") return "已有生产 writer 正在运行,未启动第二个";
+    if (code === "DEADLINE") return "本轮收口到达时限,进度已保存,下一次调度继续";
+    if (code === "BLOCKED") return "暂时不能收口:" + (_blockersSummary(oc) || oc.outcome || "存在未清零阻塞");
+    return "收口失败:" + (code || oc.error || oc.outcome || "未知错误");
+  }
+  function reexportOutcomeText(oc) {
+    const code = oc.outcome || "";
+    if (code === "REEXPORT_COMPLETED") {
+      return "重新导出成功:导入 " + Number(oc.validated || oc.result_count || 0) + " 条结果";
+    }
+    if (code === "REEXPORT_COMPLETED_NO_RESULT") return "任务已完成,本次导出 0 条,可稍后重试";
+    if (code === "REEXPORT_STILL_RUNNING") return "招商局任务仍在执行,本次未取得最终导出";
+    if (code === "REEXPORT_MANUAL") return "导出进入人工诊断,请按人工恢复手册处理";
+    if (code === "REEXPORT_REJECTED") {
+      if (!oc.error_code || oc.error_code === "REMOTE_PROGRESS_UNKNOWN") return "无法确认远端进度,未执行导出";
+      return "重新导出被拒绝:" + oc.error_code;
+    }
+    return "重新导出未完成:" + (code || oc.error_code || "未知结果");
+  }
+  function rebuildOutcomeText(oc) {
+    const code = oc.outcome || "";
+    if (code === "REBUILD_DISPATCHED") return "重建完成:新任务 " + (oc.new_task_name || "") + " 已提交";
+    if (code === "REBUILD_QUEUED") return "重建完成:新任务已创建,等待调度提交";
+    if (code === "REBUILD_SUBMIT_UNKNOWN") return "重建已创建新任务,提交结果待系统自动对账";
+    if (code === "REBUILD_ALREADY_REPLACED") return "该任务已有替代任务,未重复重建";
+    if (code === "REBUILD_NOT_ALLOWED") return "当前状态不允许重建:" + (oc.reason || oc.error_code || "");
+    if (code === "REBUILD_REJECTED") return "重建被拒绝:" + (oc.error_code || oc.reason || "未知原因");
+    return "重建结果:" + (code || "未知结果");
+  }
+  function actionOutcomeText(actionType, result) {
+    if (!result) return "操作结果未知";
+    if (result.duplicate) return ACTION_ERROR_TEXT.ACTION_IN_FLIGHT;
+    if (result.error) {
+      const code = result.error.code || "";
+      if (code === "ACTION_IN_FLIGHT" && actionType === "closeout") return "收口已在进行中";
+      if (ACTION_ERROR_TEXT[code]) return ACTION_ERROR_TEXT[code];
+      return "操作失败:" + (code || ("HTTP " + result.error.status));
+    }
+    if (result.status === "TIMEOUT") return "操作仍在执行,结果请稍后在操作记录中查看";
+    const oc = result.outcome || {};
+    if (actionType === "closeout") return closeoutOutcomeText(oc);
+    if (actionType === "re-export") return reexportOutcomeText(oc);
+    if (actionType === "rebuild") return rebuildOutcomeText(oc);
+    return "操作完成";
+  }
+
+  // ---- action 客户端(纯逻辑 seam):受控写只能由用户点击触发,轮询仅存在于
+  // post() 内部;summary 轮询控制器(createPollController)绝不 POST。 ----
+  // deps: {token, fetchJson(url, opts)→{status, json}, pollIntervalMs=2000,
+  //        maxPolls=150, setTimeout, clearTimeout}
+  // post: 同 path 在途去重({duplicate:true});非 2xx → {error:{code,status}};
+  //       2xx(202)→自动轮询 poll 路径至非 RUNNING,超 maxPolls → {status:"TIMEOUT"}。
+  // refresh: 单次 POST,不轮询,2xx 直接返回响应 json。
+  function createActionClient(deps) {
+    const fetchJson = deps.fetchJson;
+    const pollIntervalMs = deps.pollIntervalMs == null ? 2000 : Number(deps.pollIntervalMs);
+    const maxPolls = deps.maxPolls == null ? 150 : Number(deps.maxPolls);
+    const token = String(deps.token || "");
+    const timers = {
+      setTimeout: deps.setTimeout || ((fn, ms) => setTimeout(fn, ms)),
+      clearTimeout: deps.clearTimeout || ((t) => clearTimeout(t)),
+    };
+    const inFlight = {};   // path → 进行中的 promise(同 path 重复点击直接 duplicate)
+    function actionHeaders() {
+      return { "X-Dashboard-Action-Token": token, "Content-Type": "application/json" };
+    }
+    function errorCode(json) {
+      return (json && json.detail && json.detail.error_code) || null;
+    }
+    function httpError(res) {
+      const status = res ? Number(res.status) : 0;
+      return { error: { code: errorCode(res && res.json) || ("HTTP_" + status), status } };
+    }
+    function sleep(ms) {
+      return new Promise((resolve) => { timers.setTimeout(resolve, ms); });
+    }
+    async function pollUntilDone(pollPath) {
+      for (let i = 0; i < maxPolls; i += 1) {
+        await sleep(pollIntervalMs);
+        const res = await fetchJson(pollPath, { method: "GET", headers: actionHeaders() });
+        if (!res || typeof res.status !== "number" || res.status < 200 || res.status >= 300) {
+          return httpError(res);
+        }
+        const data = res.json || {};
+        if (data.status && data.status !== "RUNNING") {
+          return { action_id: data.action_id, status: data.status, outcome: data.outcome };
+        }
+      }
+      return { status: "TIMEOUT" };
+    }
+    function post(path, body) {
+      if (inFlight[path]) return Promise.resolve({ duplicate: true });
+      const run = (async () => {
+        try {
+          const res = await fetchJson(path, { method: "POST", headers: actionHeaders(), body: JSON.stringify(body || {}) });
+          if (!res || typeof res.status !== "number" || res.status < 200 || res.status >= 300) {
+            return httpError(res);
+          }
+          const json = res.json || {};
+          if (!json.poll) return json;   // 同步结果(无轮询路径)
+          return await pollUntilDone(json.poll);
+        } finally {
+          delete inFlight[path];
+        }
+      })();
+      inFlight[path] = run;
+      return run;
+    }
+    async function refresh(path, body) {
+      const res = await fetchJson(path, { method: "POST", headers: actionHeaders(), body: JSON.stringify(body || {}) });
+      if (!res || typeof res.status !== "number" || res.status < 200 || res.status >= 300) {
+        return httpError(res);
+      }
+      return res.json || {};
+    }
+    return { post, refresh };
+  }
+
+  let drawerJob = null;
+
+  function renderLiveProgressBlock(statusDict, crawlTotal) {
+    const box = $("#drawer-live .lp-body");
+    if (!box) return;
+    const d = progressDetail(statusDict, crawlTotal);
+    if (d.conflict) {
+      box.innerHTML = `<p class="lp-warn">${esc(d.text)}</p>`;
+      return;
+    }
+    if (!d.available) {
+      box.innerHTML = `<p>${esc(d.text)}</p>` +
+        `<p class="lp-note">本地采集绑定数 ${Number(d.crawlTotal)}(非远端完成数)</p>`;
+      return;
+    }
+    box.innerHTML = `
+      <div class="lp-head"><span class="pill ${d.cls}">${esc(d.classCn)}</span>` +
+      (d.observedText ? `<span class="lp-ago">${esc(d.observedText)}</span>` : "") + `</div>
+      <div class="lp-rows">${d.rows.map(([k, v]) =>
+        `<div><span>${esc(k)}</span><span>${Number(v)}</span></div>`).join("")}</div>
+      <p class="lp-note">${esc(d.summary)}</p>`;
+  }
+
+  // ---- 操作按钮可用性(与后端门完全一致;不可用时禁用而非隐藏) ----
+  const REEXPORT_ALLOWED_STATES = ["SUBMITTED", "RUNNING", "EXPORTED", "MANUAL_REQUIRED", "RECOVERY_EXHAUSTED"];
+  const REBUILD_ALLOWED_STATES = ["SUBMITTED", "RUNNING", "EXPORTED", "RECOVERY_EXHAUSTED", "MANUAL_REQUIRED"];
+  function updateDrawerButtons() {
+    const j = drawerJob;
+    const hasIdentity = !!(j && j.remote_identity);
+    const state = j ? String(j.state || "") : "";
+    const superseded = !!(j && j.superseded_by);
+    const usable = !opsUnavailable;
+    const refreshBtn = $("#btn-refresh-progress");
+    const reexportBtn = $("#btn-reexport");
+    const rebuildBtn = $("#btn-rebuild");
+    if (refreshBtn) refreshBtn.disabled = !(usable && hasIdentity);
+    if (reexportBtn) reexportBtn.disabled = !(usable && hasIdentity && REEXPORT_ALLOWED_STATES.indexOf(state) !== -1);
+    if (rebuildBtn) rebuildBtn.disabled = !(usable && hasIdentity && REBUILD_ALLOWED_STATES.indexOf(state) !== -1 && !superseded);
+  }
+  function setBtnLoading(btn, loading, loadingText, normalText) {
+    if (!btn) return;
+    if (loading) { btn.disabled = true; btn.textContent = loadingText; }
+    else { btn.disabled = false; btn.textContent = normalText; }
+  }
+  function drawerActionStatus() { return $("#action-status"); }
+
   function openDrawer(id, jobs) {
     const j = jobs.find((x) => String(x.id) === String(id));
+    if (!j) return;
+    drawerJob = j;
     const tl = (window._timelines || {})[String(id)] || {};
     $("#drawer").classList.add("show");
     $("#drawer .kv").innerHTML = `
-      <b>任务编号</b><span class="mono">#${j.id} · ${esc(j.task_name)}</span>
+      <b>任务编号</b><span class="mono">#${j.id}</span>
+      <b>任务名称</b><span class="mono">${esc(j.task_name)}</span>
+      <b>批次号</b><span class="mono">${esc(j.task_name)}</span>
       <b>远端标识</b><span class="mono">${esc(j.remote_identity || "—")}</span>
       <b>当前状态</b><span>${esc(j.state_cn)}</span>
-      <b>采集轮次</b><span>harvest ${j.harvest_attempts} 次</span>
-      <b>恢复阶段</b><span>${esc(tl.phase || "—")}${tl.recovery_attempts > 0 ? " · 已执行 " + tl.recovery_attempts + " 次自动恢复" : ""}</span>
-      <b>子任务进度</b><span>${j.subtasks ? j.subtasks.finished + " / " + j.subtasks.total : "—"}</span>`;
+      <b>采集轮次</b><span>harvest ${Number(j.harvest_attempts)} 次</span>
+      <b>恢复阶段</b><span>${esc(tl.phase || "—")}${tl.recovery_attempts > 0 ? " · 已执行 " + tl.recovery_attempts + " 次自动恢复" : ""}</span>` +
+      (j.superseded_by
+        ? `<b>替代任务</b><span class="mono">已被人工重建替代 → 新任务 ${esc(j.superseded_by.new_task_name)}(新批次 ${esc(j.superseded_by.new_batch_number)})</span>`
+        : "");
+    renderLiveProgressBlock(j.live_progress, j.crawl_total);
+    const status = drawerActionStatus();
+    if (status) status.textContent = "";
+    hideRebuildConfirm();
+    updateDrawerButtons();
     $("#drawer .tl").innerHTML = (tl.observations || []).slice(-8).map((o) => `
       <li><time>${(() => { const d = new Date(o.observed_at); return isNaN(d) ? "—" : d.toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit", timeZone: "Asia/Shanghai" }); })()}</time>进度 ${safeProgressText(o.signature)} · 导出 ${o.export_count === 0 ? "无结果" : "有结果"}</li>`).join("");
     $("#drawer .note").textContent = "观察与探测不代表异常;“需要人工检查”需要人工介入;“自动恢复已用尽”已按无采集结果安全收口,无需人工处理。";
+    loadOpLog(j.id);
+  }
+
+  // ---- 操作记录(Drawer 底部;GET /dashboard/api/actions 的 recent 过滤本 job) ----
+  const OPLOG_TYPE_CN = { "re-export": "重新导出", reexport: "重新导出", manual_reexport: "重新导出", rebuild: "重建", closeout: "收口" };
+  function oplogOutcomeText(record) {
+    if (typeof record.outcome === "string" && record.outcome) return record.outcome;
+    if (record.outcome && typeof record.outcome === "object") {
+      return String(record.outcome.outcome || record.outcome.result_code || "");
+    }
+    return String(record.result_code || "");
+  }
+  async function loadOpLog(jobId) {
+    const ul = $("#drawer-oplog");
+    if (!ul) return;
+    const sec = ul.closest(".sec");
+    try {
+      const res = await fetch("/dashboard/api/actions");
+      if (!res.ok) throw new Error("HTTP " + res.status);
+      const data = await res.json();
+      const idStr = String(jobId);
+      const rows = ((data && data.recent) || []).filter((r) =>
+        String(r.remote_job_id || "") === idStr ||
+        String(r.old_remote_job_id || "") === idStr ||
+        String(r.target || "").endsWith(":" + idStr)).slice(0, 8);
+      ul.innerHTML = rows.map((r) => {
+        const d = new Date(r.recorded_at);
+        const time = isNaN(d) ? "" : d.toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" });
+        const typeCn = OPLOG_TYPE_CN[r.action_type] || esc(r.action_type);
+        return `<li><time>${esc(time)}</time>${typeCn} · ${esc(oplogOutcomeText(r))}</li>`;
+      }).join("");
+      if (sec) sec.style.display = rows.length ? "" : "none";
+    } catch (e) {
+      if (sec) sec.style.display = "none";   // 请求失败静默隐藏
+    }
+  }
+
+  // ---- operator-context 引导:拿 per-process 令牌;失败 → 操作按钮全部禁用 ----
+  let actionToken = null, businessDate = null, actionClient = null, opsUnavailable = false;
+  async function realFetchJson(url, opts) {
+    const res = await fetch(url, opts);
+    let json = null;
+    try { json = await res.json(); } catch (e) { json = null; }
+    return { status: res.status, json };
+  }
+  function getActionClient() { return opsUnavailable ? null : actionClient; }
+  async function bootstrapOperatorContext() {
+    try {
+      const res = await fetch("/dashboard/api/operator-context");
+      if (!res.ok) throw new Error("HTTP " + res.status);
+      const data = await res.json();
+      actionToken = data.action_token || "";
+      businessDate = data.business_date || "";
+      actionClient = createActionClient({
+        token: actionToken, fetchJson: realFetchJson,
+        setTimeout: (fn, ms) => setTimeout(fn, ms), clearTimeout: (t) => clearTimeout(t),
+      });
+    } catch (e) {
+      opsUnavailable = true;
+      const status = drawerActionStatus();
+      if (status) status.textContent = "操作台不可用";
+      const finalStatus = $("#closeout-status");
+      if (finalStatus) finalStatus.textContent = "操作台不可用";
+    }
+    updateDrawerButtons();
+  }
+
+  function hideRebuildConfirm() {
+    const panel = $("#rebuild-confirm");
+    if (panel) panel.style.display = "none";
+  }
+  function showRebuildConfirm() {
+    const j = drawerJob;
+    const panel = $("#rebuild-confirm");
+    if (!panel || !j) return;
+    panel.querySelector(".rc-text").textContent =
+      "即将停用当前招商局任务并创建新的替代任务。旧任务:" + j.task_name +
+      "。新任务名称和批次号将由系统自动生成(不会复用旧值),未完成的采集行将迁移到新任务。";
+    panel.style.display = "";
+  }
+
+  function wireOperatorButtons() {
+    const refreshBtn = $("#btn-refresh-progress");
+    if (refreshBtn) refreshBtn.addEventListener("click", async () => {
+      const j = drawerJob, st = drawerActionStatus();
+      if (!j || refreshBtn.disabled) return;
+      setBtnLoading(refreshBtn, true, "刷新任务进度…");
+      if (st) st.textContent = "";
+      try {
+        const client = getActionClient();
+        if (!client) { if (st) st.textContent = "操作台不可用"; return; }
+        const res = await client.refresh(`/dashboard/api/jobs/${j.id}/refresh-progress`, { business_date: businessDate });
+        if (res.error) {
+          if (st) st.textContent = ACTION_ERROR_TEXT[res.error.code] ||
+            ("刷新失败:" + (res.error.code || ("HTTP " + res.error.status)));
+          return;
+        }
+        if (res.rate_limited) {
+          if (st) st.textContent = "刷新过于频繁,请稍候";
+          return;
+        }
+        renderLiveProgressBlock(res, j.crawl_total);
+        if (st) st.textContent = "已刷新";
+      } catch (e) {
+        if (st) st.textContent = "刷新请求失败,请稍后重试";
+      } finally {
+        setBtnLoading(refreshBtn, false, null, "刷新任务进度");
+        updateDrawerButtons();
+      }
+    });
+
+    const reexportBtn = $("#btn-reexport");
+    if (reexportBtn) reexportBtn.addEventListener("click", async () => {
+      const j = drawerJob, st = drawerActionStatus();
+      if (!j || reexportBtn.disabled) return;
+      setBtnLoading(reexportBtn, true, "重新导出…");
+      if (st) st.textContent = "";
+      try {
+        const client = getActionClient();
+        if (!client) { if (st) st.textContent = "操作台不可用"; return; }
+        const res = await client.post(`/dashboard/api/jobs/${j.id}/re-export`, { business_date: businessDate });
+        if (st) st.textContent = actionOutcomeText("re-export", res);
+      } catch (e) {
+        if (st) st.textContent = "重新导出请求失败,请稍后重试";
+      } finally {
+        setBtnLoading(reexportBtn, false, null, "重新导出");
+        updateDrawerButtons();
+        ctl.run();
+        if (j) loadOpLog(j.id);
+      }
+    });
+
+    const rebuildBtn = $("#btn-rebuild");
+    if (rebuildBtn) rebuildBtn.addEventListener("click", () => {
+      if (!drawerJob || rebuildBtn.disabled) return;
+      const st = drawerActionStatus();
+      if (st) st.textContent = "";
+      showRebuildConfirm();   // 二次确认(内嵌面板,不用浏览器原生 confirm)
+    });
+    const rebuildOk = $("#btn-rebuild-ok");
+    if (rebuildOk) rebuildOk.addEventListener("click", async () => {
+      const j = drawerJob, st = drawerActionStatus();
+      if (!j) return;
+      hideRebuildConfirm();
+      setBtnLoading(rebuildBtn, true, "重建中…");
+      if (st) st.textContent = "";
+      try {
+        const client = getActionClient();
+        if (!client) { if (st) st.textContent = "操作台不可用"; return; }
+        const res = await client.post(`/dashboard/api/jobs/${j.id}/rebuild`, { business_date: businessDate, confirm: true });
+        if (st) st.textContent = actionOutcomeText("rebuild", res);
+        const oc = (res && res.outcome) || {};
+        if (res && !res.error && (oc.new_task_name || oc.outcome === "REBUILD_ALREADY_REPLACED")) {
+          // 本地即时降级为 superseded 视图,等下一次 summary 校正
+          j.superseded_by = j.superseded_by || {
+            new_task_name: oc.new_task_name || "", new_batch_number: oc.new_batch_number || "" };
+          j.state = "SUPERSEDED";
+        }
+      } catch (e) {
+        if (st) st.textContent = "重建请求失败,请稍后重试";
+      } finally {
+        setBtnLoading(rebuildBtn, false, null, "重建任务");
+        updateDrawerButtons();
+        ctl.run();
+        if (j) loadOpLog(j.id);
+      }
+    });
+    const rebuildCancel = $("#btn-rebuild-cancel");
+    if (rebuildCancel) rebuildCancel.addEventListener("click", hideRebuildConfirm);
+
+    const closeoutBtn = $("#closeout-btn");
+    if (closeoutBtn) closeoutBtn.addEventListener("click", async () => {
+      const st = $("#closeout-status");
+      if (closeoutBtn.disabled) return;   // 双击兜底(服务端 409 亦有 ACTION_IN_FLIGHT)
+      setBtnLoading(closeoutBtn, true, "收口中…");
+      if (st) st.textContent = "";
+      try {
+        const client = getActionClient();
+        if (!client) { if (st) st.textContent = "操作台不可用"; return; }
+        const res = await client.post("/dashboard/api/actions/closeout", { business_date: businessDate });
+        if (st) st.textContent = actionOutcomeText("closeout", res);
+      } catch (e) {
+        if (st) st.textContent = "收口请求失败,请稍后重试";
+      } finally {
+        setBtnLoading(closeoutBtn, false, null, "立即收口");
+        ctl.run();   // 完成后刷新一次 summary
+      }
+    });
+
+    const copyBtn = $("#copy-path");
+    if (copyBtn) copyBtn.addEventListener("click", () => {
+      const text = $("#final-output-path") ? $("#final-output-path").textContent : "";
+      if (text && navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text).catch(() => {});   // 复制失败静默
+      }
+    });
   }
   function renderTech(status) {
     $("#tech pre").textContent = JSON.stringify(status, null, 2);
@@ -466,13 +961,16 @@
     });
     const sfRefresh = $("#sf-refresh");
     if (sfRefresh) sfRefresh.addEventListener("click", () => fetchSaasFlow(true));
+    wireOperatorButtons();          // 受控操作按钮(唯一允许 POST 的入口)
+    bootstrapOperatorContext();     // 拿 per-process 操作令牌;失败 → 按钮禁用
     setInterval(updateLive, 1000);
     ctl.run();
     sfPoller.run();  // SaaS Flow 独立启动,不等 summary
   }
   const api = { start, stop: () => { ctl.stop(); sfPoller.stop(); },
     createPollController, createSaasFlowPoller, safeProgressText, sfPartialNotice,
-    sfTreeHtml, sfGrowthText };
+    sfTreeHtml, sfGrowthText, jobProgressCell, progressDetail, outputDisplayName,
+    createActionClient, actionOutcomeText };
   if (typeof window !== "undefined") { window.Dashboards = api; }
   if (typeof module !== "undefined" && module.exports) { module.exports = api; }
   if (typeof document !== "undefined") { document.addEventListener("DOMContentLoaded", start); }

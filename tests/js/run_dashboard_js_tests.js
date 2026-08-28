@@ -13,7 +13,8 @@
 // createSaasFlowPoller / safeProgressText。
 const path = require("path");
 const { createPollController, createSaasFlowPoller, safeProgressText, sfPartialNotice,
-        sfTreeHtml, sfGrowthText } = require(
+        sfTreeHtml, sfGrowthText, jobProgressCell, progressDetail, outputDisplayName,
+        createActionClient, actionOutcomeText } = require(
   path.join(__dirname, "..", "..", "app", "static", "dashboard", "app.js"));
 
 let failed = 0;
@@ -378,6 +379,194 @@ function test_r2_review_p1_3_parent_label_no_contradiction() {
         !html.includes("爬虫未回调"), html);
 }
 
+// ---- 本机受控操作台 UI(2026-08-28):进度单元格 / 实时进度 / 路径防御 / action 客户端 ----
+// live_progress 形状对齐 app/services/dashboard_projection.py + zhaoshang_progress_probe.py。
+
+function lpFixture(overrides) {
+  return Object.assign({
+    available: true, classification: "REMOTE_TERMINAL",
+    progress: { total: 18, pending: 0, running: 0, failed: 0, waiting_db: 0, finished: 18 },
+    observed_at: "2026-08-28T10:00:00Z", stale: false, conflict: false, error_code: null,
+  }, overrides || {});
+}
+
+function test_job_progress_cell() {
+  const cells = {
+    termOk: jobProgressCell({ live_progress: lpFixture(), crawl_total: 18 }),
+    termFail: jobProgressCell({ live_progress: lpFixture(
+      { progress: { total: 18, pending: 0, running: 0, failed: 1, waiting_db: 0, finished: 17 } }), crawl_total: 18 }),
+    active: jobProgressCell({ live_progress: lpFixture(
+      { classification: "REMOTE_ACTIVE",
+        progress: { total: 18, pending: 10, running: 3, failed: 0, waiting_db: 0, finished: 5 } }), crawl_total: 18 }),
+    nullProgress: jobProgressCell({ live_progress: lpFixture({ progress: null }), crawl_total: 3 }),
+    probeFailed: jobProgressCell({ live_progress: lpFixture(
+      { available: false, classification: null, progress: null, observed_at: null, error_code: "PROBE_FAILED" }),
+      crawl_total: 4 }),
+    probeDisabled: jobProgressCell({ live_progress: lpFixture(
+      { available: false, classification: null, progress: null, observed_at: null, error_code: "PROBE_DISABLED" }),
+      crawl_total: 18 }),
+    conflict: jobProgressCell({ live_progress: lpFixture(
+      { available: false, classification: null, progress: null, observed_at: null,
+        conflict: true, error_code: "TASK_BATCH_CONFLICT" }), crawl_total: 18 }),
+    notStarted: jobProgressCell({ live_progress: lpFixture(
+      { available: false, classification: null, progress: null, observed_at: null, error_code: "PROBE_DISABLED" }),
+      crawl_total: 0 }),
+  };
+  check("OPS TERMINAL 18/18 全成功", cells.termOk.text === "✓ 18/18", cells.termOk.text);
+  check("OPS TERMINAL 17+1 失败", cells.termFail.text === "⚠ 18/18(失败 1)", cells.termFail.text);
+  check("OPS ACTIVE 5/18", cells.active.text === "5/18", cells.active.text);
+  check("OPS available 但 progress null", cells.nullProgress.text === "远端进度暂不可用", cells.nullProgress.text);
+  check("OPS 非 PROBE_DISABLED 失败同样不可用", cells.probeFailed.text === "远端进度暂不可用", cells.probeFailed.text);
+  check("OPS PROBE_DISABLED+crawl_total 显示本地采集数", cells.probeDisabled.text === "含 18 条采集", cells.probeDisabled.text);
+  check("OPS conflict 重复文案", cells.conflict.text === "名称重复,无法安全确定", cells.conflict.text);
+  check("OPS 全都无 → 未开始", cells.notStarted.text === "未开始", cells.notStarted.text);
+  for (const key of Object.keys(cells)) {
+    check("OPS 进度格绝无裸 —:" + key, cells[key].text !== "—", cells[key].text);
+  }
+}
+
+function test_progress_detail() {
+  const lp = lpFixture({ progress: { total: 18, pending: 0, running: 0, failed: 1, waiting_db: 0, finished: 17 } });
+  const d = progressDetail(lp, 18, Date.parse("2026-08-28T10:00:05Z"));
+  check("OPS DETAIL 六行 breakdown 存在",
+        ["总数", "已完成", "执行中", "待执行", "待入库", "失败"]
+          .every((k) => d.rows.some(([rk]) => rk === k)), JSON.stringify(d.rows));
+  check("OPS DETAIL TERMINAL failed>0 含 失败 1",
+        d.rows.some(([k, v]) => k === "失败" && v === 1), JSON.stringify(d.rows));
+  check("OPS DETAIL 失败态不显示全成功文案", !d.summary.includes("全部完成"), d.summary);
+  check("OPS DETAIL classification 中文", d.classCn === "已结束", d.classCn);
+  check("OPS DETAIL observed X 秒前",
+        d.observedText.includes("最后远端进度") && d.observedText.includes("秒前"), d.observedText);
+  const staleD = progressDetail(Object.assign({}, lp, { stale: true }), 18, Date.parse("2026-08-28T10:00:05Z"));
+  check("OPS DETAIL stale 附缓存标记", staleD.observedText.includes("(缓存)"), staleD.observedText);
+  const conflictD = progressDetail(lpFixture(
+    { available: false, classification: null, progress: null, observed_at: null, conflict: true }), 5);
+  check("OPS DETAIL conflict 文案", conflictD.conflict && conflictD.text.includes("无法安全确定"), conflictD.text);
+  const unD = progressDetail(lpFixture(
+    { available: false, classification: null, progress: null, observed_at: null, error_code: "PROBE_DISABLED" }), 7);
+  check("OPS DETAIL 不可用文案", unD.text === "远端进度暂不可用" && !unD.available, unD.text);
+  check("OPS DETAIL 不可用附本地绑定数", unD.crawlTotal === 7, String(unD.crawlTotal));
+}
+
+function test_output_display_name() {
+  check("OPS PATH 反斜杠取最后一段",
+        outputDisplayName("E:\\a\\b\\saas_audit_final_20260828.xlsx") === "saas_audit_final_20260828.xlsx",
+        outputDisplayName("E:\\a\\b\\saas_audit_final_20260828.xlsx"));
+  check("OPS PATH 正斜杠取最后一段", outputDisplayName("/data/out/final.xlsx") === "final.xlsx");
+  check("OPS PATH 短名透传",
+        outputDisplayName("saas_audit_final_20260828.xlsx") === "saas_audit_final_20260828.xlsx");
+  check("OPS PATH 空值安全", outputDisplayName("") === "" && outputDisplayName(null) === "");
+}
+
+function immediateTimers() {
+  return { setTimeout: (fn) => { fn(); return 0; }, clearTimeout: () => {} };
+}
+
+async function test_action_client_post_dedup_and_poll() {
+  const calls = [];
+  const gates = [];
+  const fetchJson = (url, opts) => {
+    calls.push({ url, opts });
+    const d = deferred();
+    gates.push(d);
+    return d.promise;
+  };
+  const client = createActionClient(Object.assign({ token: "tok-1", fetchJson }, immediateTimers()));
+  const p1 = client.post("/dashboard/api/actions/closeout", {});
+  const p2 = client.post("/dashboard/api/actions/closeout", {});
+  check("OPS CLIENT 在途重复 post → duplicate:true", (await p2).duplicate === true);
+  check("OPS CLIENT 在途重复只发一次 fetch", calls.length === 1, String(calls.length));
+  await gates[0].resolve({ status: 202, json: { action_id: "a1", status: "RUNNING", poll: "/dashboard/api/actions/a1" } });
+  await flush();
+  await gates[1].resolve({ status: 200, json: { action_id: "a1", status: "RUNNING", outcome: null } });
+  await flush();
+  await gates[2].resolve({ status: 200, json: { action_id: "a1", status: "SUCCEEDED", outcome: { result_code: "FINALIZED" } } });
+  const res = await p1;
+  check("OPS CLIENT 轮询到 SUCCEEDED",
+        res.status === "SUCCEEDED" && res.outcome && res.outcome.result_code === "FINALIZED", JSON.stringify(res));
+  const pollCalls = calls.filter((c) => c.opts.method === "GET");
+  check("OPS CLIENT poll 恰好两次(RUNNING→SUCCEEDED)", pollCalls.length === 2, String(pollCalls.length));
+  // 完成后同一 path 可再次发起(in-flight 已清除)
+  const p3 = client.post("/dashboard/api/actions/closeout", {});
+  await flush();
+  await gates[3].resolve({ status: 409, json: { detail: { error_code: "ACTION_IN_FLIGHT" } } });
+  const r3 = await p3;
+  check("OPS CLIENT 完成后同 path 不再 duplicate",
+        r3.duplicate !== true && r3.error && r3.error.code === "ACTION_IN_FLIGHT", JSON.stringify(r3));
+}
+
+async function test_action_client_error_and_timeout() {
+  const fetch403 = async () => ({ status: 403, json: { detail: { error_code: "INVALID_ACTION_TOKEN" } } });
+  const client403 = createActionClient(Object.assign({ token: "t", fetchJson: fetch403 }, immediateTimers()));
+  const err = await client403.post("/dashboard/api/actions/closeout", {});
+  check("OPS CLIENT 非 2xx → error.code/status",
+        err.error && err.error.code === "INVALID_ACTION_TOKEN" && err.error.status === 403, JSON.stringify(err));
+  let polls = 0;
+  const fetchRunning = async (url, opts) => {
+    if (opts.method === "GET") { polls += 1; return { status: 200, json: { status: "RUNNING" } }; }
+    return { status: 202, json: { action_id: "a2", status: "RUNNING", poll: "/p" } };
+  };
+  const clientTimeout = createActionClient(
+    Object.assign({ token: "t", fetchJson: fetchRunning, maxPolls: 2 }, immediateTimers()));
+  const timed = await clientTimeout.post("/x", {});
+  check("OPS CLIENT 超时 maxPolls → TIMEOUT", timed.status === "TIMEOUT" && polls === 2,
+        JSON.stringify(timed) + " polls=" + polls);
+  let count = 0;
+  const fetchOnce = async () => { count += 1; return { status: 200, json: { available: true, job_id: 1 } }; };
+  const clientRefresh = createActionClient(Object.assign({ token: "t", fetchJson: fetchOnce }, immediateTimers()));
+  const r = await clientRefresh.refresh("/dashboard/api/jobs/1/refresh-progress", {});
+  check("OPS CLIENT refresh 单次不轮询", r.available === true && count === 1,
+        JSON.stringify(r) + " count=" + count);
+}
+
+async function test_action_client_headers() {
+  let seen = null;
+  const fetchJson = async (url, opts) => { seen = opts; return { status: 403, json: { detail: { error_code: "X" } } }; };
+  const client = createActionClient(Object.assign({ token: "tok-abc", fetchJson }, immediateTimers()));
+  await client.post("/dashboard/api/actions/closeout", {});
+  check("OPS CLIENT POST 头含 X-Dashboard-Action-Token",
+        seen && seen.headers["X-Dashboard-Action-Token"] === "tok-abc", JSON.stringify(seen && seen.headers));
+  check("OPS CLIENT POST 头含 Content-Type",
+        seen && seen.headers["Content-Type"] === "application/json", JSON.stringify(seen && seen.headers));
+}
+
+function test_action_outcome_text() {
+  check("OPS TEXT REEXPORT_COMPLETED 含条数",
+        actionOutcomeText("re-export", { status: "SUCCEEDED", outcome: { outcome: "REEXPORT_COMPLETED", validated: 18 } })
+          .includes("18 条"));
+  check("OPS TEXT REEXPORT_COMPLETED_NO_RESULT 文案",
+        actionOutcomeText("re-export", { status: "SUCCEEDED", outcome: { outcome: "REEXPORT_COMPLETED_NO_RESULT", validated: 0 } })
+          === "任务已完成,本次导出 0 条,可稍后重试");
+  check("OPS TEXT REEXPORT_STILL_RUNNING 文案",
+        actionOutcomeText("re-export", { status: "SUCCEEDED", outcome: { outcome: "REEXPORT_STILL_RUNNING" } })
+          === "招商局任务仍在执行,本次未取得最终导出");
+  check("OPS TEXT REJECTED+REMOTE_PROGRESS_UNKNOWN 文案",
+        actionOutcomeText("re-export", { status: "SUCCEEDED", outcome: { outcome: "REEXPORT_REJECTED", error_code: "REMOTE_PROGRESS_UNKNOWN" } })
+          === "无法确认远端进度,未执行导出");
+  check("OPS TEXT closeout BLOCKED 文案",
+        actionOutcomeText("closeout", { status: "SUCCEEDED", outcome: { result_code: "BLOCKED", publication_blocked: "remote_manual" } })
+          .includes("暂时不能收口"));
+  check("OPS TEXT closeout durable 记录(无 result_code)也推导 BLOCKED",
+        actionOutcomeText("closeout", { status: "SUCCEEDED", outcome: { outcome: "INCOMPLETE", publication_blocked: true } })
+          .includes("暂时不能收口"));
+  check("OPS TEXT closeout ALREADY_RUNNING 文案",
+        actionOutcomeText("closeout", { status: "SUCCEEDED", outcome: { result_code: "ALREADY_RUNNING" } })
+          .includes("未启动第二个"));
+  check("OPS TEXT closeout ALREADY_FINALIZED 文案",
+        actionOutcomeText("closeout", { status: "SUCCEEDED", outcome: { result_code: "ALREADY_FINALIZED" } })
+          .includes("今日已完成最终出表"));
+  check("OPS TEXT closeout FINALIZED 文案",
+        actionOutcomeText("closeout", { status: "SUCCEEDED", outcome: { result_code: "FINALIZED" } })
+          .includes("最终 Excel 已生成"));
+  check("OPS TEXT closeout DEADLINE 文案",
+        actionOutcomeText("closeout", { status: "SUCCEEDED", outcome: { result_code: "DEADLINE" } })
+          .includes("下一次调度继续"));
+  check("OPS TEXT closeout 409 ACTION_IN_FLIGHT 文案",
+        actionOutcomeText("closeout", { error: { code: "ACTION_IN_FLIGHT", status: 409 } }) === "收口已在进行中");
+  check("OPS TEXT closeout FAILED 附错误码",
+        actionOutcomeText("closeout", { status: "FAILED", outcome: { result_code: "FAILED" } }).includes("收口失败"));
+}
+
 (async () => {
   await test_304_keeps_sync_fresh_without_rerender();
   await test_hidden_pauses_and_visible_resumes();
@@ -393,6 +582,13 @@ function test_r2_review_p1_3_parent_label_no_contradiction() {
   test_sf_growth_after_cutoff_text_not_normal();
   test_r2_crawler_tree_uses_callback_evidence_labels();
   test_r2_review_p1_3_parent_label_no_contradiction();
+  test_job_progress_cell();
+  test_progress_detail();
+  test_output_display_name();
+  await test_action_client_post_dedup_and_poll();
+  await test_action_client_error_and_timeout();
+  await test_action_client_headers();
+  test_action_outcome_text();
   if (failed === 0) { console.log("ALL PASS"); process.exit(0); }
   console.error(failed + " failing checks");
   process.exit(1);

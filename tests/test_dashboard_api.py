@@ -242,3 +242,23 @@ def test_rf_probe_fault_containment_api_stays_200(client, monkeypatch):
         assert "scheduler" in body                # scheduler 块结构仍在
         sched = body["scheduler"]
         assert isinstance(sched.get("available"), bool)
+
+
+# ---- 本机受控操作台 UI(2026-08-28):前端静态契约 ----
+
+def test_operator_console_static_contract(client):
+    """操作台前端契约:布局防御 CSS + HTML hook + 操作令牌头;二次确认不用
+    window.confirm(浏览器原生 confirm),POST 渲染不依赖原生弹窗。"""
+    css = client.get("/dashboard/static/app.css").text
+    html = client.get("/dashboard").text
+    js = client.get("/dashboard/static/app.js").text
+    # 长路径/长标识折行防御(1100px 主容器与 860px 断点不溢出的 CSS 保证)
+    assert "overflow-wrap:anywhere" in css
+    assert "word-break" in css
+    # 操作台关键 hook(既有 hook 由 test_static_assets_served 覆盖,不在此重复)
+    for hook in ("closeout-btn", "final-output", "copy-path", "rebuild-confirm", "jobs-actions"):
+        assert hook in html, hook
+    # 受控写必须携带进程内操作令牌头
+    assert "X-Dashboard-Action-Token" in js
+    # 不得使用浏览器原生 confirm/alert 做二次确认/提示
+    assert "window.confirm" not in js and "window.alert" not in js
