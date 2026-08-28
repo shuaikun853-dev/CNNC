@@ -89,9 +89,38 @@ def test_detail_lock_is_shared_across_business_dates(tmp_path):
     assert first.detail_lock_path.parent == (tmp_path / "runtime").resolve()
 
 
+def _synthetic_project_data_root(base: Path) -> Path:
+    """Build a self-contained stand-in for the untracked production data/ root.
+
+    ``data/latest_*.curl``, ``data/detail_request.curl`` and ``data/model.env``
+    are gitignored local production inputs, so dependency-construction tests
+    inject this synthetic root through ``PROJECT_DATA_ROOT`` (the same module
+    global the runtime resolves at call time). The assertions below therefore
+    hold identically on machines that do carry the real data/.
+    """
+    root = base / "project" / "data"
+    root.mkdir(parents=True)
+    for name in (
+        "latest_saas_sameAudit_queryAll.curl",
+        "latest_cnnc_query.curl",
+        "detail_request.curl",
+    ):
+        (root / name).write_text(f"curl https://synthetic.invalid/{name}", encoding="utf-8")
+    (root / "model.env").write_text(
+        "TITLE_MATCH_MODEL_API_KEY=synthetic-key\n"
+        "TITLE_MATCH_MODEL_BASE_URL=https://synthetic.invalid/v1\n"
+        "TITLE_MATCH_MODEL_NAME=synthetic-model\n",
+        encoding="utf-8",
+    )
+    return root
+
+
 def test_project_resources_and_default_runtime_root_do_not_depend_on_cwd(
     tmp_path, monkeypatch
 ):
+    assert runtime_module.PROJECT_ROOT == Path(runtime_module.__file__).resolve().parents[2]
+    assert runtime_module.PROJECT_DATA_ROOT == runtime_module.PROJECT_ROOT / "data"
+
     cwd_data = tmp_path / "data"
     cwd_data.mkdir()
     for name in (
@@ -110,6 +139,9 @@ def test_project_resources_and_default_runtime_root_do_not_depend_on_cwd(
         monkeypatch.delenv(key, raising=False)
     monkeypatch.chdir(tmp_path)
 
+    synthetic_root = _synthetic_project_data_root(tmp_path)
+    monkeypatch.setattr(runtime_module, "PROJECT_DATA_ROOT", synthetic_root)
+
     captured = {}
 
     class SnapshotAdapterSpy:
@@ -126,22 +158,21 @@ def test_project_resources_and_default_runtime_root_do_not_depend_on_cwd(
 
     runtime_module.build_default_dependencies()
     expected_configuration = runtime_module._read_model_configuration(
-        runtime_module.PROJECT_DATA_ROOT / "model.env"
+        synthetic_root / "model.env"
     )
     actual_configuration = runtime_module._load_model_configuration()
     paths = runtime_paths("2026-08-11")
 
-    assert runtime_module.PROJECT_ROOT == Path(runtime_module.__file__).resolve().parents[2]
-    assert runtime_module.PROJECT_DATA_ROOT == runtime_module.PROJECT_ROOT / "data"
     assert captured == {
-        "saas": runtime_module.PROJECT_DATA_ROOT / "latest_saas_sameAudit_queryAll.curl",
-        "cnnc": runtime_module.PROJECT_DATA_ROOT / "latest_cnnc_query.curl",
-        "detail": runtime_module.PROJECT_DATA_ROOT / "detail_request.curl",
+        "saas": synthetic_root / "latest_saas_sameAudit_queryAll.curl",
+        "cnnc": synthetic_root / "latest_cnnc_query.curl",
+        "detail": synthetic_root / "detail_request.curl",
     }
     assert all(
         actual_configuration.get(key) == expected_configuration.get(key)
         for key in runtime_module._MODEL_CONFIGURATION_KEYS
     )
+    assert actual_configuration["TITLE_MATCH_MODEL_NAME"] == "synthetic-model"
     assert actual_configuration["TITLE_MATCH_MODEL_NAME"] != "cwd-model"
     assert paths.run_dir == (
         runtime_module.PROJECT_ROOT
@@ -155,6 +186,13 @@ def test_finalize_dependency_construction_from_non_project_cwd_is_offline(
     tmp_path, monkeypatch
 ):
     monkeypatch.chdir(tmp_path)
+    for key in runtime_module._MODEL_CONFIGURATION_KEYS:
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setattr(
+        runtime_module,
+        "PROJECT_DATA_ROOT",
+        _synthetic_project_data_root(tmp_path),
+    )
     monkeypatch.setattr(
         runtime_module,
         "run_incremental_tick",

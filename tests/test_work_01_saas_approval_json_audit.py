@@ -35,6 +35,7 @@ from scripts.audit_saas_excel_file import (
     load_zhaoshang_auth_env_from_export_curl,
 )
 from scripts.curl_utils import internal_subprocess_env, parse_curl_command
+from scripts.zhaoshang_mall_mapping import ZhaoshangMallMapping
 
 
 SAMPLE = {
@@ -2789,6 +2790,27 @@ class TestExcludedTemplateAutoExport:
         """双 JSON 模式 run_main 会在解析前自动生成京东+震坤行模板。"""
         # 该用例需启用导出
         monkeypatch.delenv("AUDIT_SUPPRESS_EXCLUDED_EXPORT", raising=False)
+        # 商城映射表（商城sourceId映射表/商城sourceId映射表.xlsx）是 gitignored
+        # 的本地生产输入；注入结构等价的合成映射后，本用例在任何机器上都成立。
+        monkeypatch.setattr(
+            "scripts.export_excluded_malls.EXCLUDED_MALLS",
+            [
+                ZhaoshangMallMapping(
+                    mall_name="京东",
+                    source_id="3",
+                    mall_key="jd",
+                    domains=("www.jd.com", "jd.com", "item.jd.com"),
+                    vendor_keywords=("jd", "京东"),
+                ),
+                ZhaoshangMallMapping(
+                    mall_name="震坤行商城",
+                    source_id="18",
+                    mall_key="zkh",
+                    domains=("www.zkh.com", "zkh.com"),
+                    vendor_keywords=("zkh", "震坤行商城"),
+                ),
+            ],
+        )
         # 准备含京东 + 震坤行的 saas 行
         rows = [
             {**SAMPLE_SAAS_PENDING_ROW, "vCommodityId": "v-jd",

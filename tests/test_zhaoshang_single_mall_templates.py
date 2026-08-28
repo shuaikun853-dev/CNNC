@@ -7,6 +7,7 @@ import pytest
 from openpyxl import Workbook, load_workbook
 
 from scripts.export_excluded_malls import export_excluded_templates
+from scripts.zhaoshang_mall_mapping import ZhaoshangMallMapping
 
 
 EXTERNAL_TOOL = Path(
@@ -62,7 +63,30 @@ def test_single_mall_template_rejects_url_without_product_code(tmp_path):
         module.read_subtasks_from_excel(template, "haoxiny")
 
 
-def test_lxwl_templates_prefer_url_domain_over_shared_vendor_keyword(tmp_path):
+def test_lxwl_templates_prefer_url_domain_over_shared_vendor_keyword(tmp_path, monkeypatch):
+    # 商城映射表（商城sourceId映射表/商城sourceId映射表.xlsx）是 gitignored
+    # 的本地生产输入；注入结构等价的合成映射。两行共用厂商名“领先未来商城”
+    # （命中 lxwl 的厂商关键字），若按厂商关键字匹配会全部落入“领先未来商城”，
+    # 断言要求按 URL 域名分别路由到两个商城，在任何机器上都成立。
+    monkeypatch.setattr(
+        "scripts.export_excluded_malls.EXCLUDED_MALLS",
+        [
+            ZhaoshangMallMapping(
+                mall_name="领先未来商城",
+                source_id="34",
+                mall_key="lxwl",
+                domains=("www.66123123.com", "66123123.com"),
+                vendor_keywords=("lxwl", "领先未来商城"),
+            ),
+            ZhaoshangMallMapping(
+                mall_name="领先未来新商城",
+                source_id="83",
+                mall_key="lxwlmall",
+                domains=("www.lxwlmall.com", "lxwlmall.com"),
+                vendor_keywords=("lxwlmall", "领先未来新商城"),
+            ),
+        ],
+    )
     source = tmp_path / "saas.json"
     source.write_text(
         json.dumps(
