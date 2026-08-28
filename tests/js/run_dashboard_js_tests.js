@@ -12,7 +12,8 @@
 // 被测对象:app/static/dashboard/app.js 暴露的 createPollController /
 // createSaasFlowPoller / safeProgressText。
 const path = require("path");
-const { createPollController, createSaasFlowPoller, safeProgressText, sfPartialNotice } = require(
+const { createPollController, createSaasFlowPoller, safeProgressText, sfPartialNotice,
+        sfTreeHtml, sfGrowthText } = require(
   path.join(__dirname, "..", "..", "app", "static", "dashboard", "app.js"));
 
 let failed = 0;
@@ -277,6 +278,49 @@ function test_sf_partial_notice_three_states() {
         !sfPartialNotice(["x"], []).includes(":;"));
 }
 
+// ---- UI/Contract Hotfix 2026-08-28:P1 路由证据不足可见 / P2-1 AFTER_CUTOFF 文案 ----
+
+function sfStagesFixture() {
+  return {
+    crawl_status_available: true,
+    pool_counts_available: true,
+    snapshot_consistent: true,
+    snapshot_drift: [],
+    pool_scope_total: 5, not_closed: 5,
+    routing_open_total: 5,
+    no_commodity_list: 0,
+    crawl_status_1: 1, crawl_status_2: 1, crawl_status_other: 0,
+    routing_evidence_incomplete: 3,
+    grace_seconds: 1800,
+    crawler_branch: { TASK_NOT_CREATED: 1 },
+    downstream_branch: { CALLBACK_DONE_NO_SEARCH: 1 },
+  };
+}
+
+function test_sf_tree_shows_routing_evidence_incomplete() {
+  const html = sfTreeHtml(sfStagesFixture());
+  const head = html.slice(0, html.indexOf("</div>"));  // routing 文案所在的头部行
+  check("P1 routing_evidence_incomplete=3 时阶段树必须可见该分类与数量",
+        html.includes("路由证据不足") && html.includes("3"), html);
+  check("P1 文案必须体现证据不足语义(同商品存在多条采集记录/无法可靠确定当前记录)",
+        head.includes("同商品存在多条采集记录") || head.includes("无法可靠确定"), head);
+  check("P1 不得把 3 加进正常分支计数",
+        html.includes("爬虫未回调:1") && html.includes("爬虫已回调:1") &&
+        !html.includes("爬虫未回调:4") && !html.includes("爬虫已回调:4"), html);
+  check("P1 routing 文案不得误标为系统错误/数据丢失/爬虫失败/未生成任务",
+        !head.includes("系统错误") && !head.includes("数据丢失") &&
+        !head.includes("爬虫失败") && !head.includes("未生成任务"), head);
+  const zero = sfTreeHtml(Object.assign(sfStagesFixture(), { routing_evidence_incomplete: 0 }));
+  check("P1 数量为 0 时不额外突出", !zero.includes("路由证据不足"), zero);
+}
+
+function test_sf_growth_after_cutoff_text_not_normal() {
+  const text = sfGrowthText({ evaluation_reason: "AFTER_CUTOFF", evaluated: false, state: "NORMAL" });
+  check("P2-1 AFTER_CUTOFF 文案表达不评估",
+        text.includes("不评估") || text.includes("不再评估"), text);
+  check("P2-1 AFTER_CUTOFF 文案不得包含「正常」", !text.includes("正常"), text);
+}
+
 (async () => {
   await test_304_keeps_sync_fresh_without_rerender();
   await test_hidden_pauses_and_visible_resumes();
@@ -288,6 +332,8 @@ function test_sf_partial_notice_three_states() {
   await test_sf_hidden_pauses_and_visible_resumes();
   await test_sf_inflight_dedup();
   test_sf_partial_notice_three_states();
+  test_sf_tree_shows_routing_evidence_incomplete();
+  test_sf_growth_after_cutoff_text_not_normal();
   if (failed === 0) { console.log("ALL PASS"); process.exit(0); }
   console.error(failed + " failing checks");
   process.exit(1);

@@ -298,7 +298,8 @@
   const SF_REASON_LABELS = {
     NO_OBSERVATIONS: "暂无权威观察",
     INSUFFICIENT_OBSERVATIONS: "观察次数不足(需至少两次)",
-    AFTER_CUTOFF: "正常(18:00 后不评估)",
+    // UI Hotfix P2-1:evaluated=false,不能显示成"正常";只表达不评估
+    AFTER_CUTOFF: "18:00 后不再评估",
     OBSERVATION_READ_FAILED: "权威观察读取失败",
   };
 
@@ -397,11 +398,18 @@
         Math.round((stages.grace_seconds || 0) / 60) + " 分钟)内" : "";
     // Review P1-6:SQL 池计数不是权威客户计数,只称"当日商品池记录";
     // 权威客户/SaaS 数量只来自 growth.customer_count / growth.saas_count。
+    // UI Hotfix P1:routing_evidence_incomplete 是 fail-safe 证据分类(同一商品
+    // 多条 commodity_list、无法可靠选择 current row),不是业务故障;数量 > 0
+    // 必须可见,且不得计入 crawl_status_1/2 或正常分支。
     const head = "当日商品池记录:" +
       (stages.pool_counts_available === false ? "不可用" : Number(stages.pool_scope_total || 0)) +
       " · 未最终收口:" +
       (stages.not_closed == null ? "不可用" : Number(stages.not_closed)) +
-      (stages.no_commodity_list ? " · 未进入采集列表:" + Number(stages.no_commodity_list) : "");
+      (stages.no_commodity_list ? " · 未进入采集列表:" + Number(stages.no_commodity_list) : "") +
+      (stages.routing_evidence_incomplete
+        ? " · 路由证据不足(同商品存在多条采集记录,无法可靠确定当前记录):" +
+          Number(stages.routing_evidence_incomplete)
+        : "");
     const crawlerHtml = stages.crawler_branch === null
       ? '<li class="bf">├─ 爬虫未回调:' + (drift.includes("crawler_branch") ? esc(driftNote) : "本轮不可用") + "</li>"
       : '<li class="bf">├─ 爬虫未回调:' + Number(stages.crawl_status_1 || 0) + "<ul>" +
@@ -461,7 +469,8 @@
     sfPoller.run();  // SaaS Flow 独立启动,不等 summary
   }
   const api = { start, stop: () => { ctl.stop(); sfPoller.stop(); },
-    createPollController, createSaasFlowPoller, safeProgressText, sfPartialNotice };
+    createPollController, createSaasFlowPoller, safeProgressText, sfPartialNotice,
+    sfTreeHtml, sfGrowthText };
   if (typeof window !== "undefined") { window.Dashboards = api; }
   if (typeof module !== "undefined" && module.exports) { module.exports = api; }
   if (typeof document !== "undefined") { document.addEventListener("DOMContentLoaded", start); }
