@@ -380,18 +380,19 @@ _SCHEDULER_CACHE_SECONDS = 30.0
 _scheduler_cache: dict = {"at": 0.0, "value": None}
 
 
-def _run_scheduler_probe() -> dict | None:
-    """Read-only PowerShell Get-ScheduledTask/Get-ScheduledTaskInfo JSON probe."""
+def _scheduler_probe_command() -> list[str]:
+    """生产探针完整命令(文本唯一权威来源;LastTaskResult 为 UInt32,必须 [int64] 承载防 Int32 溢出)。"""
     cmd = ["powershell", "-NoProfile", "-Command",
            "$t = Get-ScheduledTask -TaskName 'CNNC-PriceAudit-Incremental' -ErrorAction SilentlyContinue; "
            "if (-not $t) { Write-Output '{}' ; exit 0 }; "
            "$i = Get-ScheduledTaskInfo -TaskName $t.TaskName -ErrorAction SilentlyContinue; "
            "[pscustomobject]@{ state = [string]$t.State; last_run = [string]$i.LastRunTime; "
            "last_result = if ($i) { [int64]$i.LastTaskResult } else { -1 }; next_run = [string]$i.NextRunTime } | ConvertTo-Json -Compress"]
-    try:
-        proc = _subprocess.run(cmd, capture_output=True, timeout=10, check=False)
-    except (OSError, _subprocess.TimeoutExpired):
-        return None
+    return cmd
+
+
+def _decode_scheduler_probe(proc: _subprocess.CompletedProcess) -> dict | None:
+    """按生产规则解码探针子进程:rc 非 0 / 空 stdout / 坏 JSON 一律按探针失败返回 None。"""
     if proc.returncode != 0 or not proc.stdout:
         return None
     try:
@@ -399,6 +400,16 @@ def _run_scheduler_probe() -> dict | None:
     except (ValueError, TypeError):
         return None
     return data or None
+
+
+def _run_scheduler_probe() -> dict | None:
+    """Read-only PowerShell Get-ScheduledTask/Get-ScheduledTaskInfo JSON probe."""
+    try:
+        proc = _subprocess.run(_scheduler_probe_command(),
+                               capture_output=True, timeout=10, check=False)
+    except (OSError, _subprocess.TimeoutExpired):
+        return None
+    return _decode_scheduler_probe(proc)
 
 
 def project_scheduler_status() -> dict:

@@ -327,7 +327,7 @@ def test_rf_probe_bad_last_result_keeps_running_state_truth(monkeypatch):
 def test_scheduler_probe_source_no_int32_cast():
     import inspect
     import app.services.dashboard_projection as dp
-    src = inspect.getsource(dp._run_scheduler_probe)
+    src = inspect.getsource(dp._scheduler_probe_command)
     assert "[int64]" in src, "探针必须用 [int64] 承载 UInt32 结果码"
     assert "[int]" not in src.replace("[int64]", ""), "不得残留 Int32 强转(会溢出)"
 
