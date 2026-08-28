@@ -232,6 +232,7 @@ def _empty_counters() -> dict[str, int]:
         "crawl_submitted": 0, "crawl_harvested": 0, "submit_unknown": 0, "crawl_running": 0,
         "harvest_batches": 0, "harvest_swept": 0, "submit_paused": 0, "submit_not_attempted": 0,
         "customer_count": 0, "saas_count": 0, "source_count_gap": 0,
+        "customer_matched": 0, "customer_matched_no_category": 0, "customer_not_found": 0,
     }
 
 
@@ -1393,6 +1394,22 @@ def run_incremental_tick(
                     counters["customer_count"] = customer_count
                 if valid_saas_count and valid_customer_count:
                     counters["source_count_gap"] = customer_count - saas_count
+                # Read-only join-quality counters (PHASE D).  The join
+                # deliberately allows NOT_FOUND rows, so these are recorded
+                # for observability only — they never participate in the
+                # freeze decision below (F-P1-3 hard gate stays deferred).
+                for counter_key in (
+                    "customer_matched",
+                    "customer_matched_no_category",
+                    "customer_not_found",
+                ):
+                    raw_lookup_count = evidence.get(counter_key)
+                    if (
+                        isinstance(raw_lookup_count, int)
+                        and not isinstance(raw_lookup_count, bool)
+                        and raw_lookup_count >= 0
+                    ):
+                        counters[counter_key] = raw_lookup_count
                 if (
                     valid_saas_count
                     and int(snapshot["row_count"]) == saas_count

@@ -6,6 +6,7 @@ import json
 import os
 import sqlite3
 import time
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Iterable
@@ -121,6 +122,7 @@ def _empty_status(
         },
         "lease": {"active": False, "stale": False, "expires_at": None},
         "remote_health": evaluate_remote_stall([]),
+        "source_completeness": _source_completeness({}),
         "production_writer": production_writer,
         "next_actions": ["run a shadow tick to create today's durable state"],
     }
@@ -175,6 +177,45 @@ def _stage_status(connection: sqlite3.Connection, snapshot_id: int, stage: str, 
         "terminal": states.get("TERMINAL_FAILED", 0),
         "attempts": sum(int(row["attempts"]) for row in rows),
     }
+
+
+def _source_completeness(metrics: Mapping[str, Any]) -> dict[str, Any]:
+    """Read-only join-quality diagnostics from the persisted daily metrics.
+
+    ``customer_count == saas_count`` is NOT a business invariant: the SaaS->
+    customer join deliberately allows NOT_FOUND rows, so this section only
+    makes the gap observable (PHASE D).  It is pure diagnosis — it never
+    feeds ``_next_actions``, the overall status, or any freeze gate
+    (F-P1-3 hard gate deferred).  Rates are percentages rounded to 2 decimals
+    and stay ``None`` while there is no positive ``saas_count`` denominator.
+    """
+
+    def metric_int(key: str) -> int:
+        value = metrics.get(key)
+        if value is None or isinstance(value, bool):
+            return 0
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return 0
+
+    saas_count = metric_int("saas_count")
+    customer_matched = metric_int("customer_matched")
+    customer_not_found = metric_int("customer_not_found")
+    completeness: dict[str, Any] = {
+        "saas_count": saas_count,
+        "customer_count": metric_int("customer_count"),
+        "source_count_gap": metric_int("source_count_gap"),
+        "customer_matched": customer_matched,
+        "customer_matched_no_category": metric_int("customer_matched_no_category"),
+        "customer_not_found": customer_not_found,
+        "customer_match_rate": None,
+        "customer_not_found_rate": None,
+    }
+    if saas_count > 0:
+        completeness["customer_match_rate"] = round(customer_matched * 100 / saas_count, 2)
+        completeness["customer_not_found_rate"] = round(customer_not_found * 100 / saas_count, 2)
+    return completeness
 
 
 def _next_actions(status: dict[str, Any]) -> list[str]:
@@ -436,6 +477,9 @@ def collect_runtime_status(
         },
         "production_writer": production_writer,
         "metrics": metrics,
+        # Read-only diagnostics derived from metrics above; never part of the
+        # overall state computation.
+        "source_completeness": _source_completeness(metrics),
     }
     status["next_actions"] = _next_actions(status)
     return status
@@ -523,6 +567,33 @@ def runtime_doctor(
     ):
         script = root / "scripts" / name
         add(f"scheduler_script_{name}", script.is_file(), required=False, detail=str(script))
+
+    try:
+        from app.services.scheduler_drift import check_scheduler_drift
+
+        drift_report = check_scheduler_drift(root, enable_remote_writes=enable_remote_writes)
+    except Exception as exc:  # read-only diagnostics must never take doctor down
+        add("scheduler_config_drift", True, required=False, detail=f"check unavailable: {type(exc).__name__}")
+    else:
+        if drift_report.get("live_task_missing"):
+            add(
+                "scheduler_config_drift",
+                True,
+                required=False,
+                detail="live scheduled task not present on this machine; drift comparison skipped",
+            )
+        else:
+            drift_items = list(drift_report.get("drift") or [])
+            add(
+                "scheduler_config_drift",
+                not drift_items,
+                required=False,
+                detail=(
+                    "SCHEDULER_CONFIG_MATCH=true"
+                    if not drift_items
+                    else "SCHEDULER_CONFIG_MATCH=false; " + "; ".join(drift_items)
+                ),
+            )
 
     if paths.state_path.is_file():
         try:

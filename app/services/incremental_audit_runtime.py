@@ -955,6 +955,15 @@ def snapshot_discoverer(
             customer_fingerprint(customer.get(normalize_cell_str(row.get("vCommodityId")), {}))
             for row in saas_rows
         ]
+        # Read-only source-completeness diagnostics: the join deliberately
+        # allows NOT_FOUND rows (customer_count == saas_count is NOT a
+        # business invariant), so the per-status counts make the join quality
+        # observable downstream without gating anything.
+        lookup_status_counts = {"MATCHED": 0, "MATCHED_NO_CATEGORY": 0, "NOT_FOUND": 0}
+        for joined_row in joined:
+            lookup_status = str(joined_row.get("customer_lookup_status") or "")
+            if lookup_status in lookup_status_counts:
+                lookup_status_counts[lookup_status] += 1
         return DiscoveredState(
             observed_at=snapshot.observed_at_utc,
             headers=SAAS_PENDING_HEADERS,
@@ -966,6 +975,10 @@ def snapshot_discoverer(
                 "source_label": snapshot.source_label or "",
                 "saas_count": snapshot.saas_count,
                 "customer_count": snapshot.customer_count,
+                "saas_rows": len(saas_rows),
+                "customer_matched": lookup_status_counts["MATCHED"],
+                "customer_matched_no_category": lookup_status_counts["MATCHED_NO_CATEGORY"],
+                "customer_not_found": lookup_status_counts["NOT_FOUND"],
                 "pages": [evidence.__dict__ for evidence in snapshot.page_evidence],
             },
         )
