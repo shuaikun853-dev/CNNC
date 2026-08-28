@@ -235,20 +235,23 @@ def test_connect_failure_degrades_to_unavailable_without_credentials():
 
 
 def test_single_query_failure_yields_partial_not_total_outage():
-    def central_raises(params):
-        raise RuntimeError("central query failed")
+    def spider_raises(params):
+        raise RuntimeError("spider query failed")
 
     service, executed, _ = make_service({
         "pool_sync_standard_counts": [("0", 3)],
         "open_crawl_status_counts": [(3, 0, 1, 2, 0)],
         "crawl1_commodity_rows": [(11, "C1")],
         "crawl1_task_rows": [(11, "SAAS-188605_701_1", 1)],
-        "crawl1_central_rows": central_raises,
+        "crawl1_spider_task_rows": spider_raises,
         "crawl2_search_flags": [],
     })
     payload = service.get_diagnostic("2026-08-27")
     assert payload["status"] == "partial"
-    assert "crawl1_central_rows" in payload["degraded_queries"]
+    assert "crawl1_spider_task_rows" in payload["degraded_queries"]
+    # spider 失败 → 商品级证据不足,不得冒充"未发现推送记录"
+    assert payload["stages"]["crawler_branch"]["EVIDENCE_INCOMPLETE"] == 1
+    assert payload["stages"]["crawler_branch"]["PUSH_RECORD_NOT_FOUND"] == 0
     # 其他查询的分类照常返回
     assert payload["stages"]["crawl_status_1"] == 1
     assert payload["stages"]["crawl_status_2"] == 2
@@ -335,7 +338,9 @@ FULL_CANNED = {
     "open_crawl_status_counts": [(4, 0, 1, 3, 0)],
     "crawl1_commodity_rows": [(11, "C1")],
     "crawl1_task_rows": [(11, "SAAS-188605_701_1", 1)],
-    "crawl1_central_rows": [("188605_701", "00", "00", None, None)],
+    # R2:task → batch(188605_701) → spider 推送记录(is_call=0) → callback 在途
+    "crawl1_spider_task_rows": [("188605_701", "E1", 0)],
+    "crawl1_callback_rows": [("E1", "8888", "active")],
     # 列:commodity_list_id, search_rows, pool_created_at, model_pending,
     #     has_internet_same, internet_pending_approval, same_approved,
     #     approval_non_same_exists, has_reference_same, has_internet_candidate,
@@ -358,7 +363,7 @@ def test_crawl_status_routes_into_separate_branches():
     assert sum(stages["crawler_branch"].values()) == 1
     # crawl_status=2 商品只进入 downstream branch
     assert sum(stages["downstream_branch"].values()) == 3
-    assert stages["crawler_branch"]["CENTRAL_NOT_ENQUEUED"] == 1
+    assert stages["crawler_branch"]["CALLBACK_IN_FLIGHT"] == 1
     assert stages["downstream_branch"]["CALLBACK_DONE_NO_SEARCH"] == 1
     assert stages["downstream_branch"]["INTERNET_SAME_PENDING_APPROVAL"] == 1
     assert stages["downstream_branch"]["INTERNET_CANDIDATES_ALL_NON_SAME"] == 1
@@ -385,68 +390,182 @@ def test_open_commodities_without_commodity_list_are_reported():
 
 
 # ---------------------------------------------------------------------------
-# D. crawler branch 分类(crawl_status=1)
+# D. crawler branch 分类(R2 callback 证据链,crawl_status=1)
 # ---------------------------------------------------------------------------
 
-def central(*rows):
-    return [dict(zip(("task_status", "queue_status", "enqueue_time", "end_time"), row)) for row in rows]
+def item_record(**kw):
+    """classify_crawler_callback 的标准输入;默认给出一条健康在途证据。"""
+    base = {
+        "task_count": 1,
+        "task_failed": False,
+        "malformed": False,
+        "batches": {"B1"},
+        "spider_failed": False,
+        "spider_rows": [{"batch_num": "B1", "exe_number": "E1", "is_call": 0}],
+        "callback_failed": False,
+        "callback_rows": [{"execution_number": "E1", "push_state": "8888",
+                           "callback_source": "active"}],
+        "exes_truncated": False,
+    }
+    base.update(kw)
+    return base
 
 
-def test_task_not_created():
-    assert diag.classify_crawler_branch({"task_count": 0, "central": []}) == "TASK_NOT_CREATED"
+def test_classify_task_not_created():
+    assert diag.classify_crawler_callback(
+        item_record(task_count=0, batches=set(), spider_rows=[],
+                    callback_rows=[])) == "TASK_NOT_CREATED"
 
 
-def test_task_created_no_central_record():
-    record = {"task_count": 3, "central": []}
-    assert diag.classify_crawler_branch(record) == "TASK_CREATED_NO_CENTRAL_RECORD"
+def test_classify_task_query_failure_is_evidence_incomplete():
+    assert diag.classify_crawler_callback(item_record(task_failed=True)) == \
+        "EVIDENCE_INCOMPLETE"
 
 
-def test_central_not_enqueued():
-    record = {"task_count": 2, "central": central(("00", "00", None, None), ("00", "00", None, None))}
-    assert diag.classify_crawler_branch(record) == "CENTRAL_NOT_ENQUEUED"
+def test_classify_malformed_task_id_is_evidence_incomplete():
+    assert diag.classify_crawler_callback(item_record(malformed=True)) == \
+        "EVIDENCE_INCOMPLETE"
 
 
-def test_central_enqueued_waiting():
-    record = {"task_count": 2, "central": central(("00", "01", "2026-08-27 08:00:00", None))}
-    assert diag.classify_crawler_branch(record) == "CENTRAL_ENQUEUED_WAITING"
+def test_classify_spider_failure_is_evidence_incomplete():
+    assert diag.classify_crawler_callback(item_record(spider_failed=True)) == \
+        "EVIDENCE_INCOMPLETE"
 
 
-def test_crawler_executing():
-    record = {"task_count": 2, "central": central(("01", "02", "2026-08-27 08:00:00", None))}
-    assert diag.classify_crawler_branch(record) == "CRAWLER_EXECUTING"
-    # 02 但 end_time 为空:完成证据不足,仍在执行
-    record2 = {"task_count": 2, "central": central(("02", "01", "2026-08-27 08:00:00", None))}
-    assert diag.classify_crawler_branch(record2) == "CRAWLER_EXECUTING"
+def test_classify_callback_failure_is_evidence_incomplete():
+    assert diag.classify_crawler_callback(item_record(callback_failed=True)) == \
+        "EVIDENCE_INCOMPLETE"
 
 
-def test_crawler_failed():
-    record = {"task_count": 2, "central": central(("03", "02", "2026-08-27 08:00:00", "2026-08-27 08:01:00"))}
-    assert diag.classify_crawler_branch(record) == "CRAWLER_FAILED"
+def test_classify_no_push_record():
+    assert diag.classify_crawler_callback(
+        item_record(spider_rows=[], callback_rows=[])) == "PUSH_RECORD_NOT_FOUND"
 
 
-def test_callback_lag_requires_all_subtasks_completed_with_end_time():
-    # 02/01 + end_time 非空 = 已完成(queue_status 不必是 02)——生产实测修正
-    record = {"task_count": 18, "central": central(
-        ("02", "01", "2026-08-27 08:00:00", "2026-08-27 08:00:01"),
-        ("02", "02", "2026-08-27 08:00:00", "2026-08-27 08:00:02"))}
-    assert diag.classify_crawler_branch(record) == "CALLBACK_LAG"
-    # 混合:部分完成 + 部分未入队 → 不是 callback lag
-    mixed = {"task_count": 18, "central": central(
-        ("02", "02", "2026-08-27 08:00:00", "2026-08-27 08:00:02"),
-        ("00", "00", None, None))}
-    assert diag.classify_crawler_branch(mixed) == "CENTRAL_NOT_ENQUEUED"
+def test_classify_partial_batch_coverage_is_evidence_incomplete():
+    # 两个 expected batch,只有一个有 spider 记录 → 不得冒充"未发现记录"
+    record = item_record(
+        batches={"B1", "B2"},
+        spider_rows=[{"batch_num": "B1", "exe_number": "E1", "is_call": 0}])
+    assert diag.classify_crawler_callback(record) == "EVIDENCE_INCOMPLETE"
 
 
-def test_crawler_evidence_incomplete_on_unknown_states():
-    record = {"task_count": 2, "central": central((None, None, None, None))}
-    assert diag.classify_crawler_branch(record) == "EVIDENCE_INCOMPLETE"
+def test_classify_missing_exe_number_is_evidence_incomplete():
+    assert diag.classify_crawler_callback(
+        item_record(spider_rows=[{"batch_num": "B1", "exe_number": "", "is_call": 0}],
+                    callback_rows=[])) == "EVIDENCE_INCOMPLETE"
 
 
-def test_start_time_is_never_used_as_execution_proof():
-    """分类输入不包含 start_time;证据字段只有 enqueue/task/queue/end。"""
-    import inspect
-    source = inspect.getsource(diag.classify_crawler_branch)
-    assert "start_time" not in source
+def test_classify_all_active_8888_in_flight():
+    assert diag.classify_crawler_callback(item_record()) == "CALLBACK_IN_FLIGHT"
+
+
+def test_classify_all_completed_0000_done_saas_pending():
+    record = item_record(
+        spider_rows=[{"batch_num": "B1", "exe_number": "E1", "is_call": 1}],
+        callback_rows=[{"execution_number": "E1", "push_state": "0000",
+                        "callback_source": "completed"}])
+    assert diag.classify_crawler_callback(record) == "CALLBACK_DONE_SAAS_PENDING"
+
+
+def test_classify_mixed_success_pending_partial():
+    record = item_record(
+        spider_rows=[{"batch_num": "B1", "exe_number": "E1", "is_call": 1},
+                     {"batch_num": "B1", "exe_number": "E2", "is_call": 0}],
+        callback_rows=[{"execution_number": "E1", "push_state": "0000",
+                        "callback_source": "completed"},
+                       {"execution_number": "E2", "push_state": "8888",
+                        "callback_source": "active"}])
+    assert diag.classify_crawler_callback(record) == "CALLBACK_PARTIAL"
+
+
+def test_classify_push_confirmed_no_callback_record():
+    assert diag.classify_crawler_callback(item_record(callback_rows=[])) == \
+        "PUSH_CONFIRMED_NO_CALLBACK_RECORD"
+
+
+def test_classify_success_plus_no_callback_record_partial():
+    record = item_record(
+        spider_rows=[{"batch_num": "B1", "exe_number": "E1", "is_call": 1},
+                     {"batch_num": "B1", "exe_number": "E2", "is_call": 0}],
+        callback_rows=[{"execution_number": "E1", "push_state": "0000",
+                        "callback_source": "completed"}])
+    assert diag.classify_crawler_callback(record) == "CALLBACK_PARTIAL"
+
+
+def test_classify_pending_plus_no_callback_record_is_in_flight():
+    """§8 锁定语义:存在真实在途回调 + 部分 execution 尚无 callback 行 → IN_FLIGHT。"""
+    record = item_record(
+        spider_rows=[{"batch_num": "B1", "exe_number": "E1", "is_call": 0},
+                     {"batch_num": "B1", "exe_number": "E2", "is_call": 0}],
+        callback_rows=[{"execution_number": "E1", "push_state": "8888",
+                        "callback_source": "active"}])
+    assert diag.classify_crawler_callback(record) == "CALLBACK_IN_FLIGHT"
+
+
+def test_classify_active_8888_with_is_call_1_is_evidence_incomplete():
+    record = item_record(
+        spider_rows=[{"batch_num": "B1", "exe_number": "E1", "is_call": 1}])
+    assert diag.classify_crawler_callback(record) == "EVIDENCE_INCOMPLETE"
+
+
+def test_classify_completed_0000_with_is_call_0_is_evidence_incomplete():
+    record = item_record(
+        spider_rows=[{"batch_num": "B1", "exe_number": "E1", "is_call": 0}],
+        callback_rows=[{"execution_number": "E1", "push_state": "0000",
+                        "callback_source": "completed"}])
+    assert diag.classify_crawler_callback(record) == "EVIDENCE_INCOMPLETE"
+
+
+def test_classify_unknown_push_state_is_evidence_incomplete_never_failed():
+    for bad in ("9999", "0001", "", None):
+        record = item_record(
+            callback_rows=[{"execution_number": "E1", "push_state": bad,
+                            "callback_source": "active"}])
+        assert diag.classify_crawler_callback(record) == "EVIDENCE_INCOMPLETE", bad
+        # completed 侧同样不得解释成失败
+        record2 = item_record(
+            spider_rows=[{"batch_num": "B1", "exe_number": "E1", "is_call": 1}],
+            callback_rows=[{"execution_number": "E1", "push_state": bad,
+                            "callback_source": "completed"}])
+        assert diag.classify_crawler_callback(record2) == "EVIDENCE_INCOMPLETE", bad
+
+
+def test_classify_execution_in_both_tables_is_evidence_incomplete():
+    record = item_record(
+        callback_rows=[{"execution_number": "E1", "push_state": "8888",
+                        "callback_source": "active"},
+                       {"execution_number": "E1", "push_state": "0000",
+                        "callback_source": "completed"}])
+    assert diag.classify_crawler_callback(record) == "EVIDENCE_INCOMPLETE"
+
+
+def test_classify_conflicting_push_states_same_source_is_evidence_incomplete():
+    record = item_record(
+        callback_rows=[{"execution_number": "E1", "push_state": "8888",
+                        "callback_source": "active"},
+                       {"execution_number": "E1", "push_state": "7777",
+                        "callback_source": "active"}])
+    assert diag.classify_crawler_callback(record) == "EVIDENCE_INCOMPLETE"
+
+
+def test_classify_no_callback_row_with_is_call_1_is_evidence_incomplete():
+    record = item_record(
+        spider_rows=[{"batch_num": "B1", "exe_number": "E1", "is_call": 1}],
+        callback_rows=[])
+    assert diag.classify_crawler_callback(record) == "EVIDENCE_INCOMPLETE"
+
+
+def test_classify_duplicate_callback_rows_do_not_change_classification():
+    doubled = item_record(callback_rows=[
+        {"execution_number": "E1", "push_state": "8888", "callback_source": "active"},
+        {"execution_number": "E1", "push_state": "8888", "callback_source": "active"}])
+    assert diag.classify_crawler_callback(doubled) == "CALLBACK_IN_FLIGHT"
+
+
+def test_classify_exes_truncated_is_evidence_incomplete():
+    assert diag.classify_crawler_callback(item_record(exes_truncated=True)) == \
+        "EVIDENCE_INCOMPLETE"
 
 
 # ---------------------------------------------------------------------------
@@ -757,8 +876,8 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def test_p1_1_crawler_incomplete_does_not_leak_into_downstream():
     canned = dict(FULL_CANNED)
-    # central 返回未知状态(有 task、有分控行,但状态不可解释)→ crawler 证据不足
-    canned["crawl1_central_rows"] = [("188605_701", None, None, None, None)]
+    # callback 出现未验证 push_state(有推送、有回调行,但状态不可解释)→ 证据不足
+    canned["crawl1_callback_rows"] = [("E1", "7777", "active")]
     service, _, _ = make_service(canned)
     payload = service.get_diagnostic("2026-08-27")
     stages = payload["stages"]
@@ -781,26 +900,26 @@ def test_p1_1_downstream_incomplete_does_not_leak_into_crawler():
     assert sum(stages["downstream_branch"].values()) == stages["crawl_status_2"]
 
 
-# ---- P1-2:central 查询失败 = 证据不足,不是 task 未进分控 ----
+# ---- P1-2:spider 推送查询失败 = 证据不足,不是"未发现推送记录" ----
 
-def test_p1_2_central_query_failure_is_evidence_incomplete_not_no_central_record():
-    def central_raises(params):
-        raise RuntimeError("central timeout")
+def test_p1_2_spider_query_failure_is_evidence_incomplete_not_push_not_found():
+    def spider_raises(params):
+        raise RuntimeError("spider timeout")
 
     service, _, _ = make_service({
         "pool_sync_standard_counts": [("0", 2)],
         "open_crawl_status_counts": [(2, 0, 2, 0, 0)],
         "crawl1_commodity_rows": [(11, "C1"), (12, "C2")],
         "crawl1_task_rows": [(11, "SAAS-188605_701_1", 1), (12, "SAAS-188605_702_1", 1)],
-        "crawl1_central_rows": central_raises,
+        "crawl1_spider_task_rows": spider_raises,
         "crawl2_search_flags": [],
     })
     payload = service.get_diagnostic("2026-08-27")
     assert payload["status"] == "partial"
-    assert "crawl1_central_rows" in payload["degraded_queries"]
+    assert "crawl1_spider_task_rows" in payload["degraded_queries"]
     crawler = payload["stages"]["crawler_branch"]
     assert crawler["EVIDENCE_INCOMPLETE"] == 2
-    assert crawler["TASK_CREATED_NO_CENTRAL_RECORD"] == 0
+    assert crawler["PUSH_RECORD_NOT_FOUND"] == 0
 
 
 # ---- P1-3:核心查询失败 ≠ 业务 0 ----
@@ -849,7 +968,8 @@ def test_p1_3_case_b_pool_failure_is_not_business_zero():
         "open_crawl_status_counts": [(3, 0, 1, 2, 0)],
         "crawl1_commodity_rows": [(11, "C1")],
         "crawl1_task_rows": [(11, "SAAS-188605_701_1", 1)],
-        "crawl1_central_rows": [("188605_701", "00", "00", None, None)],
+        "crawl1_spider_task_rows": [("188605_701", "E1", 0)],
+        "crawl1_callback_rows": [("E1", "8888", "active")],
         "crawl2_search_flags": [],
     })
     payload = service.get_diagnostic("2026-08-27")
@@ -864,7 +984,7 @@ def test_p1_3_case_b_pool_failure_is_not_business_zero():
     # 路由层成功:routing 计数与 no_commodity_list 来自 routing query 自身,可用
     assert stages["crawl_status_available"] is True
     assert stages["crawl_status_1"] == 1
-    assert stages["crawler_branch"]["CENTRAL_NOT_ENQUEUED"] == 1
+    assert stages["crawler_branch"]["CALLBACK_IN_FLIGHT"] == 1
     assert stages["routing_open_total"] == 3
     assert stages["no_commodity_list"] == 0
     assert "pool_sync_standard_counts" in payload["degraded_queries"]
@@ -1015,7 +1135,6 @@ def test_r2_p1_1_a_crawl1_detail_exceeds_route_is_drift_not_contradiction():
         "open_crawl_status_counts": [(3, 0, 3, 0, 0)],
         "crawl1_commodity_rows": [(i, f"C{i}") for i in range(1, 6)],  # 5 行 > 3
         "crawl1_task_rows": [],
-        "crawl1_central_rows": [],
         "crawl2_search_flags": [],
     })
     payload = service.get_diagnostic("2026-08-27")
@@ -1100,29 +1219,31 @@ def test_r2_p1_2_mixed_valid_and_malformed_tasks_is_evidence_incomplete():
             (11, "SAAS-188605_702_1", 1),
             (11, "FOO_123", 1),
         ],
-        "crawl1_central_rows": [("188605_701", "00", "00", None, None)],
+        "crawl1_spider_task_rows": [("188605_701", "E1", 0), ("188605_702", "E2", 0)],
+        "crawl1_callback_rows": [],
         "crawl2_search_flags": [],
     })
     payload = service.get_diagnostic("2026-08-27")
     crawler = payload["stages"]["crawler_branch"]
     assert crawler["EVIDENCE_INCOMPLETE"] == 1
-    assert crawler["TASK_CREATED_NO_CENTRAL_RECORD"] == 0
-    assert crawler["CENTRAL_NOT_ENQUEUED"] == 0
+    assert crawler["PUSH_RECORD_NOT_FOUND"] == 0
+    assert crawler["PUSH_CONFIRMED_NO_CALLBACK_RECORD"] == 0
 
 
-def test_r2_p1_2_valid_tasks_with_empty_central_keeps_no_central_record():
-    """全部 task 可解析、central 查询成功且确实无行 → 保留真实业务分类。"""
+def test_r2_p1_2_valid_tasks_with_no_spider_records_is_push_not_found():
+    """全部 task 可解析、spider 查询成功且确实无行 → 未发现推送记录(非证据不足)。"""
     service, _, _ = make_service({
         "pool_sync_standard_counts": [("0", 1)],
         "open_crawl_status_counts": [(1, 0, 1, 0, 0)],
         "crawl1_commodity_rows": [(11, "C1")],
         "crawl1_task_rows": [(11, "SAAS-188605_701_1", 1)],
-        "crawl1_central_rows": [],  # 查询成功,确实没有分控行
+        "crawl1_spider_task_rows": [],  # 查询成功,确实没有推送记录
+        "crawl1_callback_rows": [],
         "crawl2_search_flags": [],
     })
     payload = service.get_diagnostic("2026-08-27")
     crawler = payload["stages"]["crawler_branch"]
-    assert crawler["TASK_CREATED_NO_CENTRAL_RECORD"] == 1
+    assert crawler["PUSH_RECORD_NOT_FOUND"] == 1
     assert crawler["EVIDENCE_INCOMPLETE"] == 0
 
 
@@ -1205,28 +1326,28 @@ def test_r2_p2_1_missing_schema_is_read_failed(tmp_path):
     assert result["observations"] == []
 
 
-# ---- P2-2:central 失败不得覆盖已确定的 TASK_NOT_CREATED ----
+# ---- P2-2:spider 失败不得覆盖已确定的 TASK_NOT_CREATED ----
 
-def test_r2_p2_2_central_failure_keeps_task_not_created_for_taskless_commodity():
-    """A 有 task(batch 查询导致 central 整体失败)→ EVIDENCE_INCOMPLETE;
-    B 无 task → TASK_NOT_CREATED(该判断不依赖 central 查询)。"""
-    def central_raises(params):
-        raise RuntimeError("central timeout")
+def test_r2_p2_2_spider_failure_keeps_task_not_created_for_taskless_commodity():
+    """A 有 task(推送记录查询整体失败)→ EVIDENCE_INCOMPLETE;
+    B 无 task → TASK_NOT_CREATED(该判断不依赖推送查询)。"""
+    def spider_raises(params):
+        raise RuntimeError("spider timeout")
 
     service, _, _ = make_service({
         "pool_sync_standard_counts": [("0", 2)],
         "open_crawl_status_counts": [(2, 0, 2, 0, 0)],
         "crawl1_commodity_rows": [(11, "CA"), (12, "CB")],
         "crawl1_task_rows": [(11, "SAAS-188605_701_1", 1)],  # 仅 A 有 task
-        "crawl1_central_rows": central_raises,
+        "crawl1_spider_task_rows": spider_raises,
         "crawl2_search_flags": [],
     })
     payload = service.get_diagnostic("2026-08-27")
     crawler = payload["stages"]["crawler_branch"]
-    assert crawler["EVIDENCE_INCOMPLETE"] == 1   # A:有 task,central 失败
+    assert crawler["EVIDENCE_INCOMPLETE"] == 1   # A:有 task,推送证据不可用
     assert crawler["TASK_NOT_CREATED"] == 1      # B:无 task,结论确定
     assert payload["status"] == "partial"
-    assert "crawl1_central_rows" in payload["degraded_queries"]
+    assert "crawl1_spider_task_rows" in payload["degraded_queries"]
 
 
 # ---- §8 invariants 汇总 ----
@@ -1258,7 +1379,6 @@ def test_r3_p1_a_pool_lt_routing_marks_drift_not_residual():
         "open_crawl_status_counts": [(5, 0, 2, 3, 0)],
         "crawl1_commodity_rows": [(11, "C1"), (12, "C2")],
         "crawl1_task_rows": [],
-        "crawl1_central_rows": [],
         "crawl2_search_flags": [],
     })
     payload = service.get_diagnostic("2026-08-27")
@@ -1283,7 +1403,6 @@ def test_r3_p1_b_pool_gt_routing_marks_drift_not_residual():
         "open_crawl_status_counts": [(3, 0, 1, 2, 0)],
         "crawl1_commodity_rows": [(11, "C1")],
         "crawl1_task_rows": [],
-        "crawl1_central_rows": [],
         "crawl2_search_flags": [],
     })
     payload = service.get_diagnostic("2026-08-27")
@@ -1301,7 +1420,6 @@ def test_r3_p1_c_routing_statement_closes_internally():
         "open_crawl_status_counts": [(5, 1, 1, 2, 1)],
         "crawl1_commodity_rows": [(11, "C1")],
         "crawl1_task_rows": [],
-        "crawl1_central_rows": [],
         "crawl2_search_flags": [],
     })
     stages = service.get_diagnostic("2026-08-27")["stages"]
@@ -1317,7 +1435,6 @@ def test_r3_p1_d_no_commodity_list_only_from_routing_join():
         "open_crawl_status_counts": [(4, 2, 1, 1, 0)],
         "crawl1_commodity_rows": [(11, "C1")],
         "crawl1_task_rows": [],
-        "crawl1_central_rows": [],
         "crawl2_search_flags": [],
     })
     stages = service.get_diagnostic("2026-08-27")["stages"]
@@ -1359,7 +1476,6 @@ def test_r3_p2_drift_branch_aux_fields_are_none_not_zero():
         "open_crawl_status_counts": [(3, 0, 3, 0, 0)],
         "crawl1_commodity_rows": [(i, f"C{i}") for i in range(1, 6)],
         "crawl1_task_rows": [],
-        "crawl1_central_rows": [],
         "crawl2_search_flags": [],
     })
     stages = service.get_diagnostic("2026-08-27")["stages"]
@@ -1368,13 +1484,13 @@ def test_r3_p2_drift_branch_aux_fields_are_none_not_zero():
 
 
 def test_r3_p2_normal_branch_real_zero_stays_zero():
-    """正常 branch:真实 0 仍是 0,真实证据记录原样保留。"""
+    """正常 branch:真实 0 仍是 0;central 诊断已退役,detail 恒 None 不冒充空列表。"""
     service, _, _ = make_service(dict(FULL_CANNED), now_fn=lambda: BEFORE_CUTOFF)
     stages = service.get_diagnostic("2026-08-27")["stages"]
     assert stages["crawler_branch"] is not None
-    # 查询成功且确有 1 条 00/00 分控记录 → detail 原样保留(真实空列表仍会是 [])
-    assert stages["central_status_detail"] == [
-        {"batch_num": "188605_701", "task_status": "00", "queue_status": "00", "count": 1}]
+    assert stages["crawler_branch"]["CALLBACK_IN_FLIGHT"] == 1
+    # R2:不再查询 s_task_info;保留 key 兼容消费者,恒 None
+    assert stages["central_status_detail"] is None
     assert stages["reference_pending_approval_total"] == 0
     assert stages["callback_done_no_search_within_grace"] == 0  # 09:59 入池 vs 14:00 检查,超出宽限
 
@@ -1439,13 +1555,14 @@ class SqliteRegistryCursor:
         pass
 
 
-def _sqlite_backend(pool_rows, cl_rows, task_rows=(), central_rows=(), search_rows=()):
+def _sqlite_backend(pool_rows, cl_rows, task_rows=(), spider_rows=(), callback_rows=(),
+                    search_rows=()):
     import sqlite3 as _sqlite3
 
     con = _sqlite3.connect(":memory:")
     con.execute("ATTACH ':memory:' AS saas_onecode_price")
     con.execute("ATTACH ':memory:' AS saas_compare_price")
-    con.execute("ATTACH ':memory:' AS central_control_sub_demo")
+    con.execute("ATTACH ':memory:' AS shopping_spider")
     con.executescript("""
         CREATE TABLE saas_onecode_price.commodity_pool_188605 (
             COMMODITY_POOL_ID TEXT, IS_MONITOR INTEGER, IS_SYNC_STANDARD INTEGER,
@@ -1454,9 +1571,13 @@ def _sqlite_backend(pool_rows, cl_rows, task_rows=(), central_rows=(), search_ro
             id INTEGER PRIMARY KEY, commodity_id TEXT, crawl_status INTEGER);
         CREATE TABLE saas_compare_price.task_table_188605 (
             reference_id INTEGER, task_id TEXT, task_status TEXT, table_name TEXT);
-        CREATE TABLE central_control_sub_demo.s_task_info (
-            batch_num TEXT, task_status TEXT, queue_status TEXT,
-            enqueue_time TEXT, end_time TEXT, is_valid TEXT);
+        CREATE TABLE shopping_spider.spider_task_record (
+            id INTEGER PRIMARY KEY, mall TEXT, exe_number TEXT, batch_num TEXT,
+            sku_ids TEXT, is_call INTEGER, create_time TEXT, backup_time TEXT);
+        CREATE TABLE shopping_spider.spider_sync_log (
+            pid INTEGER PRIMARY KEY, execution_number TEXT, push_state TEXT);
+        CREATE TABLE shopping_spider.spider_sync_log_complated (
+            pid INTEGER PRIMARY KEY, execution_number TEXT, push_state TEXT);
         CREATE TABLE saas_compare_price.search_table_188605 (
             id INTEGER PRIMARY KEY, commodity_list_id INTEGER,
             audit_result TEXT, model_audit_result TEXT, sync_state INTEGER);
@@ -1469,8 +1590,17 @@ def _sqlite_backend(pool_rows, cl_rows, task_rows=(), central_rows=(), search_ro
         "INSERT INTO saas_compare_price.task_table_188605 VALUES (?,?,?,?)",
         [(*row, "188605") for row in task_rows])
     con.executemany(
-        "INSERT INTO central_control_sub_demo.s_task_info VALUES (?,?,?,?,?,'1')",
-        central_rows)
+        "INSERT INTO shopping_spider.spider_task_record VALUES (?,?,?,?,?,?,?,?)",
+        [(i + 1, "M%d" % i, exe, batch, "", call, "2026-08-27 08:00:00", None)
+         for i, (batch, exe, call) in enumerate(spider_rows)])
+    active = [(i + 1, exe, push) for i, (exe, push, src) in enumerate(callback_rows)
+              if src == "active"]
+    completed = [(i + 1, exe, push) for i, (exe, push, src) in enumerate(callback_rows)
+                 if src == "completed"]
+    con.executemany(
+        "INSERT INTO shopping_spider.spider_sync_log VALUES (?,?,?)", active)
+    con.executemany(
+        "INSERT INTO shopping_spider.spider_sync_log_complated VALUES (?,?,?)", completed)
     con.executemany(
         "INSERT INTO saas_compare_price.search_table_188605 VALUES (?,?,?,?,?)", search_rows)
     con.commit()
@@ -1478,8 +1608,10 @@ def _sqlite_backend(pool_rows, cl_rows, task_rows=(), central_rows=(), search_ro
 
 
 class SqliteRegistryConnection:
-    def __init__(self, pool_rows, cl_rows, task_rows=(), central_rows=(), search_rows=()):
-        self._con = _sqlite_backend(pool_rows, cl_rows, task_rows, central_rows, search_rows)
+    def __init__(self, pool_rows, cl_rows, task_rows=(), spider_rows=(), callback_rows=(),
+                 search_rows=()):
+        self._con = _sqlite_backend(pool_rows, cl_rows, task_rows, spider_rows,
+                                    callback_rows, search_rows)
 
     def cursor(self) -> SqliteRegistryCursor:
         return SqliteRegistryCursor(self._con)
@@ -1496,9 +1628,10 @@ def cl_row(cl_id, cid, status):
     return (cl_id, cid, status)
 
 
-def make_sqlite_service(pool_rows, cl_rows, task_rows=(), central_rows=(), search_rows=(),
-                        **kwargs):
-    conn = SqliteRegistryConnection(pool_rows, cl_rows, task_rows, central_rows, search_rows)
+def make_sqlite_service(pool_rows, cl_rows, task_rows=(), spider_rows=(), callback_rows=(),
+                        search_rows=(), **kwargs):
+    conn = SqliteRegistryConnection(pool_rows, cl_rows, task_rows, spider_rows,
+                                    callback_rows, search_rows)
     return diag.SaasFlowDiagnosticService(
         config=diag.DiagDBConfig(host="db.example.internal", port=3306,
                                  user="ro", password="secret-not-committed"),
@@ -1526,11 +1659,12 @@ def test_card_b_duplicate_pool_single_crawl1_classifies_once():
         pool_rows=[pool_row("C1"), pool_row("C1", created="2026-08-27 09:00:00")],
         cl_rows=[cl_row(11, "C1", 1)],
         task_rows=[(11, "SAAS-188605_701_1", "01")],
-        central_rows=[("188605_701", "00", "00", None, None)])
+        spider_rows=[("188605_701", "E1", 0)],
+        callback_rows=[("E1", "8888", "active")])
     stages = service.get_diagnostic("2026-08-27")["stages"]
     assert stages["routing_open_total"] == 1
     assert stages["crawl_status_1"] == 1
-    assert stages["crawler_branch"]["CENTRAL_NOT_ENQUEUED"] == 1
+    assert stages["crawler_branch"]["CALLBACK_IN_FLIGHT"] == 1
     assert sum(stages["crawler_branch"].values()) == stages["crawl_status_1"] == 1
 
 
@@ -1614,7 +1748,8 @@ def test_card_h_ambiguous_commodity_excluded_from_normal_branches():
         pool_rows=[pool_row("C3")],
         cl_rows=[cl_row(111, "C3", 1), cl_row(112, "C3", 2)],
         task_rows=[(111, "SAAS-188605_701_1", "01")],
-        central_rows=[("188605_701", "00", "00", None, None)])
+        spider_rows=[("188605_701", "E1", 0)],
+        callback_rows=[("E1", "8888", "active")])
     stages = service.get_diagnostic("2026-08-27")["stages"]
     assert stages["routing_evidence_incomplete"] == 1
     assert sum(stages["crawler_branch"].values()) == 0
@@ -1641,39 +1776,44 @@ def test_card_i_crawl2_query_failure_auxiliary_none():
     assert stages["callback_done_no_search_within_grace"] is None
 
 
-# ---- Test J: central 查询失败 → central_status_detail None ----
+# ---- Test J(R2): callback 查询失败 → 商品证据不足,detail 恒 None ----
 
-def test_card_j_central_query_failure_detail_none():
-    def central_raises(params):
-        raise RuntimeError("central query failed")
+def test_card_j_callback_query_failure_item_evidence_incomplete():
+    def callback_raises(params):
+        raise RuntimeError("callback query failed")
 
     service, _, _ = make_service({
         "pool_sync_standard_counts": [("0", 1)],
         "open_crawl_status_counts": [(1, 0, 1, 0, 0)],
         "crawl1_commodity_rows": [(11, "C1")],
         "crawl1_task_rows": [(11, "SAAS-188605_701_1", 1)],
-        "crawl1_central_rows": central_raises,
+        "crawl1_spider_task_rows": [("188605_701", "E1", 0)],
+        "crawl1_callback_rows": callback_raises,
         "crawl2_search_flags": [],
     })
-    stages = service.get_diagnostic("2026-08-27")["stages"]
+    payload = service.get_diagnostic("2026-08-27")
+    stages = payload["stages"]
+    assert "crawl1_callback_rows" in payload["degraded_queries"]
     assert stages["crawler_branch"]["EVIDENCE_INCOMPLETE"] == 1
+    # R2:central 诊断退役,永不冒充"查过 central 且无任务"
     assert stages["central_status_detail"] is None
 
 
-# ---- Test K: central 查询成功且真实无行 → [] ----
+# ---- Test K(R2): 推送有记录、回调两表均无行、is_call=0 → 已推送暂无回调记录 ----
 
-def test_card_k_central_success_zero_rows_detail_empty_list():
+def test_card_k_push_confirmed_no_callback_record():
     service, _, _ = make_service({
         "pool_sync_standard_counts": [("0", 1)],
         "open_crawl_status_counts": [(1, 0, 1, 0, 0)],
         "crawl1_commodity_rows": [(11, "C1")],
         "crawl1_task_rows": [(11, "SAAS-188605_701_1", 1)],
-        "crawl1_central_rows": [],
+        "crawl1_spider_task_rows": [("188605_701", "E1", 0)],
+        "crawl1_callback_rows": [],
         "crawl2_search_flags": [],
     })
     stages = service.get_diagnostic("2026-08-27")["stages"]
-    assert stages["crawler_branch"]["TASK_CREATED_NO_CENTRAL_RECORD"] == 1
-    assert stages["central_status_detail"] == []
+    assert stages["crawler_branch"]["PUSH_CONFIRMED_NO_CALLBACK_RECORD"] == 1
+    assert stages["central_status_detail"] is None
 
 
 # ===========================================================================
@@ -1742,7 +1882,8 @@ def test_r1_fix_a_task_params_bound_as_native_column_type_strings():
     """reference_id 是 varchar(255):int 绑定会让 MySQL 弃用 idx_reference_id
     (生产 EXPLAIN rows≈59 万);必须以字符串绑定(实测 rows≈95)。"""
     canned = dict(CRAWL1_CHAIN_CANNED)
-    canned["crawl1_central_rows"] = [("188605_701", "00", "00", None, None)]
+    canned["crawl1_spider_task_rows"] = [("188605_701", "E1", 0)]
+    canned["crawl1_callback_rows"] = [("E1", "8888", "active")]
     canned["crawl2_search_flags"] = []
     service, executed, _ = make_service(canned)
     payload = service.get_diagnostic("2026-08-27")
@@ -1765,33 +1906,55 @@ def test_r1_fix_b_is_connection_killing_error_classification():
 
 
 def test_r1_fix_b_2013_discards_connection_next_query_succeeds():
-    """central 2013 超时杀死连接 → crawl2 必须通过新连接正常执行,
-    不再被连带 degraded;central 本身只执行一次(绝不重试)。"""
+    """spider 查询 2013 杀死连接 → 后续独立查询(crawl2)必须通过新连接正常执行,
+    不再被连带 degraded;spider 查询本身只执行一次(绝不重试;
+    spider 失败后无 exe 可查,callback 依设计不再执行)。"""
     conn1_canned = dict(CRAWL1_CHAIN_CANNED)
-    central_attempts = {"n": 0}
+    spider_attempts = {"n": 0}
 
-    def central_2013(params):
-        central_attempts["n"] += 1
+    def spider_2013(params):
+        spider_attempts["n"] += 1
         raise _FakeMySQLError(2013, "Lost connection to MySQL server during query")
 
-    conn1_canned["crawl1_central_rows"] = central_2013
-    conn2_canned = {"crawl2_search_flags": [(21, 0, "2026-08-27 09:00:00",
-                                             0, 0, 0, 0, 0, 0, 0, 0, 0)]}
+    conn1_canned["crawl1_spider_task_rows"] = spider_2013
+    conn2_canned = {"crawl2_search_flags": [
+        (21, 0, "2026-08-27 09:00:00", 0, 0, 0, 0, 0, 0, 0, 0, 0)]}
     service, conns, calls = _make_multi_conn_service([conn1_canned, conn2_canned])
     payload = service.get_diagnostic("2026-08-27")
-    assert payload["degraded_queries"] == ["crawl1_central_rows"]
+    assert payload["degraded_queries"] == ["crawl1_spider_task_rows"]
     assert payload["status"] == "partial"
     assert calls["connect"] == 2
     # 死连接与替换连接都 best-effort close,无泄漏
     assert conns[0].closed is True and conns[1].closed is True
-    # central 只尝试过一次(绝不重试);crawl2 在新连接上成功
-    assert central_attempts["n"] == 1
-    assert "crawl1_central_rows" not in [name for name, _ in conns[1]._executed]
+    # spider 只尝试过一次(绝不重试);crawl2 在新连接上成功
+    assert spider_attempts["n"] == 1
+    assert "crawl1_spider_task_rows" not in [name for name, _ in conns[1]._executed]
     assert "crawl2_search_flags" in [name for name, _ in conns[1]._executed]
-    # routing 证据保留,central 失败语义不变(证据不足,非业务 0)
+    # routing 证据保留,spider 失败语义不变(证据不足,非业务 0)
     stages = payload["stages"]
     assert stages["crawl_status_1"] == 1
     assert stages["crawler_branch"]["EVIDENCE_INCOMPLETE"] == 1
+
+
+def test_r2_fix_b_task_2013_next_queries_run_on_new_connection():
+    """task 查询 2013 → 依赖 task 数据的 spider/callback 不再执行(无参可查),
+    独立的 crawl2 经新连接继续执行。"""
+    conn1_canned = dict(CRAWL1_CHAIN_CANNED)
+
+    def task_2013(params):
+        raise _FakeMySQLError(2013, "lost")
+
+    conn1_canned["crawl1_task_rows"] = task_2013
+    conn2_canned = {"crawl2_search_flags": []}
+    service, conns, calls = _make_multi_conn_service([conn1_canned, conn2_canned])
+    payload = service.get_diagnostic("2026-08-27")
+    assert payload["degraded_queries"] == ["crawl1_task_rows"]
+    assert calls["connect"] == 2
+    conn2_names = [name for name, _ in conns[1]._executed]
+    assert "crawl2_search_flags" in conn2_names
+    # task 失败 → 无 batch 可查,spider/callback 依设计跳过
+    assert "crawl1_spider_task_rows" not in conn2_names
+    assert "crawl1_callback_rows" not in conn2_names
 
 
 def test_r1_fix_b_2006_also_triggers_reconnect():
@@ -1801,13 +1964,14 @@ def test_r1_fix_b_2006_also_triggers_reconnect():
         raise _FakeMySQLError(2006, "MySQL server has gone away")
 
     conn1_canned["crawl1_task_rows"] = task_2006
-    conn2_canned = {"crawl1_central_rows": [], "crawl2_search_flags": []}
+    conn2_canned = {"crawl1_spider_task_rows": [], "crawl1_callback_rows": [],
+                    "crawl2_search_flags": []}
     service, conns, calls = _make_multi_conn_service([conn1_canned, conn2_canned])
     payload = service.get_diagnostic("2026-08-27")
     assert payload["degraded_queries"] == ["crawl1_task_rows"]
     assert calls["connect"] == 2
     assert conns[0].closed is True and conns[1].closed is True
-    # task 失败 → 商品级 TASK 分类不可用,但 crawl2 仍正常执行
+    # task 失败 → 商品级分类不可用,但 crawl2 仍正常执行
     assert payload["stages"]["crawler_branch"]["EVIDENCE_INCOMPLETE"] == 1
     assert "crawl2_search_flags" not in payload["degraded_queries"]
 
@@ -1816,15 +1980,15 @@ def test_r1_fix_b_ordinary_sql_error_does_not_reconnect():
     """1142 等 SQL 错误不是连接死亡:不得触发换连接/重建。"""
     conn1_canned = dict(CRAWL1_CHAIN_CANNED)
 
-    def central_1142(params):
+    def spider_1142(params):
         raise _FakeMySQLError(1142, "SELECT command denied")
 
-    conn1_canned["crawl1_central_rows"] = central_1142
+    conn1_canned["crawl1_spider_task_rows"] = spider_1142
     # routing 层 crawl2=0:crawl2 查询成功但返回空(避免 detail>route 假 drift)
     conn1_canned["crawl2_search_flags"] = []
     service, conns, calls = _make_multi_conn_service([conn1_canned])
     payload = service.get_diagnostic("2026-08-27")
-    assert payload["degraded_queries"] == ["crawl1_central_rows"]
+    assert payload["degraded_queries"] == ["crawl1_spider_task_rows"]
     assert calls["connect"] == 1  # 没有重建连接
     # crawl2 在同一连接上继续执行成功(不在 degraded)
     assert "crawl2_search_flags" in [name for name, _ in conns[0]._executed]
@@ -1833,14 +1997,14 @@ def test_r1_fix_b_ordinary_sql_error_does_not_reconnect():
 
 
 def test_r1_fix_b_replacement_failure_degrades_safely():
-    """central 2013 后重建连接也失败:已有证据保留,后续诊断降级,
+    """spider 2013 后重建连接也失败:已有证据保留,后续诊断降级,
     不 500、不伪造业务 0、不泄漏凭据。"""
     conn1_canned = dict(CRAWL1_CHAIN_CANNED)
 
-    def central_2013(params):
+    def spider_2013(params):
         raise _FakeMySQLError(2013, "Lost connection to MySQL server during query")
 
-    conn1_canned["crawl1_central_rows"] = central_2013
+    conn1_canned["crawl1_spider_task_rows"] = spider_2013
 
     def second_call_fails(call_number):
         return ConnectionError("reconnect refused") if call_number == 2 else None
@@ -1849,7 +2013,8 @@ def test_r1_fix_b_replacement_failure_degrades_safely():
         [conn1_canned], factory_side_effect=second_call_fails)
     payload = service.get_diagnostic("2026-08-27")
     assert payload["status"] == "partial"  # 安全降级,不是 5xx
-    assert payload["degraded_queries"] == ["crawl1_central_rows", "crawl2_search_flags"]
+    # spider 失败 → 无 exe 可查(callback 不执行);crawl2 因替换失败连带降级
+    assert payload["degraded_queries"] == ["crawl1_spider_task_rows", "crawl2_search_flags"]
     # 已取得的 routing 证据不丢失
     assert payload["stages"]["routing_open_total"] == 1
     assert payload["stages"]["crawl_status_1"] == 1
@@ -1870,12 +2035,12 @@ def test_r1_fix_b_dead_connection_close_failure_is_tolerated():
 
     conn1_canned = dict(CRAWL1_CHAIN_CANNED)
 
-    def central_2013(params):
+    def spider_2013(params):
         raise _FakeMySQLError(2013, "lost")
 
-    conn1_canned["crawl1_central_rows"] = central_2013
+    conn1_canned["crawl1_spider_task_rows"] = spider_2013
     conn1 = CloseExplodes(conn1_canned, [])
-    conn2 = FakeConnection({"crawl2_search_flags": []}, [])
+    conn2 = FakeConnection({"crawl1_callback_rows": [], "crawl2_search_flags": []}, [])
     calls = {"connect": 0}
     conns = [conn1, conn2]
 
@@ -1890,6 +2055,201 @@ def test_r1_fix_b_dead_connection_close_failure_is_tolerated():
         monotonic=FakeClock(),
     )
     payload = service.get_diagnostic("2026-08-27")
-    assert payload["degraded_queries"] == ["crawl1_central_rows"]
+    assert payload["degraded_queries"] == ["crawl1_spider_task_rows"]
     assert calls["connect"] == 2
     assert conn2.closed is True  # 替换连接被正确关闭
+
+# ===========================================================================
+# Round 2 Central Bypass(2026-08-28): crawl1 主链 = task → batch → spider
+# 推送 → execution_number → callback 证据;s_task_info 不再执行,central 状态退役。
+# ===========================================================================
+
+# ---- §17 SQL 安全:主链不引用 central;有界 IN 是唯一过滤形态 ----
+
+def test_r2_registry_primary_path_never_references_central():
+    for name, sql in diag.DIAG_SQL_REGISTRY.items():
+        assert "s_task_info" not in sql, name
+        assert "central_control" not in sql, name
+    assert "crawl1_central_rows" not in diag.DIAG_SQL_REGISTRY
+    assert "crawl1_central_rows" not in diag.QUERY_COLUMNS
+
+
+def test_r2_spider_and_callback_sql_shape():
+    spider = diag.DIAG_SQL_REGISTRY["crawl1_spider_task_rows"]
+    callback = diag.DIAG_SQL_REGISTRY["crawl1_callback_rows"]
+    for sql in (spider, callback):
+        low = sql.lower()
+        assert "select *" not in low
+        assert "like" not in low and "regexp" not in low
+        assert "force index" not in low and "use index" not in low
+        assert diag.validate_readonly_statement(sql) == []
+    assert "r.batch_num IN %(batch_nums)s" in spider
+    assert "execution_number" not in spider  # spider 只按 batch 查
+    assert callback.count("%(execution_numbers)s") == 2  # active+completed 各一次
+    # callback SQL 不与 task/search 表同句
+    assert "task_table" not in callback and "search_table" not in callback
+
+
+# ---- §18 参数类型回归:batch_nums / execution_numbers 全为 string ----
+
+def test_r2_batch_and_execution_params_bound_as_strings():
+    service, executed, _ = make_service({
+        "pool_sync_standard_counts": [("0", 2)],
+        "open_crawl_status_counts": [(2, 0, 2, 0, 0)],
+        "crawl1_commodity_rows": [(11, "C1"), (12, "C2")],
+        "crawl1_task_rows": [(11, "SAAS-188605_701_1", 1), (12, "SAAS-188605_702_1", 1)],
+        "crawl1_spider_task_rows": [("188605_701", "E1", 0), ("188605_702", "E2", 1)],
+        "crawl1_callback_rows": [("E1", "8888", "active"), ("E2", "0000", "completed")],
+        "crawl2_search_flags": [],
+    })
+    payload = service.get_diagnostic("2026-08-27")
+    assert payload["status"] == "ok"
+    for name, params in executed:
+        if name == "crawl1_spider_task_rows":
+            assert params["batch_nums"] and all(isinstance(v, str) for v in params["batch_nums"])
+        if name == "crawl1_callback_rows":
+            assert params["execution_numbers"] and all(
+                isinstance(v, str) for v in params["execution_numbers"])
+
+
+# ---- §16 场景:多 batch / 多 exec / 聚合 / 去重 / overflow ----
+
+def test_r2_item_with_two_batches_full_coverage():
+    """同一商品两个 task → 两个 batch;两 batch 均有推送记录,
+    exec 一在途一完成 → CALLBACK_PARTIAL(多 batch 全覆盖)。"""
+    service, _, _ = make_service({
+        "pool_sync_standard_counts": [("0", 1)],
+        "open_crawl_status_counts": [(1, 0, 1, 0, 0)],
+        "crawl1_commodity_rows": [(11, "C1")],
+        "crawl1_task_rows": [(11, "SAAS-188605_701_1", 1), (11, "SAAS-188605_702_1", 1)],
+        "crawl1_spider_task_rows": [("188605_701", "E1", 0), ("188605_702", "E2", 1)],
+        "crawl1_callback_rows": [("E1", "8888", "active"), ("E2", "0000", "completed")],
+        "crawl2_search_flags": [],
+    })
+    stages = service.get_diagnostic("2026-08-27")["stages"]
+    assert stages["crawler_branch"]["CALLBACK_PARTIAL"] == 1
+    assert sum(stages["crawler_branch"].values()) == stages["crawl_status_1"] == 1
+
+
+def test_r2_shared_batch_deduplication():
+    """18 个 task 共享同一 batch:batch 去重后仍是一个推送单位,
+    商品只分类一次(不因 task 行数放大)。"""
+    service, _, _ = make_service({
+        "pool_sync_standard_counts": [("0", 1)],
+        "open_crawl_status_counts": [(1, 0, 1, 0, 0)],
+        "crawl1_commodity_rows": [(11, "C1")],
+        "crawl1_task_rows": [(11, "SAAS-188605_701_%d" % i, 1) for i in range(18)],
+        "crawl1_spider_task_rows": [("188605_701", "E1", 0)],
+        "crawl1_callback_rows": [("E1", "8888", "active")],
+        "crawl2_search_flags": [],
+    })
+    stages = service.get_diagnostic("2026-08-27")["stages"]
+    assert stages["crawler_branch"]["CALLBACK_IN_FLIGHT"] == 1
+    assert sum(stages["crawler_branch"].values()) == 1
+
+
+def test_r2_multiple_executions_aggregate():
+    """单 batch 多 execution:全 success → CALLBACK_DONE_SAAS_PENDING。"""
+    service, _, _ = make_service({
+        "pool_sync_standard_counts": [("0", 1)],
+        "open_crawl_status_counts": [(1, 0, 1, 0, 0)],
+        "crawl1_commodity_rows": [(11, "C1")],
+        "crawl1_task_rows": [(11, "SAAS-188605_701_1", 1)],
+        "crawl1_spider_task_rows": [("188605_701", "E1", 1), ("188605_701", "E2", 1)],
+        "crawl1_callback_rows": [("E1", "0000", "completed"), ("E2", "0000", "completed")],
+        "crawl2_search_flags": [],
+    })
+    stages = service.get_diagnostic("2026-08-27")["stages"]
+    assert stages["crawler_branch"]["CALLBACK_DONE_SAAS_PENDING"] == 1
+
+
+def test_r2_duplicate_callback_rows_do_not_inflate_items():
+    """同一 execution 的重复 callback 行不得放大商品计数(set 归一)。"""
+    service, _, _ = make_service({
+        "pool_sync_standard_counts": [("0", 1)],
+        "open_crawl_status_counts": [(1, 0, 1, 0, 0)],
+        "crawl1_commodity_rows": [(11, "C1")],
+        "crawl1_task_rows": [(11, "SAAS-188605_701_1", 1)],
+        "crawl1_spider_task_rows": [("188605_701", "E1", 0)],
+        "crawl1_callback_rows": [("E1", "8888", "active"), ("E1", "8888", "active")],
+        "crawl2_search_flags": [],
+    })
+    stages = service.get_diagnostic("2026-08-27")["stages"]
+    assert stages["crawler_branch"]["CALLBACK_IN_FLIGHT"] == 1
+    assert sum(stages["crawler_branch"].values()) == 1
+
+
+def test_r2_overflow_counts_evidence_incomplete():
+    """routing 称 crawl1=3 但 detail 只有 1 行(截断/窗口)→ 溢出计入证据不足。"""
+    service, _, _ = make_service({
+        "pool_sync_standard_counts": [("0", 3)],
+        "open_crawl_status_counts": [(3, 0, 3, 0, 0)],
+        "crawl1_commodity_rows": [(11, "C1")],
+        "crawl1_task_rows": [(11, "SAAS-188605_701_1", 1)],
+        "crawl1_spider_task_rows": [("188605_701", "E1", 0)],
+        "crawl1_callback_rows": [("E1", "8888", "active")],
+        "crawl2_search_flags": [],
+    })
+    stages = service.get_diagnostic("2026-08-27")["stages"]
+    assert stages["crawler_branch"]["CALLBACK_IN_FLIGHT"] == 1
+    assert stages["crawler_branch"]["EVIDENCE_INCOMPLETE"] == 2
+    assert sum(stages["crawler_branch"].values()) == stages["crawl_status_1"] == 3
+
+
+def test_r2_taskless_item_and_full_chain_item_close_together():
+    """A 无 task → TASK_NOT_CREATED;B 全链完成 → DONE_SAAS_PENDING;分支闭合。"""
+    service, _, _ = make_service({
+        "pool_sync_standard_counts": [("0", 2)],
+        "open_crawl_status_counts": [(2, 0, 2, 0, 0)],
+        "crawl1_commodity_rows": [(11, "CA"), (12, "CB")],
+        "crawl1_task_rows": [(12, "SAAS-188605_702_1", 1)],
+        "crawl1_spider_task_rows": [("188605_702", "E2", 1)],
+        "crawl1_callback_rows": [("E2", "0000", "completed")],
+        "crawl2_search_flags": [],
+    })
+    stages = service.get_diagnostic("2026-08-27")["stages"]
+    assert stages["crawler_branch"]["TASK_NOT_CREATED"] == 1
+    assert stages["crawler_branch"]["CALLBACK_DONE_SAAS_PENDING"] == 1
+    assert sum(stages["crawler_branch"].values()) == stages["crawl_status_1"] == 2
+
+
+def test_r2_sqlite_end_to_end_completed_chain():
+    """SQLite 全链(task→batch→spider→completed callback)端到端。"""
+    service = make_sqlite_service(
+        pool_rows=[pool_row("C9")],
+        cl_rows=[cl_row(91, "C9", 1)],
+        task_rows=[(91, "SAAS-188605_709_1", "01")],
+        spider_rows=[("188605_709", "X9", 1)],
+        callback_rows=[("X9", "0000", "completed")])
+    stages = service.get_diagnostic("2026-08-27")["stages"]
+    assert stages["crawler_branch"]["CALLBACK_DONE_SAAS_PENDING"] == 1
+    assert sum(stages["crawler_branch"].values()) == stages["crawl_status_1"] == 1
+
+
+def test_r2_sqlite_partial_batch_coverage():
+    """SQLite:两个 batch 只有一个有 spider 记录 → EVIDENCE_INCOMPLETE。"""
+    service = make_sqlite_service(
+        pool_rows=[pool_row("C8")],
+        cl_rows=[cl_row(81, "C8", 1)],
+        task_rows=[(81, "SAAS-188605_701_1", "01"), (81, "SAAS-188605_702_1", "01")],
+        spider_rows=[("188605_701", "X1", 0)],
+        callback_rows=[("X1", "8888", "active")])
+    stages = service.get_diagnostic("2026-08-27")["stages"]
+    assert stages["crawler_branch"]["EVIDENCE_INCOMPLETE"] == 1
+
+
+# ---- §15 契约:dominant 参与新状态,EVIDENCE_INCOMPLETE 仍不参与 ----
+
+def test_r2_dominant_uses_new_crawler_states():
+    service, _, _ = make_service({
+        "pool_sync_standard_counts": [("0", 2)],
+        "open_crawl_status_counts": [(2, 0, 2, 0, 0)],
+        "crawl1_commodity_rows": [(11, "C1"), (12, "C2")],
+        "crawl1_task_rows": [(11, "SAAS-188605_701_1", 1), (12, "SAAS-188605_702_1", 1)],
+        "crawl1_spider_task_rows": [("188605_701", "E1", 0), ("188605_702", "E2", 0)],
+        "crawl1_callback_rows": [("E1", "8888", "active"), ("E2", "8888", "active")],
+        "crawl2_search_flags": [],
+    })
+    stages = service.get_diagnostic("2026-08-27")["stages"]
+    assert stages["dominant_stage"]["key"] == "CALLBACK_IN_FLIGHT"
+    assert stages["dominant_stage"]["label_zh"] == "回调进行中"

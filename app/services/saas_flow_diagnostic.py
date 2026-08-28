@@ -55,18 +55,22 @@ MIN_CACHE_TTL_SECONDS = 60.0        # 生产要求:至少 60 秒缓存,禁止 5 
 MIN_FRESH_READ_INTERVAL_SECONDS = 30.0  # 强制刷新间隔下限与文档/UI 声明一致,env 不可降破
 MAX_CRAWL1_COMMODITIES = 2000       # 有界结果集:单日 crawl_status=1 目标商品上限
 MAX_CRAWL2_COMMODITIES = 2000
-MAX_CENTRAL_DETAIL_ROWS = 50        # evidence 明细展示上限
+MAX_CRAWL1_EXECUTION_NUMBERS = 2000  # 有界:单轮 callback 查询 execution_number 上限
 
 DEFAULT_DB_ENV_PATH = Path(__file__).resolve().parents[2] / "data" / "CNNC_DIAG_DB.env"
 
+# R2 Central Bypass(2026-08-28):crawl_status=1 主诊断链改走已实证的
+# task → batch → spider_task_record → execution_number → spider_sync_log(_complated)
+# callback 证据;s_task_info 不再是主诊断依赖,central 状态类全部移除。
+# 未验证语义禁止臆断:无 CALLBACK_FAILED(push_state 非 0000/8888 → 证据不足),
+# 无 PENDING_URL_SYNC(取证证明 CNNC 188605 无此状态值)。
 CRAWLER_BRANCH_CLASSES = (
     "TASK_NOT_CREATED",
-    "TASK_CREATED_NO_CENTRAL_RECORD",
-    "CENTRAL_NOT_ENQUEUED",
-    "CENTRAL_ENQUEUED_WAITING",
-    "CRAWLER_EXECUTING",
-    "CRAWLER_FAILED",
-    "CALLBACK_LAG",
+    "PUSH_RECORD_NOT_FOUND",
+    "PUSH_CONFIRMED_NO_CALLBACK_RECORD",
+    "CALLBACK_IN_FLIGHT",
+    "CALLBACK_PARTIAL",
+    "CALLBACK_DONE_SAAS_PENDING",
     "EVIDENCE_INCOMPLETE",
 )
 
@@ -84,12 +88,11 @@ DOWNSTREAM_BRANCH_CLASSES = (
 
 STAGE_LABELS_ZH = {
     "TASK_NOT_CREATED": "未生成task",
-    "TASK_CREATED_NO_CENTRAL_RECORD": "task未进分控",
-    "CENTRAL_NOT_ENQUEUED": "中控未入队",
-    "CENTRAL_ENQUEUED_WAITING": "已入队等待",
-    "CRAWLER_EXECUTING": "正在执行",
-    "CRAWLER_FAILED": "爬虫失败",
-    "CALLBACK_LAG": "callback lag",
+    "PUSH_RECORD_NOT_FOUND": "未发现爬虫推送记录",
+    "PUSH_CONFIRMED_NO_CALLBACK_RECORD": "已推送，暂无回调记录",
+    "CALLBACK_IN_FLIGHT": "回调进行中",
+    "CALLBACK_PARTIAL": "部分回调完成",
+    "CALLBACK_DONE_SAAS_PENDING": "回调已完成，SaaS尚未推进",
     "CALLBACK_DONE_NO_SEARCH": "callback后暂未search",
     "MODEL_PENDING": "模型处理中",
     "INTERNET_SAME_PENDING_APPROVAL": "互联网同款待审批",
@@ -199,14 +202,28 @@ DIAG_SQL_REGISTRY: dict[str, str] = {
         WHERE t.table_name = '188605'
           AND t.reference_id IN %(commodity_list_ids)s
     """,
-    # 仅对 exact batch 查分控(有界 IN,不扫全表)
-    "crawl1_central_rows": """
-        SELECT s.batch_num AS batch_num, s.task_status AS task_status,
-               s.queue_status AS queue_status, s.enqueue_time AS enqueue_time,
-               s.end_time AS end_time
-        FROM central_control_sub_demo.s_task_info s
-        WHERE s.is_valid = '1'
-          AND s.batch_num IN %(batch_nums)s
+    # R2 Central Bypass:推送记录按派生 batch 精确查询(batch_num 为 varchar,
+    # string 绑定;索引 index_batch_nim,生产实测 0.06~0.12s)。
+    "crawl1_spider_task_rows": """
+        SELECT r.batch_num AS batch_num, r.exe_number AS exe_number,
+               r.is_call AS is_call
+        FROM shopping_spider.spider_task_record r
+        WHERE r.batch_num IN %(batch_nums)s
+    """,
+    # R2 Central Bypass:callback 证据。单条 UNION ALL 同时取在途/完成两表,
+    # 减少两 SELECT 之间的时点漂移;execution_number 为 varchar,string 绑定,
+    # 两表均走 idx_ex(生产实测 0.07~0.33s)。语义(2026-08-28 生产取证):
+    # active '8888'=在途,completed '0000'=回调成功终态;其余值未验证。
+    "crawl1_callback_rows": """
+        SELECT l.execution_number AS execution_number, l.push_state AS push_state,
+               'active' AS callback_source
+        FROM shopping_spider.spider_sync_log l
+        WHERE l.execution_number IN %(execution_numbers)s
+        UNION ALL
+        SELECT c.execution_number AS execution_number, c.push_state AS push_state,
+               'completed' AS callback_source
+        FROM shopping_spider.spider_sync_log_complated c
+        WHERE c.execution_number IN %(execution_numbers)s
     """,
     # crawl_status=2 商品的 search/model/审批 flag 聚合(search_table 只聚合、不与 task JOIN)。
     # Cardinality:JOIN 商品级去重后的 pool 聚合(每商品一行,duplicate pool 行不再
@@ -261,7 +278,8 @@ QUERY_COLUMNS: dict[str, tuple[str, ...]] = {
                                  "routing_evidence_incomplete"),
     "crawl1_commodity_rows": ("commodity_list_id", "commodity_id"),
     "crawl1_task_rows": ("commodity_list_id", "task_id", "task_status"),
-    "crawl1_central_rows": ("batch_num", "task_status", "queue_status", "enqueue_time", "end_time"),
+    "crawl1_spider_task_rows": ("batch_num", "exe_number", "is_call"),
+    "crawl1_callback_rows": ("execution_number", "push_state", "callback_source"),
     "crawl2_search_flags": (
         "commodity_list_id", "search_rows", "pool_created_at", "model_pending",
         "has_internet_same", "internet_pending_approval", "same_approved",
@@ -271,7 +289,8 @@ QUERY_COLUMNS: dict[str, tuple[str, ...]] = {
 }
 
 _ALLOWED_QUERY_PARAMS = frozenset(
-    {"pool_id", "day_start", "day_end", "commodity_list_ids", "batch_nums"}
+    {"pool_id", "day_start", "day_end", "commodity_list_ids", "batch_nums",
+     "execution_numbers"}
 )
 
 # ---------------------------------------------------------------------------
@@ -429,39 +448,104 @@ def _as_str(value: Any) -> str:
     return str(value) if value is not None else ""
 
 
-def classify_crawler_branch(record: Mapping[str, Any]) -> str:
-    """crawl_status=1 商品分类。证据只用 enqueue/task/queue/end 时间字段。
+# R2 Central Bypass:已实证的 callback 语义(2026-08-28 生产只读取证)。
+CALLBACK_PUSH_STATE_SUCCESS = "0000"   # completed 表 = 回调成功终态
+CALLBACK_PUSH_STATE_IN_FLIGHT = "8888"  # active 表 = 在途/尚未完成
 
-    决策顺序(确定性,单商品只落一桶):
-    失败 > 全部子任务完成(02+end 时间,queue_status 不作要求)> 未入队 > 已入队等待
-    > 执行中 > 证据不足。
+
+def _normalize_execution_state(
+    is_call_values: set[int],
+    active_push_states: set[str],
+    completed_push_states: set[str],
+) -> str:
+    """单个 execution_number 的状态归一化。
+
+    返回 SUCCESS / PENDING / NO_CALLBACK_RECORD / EVIDENCE_INCOMPLETE。
+    未验证语义一律 fail-safe:未知 push_state、active+completed 重叠、
+    is_call 与 callback 证据矛盾、同一来源多 push_state 均不猜测。
     """
+    if len(is_call_values) != 1:
+        return "EVIDENCE_INCOMPLETE"
+    is_call = next(iter(is_call_values))
+    if active_push_states and completed_push_states:
+        return "EVIDENCE_INCOMPLETE"  # 重叠语义未验证,不按"completed 优先"隐藏冲突
+    if active_push_states:
+        if active_push_states != {CALLBACK_PUSH_STATE_IN_FLIGHT}:
+            return "EVIDENCE_INCOMPLETE"
+        return "PENDING" if is_call == 0 else "EVIDENCE_INCOMPLETE"
+    if completed_push_states:
+        if completed_push_states != {CALLBACK_PUSH_STATE_SUCCESS}:
+            return "EVIDENCE_INCOMPLETE"
+        return "SUCCESS" if is_call == 1 else "EVIDENCE_INCOMPLETE"
+    return "NO_CALLBACK_RECORD" if is_call == 0 else "EVIDENCE_INCOMPLETE"
+
+
+def classify_crawler_callback(record: Mapping[str, Any]) -> str:
+    """crawl_status=1 商品分类(R2 callback 证据链,单商品单桶)。
+
+    输入(由 _build_stages 组装):
+      task_count / task_failed / malformed / batches(派生 batch 集合) /
+      spider_failed / spider_rows(本商品 batch 的推送记录) /
+      callback_failed / callback_rows(本商品 execution 的回调记录) /
+      exes_truncated(execution 超出有界查询上限)
+
+    决策序(fail-safe 优先):查询失败/解析失败 > 未生成task > 推送记录缺失
+    (全部 batch 无记录才算;部分覆盖=证据不足)> 字段缺失 > 逐 execution
+    归一化 > item 聚合。
+    """
+    if record.get("task_failed"):
+        return "EVIDENCE_INCOMPLETE"
     if int(record.get("task_count") or 0) == 0:
-        return "TASK_NOT_CREATED"
-    rows = list(record.get("central") or [])
+        return "TASK_NOT_CREATED"  # 不依赖推送/回调查询
+    if record.get("malformed"):
+        return "EVIDENCE_INCOMPLETE"
+    if record.get("spider_failed") or record.get("callback_failed"):
+        return "EVIDENCE_INCOMPLETE"
+    batches = {str(b) for b in (record.get("batches") or ())}
+    if not batches:
+        return "EVIDENCE_INCOMPLETE"
+    rows = [r for r in (record.get("spider_rows") or [])
+            if _as_str(r.get("batch_num")) in batches]
+    covered = {_as_str(r.get("batch_num")) for r in rows}
     if not rows:
-        return "TASK_CREATED_NO_CENTRAL_RECORD"
+        return "PUSH_RECORD_NOT_FOUND"
+    if covered != batches:
+        return "EVIDENCE_INCOMPLETE"  # 部分 batch 无推送记录,不得冒充"未发现记录"
+    if any(not _as_str(r.get("exe_number")) for r in rows):
+        return "EVIDENCE_INCOMPLETE"
+    if record.get("exes_truncated"):
+        return "EVIDENCE_INCOMPLETE"
 
-    def norm(row: Mapping[str, Any]) -> tuple[str, str, Any, Any]:
-        return (_as_str(row.get("task_status")), _as_str(row.get("queue_status")),
-                row.get("enqueue_time"), row.get("end_time"))
-
-    normalized = [norm(row) for row in rows]
-
-    def has_end(end_time: Any) -> bool:
-        return end_time not in (None, "")
-
-    if any(ts == "03" for ts, _, _, _ in normalized):
-        return "CRAWLER_FAILED"
-    if all(ts == "02" and has_end(end) for ts, _, _, end in normalized):
-        return "CALLBACK_LAG"
-    if any(ts == "00" and qs == "00" and enqueue is None for ts, qs, enqueue, _ in normalized):
-        return "CENTRAL_NOT_ENQUEUED"
-    if any(ts == "00" for ts, _, _, _ in normalized):
-        return "CENTRAL_ENQUEUED_WAITING"
-    if any(ts == "01" or (ts == "02" and not has_end(end)) for ts, _, _, end in normalized):
-        return "CRAWLER_EXECUTING"
-    return "EVIDENCE_INCOMPLETE"
+    is_call_by_exe: dict[str, set[int]] = {}
+    for r in rows:
+        try:
+            call_flag = int(r.get("is_call") or 0)
+        except (TypeError, ValueError):
+            return "EVIDENCE_INCOMPLETE"
+        is_call_by_exe.setdefault(_as_str(r["exe_number"]), set()).add(call_flag)
+    active_by_exe: dict[str, set[str]] = {}
+    completed_by_exe: dict[str, set[str]] = {}
+    for r in record.get("callback_rows") or []:
+        exe = _as_str(r.get("execution_number"))
+        target = completed_by_exe if r.get("callback_source") == "completed" else active_by_exe
+        target.setdefault(exe, set()).add(_as_str(r.get("push_state")))
+    states = [
+        _normalize_execution_state(
+            is_call_by_exe.get(exe, set()),
+            active_by_exe.get(exe, set()),
+            completed_by_exe.get(exe, set()))
+        for exe in sorted(is_call_by_exe)
+    ]
+    if not states or "EVIDENCE_INCOMPLETE" in states:
+        return "EVIDENCE_INCOMPLETE"
+    if all(state == "SUCCESS" for state in states):
+        return "CALLBACK_DONE_SAAS_PENDING"
+    if any(state == "SUCCESS" for state in states):
+        return "CALLBACK_PARTIAL"
+    if any(state == "PENDING" for state in states):
+        # 纯 PENDING 或 PENDING+NO_CALLBACK_RECORD:存在真实在途回调
+        return "CALLBACK_IN_FLIGHT"
+    return "PUSH_CONFIRMED_NO_CALLBACK_RECORD"
 
 
 def _parse_shanghai_naive(value: Any) -> datetime | None:
@@ -854,7 +938,6 @@ class SaasFlowDiagnosticService:
         # Review P1-1:两个分支各自独立计数,同名 EVIDENCE_INCOMPLETE 不共享。
         crawler_counts: dict[str, int] | None = _empty_counts(CRAWLER_BRANCH_CLASSES)
         downstream_counts: dict[str, int] | None = _empty_counts(DOWNSTREAM_BRANCH_CLASSES)
-        central_detail: dict[tuple[str, str, str], int] | None = {}
         reference_pending_total: int | None = 0
         callback_no_search_within_grace: int | None = 0
         now_sh = self._now_fn().astimezone(SHANGHAI).replace(tzinfo=None)
@@ -867,77 +950,95 @@ class SaasFlowDiagnosticService:
             snapshot_drift.append("pool_vs_routing")
 
         if not crawl_failed:
-            # ---- Branch A: crawl_status = 1 → task → exact batch → 分控 ----
+            # ---- Branch A (R2): crawl_status=1 → task → batch → spider 推送
+            # → execution_number → callback 证据。s_task_info 不再执行。----
             crawl1_rows = run("crawl1_commodity_rows", {})
             if "crawl1_commodity_rows" in degraded:
                 crawler_counts["EVIDENCE_INCOMPLETE"] += crawl1_total or 0
-                # P2:查询失败 ≠ 真实无分控行,central 明细证据不可用
-                central_detail = None
             elif len(crawl1_rows) > (crawl1_total or 0):
                 crawler_counts = None
-                central_detail = None  # R3 P2:drift 分支的派生证据不可用,不冒充空列表
                 snapshot_drift.append("crawler_branch")
             else:
                 ids = [int(row["commodity_list_id"]) for row in crawl1_rows[:MAX_CRAWL1_COMMODITIES]]
                 task_rows: list[dict[str, Any]] = []
                 task_failed = False
                 if ids:
-                    # Fix A(R1):task_table.reference_id 是 varchar(255)。int 绑定会让
-                    # MySQL 对列做数值转换、idx_reference_id 失效(生产 EXPLAIN:
-                    # key=idx_table_name/rows≈59 万,8~9s);按列原生类型字符串绑定后
-                    # key=idx_reference_id、rows≈95、0.06s(行集一致,2026-08-28 实测)。
+                    # Fix A(R1):task_table.reference_id 是 varchar(255),必须 string 绑定
                     task_rows = run("crawl1_task_rows",
                                     {"commodity_list_ids": tuple(str(i) for i in ids)})
                     task_failed = "crawl1_task_rows" in degraded
                 tasks_by_commodity: dict[int, list[dict[str, Any]]] = {}
                 for row in task_rows:
                     tasks_by_commodity.setdefault(int(row["commodity_list_id"]), []).append(row)
-                batches: set[str] = set()
-                for row in task_rows:
-                    batch = _batch_from_task_id(_as_str(row.get("task_id")))
-                    if batch is not None:
-                        batches.add(batch)
-                central_rows: list[dict[str, Any]] = []
-                central_failed = False
-                if batches:
-                    central_rows = run("crawl1_central_rows", {"batch_nums": tuple(sorted(batches))})
-                    central_failed = "crawl1_central_rows" in degraded
-                if task_failed or central_failed:
-                    # P2:task/central 查询失败 → central 证据链不可用,不冒充空列表;
-                    # 只有查询成功且真实无行才允许 [](见 detail 组装)。
-                    central_detail = None
-                central_by_batch: dict[str, list[dict[str, Any]]] = {}
-                for row in central_rows:
-                    central_by_batch.setdefault(_as_str(row.get("batch_num")), []).append(row)
-                    key = (_as_str(row.get("batch_num")), _as_str(row.get("task_status")),
-                           _as_str(row.get("queue_status")))
-                    central_detail[key] = central_detail.get(key, 0) + 1
+                # 每商品派生 batch 集合(支持多 batch;不假设单 batch)
+                batches_by_commodity: dict[int, tuple[set[str], bool]] = {}
+                all_batches: set[str] = set()
                 for commodity_list_id in ids:
                     tasks = tasks_by_commodity.get(commodity_list_id, [])
-                    # Review R2 P2-2 决策序(逐级,不整体降级):
-                    if task_failed:
-                        crawler_counts["EVIDENCE_INCOMPLETE"] += 1
-                        continue
-                    if not tasks:
-                        crawler_counts["TASK_NOT_CREATED"] += 1  # 不依赖 central 查询
-                        continue
-                    commodity_batches = [_batch_from_task_id(_as_str(t.get("task_id")))
-                                         for t in tasks]
-                    if any(batch is None for batch in commodity_batches):
-                        # Review R2 P1-2:malformed task 证据 ≠ task 未进分控;
-                        # 混合合法/malformed 同样证据集合不完整
-                        crawler_counts["EVIDENCE_INCOMPLETE"] += 1
-                        continue
-                    if central_failed:
-                        crawler_counts["EVIDENCE_INCOMPLETE"] += 1
-                        continue
-                    unique_batches = list(dict.fromkeys(commodity_batches))
-                    central_for_commodity = [row for batch in unique_batches
-                                             for row in central_by_batch.get(batch, [])]
-                    crawler_counts[classify_crawler_branch({
-                        "task_count": len(tasks),
-                        "central": central_for_commodity,
-                    })] += 1
+                    commodity_batches: set[str] = set()
+                    malformed = False
+                    for t in tasks:
+                        batch = _batch_from_task_id(_as_str(t.get("task_id")))
+                        if batch is None:
+                            malformed = True
+                        else:
+                            commodity_batches.add(batch)
+                    batches_by_commodity[commodity_list_id] = (commodity_batches, malformed)
+                    all_batches |= commodity_batches
+
+                spider_rows: list[dict[str, Any]] = []
+                spider_failed = False
+                if all_batches and not task_failed:
+                    # batch_num 为 varchar,string 绑定(生产实测走 index_batch_nim)
+                    spider_rows = run("crawl1_spider_task_rows",
+                                      {"batch_nums": tuple(sorted(all_batches))})
+                    spider_failed = "crawl1_spider_task_rows" in degraded
+                spider_by_batch: dict[str, list[dict[str, Any]]] = {}
+                for row in spider_rows:
+                    spider_by_batch.setdefault(_as_str(row.get("batch_num")), []).append(row)
+
+                all_exes: set[str] = set()
+                for rows_of_batch in spider_by_batch.values():
+                    for r in rows_of_batch:
+                        exe = _as_str(r.get("exe_number"))
+                        if exe:
+                            all_exes.add(exe)
+                exes_truncated = len(all_exes) > MAX_CRAWL1_EXECUTION_NUMBERS
+                bounded_exes = sorted(all_exes)[:MAX_CRAWL1_EXECUTION_NUMBERS]
+                callback_rows: list[dict[str, Any]] = []
+                callback_failed = False
+                if bounded_exes and not task_failed and not spider_failed:
+                    # execution_number 为 varchar,string 绑定(两表 idx_ex)
+                    callback_rows = run("crawl1_callback_rows",
+                                        {"execution_numbers": tuple(bounded_exes)})
+                    callback_failed = "crawl1_callback_rows" in degraded
+                callback_by_exe: dict[str, list[dict[str, Any]]] = {}
+                for row in callback_rows:
+                    callback_by_exe.setdefault(_as_str(row.get("execution_number")), []).append(row)
+
+                def item_record(commodity_list_id: int,
+                                item_batches: set[str], malformed: bool) -> dict[str, Any]:
+                    item_rows = [r for b in sorted(item_batches)
+                                 for r in spider_by_batch.get(b, [])]
+                    item_exes = {_as_str(r.get("exe_number")) for r in item_rows
+                                 if _as_str(r.get("exe_number"))}
+                    return {
+                        "task_count": len(tasks_by_commodity.get(commodity_list_id, [])),
+                        "task_failed": task_failed,
+                        "malformed": malformed,
+                        "batches": item_batches,
+                        "spider_failed": spider_failed,
+                        "spider_rows": item_rows,
+                        "callback_failed": callback_failed,
+                        "callback_rows": [r for exe in sorted(item_exes)
+                                          for r in callback_by_exe.get(exe, [])],
+                        "exes_truncated": exes_truncated and not item_exes <= set(bounded_exes),
+                    }
+
+                for commodity_list_id in ids:
+                    item_batches, malformed = batches_by_commodity[commodity_list_id]
+                    crawler_counts[classify_crawler_callback(
+                        item_record(commodity_list_id, item_batches, malformed))] += 1
                 overflow = (crawl1_total or 0) - len(ids)
                 if overflow > 0:
                     crawler_counts["EVIDENCE_INCOMPLETE"] += overflow
@@ -973,19 +1074,10 @@ class SaasFlowDiagnosticService:
             downstream_counts = None
             reference_pending_total = None
             callback_no_search_within_grace = None
-            central_detail = None
 
         dominant = None
         if crawler_counts is not None and downstream_counts is not None:
             dominant = _dominant_stage(crawler_counts, downstream_counts, no_commodity_list)
-        detail = None
-        if central_detail is not None:
-            detail = [
-                {"batch_num": batch, "task_status": task_status, "queue_status": queue_status,
-                 "count": number}
-                for (batch, task_status, queue_status), number in
-                sorted(central_detail.items(), key=lambda item: (-item[1], item[0]))[:MAX_CENTRAL_DETAIL_ROWS]
-            ]
         stages = {
             # Review P1-6:SQL 池计数不得冒充权威客户计数(权威计数在 growth.customer_count)
             "pool_counts_available": not pool_failed,
@@ -1011,7 +1103,9 @@ class SaasFlowDiagnosticService:
             "downstream_branch": downstream_counts,
             "callback_done_no_search_within_grace": callback_no_search_within_grace,
             "reference_pending_approval_total": reference_pending_total,
-            "central_status_detail": detail,
+            # R2:central 诊断已退役(不再查询 s_task_info)。保留 key 以兼容
+            # 现有前端/消费者,恒为 None——绝不返回 [] 冒充"查过 central 且无任务"。
+            "central_status_detail": None,
             "dominant_stage": dominant,
             "queried_at": datetime.now(UTC).isoformat(timespec="seconds"),
         }

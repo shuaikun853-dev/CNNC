@@ -280,10 +280,13 @@
     intervalMs: SF_POLL_INTERVAL_MS,
   });
 
+  // R2 Central Bypass:crawl1 链改为 task→推送→回调证据;central 状态已退役。
+  // "未发现记录"≠"未推送":缺记录只是当前证据下未见,文案不得写成确定未发生。
   const SF_STAGE_LABELS = {
-    TASK_NOT_CREATED: "未生成task", TASK_CREATED_NO_CENTRAL_RECORD: "task未进分控",
-    CENTRAL_NOT_ENQUEUED: "中控未入队", CENTRAL_ENQUEUED_WAITING: "已入队等待",
-    CRAWLER_EXECUTING: "正在执行", CRAWLER_FAILED: "爬虫失败", CALLBACK_LAG: "callback lag",
+    TASK_NOT_CREATED: "未生成task", PUSH_RECORD_NOT_FOUND: "未发现爬虫推送记录",
+    PUSH_CONFIRMED_NO_CALLBACK_RECORD: "已推送，暂无回调记录",
+    CALLBACK_IN_FLIGHT: "回调进行中", CALLBACK_PARTIAL: "部分回调完成",
+    CALLBACK_DONE_SAAS_PENDING: "回调已完成，SaaS尚未推进",
     CALLBACK_DONE_NO_SEARCH: "callback后暂未search", MODEL_PENDING: "模型处理中",
     INTERNET_SAME_PENDING_APPROVAL: "互联网同款待审批",
     APPROVAL_OR_FINAL_CLOSURE_PENDING: "最终收口中",
@@ -388,8 +391,9 @@
     const drift = stages.snapshot_drift || [];
     const driftNote = "查询期间数据变化,本轮该分支分类暂不发布(约 60 秒后自动重新取证;这是取证时点问题,不是业务异常)";
     const crawler = stages.crawler_branch || {}, down = stages.downstream_branch || {};
-    const crawlerKeys = ["TASK_NOT_CREATED", "TASK_CREATED_NO_CENTRAL_RECORD", "CENTRAL_NOT_ENQUEUED",
-      "CENTRAL_ENQUEUED_WAITING", "CRAWLER_EXECUTING", "CRAWLER_FAILED", "CALLBACK_LAG"];
+    const crawlerKeys = ["TASK_NOT_CREATED", "PUSH_RECORD_NOT_FOUND",
+      "PUSH_CONFIRMED_NO_CALLBACK_RECORD", "CALLBACK_IN_FLIGHT", "CALLBACK_PARTIAL",
+      "CALLBACK_DONE_SAAS_PENDING"];
     const downKeys = ["CALLBACK_DONE_NO_SEARCH", "MODEL_PENDING", "INTERNET_SAME_PENDING_APPROVAL",
       "APPROVAL_OR_FINAL_CLOSURE_PENDING", "INTERNET_CANDIDATES_ALL_NON_SAME", "REFERENCE_SAME_ONLY",
       "MODEL_DONE_NO_SAME", "NO_INTERNET_CANDIDATE"];
@@ -430,12 +434,6 @@
     const parts = [];
     if (stages.reference_pending_approval_total) {
       parts.push("其中参考链接同款待人工审批 " + Number(stages.reference_pending_approval_total) + " 个商品");
-    }
-    const detail = stages.central_status_detail || [];
-    if (detail.length) {
-      parts.push("分控子任务状态(前 " + detail.length + " 组,batch/任务/队列态×数量):" +
-        detail.map((d) => esc(String(d.task_status) + "/" + String(d.queue_status) + " ×" + d.count))
-          .join("、"));
     }
     if (!parts.length) return "";
     return "<p>" + parts.join("。</p><p>") + "。</p>";

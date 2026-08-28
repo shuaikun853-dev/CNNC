@@ -321,6 +321,38 @@ function test_sf_growth_after_cutoff_text_not_normal() {
   check("P2-1 AFTER_CUTOFF 文案不得包含「正常」", !text.includes("正常"), text);
 }
 
+// ---- R2 Central Bypass:crawl1 状态树文案契约 ----
+
+function test_r2_crawler_tree_uses_callback_evidence_labels() {
+  const fs = require("fs");
+  const js = fs.readFileSync(
+    path.join(__dirname, "..", "..", "app", "static", "dashboard", "app.js"), "utf-8");
+  for (const oldLabel of ["task未进分控", "中控未入队", "已入队等待", "正在执行",
+                          "爬虫失败", "callback lag"]) {
+    check("R2 旧 central 文案必须从页面移除:" + oldLabel,
+          !js.includes('"' + oldLabel + '"'), oldLabel);
+  }
+  for (const newLabel of ["未发现爬虫推送记录", "已推送，暂无回调记录", "回调进行中",
+                          "部分回调完成", "回调已完成，SaaS尚未推进"]) {
+    check("R2 新回调链文案必须存在:" + newLabel, js.includes('"' + newLabel + '"'), newLabel);
+  }
+  check("R2 禁止出现未经验证的 PENDING_URL_SYNC",
+        !js.includes("PENDING_URL_SYNC") && !js.includes("s_task_info"));
+  // 阶段树渲染:新状态键生成对应 <li>
+  const stages = {
+    crawl_status_available: true, pool_counts_available: true,
+    snapshot_consistent: true, snapshot_drift: [],
+    pool_scope_total: 2, not_closed: 2, crawl_status_1: 2, crawl_status_2: 0,
+    grace_seconds: 1800,
+    crawler_branch: { TASK_NOT_CREATED: 1, CALLBACK_IN_FLIGHT: 1 },
+    downstream_branch: {},
+  };
+  const html = sfTreeHtml(stages);
+  check("R2 阶段树渲染新状态(未生成task/回调进行中)",
+        html.includes("未生成task") && html.includes("回调进行中") &&
+        html.includes("爬虫未回调:2"), html);
+}
+
 (async () => {
   await test_304_keeps_sync_fresh_without_rerender();
   await test_hidden_pauses_and_visible_resumes();
@@ -334,6 +366,7 @@ function test_sf_growth_after_cutoff_text_not_normal() {
   test_sf_partial_notice_three_states();
   test_sf_tree_shows_routing_evidence_incomplete();
   test_sf_growth_after_cutoff_text_not_normal();
+  test_r2_crawler_tree_uses_callback_evidence_labels();
   if (failed === 0) { console.log("ALL PASS"); process.exit(0); }
   console.error(failed + " failing checks");
   process.exit(1);

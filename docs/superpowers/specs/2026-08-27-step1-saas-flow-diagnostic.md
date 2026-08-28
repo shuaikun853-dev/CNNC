@@ -249,3 +249,11 @@ Implementation is not mergeable until all are true:
 10. Unit/integration tests cover security scope, state classification, growth-stall detection, caching, and degradation.
 11. Fresh full test suite passes before review.
 12. No merge, deployment, scheduled-task change, or production configuration change without explicit user approval.
+
+## Round 2 Addendum — Central Bypass(2026-08-28)
+
+crawl_status=1 主诊断链由 s_task_info central 查询替换为已生产实证的 callback 证据链:
+task_table.task_id → _batch_from_task_id → shopping_spider.spider_task_record(batch_num 索引) → exe_number → spider_sync_log/_complated(execution_number 索引)。
+central 状态类(TASK_CREATED_NO_CENTRAL_RECORD 等 6 项)退役;新状态:TASK_NOT_CREATED / PUSH_RECORD_NOT_FOUND / PUSH_CONFIRMED_NO_CALLBACK_RECORD / CALLBACK_IN_FLIGHT / CALLBACK_PARTIAL / CALLBACK_DONE_SAAS_PENDING / EVIDENCE_INCOMPLETE。
+已实证语义:completed push_state=0000=回调成功终态、active 8888=在途、spider_task_record.is_call 0/1 对应未回调/已回调;其余 push_state 未验证 → 证据不足,不设 CALLBACK_FAILED;PENDING_URL_SYNC 无出处,禁用。
+s_task_info 不再出现在 DIAG_SQL_REGISTRY;central_status_detail 保留 key 恒 None。
