@@ -10,6 +10,7 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import time
 import uuid
 from collections import Counter
@@ -456,6 +457,41 @@ def _temporary_environment(values: Mapping[str, str]):
                 os.environ.pop(key, None)
             else:
                 os.environ[key] = value
+
+
+_ZHAOSHANG_ENV_LOCK = threading.RLock()
+
+
+@contextmanager
+def _locked_temporary_environment(values: Mapping[str, str]):
+    """Serialize the whole process-env mutation window across threads.
+
+    ``_temporary_environment`` mutates ``os.environ`` (process-global), so two
+    overlapping callers cross-contaminate auth or leave residue.  Every
+    zhaoshang seam that keeps the temporary env alive across downstream calls
+    (the priority DB connection constructor reads ZHAOSHANG_DB_* dynamically)
+    must hold this lock for the entire window.  HTTP helpers never re-read the
+    environment (auth is copied into ``session.headers`` by ``build_session``),
+    so session-based seams use ``_locked_session_construction`` instead and
+    keep their network calls concurrent.
+    """
+    with _ZHAOSHANG_ENV_LOCK:
+        with _temporary_environment(values):
+            yield
+
+
+@contextmanager
+def _locked_session_construction(session_environment, build):
+    """Lock only env-injection + session construction; yield the raw session.
+
+    The legacy constructor copies BLADE_AUTH/COOKIE into the session headers
+    and never re-reads the environment afterwards, so serializing the
+    construction window removes the os.environ race while the returned
+    session's HTTP calls stay fully concurrent.
+    """
+    with _ZHAOSHANG_ENV_LOCK:
+        with _temporary_environment(session_environment):
+            yield build()
 
 
 def _host_matches(host: str, domains: Iterable[str]) -> bool:
@@ -993,7 +1029,7 @@ class CnncLegacyZhaoshangAdapter:
                 "legacy_zhaoshang_priority_core",
             )
             db_environment = load_zhaoshang_db_env(self._db_env_path)
-            with _temporary_environment(db_environment):
+            with _locked_temporary_environment(db_environment):
                 marker_time = self._submission_marker_time(
                     self._read_batch_events(job),
                     task_id,
@@ -1212,18 +1248,18 @@ class CnncLegacyZhaoshangAdapter:
         remaining = deadline - self._monotonic()
         if remaining <= 0:
             raise TimeoutError("legacy reconciliation auth refresh exhausted the deadline")
-        with _temporary_environment(auth_environment):
+        with _locked_session_construction(auth_environment, module.build_session) as _raw:
             session = _BoundedReadOnlySession(
-                module.build_session(),
+                _raw,
                 remaining,
                 monotonic=self._monotonic,
                 deadline=deadline,
             )
-            mall_code = module.priority_mall_code_for_key(mall_key)
-            try:
-                return module.check_existing_task(session, task_name, mall_code)
-            except RuntimeError as exc:
-                raise SubmissionEvidenceConflictError(str(exc)) from exc
+        mall_code = module.priority_mall_code_for_key(mall_key)
+        try:
+            return module.check_existing_task(session, task_name, mall_code)
+        except RuntimeError as exc:
+            raise SubmissionEvidenceConflictError(str(exc)) from exc
 
     def reconcile_unknown(self, job: PreparedLegacyJob, *, timeout_seconds: float) -> LegacyReconcileOutcome:
         if timeout_seconds <= 0:
@@ -1516,7 +1552,7 @@ class CnncLegacyZhaoshangAdapter:
         }
         if len(session_environment) != 2:
             raise LegacyZhaoshangAdapterError("legacy Zhaoshang session auth is unavailable")
-        with _temporary_environment(session_environment):
+        with _locked_temporary_environment(session_environment):
             session = tool.build_session()
             mall_code = tool.priority_mall_code_for_key(job.mall_key)
             resolved_task_name, _batch_number = tool.build_browser_task_identifiers(
@@ -1672,7 +1708,7 @@ class CnncLegacyZhaoshangAdapter:
         }
         if len(session_environment) != 2:
             raise LegacyZhaoshangAdapterError("legacy Zhaoshang session auth is unavailable")
-        with _temporary_environment(session_environment):
+        with _locked_temporary_environment(session_environment):
             session = _BoundedReadOnlySession(
                 tool.build_session(),
                 timeout_seconds,
@@ -1916,47 +1952,47 @@ class CnncLegacyZhaoshangAdapter:
         }
         if len(session_environment) != 2:
             raise LegacyZhaoshangAdapterError("legacy Zhaoshang session auth is unavailable")
-        with _temporary_environment(session_environment):
+        with _locked_session_construction(session_environment, tool.build_session) as _raw:
             session = _BoundedReadOnlySession(
-                tool.build_session(),
+                _raw,
                 timeout_seconds,
                 monotonic=self._monotonic,
                 deadline=deadline,
             )
-            mall_code = tool.priority_mall_code_for_key(job.mall_key)
-            resolved_task_name, _batch_number = tool.build_browser_task_identifiers(
-                job.task_name, job.mall_key
+        mall_code = tool.priority_mall_code_for_key(job.mall_key)
+        resolved_task_name, _batch_number = tool.build_browser_task_identifiers(
+            job.task_name, job.mall_key
+        )
+        # Identity verification boundary (same proof rules as the running
+        # probe): the external tool's exact-task lookup RuntimeError sites
+        # and get_task_identity's 商城标识不一致 marker are PROVEN
+        # conflicts with the durable remote identity; malformed payloads
+        # stay untyped so they keep counting transient.
+        try:
+            task = tool.check_existing_task(session, resolved_task_name, mall_code)
+        except RuntimeError as exc:
+            raise RemoteTaskIdentityConflictError(str(exc)) from exc
+        if task is None:
+            raise LegacyZhaoshangAdapterError(
+                "progress query found no exact existing task"
             )
-            # Identity verification boundary (same proof rules as the running
-            # probe): the external tool's exact-task lookup RuntimeError sites
-            # and get_task_identity's 商城标识不一致 marker are PROVEN
-            # conflicts with the durable remote identity; malformed payloads
-            # stay untyped so they keep counting transient.
-            try:
-                task = tool.check_existing_task(session, resolved_task_name, mall_code)
-            except RuntimeError as exc:
+        try:
+            live_task_id, live_task_number, _mall_logo = tool.get_task_identity(task, mall_code)
+        except RuntimeError as exc:
+            if "商城标识不一致" in str(exc):
                 raise RemoteTaskIdentityConflictError(str(exc)) from exc
-            if task is None:
-                raise LegacyZhaoshangAdapterError(
-                    "progress query found no exact existing task"
-                )
-            try:
-                live_task_id, live_task_number, _mall_logo = tool.get_task_identity(task, mall_code)
-            except RuntimeError as exc:
-                if "商城标识不一致" in str(exc):
-                    raise RemoteTaskIdentityConflictError(str(exc)) from exc
-                raise
-            if str(live_task_id) != str(task_id) or str(live_task_number) != str(task_number):
-                raise RemoteTaskIdentityConflictError(
-                    "live task identity does not match the durable remote identity"
-                )
-            remaining = deadline - self._monotonic()
-            if remaining <= 0:
-                raise TimeoutError("progress query deadline exhausted before progress query")
-            # The progress endpoint keys on the task record's batchNumber, not
-            # the RW- taskNumber; mirror run_auto_task's identifier choice.
-            batch_number = _text(task.get("batchNumber")) or resolved_task_name
-            progress_json = tool.query_task_progress(session, batch_number)
+            raise
+        if str(live_task_id) != str(task_id) or str(live_task_number) != str(task_number):
+            raise RemoteTaskIdentityConflictError(
+                "live task identity does not match the durable remote identity"
+            )
+        remaining = deadline - self._monotonic()
+        if remaining <= 0:
+            raise TimeoutError("progress query deadline exhausted before progress query")
+        # The progress endpoint keys on the task record's batchNumber, not
+        # the RW- taskNumber; mirror run_auto_task's identifier choice.
+        batch_number = _text(task.get("batchNumber")) or resolved_task_name
+        progress_json = tool.query_task_progress(session, batch_number)
         # Business-response gate (same rule as the probe path): a business-
         # failed progress response donates no counter evidence, so it returns
         # progress=None (REMOTE_UNKNOWN upstream) instead of raising; the raw
@@ -2125,7 +2161,7 @@ class CnncLegacyZhaoshangAdapter:
                 )
             return task, str(live_task_id), str(live_task_number), mall_logo
 
-        with _temporary_environment(session_environment):
+        with _locked_temporary_environment(session_environment):
             # The deadline must reach the real HTTP requests: the legacy tool
             # hard-codes timeout=60 inside its helpers, so every call flows
             # through this clamping session wrapper instead.
@@ -2429,7 +2465,7 @@ class CnncLegacyZhaoshangAdapter:
                 )
             return task, str(live_task_id), str(live_task_number), mall_logo
 
-        with _temporary_environment(session_environment):
+        with _locked_temporary_environment(session_environment):
             session = _BoundedReadOnlySession(
                 tool.build_session(),
                 timeout_seconds,

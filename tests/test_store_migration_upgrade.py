@@ -224,3 +224,79 @@ def test_supersede_and_readers_work_after_upgrade(copied_db: Path):
     listed = store.list_remote_replacements(int(lease.run_id))
     assert [int(row["id"]) for row in listed] == [replacement_id]
     assert listed[0]["rebuild_action_id"] == "smoke-action-1"
+
+
+def test_upgrade_adds_rebuild_actions_table_alongside_replacements(copied_db: Path):
+    # P1-2:44c37de 夹具升级后必须与 remote_job_replacements 并存,且
+    # write-ahead rebuild action 协议(建行/推进/读回)立即可用、行完整。
+    store = DailyAuditStore(copied_db)
+    names = store.table_names()
+    assert "remote_job_rebuild_actions" in names
+    assert "remote_job_replacements" in names
+
+    lease = store.acquire_lease(BUSINESS_DATE, "rebuild-action-smoke", 300.0)
+    try:
+        jobs = {job["logical_key"]: job for job in store.list_remote_jobs(lease)}
+        job2_id = int(jobs[JOB2_LOGICAL_KEY]["id"])
+        action = store.create_rebuild_action(
+            lease,
+            action_id="upgrade-action-1",
+            old_remote_job_id=job2_id,
+            remote_identity="jd|200|RW-200",
+            replacement_task_name="cnnc_current_opt_京东_44444444444444",
+        )
+        store.update_rebuild_action_phase(
+            lease,
+            action_id="upgrade-action-1",
+            phase="STOP_SENT",
+            stop_evidence={"phase": "STOP_SENT"},
+        )
+    finally:
+        store.release_lease(lease)
+
+    stored = store.get_rebuild_action("upgrade-action-1")
+    assert stored is not None
+    assert int(stored["run_id"]) == int(lease.run_id)
+    assert int(stored["old_remote_job_id"]) == job2_id
+    assert stored["remote_identity"] == "jd|200|RW-200"
+    assert stored["replacement_task_name"] == "cnnc_current_opt_京东_44444444444444"
+    assert stored["phase"] == "STOP_SENT"
+    assert json.loads(stored["stop_evidence_json"]) == {"phase": "STOP_SENT"}
+    assert stored["new_remote_job_id"] is None
+    assert stored["error_text"] is None
+    assert stored["created_at"] and stored["updated_at"]
+    assert store.get_latest_rebuild_action_for_job(job2_id)["action_id"] == "upgrade-action-1"
+
+
+def test_reopen_recreates_dropped_rebuild_actions_table(copied_db: Path):
+    # 模拟 8526659(只有 replacements 表)夹具:先升级出两表,再 sqlite 直接
+    # DROP 掉 rebuild_actions,重新打开必须把缺失表原地重建且不动既有行。
+    first = DailyAuditStore(copied_db)
+    assert {"remote_job_rebuild_actions", "remote_job_replacements"} <= first.table_names()
+    jobs_before, crawls_before = _snapshot_rows(copied_db)
+
+    connection = _connect(copied_db)
+    try:
+        connection.execute("DROP TABLE remote_job_rebuild_actions")
+        connection.commit()
+    finally:
+        connection.close()
+    assert "remote_job_rebuild_actions" not in _sqlite_tables(copied_db)
+
+    second = DailyAuditStore(copied_db)  # 重新打开:_initialize 重建缺失表
+    names = second.table_names()
+    assert "remote_job_rebuild_actions" in names
+    assert "remote_job_replacements" in names
+
+    third = DailyAuditStore(copied_db)  # 两轮打开幂等
+    assert {"remote_job_rebuild_actions", "remote_job_replacements"} <= third.table_names()
+
+    jobs_after, crawls_after = _snapshot_rows(copied_db)
+    assert jobs_after == jobs_before
+    assert crawls_after == crawls_before
+
+    connection = _connect(copied_db)
+    try:
+        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
+    finally:
+        connection.close()

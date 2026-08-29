@@ -375,6 +375,21 @@ class DailyAuditStore:
                     UNIQUE(run_id, old_remote_job_id),
                     UNIQUE(rebuild_action_id)
                 );
+                CREATE TABLE IF NOT EXISTS remote_job_rebuild_actions (
+                    id INTEGER PRIMARY KEY,
+                    run_id INTEGER NOT NULL REFERENCES daily_runs(id) ON DELETE CASCADE,
+                    action_id TEXT NOT NULL,
+                    old_remote_job_id INTEGER NOT NULL REFERENCES remote_jobs(id),
+                    remote_identity TEXT NOT NULL,
+                    replacement_task_name TEXT NOT NULL,
+                    phase TEXT NOT NULL DEFAULT 'INTENT',
+                    stop_evidence_json TEXT NOT NULL DEFAULT '{}',
+                    new_remote_job_id INTEGER,
+                    error_text TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(action_id)
+                );
                 """
             )
             columns = {row["name"] for row in connection.execute("PRAGMA table_info(remote_jobs)")}
@@ -1248,14 +1263,17 @@ class DailyAuditStore:
         new_batch_number: str,
         stop_evidence: Mapping[str, Any],
         eligible_crawl_ids: Sequence[int],
+        rebuild_action_id: str | None = None,
     ) -> dict[str, Any]:
         """Retire one manual-rebuild target by recording its durable replacement.
 
         One BEGIN IMMEDIATE transaction moves the non-terminal crawl evidence
         of the old job to a fresh SUBMIT_INTENT job, records the replacement
-        lineage (action id, batch numbers, stop evidence) and marks the old
+        lineage (action id, batch numbers, stop evidence), marks the old
         job SUPERSEDED without touching its accumulated error/recovery
-        evidence.  Every precondition is checked inside the transaction, so a
+        evidence and -- when ``rebuild_action_id`` is given -- advances the
+        write-ahead rebuild action to its SUPERSEDED phase bound to the new
+        job.  Every precondition is checked inside the transaction, so a
         rejected rebuild leaves zero durable writes behind.
         """
         ids = list(dict.fromkeys(int(crawl_id) for crawl_id in eligible_crawl_ids))
@@ -1345,6 +1363,19 @@ class DailyAuditStore:
                    WHERE id IN ({placeholders})""",
                 (new_job_id, now, *ids),
             )
+            if rebuild_action_id is not None:
+                action = connection.execute(
+                    "SELECT * FROM remote_job_rebuild_actions WHERE action_id=? AND run_id=?",
+                    (str(rebuild_action_id), token.run_id),
+                ).fetchone()
+                if action is None or int(action["old_remote_job_id"]) != old_job_id:
+                    raise RemoteIntentConflict("rebuild action does not match the superseded job")
+                connection.execute(
+                    """UPDATE remote_job_rebuild_actions
+                       SET phase='SUPERSEDED', new_remote_job_id=?, updated_at=?
+                       WHERE id=?""",
+                    (new_job_id, now, int(action["id"])),
+                )
             return {
                 "old_job": self._row(connection.execute("SELECT * FROM remote_jobs WHERE id=?", (old_job_id,)).fetchone()),
                 "new_job": self._row(connection.execute("SELECT * FROM remote_jobs WHERE id=?", (new_job_id,)).fetchone()),
@@ -1380,6 +1411,167 @@ class DailyAuditStore:
                 (run_id,),
             ).fetchall()
             return [self._row(row) for row in rows]  # type: ignore[list-item]
+
+    _REBUILD_ACTION_ACTIVE_PHASES_SQL = (
+        "'INTENT','STOP_SENT','STOP_CONFIRMED','TERMINAL_PROOF','CREATE_SENT'"
+    )
+
+    def create_rebuild_action(
+        self,
+        token: LeaseToken,
+        *,
+        action_id: str,
+        old_remote_job_id: int,
+        remote_identity: str,
+        replacement_task_name: str,
+    ) -> dict[str, Any]:
+        """Persist the write-ahead INTENT row of one manual-rebuild protocol.
+
+        The row is the durable evidence that a rebuild protocol owns this old
+        remote job before any remote disable/create write leaves the process.
+        One BEGIN IMMEDIATE transaction admits the action only when no other
+        active protocol exists for the old job, no replacement was recorded
+        yet and the action id is globally unique (a FAILED action never
+        blocks a fresh protocol).
+        """
+        action_id = str(action_id)
+        identity = str(remote_identity or "").strip()
+        parts = identity.split("|")
+        if len(parts) != 3 or not all(parts):
+            raise ValueError("remote identity must have exactly three non-empty parts")
+        now = self._utcnow()
+        with self._transaction(immediate=True) as connection:
+            self._validate_lease(connection, token)
+            job = connection.execute(
+                "SELECT * FROM remote_jobs WHERE id=?", (int(old_remote_job_id),)
+            ).fetchone()
+            if job is None or int(job["run_id"]) != token.run_id:
+                raise ValueError("old remote job must belong to the leased daily run")
+            active = connection.execute(
+                f"""SELECT id FROM remote_job_rebuild_actions
+                    WHERE run_id=? AND old_remote_job_id=?
+                      AND phase IN ({self._REBUILD_ACTION_ACTIVE_PHASES_SQL})""",
+                (token.run_id, int(old_remote_job_id)),
+            ).fetchone()
+            if active is not None:
+                raise RemoteIntentConflict(
+                    "an active rebuild action already exists for this remote job"
+                )
+            replaced = connection.execute(
+                "SELECT id FROM remote_job_replacements WHERE run_id=? AND old_remote_job_id=?",
+                (token.run_id, int(old_remote_job_id)),
+            ).fetchone()
+            if replaced is not None:
+                raise RemoteIntentConflict("remote job already has a replacement")
+            try:
+                cursor = connection.execute(
+                    """INSERT INTO remote_job_rebuild_actions(
+                           run_id, action_id, old_remote_job_id, remote_identity,
+                           replacement_task_name, phase, stop_evidence_json,
+                           created_at, updated_at
+                       )
+                       VALUES (?, ?, ?, ?, ?, 'INTENT', '{}', ?, ?)""",
+                    (
+                        token.run_id,
+                        action_id,
+                        int(old_remote_job_id),
+                        identity,
+                        str(replacement_task_name),
+                        now,
+                        now,
+                    ),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise RemoteIntentConflict("rebuild action id already exists") from exc
+            return self._row(
+                connection.execute(
+                    "SELECT * FROM remote_job_rebuild_actions WHERE id=?",
+                    (cursor.lastrowid,),
+                ).fetchone()
+            )  # type: ignore[return-value]
+
+    def get_rebuild_action(self, action_id: str) -> dict[str, Any] | None:
+        """Lease-free read of one durable rebuild action row."""
+        with self._reader() as connection:
+            return self._row(
+                connection.execute(
+                    "SELECT * FROM remote_job_rebuild_actions WHERE action_id=?",
+                    (str(action_id),),
+                ).fetchone()
+            )
+
+    def get_latest_rebuild_action_for_job(self, old_job_id: int) -> dict[str, Any] | None:
+        """Lease-free read of the newest rebuild action for one old job."""
+        with self._reader() as connection:
+            return self._row(
+                connection.execute(
+                    """SELECT * FROM remote_job_rebuild_actions
+                       WHERE old_remote_job_id=? ORDER BY id DESC LIMIT 1""",
+                    (int(old_job_id),),
+                ).fetchone()
+            )
+
+    def update_rebuild_action_phase(
+        self,
+        token: LeaseToken,
+        *,
+        action_id: str,
+        phase: str,
+        stop_evidence: Mapping[str, Any] | None = None,
+        new_remote_job_id: int | None = None,
+        error_text: str | None = None,
+    ) -> dict[str, Any]:
+        """Advance the write-ahead phase of one durable rebuild action.
+
+        ``stop_evidence`` merges into the persisted evidence document (it
+        never replaces prior evidence); ``new_remote_job_id`` and
+        ``error_text`` are written only when provided -- ``error_text=""``
+        clears the diagnostic, ``None`` keeps it.
+        """
+        phase = str(phase)
+        if not phase.strip():
+            raise ValueError("rebuild action phase must be a non-empty string")
+        now = self._utcnow()
+        with self._transaction(immediate=True) as connection:
+            self._validate_lease(connection, token)
+            action = connection.execute(
+                "SELECT * FROM remote_job_rebuild_actions WHERE action_id=? AND run_id=?",
+                (str(action_id), token.run_id),
+            ).fetchone()
+            if action is None:
+                raise ValueError(
+                    f"rebuild action does not exist in this run: {action_id}"
+                )
+            merged: dict[str, Any] | None = None
+            if stop_evidence is not None:
+                try:
+                    restored = json.loads(str(action["stop_evidence_json"] or "{}"))
+                except (TypeError, ValueError):
+                    restored = {}
+                merged = dict(restored) if isinstance(restored, dict) else {}
+                merged.update(dict(stop_evidence))
+            sets = ["phase=?", "updated_at=?"]
+            values: list[Any] = [phase, now]
+            if merged is not None:
+                sets.append("stop_evidence_json=?")
+                values.append(self._canonical_json(merged))
+            if new_remote_job_id is not None:
+                sets.append("new_remote_job_id=?")
+                values.append(int(new_remote_job_id))
+            if error_text is not None:
+                sets.append("error_text=?")
+                values.append(str(error_text))
+            values.append(int(action["id"]))
+            connection.execute(
+                f"UPDATE remote_job_rebuild_actions SET {', '.join(sets)} WHERE id=?",
+                values,
+            )
+            return self._row(
+                connection.execute(
+                    "SELECT * FROM remote_job_rebuild_actions WHERE id=?",
+                    (int(action["id"]),),
+                ).fetchone()
+            )  # type: ignore[return-value]
 
     def claim_remote_submission(self, token: LeaseToken, job_id: int) -> dict[str, Any] | None:
         with self._transaction(immediate=True) as connection:

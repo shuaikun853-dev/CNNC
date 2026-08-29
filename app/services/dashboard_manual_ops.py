@@ -87,6 +87,14 @@ REBUILD_SUCCESS_OUTCOMES = frozenset(
     }
 )
 
+# Write-ahead phases of the durable rebuild protocol
+# (remote_job_rebuild_actions).  A row in any of these phases owns the rebuild
+# protocol for its old job: a later click resumes the same action instead of
+# starting a competing one.  FAILED rows never block a fresh protocol.
+REBUILD_ACTION_ACTIVE_PHASES = frozenset(
+    {"INTENT", "STOP_SENT", "STOP_CONFIRMED", "TERMINAL_PROOF", "CREATE_SENT"}
+)
+
 # The runtime persists every legacy browser task as this exact display name
 # (incremental_audit_runtime legacy bridge); a replacement must keep the form.
 _REPLACEMENT_NAME_PATTERN = "cnnc_current_opt_{mall}_{digits}"
@@ -533,6 +541,175 @@ def run_manual_reexport_command(
     return result
 
 
+def _resume_replaced_rebuild(
+    store: DailyAuditStore,
+    token: Any,
+    base: dict[str, Any],
+    *,
+    job: Mapping[str, Any],
+    replacement: Mapping[str, Any],
+    adapter: CnncLegacyZhaoshangAdapter,
+    business_date: str,
+    timeout_seconds: float,
+    state_path: Path,
+    remote_calls: int,
+) -> dict[str, Any]:
+    """Answer a rebuild click for a job that already has a replacement row.
+
+    Three durable shapes live behind the replacement: the new job still sits
+    on an unburned SUBMIT_INTENT (its dispatch attempt never left this
+    process -- resume it through the same burn-before-send claim), the claim
+    is burned but the create outcome was never recorded (fail safe onto the
+    tick reconcile; never a second create), or the replacement is already
+    dispatched/terminal (pure informational replay with zero remote calls).
+    """
+    new_job_id = int(replacement["new_remote_job_id"])
+    new_job = store.get_remote_job(new_job_id)
+    if new_job is None or str(new_job["state"]) != "SUBMIT_INTENT":
+        return {
+            **base,
+            "outcome": "REBUILD_ALREADY_REPLACED",
+            "replacement": dict(replacement),
+            "old_task_name": str(job["task_name"]),
+            "new_task_name": str(replacement["new_batch_number"]),
+            "new_batch_number": str(replacement["new_batch_number"]),
+            "new_remote_job_id": new_job_id,
+            "remote_calls": remote_calls,
+        }
+    action = store.get_latest_rebuild_action_for_job(int(job["id"]))
+    resume_action_id = str(action["action_id"]) if action is not None else None
+
+    def persist_phase(phase: str) -> None:
+        if resume_action_id is not None:
+            store.update_rebuild_action_phase(
+                token, action_id=resume_action_id, phase=phase
+            )
+
+    result: dict[str, Any] = {
+        **base,
+        "old_task_name": str(job["task_name"]),
+        "new_task_name": str(replacement["new_batch_number"]),
+        "new_batch_number": str(replacement["new_batch_number"]),
+        "old_remote_job_id": int(job["id"]),
+        "new_remote_job_id": new_job_id,
+        "replacement_id": int(replacement["id"]),
+        "rebuild_action_id": resume_action_id,
+        "rebuild_resumed": True,
+    }
+    if int(new_job["post_attempted"]) != 0:
+        # Crash after the claim burned but before the create outcome was
+        # durably recorded: the create may already have left this process.
+        # Never re-submit -- hand the exact truth to the tick reconciler.
+        store.mark_submit_unknown(
+            token, new_job_id, "dashboard rebuild: dispatch interrupted after claim"
+        )
+        persist_phase("SUBMIT_UNKNOWN")
+        return {
+            **result,
+            "outcome": "REBUILD_SUBMIT_UNKNOWN",
+            "reason": (
+                "durable replacement dispatch was interrupted after its claim; "
+                "tick reconcile will confirm"
+            ),
+            "remote_calls": remote_calls,
+        }
+    try:
+        new_prepared = reconstruct_prepared_job(state_path, new_job)
+    except RecoveryRejected:
+        return {
+            **result,
+            "outcome": "REBUILD_ALREADY_REPLACED",
+            "reason": "replacement payload cannot be reconstructed; scheduler will dispatch",
+            "remote_calls": remote_calls,
+        }
+    claim = store.claim_remote_submission(token, new_job_id)
+    if claim is None:
+        persist_phase("QUEUED")
+        return {
+            **result,
+            "outcome": "REBUILD_QUEUED",
+            "reason": "replacement submission claim unavailable; scheduler will dispatch",
+            "remote_calls": remote_calls,
+        }
+    persist_phase("CREATE_SENT")
+    remote_calls += 1
+    try:
+        submit_outcome = adapter.submit(
+            new_prepared, timeout_seconds=max(0.001, float(timeout_seconds))
+        )
+    except Exception as exc:
+        store.mark_submit_unknown(
+            token, new_job_id, f"dashboard rebuild: {type(exc).__name__}: {exc}"
+        )
+        persist_phase("SUBMIT_UNKNOWN")
+        return {
+            **result,
+            "outcome": "REBUILD_SUBMIT_UNKNOWN",
+            "reason": "legacy create-only dispatch raised; tick reconcile will confirm",
+            "remote_calls": remote_calls,
+        }
+    if submit_outcome.status is SubmitStatus.NOT_ATTEMPTED:
+        store.release_remote_submission_claim(
+            token, new_job_id, f"dashboard rebuild: {submit_outcome.diagnostic}"
+        )
+        persist_phase("QUEUED")
+        return {
+            **result,
+            "outcome": "REBUILD_QUEUED",
+            "reason": (
+                f"submit not attempted: {submit_outcome.diagnostic}; "
+                "scheduler will dispatch"
+            ),
+            "remote_calls": remote_calls,
+        }
+    if submit_outcome.status is SubmitStatus.SUBMIT_UNKNOWN:
+        store.mark_submit_unknown(token, new_job_id, "legacy create-only outcome unknown")
+        persist_phase("SUBMIT_UNKNOWN")
+        return {
+            **result,
+            "outcome": "REBUILD_SUBMIT_UNKNOWN",
+            "reason": "legacy create-only outcome unknown; tick reconcile will confirm",
+            "remote_calls": remote_calls,
+        }
+    if not submit_outcome.task_id or not submit_outcome.task_number:
+        store.mark_submit_unknown(
+            token, new_job_id, "dashboard rebuild: submit response had no remote identity"
+        )
+        persist_phase("SUBMIT_UNKNOWN")
+        return {
+            **result,
+            "outcome": "REBUILD_SUBMIT_UNKNOWN",
+            "reason": "submit response had no remote identity; tick reconcile will confirm",
+            "remote_calls": remote_calls,
+        }
+    new_state = (
+        "SUBMITTED"
+        if submit_outcome.priority_evidence in {"updated", "already_highest_priority"}
+        else "PRIORITY_PENDING"
+    )
+    new_identity = (
+        f"{new_prepared.mall_key}|{submit_outcome.task_id}|{submit_outcome.task_number}"
+    )
+    store.reconcile_remote_job(
+        token,
+        new_job_id,
+        remote_identity=new_identity,
+        state=new_state,
+        result={"priority_evidence": submit_outcome.priority_evidence},
+    )
+    if new_state != "PRIORITY_PENDING":
+        store.advance_crawl_work_for_job(token, new_job_id, new_state)
+    persist_phase("DISPATCHED")
+    return {
+        **result,
+        "outcome": "REBUILD_DISPATCHED",
+        "state": new_state,
+        "new_remote_identity": new_identity,
+        "priority_evidence": submit_outcome.priority_evidence,
+        "remote_calls": remote_calls,
+    }
+
+
 def _run_manual_rebuild_once(
     *,
     state_path: Path,
@@ -595,19 +772,23 @@ def _run_manual_rebuild_once(
         # Idempotency answers before the source-state gate: a recorded
         # replacement row is the definitive durable answer, so a repeated
         # click (any action id) replays it with zero writes and zero remote
-        # calls instead of tripping the SUPERSEDED state gate below.
+        # calls instead of tripping the SUPERSEDED state gate below.  A crash
+        # between that supersede and its dispatch attempt resumes the durable
+        # replacement instead of replaying blindly.
         existing = store.get_replacement_for_job(int(job["id"]))
         if existing is not None:
-            return {
-                **base,
-                "outcome": "REBUILD_ALREADY_REPLACED",
-                "replacement": existing,
-                "old_task_name": str(job["task_name"]),
-                "new_task_name": str(existing["new_batch_number"]),
-                "new_batch_number": str(existing["new_batch_number"]),
-                "new_remote_job_id": int(existing["new_remote_job_id"]),
-                "remote_calls": remote_calls,
-            }
+            return _resume_replaced_rebuild(
+                store,
+                token,
+                base,
+                job=job,
+                replacement=existing,
+                adapter=adapter,
+                business_date=business_date,
+                timeout_seconds=timeout_seconds,
+                state_path=state_path,
+                remote_calls=remote_calls,
+            )
         job_state = str(job["state"])
         post_attempted = int(job["post_attempted"])
         if job_state not in REBUILD_ALLOWED_SOURCE_STATES or post_attempted != 1:
@@ -682,6 +863,38 @@ def _run_manual_rebuild_once(
                 "exact durable priority evidence does not match the remote identity"
             )
 
+        # Durable write-ahead protocol: the newest action row for this old job
+        # decides whether a crash left an unfinished protocol that this click
+        # must resume (same action id, same persisted replacement task name).
+        action = store.get_latest_rebuild_action_for_job(int(job["id"]))
+        resume = False
+        action_phase: str | None = None
+        persisted_new_task_name = ""
+        if action is not None:
+            phase = str(action["phase"])
+            if phase in REBUILD_ACTION_ACTIVE_PHASES:
+                resume = True
+                action_phase = phase
+                action_id = str(action["action_id"])  # resume owns this protocol
+                base["action_id"] = action_id
+                persisted_new_task_name = str(action["replacement_task_name"])
+                if str(action["remote_identity"]) != expected_identity:
+                    return rejected_invalid(
+                        "durable rebuild action identity no longer matches"
+                    )
+            elif phase == "FAILED":
+                action = None  # a failed protocol never blocks a fresh one
+            else:
+                # SUPERSEDED/QUEUED/DISPATCHED/SUBMIT_UNKNOWN without a
+                # replacement row is unreachable bookkeeping: fail closed.
+                return {
+                    **base,
+                    "outcome": "REBUILD_REJECTED",
+                    "error_code": "REBUILD_ACTION_STATE",
+                    "reason": f"durable rebuild action phase {phase} without a replacement row",
+                    "remote_calls": remote_calls,
+                }
+
         crawls = store.crawl_work_for_job(int(job["id"]))
         eligible = [
             crawl
@@ -737,6 +950,61 @@ def _run_manual_rebuild_once(
             in eligible_keys
         )
 
+        # Write-ahead INTENT: the protocol becomes durable before any remote
+        # write, so a crash can never leave the old task stopped without
+        # evidence.  On resume the persisted batch name is authoritative --
+        # it is never re-derived (the action id owns the name).
+        new_task_name = _replacement_task_name(
+            str(job["task_name"]), action_id, prepared.mall_name
+        )
+        if resume:
+            new_task_name = persisted_new_task_name
+        else:
+            try:
+                store.create_rebuild_action(
+                    token,
+                    action_id=action_id,
+                    old_remote_job_id=int(job["id"]),
+                    remote_identity=expected_identity,
+                    replacement_task_name=new_task_name,
+                )
+            except RemoteIntentConflict as exc:
+                message = str(exc)
+                if "active rebuild action" in message:
+                    code = "REBUILD_ACTION_ACTIVE"
+                elif "already has a replacement" in message:
+                    code = "REBUILD_ALREADY_REPLACED"
+                else:
+                    code = "REBUILD_REJECTED"
+                existing_action_id = None
+                if code == "REBUILD_ACTION_ACTIVE":
+                    latest = store.get_latest_rebuild_action_for_job(int(job["id"]))
+                    existing_action_id = (
+                        str(latest["action_id"]) if latest is not None else None
+                    )
+                return {
+                    **base,
+                    "outcome": "REBUILD_REJECTED",
+                    "error_code": code,
+                    "reason": message,
+                    "existing_action_id": existing_action_id,
+                    "remote_calls": remote_calls,
+                }
+
+        def persist_action_phase(
+            phase: str,
+            *,
+            evidence: Mapping[str, Any] | None = None,
+            error_text: str | None = None,
+        ) -> None:
+            store.update_rebuild_action_phase(
+                token,
+                action_id=action_id,
+                phase=phase,
+                stop_evidence=evidence,
+                error_text=error_text,
+            )
+
         def query_progress() -> Mapping[str, Any] | None:
             nonlocal remote_calls
             remote_calls += 1
@@ -748,133 +1016,220 @@ def _run_manual_rebuild_once(
                 prepared, task_id, task_number, min(30.0, float(timeout_seconds))
             )
 
-        try:
-            progress_answer = query_progress()
-            progress_raw = (
-                progress_answer.get("progress")
-                if isinstance(progress_answer, Mapping)
-                else None
-            )
-        except Exception:
-            progress_raw = None
-        progress_snapshot = dict(progress_raw) if isinstance(progress_raw, Mapping) else None
-        classification = classify_remote_execution_state(
-            progress_raw if isinstance(progress_raw, Mapping) else None,
-            "",
-        )
-        if classification is RemoteExecutionState.UNKNOWN:
-            return {
-                **base,
-                "outcome": "REBUILD_REJECTED",
-                "error_code": "REMOTE_PROGRESS_UNKNOWN",
-                "reason": "remote execution state could not be proven; no rebuild was started",
-                "progress_classification": classification.value,
-                "remote_calls": remote_calls,
-            }
-
+        progress_snapshot: dict[str, Any] | None
+        classification: RemoteExecutionState
         stop_evidence: dict[str, Any]
-        if classification is RemoteExecutionState.TERMINAL:
-            stop_evidence = {
-                "phase": "TERMINAL_BEFORE_REBUILD",
-                "classification": RemoteExecutionState.TERMINAL.value,
-                "progress": progress_snapshot,
-            }
-        else:
-            remote_calls += 1
-            if stop_callable is not None:
-                stop = stop_callable(prepared, task_id, task_number, float(timeout_seconds))
+        if resume and action_phase == "STOP_SENT":
+            # Crash after the write-ahead STOP_SENT: the first disable may
+            # already have left this process, so a fresh stop is forbidden.
+            # Reconcile read-only and fail closed on any ambiguity.
+            try:
+                answer = query_progress()
+                raw = answer.get("progress") if isinstance(answer, Mapping) else None
+            except Exception:
+                answer = None
+                raw = None
+            progress_snapshot = dict(raw) if isinstance(raw, Mapping) else None
+            observed_enabled = (
+                answer.get("enabled") if isinstance(answer, Mapping) else None
+            )
+            reclass = classify_remote_execution_state(
+                raw if isinstance(raw, Mapping) else None,
+                "",
+            )
+            if observed_enabled is False:
+                stop_evidence = {
+                    "phase": "ALREADY_DISABLED",
+                    "reconciled": True,
+                    "observed_enabled": False,
+                    "progress": progress_snapshot,
+                }
+                persist_action_phase("STOP_CONFIRMED", evidence=stop_evidence)
+                classification = RemoteExecutionState.ACTIVE
+            elif reclass is RemoteExecutionState.TERMINAL:
+                stop_evidence = {
+                    "phase": "TERMINAL_BEFORE_REBUILD",
+                    "reconciled": True,
+                    "progress": progress_snapshot,
+                }
+                persist_action_phase("TERMINAL_PROOF", evidence=stop_evidence)
+                classification = RemoteExecutionState.TERMINAL
             else:
-                stop = adapter.stop_running_task(
-                    prepared, task_id, task_number, float(timeout_seconds)
-                )
-            status = getattr(stop, "status", None)
-            diagnostic = str(getattr(stop, "diagnostic", "") or "")
-
-            def stop_unconfirmed(detail: str) -> dict[str, Any]:
                 return {
                     **base,
                     "outcome": "REBUILD_REJECTED",
                     "error_code": "OLD_TASK_STOP_UNCONFIRMED",
-                    "reason": detail,
-                    "progress_classification": classification.value,
-                    "stop_status": getattr(status, "value", str(status)),
+                    "reason": (
+                        "durable STOP_SENT with live task still enabled/active; "
+                        "cannot prove the first disable did not land; refusing a second stop"
+                    ),
+                    "progress_classification": reclass.value,
                     "remote_calls": remote_calls,
                 }
-
-            if status is RestartStatus.STOPPED:
-                stop_evidence = {
-                    "phase": "STOP_CONFIRMED",
-                    "disable_confirmed": True,
-                    "observed_enabled": False,
-                    "diagnostic": diagnostic,
-                }
-            elif status is RestartStatus.EXTERNALLY_DISABLED:
-                # Zero remote writes happened; the exact task is already
-                # disabled so it cannot double-run against the replacement.
-                stop_evidence = {
-                    "phase": "ALREADY_DISABLED",
-                    "observed_enabled": False,
-                    "diagnostic": diagnostic,
-                }
-            elif status is RestartStatus.NOT_RUNNING:
-                stop_evidence = {"phase": "TASK_NOT_FOUND", "diagnostic": diagnostic}
-            elif status is RestartStatus.NO_LONGER_RUNNING:
-                # Not ACTIVE at write time: one fresh progress precheck must
-                # prove TERMINAL before any replacement may be created.
-                try:
-                    recheck_answer = query_progress()
-                    recheck_raw = (
-                        recheck_answer.get("progress")
-                        if isinstance(recheck_answer, Mapping)
-                        else None
-                    )
-                except Exception:
-                    recheck_raw = None
-                recheck_snapshot = (
-                    dict(recheck_raw) if isinstance(recheck_raw, Mapping) else None
+        elif resume and action_phase in ("STOP_CONFIRMED", "TERMINAL_PROOF"):
+            # Crash after the stop was durably confirmed: no precheck, no
+            # second stop -- resume straight from the persisted evidence.
+            try:
+                restored = json.loads(str(action.get("stop_evidence_json") or "{}"))
+            except (TypeError, ValueError):
+                restored = {}
+            stop_evidence = dict(restored) if isinstance(restored, dict) else {}
+            restored_progress = stop_evidence.get("progress")
+            progress_snapshot = (
+                dict(restored_progress)
+                if isinstance(restored_progress, Mapping)
+                else None
+            )
+            classification = (
+                RemoteExecutionState.TERMINAL
+                if action_phase == "TERMINAL_PROOF"
+                or str(stop_evidence.get("classification") or "")
+                == RemoteExecutionState.TERMINAL.value
+                else RemoteExecutionState.ACTIVE
+            )
+        else:
+            # Fresh protocol or resume-from-INTENT (crash before any remote
+            # write): run the full read-only precheck then the stop protocol,
+            # persisting every durable transition into the write-ahead row.
+            try:
+                progress_answer = query_progress()
+                progress_raw = (
+                    progress_answer.get("progress")
+                    if isinstance(progress_answer, Mapping)
+                    else None
                 )
-                recheck = classify_remote_execution_state(
-                    recheck_raw if isinstance(recheck_raw, Mapping) else None,
-                    "",
-                )
-                if recheck is RemoteExecutionState.TERMINAL:
-                    stop_evidence = {
-                        "phase": "NO_LONGER_RUNNING_TERMINAL",
-                        "diagnostic": diagnostic,
-                        "progress": recheck_snapshot,
-                    }
+            except Exception:
+                progress_raw = None
+            progress_snapshot = dict(progress_raw) if isinstance(progress_raw, Mapping) else None
+            classification = classify_remote_execution_state(
+                progress_raw if isinstance(progress_raw, Mapping) else None,
+                "",
+            )
+            if classification is RemoteExecutionState.UNKNOWN:
+                # The protocol failed before any remote write: mark it FAILED
+                # so a later click may open a fresh action.
+                persist_action_phase("FAILED", error_text="REMOTE_PROGRESS_UNKNOWN")
+                return {
+                    **base,
+                    "outcome": "REBUILD_REJECTED",
+                    "error_code": "REMOTE_PROGRESS_UNKNOWN",
+                    "reason": "remote execution state could not be proven; no rebuild was started",
+                    "progress_classification": classification.value,
+                    "remote_calls": remote_calls,
+                }
+            if classification is RemoteExecutionState.TERMINAL:
+                stop_evidence = {
+                    "phase": "TERMINAL_BEFORE_REBUILD",
+                    "classification": RemoteExecutionState.TERMINAL.value,
+                    "progress": progress_snapshot,
+                }
+                persist_action_phase("TERMINAL_PROOF", evidence=stop_evidence)
+            else:
+                # Write-ahead stop: the phase lands before the remote disable,
+                # so a crash during the disable is always provable.
+                persist_action_phase("STOP_SENT")
+                remote_calls += 1
+                if stop_callable is not None:
+                    stop = stop_callable(prepared, task_id, task_number, float(timeout_seconds))
                 else:
-                    return stop_unconfirmed(
-                        "write-time execution state "
-                        f"{recheck.value} after NO_LONGER_RUNNING; old task stop is unconfirmed: "
-                        f"{diagnostic}"
+                    stop = adapter.stop_running_task(
+                        prepared, task_id, task_number, float(timeout_seconds)
                     )
-            elif status is RestartStatus.DISABLE_UNKNOWN:
-                observed = getattr(stop, "observed_enabled", None)
-                if observed is False:
+                status = getattr(stop, "status", None)
+                diagnostic = str(getattr(stop, "diagnostic", "") or "")
+
+                def stop_unconfirmed(detail: str) -> dict[str, Any]:
+                    # The phase intentionally stays STOP_SENT: the next run
+                    # reconciles read-only instead of issuing a second stop.
+                    return {
+                        **base,
+                        "outcome": "REBUILD_REJECTED",
+                        "error_code": "OLD_TASK_STOP_UNCONFIRMED",
+                        "reason": detail,
+                        "progress_classification": classification.value,
+                        "stop_status": getattr(status, "value", str(status)),
+                        "remote_calls": remote_calls,
+                    }
+
+                if status is RestartStatus.STOPPED:
                     stop_evidence = {
                         "phase": "STOP_CONFIRMED",
-                        "disable_confirmed": False,
-                        "reconciled": True,
+                        "disable_confirmed": True,
                         "observed_enabled": False,
                         "diagnostic": diagnostic,
                     }
+                    persist_action_phase("STOP_CONFIRMED", evidence=stop_evidence)
+                elif status is RestartStatus.EXTERNALLY_DISABLED:
+                    # Zero remote writes happened; the exact task is already
+                    # disabled so it cannot double-run against the replacement.
+                    stop_evidence = {
+                        "phase": "ALREADY_DISABLED",
+                        "observed_enabled": False,
+                        "diagnostic": diagnostic,
+                    }
+                    persist_action_phase("STOP_CONFIRMED", evidence=stop_evidence)
+                elif status is RestartStatus.NOT_RUNNING:
+                    stop_evidence = {"phase": "TASK_NOT_FOUND", "diagnostic": diagnostic}
+                    persist_action_phase("TERMINAL_PROOF", evidence=stop_evidence)
+                elif status is RestartStatus.NO_LONGER_RUNNING:
+                    # Not ACTIVE at write time: one fresh progress precheck must
+                    # prove TERMINAL before any replacement may be created.
+                    try:
+                        recheck_answer = query_progress()
+                        recheck_raw = (
+                            recheck_answer.get("progress")
+                            if isinstance(recheck_answer, Mapping)
+                            else None
+                        )
+                    except Exception:
+                        recheck_raw = None
+                    recheck_snapshot = (
+                        dict(recheck_raw) if isinstance(recheck_raw, Mapping) else None
+                    )
+                    recheck = classify_remote_execution_state(
+                        recheck_raw if isinstance(recheck_raw, Mapping) else None,
+                        "",
+                    )
+                    if recheck is RemoteExecutionState.TERMINAL:
+                        stop_evidence = {
+                            "phase": "NO_LONGER_RUNNING_TERMINAL",
+                            "diagnostic": diagnostic,
+                            "progress": recheck_snapshot,
+                        }
+                        persist_action_phase("TERMINAL_PROOF", evidence=stop_evidence)
+                    else:
+                        return stop_unconfirmed(
+                            "write-time execution state "
+                            f"{recheck.value} after NO_LONGER_RUNNING; old task stop is unconfirmed: "
+                            f"{diagnostic}"
+                        )
+                elif status is RestartStatus.DISABLE_UNKNOWN:
+                    observed = getattr(stop, "observed_enabled", None)
+                    if observed is False:
+                        stop_evidence = {
+                            "phase": "STOP_CONFIRMED",
+                            "disable_confirmed": False,
+                            "reconciled": True,
+                            "observed_enabled": False,
+                            "diagnostic": diagnostic,
+                        }
+                        persist_action_phase("STOP_CONFIRMED", evidence=stop_evidence)
+                    else:
+                        return stop_unconfirmed(
+                            "disable outcome unknown and the live task is not provably "
+                            f"disabled (observed_enabled={observed!r}): {diagnostic}"
+                        )
+                elif status is RestartStatus.IDENTITY_CONFLICT:
+                    persist_action_phase(
+                        "FAILED", error_text=f"stop identity conflict: {diagnostic}"
+                    )
+                    return rejected_invalid(f"stop identity conflict: {diagnostic}")
                 else:
                     return stop_unconfirmed(
-                        "disable outcome unknown and the live task is not provably "
-                        f"disabled (observed_enabled={observed!r}): {diagnostic}"
+                        f"stop protocol did not confirm the old task is stopped "
+                        f"({getattr(status, 'value', str(status))}): {diagnostic}"
                     )
-            elif status is RestartStatus.IDENTITY_CONFLICT:
-                return rejected_invalid(f"stop identity conflict: {diagnostic}")
-            else:
-                return stop_unconfirmed(
-                    f"stop protocol did not confirm the old task is stopped "
-                    f"({getattr(status, 'value', str(status))}): {diagnostic}"
-                )
 
-        new_task_name = _replacement_task_name(
-            str(job["task_name"]), action_id, prepared.mall_name
-        )
         new_suffix = new_task_name.rsplit("_", 1)[-1]
         new_job_dir = Path(str(job["input_path"])).parent.parent / new_suffix
         try:
@@ -916,6 +1271,7 @@ def _run_manual_rebuild_once(
                     "precheck_classification": classification.value,
                 },
                 eligible_crawl_ids=[int(crawl["id"]) for crawl in eligible],
+                rebuild_action_id=action_id,
             )
         except RemoteIntentConflict as exc:
             message = str(exc)
@@ -980,20 +1336,24 @@ def _run_manual_rebuild_once(
             "skipped_terminal_crawl_count": skipped_terminal,
             "stop_phase": stop_evidence.get("phase"),
             "precheck_classification": classification.value,
+            "rebuild_action_id": action_id,
             "remote_calls": remote_calls,
         }
 
         # Immediate dispatch attempt (burn-before-send): mirror the tick
         # engine's SUBMIT_INTENT semantics; every miss stays durable for the
-        # scheduler to resume.
+        # scheduler to resume.  CREATE_SENT lands before the create POST, so a
+        # crash can always prove the dispatch may already have left.
         claim = store.claim_remote_submission(token, new_job_id)
         if claim is None:
+            persist_action_phase("QUEUED")
             return {
                 **result,
                 "outcome": "REBUILD_QUEUED",
                 "reason": "replacement submission claim unavailable; scheduler will dispatch",
                 "remote_calls": remote_calls,
             }
+        persist_action_phase("CREATE_SENT")
         remote_calls += 1
         try:
             submit_outcome = adapter.submit(
@@ -1003,6 +1363,7 @@ def _run_manual_rebuild_once(
             store.mark_submit_unknown(
                 token, new_job_id, f"dashboard rebuild: {type(exc).__name__}: {exc}"
             )
+            persist_action_phase("SUBMIT_UNKNOWN")
             return {
                 **result,
                 "outcome": "REBUILD_SUBMIT_UNKNOWN",
@@ -1013,6 +1374,7 @@ def _run_manual_rebuild_once(
             store.release_remote_submission_claim(
                 token, new_job_id, f"dashboard rebuild: {submit_outcome.diagnostic}"
             )
+            persist_action_phase("QUEUED")
             return {
                 **result,
                 "outcome": "REBUILD_QUEUED",
@@ -1026,6 +1388,7 @@ def _run_manual_rebuild_once(
             store.mark_submit_unknown(
                 token, new_job_id, "legacy create-only outcome unknown"
             )
+            persist_action_phase("SUBMIT_UNKNOWN")
             return {
                 **result,
                 "outcome": "REBUILD_SUBMIT_UNKNOWN",
@@ -1036,6 +1399,7 @@ def _run_manual_rebuild_once(
             store.mark_submit_unknown(
                 token, new_job_id, "dashboard rebuild: submit response had no remote identity"
             )
+            persist_action_phase("SUBMIT_UNKNOWN")
             return {
                 **result,
                 "outcome": "REBUILD_SUBMIT_UNKNOWN",
@@ -1059,6 +1423,7 @@ def _run_manual_rebuild_once(
         )
         if new_state != "PRIORITY_PENDING":
             store.advance_crawl_work_for_job(token, new_job_id, new_state)
+        persist_action_phase("DISPATCHED")
         return {
             **result,
             "outcome": "REBUILD_DISPATCHED",
@@ -1092,14 +1457,21 @@ def run_manual_rebuild(
 
     Protocol (strict order): durable identity + idempotency + source-state
     gate, immutable payload reconstruction, fail-closed eligible-crawl
-    coverage, live progress precheck (UNKNOWN rejects with zero writes), a
-    safe stop of the old task whenever it is still ACTIVE (a replacement is
-    only ever created once the old task provably cannot double-run), one
-    atomic supersede transaction that migrates the eligible crawls to a fresh
-    SUBMIT_INTENT job and retires the old job as SUPERSEDED with all its
-    evidence, then an immediate create-only dispatch attempt that mirrors the
-    tick engine (every dispatch miss stays durable for the scheduler).  The
-    old job's identity is never updated; one rebuild action lands as one
+    coverage, then a durable write-ahead ``remote_job_rebuild_actions`` INTENT
+    row that names the replacement task before anything touches the remote.
+    The live progress precheck follows (UNKNOWN fails the action with zero
+    remote writes), then a safe stop of the old task whenever it is still
+    ACTIVE -- each stop phase (STOP_SENT/STOP_CONFIRMED/TERMINAL_PROOF) is
+    persisted before and after the remote disable, so a crash can always
+    prove whether the disable happened and a resumed click reconciles
+    read-only instead of issuing a second stop.  One atomic supersede
+    transaction migrates the eligible crawls to a fresh SUBMIT_INTENT job,
+    retires the old job as SUPERSEDED and advances the action row in the same
+    commit; the immediate create-only dispatch attempt mirrors the tick
+    engine with a write-ahead CREATE_SENT phase (every dispatch miss stays
+    durable for the scheduler, an interrupted dispatch resumes or fails safe
+    onto the tick reconcile -- never a second create).  The old job's
+    identity is never updated; one rebuild action lands as one
     ``dashboard_actions.jsonl`` record.
     """
     path = Path(state_path)
@@ -1131,6 +1503,8 @@ def run_manual_rebuild(
             "new_remote_job_id": result.get("new_remote_job_id"),
             "old_task_name": result.get("old_task_name"),
             "new_task_name": result.get("new_task_name"),
+            "rebuild_action_id": result.get("rebuild_action_id"),
+            "rebuild_resumed": result.get("rebuild_resumed"),
             "stop_phase": result.get("stop_phase"),
             "migrated_crawl_count": result.get("migrated_crawl_count"),
             "skipped_terminal_crawl_count": result.get("skipped_terminal_crawl_count"),

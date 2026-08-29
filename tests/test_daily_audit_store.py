@@ -41,7 +41,9 @@ def test_schema_has_only_checkpoint_tables_and_dates_are_isolated(store):
 
     assert first["id"] == again["id"]
     assert first["id"] != second["id"]
-    assert {"daily_runs", "snapshots", "snapshot_members", "audit_items", "stage_work", "crawl_work", "remote_jobs", "remote_job_replacements"} == store.table_names()
+    # P1-2 adds the durable write-ahead rebuild protocol table
+    # (remote_job_rebuild_actions) next to the checkpoint tables.
+    assert {"daily_runs", "snapshots", "snapshot_members", "audit_items", "stage_work", "crawl_work", "remote_jobs", "remote_job_replacements", "remote_job_rebuild_actions"} == store.table_names()
 
 
 def test_run_scope_and_cutoff_are_canonical_and_conflicts_fail_closed(store):
