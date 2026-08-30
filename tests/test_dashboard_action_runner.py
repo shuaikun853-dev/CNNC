@@ -16,7 +16,10 @@ from app.services.dashboard_actions import (
     DashboardActionError,
     DashboardActionRunner,
 )
-from app.services.dashboard_manual_ops import read_operator_actions
+from app.services.dashboard_manual_ops import (
+    read_operator_actions,
+    record_operator_action,
+)
 
 BUSINESS_DATE = "2026-08-28"
 IDENTITY = "JD|8899|1024"
@@ -248,3 +251,77 @@ def test_list_recent_running_first(tmp_path):
     listed = runner.list_recent()
     assert listed[0].action_id == running.action_id
     assert running.status == "RUNNING" and done.status == "SUCCEEDED"
+
+
+# ---- durable_status_recent: 跨业务日 bounded durable 查询 (P2-C) ----
+
+
+def _record_finished_action(run_dir, action_id):
+    record_operator_action(
+        run_dir,
+        action_type="closeout",
+        action_id=action_id,
+        payload={
+            "event": "finished",
+            "target": "2026-08-30:-",
+            "result_code": "FINALIZED",
+            "outcome": {"outcome": "FINALIZED"},
+            "exit_code": 0,
+        },
+    )
+
+
+def _recent_runner(tmp_path: Path):
+    return DashboardActionRunner(
+        repo_root=tmp_path / "repo",
+        runtime_root=tmp_path / "runtime",
+        python_executable="X:/fake/python.exe",
+        spawn=lambda *args, **kwargs: None,
+    )
+
+
+def test_durable_status_recent_finds_yesterday_run_dir(tmp_path):
+    runner = _recent_runner(tmp_path)
+    _record_finished_action(tmp_path / "runtime" / "2026-08-29", "act-y")
+    durable = runner.durable_status_recent("act-y", today="2026-08-30")
+    assert durable is not None
+    assert durable["action_id"] == "act-y"
+    assert durable["action_type"] == "closeout"
+    assert durable["status"] == "SUCCEEDED"  # result_code FINALIZED record
+
+
+def test_durable_status_recent_prefers_today_then_walks_back(tmp_path):
+    runner = _recent_runner(tmp_path)
+    _record_finished_action(tmp_path / "runtime" / "2026-08-29", "act-y")
+    _record_finished_action(tmp_path / "runtime" / "2026-08-30", "act-y")
+    durable = runner.durable_status_recent("act-y", today="2026-08-30")
+    assert durable is not None
+    # 单目录语义保留:今天的记录就是权威答案
+    assert runner.durable_status(
+        "act-y", tmp_path / "runtime" / "2026-08-30"
+    ) is not None
+    assert runner.durable_status_recent("act-y", today="2026-08-30")["status"] == "SUCCEEDED"
+
+
+def test_durable_status_recent_missing_id_is_none(tmp_path):
+    runner = _recent_runner(tmp_path)
+    _record_finished_action(tmp_path / "runtime" / "2026-08-29", "act-y")
+    assert runner.durable_status_recent("missing", today="2026-08-30") is None
+
+
+def test_durable_status_recent_window_is_bounded(tmp_path):
+    runner = _recent_runner(tmp_path)
+    # lookback_days=7 锚定 2026-08-30 覆盖 08-24..08-30:
+    # 08-24 是窗内最旧一天,08-23 是窗外第一天。
+    _record_finished_action(tmp_path / "runtime" / "2026-08-23", "act-out")
+    assert runner.durable_status_recent("act-out", today="2026-08-30") is None
+    _record_finished_action(tmp_path / "runtime" / "2026-08-24", "act-edge")
+    durable = runner.durable_status_recent("act-edge", today="2026-08-30")
+    assert durable is not None and durable["action_id"] == "act-edge"
+
+
+def test_durable_status_recent_treats_action_id_as_opaque(tmp_path):
+    runner = _recent_runner(tmp_path)
+    _record_finished_action(tmp_path / "runtime" / "2026-08-29", "act-y")
+    for evil in ("..", "a%2fb", "C:\\evil\\path", "/etc/passwd"):
+        assert runner.durable_status_recent(evil, today="2026-08-30") is None

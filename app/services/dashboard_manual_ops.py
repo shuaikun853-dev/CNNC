@@ -991,19 +991,27 @@ def _run_manual_rebuild_once(
                     "remote_calls": remote_calls,
                 }
 
+        current_phase: str = "INTENT"
+
         def persist_action_phase(
             phase: str,
             *,
             evidence: Mapping[str, Any] | None = None,
             error_text: str | None = None,
         ) -> None:
-            store.update_rebuild_action_phase(
+            nonlocal current_phase
+            row = store.update_rebuild_action_phase(
                 token,
                 action_id=action_id,
                 phase=phase,
                 stop_evidence=evidence,
                 error_text=error_text,
             )
+            if row is not None:
+                # Track only phases that actually landed durably, so the
+                # supersede conflict gate below always reasons about the
+                # durable phase, never an optimistic in-memory one.
+                current_phase = str(row["phase"])
 
         def query_progress() -> Mapping[str, Any] | None:
             nonlocal remote_calls
@@ -1219,6 +1227,28 @@ def _run_manual_rebuild_once(
                             "disable outcome unknown and the live task is not provably "
                             f"disabled (observed_enabled={observed!r}): {diagnostic}"
                         )
+                elif status is RestartStatus.PRE_WRITE_FAILED:
+                    # Proven zero-write boundary (adapter escape translator: the
+                    # disable POST never started), so the write-ahead STOP_SENT
+                    # is withdrawn -- the same withdrawal the scheduler-side
+                    # recovery performs for its DISABLE_SENT.  The action
+                    # resumes from INTENT and a later click re-runs the
+                    # precheck and a fresh stop with zero double-stop risk.
+                    persist_action_phase(
+                        "INTENT", error_text=f"stop pre-write failure: {diagnostic}"
+                    )
+                    return {
+                        **base,
+                        "outcome": "REBUILD_REJECTED",
+                        "error_code": "STOP_PRE_WRITE_FAILED",
+                        "reason": (
+                            "stop failed before any remote write was attempted "
+                            f"({diagnostic}); the rebuild action stays retryable from INTENT"
+                        ),
+                        "progress_classification": classification.value,
+                        "stop_status": RestartStatus.PRE_WRITE_FAILED.value,
+                        "remote_calls": remote_calls,
+                    }
                 elif status is RestartStatus.IDENTITY_CONFLICT:
                     persist_action_phase(
                         "FAILED", error_text=f"stop identity conflict: {diagnostic}"
@@ -1289,6 +1319,16 @@ def _run_manual_rebuild_once(
                     "remote_calls": remote_calls,
                 }
             if "task name is already reserved" in message or "immutable intent" in message:
+                released = False
+                if current_phase in {"INTENT", "STOP_CONFIRMED", "TERMINAL_PROOF"}:
+                    # No ambiguous remote write is outstanding (nothing sent,
+                    # or the stop is durably confirmed): release the action so
+                    # a fresh action id derives a brand-new replacement name
+                    # instead of dead-ending behind the active guard.
+                    persist_action_phase(
+                        "FAILED", error_text=f"replacement task name conflict: {message}"
+                    )
+                    released = True
                 return {
                     **base,
                     "outcome": "REBUILD_REJECTED",
@@ -1298,6 +1338,7 @@ def _run_manual_rebuild_once(
                     "new_task_name": new_task_name,
                     "stop_phase": stop_evidence.get("phase"),
                     "precheck_classification": classification.value,
+                    "action_failed": released,
                     "remote_calls": remote_calls,
                 }
             return {

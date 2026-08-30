@@ -65,6 +65,9 @@ class _FakeRunner:
     def durable_status(self, action_id, run_dir):
         return self.durable_result
 
+    def durable_status_recent(self, action_id, *, today=None, lookback_days=7):
+        return self.durable_result
+
 
 def _job_row(updated_at="2026-08-28T09:00:00", identity=IDENTITY):
     return {
@@ -295,6 +298,41 @@ def test_action_status_falls_back_to_durable(client, monkeypatch, tmp_path):
     r = client.get("/dashboard/api/actions/act-9")
     assert r.status_code == 200
     assert r.json()["status"] == "SUCCEEDED"
+
+
+def test_action_status_durable_finds_yesterday_business_day(client, monkeypatch, tmp_path):
+    """跨业务日/重启后:真实 runner 的 durable fallback 覆盖昨日 run_dir。
+
+    内存无 handle(模拟 Dashboard 重启),记录写在锚定业务日的昨天,
+    端点必须经 durable_status_recent 的服务端日期窗口命中它。
+    """
+    from datetime import date, timedelta
+
+    from app.services.dashboard_actions import DashboardActionRunner
+    from app.services.incremental_audit_runtime import business_date_in_shanghai
+
+    runner = DashboardActionRunner(
+        repo_root=tmp_path / "repo",
+        runtime_root=tmp_path / "runtime",
+        spawn=lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr("app.dashboard_api.get_action_runner", lambda: runner)
+    today = business_date_in_shanghai()
+    yesterday = (date.fromisoformat(today) - timedelta(days=1)).isoformat()
+    record_operator_action(
+        tmp_path / "runtime" / yesterday,
+        action_type="closeout",
+        action_id="act-yd",
+        payload={"event": "finished", "target": f"{yesterday}:-",
+                 "result_code": "FINALIZED", "outcome": {"outcome": "FINALIZED"},
+                 "exit_code": 0},
+    )
+    r = client.get("/dashboard/api/actions/act-yd")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["action_id"] == "act-yd"
+    assert body["action_type"] == "closeout"
+    assert body["status"] == "SUCCEEDED"
 
 
 # ---- 11. actions 列表(今日 run_dir 的 durable 记录) ----

@@ -16,7 +16,7 @@ import sys
 import threading
 import uuid
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Callable
 
@@ -26,7 +26,10 @@ from app.services.dashboard_manual_ops import (
     read_operator_actions,
     record_operator_action,
 )
-from app.services.incremental_audit_runtime import DEFAULT_RUNTIME_ROOT
+from app.services.incremental_audit_runtime import (
+    DEFAULT_RUNTIME_ROOT,
+    business_date_in_shanghai,
+)
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 _AUDIT_SCRIPT = Path("scripts") / "incremental_price_audit.py"
@@ -301,6 +304,30 @@ class DashboardActionRunner:
             ),
             "started_at": record.get("recorded_at"),
         }
+
+    def durable_status_recent(
+        self,
+        action_id: str,
+        *,
+        today: str | None = None,
+        lookback_days: int = 7,
+    ) -> dict | None:
+        """Durable status across the most recent Shanghai business days.
+
+        Anchors on ``today or business_date_in_shanghai()`` and probes the
+        per-day run dirs (today, today-1, ... for a bounded window of
+        ``lookback_days``) with the single-day ``durable_status`` lookup.  The
+        date sequence is generated entirely server-side -- the client can
+        never inject a path -- and ``action_id`` is only ever compared for
+        equality against JSONL records, so it never touches the filesystem.
+        """
+        anchor = date.fromisoformat(str(today or business_date_in_shanghai()))
+        for k in range(max(1, int(lookback_days))):
+            day = (anchor - timedelta(days=k)).isoformat()
+            durable = self.durable_status(action_id, self._runtime_root / day)
+            if durable is not None:
+                return durable
+        return None
 
     # ------------------------------------------------------------------
     # Internals

@@ -57,6 +57,17 @@ ACTION_E1 = "crash-e-unknown-01"
 ACTION_E2 = "crash-e-click-002"
 ACTION_F1 = "crash-f-intent-001"
 ACTION_F2 = "crash-f-click-002"
+ACTION_PWF_A = "pwf-a-0001"
+ACTION_PWF_B = "pwf-b-0002"
+ACTION_PWF_C = "pwf-c-0003"
+ACTION_PWF_D = "pwf-d-0004"
+ACTION_PWF_E = "pwf-e-0005"
+ACTION_PWF_F = "pwf-f-0006"
+ACTION_TNC_A = "tnc-a-0001"
+ACTION_TNC_B = "tnc-b-0002"
+ACTION_TNC_C = "tnc-c-0003"
+ACTION_TNC_E1 = "tnc-e-0001"
+ACTION_TNC_E2 = "tnc-e-0002"
 
 
 def _sql(state_path: Path, query: str, *params) -> None:
@@ -770,3 +781,253 @@ def test_store_rebuild_action_protocol_guards(tmp_path):
         assert stray == 0
     finally:
         store.release_lease(lease)
+
+
+# ---------------------------------------------------------------------------
+# P2-A: PRE_WRITE_FAILED is a proven zero-write stop boundary -- the
+# write-ahead STOP_SENT is withdrawn back to INTENT, never reconcile-locked.
+# ---------------------------------------------------------------------------
+
+
+def test_pre_write_failed_reverts_stop_sent_to_intent(tmp_path):
+    seed = _CrashSeed(tmp_path)
+    seed.remote_progress = seed.active_progress(18)
+    store, job, _crawls = seed.seed(18)
+    seed.stop_outcome = LegacyRestartOutcome(
+        RestartStatus.PRE_WRITE_FAILED,
+        diagnostic="auth refresh deadline exhausted",
+    )
+
+    first = seed.rebuild(job, action_id=ACTION_PWF_A)
+
+    assert first["outcome"] == "REBUILD_REJECTED"
+    assert first["error_code"] == "STOP_PRE_WRITE_FAILED"
+    assert first["stop_status"] == "PRE_WRITE_FAILED"
+    action = store.get_rebuild_action(ACTION_PWF_A)
+    assert action is not None
+    assert action["phase"] == "INTENT"  # write-ahead STOP_SENT withdrawn
+    assert "pre-write" in str(action["error_text"])
+    assert "auth refresh deadline exhausted" in str(action["error_text"])
+    assert len(seed.stop_calls) == 1  # the stop attempt fired but wrote nothing
+    assert store.get_replacement_for_job(int(job["id"])) is None
+    assert seed.runner_calls == []  # no replacement was created
+
+
+def test_pre_write_failed_then_click_retries_fresh_stop(tmp_path):
+    seed = _CrashSeed(tmp_path)
+    seed.remote_progress = seed.active_progress(18)
+    store, job, _crawls = seed.seed(18)
+    seed.stop_outcome = LegacyRestartOutcome(
+        RestartStatus.PRE_WRITE_FAILED,
+        diagnostic="auth refresh deadline exhausted",
+    )
+    first = seed.rebuild(job, action_id=ACTION_PWF_A)
+    assert first["error_code"] == "STOP_PRE_WRITE_FAILED"
+    persisted_name = str(store.get_rebuild_action(ACTION_PWF_A)["replacement_task_name"])
+
+    # A later click with a recovered auth channel resumes the same action
+    # from INTENT: fresh precheck, fresh stop, same deterministic name.
+    seed.stop_outcome = LegacyRestartOutcome(
+        RestartStatus.STOPPED,
+        disable_confirmed=True,
+        observed_enabled=False,
+        diagnostic="exact task disabled with confirmed evidence",
+    )
+    second = seed.rebuild(job, action_id=ACTION_PWF_B)
+
+    assert second["outcome"] == "REBUILD_DISPATCHED"
+    assert second["rebuild_action_id"] == ACTION_PWF_A  # resume owns the protocol
+    assert second["new_task_name"] == persisted_name
+    assert len(seed.stop_calls) == 2  # one fresh stop, zero double-stop risk
+    assert store.get_rebuild_action(ACTION_PWF_A)["phase"] == "DISPATCHED"
+    assert store.get_rebuild_action(ACTION_PWF_B) is None  # exactly one row
+
+
+def test_disable_unknown_keeps_stop_sent_reconcile_only(tmp_path):
+    seed = _CrashSeed(tmp_path)
+    seed.remote_progress = seed.active_progress(18)
+    store, job, _crawls = seed.seed(18)
+    seed.stop_outcome = LegacyRestartOutcome(
+        RestartStatus.DISABLE_UNKNOWN,
+        observed_enabled=True,
+        diagnostic="disable request outcome unknown",
+    )
+
+    first = seed.rebuild(job, action_id=ACTION_PWF_C)
+
+    assert first["outcome"] == "REBUILD_REJECTED"
+    assert first["error_code"] == "OLD_TASK_STOP_UNCONFIRMED"
+    assert store.get_rebuild_action(ACTION_PWF_C)["phase"] == "STOP_SENT"
+
+    def live_lookup(_prepared, _task_id, _task_number, _timeout):
+        return {"enabled": True, "progress": dict(seed.active_progress(18))}
+
+    second = seed.rebuild(job, action_id=ACTION_PWF_D, progress_lookup=live_lookup)
+
+    assert second["outcome"] == "REBUILD_REJECTED"
+    assert second["error_code"] == "OLD_TASK_STOP_UNCONFIRMED"
+    assert len(seed.stop_calls) == 1  # reconcile-only: never a second disable
+    assert store.get_rebuild_action(ACTION_PWF_C)["phase"] == "STOP_SENT"
+    assert store.get_replacement_for_job(int(job["id"])) is None
+
+
+def test_stop_timeout_escape_keeps_stop_sent(tmp_path):
+    seed = _CrashSeed(tmp_path)
+    seed.remote_progress = seed.active_progress(18)
+    store, job, _crawls = seed.seed(18)
+
+    def timeout_stop(_prepared, task_id, _task_number, _timeout):
+        seed.stop_calls.append({"task_id": str(task_id), "timeout": True})
+        raise TimeoutError("deadline")
+
+    with pytest.raises(TimeoutError):
+        seed.rebuild(job, action_id=ACTION_PWF_E, stop_callable=timeout_stop)
+
+    assert store.get_rebuild_action(ACTION_PWF_E)["phase"] == "STOP_SENT"
+
+    def live_lookup(_prepared, _task_id, _task_number, _timeout):
+        return {"enabled": True, "progress": dict(seed.active_progress(18))}
+
+    result = seed.rebuild(job, action_id=ACTION_PWF_F, progress_lookup=live_lookup)
+
+    assert result["outcome"] == "REBUILD_REJECTED"
+    assert result["error_code"] == "OLD_TASK_STOP_UNCONFIRMED"
+    assert len(seed.stop_calls) == 1  # the escape stays reconcile-only
+    assert store.get_rebuild_action(ACTION_PWF_E)["phase"] == "STOP_SENT"
+
+
+# ---------------------------------------------------------------------------
+# P2-B: a replacement task-name conflict must not dead-end a stop-confirmed
+# action; an ambiguous durable phase is still never released.
+# ---------------------------------------------------------------------------
+
+
+def _seed_name_conflict(tmp_path):
+    """Seed one old job plus a remote_jobs row reserving the tnc-a name."""
+    seed = _CrashSeed(tmp_path)
+    seed.remote_progress = seed.active_progress(18)
+    store, job, _crawls = seed.seed(18)
+    reserved = _replacement_task_name(OLD_TASK_NAME, ACTION_TNC_A, MALL_NAME)
+    lease = store.acquire_lease(BUSINESS_DATE, "tnc-reserve", 300.0)
+    try:
+        store.prepare_remote_intent(
+            lease,
+            f"legacy:{MALL_KEY}:reserved-{ACTION_TNC_A}",
+            reserved,
+            "reserved-hash",
+            mall_key=MALL_KEY,
+            input_path="C:\\x\\r-input.xlsx",
+            result_path="C:\\x\\r-result.xlsx",
+            payload_json={"requests": [], "batch_state": "C:\\x\\BATCH_STATE.md"},
+        )
+    finally:
+        store.release_lease(lease)
+    return seed, store, job, reserved
+
+
+def test_task_name_conflict_fails_action_when_stop_confirmed(tmp_path):
+    seed, store, job, reserved = _seed_name_conflict(tmp_path)
+
+    result = seed.rebuild(job, action_id=ACTION_TNC_A)
+
+    assert result["outcome"] == "REBUILD_REJECTED"
+    assert result["error_code"] == "TASK_NAME_CONFLICT"
+    assert result["action_failed"] is True
+    action = store.get_rebuild_action(ACTION_TNC_A)
+    assert action["phase"] == "FAILED"  # released: stop was durably confirmed
+    assert "replacement task name conflict" in str(action["error_text"])
+    assert store.get_replacement_for_job(int(job["id"])) is None
+    assert len(seed.stop_calls) == 1  # the stop confirmed before the conflict
+    assert seed.runner_calls == []
+
+
+def test_task_name_conflict_then_new_action_rebuilds(tmp_path):
+    seed, store, job, reserved = _seed_name_conflict(tmp_path)
+    first = seed.rebuild(job, action_id=ACTION_TNC_A)
+    assert first["error_code"] == "TASK_NAME_CONFLICT"
+    assert seed.stop_disable_writes == 1  # the one confirmed disable
+
+    # The released action lets a fresh action id derive a brand-new name; the
+    # exact task is already disabled, so the second protocol is zero-write.
+    seed.stop_outcome = LegacyRestartOutcome(
+        RestartStatus.EXTERNALLY_DISABLED,
+        observed_enabled=False,
+        diagnostic="exact task is already disabled elsewhere",
+    )
+    second = seed.rebuild(job, action_id=ACTION_TNC_B)
+
+    assert second["outcome"] == "REBUILD_DISPATCHED"
+    assert second["new_task_name"] != reserved
+    assert seed.stop_disable_writes == 1  # EXTERNALLY_DISABLED writes nothing
+    assert store.get_rebuild_action(ACTION_TNC_B)["phase"] == "DISPATCHED"
+    assert store.get_rebuild_action(ACTION_TNC_A)["phase"] == "FAILED"
+    assert store.get_replacement_for_job(int(job["id"])) is not None
+
+
+def test_failed_conflict_action_same_id_click_starts_fresh(tmp_path):
+    seed, store, job, _reserved = _seed_name_conflict(tmp_path)
+    first = seed.rebuild(job, action_id=ACTION_TNC_A)
+    assert first["error_code"] == "TASK_NAME_CONFLICT"
+
+    retry = seed.rebuild(job, action_id=ACTION_TNC_A)  # same id click
+
+    # The FAILED row never trips the active guard: the replayed id is caught
+    # by the id-level uniqueness instead, with zero further remote writes.
+    assert retry["outcome"] == "REBUILD_REJECTED"
+    assert retry["error_code"] != "REBUILD_ACTION_ACTIVE"
+    assert "already exists" in str(retry["reason"])
+    assert store.get_rebuild_action(ACTION_TNC_A)["phase"] == "FAILED"
+    assert len(seed.stop_calls) == 1
+
+
+def test_task_name_conflict_at_stop_sent_never_releases(tmp_path, monkeypatch):
+    seed = _CrashSeed(tmp_path)
+    seed.remote_progress = seed.active_progress(18)
+    store, job, _crawls = seed.seed(18)
+
+    original_update = DailyAuditStore.update_rebuild_action_phase
+
+    def suppressing_update(
+        self, token, *, action_id, phase, stop_evidence=None,
+        new_remote_job_id=None, error_text=None,
+    ):
+        if phase == "STOP_CONFIRMED":
+            return None  # the confirm never lands: durable stays STOP_SENT
+        return original_update(
+            self, token, action_id=action_id, phase=phase,
+            stop_evidence=stop_evidence, new_remote_job_id=new_remote_job_id,
+            error_text=error_text,
+        )
+
+    def conflicting_supersede(self, *args, **kwargs):
+        raise RemoteIntentConflict("replacement task name is already reserved")
+
+    monkeypatch.setattr(
+        DailyAuditStore, "update_rebuild_action_phase", suppressing_update)
+    monkeypatch.setattr(
+        DailyAuditStore, "supersede_remote_job_to_replacement", conflicting_supersede)
+
+    result = seed.rebuild(job, action_id=ACTION_TNC_C)
+
+    assert result["outcome"] == "REBUILD_REJECTED"
+    assert result["error_code"] == "TASK_NAME_CONFLICT"
+    assert result["action_failed"] is False  # ambiguous phase: fail closed
+    action = store.get_rebuild_action(ACTION_TNC_C)
+    assert action["phase"] == "STOP_SENT"  # not FAILED, not released
+    assert len(seed.stop_calls) == 1
+
+
+def test_conflict_with_existing_replacement_still_already_replaced(tmp_path):
+    seed = _CrashSeed(tmp_path)
+    seed.remote_progress = seed.terminal_progress(18)
+    store, job, _crawls = seed.seed(18)
+
+    first = seed.rebuild(job, action_id=ACTION_TNC_E1)
+
+    assert first["outcome"] == "REBUILD_DISPATCHED"
+
+    second = seed.rebuild(job, action_id=ACTION_TNC_E2)
+
+    assert second["outcome"] == "REBUILD_ALREADY_REPLACED"  # idempotent replay
+    assert second["new_remote_job_id"] == first["new_remote_job_id"]
+    assert store.get_replacement_for_job(int(job["id"])) is not None

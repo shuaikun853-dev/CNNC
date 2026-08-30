@@ -370,8 +370,7 @@ def dashboard_action_status(action_id: str) -> JSONResponse:
              "status": handle.status, "outcome": handle.outcome,
              "started_at": handle.started_at},
             headers=_NO_STORE)
-    durable = get_action_runner().durable_status(
-        action_id, runtime_paths(_today()).run_dir)
+    durable = get_action_runner().durable_status_recent(action_id)
     if durable is not None:
         return JSONResponse(durable, headers=_NO_STORE)
     raise HTTPException(status_code=404, detail={
