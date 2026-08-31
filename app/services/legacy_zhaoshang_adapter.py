@@ -1532,6 +1532,14 @@ class CnncLegacyZhaoshangAdapter:
         task_number: str,
         timeout_seconds: float,
     ) -> ExportNoPriceProbe:
+        # Business-response evidence gate (review finding A): HTTP 200 is not
+        # business success.  Every raw business response that donates
+        # no-result evidence (finished marker, progress counters, no-price
+        # rspDesc / count) must pass the same business-success rule as the
+        # running probe; a success=false / non-0000 rspCode payload fails
+        # closed instead of authorizing an irreversible NO_RESULT write.
+        from app.services.remote_running_recovery import remote_business_response_ok
+
         if timeout_seconds <= 0:
             raise TimeoutError("export no-price probe timeout must be positive")
         if not self._external_tool_path.is_file():
@@ -1575,6 +1583,10 @@ class CnncLegacyZhaoshangAdapter:
                 raise TimeoutError("export no-price probe deadline exhausted before status query")
             status = tool.query_task_status(session, str(live_task_id))
             remote_calls += 1
+            if not remote_business_response_ok(status):
+                raise LegacyZhaoshangAdapterError(
+                    "export no-price task-status response is not business-successful"
+                )
             remaining = deadline - self._monotonic()
             if remaining <= 0:
                 raise TimeoutError("export no-price probe deadline exhausted before progress query")
@@ -1583,6 +1595,10 @@ class CnncLegacyZhaoshangAdapter:
             batch_number = _text(task.get("batchNumber")) or resolved_task_name
             progress_json = tool.query_task_progress(session, batch_number)
             remote_calls += 1
+            if not remote_business_response_ok(progress_json):
+                raise LegacyZhaoshangAdapterError(
+                    "export no-price progress response is not business-successful"
+                )
             remaining = deadline - self._monotonic()
             if remaining <= 0:
                 raise TimeoutError("export no-price probe deadline exhausted before export query")
@@ -1616,6 +1632,10 @@ class CnncLegacyZhaoshangAdapter:
             ) from exc
         if not isinstance(data, dict):
             raise LegacyZhaoshangAdapterError("export endpoint returned an unexpected payload")
+        if not remote_business_response_ok(data):
+            raise LegacyZhaoshangAdapterError(
+                "export no-price export response is not business-successful"
+            )
         embedded = data.get("data")
         if isinstance(embedded, dict) and any(
             _text(embedded.get(key)) for key in ("url", "fileUrl", "downloadUrl", "exportUrl")

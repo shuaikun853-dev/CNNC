@@ -99,13 +99,14 @@ def _seed_partial_job(
     duplicate_sources: dict[int, tuple[str, ...]] | None = None,
     execution_numbers: list[str] | None = None,
     export_probe: Callable[..., ExportNoPriceProbe] | None = None,
+    adapter: CnncLegacyZhaoshangAdapter | None = None,
 ) -> tuple[DailyAuditStore, CnncLegacyZhaoshangAdapter, int, str, Path]:
     run_dir = tmp_path / "runtime" / BUSINESS_DATE
     run_dir.mkdir(parents=True)
     state_path = run_dir / "state.sqlite3"
     batch_state = run_dir / "BATCH_STATE.md"
     batch_state.write_text("# state\n", encoding="utf-8")
-    adapter = CnncLegacyZhaoshangAdapter(
+    adapter = adapter or CnncLegacyZhaoshangAdapter(
         mappings=[],
         db_env_path=None,
         export_probe=export_probe,
@@ -929,3 +930,147 @@ def test_partial_exact_harvest_without_absent_rows_never_probes(tmp_path):
     assert result["remote_calls"] == 0
     assert result["remote_state"] == "COMPLETED"
     assert {crawl["state"] for crawl in store.crawl_work_for_job(job_id)} == {"SUCCESS"}
+
+
+class _Http200FakeResponse:
+    """HTTP 200 JSON response; success is only a transport-level fact."""
+
+    def __init__(self, payload):
+        self._payload = payload
+        self.headers = {"Content-Type": "application/json"}
+        self.content = json.dumps(payload).encode("utf-8")
+
+    def raise_for_status(self):
+        return None
+
+    def json(self):
+        return self._payload
+
+
+class _Http200FakeSession:
+    def __init__(self, export_payload):
+        self._export_payload = export_payload
+
+    def post(self, url, json=None, timeout=None):
+        return _Http200FakeResponse(self._export_payload)
+
+    def get(self, url, params=None, timeout=None):
+        return _Http200FakeResponse({})
+
+
+def _business_failure_production_tool(export_payload):
+    """Minimal external-tool stand-in: business-OK status/progress, business-FAILED export."""
+
+    class _Module:
+        EXPORT_TASK_URL = "https://platform.invalid/exportTask"
+
+        @staticmethod
+        def build_session():
+            return _Http200FakeSession(export_payload)
+
+        @staticmethod
+        def priority_mall_code_for_key(mall_key):
+            return mall_key
+
+        @staticmethod
+        def build_browser_task_identifiers(task_name, mall_key):
+            return task_name, task_name
+
+        @staticmethod
+        def check_existing_task(session, task_name, mall_code):
+            return {
+                "taskName": task_name,
+                "taskId": "task-id",
+                "taskNumber": "task-number",
+                "batchNumber": "batch-target",
+            }
+
+        @staticmethod
+        def get_task_identity(task, mall_code):
+            return task["taskId"], task["taskNumber"], mall_code
+
+        @staticmethod
+        def query_task_status(session, task_id):
+            return {"rspCode": "0000", "rspDesc": "本次任务执行完毕", "success": True}
+
+        @staticmethod
+        def query_task_progress(session, batch_number):
+            return {
+                "rspCode": "0000",
+                "rspDesc": (
+                    "总任务量：2条，待执行：0条，执行中：0条，失败：0条，"
+                    "待入库：0条，执行完成：2条"
+                ),
+                "success": True,
+            }
+
+        @staticmethod
+        def parse_task_progress_desc(rsp_desc):
+            values = {
+                "总任务量": "total",
+                "待执行": "pending",
+                "执行中": "running",
+                "失败": "failed",
+                "待入库": "waiting_db",
+                "执行完成": "finished",
+            }
+            summary = {}
+            for label, key in values.items():
+                marker = f"{label}："
+                if marker in rsp_desc:
+                    head = rsp_desc.split(marker, 1)[1]
+                    summary[key] = int(head.split("条", 1)[0])
+            return summary
+
+    return _Module
+
+
+class _FakeProductionAuthManager:
+    def export_environment(self, system, refresh=False):
+        return {"BLADE_AUTH": "bearer fake", "COOKIE": "x-access-token=fake; refreshToken=fake"}
+
+
+def test_partial_exact_absence_production_probe_rejects_business_failed_export(
+    tmp_path, monkeypatch
+):
+    """P0 E2E: HTTP 200 + success=false/5001 export faking no-price -> reject, zero writes.
+
+    The production probe path must refuse to let a business-failed export
+    response donate the no-price rspDesc/count evidence, so the harvest
+    recovery rejects with zero NO_RESULT writes and the job stays manual.
+    """
+    requests = _requests(2)
+    rows = [(requests[0].sku_id, requests[0].sku_id, requests[0].url, 10)]
+    export_payload = {
+        "success": False,
+        "rspCode": "5001",
+        "rspDesc": EXPORT_NO_PRICE_RSP_DESC,
+        "count": 0,
+        "data": None,
+    }
+    monkeypatch.setattr(
+        CnncLegacyZhaoshangAdapter,
+        "_load_module",
+        classmethod(
+            lambda cls, path, name: _business_failure_production_tool(export_payload)
+        ),
+    )
+    production_adapter = CnncLegacyZhaoshangAdapter(
+        mappings=[],
+        db_env_path=None,
+        auth_manager=_FakeProductionAuthManager(),
+    )
+    store, adapter, job_id, identity, state_path = _seed_partial_job(
+        tmp_path,
+        requests,
+        rows,
+        adapter=production_adapter,
+    )
+
+    with pytest.raises(recovery.RecoveryRejected, match="probe failed"):
+        _run(state_path, adapter, job_id, identity)
+
+    crawls = store.crawl_work_for_job(job_id)
+    assert {crawl["state"] for crawl in crawls} == {"PENDING"}
+    assert [crawl["state"] for crawl in crawls].count("NO_RESULT") == 0
+    assert store.get_remote_job(job_id)["state"] == "MANUAL_REQUIRED"

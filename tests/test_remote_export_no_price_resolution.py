@@ -17,6 +17,7 @@ from app.services.legacy_zhaoshang_adapter import (
     CnncLegacyZhaoshangAdapter,
     CrawlRequest,
     ExportNoPriceProbe,
+    LegacyZhaoshangAdapterError,
 )
 
 
@@ -631,7 +632,7 @@ class _FakeSession:
         return _FakeResponse(self.progress_payload)
 
 
-def _fake_tool_module(task_record, session):
+def _fake_tool_module(task_record, session, status_payload=None):
     class _Module:
         EXPORT_TASK_URL = "https://platform.invalid/exportTask"
         QUERY_PROGRESS_URL = "https://platform.invalid/queryTaskProgress"
@@ -658,6 +659,8 @@ def _fake_tool_module(task_record, session):
 
         @staticmethod
         def query_task_status(session, task_id):
+            if status_payload is not None:
+                return status_payload
             return {"rspCode": "0000", "rspDesc": FINISHED_STATUS, "success": True}
 
         @staticmethod
@@ -793,3 +796,290 @@ def test_production_probe_accepts_missing_count_only_with_empty_data(tmp_path, m
     )
     with pytest.raises(LegacyZhaoshangAdapterError, match="rows without a count"):
         adapter.probe_export_no_price(prepared, TASK_ID, TASK_NUMBER, 60.0)
+
+
+_FULL_PROGRESS_DESC = (
+    "总任务量：3条，待执行：0条，执行中：0条，失败：0条，待入库：0条，执行完成：3条"
+)
+_FULL_PROGRESS = {
+    "total": 3,
+    "pending": 0,
+    "running": 0,
+    "failed": 0,
+    "waiting_db": 0,
+    "finished": 3,
+}
+_OK_STATUS = {"rspCode": "0000", "rspDesc": FINISHED_STATUS, "success": True}
+_OK_PROGRESS = {"rspCode": "0000", "rspDesc": _FULL_PROGRESS_DESC, "success": True}
+_OK_EXPORT = {
+    "rspCode": "0000",
+    "rspDesc": NO_PRICE_RSP_DESC,
+    "count": 0,
+    "data": None,
+    "success": True,
+}
+
+
+def _production_probe_with_payloads(
+    tmp_path,
+    monkeypatch,
+    *,
+    status_payload=None,
+    progress_payload=None,
+    export_payload=None,
+):
+    """Walk the production probe path with per-source raw response payloads."""
+    from app.services.legacy_zhaoshang_adapter import CnncLegacyZhaoshangAdapter
+
+    seed = _Seed(tmp_path)
+    prepared = seed.adapter.prepare_job(
+        BUSINESS_DATE,
+        seed.build_requests(3),
+        seed.run_dir / "input.xlsx",
+        seed.run_dir / "result.xlsx",
+        "task-target",
+        seed.batch_state,
+    )
+    task_record = {
+        "taskName": prepared.task_name,
+        "mallLogo": "lxwl",
+        "taskId": TASK_ID,
+        "taskNumber": TASK_NUMBER,
+        "batchNumber": "batch-target",
+    }
+    session = _FakeSession(
+        progress_payload=_OK_PROGRESS if progress_payload is None else progress_payload,
+        export_payload=_OK_EXPORT if export_payload is None else export_payload,
+    )
+    monkeypatch.setattr(
+        CnncLegacyZhaoshangAdapter,
+        "_load_module",
+        classmethod(
+            lambda cls, path, name: _fake_tool_module(
+                task_record, session, status_payload=status_payload
+            )
+        ),
+    )
+    adapter = CnncLegacyZhaoshangAdapter(
+        mappings=[], db_env_path=None, auth_manager=_FakeAuthManager()
+    )
+    return adapter, prepared, session
+
+
+def test_production_probe_status_business_gate_accepts_full_success(tmp_path, monkeypatch):
+    """S1: success=true + rspCode 0000 + finished marker stays admissible."""
+    adapter, prepared, _session = _production_probe_with_payloads(
+        tmp_path, monkeypatch, status_payload=dict(_OK_STATUS)
+    )
+
+    probe = adapter.probe_export_no_price(prepared, TASK_ID, TASK_NUMBER, 60.0)
+
+    assert probe.task_status_rsp_desc == FINISHED_STATUS
+    assert probe.remote_calls == 4
+
+
+def test_production_probe_status_business_gate_rejects_success_false(tmp_path, monkeypatch):
+    """S2: status success=false must never donate the finished marker."""
+    adapter, prepared, session = _production_probe_with_payloads(
+        tmp_path,
+        monkeypatch,
+        status_payload={"rspCode": "0000", "rspDesc": FINISHED_STATUS, "success": False},
+    )
+
+    with pytest.raises(
+        LegacyZhaoshangAdapterError, match="task-status response is not business-successful"
+    ):
+        adapter.probe_export_no_price(prepared, TASK_ID, TASK_NUMBER, 60.0)
+    assert not any("exportTask" in str(call[0]) for call in session.calls)
+
+
+def test_production_probe_status_business_gate_rejects_rsp_code_5001(tmp_path, monkeypatch):
+    """S3: status rspCode 5001 is a business failure despite the finished text."""
+    adapter, prepared, session = _production_probe_with_payloads(
+        tmp_path,
+        monkeypatch,
+        status_payload={"rspCode": "5001", "rspDesc": FINISHED_STATUS, "success": True},
+    )
+
+    with pytest.raises(
+        LegacyZhaoshangAdapterError, match="task-status response is not business-successful"
+    ):
+        adapter.probe_export_no_price(prepared, TASK_ID, TASK_NUMBER, 60.0)
+    assert not any("exportTask" in str(call[0]) for call in session.calls)
+
+
+def test_production_probe_status_business_gate_rejects_success_null(tmp_path, monkeypatch):
+    """S4: explicit success=null (not absent) is not business success."""
+    adapter, prepared, session = _production_probe_with_payloads(
+        tmp_path,
+        monkeypatch,
+        status_payload={"rspCode": "0000", "rspDesc": FINISHED_STATUS, "success": None},
+    )
+
+    with pytest.raises(
+        LegacyZhaoshangAdapterError, match="task-status response is not business-successful"
+    ):
+        adapter.probe_export_no_price(prepared, TASK_ID, TASK_NUMBER, 60.0)
+    assert not any("exportTask" in str(call[0]) for call in session.calls)
+
+
+def test_production_probe_status_business_gate_allows_missing_fields(tmp_path, monkeypatch):
+    """S5: absent success/rspCode stay admissible (compatibility is not tightened)."""
+    adapter, prepared, _session = _production_probe_with_payloads(
+        tmp_path, monkeypatch, status_payload={"rspDesc": FINISHED_STATUS}
+    )
+
+    probe = adapter.probe_export_no_price(prepared, TASK_ID, TASK_NUMBER, 60.0)
+
+    assert probe.task_status_rsp_desc == FINISHED_STATUS
+    assert probe.remote_calls == 4
+
+
+def test_production_probe_progress_business_gate_accepts_full_success(tmp_path, monkeypatch):
+    """P1: success=true + 0000 + complete counters stay admissible."""
+    adapter, prepared, _session = _production_probe_with_payloads(
+        tmp_path, monkeypatch, progress_payload=dict(_OK_PROGRESS)
+    )
+
+    probe = adapter.probe_export_no_price(prepared, TASK_ID, TASK_NUMBER, 60.0)
+
+    assert probe.progress == _FULL_PROGRESS
+    assert probe.remote_calls == 4
+
+
+def test_production_probe_progress_business_gate_rejects_success_false_with_forged_counters(
+    tmp_path, monkeypatch
+):
+    """P2: a business-failed progress body must not donate forged counter evidence."""
+    adapter, prepared, session = _production_probe_with_payloads(
+        tmp_path,
+        monkeypatch,
+        progress_payload={"rspDesc": _FULL_PROGRESS_DESC, "success": False},
+    )
+
+    with pytest.raises(
+        LegacyZhaoshangAdapterError, match="progress response is not business-successful"
+    ):
+        adapter.probe_export_no_price(prepared, TASK_ID, TASK_NUMBER, 60.0)
+    assert not any("exportTask" in str(call[0]) for call in session.calls)
+
+
+def test_production_probe_progress_business_gate_rejects_rsp_code_5001(tmp_path, monkeypatch):
+    """P3: rspCode 5001 with complete counters is still a business failure."""
+    adapter, prepared, session = _production_probe_with_payloads(
+        tmp_path,
+        monkeypatch,
+        progress_payload={"rspCode": "5001", "rspDesc": _FULL_PROGRESS_DESC, "success": True},
+    )
+
+    with pytest.raises(
+        LegacyZhaoshangAdapterError, match="progress response is not business-successful"
+    ):
+        adapter.probe_export_no_price(prepared, TASK_ID, TASK_NUMBER, 60.0)
+    assert not any("exportTask" in str(call[0]) for call in session.calls)
+
+
+def test_production_probe_progress_business_gate_allows_missing_fields(tmp_path, monkeypatch):
+    """P4: progress with only rspDesc (absent success/rspCode) stays admissible."""
+    adapter, prepared, _session = _production_probe_with_payloads(
+        tmp_path, monkeypatch, progress_payload={"rspDesc": _FULL_PROGRESS_DESC}
+    )
+
+    probe = adapter.probe_export_no_price(prepared, TASK_ID, TASK_NUMBER, 60.0)
+
+    assert probe.progress == _FULL_PROGRESS
+    assert probe.remote_calls == 4
+
+
+def test_production_probe_export_business_gate_accepts_full_success(tmp_path, monkeypatch):
+    """E1: success=true + 0000 + no-price + count=0 stays admissible."""
+    adapter, prepared, _session = _production_probe_with_payloads(
+        tmp_path, monkeypatch, export_payload=dict(_OK_EXPORT)
+    )
+
+    probe = adapter.probe_export_no_price(prepared, TASK_ID, TASK_NUMBER, 60.0)
+
+    assert probe.export_rsp_desc == NO_PRICE_RSP_DESC
+    assert probe.export_count == 0
+    assert probe.remote_calls == 4
+
+
+def test_production_probe_export_business_gate_rejects_success_false_with_forged_no_price(
+    tmp_path, monkeypatch
+):
+    """E2: the most dangerous false positive - business failure faking no-price."""
+    adapter, prepared, _session = _production_probe_with_payloads(
+        tmp_path,
+        monkeypatch,
+        export_payload={
+            "success": False,
+            "rspCode": "5001",
+            "rspDesc": NO_PRICE_RSP_DESC,
+            "count": 0,
+            "data": None,
+        },
+    )
+
+    with pytest.raises(
+        LegacyZhaoshangAdapterError, match="export response is not business-successful"
+    ):
+        adapter.probe_export_no_price(prepared, TASK_ID, TASK_NUMBER, 60.0)
+
+
+def test_production_probe_export_business_gate_rejects_success_false_code_0000(
+    tmp_path, monkeypatch
+):
+    """E3: success=false with a 0000 rspCode is still a business failure."""
+    adapter, prepared, _session = _production_probe_with_payloads(
+        tmp_path,
+        monkeypatch,
+        export_payload={
+            "rspCode": "0000",
+            "rspDesc": NO_PRICE_RSP_DESC,
+            "count": 0,
+            "data": None,
+            "success": False,
+        },
+    )
+
+    with pytest.raises(
+        LegacyZhaoshangAdapterError, match="export response is not business-successful"
+    ):
+        adapter.probe_export_no_price(prepared, TASK_ID, TASK_NUMBER, 60.0)
+
+
+def test_production_probe_export_business_gate_rejects_success_true_code_9999(
+    tmp_path, monkeypatch
+):
+    """E4: success=true with a non-0000 rspCode is a business failure."""
+    adapter, prepared, _session = _production_probe_with_payloads(
+        tmp_path,
+        monkeypatch,
+        export_payload={
+            "rspCode": "9999",
+            "rspDesc": NO_PRICE_RSP_DESC,
+            "count": 0,
+            "data": None,
+            "success": True,
+        },
+    )
+
+    with pytest.raises(
+        LegacyZhaoshangAdapterError, match="export response is not business-successful"
+    ):
+        adapter.probe_export_no_price(prepared, TASK_ID, TASK_NUMBER, 60.0)
+
+
+def test_production_probe_export_business_gate_allows_missing_fields(tmp_path, monkeypatch):
+    """E5: export with only rspDesc + count (absent success/rspCode) stays admissible."""
+    adapter, prepared, _session = _production_probe_with_payloads(
+        tmp_path,
+        monkeypatch,
+        export_payload={"rspDesc": NO_PRICE_RSP_DESC, "count": 0},
+    )
+
+    probe = adapter.probe_export_no_price(prepared, TASK_ID, TASK_NUMBER, 60.0)
+
+    assert probe.export_rsp_desc == NO_PRICE_RSP_DESC
+    assert probe.export_count == 0
+    assert probe.remote_calls == 4
