@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-from decimal import Decimal
 from pathlib import Path
 from typing import Any, Callable
 
@@ -245,12 +244,19 @@ def _run(
     ("expected", "matched", "missing"),
     [(273, 272, 1), (58, 55, 3)],
 )
-def test_partial_exact_harvest_completes_unique_matches_and_exact_absences(
+def test_partial_exact_harvest_mixed_large_batch_rejects_contradictory_evidence(
     tmp_path,
     expected,
     matched,
     missing,
 ):
+    """B1/B2 large-number variants: a mixed workbook is rejected, never stitched.
+
+    Regression shape for Review Finding B: exact SUCCESS rows coexisting with
+    pending exact_absent identities used to receive irreversible NO_RESULT
+    from the whole-task zero-price probe. The recovery must fail closed at
+    the contradictory-evidence gate instead.
+    """
     requests = _requests(expected)
     rows = [
         (request.sku_id, request.sku_id, request.url, 0 if index == 0 else index + 1)
@@ -261,93 +267,174 @@ def test_partial_exact_harvest_completes_unique_matches_and_exact_absences(
         tmp_path, requests, rows, export_probe=_make_export_probe(calls=probe_calls)
     )
 
-    result = _run(state_path, adapter, job_id, identity)
+    with pytest.raises(
+        recovery.RecoveryRejected, match="cannot prove per-identity absence"
+    ):
+        _run(state_path, adapter, job_id, identity)
 
-    assert result["crawl_success"] == matched
-    assert result["crawl_no_result"] == missing
-    assert result["crawl_manual"] == 0
-    assert result["remote_state"] == "COMPLETED"
-    assert result["remote_calls"] == 3
-    assert len(probe_calls) == 1
-    assert result["add_calls"] == 0
+    assert probe_calls == []
     crawls = store.crawl_work_for_job(job_id)
-    assert [crawl["state"] for crawl in crawls].count("SUCCESS") == matched
-    assert [crawl["state"] for crawl in crawls].count("NO_RESULT") == missing
-    zero = json.loads(crawls[0]["result_json"])
-    assert zero["page_price_status"] == "PRICE_IS_ZERO"
-    assert Decimal(str(zero["page_price_value"])) == Decimal("0")
+    assert len(crawls) == expected
+    assert {crawl["state"] for crawl in crawls} == {"PENDING"}
+    assert store.get_remote_job(job_id)["state"] == "MANUAL_REQUIRED"
+
+
+def test_partial_exact_harvest_mixed_matches_and_absent_rejects_before_probe_or_writes(tmp_path):
+    """B1: small mixed matched+absent batch rejects before any probe or write."""
+    requests = _requests(3)
+    rows = [
+        (request.sku_id, request.sku_id, request.url, index + 1)
+        for index, request in enumerate(requests[:2])
+    ]
+    probe_calls: list[tuple[str, str, float]] = []
+    store, adapter, job_id, identity, state_path = _seed_partial_job(
+        tmp_path, requests, rows, export_probe=_make_export_probe(calls=probe_calls)
+    )
+
+    with pytest.raises(
+        recovery.RecoveryRejected, match="cannot prove per-identity absence"
+    ):
+        _run(state_path, adapter, job_id, identity)
+
+    assert probe_calls == []
+    assert {crawl["state"] for crawl in store.crawl_work_for_job(job_id)} == {"PENDING"}
+    assert store.get_remote_job(job_id)["state"] == "MANUAL_REQUIRED"
+
+
+def test_partial_exact_harvest_mixed_one_match_two_absent_rejects_before_probe_or_writes(tmp_path):
+    """B2: one match plus two absent identities is still contradictory evidence."""
+    requests = _requests(3)
+    rows = [(requests[0].sku_id, requests[0].sku_id, requests[0].url, 10)]
+    probe_calls: list[tuple[str, str, float]] = []
+    store, adapter, job_id, identity, state_path = _seed_partial_job(
+        tmp_path, requests, rows, export_probe=_make_export_probe(calls=probe_calls)
+    )
+
+    with pytest.raises(
+        recovery.RecoveryRejected, match="cannot prove per-identity absence"
+    ):
+        _run(state_path, adapter, job_id, identity)
+
+    assert probe_calls == []
+    assert {crawl["state"] for crawl in store.crawl_work_for_job(job_id)} == {"PENDING"}
+    assert store.get_remote_job(job_id)["state"] == "MANUAL_REQUIRED"
+
+
+def test_partial_exact_harvest_mixed_fanout_absent_rejects_without_no_result_fanout(tmp_path):
+    """B3: a fan-out absent identity gets no NO_RESULT fan from global evidence."""
+    requests = _requests(2)
+    rows = [(requests[0].sku_id, requests[0].sku_id, requests[0].url, 10)]
+    probe_calls: list[tuple[str, str, float]] = []
+    store, adapter, job_id, identity, state_path = _seed_partial_job(
+        tmp_path,
+        requests,
+        rows,
+        duplicate_sources={1: ("v-1", "v-2", "v-3")},
+        export_probe=_make_export_probe(calls=probe_calls),
+    )
+
+    with pytest.raises(
+        recovery.RecoveryRejected, match="cannot prove per-identity absence"
+    ):
+        _run(state_path, adapter, job_id, identity)
+
+    crawls = store.crawl_work_for_job(job_id)
+    assert len(crawls) == 4
+    assert {crawl["state"] for crawl in crawls} == {"PENDING"}
+    assert probe_calls == []
+    assert store.get_remote_job(job_id)["state"] == "MANUAL_REQUIRED"
 
 
 def test_partial_exact_harvest_treats_candidate_columns_as_exported_aliases(tmp_path):
+    """All-matched alias classification: shared-URL candidate columns resolve to
+    SUCCESS for every consumer without any probe call."""
     normal = _requests(31)
     shared_url = "https://shop.example/shared"
     requests = (
         *normal,
         CrawlRequest("mall", "source", "Mall", "base", shared_url, "legacy-v1"),
         CrawlRequest("mall", "source", "Mall", "basePCS", shared_url, "legacy-v1"),
-        CrawlRequest("mall", "source", "Mall", "absent", "https://shop.example/absent", "legacy-v1"),
     )
     rows = [
         (request.sku_id, request.sku_id, request.url, index + 1)
         for index, request in enumerate(normal)
     ]
     rows.append(("base", "basePCS", shared_url, 99))
+    probe_calls: list[tuple[str, str, float]] = []
     store, adapter, job_id, identity, state_path = _seed_partial_job(
-        tmp_path, requests, rows, export_probe=_make_export_probe()
+        tmp_path,
+        requests,
+        rows,
+        export_probe=_make_export_probe(
+            calls=probe_calls, exception=RuntimeError("must not probe")
+        ),
     )
 
     result = _run(state_path, adapter, job_id, identity)
 
     assert result["crawl_success"] == 33
-    assert result["crawl_no_result"] == 1
+    assert result["crawl_no_result"] == 0
     assert result["crawl_manual"] == 0
     assert result["remote_state"] == "COMPLETED"
+    assert result["remote_calls"] == 0
+    assert probe_calls == []
     states = {crawl["sku_id"]: crawl["state"] for crawl in store.crawl_work_for_job(job_id)}
+    assert set(states.values()) == {"SUCCESS"}
     assert states["base"] == "SUCCESS"
     assert states["basePCS"] == "SUCCESS"
-    assert states["absent"] == "NO_RESULT"
 
 
 def test_partial_exact_absence_does_not_borrow_sibling_sku_price(tmp_path):
+    """Sibling-SKU shared-URL workbook is contradictory evidence: reject fully.
+
+    Historically this proved the absent sibling never borrowed the matched
+    sibling's price; under the contradictory-evidence invariant the whole
+    mixed batch now fails closed before the probe, so no NO_RESULT evidence
+    is produced at all.
+    """
     shared_url = "https://shop.example/shared"
     requests = (
         CrawlRequest("mall", "source", "Mall", "basePCS", shared_url, "legacy-v1"),
         CrawlRequest("mall", "source", "Mall", "base", shared_url, "legacy-v1"),
     )
     rows = [("basePCS", "basePCS", shared_url, 12.3)]
+    probe_calls: list[tuple[str, str, float]] = []
     store, adapter, job_id, identity, state_path = _seed_partial_job(
-        tmp_path, requests, rows, export_probe=_make_export_probe()
+        tmp_path, requests, rows, export_probe=_make_export_probe(calls=probe_calls)
     )
 
-    result = _run(state_path, adapter, job_id, identity)
+    with pytest.raises(
+        recovery.RecoveryRejected, match="cannot prove per-identity absence"
+    ):
+        _run(state_path, adapter, job_id, identity)
 
-    assert result["crawl_success"] == 1
-    assert result["crawl_no_result"] == 1
-    crawls = {crawl["sku_id"]: crawl for crawl in store.crawl_work_for_job(job_id)}
-    assert Decimal(
-        str(json.loads(crawls["basePCS"]["result_json"])["page_price_value"])
-    ) == Decimal("12.3")
-    absent = json.loads(crawls["base"]["result_json"])
-    assert absent["evidence_type"] == "EXPORTED_NO_MATCHING_ROW"
-    assert absent["no_result_reason"] == EXPORT_NO_PRICE_CRAWL_REASON
-    assert crawls["base"]["error_text"] == EXPORT_NO_PRICE_CRAWL_REASON
-    assert absent["page_price_value"] is None
+    assert probe_calls == []
+    assert {crawl["state"] for crawl in store.crawl_work_for_job(job_id)} == {"PENDING"}
+    assert store.get_remote_job(job_id)["state"] == "MANUAL_REQUIRED"
 
 
 def test_partial_exact_harvest_filters_foreign_provenance_rows(tmp_path):
+    """Foreign-provenance rows are filtered before classification, so an
+    all-foreign workbook classifies as fully absent and keeps the legal
+    probe path to NO_RESULT."""
     requests = _requests(2)
-    current = [(requests[0].sku_id, requests[0].sku_id, requests[0].url, 10)]
-    foreign = [(requests[1].sku_id, requests[1].sku_id, requests[1].url, 999)]
+    foreign = [
+        (requests[0].sku_id, requests[0].sku_id, requests[0].url, 10),
+        (requests[1].sku_id, requests[1].sku_id, requests[1].url, 999),
+    ]
     store, adapter, job_id, identity, state_path = _seed_partial_job(
-        tmp_path, requests, current, foreign_rows=foreign, export_probe=_make_export_probe()
+        tmp_path, requests, [], foreign_rows=foreign, export_probe=_make_export_probe()
     )
 
     result = _run(state_path, adapter, job_id, identity)
 
-    assert result["foreign_filtered"] == 1
+    assert result["foreign_filtered"] == 2
+    assert result["crawl_success"] == 0
+    assert result["crawl_no_result"] == 2
     crawls = {crawl["sku_id"]: crawl for crawl in store.crawl_work_for_job(job_id)}
-    assert crawls["sku-0"]["state"] == "SUCCESS"
+    assert crawls["sku-0"]["state"] == "NO_RESULT"
     assert crawls["sku-1"]["state"] == "NO_RESULT"
+    assert json.loads(crawls["sku-0"]["result_json"])["page_price_value"] is None
     assert json.loads(crawls["sku-1"]["result_json"])["page_price_value"] is None
 
 
@@ -468,10 +555,11 @@ def test_partial_exact_harvest_rerun_skips_success_without_new_harvest_attempt(t
 
 
 def test_partial_exact_harvest_is_resumable_after_mid_write_crash(tmp_path, monkeypatch):
+    """All-matched crash/resume: an interrupted write loop resumes to full SUCCESS."""
     requests = _requests(3)
     rows = [
         (request.sku_id, request.sku_id, request.url, index + 1)
-        for index, request in enumerate(requests[:2])
+        for index, request in enumerate(requests)
     ]
     store, adapter, job_id, identity, state_path = _seed_partial_job(
         tmp_path, requests, rows, export_probe=_make_export_probe()
@@ -498,12 +586,12 @@ def test_partial_exact_harvest_is_resumable_after_mid_write_crash(tmp_path, monk
 
     resumed = _run(state_path, adapter, job_id, identity)
 
-    assert resumed["written_success"] == 1
-    assert resumed["written_no_result"] == 1
+    assert resumed["written_success"] == 2
+    assert resumed["written_no_result"] == 0
     assert [crawl["state"] for crawl in store.crawl_work_for_job(job_id)] == [
         "SUCCESS",
         "SUCCESS",
-        "NO_RESULT",
+        "SUCCESS",
     ]
     assert store.get_remote_job(job_id)["harvest_attempts"] == attempts
 
@@ -561,14 +649,13 @@ def test_partial_exact_harvest_does_not_fan_out_to_unbound_same_request(tmp_path
 
 
 def test_partial_exact_absence_rejects_incomplete_progress_without_writes(tmp_path):
-    """P1: absent + probe progress not fully completed -> reject, zero writes, retryable."""
+    """P1: all-absent + probe progress not fully completed -> reject, zero writes, retryable."""
     requests = _requests(2)
-    rows = [(requests[0].sku_id, requests[0].sku_id, requests[0].url, 10)]
     probe_calls: list[tuple[str, str, float]] = []
     store, adapter, job_id, identity, state_path = _seed_partial_job(
         tmp_path,
         requests,
-        rows,
+        [],
         export_probe=_make_export_probe(
             calls=probe_calls,
             progress={
@@ -596,19 +683,18 @@ def test_partial_exact_absence_rejects_incomplete_progress_without_writes(tmp_pa
     )
     retried = _run(state_path, retry_adapter, job_id, identity)
 
-    assert retried["crawl_success"] == 1
-    assert retried["crawl_no_result"] == 1
+    assert retried["crawl_success"] == 0
+    assert retried["crawl_no_result"] == 2
     assert retried["remote_state"] == "COMPLETED"
 
 
 def test_partial_exact_absence_rejects_task_status_without_finished_marker(tmp_path):
-    """P2: absent + probe task status missing the finished marker -> reject."""
+    """P2/B5: all-absent + probe task status missing the finished marker -> reject."""
     requests = _requests(2)
-    rows = [(requests[0].sku_id, requests[0].sku_id, requests[0].url, 10)]
     store, adapter, job_id, identity, state_path = _seed_partial_job(
         tmp_path,
         requests,
-        rows,
+        [],
         export_probe=_make_export_probe(task_status_rsp_desc="任务仍在运行"),
     )
 
@@ -622,17 +708,13 @@ def test_partial_exact_absence_rejects_task_status_without_finished_marker(tmp_p
 
 
 def test_partial_exact_absence_writes_no_result_only_with_full_probe_contract(tmp_path):
-    """P3: absent + fully conforming probe -> NO_RESULT with durable evidence."""
+    """P3/B4: all-absent + fully conforming probe -> NO_RESULT with durable evidence."""
     requests = _requests(3)
-    rows = [
-        (request.sku_id, request.sku_id, request.url, index + 1)
-        for index, request in enumerate(requests[:2])
-    ]
     probe_calls: list[tuple[str, str, float]] = []
     store, adapter, job_id, identity, state_path = _seed_partial_job(
         tmp_path,
         requests,
-        rows,
+        [],
         export_probe=_make_export_probe(calls=probe_calls, remote_calls=5),
     )
 
@@ -655,23 +737,21 @@ def test_partial_exact_absence_writes_no_result_only_with_full_probe_contract(tm
         "waiting_db": 0,
     }
     crawls = {crawl["sku_id"]: crawl for crawl in store.crawl_work_for_job(job_id)}
-    assert crawls["sku-0"]["state"] == "SUCCESS"
-    assert crawls["sku-1"]["state"] == "SUCCESS"
-    assert crawls["sku-2"]["state"] == "NO_RESULT"
-    absent_evidence = json.loads(crawls["sku-2"]["result_json"])
-    assert absent_evidence["evidence_type"] == "EXPORTED_NO_MATCHING_ROW"
-    assert absent_evidence["no_result_reason"] == EXPORT_NO_PRICE_CRAWL_REASON
-    assert crawls["sku-2"]["error_text"] == EXPORT_NO_PRICE_CRAWL_REASON
+    assert {crawl["state"] for crawl in crawls.values()} == {"NO_RESULT"}
+    for absent_crawl in crawls.values():
+        absent_evidence = json.loads(absent_crawl["result_json"])
+        assert absent_evidence["evidence_type"] == "EXPORTED_NO_MATCHING_ROW"
+        assert absent_evidence["no_result_reason"] == EXPORT_NO_PRICE_CRAWL_REASON
+        assert absent_crawl["error_text"] == EXPORT_NO_PRICE_CRAWL_REASON
 
 
 def test_partial_exact_absence_probe_exception_fails_closed(tmp_path):
-    """P4: absent + probe raises -> reject before any state write."""
+    """P4: all-absent + probe raises -> reject before any state write."""
     requests = _requests(2)
-    rows = [(requests[0].sku_id, requests[0].sku_id, requests[0].url, 10)]
     store, adapter, job_id, identity, state_path = _seed_partial_job(
         tmp_path,
         requests,
-        rows,
+        [],
         export_probe=_make_export_probe(exception=RuntimeError("network down")),
     )
 
@@ -683,17 +763,13 @@ def test_partial_exact_absence_probe_exception_fails_closed(tmp_path):
 
 
 def test_partial_exact_absence_rerun_is_idempotent_without_new_probe(tmp_path):
-    """P5: after a proven completion, rerun probes nothing and writes nothing."""
+    """P5: after a proven all-absent completion, rerun probes nothing and writes nothing."""
     requests = _requests(3)
-    rows = [
-        (request.sku_id, request.sku_id, request.url, index + 1)
-        for index, request in enumerate(requests[:2])
-    ]
     probe_calls: list[tuple[str, str, float]] = []
     store, adapter, job_id, identity, state_path = _seed_partial_job(
         tmp_path,
         requests,
-        rows,
+        [],
         export_probe=_make_export_probe(calls=probe_calls),
     )
     first = _run(state_path, adapter, job_id, identity)
@@ -702,7 +778,7 @@ def test_partial_exact_absence_rerun_is_idempotent_without_new_probe(tmp_path):
 
     second = _run(state_path, adapter, job_id, identity)
 
-    assert first["crawl_no_result"] == 1
+    assert first["crawl_no_result"] == 3
     assert len(probe_calls) == 1
     assert second["remote_calls"] == 0
     assert second["written_success"] == 0
@@ -720,14 +796,10 @@ def test_partial_exact_absence_rerun_is_idempotent_without_new_probe(tmp_path):
 def test_partial_exact_terminal_crawls_survive_rerun_without_probe(tmp_path):
     """P6: SUCCESS/NO_RESULT crawls are never rewritten and never re-probed."""
     requests = _requests(3)
-    rows = [
-        (request.sku_id, request.sku_id, request.url, index + 1)
-        for index, request in enumerate(requests[:2])
-    ]
     store, _adapter, job_id, identity, state_path = _seed_partial_job(
         tmp_path,
         requests,
-        rows,
+        [],
         export_probe=_make_export_probe(),
     )
     first = _run(state_path, _adapter, job_id, identity)
@@ -752,6 +824,55 @@ def test_partial_exact_terminal_crawls_survive_rerun_without_probe(tmp_path):
     assert final_job["export_path"] == before_job["export_path"]
 
 
+def test_partial_exact_harvest_mixed_with_absent_already_terminal_reruns_idempotently(tmp_path):
+    """B8: mixed workbook whose absent crawl already holds terminal NO_RESULT.
+
+    The contradictory-evidence gate only fires while an absent identity is
+    still pending.  Once the absent crawl carries durable NO_RESULT evidence
+    from an earlier proven pass, the rerun completes the remaining SUCCESS
+    rows with zero probe calls and no rejection.
+    """
+    requests = _requests(3)
+    rows = [
+        (request.sku_id, request.sku_id, request.url, index + 1)
+        for index, request in enumerate(requests[:2])
+    ]
+    probe_calls: list[tuple[str, str, float]] = []
+    store, adapter, job_id, identity, state_path = _seed_partial_job(
+        tmp_path, requests, rows, export_probe=_make_export_probe(calls=probe_calls)
+    )
+    absent_crawl = next(
+        crawl for crawl in store.crawl_work_for_job(job_id) if crawl["sku_id"] == "sku-2"
+    )
+    job = store.get_remote_job(job_id)
+    lease = store.acquire_lease(BUSINESS_DATE, "seed-absent-terminal", 60)
+    try:
+        store.complete_partial_exact_no_result(
+            lease,
+            int(absent_crawl["id"]),
+            remote_job_id=job_id,
+            remote_identity=identity,
+            result_path=str(job["result_path"]),
+            reason=EXPORT_NO_PRICE_CRAWL_REASON,
+        )
+    finally:
+        store.release_lease(lease)
+
+    result = _run(state_path, adapter, job_id, identity)
+
+    assert result["crawl_success"] == 2
+    assert result["crawl_no_result"] == 1
+    assert result["written_success"] == 2
+    assert result["skipped_terminal"] == 1
+    assert result["remote_state"] == "COMPLETED"
+    assert probe_calls == []
+    crawls = {crawl["sku_id"]: crawl for crawl in store.crawl_work_for_job(job_id)}
+    assert crawls["sku-0"]["state"] == "SUCCESS"
+    assert crawls["sku-1"]["state"] == "SUCCESS"
+    assert crawls["sku-2"]["state"] == "NO_RESULT"
+    assert store.get_remote_job(job_id)["state"] == "COMPLETED"
+
+
 def test_partial_exact_absence_rejects_before_probe_when_no_result_limit_exceeded(tmp_path):
     """LIMIT: no_result_before + pending absent > 10 rejects before any probe call."""
     requests = _requests(11)
@@ -772,13 +893,12 @@ def test_partial_exact_absence_rejects_before_probe_when_no_result_limit_exceede
 
 
 def test_partial_exact_absence_rejects_non_no_price_export_semantic_without_writes(tmp_path):
-    """Case 4b: export response lacking the exact no-price semantic -> reject, zero writes."""
+    """Case 4b: all-absent + export response lacking the exact no-price semantic -> reject."""
     requests = _requests(2)
-    rows = [(requests[0].sku_id, requests[0].sku_id, requests[0].url, 10)]
     store, adapter, job_id, identity, state_path = _seed_partial_job(
         tmp_path,
         requests,
-        rows,
+        [],
         export_probe=_make_export_probe(export_rsp_desc="部分成功"),
     )
 
@@ -792,13 +912,12 @@ def test_partial_exact_absence_rejects_non_no_price_export_semantic_without_writ
 
 
 def test_partial_exact_absence_rejects_progress_total_mismatch_without_writes(tmp_path):
-    """Case 6: finished status but progress total differs from expected -> reject."""
+    """Case 6: all-absent + finished status but progress total differs -> reject."""
     requests = _requests(2)
-    rows = [(requests[0].sku_id, requests[0].sku_id, requests[0].url, 10)]
     store, adapter, job_id, identity, state_path = _seed_partial_job(
         tmp_path,
         requests,
-        rows,
+        [],
         export_probe=_make_export_probe(
             progress={
                 "total": 1,
@@ -819,13 +938,12 @@ def test_partial_exact_absence_rejects_progress_total_mismatch_without_writes(tm
 
 
 def test_partial_exact_absence_rejects_failed_progress_without_writes(tmp_path):
-    """Case 7: progress reports failed subtasks -> reject, zero writes."""
+    """Case 7: all-absent + progress reports failed subtasks -> reject, zero writes."""
     requests = _requests(2)
-    rows = [(requests[0].sku_id, requests[0].sku_id, requests[0].url, 10)]
     store, adapter, job_id, identity, state_path = _seed_partial_job(
         tmp_path,
         requests,
-        rows,
+        [],
         export_probe=_make_export_probe(
             progress={
                 "total": 2,
@@ -846,13 +964,12 @@ def test_partial_exact_absence_rejects_failed_progress_without_writes(tmp_path):
 
 
 def test_partial_exact_absence_rejects_nonzero_export_count_without_writes(tmp_path):
-    """Case 9: export endpoint still returns rows -> reject, zero writes."""
+    """Case 9: all-absent + export endpoint still returns rows -> reject, zero writes."""
     requests = _requests(2)
-    rows = [(requests[0].sku_id, requests[0].sku_id, requests[0].url, 10)]
     store, adapter, job_id, identity, state_path = _seed_partial_job(
         tmp_path,
         requests,
-        rows,
+        [],
         export_probe=_make_export_probe(export_count=3),
     )
 
@@ -864,13 +981,12 @@ def test_partial_exact_absence_rejects_nonzero_export_count_without_writes(tmp_p
 
 
 def test_partial_exact_absence_probe_evidence_passes_or_rejects_whole_absent_batch(tmp_path):
-    """Case 11: one probe verdict covers every absent crawl in the batch."""
+    """Case 11: one probe verdict covers every absent crawl in an all-absent batch."""
     requests = _requests(3)
-    rows = [(requests[0].sku_id, requests[0].sku_id, requests[0].url, 10)]
     store, adapter, job_id, identity, state_path = _seed_partial_job(
         tmp_path,
         requests,
-        rows,
+        [],
         export_probe=_make_export_probe(
             progress={
                 "total": 3,
@@ -896,9 +1012,10 @@ def test_partial_exact_absence_probe_evidence_passes_or_rejects_whole_absent_bat
     )
     retried = _run(state_path, retry_adapter, job_id, identity)
 
-    assert retried["crawl_success"] == 1
-    assert retried["crawl_no_result"] == 2
+    assert retried["crawl_success"] == 0
+    assert retried["crawl_no_result"] == 3
     crawls = {crawl["sku_id"]: crawl for crawl in store.crawl_work_for_job(job_id)}
+    assert crawls["sku-0"]["state"] == "NO_RESULT"
     assert crawls["sku-1"]["state"] == "NO_RESULT"
     assert crawls["sku-2"]["state"] == "NO_RESULT"
     assert retried["remote_state"] == "COMPLETED"
@@ -1033,14 +1150,14 @@ class _FakeProductionAuthManager:
 def test_partial_exact_absence_production_probe_rejects_business_failed_export(
     tmp_path, monkeypatch
 ):
-    """P0 E2E: HTTP 200 + success=false/5001 export faking no-price -> reject, zero writes.
+    """P0 E2E / B6: all-absent + business-FAILED export behind HTTP 200 -> reject.
 
-    The production probe path must refuse to let a business-failed export
+    For a fully absent workbook the production probe must really run, and its
+    R1 business-response gate must refuse to let a success=false/5001 export
     response donate the no-price rspDesc/count evidence, so the harvest
     recovery rejects with zero NO_RESULT writes and the job stays manual.
     """
     requests = _requests(2)
-    rows = [(requests[0].sku_id, requests[0].sku_id, requests[0].url, 10)]
     export_payload = {
         "success": False,
         "rspCode": "5001",
@@ -1063,11 +1180,13 @@ def test_partial_exact_absence_production_probe_rejects_business_failed_export(
     store, adapter, job_id, identity, state_path = _seed_partial_job(
         tmp_path,
         requests,
-        rows,
+        [],
         adapter=production_adapter,
     )
 
-    with pytest.raises(recovery.RecoveryRejected, match="probe failed"):
+    with pytest.raises(
+        recovery.RecoveryRejected, match="probe failed.*not business-successful"
+    ):
         _run(state_path, adapter, job_id, identity)
 
     crawls = store.crawl_work_for_job(job_id)
