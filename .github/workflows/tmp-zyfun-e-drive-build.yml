@@ -58,6 +58,7 @@ jobs:
 
             // Fail fast: never silently fall back to C: when E: is unavailable.
             const root = ensureDirectory(win32.resolve(WINDOWS_DATA_ROOT));
+            const home = ensureDirectory(win32.join(root, 'home'));
             const appData = ensureDirectory(win32.join(root, 'app-data'));
             const userData = ensureDirectory(win32.join(root, 'user-data'));
             const sessionData = ensureDirectory(win32.join(root, 'session-data'));
@@ -66,6 +67,7 @@ jobs:
             const crashDumps = ensureDirectory(win32.join(root, 'crash-dumps'));
             const chromiumCache = ensureDirectory(win32.join(root, 'chromium-cache'));
 
+            app.setPath('home', home);
             app.setPath('appData', appData);
             app.setPath('userData', userData);
             app.setPath('sessionData', sessionData);
@@ -79,36 +81,8 @@ jobs:
           void import('./app');
           '@ | Set-Content -LiteralPath 'src/main/index.ts' -Encoding utf8
 
-          $pathFile = 'src/main/utils/path.ts'
-          $source = Get-Content -LiteralPath $pathFile -Raw
-          $old = @'
-          export const getHomePath = (name: IHomePath): string => {
-            if (HOME_PATHS.includes(name)) {
-              return join(getSystemPath('home'), `.${APP_NAME_ALIAS}`, name);
-            }
-
-            return '';
-          };
-          '@
-          $new = @'
-          export const getHomePath = (name: IHomePath): string => {
-            if (HOME_PATHS.includes(name)) {
-              // App-managed binaries follow userData so Windows keeps them on E:.
-              return join(getSystemPath('userData'), 'bin');
-            }
-
-            return '';
-          };
-          '@
-          if (-not $source.Contains($old)) {
-            throw 'Expected getHomePath block not found; refusing partial path patch.'
-          }
-          $source = $source.Replace($old, $new)
-          Set-Content -LiteralPath $pathFile -Value $source -Encoding utf8
-
-          Write-Host 'Patched source paths:'
+          Write-Host 'Patched bootstrap:'
           Get-Content -LiteralPath 'src/main/index.ts'
-          Select-String -LiteralPath $pathFile -Pattern "getSystemPath\('userData'\), 'bin'"
 
       - name: Install dependencies
         shell: pwsh
