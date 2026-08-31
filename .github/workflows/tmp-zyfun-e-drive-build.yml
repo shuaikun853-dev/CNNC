@@ -99,7 +99,9 @@ jobs:
         working-directory: zyfun
         env:
           NODE_OPTIONS: --max-old-space-size=8192
-        run: pnpm build:win:x64
+        run: |
+          pnpm build
+          pnpm exec electron-builder --win --x64 --publish never
 
       - name: Validate installer
         shell: pwsh
