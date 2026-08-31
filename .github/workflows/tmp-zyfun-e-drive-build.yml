@@ -1,0 +1,145 @@
+name: Temporary zyfun E-drive build
+
+on:
+  push:
+    branches:
+      - tmp/zyfun-e-drive-build-20260831
+
+permissions:
+  contents: read
+
+jobs:
+  build-windows-x64:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24.11.1'
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: '10.27.0'
+          run_install: false
+
+      - name: Clone zyfun v3.4.7
+        shell: pwsh
+        run: |
+          git clone --depth 1 --branch v3.4.7 https://github.com/Hiram-Wong/zyfun.git zyfun
+
+      - name: Patch runtime storage to E drive
+        shell: pwsh
+        run: |
+          Set-Location zyfun
+          Move-Item -LiteralPath 'src/main/index.ts' -Destination 'src/main/app.ts'
+
+          @'
+          /**
+           * Main-process bootstrap for the E-drive custom build.
+           * Keep this file dependency-light: application modules resolve Electron
+           * storage paths during module evaluation, so redirect paths first.
+           */
+          import { mkdirSync } from 'node:fs';
+          import { win32 } from 'node:path';
+
+          import { app } from 'electron';
+
+          const WINDOWS_DATA_ROOT = 'E:\\zyfun-data';
+
+          function ensureDirectory(path: string): string {
+            mkdirSync(path, { recursive: true });
+            return path;
+          }
+
+          function setupWindowsDataPaths(): void {
+            if (process.platform !== 'win32') return;
+
+            // Fail fast: never silently fall back to C: when E: is unavailable.
+            const root = ensureDirectory(win32.resolve(WINDOWS_DATA_ROOT));
+            const appData = ensureDirectory(win32.join(root, 'app-data'));
+            const userData = ensureDirectory(win32.join(root, 'user-data'));
+            const sessionData = ensureDirectory(win32.join(root, 'session-data'));
+            const temp = ensureDirectory(win32.join(root, 'temp'));
+            const logs = ensureDirectory(win32.join(root, 'logs'));
+            const crashDumps = ensureDirectory(win32.join(root, 'crash-dumps'));
+            const chromiumCache = ensureDirectory(win32.join(root, 'chromium-cache'));
+
+            app.setPath('appData', appData);
+            app.setPath('userData', userData);
+            app.setPath('sessionData', sessionData);
+            app.setPath('temp', temp);
+            app.setPath('logs', logs);
+            app.setPath('crashDumps', crashDumps);
+            app.commandLine.appendSwitch('disk-cache-dir', chromiumCache);
+          }
+
+          setupWindowsDataPaths();
+          void import('./app');
+          '@ | Set-Content -LiteralPath 'src/main/index.ts' -Encoding utf8
+
+          $pathFile = 'src/main/utils/path.ts'
+          $source = Get-Content -LiteralPath $pathFile -Raw
+          $old = @'
+          export const getHomePath = (name: IHomePath): string => {
+            if (HOME_PATHS.includes(name)) {
+              return join(getSystemPath('home'), `.${APP_NAME_ALIAS}`, name);
+            }
+
+            return '';
+          };
+          '@
+          $new = @'
+          export const getHomePath = (name: IHomePath): string => {
+            if (HOME_PATHS.includes(name)) {
+              // App-managed binaries follow userData so Windows keeps them on E:.
+              return join(getSystemPath('userData'), 'bin');
+            }
+
+            return '';
+          };
+          '@
+          if (-not $source.Contains($old)) {
+            throw 'Expected getHomePath block not found; refusing partial path patch.'
+          }
+          $source = $source.Replace($old, $new)
+          Set-Content -LiteralPath $pathFile -Value $source -Encoding utf8
+
+          Write-Host 'Patched source paths:'
+          Get-Content -LiteralPath 'src/main/index.ts'
+          Select-String -LiteralPath $pathFile -Pattern "getSystemPath\('userData'\), 'bin'"
+
+      - name: Install dependencies
+        shell: pwsh
+        working-directory: zyfun
+        run: pnpm install --frozen-lockfile
+
+      - name: Prepare env
+        shell: pwsh
+        working-directory: zyfun
+        run: Copy-Item -LiteralPath '.env.example' -Destination '.env' -Force
+
+      - name: Typecheck and build Windows x64 installer
+        shell: pwsh
+        working-directory: zyfun
+        env:
+          NODE_OPTIONS: --max-old-space-size=8192
+        run: pnpm build:win:x64
+
+      - name: Validate installer
+        shell: pwsh
+        run: |
+          $exe = Get-ChildItem -Path 'zyfun/dist' -Filter 'zyfun-win-3.4.7-x64-setup.exe' -File -Recurse | Select-Object -First 1
+          if (-not $exe) { throw 'Windows x64 installer not found.' }
+          Write-Host "Installer: $($exe.FullName)"
+          Write-Host "Size: $($exe.Length) bytes"
+          Get-FileHash -Algorithm SHA256 -LiteralPath $exe.FullName
+
+      - name: Upload installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: zyfun-3.4.7-e-drive-win-x64
+          path: zyfun/dist/zyfun-win-3.4.7-x64-setup.exe
+          if-no-files-found: error
+          retention-days: 1
