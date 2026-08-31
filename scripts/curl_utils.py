@@ -16,6 +16,7 @@ INTERNAL_NO_PROXY_HOSTS = (
     "zhaosj.iioprod.com",
     "www.cnncmall.com",
     "cnncmall.com",
+    "one.cnncecp.com",
     "172.168.1.245",
     "192.168.10.239",
     "10.100.12.250",

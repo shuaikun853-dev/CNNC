@@ -8,7 +8,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Collection, Mapping
 from urllib import error, request
 from urllib.parse import urlparse
 
@@ -20,7 +20,7 @@ TENANT_ID = "188605"
 COMMODITY_POOL_ID = "222"
 SAAS_QUERY_ALL_PATH = "/improxy/saas/iio2/sameAudit/queryAll"
 SAAS_HOST = "saasportal.iio.com"
-CNNC_HOST = "www.cnncmall.com"
+CNNC_TRUSTED_HOSTS = frozenset({"www.cnncmall.com", "one.cnncecp.com"})
 CNNC_QUERY_PATH = "/emp/onecode/improxy/iio2/quasiStandardCommodityDocumentModel/query"
 
 
@@ -150,13 +150,17 @@ class CnncSaasSnapshotAdapter:
     def _validate_endpoint(
         config: Mapping[str, Any],
         side: str,
-        expected_host: str,
+        expected_host: str | Collection[str],
         expected_path: str,
     ) -> None:
         parsed = urlparse(str(config.get("url") or ""))
         if parsed.scheme.lower() not in {"http", "https"}:
             raise ValueError(f"{side} cURL scheme must be http or https")
-        if (parsed.hostname or "").lower() != expected_host:
+        if isinstance(expected_host, str):
+            trusted_hosts = {expected_host.lower()}
+        else:
+            trusted_hosts = {host.lower() for host in expected_host}
+        if (parsed.hostname or "").lower() not in trusted_hosts:
             raise ValueError(f"{side} cURL host is not trusted")
         if parsed.path != expected_path:
             raise ValueError(f"{side} cURL path is not the authoritative query endpoint")
@@ -167,7 +171,7 @@ class CnncSaasSnapshotAdapter:
         saas_body = self._request_body(self._saas_config, "saas")
         customer_body = self._request_body(self._customer_config, "customer")
         self._validate_endpoint(self._saas_config, "saas", SAAS_HOST, SAAS_QUERY_ALL_PATH)
-        self._validate_endpoint(self._customer_config, "customer", CNNC_HOST, CNNC_QUERY_PATH)
+        self._validate_endpoint(self._customer_config, "customer", CNNC_TRUSTED_HOSTS, CNNC_QUERY_PATH)
         if str(saas_body.get("tenantId")) != TENANT_ID:
             raise ValueError("saas tenant scope must be 188605")
         if str(saas_body.get("commodityPoolId")) != COMMODITY_POOL_ID:

@@ -67,7 +67,7 @@ def _saas_config(**overrides):
 
 def _customer_config(**overrides):
     return _config(
-        "https://www.cnncmall.com/emp/onecode/improxy/iio2/quasiStandardCommodityDocumentModel/query",
+        "https://one.cnncecp.com/emp/onecode/improxy/iio2/quasiStandardCommodityDocumentModel/query",
         {"sassCheckStatuss": ["0"], **overrides},
     )
 
@@ -107,7 +107,7 @@ def test_scope_mismatch_fails_before_network():
     [
         (
             "https://wrong.example/improxy/saas/iio2/sameAudit/queryAll",
-            "https://www.cnncmall.com/emp/onecode/improxy/iio2/quasiStandardCommodityDocumentModel/query",
+            "https://one.cnncecp.com/emp/onecode/improxy/iio2/quasiStandardCommodityDocumentModel/query",
         ),
         (
             "https://saasportal.iio.com/improxy/saas/iio2/sameAudit/queryAll",
@@ -127,6 +127,66 @@ def test_untrusted_curl_host_fails_before_network(saas_url, customer_url):
         adapter.fetch()
 
     assert opener.requests == []
+
+
+@pytest.mark.parametrize(
+    "saas_url, customer_url",
+    [
+        (
+            "https://saasportal.iio.com/improxy/saas/iio2/sameAudit/queryAll",
+            "https://one.cnncecp.com/emp/onecode/improxy/iio2/quasiStandardCommodityDocumentModel/queryAll",
+        ),
+        (
+            "https://saasportal.iio.com/improxy/saas/iio2/sameAudit/queryAll",
+            "https://www.cnncmall.com/emp/onecode/improxy/iio2/quasiStandardCommodityDocumentModel/queryDetail",
+        ),
+        (
+            "https://saasportal.iio.com/improxy/saas/iio2/sameAudit/queryDetail",
+            "https://one.cnncecp.com/emp/onecode/improxy/iio2/quasiStandardCommodityDocumentModel/query",
+        ),
+    ],
+)
+def test_wrong_path_on_trusted_host_fails_before_network(saas_url, customer_url):
+    opener = _Opener([])
+    adapter = CnncSaasSnapshotAdapter(
+        _config(saas_url, {"tenantId": "188605", "commodityPoolId": "222"}),
+        _config(customer_url, {"sassCheckStatuss": ["0"]}),
+        opener=opener,
+    )
+
+    with pytest.raises(ValueError, match="path"):
+        adapter.fetch()
+
+    assert opener.requests == []
+
+
+@pytest.mark.parametrize(
+    "customer_url",
+    [
+        "https://www.cnncmall.com/emp/onecode/improxy/iio2/quasiStandardCommodityDocumentModel/query",
+        "https://one.cnncecp.com/emp/onecode/improxy/iio2/quasiStandardCommodityDocumentModel/query",
+    ],
+)
+def test_trusted_customer_hosts_pass_scope_and_fetch(customer_url):
+    opener = _Opener(
+        [
+            _ok([{"vCommodityId": "a"}], 1),
+            _ok([{"documentId": "c1"}], 1),
+        ]
+    )
+    adapter = CnncSaasSnapshotAdapter(
+        _saas_config(),
+        _config(customer_url, {"sassCheckStatuss": ["0"]}),
+        opener=opener,
+        monotonic=lambda: 0.0,
+        sleep=lambda _seconds: None,
+    )
+
+    snapshot = adapter.fetch()
+
+    assert snapshot.saas_count == 1
+    assert snapshot.customer_count == 1
+    assert [json.loads(request.data.decode("utf-8"))["page"] for request in opener.requests] == [1, 1]
 
 
 def test_fetches_exact_multipage_rows_and_preserves_duplicate_order():
