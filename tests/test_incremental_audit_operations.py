@@ -979,6 +979,13 @@ def test_scheduled_runner_routes_hours_without_running_python(tmp_path):
         ("2026-08-15T18:00:00", []),
         ("2026-08-16T19:00:00", []),
     )
+    # Only the one-shot 20:35 safety closeout may unlock the guarded cached
+    # degraded finalization; every other routing stays strict.
+    cached_flag_expectations = {
+        "2026-08-13T18:00:00": False,
+        "2026-08-13T20:00:00": False,
+        "2026-08-13T20:35:00": True,
+    }
 
     for timestamp, phases in expected:
         completed = _run_powershell_script(
@@ -995,6 +1002,11 @@ def test_scheduled_runner_routes_hours_without_running_python(tmp_path):
         assert completed.returncode == 0, completed.stderr.decode("utf-8", errors="replace")
         plan = json.loads(completed.stdout.decode("utf-8-sig"))
         assert plan["Phases"] == phases
+        expect_cached_flag = cached_flag_expectations.get(timestamp, False)
+        assert plan["AllowCachedFinalize"] is expect_cached_flag, timestamp
+        if phases:
+            arguments = plan["Commands"][0]["Arguments"]
+            assert ("--allow-cached-finalize" in arguments) is expect_cached_flag, timestamp
         assert plan["RemoteWrites"] is True
         assert plan["BudgetSeconds"] == 720
         assert plan["CloseoutBudgetSeconds"] == 1680

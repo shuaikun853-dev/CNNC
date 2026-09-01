@@ -2745,3 +2745,31 @@ def test_repeated_pre_send_failures_keep_releasing_claim_without_unknown(tmp_pat
     assert jobs[0]["post_attempted"] is False
     assert jobs[0]["error_text"]
     store.release_lease(inspect)
+
+
+def test_cli_closeout_parses_allow_cached_finalize_flag():
+    from scripts.incremental_price_audit import build_parser
+
+    enabled = build_parser().parse_args(["closeout", "--allow-cached-finalize"])
+    assert enabled.allow_cached_finalize is True
+    default = build_parser().parse_args(["closeout"])
+    assert default.allow_cached_finalize is False
+
+
+def test_cli_cached_finalize_subcommand_parses_stability_and_output():
+    from scripts.incremental_price_audit import build_parser
+
+    args = build_parser().parse_args([
+        "cached-finalize",
+        "--business-date", "2026-08-31",
+        "--runtime-root", "runtime/incremental_price_audit",
+        "--output", "formal.xlsx",
+        "--source-stability-seconds", "300",
+    ])
+    assert args.command == "cached-finalize"
+    assert args.source_stability_seconds == 300.0
+    assert str(args.output) == "formal.xlsx"
+
+    default = build_parser().parse_args(["cached-finalize"])
+    assert default.source_stability_seconds == 600.0
+    assert default.output is None

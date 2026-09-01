@@ -18,6 +18,7 @@ import app.services.incremental_audit_runtime as runtime_module
 from app.services.daily_audit_store import DailyAuditStore, ProcessLock
 from app.services.incremental_audit_runtime import (
     runtime_paths,
+    run_cached_finalize_command,
     run_remote_harvest_recovery_command,
     run_runtime_command,
 )
@@ -40,6 +41,7 @@ from app.workflows.incremental_price_audit_finalize import (
     FinalizeReadiness,
     materialize_frozen_daily_run,
 )
+from scripts.audit_saas_excel_file import RESULT_APPENDED_COLUMNS
 
 
 BUSINESS_DATE = "2026-08-11"
@@ -945,3 +947,185 @@ def test_status_stays_read_only_after_recovery_closeout(tmp_path, monkeypatch):
     assert report["state"] == "FINALIZED"
     assert report["final"]["finalized"] is True
     assert state_path.read_bytes() == before
+
+
+# ---------------------------------------------------------------------------
+# Guarded cached degraded finalization: manual command + status provenance.
+# The command is the force-finalize precedent: an independent entry point that
+# never constructs TickDependencies, so discover/Detail/Model/submit/harvest
+# are structurally unreachable.
+# ---------------------------------------------------------------------------
+
+
+def _seed_green_day_at_runtime_paths(runtime_root: Path):
+    """Full-green day at the real runtime paths: three identical snapshots,
+    DETAIL/MODEL SUCCESS, crawl SUCCESS bound to COMPLETED remote jobs.
+    Headers mirror the real source export (audit-appended columns excluded)
+    so the default legacy writer can materialize the formal workbook."""
+    paths = runtime_paths(BUSINESS_DATE, runtime_root)
+    paths.run_dir.mkdir(parents=True, exist_ok=True)
+    store = DailyAuditStore(paths.state_path)
+    store.ensure_run(BUSINESS_DATE, cutoff_at=f"{BUSINESS_DATE}T10:00:00+00:00")
+    token = store.acquire_lease(BUSINESS_DATE, "seed-cached", 600)
+    rows = [
+        _row(f"v-{index}", f"sku-{index}", extLink=f"https://shop.example/item/{index}")
+        for index in range(1, 10)
+    ]
+    source_headers = [
+        name for name in rows[0]
+        if not name.startswith("__") and name not in RESULT_APPENDED_COLUMNS
+    ]
+    evidence = {"observed_count": len(rows), "saas_count": len(rows), "customer_count": len(rows)}
+    snapshots = []
+    for moment in ("04:00:08", "05:00:05", "07:00:05"):
+        snapshots.append(store.ingest_snapshot(
+            token, rows, f"{BUSINESS_DATE}T{moment}+00:00",
+            headers=source_headers, evidence=dict(evidence),
+        )["snapshot"])
+    items = store.ordered_snapshot_items(int(snapshots[-1]["id"]))
+    for item in items:
+        detail = store.ensure_stage_work(token, item["id"], "DETAIL", f"detail-{item['id']}")
+        store.claim_stage_work(token, detail["id"], max_attempts=3, max_elapsed_seconds=300)
+        store.complete_stage_work(token, detail["id"], {
+            "customerPrice": "10",
+            "customerPriceStatus": "FOUND",
+            "customerPriceSource": "DETAIL_REFERENCE_INFOS",
+            "customerPriceWarning": "",
+            "customerPriceEvidence": "customer=10",
+        })
+        model = store.ensure_stage_work(token, item["id"], "MODEL", f"model-{item['id']}")
+        store.claim_stage_work(token, model["id"], max_attempts=1, max_elapsed_seconds=300)
+        store.complete_stage_work(token, model["id"], {
+            "match_result": "SAME", "confidence": 0.95, "model_match": "exact", "reason": "一致",
+        })
+    jobs = []
+    for job_index in range(3):
+        job = store.prepare_remote_intent(
+            token,
+            f"mall:key-{job_index}",
+            f"daily-{BUSINESS_DATE.replace('-', '')}-mall-{job_index}",
+            f"payload-{job_index}",
+            mall_key="mall",
+            result_path=str(paths.run_dir / f"mall-result-{job_index}.xlsx"),
+        )
+        store.claim_remote_submission(token, int(job["id"]))
+        store.reconcile_remote_job(
+            token,
+            int(job["id"]),
+            remote_identity=f"mall|task-{job_index}|num-{job_index}",
+            state="COMPLETED",
+            result={"page": "ok"},
+        )
+        jobs.append(int(job["id"]))
+    for index, item in enumerate(items):
+        row = rows[index]
+        crawl = store.ensure_crawl_work(
+            token, "mall", str(row["skuId"]), str(row["extLink"]), "legacy-v1",
+            f"crawl-fp-{item['id']}", source_id=str(row["vCommodityId"]),
+        )
+        store.link_crawl_work_to_remote_job(token, int(crawl["id"]), jobs[index % len(jobs)])
+        store.complete_crawl_work(token, int(crawl["id"]), {
+            "page_price_value": "9.5", "page_price_status": "OK", "page_price_source": "招商局",
+        })
+    store.release_lease(token)
+    return store, snapshots, paths
+
+
+def test_cached_finalize_command_publishes_without_discover_chain(tmp_path, monkeypatch):
+    store, snapshots, paths = _seed_green_day_at_runtime_paths(tmp_path / "runtime")
+
+    def forbidden_dependencies(**_kwargs):
+        raise AssertionError("cached finalize must never build TickDependencies")
+
+    monkeypatch.setattr(runtime_module, "build_default_dependencies", forbidden_dependencies)
+
+    result = run_cached_finalize_command(
+        business_date=BUSINESS_DATE,
+        runtime_root=tmp_path / "runtime",
+        source_stability_seconds=600.0,
+        now=datetime(2026, 8, 11, 20, 35, tzinfo=UTC),
+    )
+
+    assert result["outcome"] == "CACHED_FINALIZED"
+    assert result["finalized"] is True
+    assert result["frozen_snapshot_id"] == int(snapshots[-1]["id"])
+    assert result["last_source_observed_at"] == f"{BUSINESS_DATE}T07:00:05+00:00"
+    assert result["degraded_reason_code"] == "MANUAL_CACHED_FINALIZE"
+    assert result["degraded_source_side"] == "unknown"
+    assert paths.final_output_path.is_file()
+    run = store.get_run(BUSINESS_DATE)
+    assert run["state"] == "FINALIZED"
+    assert int(run["frozen_snapshot_id"]) == int(snapshots[-1]["id"])
+    metrics = json.loads(run["metrics_json"])
+    assert metrics["finalization_mode"] == "CACHED_DEGRADED"
+    assert metrics["cached_snapshot_id"] == int(snapshots[-1]["id"])
+
+    # Idempotent rerun after the day is FINALIZED.
+    rerun = run_cached_finalize_command(
+        business_date=BUSINESS_DATE,
+        runtime_root=tmp_path / "runtime",
+        now=datetime(2026, 8, 11, 20, 40, tzinfo=UTC),
+    )
+    assert rerun["outcome"] == "ALREADY_FINALIZED"
+    assert rerun["finalized"] is True
+
+
+def test_cached_finalize_command_blocks_when_no_run_exists(tmp_path):
+    result = run_cached_finalize_command(
+        business_date=BUSINESS_DATE,
+        runtime_root=tmp_path / "runtime",
+        now=datetime(2026, 8, 11, 20, 35, tzinfo=UTC),
+    )
+
+    assert result["outcome"] == "CACHED_FINALIZE_BLOCKED"
+    assert result["reason_code"] == "NO_RUN"
+    assert result["error_type"] == "CachedFinalizeBlocked(NO_RUN)"
+    assert result["finalized"] is False
+    assert not (tmp_path / "runtime").exists()
+
+
+def test_status_reports_cached_degraded_provenance_after_cached_finalize(tmp_path):
+    store, _snapshots, _paths = _seed_green_day_at_runtime_paths(tmp_path / "runtime")
+
+    before = collect_runtime_status(business_date=BUSINESS_DATE, runtime_root=tmp_path / "runtime")
+    assert before["final"]["finalization_mode"] is None
+    assert before["final"]["last_source_observed_at"] is None
+    assert before["final"]["degraded_reason_code"] is None
+    assert before["final"]["degraded_source_side"] is None
+
+    run_cached_finalize_command(
+        business_date=BUSINESS_DATE,
+        runtime_root=tmp_path / "runtime",
+        source_stability_seconds=600.0,
+        now=datetime(2026, 8, 11, 20, 35, tzinfo=UTC),
+    )
+
+    after = collect_runtime_status(business_date=BUSINESS_DATE, runtime_root=tmp_path / "runtime")
+    assert after["final"]["finalization_mode"] == "CACHED_DEGRADED"
+    assert after["final"]["last_source_observed_at"] == f"{BUSINESS_DATE}T07:00:05+00:00"
+    assert after["final"]["degraded_reason_code"] == "MANUAL_CACHED_FINALIZE"
+    assert after["final"]["degraded_source_side"] == "unknown"
+
+
+def test_closeout_command_threads_allow_cached_finalize_flag(tmp_path, monkeypatch):
+    captures = []
+    real_run_closeout = runtime_module.run_closeout
+
+    def capture(store, process_lock, config, deps, closeout, **kwargs):
+        captures.append(closeout)
+        return real_run_closeout(store, process_lock, config, deps, closeout, **kwargs)
+
+    monkeypatch.setattr(runtime_module, "run_closeout", capture)
+    harness = CloseoutHarness(
+        tmp_path,
+        [_observation([_row("v1", "s1")], datetime(2026, 8, 11, 10, 1, tzinfo=UTC))],
+    )
+    harness.run(allow_cached_finalize=True, source_stability_seconds=0)
+    assert captures[0].allow_cached_finalize is True
+
+    harness = CloseoutHarness(
+        tmp_path,
+        [_observation([_row("v2", "s2")], datetime(2026, 8, 11, 10, 1, tzinfo=UTC))],
+    )
+    harness.run(source_stability_seconds=0)
+    assert captures[1].allow_cached_finalize is False
