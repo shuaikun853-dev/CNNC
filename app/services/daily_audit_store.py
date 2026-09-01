@@ -2725,6 +2725,31 @@ class DailyAuditStore:
             connection.execute("UPDATE daily_runs SET state=CASE WHEN state='FINALIZED' THEN state ELSE 'FINALIZING' END, frozen_snapshot_id=?, updated_at=? WHERE id=?", (snapshot_id, self._utcnow(), token.run_id))
             return self._row(connection.execute("SELECT * FROM daily_runs WHERE id=?", (token.run_id,)).fetchone())  # type: ignore[return-value]
 
+    def freeze_snapshot_with_metrics(self, token: LeaseToken, snapshot_id: int, metrics: Mapping[str, Any]) -> dict[str, Any]:
+        """Freeze one authoritative snapshot and merge provenance metrics in one commit.
+
+        The frozen pointer and the ``metrics_json`` merge share a single
+        BEGIN IMMEDIATE transaction, so a crash can never leave a frozen run
+        without its provenance (or provenance without the freeze).  Re-calling
+        with the same snapshot id merges again (provenance backfill) instead
+        of raising; a different frozen id still conflicts.
+        """
+        with self._transaction(immediate=True) as connection:
+            run = self._validate_lease(connection, token)
+            snapshot = connection.execute("SELECT id FROM snapshots WHERE id=? AND run_id=?", (snapshot_id, token.run_id)).fetchone()
+            if snapshot is None:
+                raise ValueError("frozen snapshot must belong to the leased daily run")
+            frozen = run["frozen_snapshot_id"]
+            if frozen is not None and int(frozen) != snapshot_id:
+                raise FrozenSnapshotConflict("daily run already froze a different authoritative snapshot")
+            existing = json.loads(run["metrics_json"] or "{}")
+            existing.update(metrics)
+            connection.execute(
+                "UPDATE daily_runs SET state=CASE WHEN state='FINALIZED' THEN state ELSE 'FINALIZING' END, frozen_snapshot_id=?, metrics_json=?, updated_at=? WHERE id=?",
+                (snapshot_id, self._canonical_json(existing), self._utcnow(), token.run_id),
+            )
+            return self._row(connection.execute("SELECT * FROM daily_runs WHERE id=?", (token.run_id,)).fetchone())  # type: ignore[return-value]
+
     def prepare_finalization(self, token: LeaseToken, output_path: str) -> dict[str, Any]:
         """Durably reserve the one formal output path before publishing it."""
         output_path = str(output_path or "").strip()

@@ -15,6 +15,7 @@ from datetime import UTC, datetime
 from functools import partial
 from pathlib import Path
 from typing import Any
+from urllib.error import URLError
 
 from app.services.daily_audit_store import DailyAuditStore, ProcessLock
 from app.services.incremental_audit_cached_finalize import run_cached_finalization
@@ -551,3 +552,95 @@ def test_safety_closeout_waiting_deadline_exhaustion_never_caches(tmp_path):
     run = harness.store.get_run(BUSINESS_DATE)
     assert run["frozen_snapshot_id"] is None
     assert run["state"] != "FINALIZED"
+
+
+# ---------------------------------------------------------------------------
+# Whitelist tightening: generic transport failure names cannot prove the
+# outage happened during discovery, so they keep strict retryable semantics
+# and must never unlock the guarded cached degraded finalization.  The
+# adapter already wraps transport-level retry exhaustion into the typed
+# SnapshotFetchExhausted (still eligible), and SnapshotConsistencyDrift
+# means the source was actively changing — never a state to degrade from.
+# ---------------------------------------------------------------------------
+
+
+def _assert_transport_outage_never_caches(tmp_path: Path, discover, store) -> None:
+    """Shared assertions: strict retryable walk, no cached attempt, no freeze.
+
+    The config mirrors the SnapshotFetchExhausted deadline fallback test so
+    the cached fallback IS offered at the deadline; only the tightened
+    whitelist refusal can explain the strict outcome.
+    """
+    harness = _Harness(tmp_path, discover)
+    summary, publication, _blocked, _error = harness.run(
+        allow_cached_finalize=True,
+        config_overrides={"source_stability_seconds": 600.0},
+        cached_finalize=_never_cached_finalize,
+        output_path=tmp_path / "final.xlsx",
+        wall_budget_seconds=130,
+        final_materialize_reserve_seconds=120,
+        failed_pass_retry_seconds=5.0,
+    )
+
+    assert summary.outcome == "CLOSEOUT_DEADLINE", (
+        "a generic transport outage keeps strict retryable semantics: the "
+        "backoff walk reaches the long-operation deadline and stops"
+    )
+    assert "pass1:FAILED" in summary.phase_trace
+    assert "stop:deadline" in summary.phase_trace
+    assert "cached_finalized" not in summary.phase_trace
+    assert "cached_blocked" not in summary.phase_trace
+    assert publication is None
+    assert not (tmp_path / "final.xlsx").exists()
+    run = store.get_run(BUSINESS_DATE)
+    assert run["frozen_snapshot_id"] is None
+    assert run["state"] != "FINALIZED"
+
+
+def test_safety_closeout_timeout_error_never_caches(tmp_path):
+    calls: list[int] = []
+
+    def discover(_timeout):
+        calls.append(len(calls))
+        raise TimeoutError("x")
+
+    store, _snapshots = _seed_full_good_day(tmp_path / "state.sqlite3", BUSINESS_DATE)
+    _assert_transport_outage_never_caches(tmp_path, discover, store)
+    assert calls == [0], "retryable passes sleep to the deadline without a second pass"
+
+
+def test_safety_closeout_connection_error_never_caches(tmp_path):
+    calls: list[int] = []
+
+    def discover(_timeout):
+        calls.append(len(calls))
+        raise ConnectionError("x")
+
+    store, _snapshots = _seed_full_good_day(tmp_path / "state.sqlite3", BUSINESS_DATE)
+    _assert_transport_outage_never_caches(tmp_path, discover, store)
+    assert calls == [0]
+
+
+def test_safety_closeout_url_error_never_caches(tmp_path):
+    calls: list[int] = []
+
+    def discover(_timeout):
+        calls.append(len(calls))
+        raise URLError("x")
+
+    store, _snapshots = _seed_full_good_day(tmp_path / "state.sqlite3", BUSINESS_DATE)
+    _assert_transport_outage_never_caches(tmp_path, discover, store)
+    assert calls == [0]
+
+
+def test_safety_closeout_consistency_drift_never_caches(tmp_path):
+    """A mid-pagination source change is the opposite of a stable snapshot."""
+    calls: list[int] = []
+
+    def discover(_timeout):
+        calls.append(len(calls))
+        raise SnapshotConsistencyDrift("saas", "count changed during pagination")
+
+    store, _snapshots = _seed_full_good_day(tmp_path / "state.sqlite3", BUSINESS_DATE)
+    _assert_transport_outage_never_caches(tmp_path, discover, store)
+    assert calls == [0]

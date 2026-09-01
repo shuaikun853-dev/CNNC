@@ -379,13 +379,23 @@ def build_frozen_audit_artifact(
     output_identity: str,
     review_mode: bool = False,
     tolerate_pending: bool = False,
+    snapshot_id: int | None = None,
 ) -> FrozenArtifactBuild:
     run = store.get_run(token.business_date)
-    if run is None or int(run["id"]) != token.run_id or run["frozen_snapshot_id"] is None:
+    if run is None or int(run["id"]) != token.run_id or (
+        snapshot_id is None and run["frozen_snapshot_id"] is None
+    ):
         raise FinalizeBlocked("daily run has no frozen authoritative snapshot")
-    snapshot = store.get_snapshot(int(run["frozen_snapshot_id"]))
+    resolved_snapshot_id = (
+        int(run["frozen_snapshot_id"]) if snapshot_id is None else int(snapshot_id)
+    )
+    snapshot = store.get_snapshot(resolved_snapshot_id)
     if snapshot is None:
-        raise FinalizeBlocked("frozen snapshot metadata is missing")
+        if snapshot_id is None:
+            raise FinalizeBlocked("frozen snapshot metadata is missing")
+        raise FinalizeBlocked("candidate snapshot metadata is missing")
+    if snapshot_id is not None and int(snapshot["run_id"]) != int(run["id"]):
+        raise FinalizeBlocked("candidate snapshot does not belong to this run")
     headers = _decode_json(snapshot.get("headers_json"), list, "headers")
     evidence = _decode_json(snapshot.get("evidence_json"), dict, "evidence")
     if not headers:

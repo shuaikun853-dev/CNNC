@@ -156,15 +156,14 @@ def _seed_full_good_day(
         })
 
     if extra_remote_state is not None:
-        job = store.prepare_remote_intent(
-            token, "mall:key-extra", f"daily-{business_date.replace('-', '')}-mall-extra", "payload-extra",
-            result_path=str(store_path.parent / "mall-result-extra.xlsx"),
-        )
-        store.claim_remote_submission(token, int(job["id"]))
+        # The shared formal FinalizeReadiness only counts remote work
+        # reachable from a required row's crawl chain, so the pending/manual
+        # state must land on a bound job (exact strict-finalize semantics),
+        # not on an unlinked extra job.
         if extra_remote_state == "SUBMIT_UNKNOWN":
-            store.mark_submit_unknown(token, int(job["id"]), "post outcome unknown")
+            store.mark_submit_unknown(token, jobs[0], "post outcome unknown")
         elif extra_remote_state == "MANUAL_REQUIRED":
-            store.mark_remote_manual(token, int(job["id"]), "needs human export")
+            store.mark_remote_manual(token, jobs[0], "needs human export")
         else:
             raise ValueError(f"unsupported extra_remote_state {extra_remote_state!r}")
 
@@ -224,6 +223,21 @@ def _run_cached(store: DailyAuditStore, lock_path: Path, output: Path, **overrid
     )
 
 
+def _run_blocked_before_freeze(store: DailyAuditStore, tmp_path: Path, **overrides):
+    """Run the guarded runner and return (blocker, run) with freeze assertions.
+
+    Every formal-readiness refusal must fire before the freeze: the day stays
+    unfrozen, unfinalized and without any final workbook on disk.
+    """
+    output = tmp_path / "formal.xlsx"
+    with pytest.raises(CachedFinalizeBlocked) as excinfo:
+        _run_cached(store, tmp_path / "closeout.lock", output, **overrides)
+    run = store.get_run(BUSINESS_DATE)
+    assert run["state"] != "FINALIZED"
+    assert not output.exists()
+    return excinfo.value, run
+
+
 def test_constants_use_fixed_mode_names():
     assert CACHED_FINALIZATION_MODE == "CACHED_DEGRADED"
     assert STRICT_FINALIZATION_MODE == "STRICT"
@@ -263,42 +277,50 @@ def test_d_model_pending_is_blocked(tmp_path):
     store, _snapshots = _seed_full_good_day(
         tmp_path / "state.sqlite", BUSINESS_DATE, model_pending_indexes={3},
     )
-    blocked = _evaluate_blocked(store)
-    assert blocked.reason_code == "STAGE_PENDING"
-    assert blocked.detail["model_pending"] >= 1
+    blocked, run = _run_blocked_before_freeze(store, tmp_path)
+    assert blocked.reason_code == "READINESS_BLOCKED"
+    assert blocked.detail["readiness"]["model_pending"] >= 1
+    assert run["frozen_snapshot_id"] is None
 
 
 def test_e_model_terminal_failed_is_blocked(tmp_path):
     store, _snapshots = _seed_full_good_day(
         tmp_path / "state.sqlite", BUSINESS_DATE, model_terminal_indexes={4},
     )
-    blocked = _evaluate_blocked(store)
-    assert blocked.reason_code == "STAGE_PENDING"
-    assert blocked.detail["model_terminal"] >= 1
+    blocked, run = _run_blocked_before_freeze(store, tmp_path)
+    assert blocked.reason_code == "READINESS_BLOCKED"
+    assert blocked.detail["readiness"]["model_terminal"] >= 1
+    assert run["frozen_snapshot_id"] is None
 
 
 def test_f_crawl_pending_is_blocked(tmp_path):
     store, _snapshots = _seed_full_good_day(
         tmp_path / "state.sqlite", BUSINESS_DATE, crawl_pending_indexes={2},
     )
-    blocked = _evaluate_blocked(store)
-    assert blocked.reason_code == "CRAWL_PENDING"
+    blocked, run = _run_blocked_before_freeze(store, tmp_path)
+    assert blocked.reason_code == "READINESS_BLOCKED"
+    assert blocked.detail["readiness"]["crawl_pending"] >= 1
+    assert run["frozen_snapshot_id"] is None
 
 
 def test_g_remote_submit_unknown_is_blocked(tmp_path):
     store, _snapshots = _seed_full_good_day(
         tmp_path / "state.sqlite", BUSINESS_DATE, extra_remote_state="SUBMIT_UNKNOWN",
     )
-    blocked = _evaluate_blocked(store)
-    assert blocked.reason_code == "REMOTE_PENDING_OR_MANUAL"
+    blocked, run = _run_blocked_before_freeze(store, tmp_path)
+    assert blocked.reason_code == "READINESS_BLOCKED"
+    assert blocked.detail["readiness"]["remote_pending"] >= 1
+    assert run["frozen_snapshot_id"] is None
 
 
 def test_h_remote_manual_required_is_blocked(tmp_path):
     store, _snapshots = _seed_full_good_day(
         tmp_path / "state.sqlite", BUSINESS_DATE, extra_remote_state="MANUAL_REQUIRED",
     )
-    blocked = _evaluate_blocked(store)
-    assert blocked.reason_code == "REMOTE_PENDING_OR_MANUAL"
+    blocked, run = _run_blocked_before_freeze(store, tmp_path)
+    assert blocked.reason_code == "READINESS_BLOCKED"
+    assert blocked.detail["readiness"]["remote_manual"] >= 1
+    assert run["frozen_snapshot_id"] is None
 
 
 def test_i_deleted_snapshot_member_is_incomplete(tmp_path):
@@ -488,3 +510,111 @@ def test_20260831_regression_gate_fires_before_freeze_leaves_day_unfrozen(tmp_pa
     assert run["frozen_snapshot_id"] is None
     assert run["state"] != "FINALIZED"
     assert not output.exists()
+
+
+def test_crash_after_freeze_keeps_frozen_run_with_full_provenance(tmp_path):
+    """Freeze and provenance metrics commit atomically, before materialization.
+
+    A materializer crash after the freeze must leave the run frozen with the
+    full cached provenance already merged (one BEGIN IMMEDIATE transaction),
+    the day not FINALIZED and no final.xlsx on disk; a rerun then recovers.
+    """
+    store_path = tmp_path / "state.sqlite"
+    store, snapshots = _seed_full_good_day(store_path, BUSINESS_DATE)
+    output = tmp_path / "final.xlsx"
+    candidate_id = int(snapshots[-1]["id"])
+
+    class CrashingMaterializer:
+        def materialize(self, _artifact, _path):
+            raise RuntimeError("simulated materializer crash")
+
+    with pytest.raises(RuntimeError, match="simulated materializer crash"):
+        _run_cached(
+            store, tmp_path / "closeout.lock", output,
+            materializer=CrashingMaterializer(),
+        )
+
+    run = store.get_run(BUSINESS_DATE)
+    assert int(run["frozen_snapshot_id"]) == candidate_id
+    assert run["state"] != "FINALIZED"
+    metrics = json.loads(run["metrics_json"])
+    assert metrics["finalization_mode"] == "CACHED_DEGRADED"
+    assert metrics["cached_snapshot_id"] == candidate_id
+    assert metrics["degraded_reason_code"] == "SOURCE_AUTH_UNAVAILABLE"
+    assert metrics["degraded_source_side"] == "customer"
+    assert metrics["cached_last_source_observed_at"] == f"{BUSINESS_DATE}T07:00:05+00:00"
+    assert metrics["frozen_snapshot_id"] == candidate_id
+    assert "cached_freeze_at" in metrics
+    assert not output.exists()
+
+    # Crash recovery: the idempotent same-id freeze merge lets the rerun
+    # finish the materialization without any frozen/conflict error.
+    outcome = _run_cached(
+        store, tmp_path / "closeout.lock", output,
+        materializer=LegacyWorkbookMaterializer(writer=_writer),
+    )
+    assert outcome.outcome == "CACHED_FINALIZED"
+    assert output.exists()
+    assert store.get_run(BUSINESS_DATE)["state"] == "FINALIZED"
+
+
+def test_invalid_crawl_success_price_blocks_before_freeze(tmp_path):
+    """A crawl that 'succeeded' without a parseable price must block pre-freeze."""
+    store_path = tmp_path / "state.sqlite"
+    store, _snapshots = _seed_full_good_day(store_path, BUSINESS_DATE)
+    connection = sqlite3.connect(store_path)
+    try:
+        with connection:
+            crawl_id = connection.execute(
+                "SELECT id FROM crawl_work ORDER BY id LIMIT 1"
+            ).fetchone()[0]
+            connection.execute(
+                "UPDATE crawl_work SET result_json=? WHERE id=?",
+                (json.dumps({"page_price_status": "OK", "page_price_value": "abc"}), crawl_id),
+            )
+    finally:
+        connection.close()
+
+    blocked, run = _run_blocked_before_freeze(store, tmp_path)
+
+    assert blocked.reason_code == "READINESS_BLOCKED"
+    assert blocked.detail["readiness"]["crawl_invalid_price"] >= 1
+    assert run["frozen_snapshot_id"] is None
+
+
+def test_completed_remote_without_post_attempt_blocks_before_freeze(tmp_path):
+    """A COMPLETED remote job without posted evidence is invalid, pre-freeze."""
+    store_path = tmp_path / "state.sqlite"
+    store, _snapshots = _seed_full_good_day(store_path, BUSINESS_DATE)
+    connection = sqlite3.connect(store_path)
+    try:
+        with connection:
+            connection.execute(
+                "UPDATE remote_jobs SET post_attempted=0 WHERE id=(SELECT MIN(id) FROM remote_jobs)"
+            )
+    finally:
+        connection.close()
+
+    blocked, run = _run_blocked_before_freeze(store, tmp_path)
+
+    assert blocked.reason_code == "READINESS_BLOCKED"
+    assert blocked.detail["readiness"]["remote_invalid"] >= 1
+    assert run["frozen_snapshot_id"] is None
+
+
+def test_required_row_without_crawl_work_blocks_before_freeze(tmp_path):
+    """A required crawl identity without durable crawl work blocks pre-freeze."""
+    store_path = tmp_path / "state.sqlite"
+    store, _snapshots = _seed_full_good_day(store_path, BUSINESS_DATE)
+    connection = sqlite3.connect(store_path)
+    try:
+        with connection:
+            connection.execute("DELETE FROM crawl_work WHERE id=(SELECT MIN(id) FROM crawl_work)")
+    finally:
+        connection.close()
+
+    blocked, run = _run_blocked_before_freeze(store, tmp_path)
+
+    assert blocked.reason_code == "READINESS_BLOCKED"
+    assert blocked.detail["readiness"]["crawl_unplanned"] >= 1
+    assert run["frozen_snapshot_id"] is None

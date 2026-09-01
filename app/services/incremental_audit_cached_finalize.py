@@ -1,4 +1,4 @@
-"""Cached degraded finalization: ten-gate evaluator plus guarded runner.
+"""Cached degraded finalization: snapshot-gate evaluator plus guarded runner.
 
 This module is the guarded "cached" fallback for the 2026-08-31 incident
 shape: business evidence all green, several identical authoritative
@@ -12,33 +12,40 @@ Structural no-network guarantee:
 - The module takes no ``TickDependencies`` (no ``deps`` parameter at all),
   so it cannot call discover / Detail / Model / submit / priority / harvest.
 - Every input comes from ``DailyAuditStore`` reads or the caller; the only
-  writable effects are ``freeze_snapshot`` / ``prepare_finalization`` /
-  ``materialize`` (local workbook) / ``mark_finalized`` /
-  ``update_daily_metrics``.
+  writable effects are ``freeze_snapshot_with_metrics`` /
+  ``prepare_finalization`` / ``materialize`` (local workbook) /
+  ``mark_finalized`` / ``update_daily_metrics``.
 - Provenance (``finalization_mode=CACHED_DEGRADED``, degraded reason and
-  side, cached snapshot id / observed_at / stability) is written only into
-  ``daily_runs.metrics_json`` — no schema migration, no secrets.
+  side, cached snapshot id / observed_at / stability, freeze timestamp) is
+  committed atomically with the freeze into ``daily_runs.metrics_json`` —
+  no schema migration, no secrets.
 
-Ten readiness gates, evaluated in order before any freeze, each raising
-``CachedFinalizeBlocked`` with a fixed reason code and count/timestamp/id
-detail only (never response bodies or tokens):
+Snapshot-side readiness gates, evaluated by
+``evaluate_cached_finalization_readiness`` before anything else, each
+raising ``CachedFinalizeBlocked`` with a fixed reason code and
+count/timestamp/id detail only (never response bodies or tokens):
 
-1. ``BEFORE_CUTOFF``            now >= cutoff_at
-2. ``NO_RUN``                   the daily run exists
-3. ``NO_SNAPSHOTS``             at least one authoritative observation
-4. ``SINGLE_OBSERVATION``       tail run length >= 2
-5. ``TAIL_CONTENT_DIFFERS``     the last observations share (row_count, ordered_hash)
+1. ``BEFORE_CUTOFF``             now >= cutoff_at
+2. ``NO_RUN``                    the daily run exists
+3. ``NO_SNAPSHOTS``              at least one authoritative observation
+4. ``SINGLE_OBSERVATION``        tail run length >= 2
+5. ``TAIL_CONTENT_DIFFERS``      the last observations share (row_count, ordered_hash)
 6. ``STABILITY_BELOW_THRESHOLD`` trailing identical span >= threshold
-7. ``MEMBERS_INCOMPLETE``       ordered members match row_count, headers/evidence parse
-8. ``SAAS_COUNT_MISMATCH``      evidence saas_count is a valid int equal to row_count
-9. ``STAGE_PENDING``            DETAIL/MODEL all SUCCESS (missing rows count as pending)
-10. ``CRAWL_PENDING``           no crawl work pending/unresolved
-    ``REMOTE_PENDING_OR_MANUAL`` no remote job pending or manual-required
+7. ``MEMBERS_INCOMPLETE``        ordered members match row_count, headers/evidence parse
+8. ``SAAS_COUNT_MISMATCH``       evidence saas_count is a valid int equal to row_count
+
+The business-side gate (Detail/Model SUCCESS, crawl and remote evidence)
+is the formal ``FinalizeReadiness`` computed by
+``build_frozen_audit_artifact`` for the candidate snapshot — the same
+single rule set strict/review/force finalization uses, never a second
+private copy.  The runner evaluates it before the freeze, so every refusal
+(``READINESS_BLOCKED``) leaves the day unfrozen.
 
 The candidate snapshot is the last observation (by observed_at, id), i.e.
 the naturally last-known-good one.  The runner mirrors
 ``materialize_frozen_daily_run`` (one process lock, one lease) but freezes
-the evaluated candidate first and stamps cached provenance metrics.
+the evaluated candidate first, committing the frozen pointer and the
+cached provenance metrics in one transaction.
 """
 
 from __future__ import annotations
@@ -62,27 +69,6 @@ from app.workflows.incremental_price_audit_finalize import (
 CACHED_FINALIZATION_MODE = "CACHED_DEGRADED"
 STRICT_FINALIZATION_MODE = "STRICT"
 
-_STAGE_PENDING_STATES = frozenset({"PENDING", "CLAIMED", "RETRYABLE_FAILED"})
-_STAGE_TERMINAL_STATE = "TERMINAL_FAILED"
-_STAGE_EVALUATED = ("DETAIL", "MODEL")
-_CRAWL_PENDING_STATES = frozenset({
-    "PENDING",
-    "PRIORITY_PENDING",
-    "SUBMITTED",
-    "RUNNING",
-    "EXPORTED",
-    "RETRYABLE_FAILED",
-    "SUBMIT_UNKNOWN",
-})
-_REMOTE_BLOCKING_STATES = frozenset({
-    "SUBMIT_INTENT",
-    "SUBMIT_UNKNOWN",
-    "PRIORITY_PENDING",
-    "SUBMITTED",
-    "RUNNING",
-    "EXPORTED",
-    "MANUAL_REQUIRED",
-})
 _STABILITY_EPSILON_SECONDS = 1e-9
 
 
@@ -214,48 +200,6 @@ def evaluate_cached_finalization_readiness(
             "saas_count": saas_count if _valid_count(saas_count) else str(type(saas_count).__name__),
         })
 
-    item_ids = {int(item["id"]) for item in items}
-    stage_detail: dict[str, int] = {}
-    stage_blocked = False
-    for stage in _STAGE_EVALUATED:
-        rows_by_item = {
-            int(row["audit_item_id"]): row
-            for row in store.list_stage_work(token, stage=stage)
-        }
-        missing = 0
-        pending = 0
-        terminal = 0
-        for item_id in item_ids:
-            row = rows_by_item.get(item_id)
-            if row is None:
-                missing += 1
-            elif str(row["state"]) == _STAGE_TERMINAL_STATE:
-                terminal += 1
-            elif str(row["state"]) in _STAGE_PENDING_STATES:
-                pending += 1
-        prefix = stage.lower()
-        stage_detail[f"{prefix}_missing"] = missing
-        stage_detail[f"{prefix}_pending"] = pending
-        stage_detail[f"{prefix}_terminal"] = terminal
-        stage_blocked = stage_blocked or bool(missing or pending or terminal)
-    if stage_blocked:
-        raise CachedFinalizeBlocked("STAGE_PENDING", {"snapshot_id": candidate_id, **stage_detail})
-
-    pending_crawls = store.list_crawl_work(token, states=set(_CRAWL_PENDING_STATES))
-    if pending_crawls:
-        raise CachedFinalizeBlocked("CRAWL_PENDING", {
-            "crawl_pending": len(pending_crawls),
-            "states": sorted({str(row["state"]) for row in pending_crawls}),
-        })
-    blocking_remote_jobs = store.list_remote_jobs(token, states=set(_REMOTE_BLOCKING_STATES))
-    if blocking_remote_jobs:
-        states = [str(job["state"]) for job in blocking_remote_jobs]
-        raise CachedFinalizeBlocked("REMOTE_PENDING_OR_MANUAL", {
-            "remote_pending": sum(1 for state in states if state != "MANUAL_REQUIRED"),
-            "remote_manual": sum(1 for state in states if state == "MANUAL_REQUIRED"),
-            "states": sorted(set(states)),
-        })
-
     return CachedFinalizePlan(
         snapshot_id=candidate_id,
         row_count=row_count,
@@ -313,21 +257,39 @@ def run_cached_finalization(
             now=now,
             source_stability_threshold_seconds=source_stability_threshold_seconds,
         )
+        # The formal, shared business-readiness gate runs BEFORE the freeze:
+        # the same FinalizeReadiness strict/review/force finalization uses,
+        # computed for the candidate snapshot, so no second rule set exists
+        # and every refusal leaves the day unfrozen.
+        built = build_frozen_audit_artifact(
+            store,
+            token,
+            output_identity=f"daily-final-{business_date.replace('-', '')}",
+            snapshot_id=plan.snapshot_id,
+        )
+        if not built.readiness.ready or built.artifact is None:
+            raise CachedFinalizeBlocked("READINESS_BLOCKED", {
+                "snapshot_id": plan.snapshot_id,
+                "readiness": asdict(built.readiness),
+            })
         frozen = run["frozen_snapshot_id"] if run is not None else None
         if frozen is not None and int(frozen) != plan.snapshot_id:
             raise CachedFinalizeBlocked("NOT_FROZEN_CONFLICT", {
                 "frozen_snapshot_id": int(frozen),
                 "candidate_snapshot_id": plan.snapshot_id,
             })
-        if frozen is None:
-            store.freeze_snapshot(token, plan.snapshot_id)
-        built = build_frozen_audit_artifact(
-            store,
-            token,
-            output_identity=f"daily-final-{business_date.replace('-', '')}",
-        )
-        if not built.readiness.ready or built.artifact is None:
-            raise CachedFinalizeBlocked("READINESS_BLOCKED", {"readiness": asdict(built.readiness)})
+        # One transaction commits the frozen pointer and the cached
+        # provenance; the same-id rerun merges (provenance backfill).
+        store.freeze_snapshot_with_metrics(token, plan.snapshot_id, {
+            "finalization_mode": CACHED_FINALIZATION_MODE,
+            "cached_snapshot_id": plan.snapshot_id,
+            "cached_last_source_observed_at": plan.observed_at,
+            "cached_source_stability_seconds": plan.stability_seconds,
+            "degraded_reason_code": degraded_reason_code,
+            "degraded_source_side": degraded_source_side,
+            "cached_freeze_at": datetime.now(UTC).isoformat(timespec="seconds"),
+            "frozen_snapshot_id": plan.snapshot_id,
+        })
         resolved_output = Path(output_path).resolve()
         store.prepare_finalization(token, str(resolved_output))
         publisher = materializer or LegacyWorkbookMaterializer()
@@ -335,14 +297,7 @@ def run_cached_finalization(
         store.mark_finalized(token, str(resolved_output), result.manifest_sha256)
         store.update_daily_metrics(token, {
             "finalized_rows": result.row_count,
-            "finalization_mode": CACHED_FINALIZATION_MODE,
-            "cached_snapshot_id": plan.snapshot_id,
-            "cached_last_source_observed_at": plan.observed_at,
-            "cached_source_stability_seconds": plan.stability_seconds,
-            "degraded_reason_code": degraded_reason_code,
-            "degraded_source_side": degraded_source_side,
             "cached_finalized_at": datetime.now(UTC).isoformat(timespec="seconds"),
-            "frozen_snapshot_id": plan.snapshot_id,
         })
         return CachedFinalizeOutcome(
             "CACHED_FINALIZED",

@@ -93,15 +93,18 @@ _PERMANENT_CLOSEOUT_FAILURE_NAMES = frozenset(
 )
 # The only failure names that may unlock the guarded cached degraded
 # finalization, matched as the leading type name of the persisted error.
-# Never widened implicitly: RuntimeError and every other unknown exception
-# must stay outside this set.
+# Generic transport names (TimeoutError/ConnectionError/URLError) cannot
+# prove the outage happened during discovery, so they must never degrade
+# the day: the adapter already wraps transport-level retry exhaustion into
+# the typed SnapshotFetchExhausted, which stays eligible here.  The typed
+# SnapshotAuthExpiredError proves a discovery-side refusal.  Never widened
+# implicitly: RuntimeError and every other unknown exception stay outside
+# this set, and SnapshotConsistencyDrift means the source was actively
+# changing during pagination — never a state to freeze from.
 _ELIGIBLE_CACHED_SOURCE_UNAVAILABLE_NAMES = frozenset(
     {
         "SnapshotAuthExpiredError",
         "SnapshotFetchExhausted",
-        "TimeoutError",
-        "ConnectionError",
-        "URLError",
     }
 )
 _FAILED_PASS_BACKOFF_CAP_SECONDS = 300.0
