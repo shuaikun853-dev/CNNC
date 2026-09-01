@@ -118,6 +118,10 @@ def _empty_status(
         "final": {
             "pending": 0, "computed_pending": 0, "frozen": False, "finalized": False,
             "forced": False,
+            "finalization_mode": None,
+            "last_source_observed_at": None,
+            "degraded_reason_code": None,
+            "degraded_source_side": None,
             "output_path": None, "output_exists": False, "manifest_recorded": False,
             "blocker_summary": _empty_blocker_summary(),
         },
@@ -437,6 +441,14 @@ def collect_runtime_status(
             # True only when the FINALIZED outcome came from an explicit
             # guarded force-finalize; metrics carry the durable audit flag.
             "forced": bool(metrics.get("force_finalize", False)),
+            # Machine-readable cached-degraded provenance, read back from the
+            # durable metrics the cached finalize wrote.  None (strict days
+            # never write the metric) means strict or unknown — the status
+            # stays faithful to metrics and never guesses.
+            "finalization_mode": metrics.get("finalization_mode"),
+            "last_source_observed_at": metrics.get("cached_last_source_observed_at"),
+            "degraded_reason_code": metrics.get("degraded_reason_code"),
+            "degraded_source_side": metrics.get("degraded_source_side"),
             "output_path": output_path,
             "output_exists": bool(output_path and Path(output_path).is_file()),
             "manifest_recorded": bool(run["final_manifest_hash"]),

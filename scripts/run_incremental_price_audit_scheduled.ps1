@@ -46,6 +46,7 @@ $now = if ($null -ne $At) { [datetime]$At } else { Get-Date }
 $hour = $now.Hour
 $minute = $now.Minute
 $phases = @()
+$allowCachedFinalize = $false
 $isWeekday = $now.DayOfWeek -notin @([DayOfWeek]::Saturday, [DayOfWeek]::Sunday)
 if ($isWeekday -and $hour -eq 17 -and ($minute % 5) -eq 0 -and $minute -le 50) {
     # 17:00-17:50 is the SaaS new-data peak: every 5-minute wakeup is a full
@@ -89,6 +90,11 @@ elseif (
     # 20:36 and later never auto-run, so later progress is an explicit
     # manual closeout from the operator.
     $phases = @("closeout")
+    # Only the one-shot 20:35 safety closeout may unlock the guarded cached
+    # degraded finalization: if the authoritative source is provably down for
+    # the whole evening, the day still leaves with a durable, fully-gated
+    # final workbook instead of staying unfinalized.
+    $allowCachedFinalize = ($hour -eq 20 -and $minute -eq 35)
 }
 
 $modeArgument = if ($EnableRemoteWrites) { "--enable-remote-writes" } else { "--shadow" }
@@ -98,7 +104,7 @@ function Get-PhaseBudgetSeconds([string] $Phase) {
     }
     return [int][math]::Min($BudgetSeconds, $HardTimeoutMinutes * 60 - 60)
 }
-function Get-PhaseArguments([string] $Phase, [int] $PhaseBudgetSeconds) {
+function Get-PhaseArguments([string] $Phase, [int] $PhaseBudgetSeconds, [bool] $AllowCachedFinalize = $false) {
     $arguments = @(
         "-u",
         $cliPath,
@@ -108,6 +114,9 @@ function Get-PhaseArguments([string] $Phase, [int] $PhaseBudgetSeconds) {
     )
     if ($Phase -notin @("drain-only", "harvest-only")) {
         $arguments += $modeArgument
+    }
+    if ($Phase -eq "closeout" -and $AllowCachedFinalize) {
+        $arguments += "--allow-cached-finalize"
     }
     $arguments += @("--invocation", "scheduler")
     $arguments += @("--zhaoshang-backend", $ZhaoshangBackend)
@@ -120,7 +129,7 @@ if ($Preview) {
             [pscustomobject]@{
                 Phase = $phase
                 Command = $PythonExe
-                Arguments = (Get-PhaseArguments $phase (Get-PhaseBudgetSeconds $phase))
+                Arguments = (Get-PhaseArguments $phase (Get-PhaseBudgetSeconds $phase) $allowCachedFinalize)
             }
         }
     )
@@ -130,6 +139,7 @@ if ($Preview) {
         Hour = $hour
         DayOfWeek = [string]$now.DayOfWeek
         IsWeekday = $isWeekday
+        AllowCachedFinalize = [bool]$allowCachedFinalize
         Phases = @($phases)
         Commands = $commands
         RuntimeRoot = $RuntimeRoot
@@ -181,8 +191,8 @@ function Write-SchedulerLog([string] $Message) {
     Write-SchedulerOutput $line
 }
 
-function Invoke-Phase([string] $Phase, [int] $PhaseBudgetSeconds) {
-    $arguments = Get-PhaseArguments $Phase $PhaseBudgetSeconds
+function Invoke-Phase([string] $Phase, [int] $PhaseBudgetSeconds, [bool] $AllowCachedFinalize = $false) {
+    $arguments = Get-PhaseArguments $Phase $PhaseBudgetSeconds $AllowCachedFinalize
     $phaseMode = if ($Phase -in @("drain-only", "harvest-only")) { $Phase } else { $modeArgument }
     Write-SchedulerLog "START phase=$Phase budget_seconds=$PhaseBudgetSeconds mode=$phaseMode backend=$ZhaoshangBackend"
     $remainingSeconds = [math]::Floor(
@@ -234,7 +244,7 @@ try {
             break
         }
         $phaseBudget = [math]::Min((Get-PhaseBudgetSeconds $phase), $remainingSeconds)
-        $exitCode = Invoke-Phase $phase $phaseBudget
+        $exitCode = Invoke-Phase $phase $phaseBudget $allowCachedFinalize
         if ($exitCode -ne 0) {
             Write-SchedulerLog "STOP reason=phase_failed phase=$phase exit_code=$exitCode"
             exit $exitCode

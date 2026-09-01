@@ -15,6 +15,7 @@ if str(ROOT) not in sys.path:
 from app.services.incremental_audit_runtime import (
     DEFAULT_RUNTIME_ROOT,
     business_date_in_shanghai,
+    run_cached_finalize_command,
     run_existing_remote_harvest_command,
     run_force_finalize_command,
     run_model_recovery_command,
@@ -101,6 +102,13 @@ def build_parser() -> argparse.ArgumentParser:
                 type=float,
                 default=600.0,
                 help="identical authoritative observations must span this long before freeze",
+            )
+            child.add_argument(
+                "--allow-cached-finalize",
+                action="store_true",
+                help="on a whitelisted source-unavailable failure, freeze the "
+                "day's last-known-good snapshot and materialize from durable "
+                "SQLite (guarded cached degraded finalization)",
             )
             child.add_argument(
                 "--source-observation-interval-seconds",
@@ -290,6 +298,19 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         help="formal output path; defaults to the day's reserved final workbook path",
     )
+    cached_finalize = subparsers.add_parser("cached-finalize")
+    _add_common_arguments(cached_finalize, allow_remote_writes=False)
+    cached_finalize.add_argument(
+        "--output",
+        type=Path,
+        help="formal output path; defaults to the day's reserved final workbook path",
+    )
+    cached_finalize.add_argument(
+        "--source-stability-seconds",
+        type=float,
+        default=600.0,
+        help="identical authoritative observations must span this long before the cached freeze",
+    )
     return parser
 
 
@@ -351,6 +372,15 @@ def main(argv: list[str] | None = None) -> int:
         )
         print(json.dumps(result, ensure_ascii=False, sort_keys=True))
         return 0 if result.get("outcome") in {"FORCE_FINALIZED", "ALREADY_FINALIZED"} else 2
+    if args.command == "cached-finalize":
+        result = run_cached_finalize_command(
+            business_date=business_date,
+            runtime_root=args.runtime_root,
+            output_path=args.output,
+            source_stability_seconds=args.source_stability_seconds,
+        )
+        print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+        return 0 if result.get("outcome") in {"CACHED_FINALIZED", "ALREADY_FINALIZED"} else 2
     if args.command == "reexport-existing-remote":
         try:
             reexport = run_manual_reexport_command(
@@ -528,6 +558,7 @@ def main(argv: list[str] | None = None) -> int:
         output_path=getattr(args, "output", None),
         invocation=args.invocation,
         source_stability_seconds=getattr(args, "source_stability_seconds", None),
+        allow_cached_finalize=getattr(args, "allow_cached_finalize", False),
         closeout_observation_interval_seconds=getattr(
             args, "source_observation_interval_seconds", 300.0
         ),

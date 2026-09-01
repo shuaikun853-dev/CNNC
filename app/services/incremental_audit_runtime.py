@@ -33,6 +33,10 @@ from app.services.daily_audit_store import (
     LeaseUnavailable,
     ProcessLock,
 )
+from app.services.incremental_audit_cached_finalize import (
+    CachedFinalizeBlocked,
+    run_cached_finalization,
+)
 from app.services.incremental_audit_closeout import (
     CloseoutConfig,
     run_closeout,
@@ -714,6 +718,87 @@ def run_force_finalize_command(
         "add_calls": 0,
     }
     _record_recovery_event(paths, result)
+    return result
+
+
+def run_cached_finalize_command(
+    *,
+    business_date: str,
+    runtime_root: Path | str = DEFAULT_RUNTIME_ROOT,
+    output_path: Path | str | None = None,
+    source_stability_seconds: float = 600.0,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Guarded cached degraded finalization; structurally no discovery chain.
+
+    Mirrors ``run_force_finalize_command``: no ``TickDependencies`` is ever
+    built, so discover / Detail / Model / submit / priority / harvest cannot
+    run.  The ten readiness gates in ``run_cached_finalization`` decide from
+    durable SQLite alone whether the day's last-known-good snapshot may be
+    frozen and materialized; a refusal is reported as
+    ``CACHED_FINALIZE_BLOCKED`` with the fixed reason code and never
+    fabricates a final workbook.
+    """
+    if source_stability_seconds < 0:
+        raise ValueError("source stability window must be zero or positive")
+    paths = runtime_paths(business_date, runtime_root)
+    resolved_output = Path(output_path) if output_path is not None else paths.final_output_path
+    wall_now = now or datetime.now(UTC)
+    if wall_now.tzinfo is None or wall_now.utcoffset() is None:
+        raise ValueError("runtime clock must return an explicit-timezone datetime")
+    if not paths.state_path.is_file():
+        return {
+            "outcome": "CACHED_FINALIZE_BLOCKED",
+            "error_type": "CachedFinalizeBlocked(NO_RUN)",
+            "reason_code": "NO_RUN",
+            "business_date": business_date,
+            "output_path": str(resolved_output.resolve()),
+            "finalized": False,
+        }
+    store = DailyAuditStore(paths.state_path)
+    run = store.get_run(business_date)
+    cutoff_at = None
+    if run is not None and run["cutoff_at"]:
+        cutoff_at = datetime.fromisoformat(str(run["cutoff_at"]))
+    try:
+        outcome = run_cached_finalization(
+            store,
+            ProcessLock(paths.lock_path),
+            business_date,
+            resolved_output,
+            cutoff_at=cutoff_at,
+            now=wall_now,
+            source_stability_threshold_seconds=source_stability_seconds,
+            degraded_reason_code="MANUAL_CACHED_FINALIZE",
+            degraded_source_side="unknown",
+        )
+    except CachedFinalizeBlocked as exc:
+        return {
+            "outcome": "CACHED_FINALIZE_BLOCKED",
+            "error_type": f"CachedFinalizeBlocked({exc.reason_code})",
+            "reason_code": exc.reason_code,
+            "business_date": business_date,
+            "output_path": str(resolved_output.resolve()),
+            "finalized": False,
+        }
+    result = {
+        "outcome": outcome.outcome,
+        "business_date": business_date,
+        "output_path": str(resolved_output.resolve()),
+        "frozen_snapshot_id": outcome.cached_snapshot_id,
+        "finalized": True,
+        "manifest_recorded": True,
+        "remote_calls": 0,
+    }
+    if outcome.outcome == "CACHED_FINALIZED":
+        materialization = outcome.publication.materialization
+        assert materialization is not None
+        result["output_path"] = str(materialization.output_path)
+        result["last_source_observed_at"] = outcome.last_source_observed_at
+        result["source_stability_seconds"] = outcome.source_stability_seconds
+        result["degraded_reason_code"] = "MANUAL_CACHED_FINALIZE"
+        result["degraded_source_side"] = "unknown"
+        _record_recovery_event(paths, result)
     return result
 
 
@@ -1858,6 +1943,7 @@ def run_runtime_command(
     monotonic: Callable[[], float] = monotonic_time.monotonic,
     invocation: str = "manual",
     source_stability_seconds: float | None = None,
+    allow_cached_finalize: bool = False,
     closeout_observation_interval_seconds: float = 300.0,
     closeout_remote_sweep_interval_seconds: float = 600.0,
     closeout_final_reserve_seconds: float = 120.0,
@@ -1921,6 +2007,7 @@ def run_runtime_command(
                 source_observation_interval_seconds=closeout_observation_interval_seconds,
                 remote_sweep_interval_seconds=closeout_remote_sweep_interval_seconds,
                 final_materialize_reserve_seconds=closeout_final_reserve_seconds,
+                allow_cached_finalize=allow_cached_finalize,
             ),
             closeout_sleep=closeout_sleep,
         )

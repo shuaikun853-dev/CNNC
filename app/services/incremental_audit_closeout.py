@@ -20,12 +20,17 @@ continued by the next scheduled closeout.
 
 from __future__ import annotations
 
+import re
 import time
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
 from app.services.daily_audit_store import DailyAuditStore, FrozenSnapshotConflict, ProcessLock
+from app.services.incremental_audit_cached_finalize import (
+    CachedFinalizeBlocked,
+    run_cached_finalization,
+)
 from app.services.incremental_audit_materializer import (
     ArtifactConflictError,
     MaterializationValidationError,
@@ -78,9 +83,48 @@ _PERMANENT_CLOSEOUT_FAILURE_NAMES = frozenset(
         "SubmissionEvidenceConflictError",
         "DatabaseError",
         "IntegrityError",
+        # Deterministic typed snapshot-source diagnostics: retrying them
+        # cannot succeed until a human replaces the curl, so strict passes
+        # fail fast instead of burning the closeout budget.
+        "SnapshotAuthExpiredError",
+        "SnapshotResponseCodeError",
+        "SnapshotContractError",
+    }
+)
+# The only failure names that may unlock the guarded cached degraded
+# finalization, matched as the leading type name of the persisted error.
+# Never widened implicitly: RuntimeError and every other unknown exception
+# must stay outside this set.
+_ELIGIBLE_CACHED_SOURCE_UNAVAILABLE_NAMES = frozenset(
+    {
+        "SnapshotAuthExpiredError",
+        "SnapshotFetchExhausted",
+        "TimeoutError",
+        "ConnectionError",
+        "URLError",
     }
 )
 _FAILED_PASS_BACKOFF_CAP_SECONDS = 300.0
+
+
+def _leading_error_type(summary: TickSummary) -> str:
+    return str(summary.error or "").strip().split("(", 1)[0].strip()
+
+
+def _is_eligible_source_unavailable(summary: TickSummary) -> bool:
+    """True only when the failed pass hit a whitelisted source outage."""
+    return _leading_error_type(summary) in _ELIGIBLE_CACHED_SOURCE_UNAVAILABLE_NAMES
+
+
+def _cached_reason_code(summary: TickSummary) -> str:
+    if _leading_error_type(summary) == "SnapshotAuthExpiredError":
+        return "SOURCE_AUTH_UNAVAILABLE"
+    return "SOURCE_UNAVAILABLE"
+
+
+def _cached_source_side(summary: TickSummary) -> str:
+    match = re.search(r"side=([^,)]+)", str(summary.error or ""))
+    return match.group(1).strip() if match else "unknown"
 
 
 def _closeout_failure_class(summary: TickSummary) -> str:
@@ -126,6 +170,10 @@ class CloseoutConfig:
     failed_pass_retry_seconds: float = 30.0
     idle_pass_retry_seconds: float = 30.0
     max_consecutive_failed_passes: int = 2
+    # Opt-in for the one-shot safety closeout only: on a whitelisted
+    # source-unavailable failure, freeze the day's last-known-good snapshot
+    # and materialize from durable SQLite instead of leaving the day unfinal.
+    allow_cached_finalize: bool = False
 
     def __post_init__(self) -> None:
         values = (
@@ -163,6 +211,7 @@ def run_closeout(
     materialize: Callable[..., FinalizePublication] = materialize_frozen_daily_run,
     monotonic: Callable[[], float] = time.monotonic,
     sleep: Callable[[float], None] = time.sleep,
+    cached_finalize: Callable[..., Any] = run_cached_finalization,
 ) -> tuple[TickSummary, FinalizePublication | None, str | None, str | None]:
     """Drive one business day to FINAL inside a single production writer.
 
@@ -192,6 +241,39 @@ def run_closeout(
             last.error if last is not None else None,
         )
 
+    def cached_finalize_fallback(summary: TickSummary):
+        """Guarded degraded finalization before a failed strict exit.
+
+        Returns the ``CACHED_FINALIZED`` result tuple, or ``None`` to keep the
+        original failed-return semantics untouched.  Only the explicit
+        ``allow_cached_finalize`` flag, a whitelisted source-unavailable error
+        and enough remaining wall clock unlock it; a ``CachedFinalizeBlocked``
+        refusal only appends its reason to the trace.
+        """
+        if not closeout.allow_cached_finalize:
+            return None
+        if not _is_eligible_source_unavailable(summary):
+            return None
+        if wall_deadline - monotonic() < MIN_MATERIALIZE_SECONDS:
+            return None
+        try:
+            outcome = cached_finalize(
+                store,
+                process_lock,
+                config.business_date,
+                Path(output_path),
+                cutoff_at=config.cutoff_at,
+                now=deps.wall_clock(),
+                source_stability_threshold_seconds=config.source_stability_seconds,
+                degraded_reason_code=_cached_reason_code(summary),
+                degraded_source_side=_cached_source_side(summary),
+            )
+        except CachedFinalizeBlocked as exc:
+            trace.append(f"cached_blocked:{exc.reason_code}")
+            return None
+        trace.append("cached_finalized")
+        return merged("CACHED_FINALIZED"), outcome.publication, None, None
+
     while True:
         now = monotonic()
         run = store.get_run(config.business_date)
@@ -200,6 +282,15 @@ def run_closeout(
             return merged("ALREADY_FINALIZED"), None, None, None
         if now >= long_op_deadline:
             trace.append("stop:deadline")
+            # Retryable source outages sleep up to this deadline instead of
+            # exiting through the failure branch, so the whitelisted
+            # source-unavailable fallback must be re-offered here too — the
+            # last pass's failure is the classification evidence.  A waiting
+            # (non-failed) deadline exhaustion keeps the original semantics.
+            if last is not None and last.outcome in {"FAILED", "DISCOVERY_INCOMPLETE"}:
+                fallback = cached_finalize_fallback(last)
+                if fallback is not None:
+                    return fallback
             return merged("CLOSEOUT_DEADLINE"), None, None, None
         frozen = run is not None and run["frozen_snapshot_id"] is not None
         observation_due = now + 1e-9 >= next_observation_at
@@ -254,10 +345,16 @@ def run_closeout(
             failure_class = _closeout_failure_class(summary)
             consecutive_failed += 1
             if monotonic() >= long_op_deadline or failure_class == "permanent":
+                fallback = cached_finalize_fallback(summary)
+                if fallback is not None:
+                    return fallback
                 return merged(summary.outcome), None, None, None
             if failure_class == "unknown" and (
                 consecutive_failed >= closeout.max_consecutive_failed_passes
             ):
+                fallback = cached_finalize_fallback(summary)
+                if fallback is not None:
+                    return fallback
                 return merged(summary.outcome), None, None, None
             # Retryable failures spend the full remaining budget with a
             # growing backoff; unknown failures keep the fixed historical
