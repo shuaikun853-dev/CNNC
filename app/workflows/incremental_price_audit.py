@@ -20,6 +20,10 @@ from datetime import UTC, datetime, timedelta
 from typing import Any, Callable, Mapping, Sequence
 from urllib import error
 
+from app.services.cnnc_saas_snapshot_adapter import (
+    SnapshotContractError,
+    SnapshotSourceError,
+)
 from app.services.daily_audit_store import DailyAuditStore, LeaseToken, LeaseUnavailable, ProcessLock
 from app.services.remote_running_recovery import (
     RECOVERY_CALLBACK_TIMEOUT_SECONDS,
@@ -256,6 +260,10 @@ def _safe_error(exc: BaseException) -> str:
     # This typed pre-send message is built only from the legacy adapter's
     # fixed diagnostic vocabulary, so it can be persisted verbatim.
     if isinstance(exc, SubmitNotAttemptedError):
+        return str(exc)
+    # Snapshot source diagnostics carry their own fixed whitelist format
+    # (side/code or side/reason) and never embed rspDesc or response bodies.
+    if isinstance(exc, (SnapshotSourceError, SnapshotContractError)):
         return str(exc)
     code = getattr(exc, "code", None)
     if isinstance(code, int):

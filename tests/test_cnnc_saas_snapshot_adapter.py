@@ -5,9 +5,12 @@ import pytest
 
 from app.services.cnnc_saas_snapshot_adapter import (
     CnncSaasSnapshotAdapter,
+    SnapshotAuthExpiredError,
     SnapshotConsistencyDrift,
+    SnapshotContractError,
     SnapshotFetchExhausted,
     SnapshotFetchPolicy,
+    SnapshotResponseCodeError,
     snapshot_to_json_payloads,
 )
 
@@ -372,3 +375,51 @@ def test_serialization_contract_preserves_order_and_duplicates():
 
     assert saas == {"rspCode": "0000", "count": 2, "rows": [{"vCommodityId": "a"}, {"vCommodityId": "a"}], "success": True}
     assert customer == {"rspCode": "0000", "count": 1, "rows": [{"documentId": "c"}], "success": True}
+
+
+def test_auth_expired_rsp_code_raises_typed_error():
+    auth_expired = {"rspCode": "3333", "rspDesc": "登录已过期,请重新登录", "success": False, "data": ""}
+    adapter, opener = _adapter([auth_expired, auth_expired])
+
+    with pytest.raises(SnapshotAuthExpiredError) as caught:
+        adapter.fetch()
+
+    assert caught.value.side == "saas"
+    assert caught.value.rsp_code == "3333"
+    assert str(caught.value) == "SnapshotAuthExpiredError(side=saas,code=3333)"
+    assert "登录已过期" not in str(caught.value)
+    assert len(opener.requests) == 1  # Typed source errors never retry.
+
+
+def test_non_auth_bad_rsp_code_raises_response_code_error():
+    bad_code = {"rspCode": "5001", "rspDesc": "业务处理失败", "success": False, "data": ""}
+    adapter, opener = _adapter([bad_code, bad_code])
+
+    with pytest.raises(SnapshotResponseCodeError) as caught:
+        adapter.fetch()
+
+    assert caught.value.side == "saas"
+    assert caught.value.rsp_code == "5001"
+    assert str(caught.value) == "SnapshotResponseCodeError(side=saas,code=5001)"
+    assert len(opener.requests) == 1  # Typed source errors never retry.
+
+
+def test_rows_contract_violation_raises_contract_error():
+    adapter, _opener = _adapter([{"rspCode": "0000", "count": 1, "rows": "nope"}])
+
+    with pytest.raises(SnapshotContractError) as caught:
+        adapter.fetch()
+
+    assert caught.value.side == "saas"
+    assert caught.value.reason == "ROWS_NOT_OBJECTS"
+    assert str(caught.value) == "SnapshotContractError(side=saas,reason=ROWS_NOT_OBJECTS)"
+
+
+def test_count_contract_violation_raises_contract_error():
+    adapter, _opener = _adapter([{"rspCode": "0000", "count": "abc", "rows": []}])
+
+    with pytest.raises(SnapshotContractError) as caught:
+        adapter.fetch()
+
+    assert caught.value.side == "saas"
+    assert caught.value.reason == "COUNT_INVALID"

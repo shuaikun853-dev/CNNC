@@ -10,6 +10,10 @@ from urllib import error
 import pytest
 from pymysql.err import OperationalError
 
+from app.services.cnnc_saas_snapshot_adapter import (
+    SnapshotAuthExpiredError,
+    SnapshotContractError,
+)
 from app.services.daily_audit_store import DailyAuditStore, ProcessLock
 from app.services.legacy_zhaoshang_adapter import (
     retryable_priority_error_diagnostic,
@@ -489,6 +493,11 @@ def test_persisted_external_error_is_type_only_and_does_not_store_secrets():
 
     assert message == "RuntimeError"
     assert "do-not-store" not in message
+
+
+def test_safe_error_keeps_typed_snapshot_source_errors():
+    assert _safe_error(SnapshotAuthExpiredError("customer", "3333")) == "SnapshotAuthExpiredError(side=customer,code=3333)"
+    assert _safe_error(SnapshotContractError("customer", "ROWS_NOT_OBJECTS")) == "SnapshotContractError(side=customer,reason=ROWS_NOT_OBJECTS)"
 
 
 def test_hard_stage_crash_remains_claimed_then_next_tick_recovers(tmp_path):

@@ -102,6 +102,48 @@ class SnapshotConsistencyDrift(RuntimeError):
         super().__init__(f"{side} snapshot consistency drift: {reason}")
 
 
+class SnapshotSourceError(RuntimeError):
+    """Typed diagnostic for a snapshot source refusing service.
+
+    ``rspDesc`` is consumed for classification only and never enters the
+    message: ``__str__`` renders a fixed whitelist format so downstream
+    persistence can store it verbatim without leaking response bodies,
+    tokens or cookies.
+    """
+
+    def __init__(self, side: str, rsp_code: str) -> None:
+        self.side = side
+        self.rsp_code = rsp_code
+        super().__init__(f"{type(self).__name__}(side={self.side},code={self.rsp_code})")
+
+    def __str__(self) -> str:
+        return f"{type(self).__name__}(side={self.side},code={self.rsp_code})"
+
+
+class SnapshotAuthExpiredError(SnapshotSourceError):
+    """The source session is expired (auth rspCode or expired-login rspDesc)."""
+
+
+class SnapshotResponseCodeError(SnapshotSourceError):
+    """The source answered with a non-success, non-retryable rspCode."""
+
+
+class SnapshotContractError(RuntimeError):
+    """Typed diagnostic for a snapshot payload violating its shape contract."""
+
+    def __init__(self, side: str | None, reason: str) -> None:
+        self.side = side
+        self.reason = reason
+        super().__init__(f"SnapshotContractError(side={self.side},reason={self.reason})")
+
+    def __str__(self) -> str:
+        return f"SnapshotContractError(side={self.side},reason={self.reason})"
+
+
+SNAPSHOT_AUTH_EXPIRED_RSP_CODES = frozenset({"401", "3333"})
+SNAPSHOT_AUTH_EXPIRED_DESC_MARKERS = frozenset({"登录已过期", "请重新登录", "unauthorized"})
+
+
 SNAPSHOT_DRIFT_MAX_ROUNDS = 3
 
 
@@ -190,7 +232,7 @@ class CnncSaasSnapshotAdapter:
             else:
                 rows = nested
         if not isinstance(rows, list) or not all(isinstance(row, dict) for row in rows):
-            raise RuntimeError(f"{side} response rows must be a list of objects")
+            raise SnapshotContractError(side, "ROWS_NOT_OBJECTS")
         return rows
 
     @staticmethod
@@ -200,13 +242,13 @@ class CnncSaasSnapshotAdapter:
             nested = payload["data"]
             value = nested.get("count", nested.get("total"))
         if isinstance(value, bool):
-            raise RuntimeError(f"{side} response count is invalid")
+            raise SnapshotContractError(side, "COUNT_INVALID")
         try:
             count = int(value)
         except (TypeError, ValueError) as exc:
-            raise RuntimeError(f"{side} response count is invalid") from exc
+            raise SnapshotContractError(side, "COUNT_INVALID") from exc
         if count < 0:
-            raise RuntimeError(f"{side} response count is invalid")
+            raise SnapshotContractError(side, "COUNT_INVALID")
         return count
 
     @staticmethod
@@ -289,18 +331,28 @@ class CnncSaasSnapshotAdapter:
                     )
                 else:
                     with self._opener.open(factory(), timeout=timeout) as response:
-                        response_payload = self._decode_response(response)
+                        try:
+                            response_payload = self._decode_response(response)
+                        except RuntimeError as exc:
+                            raise SnapshotContractError(side, "NOT_JSON_OBJECT") from exc
                 now = self._monotonic()
                 if now > deadline:
                     raise SnapshotFetchExhausted(
                         side, page, attempts, max(now - started_at, 0.0), TimeoutError("discovery deadline exceeded")
                     )
                 if not isinstance(response_payload, dict):
-                    raise RuntimeError(f"{side} response must be a JSON object")
+                    raise SnapshotContractError(side, "PAYLOAD_NOT_OBJECT")
                 if str(response_payload.get("rspCode")) != "0000":
                     if self._is_retryable_response(response_payload):
                         raise _RetryableSnapshotResponse(f"{side} retryable response")
-                    raise RuntimeError(f"{side} response rspCode is not 0000")
+                    rsp_code = str(response_payload.get("rspCode") or "")
+                    rsp_desc = str(response_payload.get("rspDesc") or "")
+                    if (
+                        rsp_code in SNAPSHOT_AUTH_EXPIRED_RSP_CODES
+                        or any(marker in rsp_desc for marker in SNAPSHOT_AUTH_EXPIRED_DESC_MARKERS)
+                    ):
+                        raise SnapshotAuthExpiredError(side, rsp_code) from None
+                    raise SnapshotResponseCodeError(side, rsp_code) from None
                 return response_payload
             except Exception as exc:
                 if not self._is_retryable_exception(exc):
