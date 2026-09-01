@@ -223,12 +223,14 @@ def run_partial_exact_harvest_recovery(
     entire export endpoint (GLOBAL_EXPORT_ZERO), never per-identity proof
     (PER_IDENTITY_NO_RESULT), so a second invariant holds:
     CONTRADICTORY_EVIDENCE != NO_RESULT_PROVEN.  A mixed classification that
-    carries exact result rows alongside still-pending exact_absent identities
+    carries task-owned non-absence evidence — exact result rows or ambiguous
+    identities whose exported rows cannot be attributed to exactly one
+    durable request group — alongside still-pending exact_absent identities
     is rejected before the first durable mutation and before any probe: a
-    live global zero-export-count contradicts the local SUCCESS rows and
+    live global zero-export-count contradicts that task-owned evidence and
     cannot be stitched into per-identity absence proof.  An all-absent
-    classification with fully consistent live evidence remains the legal
-    NO_RESULT path.
+    classification (no exact matches and no ambiguous identities) with fully
+    consistent live evidence remains the legal NO_RESULT path.
     """
     path = Path(state_path)
     if not path.is_file():
@@ -367,15 +369,19 @@ def run_partial_exact_harvest_recovery(
             # probe_export_no_price speaks for the whole export endpoint
             # (GLOBAL_EXPORT_ZERO: one task-level rspDesc/count), never for a
             # single identity (PER_IDENTITY_NO_RESULT).  When the same workbook
-            # already contains exact result rows for this task, a live global
-            # zero-count contradicts those rows, so stitching "matched=SUCCESS
-            # + absent=NO_RESULT" together would have no evidentiary basis.
-            # Fail closed before any DB read or remote call; the operator must
-            # re-export or resolve the batch manually instead.
-            if classification.exact_matches:
+            # already contains task-owned non-absence evidence for this task —
+            # exact result rows, or ambiguous identities whose exported rows
+            # cannot be attributed to exactly one durable request group — a
+            # live global zero-count contradicts that evidence, so stitching
+            # "matched=SUCCESS / ambiguous=MANUAL + absent=NO_RESULT" together
+            # would have no evidentiary basis.  Fail closed before any DB read
+            # or remote call; the operator must re-export or resolve the batch
+            # manually instead.
+            if classification.exact_matches or classification.ambiguous:
                 raise RecoveryRejected(
-                    "partial export contains exact result rows; global zero-result "
-                    "evidence cannot prove per-identity absence"
+                    "partial export contains task-owned result evidence "
+                    "(exact or ambiguous); global zero-result evidence cannot "
+                    "prove per-identity absence"
                 )
             no_result_before = len(store.list_crawl_work(token, states={"NO_RESULT"}))
             if (

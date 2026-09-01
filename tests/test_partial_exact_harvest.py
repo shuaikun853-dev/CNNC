@@ -873,6 +873,120 @@ def test_partial_exact_harvest_mixed_with_absent_already_terminal_reruns_idempot
     assert store.get_remote_job(job_id)["state"] == "COMPLETED"
 
 
+def test_partial_exact_harvest_ambiguous_conflict_rows_and_absent_rejects_before_probe_or_writes(
+    tmp_path,
+):
+    """C1: ambiguous business-field conflict + pending absent rejects fully.
+
+    One task-owned row whose exported code points at request A while its URL
+    points at request B is non-absence evidence for both identities (the
+    classifier marks A and B ambiguous), so a live global zero-export-count
+    still cannot donate per-identity absence proof to the remaining pending
+    identity C. The contradictory-evidence gate must fail closed on the
+    ambiguous evidence too, before any probe or durable write.
+    """
+    requests = _requests(3)
+    rows = [("sku-0", "sku-0", requests[1].url, 10)]
+    probe_calls: list[tuple[str, str, float]] = []
+    store, adapter, job_id, identity, state_path = _seed_partial_job(
+        tmp_path, requests, rows, export_probe=_make_export_probe(calls=probe_calls)
+    )
+
+    with pytest.raises(
+        recovery.RecoveryRejected, match="cannot prove per-identity absence"
+    ):
+        _run(state_path, adapter, job_id, identity)
+
+    assert probe_calls == []
+    assert {crawl["state"] for crawl in store.crawl_work_for_job(job_id)} == {"PENDING"}
+    assert store.get_remote_job(job_id)["state"] == "MANUAL_REQUIRED"
+
+
+def test_partial_exact_harvest_ambiguous_url_multimatch_and_absent_rejects_before_probe_or_writes(
+    tmp_path,
+):
+    """C2: one exported URL hitting several request groups + absent rejects fully.
+
+    The row's code column matches no durable request and its URL matches the
+    shared URL of requests A and B, so the classifier marks A and B ambiguous
+    while C stays exact_absent and pending. That ambiguous task-owned evidence
+    again forbids the GLOBAL_EXPORT_ZERO probe from writing an irreversible
+    NO_RESULT for C: reject before any probe or durable write.
+    """
+    shared_url = "https://shop.example/shared"
+    requests = (
+        CrawlRequest("mall", "source", "Mall", "sku-0", shared_url, "legacy-v1"),
+        CrawlRequest("mall", "source", "Mall", "sku-1", shared_url, "legacy-v1"),
+        CrawlRequest("mall", "source", "Mall", "sku-2", "https://shop.example/2", "legacy-v1"),
+    )
+    rows = [("zzz-unknown", "zzz-unknown", shared_url, 10)]
+    probe_calls: list[tuple[str, str, float]] = []
+    store, adapter, job_id, identity, state_path = _seed_partial_job(
+        tmp_path, requests, rows, export_probe=_make_export_probe(calls=probe_calls)
+    )
+
+    with pytest.raises(
+        recovery.RecoveryRejected, match="cannot prove per-identity absence"
+    ):
+        _run(state_path, adapter, job_id, identity)
+
+    assert probe_calls == []
+    assert {crawl["state"] for crawl in store.crawl_work_for_job(job_id)} == {"PENDING"}
+    assert store.get_remote_job(job_id)["state"] == "MANUAL_REQUIRED"
+
+
+def test_partial_exact_harvest_ambiguous_with_absent_already_terminal_reruns_idempotently(
+    tmp_path,
+):
+    """C4: ambiguous workbook whose absent identity already holds terminal NO_RESULT.
+
+    The contradictory-evidence gate only fires while an absent identity is
+    still pending.  Once C carries durable NO_RESULT evidence from an earlier
+    proven pass, no GLOBAL_EXPORT_ZERO stitch is at stake: the rerun must not
+    raise, must not probe, must keep C terminal, and must route the
+    conflicting ambiguous identities A/B through the existing manual write
+    loop instead of the absent gate.
+    """
+    requests = _requests(3)
+    rows = [("sku-0", "sku-0", requests[1].url, 10)]
+    probe_calls: list[tuple[str, str, float]] = []
+    store, adapter, job_id, identity, state_path = _seed_partial_job(
+        tmp_path, requests, rows, export_probe=_make_export_probe(calls=probe_calls)
+    )
+    absent_crawl = next(
+        crawl for crawl in store.crawl_work_for_job(job_id) if crawl["sku_id"] == "sku-2"
+    )
+    job = store.get_remote_job(job_id)
+    lease = store.acquire_lease(BUSINESS_DATE, "seed-absent-terminal", 60)
+    try:
+        store.complete_partial_exact_no_result(
+            lease,
+            int(absent_crawl["id"]),
+            remote_job_id=job_id,
+            remote_identity=identity,
+            result_path=str(job["result_path"]),
+            reason=EXPORT_NO_PRICE_CRAWL_REASON,
+        )
+    finally:
+        store.release_lease(lease)
+
+    result = _run(state_path, adapter, job_id, identity)
+
+    assert probe_calls == []
+    assert result["outcome"] == "PARTIAL_EXACT_HARVEST_MANUAL"
+    assert result["crawl_success"] == 0
+    assert result["crawl_no_result"] == 1
+    assert result["crawl_manual"] == 2
+    assert result["written_manual"] == 2
+    assert result["skipped_terminal"] == 1
+    assert result["remote_state"] == "MANUAL_REQUIRED"
+    crawls = {crawl["sku_id"]: crawl for crawl in store.crawl_work_for_job(job_id)}
+    assert crawls["sku-0"]["state"] == "MANUAL_REQUIRED"
+    assert crawls["sku-1"]["state"] == "MANUAL_REQUIRED"
+    assert crawls["sku-2"]["state"] == "NO_RESULT"
+    assert store.get_remote_job(job_id)["state"] == "MANUAL_REQUIRED"
+
+
 def test_partial_exact_absence_rejects_before_probe_when_no_result_limit_exceeded(tmp_path):
     """LIMIT: no_result_before + pending absent > 10 rejects before any probe call."""
     requests = _requests(11)
