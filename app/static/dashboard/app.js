@@ -706,6 +706,9 @@
         navigator.clipboard.writeText(text).catch(() => {});   // 复制失败静默
       }
     });
+
+    const cnncLoginBtn = $("#cnnc-auth-login");
+    if (cnncLoginBtn) cnncLoginBtn.addEventListener("click", cnncAuthLogin);
   }
   function renderTech(status) {
     $("#tech pre").textContent = JSON.stringify(status, null, 2);
@@ -949,10 +952,81 @@
       .map((k) => (SF_STAGE_LABELS[k] || k) + " " + merged[k]);
   }
 
+  // ---- CNNC 认证状态(只读 30s 轮询;login_required 时显示受控重新登录按钮) ----
+  const CNNC_POLL_INTERVAL_MS = 30000;
+  const CNNC_STATUS_LABELS = {
+    CNNC_AUTH_OK: "正常",
+    CNNC_AUTH_REFRESHED: "正常（已自动续签）",
+    SSO_LOGIN_REQUIRED: "⚠ 中核 SSO 已失效，需要重新登录",
+    CNNC_AUTH_REFRESH_IN_PROGRESS: "正在续签",
+  };
+  function cnncStatusText(p) {
+    return CNNC_STATUS_LABELS[p.status] || ("异常：" + p.status);
+  }
+  function renderCnncAuth(p) {
+    const chips = $("#cnnc-auth-chips");
+    if (!chips) return;
+    const parts = ["状态 " + cnncStatusText(p)];
+    const refreshedAt = new Date(p.last_refresh_at || "").getTime();
+    if (!Number.isNaN(refreshedAt) && p.last_refresh_at) {
+      parts.push("最后刷新 " + fmtAgoAt(p.last_refresh_at, Date.now()));
+    }
+    chips.textContent = parts.join(" · ");
+    const meta = $("#cnnc-auth-meta");
+    if (meta) meta.textContent = p.last_error ? "最近错误：" + p.last_error : "";
+    const btn = $("#cnnc-auth-login");
+    if (btn) btn.style.display = p.login_required ? "" : "none";
+  }
+  let cnncInFlight = false;
+  async function fetchCnncAuth() {
+    if (cnncInFlight) return;
+    cnncInFlight = true;
+    try {
+      const res = await fetch("/dashboard/api/cnnc-auth/status");
+      if (!res.ok) throw new Error("HTTP " + res.status);
+      renderCnncAuth(await res.json());
+    } catch (e) {
+      const chips = $("#cnnc-auth-chips");
+      if (chips) chips.textContent = "状态 — · CNNC 认证状态读取失败，稍后自动重试";
+    } finally {
+      cnncInFlight = false;
+    }
+  }
+  async function cnncAuthLogin() {
+    const btn = $("#cnnc-auth-login");
+    const notice = $("#cnnc-auth-notice");
+    if (!btn || btn.disabled) return;
+    const client = getActionClient();
+    if (!client) { if (notice) notice.textContent = "操作台不可用，无法发起重新登录。"; return; }
+    setBtnLoading(btn, true, "正在启动登录浏览器…");
+    if (notice) notice.textContent = "";
+    try {
+      const res = await client.refresh("/dashboard/api/cnnc-auth/login", {});
+      if (res.error) {
+        if (notice) notice.textContent = res.error.status === 429
+          ? "登录浏览器已在启动中（60 秒内），请稍候。"
+          : "登录请求失败：" + (res.error.code || "HTTP " + res.error.status);
+        return;
+      }
+      if (notice) notice.textContent = (res && res.note) || "登录浏览器已启动，完成滑块/短信后系统自动恢复。";
+    } catch (e) {
+      if (notice) notice.textContent = "登录请求失败，请稍后重试。";
+    } finally {
+      setBtnLoading(btn, false, null, "重新登录");
+    }
+  }
+  const cnncPoller = createSaasFlowPoller({
+    poll: fetchCnncAuth,
+    visible: () => document.visibilityState === "visible",
+    setTimeout: (fn, ms) => setTimeout(fn, ms),
+    clearTimeout: (t) => clearTimeout(t),
+    intervalMs: CNNC_POLL_INTERVAL_MS,
+  });
+
   function start() {
     document.addEventListener("visibilitychange", () => {
-      if (document.visibilityState === "visible") { ctl.onVisible(); sfPoller.onVisible(); }
-      else { ctl.onHidden(); sfPoller.onHidden(); }
+      if (document.visibilityState === "visible") { ctl.onVisible(); sfPoller.onVisible(); cnncPoller.onVisible(); }
+      else { ctl.onHidden(); sfPoller.onHidden(); cnncPoller.onHidden(); }
     });
     $("#refresh").addEventListener("click", () => ctl.run());
     $("#jobs-toggle").addEventListener("click", () => {
@@ -966,11 +1040,12 @@
     setInterval(updateLive, 1000);
     ctl.run();
     sfPoller.run();  // SaaS Flow 独立启动,不等 summary
+    cnncPoller.run();  // CNNC 认证状态独立启动(30s 只读轮询)
   }
-  const api = { start, stop: () => { ctl.stop(); sfPoller.stop(); },
+  const api = { start, stop: () => { ctl.stop(); sfPoller.stop(); cnncPoller.stop(); },
     createPollController, createSaasFlowPoller, safeProgressText, sfPartialNotice,
     sfTreeHtml, sfGrowthText, jobProgressCell, progressDetail, outputDisplayName,
-    createActionClient, actionOutcomeText };
+    createActionClient, actionOutcomeText, cnncStatusText };
   if (typeof window !== "undefined") { window.Dashboards = api; }
   if (typeof module !== "undefined" && module.exports) { module.exports = api; }
   if (typeof document !== "undefined") { document.addEventListener("DOMContentLoaded", start); }

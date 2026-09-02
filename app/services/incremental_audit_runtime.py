@@ -104,7 +104,8 @@ from app.workflows.incremental_price_audit_finalize import (
     materialize_forced_frozen_daily_run,
 )
 from scripts.audit_saas_excel_file import call_detail_api
-from scripts.auth_manager import AuthManager
+from scripts.auth_manager import AuthManager, _payload_is_auth_failure
+from scripts.cnnc_auth_core import AT_COOKIE_RE, CnncAuthProvider
 from scripts.curl_utils import load_curl_command
 from app.services.title_match_model_adapter import (
     TITLE_MATCH_PROMPT_VERSION,
@@ -142,6 +143,32 @@ _MODEL_RUNTIME_TUNING_KEYS = (
 _BATCH_STATE_START = "<!-- incremental-runtime-state:start -->"
 _BATCH_STATE_END = "<!-- incremental-runtime-state:end -->"
 FINALIZE_MATERIALIZE_RESERVE_SECONDS = 60.0
+
+# CNNC 认证 provider 进程级单例（懒加载）。生产安静运行：logger=None。
+_cnnc_provider_singleton: CnncAuthProvider | None = None
+
+
+def shared_cnnc_provider() -> CnncAuthProvider:
+    global _cnnc_provider_singleton
+    if _cnnc_provider_singleton is None:
+        _cnnc_provider_singleton = CnncAuthProvider(logger=None)
+    return _cnnc_provider_singleton
+
+
+def _apply_cnnc_at(config: dict[str, Any], at: str) -> None:
+    """把当前 AT 注入 detail 请求配置：headers 的 access-token 项 + cookie 的 token=AT-...。
+
+    config 是模板的浅拷贝；headers 必须重建列表，避免污染共享模板。
+    """
+    headers = config.get("headers")
+    if isinstance(headers, list):
+        config["headers"] = [
+            (name, at) if str(name).lower() == "access-token" else (name, value)
+            for name, value in headers
+        ]
+    cookie = str(config.get("cookie") or "")
+    if cookie:
+        config["cookie"] = AT_COOKIE_RE.sub(f"token={at}", cookie)
 
 
 class RuntimeConfigurationError(RuntimeError):
@@ -953,6 +980,12 @@ def snapshot_discoverer(
     def discover(timeout_seconds: float) -> DiscoveredState:
         if timeout_seconds <= 0:
             raise RuntimeConfigurationError("snapshot discovery has no remaining tick budget")
+        provider = getattr(adapter, "cnnc_provider", None)
+        if provider is not None:
+            try:
+                provider.preflight_check()
+            except Exception:
+                pass  # preflight 失败不阻塞发现；lazy 刷新路径兜底
         snapshot = adapter.fetch(source_label="incremental-runtime", max_elapsed_seconds=timeout_seconds)
         customer = _customer_index(snapshot.customer_rows)
         saas_rows = [normalize_saas_pending_row(dict(row)) for row in snapshot.saas_rows]
@@ -996,6 +1029,7 @@ def _detail_worker(
     sleep: Callable[[float], None] = time_module.sleep,
     monotonic: Callable[[], float] = time_module.monotonic,
     lock_factory: Callable[[Path | str], ProcessLock] = ProcessLock,
+    cnnc_provider: Any | None = None,
 ) -> Callable[[Mapping[str, Any], float], Mapping[str, Any]]:
     from app.services.saas_audit_core import extract_customer_price_from_detail
 
@@ -1043,12 +1077,35 @@ def _detail_worker(
             remaining = timeout_seconds - (monotonic() - started)
             if remaining <= 0:
                 raise TimeoutError("Detail deadline exhausted before request")
+            config = dict(template)
+            current_at: str | None = None
+            if cnnc_provider is not None:
+                current_at = cnnc_provider.get_access_token()
+                _apply_cnnc_at(config, current_at)
             response = call_detail_api(
-                dict(template),
+                config,
                 document_id,
                 category_id,
                 timeout=max(0.001, remaining),
             )
+            if (
+                cnnc_provider is not None
+                and response.get("ok")
+                and isinstance(response.get("payload"), dict)
+                and _payload_is_auth_failure(response["payload"])
+            ):
+                # AT 被拒：刷新一次并重发（第二次结果为准）。refresh 受 SSO
+                # 冷却断路器约束，其 CnncAuthError 是 RuntimeError 子类，直接上抛。
+                current_at = cnnc_provider.refresh(stale_access_token=current_at)
+                config = dict(template)
+                _apply_cnnc_at(config, current_at)
+                remaining = timeout_seconds - (monotonic() - started)
+                response = call_detail_api(
+                    config,
+                    document_id,
+                    category_id,
+                    timeout=max(0.001, remaining),
+                )
         finally:
             if detail_lock is not None:
                 detail_lock.release()
@@ -1057,7 +1114,21 @@ def _detail_worker(
             sleep(request_interval_seconds)
         if not response.get("ok"):
             raise RuntimeError("detail request failed")
-        return extract_customer_price_from_detail(response.get("payload"))
+        payload = response.get("payload")
+        if (
+            cnnc_provider is not None
+            and isinstance(payload, dict)
+            and _payload_is_auth_failure(payload)
+        ):
+            try:
+                auth_status = str(
+                    (cnnc_provider.get_status() or {}).get("status") or ""
+                )
+            except Exception:
+                auth_status = ""  # duck-typed provider 无 get_status 时不掩盖原错误
+            suffix = f"（认证状态: {auth_status}）" if auth_status else ""
+            raise RuntimeError(f"CNNC 认证失败：刷新重试后仍被拒{suffix}")
+        return extract_customer_price_from_detail(payload)
 
     return detail
 
@@ -1774,6 +1845,7 @@ def build_default_dependencies(
         PROJECT_DATA_ROOT / "latest_saas_sameAudit_queryAll.curl",
         PROJECT_DATA_ROOT / "latest_cnnc_query.curl",
         auth_manager=AuthManager(),
+        cnnc_provider=shared_cnnc_provider(),
     )
     detail_template = load_curl_command(PROJECT_DATA_ROOT / "detail_request.curl")
     if zhaoshang_backend not in {"legacy", "batch"}:
@@ -1786,7 +1858,11 @@ def build_default_dependencies(
         resolver = lambda row: legacy_adapter.request_from_saas_row(row, backend_version=backend_version)
     dependencies = TickDependencies(
         discover=snapshot_discoverer(snapshot_adapter, crawl_request_resolver=resolver),
-        detail=_detail_worker(detail_template, detail_lock_path=paths.detail_lock_path if paths is not None else None),
+        detail=_detail_worker(
+            detail_template,
+            detail_lock_path=paths.detail_lock_path if paths is not None else None,
+            cnnc_provider=shared_cnnc_provider(),
+        ),
         model=_model_worker,
         model_batch=_model_batch_worker,
     )

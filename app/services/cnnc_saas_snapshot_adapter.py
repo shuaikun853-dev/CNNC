@@ -1,5 +1,8 @@
 """Read-only authoritative SaaS and CNNC snapshot discovery for incremental audit ticks."""
 
+# customer 侧认证由 CnncAuthProvider 动态注入（access-token 头 + cookie token=AT-...）；
+# customer cURL 模板仅提供 URL/body/K5 头模板，不作为凭证来源。
+
 from __future__ import annotations
 
 import json
@@ -117,6 +120,7 @@ class CnncSaasSnapshotAdapter:
         *,
         policy: SnapshotFetchPolicy | None = None,
         auth_manager: AuthManager | None = None,
+        cnnc_provider: Any | None = None,
         opener: Any | None = None,
         monotonic: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], None] = time.sleep,
@@ -125,6 +129,7 @@ class CnncSaasSnapshotAdapter:
         self._customer_config = self._load_config(customer_curl)
         self.policy = policy or SnapshotFetchPolicy()
         self.auth_manager = auth_manager
+        self.cnnc_provider = cnnc_provider
         self._opener = opener or internal_direct_opener()
         self._monotonic = monotonic
         self._sleep = sleep
@@ -282,6 +287,15 @@ class CnncSaasSnapshotAdapter:
                 if side == "saas" and self.auth_manager is not None:
                     response_payload = self.auth_manager.request_json(
                         "saas",
+                        factory,
+                        read_only=True,
+                        opener=self._opener,
+                        timeout=timeout,
+                    )
+                elif side == "customer" and self.cnnc_provider is not None:
+                    # CnncAuthProvider 自带一次「刷新 + 重试」；其 CnncAuthError
+                    # 不属于可重试异常，会直接向上传播（认证失败即 fail-fast）。
+                    response_payload = self.cnnc_provider.request_json_cnnc(
                         factory,
                         read_only=True,
                         opener=self._opener,

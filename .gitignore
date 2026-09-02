@@ -28,6 +28,11 @@ data/*.txt
 data/**/*.txt
 data/auth_state.json
 data/.auth_state.json.*.lock
+
+# CNNC auth auto-renew runtime artifacts
+data/cnnc_auth_profile/
+data/cnnc_auth_ledger.jsonl
+data/.cnnc_auth_state.json.refresh.lock*
 runtime/
 runtimepytest*/
 outputs/

@@ -6,9 +6,13 @@ _guard_operator_action(Host/Origin/X-Dashboard-Action-Token),绝无轮询触写�
 """
 from __future__ import annotations
 
+import os
 import re
 import secrets
 import sqlite3
+import subprocess
+import sys
+import time
 from datetime import date
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -29,6 +33,7 @@ from app.services.saas_flow_diagnostic import get_saas_flow_diagnostic
 
 router = APIRouter(prefix="/dashboard", tags=["step1-dashboard"])
 _STATIC_DIR = Path(__file__).resolve().parent / "static" / "dashboard"
+_ROOT_DIR = Path(__file__).resolve().parents[1]
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 # saas-flow 只接受 date(YYYY-MM-DD)与 refresh=1(缓存行为标志);
 # tenant/pool/schema/table/sql 等任何 SQL 或 scope 可控参数一律 400。
@@ -346,6 +351,59 @@ def dashboard_job_refresh_progress(
     job = _validated_job_for_action(job_id, business_date, None)
     status = refresh_job_progress(runtime_paths(business_date).state_path, job)
     return JSONResponse(status, headers=_NO_STORE)
+
+
+# ======================================================================
+# CNNC 认证:只读状态 + 受控本地登录浏览器启动
+# ======================================================================
+
+_CNNC_LOGIN_THROTTLE_SECONDS = 60.0
+# 进程内单例节流:60 秒内只允许启动一次登录浏览器(monotonic 时间戳)。
+_cnnc_login_launched_at: float | None = None
+
+
+@router.get("/api/cnnc-auth/status")
+def dashboard_cnnc_auth_status() -> JSONResponse:
+    """CNNC 认证只读状态;get_status 纯本地读(state/cURL 文件),无网络副作用。"""
+    from scripts.cnnc_auth_core import CnncAuthProvider
+    try:
+        payload = CnncAuthProvider().get_status()
+    except Exception as exc:  # 读取失败只降级本面板,不暴露堆栈
+        raise HTTPException(status_code=503, detail={
+            "error_code": "CNNC_AUTH_STATUS_READ_FAILED",
+            "message": "CNNC 认证状态读取失败,请稍后重试",
+            "type": type(exc).__name__}) from exc
+    return JSONResponse(payload, headers=_NO_STORE)
+
+
+@router.post("/api/cnnc-auth/login")
+def dashboard_cnnc_auth_login(request: Request) -> JSONResponse:
+    """启动本地 CNNC SSO 登录浏览器(detached 子进程;不占 action 槽、不阻塞)。"""
+    _guard_operator_action(request, "cnnc-auth-login")
+    global _cnnc_login_launched_at
+    now = time.monotonic()
+    if _cnnc_login_launched_at is not None and \
+            now - _cnnc_login_launched_at < _CNNC_LOGIN_THROTTLE_SECONDS:
+        return JSONResponse(
+            {"error": "登录浏览器已在启动中（60 秒内）"}, status_code=429,
+            headers=_NO_STORE)
+    popen_kwargs: dict = {}
+    if os.name == "nt":  # Windows:脱离本服务进程,不随 dashboard 重启被杀
+        popen_kwargs["creationflags"] = (
+            subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP)
+    try:
+        subprocess.Popen(
+            [sys.executable, str(_ROOT_DIR / "scripts" / "cnnc_auth_browser.py"), "login"],
+            cwd=str(_ROOT_DIR), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            **popen_kwargs)
+    except OSError as exc:  # FileNotFoundError 等:简讯返回,不暴露堆栈
+        raise HTTPException(status_code=500, detail={
+            "error_code": "CNNC_LOGIN_LAUNCH_FAILED",
+            "message": "登录浏览器启动失败,请稍后重试"}) from exc
+    _cnnc_login_launched_at = now
+    return JSONResponse(
+        {"started": True, "note": "登录浏览器已启动，完成滑块/短信后系统自动恢复"},
+        status_code=202, headers=_NO_STORE)
 
 
 @router.get("/api/actions")

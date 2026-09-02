@@ -113,7 +113,7 @@ def test_project_resources_and_default_runtime_root_do_not_depend_on_cwd(
     captured = {}
 
     class SnapshotAdapterSpy:
-        def __init__(self, saas_path, cnnc_path, *, auth_manager):
+        def __init__(self, saas_path, cnnc_path, *, auth_manager, cnnc_provider=None):
             captured["saas"] = Path(saas_path)
             captured["cnnc"] = Path(cnnc_path)
 

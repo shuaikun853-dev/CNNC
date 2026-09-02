@@ -71,6 +71,22 @@
   </details>
 </section>
 
+<!-- CNNC 认证状态(只读轮询;SSO 失效时提供受控重新登录入口) -->
+<section class="card">
+  <details class="saasflow" id="cnnc-auth">
+    <summary style="cursor:pointer">
+      <span class="lab">CNNC 认证</span>
+      <span class="sf-chips" id="cnnc-auth-chips">状态 — · 检测中…</span>
+      <span class="sf-hint">点击展开详情</span>
+    </summary>
+    <div class="sf-body">
+      <div class="sf-notice" id="cnnc-auth-notice"></div>
+      <div class="sf-actions"><button class="btn" id="cnnc-auth-login" style="display:none">重新登录</button>
+        <span class="sf-meta" id="cnnc-auth-meta"></span></div>
+    </div>
+  </details>
+</section>
+
 <!-- 二级详情(默认收起):任务全表 + 抽屉 + 技术详情 -->
 <div class="more-block" id="more">
   <section class="card">
