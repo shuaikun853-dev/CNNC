@@ -262,3 +262,182 @@ def test_operator_console_static_contract(client):
     assert "X-Dashboard-Action-Token" in js
     # 不得使用浏览器原生 confirm/alert 做二次确认/提示
     assert "window.confirm" not in js and "window.alert" not in js
+
+
+# ---- Dashboard Auth/Timezone/Closeout 修复(2026-09-02):G1-G5 ----
+
+def test_dashboard_index_cache_busting(client):
+    r = client.get("/dashboard")
+    assert r.status_code == 200
+    assert r.headers["Cache-Control"] == "no-cache"
+    import re
+    html = r.text
+    assert re.search(r"/dashboard/static/app\.js\?v=\d+", html)
+    assert re.search(r"/dashboard/static/app\.css\?v=\d+", html)
+    assert html.count("?v=") == 2
+    disk = (ROOT / "app" / "static" / "dashboard" / "index.html").read_text(encoding="utf-8")
+    assert "?v=" not in disk
+    for name in ("app.js", "app.css"):
+        assert client.get(f"/dashboard/static/{name}").status_code == 200
+    assert "cdn" not in html.lower()
+    assert 'src="/dashboard/static/app.js?v=' in html
+    assert 'href="/dashboard/static/app.css?v=' in html
+
+
+def test_dashboard_index_version_tracks_mtime(monkeypatch):
+    """真实行为断言:版本源变化 → 注入 URL 变化(monkeypatch _asset_version)。"""
+    import re
+
+    from app import dashboard_api
+
+    versions = iter(["1000000000001", "2000000000002"])
+
+    def fake_version(path):
+        if path.name == "app.js":
+            return next(versions)
+        return str(path.stat().st_mtime_ns)
+
+    monkeypatch.setattr(dashboard_api, "_asset_version", fake_version)
+    html1 = dashboard_api._dashboard_index_html()
+    html2 = dashboard_api._dashboard_index_html()
+    v1 = re.search(r"/dashboard/static/app\.js\?v=(\d+)", html1).group(1)
+    v2 = re.search(r"/dashboard/static/app\.js\?v=(\d+)", html2).group(1)
+    assert v1 == "1000000000001" and v2 == "2000000000002" and v1 != v2
+
+
+def test_actions_running_entries_carry_business_date(client, monkeypatch):
+    """/api/actions 的 running 条目必须带 business_date(前端 closeoutRunning
+    权威判定的首选匹配字段;ActionHandle 本就有该字段,纯 additive)。"""
+    from app import dashboard_api
+
+    class _Handle:
+        action_id = "a-1"
+        action_type = "closeout"
+        status = "RUNNING"
+        target = "2026-09-02:-"
+        started_at = "2026-09-02T10:00:00+00:00"
+        business_date = "2026-09-02"
+
+    class _Runner:
+        def list_recent(self, limit):
+            return [_Handle()]
+
+        def get(self, action_id):
+            return None
+
+        def durable_status(self, action_id, run_dir):
+            return None
+
+    monkeypatch.setattr(dashboard_api, "get_action_runner", lambda: _Runner())
+    r = client.get("/dashboard/api/actions")
+    assert r.status_code == 200
+    running = r.json()["running"]
+    assert running, "构造的 RUNNING closeout 必须出现在 running 列表"
+    assert running[0]["business_date"] == "2026-09-02"
+    assert running[0]["target"] == "2026-09-02:-"
+    assert running[0]["action_type"] == "closeout" and running[0]["status"] == "RUNNING"
+
+
+def _stages_status_fixture(*, frozen: bool = False, finalized: bool = False,
+                           writer_active: bool = False) -> dict:
+    """_stages 所需的最小 status mapping(字段名对齐 incremental_audit_status
+    的 _empty_status 真实形状,只保留 _stages 访问的键)。"""
+    return {
+        "counts": {"discovered": 0, "unique_items": 0, "new": 0, "changed": 0},
+        "detail": {"pending": 0, "running": 0, "completed": 0, "terminal": 0},
+        "model": {"pending": 0, "running": 0, "completed": 0, "terminal": 0},
+        "crawl": {"pending": 0, "running": 0, "completed": 0, "no_result": 0,
+                  "unplanned": 0, "planning_pending": 0, "unknown": 0, "manual": 0,
+                  "waiting_submit": 0},
+        "remote": {"intent": 0, "pending": 0, "running": 0, "exported": 0,
+                   "completed": 0, "unknown": 0, "manual": 0,
+                   "awaiting_priority": 0, "awaiting_harvest": 0,
+                   "recovery_exhausted": 0, "superseded": 0},
+        "remote_health": {},
+        "final": {"frozen": frozen, "finalized": finalized, "forced": False,
+                  "output_path": None},
+        "production_writer": {"active": writer_active},
+    }
+
+
+def _closeout_stage(stages):
+    return next(s for s in stages if s["key"] == "closeout")
+
+
+def test_projection_closeout_writer_active_unfrozen_shows_running():
+    """Bug3 核心:人工 closeout RUNNING(writer 锁真实持有)而 frozen=false
+    不得再显示"○ 等待",必须显示"● 进行中/收口任务已启动,正在准备"。"""
+    from app.services.dashboard_projection import _stages
+    stage = _closeout_stage(_stages(
+        _stages_status_fixture(writer_active=True, frozen=False, finalized=False), False))
+    assert stage["state"] == "cur"
+    assert stage["state_word"] == "● 进行中"
+    assert stage["sub"] == [("数据冻结", "收口任务已启动，正在准备")]
+
+
+def test_projection_closeout_writer_active_frozen():
+    from app.services.dashboard_projection import _stages
+    stage = _closeout_stage(_stages(
+        _stages_status_fixture(writer_active=True, frozen=True, finalized=False), False))
+    assert stage["state"] == "cur"
+    assert stage["sub"] == [("数据冻结", "已冻结，正在收口")]
+
+
+def test_projection_closeout_frozen_without_writer():
+    from app.services.dashboard_projection import _stages
+    stage = _closeout_stage(_stages(
+        _stages_status_fixture(writer_active=False, frozen=True, finalized=False), False))
+    assert stage["state"] == "cur"
+    assert stage["state_word"] == "● 进行中"
+    assert stage["sub"] == [("数据冻结", "已冻结")]
+
+
+def test_projection_closeout_all_false_waits():
+    from app.services.dashboard_projection import _stages
+    stage = _closeout_stage(_stages(
+        _stages_status_fixture(writer_active=False, frozen=False, finalized=False), False))
+    assert stage["state"] == "wait"
+    assert stage["state_word"] == "○ 等待"
+    assert stage["sub"] == [("数据冻结", "未开始(等待 18:00)")]
+
+
+def test_projection_closeout_finalized_done():
+    from app.services.dashboard_projection import _stages
+    stage = _closeout_stage(_stages(
+        _stages_status_fixture(writer_active=False, frozen=True, finalized=True), True))
+    assert stage["state"] == "done"
+    assert stage["state_word"] == "✓ 完成"
+    assert stage["sub"] == [("数据冻结", "已完成")]
+
+
+def test_projection_closeout_missing_writer_key_is_defensive():
+    """旧 payload/外部构造缺 production_writer 键时按 False 处理,绝不 KeyError。"""
+    from app.services.dashboard_projection import _stages
+    status = _stages_status_fixture(writer_active=False, frozen=False, finalized=False)
+    status.pop("production_writer")
+    stage = _closeout_stage(_stages(status, False))
+    assert stage["state"] == "wait"
+
+
+def test_fingerprint_reflects_production_writer_activity():
+    """writer_active 参与 ETag:活动状态变化必须产出新指纹(无 304 陈旧)。"""
+    from app.services.dashboard_projection import fingerprint_payload
+    base = {"status": {"production_writer": {"active": False}}, "overall": {}}
+    busy = {"status": {"production_writer": {"active": True}}, "overall": {}}
+    assert fingerprint_payload(base) != fingerprint_payload(busy)
+
+
+def test_production_writer_lock_blocks_second_process(tmp_path):
+    """DashboardActionRunner._inflight 丢失(进程重启)后,底层 per-day
+    production writer ProcessLock(OS 级 msvcrt/fcntl)仍是唯一单 writer fence。"""
+    from app.services.daily_audit_store import LeaseUnavailable, ProcessLock
+    lock_path = tmp_path / "production.lock"
+    first = ProcessLock(lock_path).acquire(owner={"pid": 111})
+    try:
+        with pytest.raises(LeaseUnavailable):
+            ProcessLock(lock_path).acquire(owner={"pid": 222})
+    finally:
+        first.release()
+    # 释放后可重新获取
+    second = ProcessLock(lock_path).acquire(owner={"pid": 333})
+    second.release()

@@ -9,15 +9,24 @@
 // 覆盖 SaaS Flow Diagnostic Review Fix Round 1:
 //   P1-4  SaaS Flow 独立轮询生命周期:summary 连续 304 仍按 ~60s 周期刷新;
 //         hidden 停止、visible 立即补刷;与 summary ETag/304 生命周期解耦。
+// 覆盖 Dashboard Auth/Timezone/Closeout 修复(2026-09-02):
+//   TZ    fmtShanghaiDateTime 按 Asia/Shanghai 展示 UTC ISO(不做 +8 算术);
+//   CNNC  fetch 8s 超时(AbortController)→ 失败文案 → inFlight 释放 →
+//         poller 继续排程 → 下次恢复;在途去重无双链;poller 兜底 catch 防断链;
+//   CACHE index.html 磁盘契约(不手写 ?v=,版本由服务端 mtime 注入);
+//   CLOSE closeoutRunning 统一权威:applyCloseoutRunningOverlay /
+//         computeCloseoutBackendRunning / 收口按钮两态幂等 / summary 重刷不覆盖。
 // 被测对象:app/static/dashboard/app.js 暴露的 createPollController /
-// createSaasFlowPoller / safeProgressText。
+// createSaasFlowPoller / safeProgressText / fmtShanghaiDateTime /
+// createCnncAuthFetcher / computeCloseoutBackendRunning / applyCloseoutRunningOverlay。
 const path = require("path");
 
 // R2 Case 22:renderCnncAuth 前端测试需要的最小 document stub,必须在 require
 // app.js 之前设置。按选择器缓存同一假元素(测试要断言 renderCnncAuth 写入的
 // display),未知选择器返回 null;其他测试不用 document,不受影响。
+// 2026-09-02:#closeout-btn 返回可变按钮对象(updateCloseoutUI 两态断言)。
 const cnncFakeElements = new Map();
-const cnncKnownSelectors = new Set(["#cnnc-auth-chips", "#cnnc-auth-meta", "#cnnc-auth-login"]);
+const cnncKnownSelectors = new Set(["#cnnc-auth-chips", "#cnnc-auth-meta", "#cnnc-auth-login", "#closeout-btn"]);
 global.document = {
   addEventListener() {},
   querySelector(sel) {
@@ -25,7 +34,9 @@ global.document = {
     if (!cnncFakeElements.has(sel)) {
       cnncFakeElements.set(sel, sel === "#cnnc-auth-login"
         ? { style: { display: "none" } }
-        : { textContent: "" });
+        : sel === "#closeout-btn"
+          ? { textContent: "立即收口", disabled: false, dataset: {} }
+          : { textContent: "" });
     }
     return cnncFakeElements.get(sel);
   },
@@ -33,7 +44,9 @@ global.document = {
 
 const { createPollController, createSaasFlowPoller, safeProgressText, sfPartialNotice,
         sfTreeHtml, sfGrowthText, jobProgressCell, progressDetail, outputDisplayName,
-        createActionClient, actionOutcomeText, renderCnncAuth } = require(
+        createActionClient, actionOutcomeText, renderCnncAuth,
+        fmtShanghaiDateTime, createCnncAuthFetcher, computeCloseoutBackendRunning,
+        applyCloseoutRunningOverlay, updateCloseoutUI, _setCloseoutRunningForTest } = require(
   path.join(__dirname, "..", "..", "app", "static", "dashboard", "app.js"));
 
 let failed = 0;
@@ -610,6 +623,305 @@ function test_r2_case22_login_required_covers_recovery_failure() {
   }
 }
 
+// ---- Dashboard Auth/Timezone/Closeout 修复(2026-09-02):F1-F9 ----
+
+// F1:UTC/任意 offset ISO → 上海时区 "YYYY-MM-DD HH:mm:ss"(纯函数,无 +8 算术)
+function test_fmt_shanghai_datetime() {
+  check("TZ +00:00 → 上海 17:20:22",
+        fmtShanghaiDateTime("2026-09-02T09:20:22+00:00") === "2026-09-02 17:20:22",
+        fmtShanghaiDateTime("2026-09-02T09:20:22+00:00"));
+  check("TZ Z 后缀 → 上海 17:20:22",
+        fmtShanghaiDateTime("2026-09-02T09:20:22Z") === "2026-09-02 17:20:22",
+        fmtShanghaiDateTime("2026-09-02T09:20:22Z"));
+  check("TZ +08:00 原值即上海 → 17:20:22",
+        fmtShanghaiDateTime("2026-09-02T17:20:22+08:00") === "2026-09-02 17:20:22",
+        fmtShanghaiDateTime("2026-09-02T17:20:22+08:00"));
+  check("TZ +05:30 非±8 offset 也按真实换算(非本地时区)",
+        fmtShanghaiDateTime("2026-09-02T14:50:22+05:30") === "2026-09-02 17:20:22",
+        fmtShanghaiDateTime("2026-09-02T14:50:22+05:30"));
+  check("TZ null/undefined/空串/坏值 → —",
+        fmtShanghaiDateTime(null) === "—" && fmtShanghaiDateTime(undefined) === "—" &&
+        fmtShanghaiDateTime("") === "—" && fmtShanghaiDateTime("not-a-date") === "—");
+}
+
+function cnncOkPayload() {
+  return { status: "CNNC_AUTH_OK", last_refresh_at: "", last_error: "", login_required: false };
+}
+
+// F2:CNNC auth 正常返回 → chips 恢复"状态 正常"
+async function test_cnnc_fetcher_ok() {
+  const chips = global.document.querySelector("#cnnc-auth-chips");
+  chips.textContent = "状态 — · 检测中…";
+  const fetcher = createCnncAuthFetcher({
+    fetchImpl: async () => ({ ok: true, json: async () => cnncOkPayload() }),
+  });
+  await fetcher.run();
+  check("CNNC 正常返回后 chips 显示 状态 正常", chips.textContent.includes("状态 正常"),
+        chips.textContent);
+  check("CNNC 正常返回后 inFlight 释放", fetcher.state.inFlight === false);
+}
+
+// F3:HTTP 500 / fetch reject → 失败文案;poller 链继续排程(不死亡)
+async function test_cnnc_fetcher_failure_keeps_chain() {
+  const chips = global.document.querySelector("#cnnc-auth-chips");
+  const clock = makeClock();
+
+  chips.textContent = "";
+  const f500 = createCnncAuthFetcher({ fetchImpl: async () => ({ ok: false, status: 500 }) });
+  await f500.run();
+  check("CNNC HTTP 500 → 失败文案", chips.textContent.includes("CNNC 认证状态读取失败"),
+        chips.textContent);
+
+  chips.textContent = "";
+  const fReject = createCnncAuthFetcher({
+    fetchImpl: async () => { throw new Error("network down"); },
+  });
+  await fReject.run();
+  check("CNNC fetch reject → 失败文案", chips.textContent.includes("CNNC 认证状态读取失败"),
+        chips.textContent);
+
+  // 失败被 fetcher 自吞 → poll reject 不外泄 → poller 必须继续排程(唯一一条链)
+  const poller = createSaasFlowPoller({
+    poll: fReject.run,
+    visible: () => true,
+    setTimeout: clock.setTimeout,
+    clearTimeout: clock.clearTimeout,
+    intervalMs: 30000,
+  });
+  poller.run();
+  await flush();
+  check("CNNC 失败 settle 后 poller 继续排程(clock.pending===1)", clock.pending() === 1,
+        String(clock.pending()));
+}
+
+// F4(关键):永久 pending fetch → 8s 超时 abort → 失败文案 + inFlight 释放 +
+// poller 继续排程;第二次 fetch 正常返回 → chips 恢复"状态 正常"(恢复闭环)
+async function test_cnnc_fetcher_timeout_recovers() {
+  const clock = makeClock();
+  const chips = global.document.querySelector("#cnnc-auth-chips");
+  let savedSignal = null;
+  let calls = 0;
+  const fetchImpl = (url, opts) => {
+    calls += 1;
+    if (calls === 1) {
+      savedSignal = opts.signal;
+      return new Promise((_, reject) => {
+        savedSignal.addEventListener("abort", () => reject(new Error("AbortError")));
+      });
+    }
+    return Promise.resolve({ ok: true, json: async () => cnncOkPayload() });
+  };
+  const fetcher = createCnncAuthFetcher({
+    fetchImpl,
+    timers: { setTimeout: clock.setTimeout, clearTimeout: clock.clearTimeout },
+    timeoutMs: 8000,
+  });
+  chips.textContent = "";
+  fetcher.run();
+  await flush();
+  check("CNNC 永久 pending:超时前 fetch 只发一次且 8s timer 在挂",
+        calls === 1 && clock.pending() === 1 && fetcher.state.inFlight === true &&
+        chips.textContent === "",
+        JSON.stringify({ calls, pending: clock.pending(), chips: chips.textContent }));
+  clock.advance(7999);
+  await flush();
+  check("CNNC 7999ms:尚未 abort、仍在途、无失败文案",
+        savedSignal.aborted === false && fetcher.state.inFlight === true &&
+        !chips.textContent.includes("读取失败"), savedSignal.aborted + "/" + chips.textContent);
+  clock.advance(1);
+  await flush();
+  check("CNNC 8000ms:abort 触发 → 失败文案 + inFlight 释放",
+        savedSignal.aborted === true && chips.textContent.includes("读取失败") &&
+        fetcher.state.inFlight === false,
+        savedSignal.aborted + "/" + chips.textContent);
+  check("CNNC 超时后独立 fetcher 不自挂 timer", clock.pending() === 0, String(clock.pending()));
+
+  const poller = createSaasFlowPoller({
+    poll: fetcher.run,
+    visible: () => true,
+    setTimeout: clock.setTimeout,
+    clearTimeout: clock.clearTimeout,
+    intervalMs: 30000,
+  });
+  poller.run();
+  await flush();
+  check("CNNC 失败后 poller 立即发起第二次 fetch 且只排一条链",
+        calls === 2 && clock.pending() === 1,
+        JSON.stringify({ calls, pending: clock.pending() }));
+  clock.advance(30000);
+  await flush();
+  check("CNNC 第二次正常返回 → chips 恢复 状态 正常(闭环)",
+        chips.textContent.includes("状态 正常"), chips.textContent);
+  check("CNNC 恢复后仍只有一条轮询链", clock.pending() === 1, String(clock.pending()));
+}
+
+// F5:在途去重无双链(poller 连续触发 + fetcher 直调 + onVisible 都不算新链)
+async function test_cnnc_fetcher_inflight_dedup() {
+  const clock = makeClock();
+  let fetchCalls = 0;
+  const gates = [];
+  const fetchImpl = () => { fetchCalls += 1; const d = deferred(); gates.push(d); return d.promise; };
+  const fetcher = createCnncAuthFetcher({
+    fetchImpl,
+    timers: { setTimeout: clock.setTimeout, clearTimeout: clock.clearTimeout },
+    timeoutMs: 600000,
+  });
+  const poller = createSaasFlowPoller({
+    poll: fetcher.run,
+    visible: () => true,
+    setTimeout: clock.setTimeout,
+    clearTimeout: clock.clearTimeout,
+    intervalMs: 30000,
+  });
+  poller.run();
+  poller.run();          // 在途时重复触发
+  fetcher.run();         // fetcher 直调(在途直接忽略)
+  poller.onVisible();    // 回前台补刷(在途忽略)
+  await flush();
+  check("CNNC 在途期间各种触发都去重:fetch 恰好 1 次", fetchCalls === 1, String(fetchCalls));
+  await gates[0].resolve({ ok: true, json: async () => cnncOkPayload() });
+  await flush();
+  check("CNNC 完成后仅排一条链", clock.pending() === 1, String(clock.pending()));
+}
+
+// F6:poller 兜底 catch——poll 直接 reject 也不断链
+async function test_sf_poller_broken_poll_still_schedules() {
+  const clock = makeClock();
+  const poller = createSaasFlowPoller({
+    poll: async () => { throw new Error("poll exploded"); },
+    visible: () => true,
+    setTimeout: clock.setTimeout,
+    clearTimeout: clock.clearTimeout,
+    intervalMs: 30000,
+  });
+  poller.run();
+  await flush();
+  check("POLLER poll reject 后仍继续排程(clock.pending===1)", clock.pending() === 1,
+        String(clock.pending()));
+}
+
+// F7:index.html 磁盘契约——不手写 ?v=(版本由服务端 mtime 注入)
+function test_index_html_disk_contract() {
+  const fs = require("fs");
+  const html = fs.readFileSync(
+    path.join(__dirname, "..", "..", "app", "static", "dashboard", "index.html"), "utf-8");
+  check("CACHE 磁盘 index.html 引用 /dashboard/static/app.js",
+        html.includes('src="/dashboard/static/app.js'), "missing src hook");
+  check("CACHE 磁盘 index.html 引用 /dashboard/static/app.css",
+        html.includes('href="/dashboard/static/app.css'), "missing href hook");
+  check("CACHE 磁盘 index.html 不得手写 ?v=", !html.includes("?v="), "found ?v= on disk");
+}
+
+// F8:Bug3/4 closeoutRunning——纯函数覆盖 + 当天 RUNNING 判定 + 按钮两态
+function closeoutStageFixture(stateWord, freezeText) {
+  return [{ key: "closeout", name: "最终收口", state: stateWord === "✓ 完成" ? "done"
+            : (stateWord === "● 进行中" ? "cur" : "wait"),
+            state_word: stateWord, num: "18:00 口径",
+            sub: [["数据冻结", freezeText]] }];
+}
+
+function test_closeout_running_seam() {
+  const wait = closeoutStageFixture("○ 等待", "未开始(等待 18:00)");
+  const frozen = closeoutStageFixture("● 进行中", "已冻结");
+  const done = closeoutStageFixture("✓ 完成", "已完成");
+
+  const overlaid = applyCloseoutRunningOverlay(wait, { closeoutRunning: true });
+  check("CLOSE wait+running → cur/● 正在收口",
+        overlaid[0].state === "cur" && overlaid[0].state_word === "● 正在收口",
+        JSON.stringify(overlaid));
+  check("CLOSE wait+running → 数据冻结=收口任务已启动，正在准备",
+        overlaid[0].sub[0][1] === "收口任务已启动，正在准备", JSON.stringify(overlaid[0].sub));
+  const json = JSON.stringify(overlaid);
+  check("CLOSE wait+running 输出绝无 ○ 等待/未开始 残留",
+        !json.includes("○ 等待") && !json.includes("未开始"), json);
+
+  const overlaidFrozen = applyCloseoutRunningOverlay(frozen, { closeoutRunning: true });
+  check("CLOSE frozen+running → 数据冻结=已冻结，正在收口",
+        overlaidFrozen[0].sub[0][1] === "已冻结，正在收口" &&
+        overlaidFrozen[0].state === "cur", JSON.stringify(overlaidFrozen));
+
+  const doneUntouched = applyCloseoutRunningOverlay(done, { closeoutRunning: true });
+  check("CLOSE finalized(done)+running 不改写",
+        doneUntouched[0].state === "done" && doneUntouched[0].state_word === "✓ 完成" &&
+        doneUntouched[0].sub[0][1] === "已完成", JSON.stringify(doneUntouched));
+
+  const notRunning = applyCloseoutRunningOverlay(wait, { closeoutRunning: false });
+  check("CLOSE running=false 原样保留(○ 等待/未开始)",
+        notRunning[0].state === "wait" && notRunning[0].sub[0][1] === "未开始(等待 18:00)",
+        JSON.stringify(notRunning));
+
+  const original = closeoutStageFixture("○ 等待", "未开始(等待 18:00)");
+  applyCloseoutRunningOverlay(original, { closeoutRunning: true });
+  check("CLOSE overlay 不 mutate 入参",
+        original[0].state === "wait" && original[0].sub[0][1] === "未开始(等待 18:00)",
+        JSON.stringify(original));
+
+  const running = [{ action_type: "closeout", status: "RUNNING",
+                     business_date: "2026-09-02", target: "2026-09-02:-" }];
+  check("CLOSE 当天 closeout RUNNING → true",
+        computeCloseoutBackendRunning(running, "2026-09-02") === true);
+  check("CLOSE 空 running 列表 → false",
+        computeCloseoutBackendRunning([], "2026-09-02") === false);
+  check("CLOSE business_date 缺失但 target 前缀匹配 → true",
+        computeCloseoutBackendRunning(
+          [{ action_type: "closeout", status: "RUNNING", target: "2026-09-02:-" }],
+          "2026-09-02") === true);
+  check("CLOSE 别的日期 → false",
+        computeCloseoutBackendRunning(running, "2026-09-01") === false);
+  check("CLOSE 非 closeout 类型 → false",
+        computeCloseoutBackendRunning(
+          [{ action_type: "re-export", status: "RUNNING", business_date: "2026-09-02",
+             target: "2026-09-02:7" }], "2026-09-02") === false);
+  check("CLOSE status 非 RUNNING → false",
+        computeCloseoutBackendRunning(
+          [{ action_type: "closeout", status: "SUCCEEDED", business_date: "2026-09-02",
+             target: "2026-09-02:-" }], "2026-09-02") === false);
+
+  // 按钮两态(updateCloseoutUI 幂等;权威状态经测试 seam 驱动,与生产同源)
+  const btn = global.document.querySelector("#closeout-btn");
+  _setCloseoutRunningForTest(false, false);
+  btn.disabled = false; btn.textContent = "立即收口";
+  updateCloseoutUI();
+  check("CLOSE 空闲态:按钮 enabled+立即收口",
+        btn.disabled === false && btn.textContent === "立即收口",
+        btn.disabled + "/" + btn.textContent);
+  _setCloseoutRunningForTest(true, false);
+  updateCloseoutUI();
+  check("CLOSE 本页在途:按钮 disabled+收口中…",
+        btn.disabled === true && btn.textContent === "收口中…",
+        btn.disabled + "/" + btn.textContent);
+  _setCloseoutRunningForTest(true, true);
+  updateCloseoutUI();
+  check("CLOSE 本页在途+后端 RUNNING:仍 disabled+收口中…",
+        btn.disabled === true && btn.textContent === "收口中…",
+        btn.disabled + "/" + btn.textContent);
+  _setCloseoutRunningForTest(false, true);
+  updateCloseoutUI();
+  check("CLOSE 仅后端 RUNNING(F5 恢复场景):disabled+收口中…",
+        btn.disabled === true && btn.textContent === "收口中…",
+        btn.disabled + "/" + btn.textContent);
+  _setCloseoutRunningForTest(false, false);
+  updateCloseoutUI();
+  check("CLOSE 终态后恢复:enabled+立即收口",
+        btn.disabled === false && btn.textContent === "立即收口",
+        btn.disabled + "/" + btn.textContent);
+  _setCloseoutRunningForTest(false, false);
+}
+
+// F9(Test C 语义):5s summary 重刷反复重渲,overlay 必须每轮都生效,不打回"○ 等待"
+function test_closeout_overlay_survives_summary_rerenders() {
+  let allCur = true;
+  for (let round = 0; round < 3; round += 1) {
+    const fresh = closeoutStageFixture("○ 等待", "未开始(等待 18:00)");
+    const rendered = applyCloseoutRunningOverlay(fresh, { closeoutRunning: true });
+    if (rendered[0].state !== "cur" || rendered[0].state_word !== "● 正在收口" ||
+        rendered[0].sub[0][1] !== "收口任务已启动，正在准备") {
+      allCur = false;
+    }
+  }
+  check("CLOSE 3 轮 summary 重刷每轮都是 ● 正在收口(不被打回等待)", allCur);
+}
+
 (async () => {
   await test_304_keeps_sync_fresh_without_rerender();
   await test_hidden_pauses_and_visible_resumes();
@@ -633,6 +945,15 @@ function test_r2_case22_login_required_covers_recovery_failure() {
   await test_action_client_headers();
   test_action_outcome_text();
   test_r2_case22_login_required_covers_recovery_failure();
+  test_fmt_shanghai_datetime();
+  await test_cnnc_fetcher_ok();
+  await test_cnnc_fetcher_failure_keeps_chain();
+  await test_cnnc_fetcher_timeout_recovers();
+  await test_cnnc_fetcher_inflight_dedup();
+  await test_sf_poller_broken_poll_still_schedules();
+  test_index_html_disk_contract();
+  test_closeout_running_seam();
+  test_closeout_overlay_survives_summary_rerenders();
   if (failed === 0) { console.log("ALL PASS"); process.exit(0); }
   console.error(failed + " failing checks");
   process.exit(1);

@@ -60,6 +60,25 @@
   function fmtAgoMs(ms) { return fmtAgoSeconds(Math.max(0, (Date.now() - ms) / 1000)); }
   function fmtAgo(iso) { return fmtAgoMs(new Date(iso).getTime()); }
   function fmtAgoAt(iso, nowMs) { return fmtAgoSeconds(Math.max(0, (nowMs - new Date(iso).getTime()) / 1000)); }
+  // Bug1:后端全链路存 UTC ISO,展示必须固定为上海时区;不依赖系统/浏览器时区,
+  // 也绝不做 +8 算术(时间戳可带任意 offset)。输出 "YYYY-MM-DD HH:mm:ss"。
+  function fmtShanghaiDateTime(iso) {
+    if (iso === null || iso === undefined || iso === "") return "—";
+    const d = new Date(iso);
+    if (Number.isNaN(d.getTime())) return "—";
+    const parts = new Intl.DateTimeFormat("en-CA", {
+      timeZone: "Asia/Shanghai", hour12: false,
+      year: "numeric", month: "2-digit", day: "2-digit",
+      hour: "2-digit", minute: "2-digit", second: "2-digit",
+    }).formatToParts(d);
+    const get = (type) => {
+      const p = parts.find((x) => x.type === type);
+      return p ? p.value : "";
+    };
+    const hour = get("hour") === "24" ? "00" : get("hour");   // 个别 ICU 小时档输出 24
+    return get("year") + "-" + get("month") + "-" + get("day") + " " +
+      hour + ":" + get("minute") + ":" + get("second");
+  }
   function setLive(ok, text) {
     $("#live").textContent = text;
     $("#live-dot").className = "dot" + (ok ? "" : " err");
@@ -103,11 +122,14 @@
 
   function render(p) {
     renderHero(p.overall); renderAttention(p.overall.attention);
-    renderStages(p.overall.stages); renderZs(p.overall.zs_summary);
+    // closeoutRunning 覆盖必须施加在每次 summary 重渲上(5s 重刷不打回"○ 等待")
+    renderStages(applyCloseoutRunningOverlay(p.overall.stages, { closeoutRunning: closeoutUIRunning() }));
+    renderZs(p.overall.zs_summary);
     renderFinal(p.overall, p.status); renderMeta(p);
     renderJobs(p.jobs);
     window._timelines = p.timelines;
     renderTech(p.status);
+    updateCloseoutUI();
     // Review P1-4:SaaS Flow 有独立轮询生命周期,不再依赖 summary 的 200 render;
     // summary 连续 304 时 SaaS Flow 仍按自身 ~60s 周期刷新。
   }
@@ -537,7 +559,7 @@
         String(r.target || "").endsWith(":" + idStr)).slice(0, 8);
       ul.innerHTML = rows.map((r) => {
         const d = new Date(r.recorded_at);
-        const time = isNaN(d) ? "" : d.toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" });
+        const time = isNaN(d) ? "" : d.toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit", timeZone: "Asia/Shanghai" });
         const typeCn = OPLOG_TYPE_CN[r.action_type] || esc(r.action_type);
         return `<li><time>${esc(time)}</time>${typeCn} · ${esc(oplogOutcomeText(r))}</li>`;
       }).join("");
@@ -574,8 +596,82 @@
       const finalStatus = $("#closeout-status");
       if (finalStatus) finalStatus.textContent = "操作台不可用";
     }
+    // 成功(F5 恢复:拿到当天 businessDate 立即查 RUNNING)与失败(actions GET
+    // 无需 token;操作台不可用也应显示正在收口)两条路径都要查一次。
+    refreshCloseoutActions();
     updateDrawerButtons();
   }
+
+  // ---- 收口进行中(closeoutRunning)统一权威:拒绝猜测 ----
+  // 权威 = 本页 action 在途 OR /api/actions 报告当天 closeout RUNNING。
+  // 后端 writer_active 经 summary stages 参与 fingerprint,自动出新 ETag,无 304 陈旧;
+  // F5/页面重启后靠 /api/actions 轮询恢复同状态,绝不用 localStorage 充当权威。
+  let closeoutActionInFlight = false;   // 本页 POST 202 已接受,poll 未到终态
+  let closeoutBackendRunning = false;   // /api/actions 报告当天 closeout RUNNING
+  function closeoutUIRunning() { return closeoutActionInFlight || closeoutBackendRunning; }
+
+  // 纯函数:当天 running 列表是否存在 closeout RUNNING(business_date 优先,target 前缀兜底)
+  function computeCloseoutBackendRunning(runningList, businessDate) {
+    const date = String(businessDate || "");
+    return (Array.isArray(runningList) ? runningList : []).some((r) =>
+      r && r.action_type === "closeout" && r.status === "RUNNING" &&
+      (date && (String(r.business_date || "") === date ||
+                String(r.target || "").startsWith(date + ":"))));
+  }
+
+  // 纯函数:summary stages 的 closeout 阶段叠加正在收口覆盖(不 mutate 入参)。
+  // 规则:finalized(done)不动;closeoutRunning → cur/"● 正在收口",数据冻结行:
+  //   原"已冻结"→"已冻结，正在收口";否则 →"收口任务已启动，正在准备"。
+  function applyCloseoutRunningOverlay(stages, opts) {
+    if (!opts || !opts.closeoutRunning || !Array.isArray(stages)) return stages;
+    return stages.map((stg) => {
+      if (!stg || stg.key !== "closeout" || stg.state === "done") return stg;
+      const sub = (stg.sub || []).map(([k, v]) => {
+        if (k !== "数据冻结") return [k, v];
+        return [k, String(v || "").indexOf("已冻结") === 0 ? "已冻结，正在收口" : "收口任务已启动，正在准备"];
+      });
+      return Object.assign({}, stg, { state: "cur", state_word: "● 正在收口", sub });
+    });
+  }
+
+  // 纯 DOM,幂等:summary 重刷(render)反复调用也不闪文案;finalized 后区域隐藏
+  // 仍由 renderFinal 管,这里只负责"进行中/可点"两态。
+  function updateCloseoutUI() {
+    const btn = $("#closeout-btn");
+    if (!btn) return;
+    if (closeoutUIRunning()) {
+      btn.disabled = true;
+      if (btn.textContent !== "收口中…") btn.textContent = "收口中…";
+    } else if (!btn.dataset.loading) {
+      btn.disabled = false;
+      if (btn.textContent !== "立即收口") btn.textContent = "立即收口";
+    }
+  }
+  // 测试 seam:行为级验证需要驱动模块内权威状态(与生产同源,生产路径绝不调用)。
+  function _setCloseoutRunningForTest(actionInFlight, backendRunning) {
+    closeoutActionInFlight = !!actionInFlight;
+    closeoutBackendRunning = !!backendRunning;
+  }
+
+  // actions 轻量轮询:复用 createSaasFlowPoller,零新基建;有 RUNNING 收口时提速到 5s。
+  const CLOSEOUT_ACTIONS_IDLE_MS = 30000, CLOSEOUT_ACTIONS_ACTIVE_MS = 5000;
+  const closeoutActionsDeps = {
+    visible: () => document.visibilityState === "visible",
+    setTimeout: (fn, ms) => setTimeout(fn, ms),
+    clearTimeout: (t) => clearTimeout(t),
+    intervalMs: CLOSEOUT_ACTIONS_IDLE_MS,
+    poll: async () => {
+      const res = await fetch("/dashboard/api/actions");
+      if (!res.ok) throw new Error("HTTP " + res.status);
+      const data = await res.json();
+      closeoutBackendRunning = computeCloseoutBackendRunning(data && data.running, businessDate);
+      closeoutActionsDeps.intervalMs = closeoutBackendRunning ? CLOSEOUT_ACTIONS_ACTIVE_MS : CLOSEOUT_ACTIONS_IDLE_MS;
+      updateCloseoutUI();
+      if (closeoutBackendRunning) ctl.run();   // 立即拉一次 summary,阶段卡马上反映
+    },
+  };
+  const closeoutActionsPoller = createSaasFlowPoller(closeoutActionsDeps);
+  async function refreshCloseoutActions() { try { await closeoutActionsPoller.run(); } catch (e) { /* 下轮再试 */ } }
 
   function hideRebuildConfirm() {
     const panel = $("#rebuild-confirm");
@@ -683,18 +779,26 @@
     const closeoutBtn = $("#closeout-btn");
     if (closeoutBtn) closeoutBtn.addEventListener("click", async () => {
       const st = $("#closeout-status");
-      if (closeoutBtn.disabled) return;   // 双击兜底(服务端 409 亦有 ACTION_IN_FLIGHT)
-      setBtnLoading(closeoutBtn, true, "收口中…");
+      // 双击/在途兜底:按钮态由 closeoutRunning 权威驱动(服务端 409 亦有 ACTION_IN_FLIGHT)
+      if (closeoutUIRunning() || closeoutBtn.disabled) return;
+      closeoutActionInFlight = true;   // POST 202 已接受→poll 到终态前保持"收口中…"
+      updateCloseoutUI();
       if (st) st.textContent = "";
       try {
         const client = getActionClient();
         if (!client) { if (st) st.textContent = "操作台不可用"; return; }
         const res = await client.post("/dashboard/api/actions/closeout", { business_date: businessDate });
+        if (res.error && res.error.code === "ACTION_IN_FLIGHT") {
+          // 409:已有在途收口,同步真实状态为"正在收口",不当失败处理
+          refreshCloseoutActions();
+        }
         if (st) st.textContent = actionOutcomeText("closeout", res);
       } catch (e) {
         if (st) st.textContent = "收口请求失败,请稍后重试";
       } finally {
-        setBtnLoading(closeoutBtn, false, null, "立即收口");
+        closeoutActionInFlight = false;   // action client post 已轮询到终态才 resolve
+        refreshCloseoutActions();   // 终态后立即刷新权威列表,马上清掉 backendRunning(FAILED/BLOCKED 不多等一轮轮询)
+        updateCloseoutUI();
         ctl.run();   // 完成后刷新一次 summary
       }
     });
@@ -738,6 +842,8 @@
       st.inFlight = true;
       try {
         await deps.poll();
+      } catch (e) {
+        // poll 契约是自吞错误;此处兜底防断链(poll reject 时仍排程)
       } finally {
         st.inFlight = false;
       }
@@ -859,7 +965,7 @@
         ",SaaS " + (g.saas_count ?? "—") + "。";
     } else if (g.available) {
       let text = "今日权威观察 " + (g.observation_count ?? 0) + " 次;最近一次 " +
-        (g.last_observed_at ? String(g.last_observed_at).replace("T", " ").slice(0, 19) : "—") +
+        fmtShanghaiDateTime(g.last_observed_at) +
         ":客户 " + (g.customer_count ?? "—") + ",SaaS " + (g.saas_count ?? "—");
       if (g.evaluated) text += ";本轮 客户 " + (g.customer_delta ?? 0) + " / SaaS " + (g.saas_delta ?? 0);
       growthBox.textContent = text;
@@ -980,21 +1086,46 @@
     const btn = $("#cnnc-auth-login");
     if (btn) btn.style.display = p.login_required ? "" : "none";
   }
-  let cnncInFlight = false;
-  async function fetchCnncAuth() {
-    if (cnncInFlight) return;
-    cnncInFlight = true;
-    try {
-      const res = await fetch("/dashboard/api/cnnc-auth/status");
-      if (!res.ok) throw new Error("HTTP " + res.status);
-      renderCnncAuth(await res.json());
-    } catch (e) {
-      const chips = $("#cnnc-auth-chips");
-      if (chips) chips.textContent = "状态 — · CNNC 认证状态读取失败，稍后自动重试";
-    } finally {
-      cnncInFlight = false;
+  // Bug2B:fetch 必须有超时——永久 pending 的响应曾让 inFlight 永真、轮询链死亡。
+  // fetcher 做成可注入 factory(tests/js 用 fake clock 驱动超时行为),失败文案逐字保留。
+  const CNNC_FETCH_TIMEOUT_MS = 8000;
+  // deps: {fetchImpl(url,opts), timers:{setTimeout,clearTimeout}, timeoutMs}
+  function createCnncAuthFetcher(deps) {
+    const fetchImpl = deps.fetchImpl || ((url, opts) => fetch(url, opts));
+    const timers = deps.timers || {
+      setTimeout: (fn, ms) => setTimeout(fn, ms),
+      clearTimeout: (t) => clearTimeout(t),
+    };
+    const timeoutMs = deps.timeoutMs == null ? CNNC_FETCH_TIMEOUT_MS : Number(deps.timeoutMs);
+    const st = { inFlight: false };
+    async function run() {
+      if (st.inFlight) return;
+      st.inFlight = true;
+      const abort = new AbortController();
+      const timer = timers.setTimeout(() => abort.abort(), timeoutMs);
+      try {
+        const res = await fetchImpl("/dashboard/api/cnnc-auth/status", { signal: abort.signal });
+        if (!res.ok) throw new Error("HTTP " + res.status);
+        renderCnncAuth(await res.json());
+      } catch (e) {
+        const chips = $("#cnnc-auth-chips");
+        if (chips) chips.textContent = "状态 — · CNNC 认证状态读取失败，稍后自动重试";
+      } finally {
+        timers.clearTimeout(timer);
+        st.inFlight = false;
+      }
     }
+    return { run, state: st };
   }
+  const cnncAuthFetcher = createCnncAuthFetcher({});
+  const cnncPoller = createSaasFlowPoller({
+    poll: () => cnncAuthFetcher.run(),
+    visible: () => document.visibilityState === "visible",
+    setTimeout: (fn, ms) => setTimeout(fn, ms),
+    clearTimeout: (t) => clearTimeout(t),
+    intervalMs: CNNC_POLL_INTERVAL_MS,
+  });
+
   async function cnncAuthLogin() {
     const btn = $("#cnnc-auth-login");
     const notice = $("#cnnc-auth-notice");
@@ -1018,18 +1149,14 @@
       setBtnLoading(btn, false, null, "重新登录");
     }
   }
-  const cnncPoller = createSaasFlowPoller({
-    poll: fetchCnncAuth,
-    visible: () => document.visibilityState === "visible",
-    setTimeout: (fn, ms) => setTimeout(fn, ms),
-    clearTimeout: (t) => clearTimeout(t),
-    intervalMs: CNNC_POLL_INTERVAL_MS,
-  });
 
   function start() {
     document.addEventListener("visibilitychange", () => {
-      if (document.visibilityState === "visible") { ctl.onVisible(); sfPoller.onVisible(); cnncPoller.onVisible(); }
-      else { ctl.onHidden(); sfPoller.onHidden(); cnncPoller.onHidden(); }
+      if (document.visibilityState === "visible") {
+        ctl.onVisible(); sfPoller.onVisible(); cnncPoller.onVisible(); closeoutActionsPoller.onVisible();
+      } else {
+        ctl.onHidden(); sfPoller.onHidden(); cnncPoller.onHidden(); closeoutActionsPoller.onHidden();
+      }
     });
     $("#refresh").addEventListener("click", () => ctl.run());
     $("#jobs-toggle").addEventListener("click", () => {
@@ -1045,10 +1172,13 @@
     sfPoller.run();  // SaaS Flow 独立启动,不等 summary
     cnncPoller.run();  // CNNC 认证状态独立启动(30s 只读轮询)
   }
-  const api = { start, stop: () => { ctl.stop(); sfPoller.stop(); cnncPoller.stop(); },
+  const api = { start, stop: () => { ctl.stop(); sfPoller.stop(); cnncPoller.stop(); closeoutActionsPoller.stop(); },
     createPollController, createSaasFlowPoller, safeProgressText, sfPartialNotice,
     sfTreeHtml, sfGrowthText, jobProgressCell, progressDetail, outputDisplayName,
-    createActionClient, actionOutcomeText, cnncStatusText, renderCnncAuth };
+    createActionClient, actionOutcomeText, cnncStatusText, renderCnncAuth,
+    fmtShanghaiDateTime, createCnncAuthFetcher,
+    computeCloseoutBackendRunning, applyCloseoutRunningOverlay,
+    closeoutUIRunning, updateCloseoutUI, _setCloseoutRunningForTest };
   if (typeof window !== "undefined") { window.Dashboards = api; }
   if (typeof module !== "undefined" && module.exports) { module.exports = api; }
   if (typeof document !== "undefined") { document.addEventListener("DOMContentLoaded", start); }

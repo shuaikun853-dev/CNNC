@@ -116,10 +116,26 @@ def _stages(s: Mapping, finalized: bool, recovery_exhausted_invalid: int = 0) ->
                 ("执行中(含自动恢复)", str(r["running"])), ("等待回收", str(r["awaiting_harvest"])),
                 ("已完成", str(r["completed"])), ("需人工", str(r["manual"])),
                 ("自动恢复已用尽", str(r["recovery_exhausted"]))]})
+    # closeout 阶段纳入 production writer 权威:手动 closeout 已真实持有 OS 级
+    # writer 锁(status.production_writer.active)而数据尚未冻结时,旧逻辑只看
+    # finalized/frozen,必然把"进行中"显示成"○ 等待"。优先级:
+    # finalized > 收口执行中(writer 锁真实持有,覆盖手动/自动)> frozen > wait。
+    writer_active = bool((s.get("production_writer") or {}).get("active"))
+    if finalized:
+        closeout_state, closeout_word = "done", "✓ 完成"
+        freeze_text = "已完成"
+    elif s["final"]["frozen"] or writer_active:
+        closeout_state, closeout_word = "cur", "● 进行中"
+        if s["final"]["frozen"]:
+            freeze_text = "已冻结，正在收口" if writer_active else "已冻结"
+        else:
+            freeze_text = "收口任务已启动，正在准备"
+    else:
+        closeout_state, closeout_word = "wait", "○ 等待"
+        freeze_text = "未开始(等待 18:00)"
     stages.append({"key": "closeout", "name": "最终收口",
-        "state": "done" if finalized else ("cur" if s["final"]["frozen"] else "wait"),
-        "state_word": "✓ 完成" if finalized else ("● 进行中" if s["final"]["frozen"] else "○ 等待"),
-        "num": "18:00 口径", "sub": [("数据冻结", "已冻结" if s["final"]["frozen"] else "未开始(等待 18:00)")]})
+        "state": closeout_state, "state_word": closeout_word,
+        "num": "18:00 口径", "sub": [("数据冻结", freeze_text)]})
     stages.append({"key": "publish", "name": "最终出表", "state": "done" if finalized else "wait",
         "state_word": "✓ 完成" if finalized else "○ 等待",
         "num": "已生成" if finalized else "阻塞清零后自动",

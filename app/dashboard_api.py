@@ -18,7 +18,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from fastapi import APIRouter, HTTPException, Query, Request, Response
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.services.dashboard_actions import DashboardActionError, get_action_runner
@@ -64,9 +64,27 @@ def _today() -> str:
     return business_date_in_shanghai()
 
 
+# 静态资源 cache busting:磁盘 index.html 不手写 ?v=(保持纯静态契约),
+# 由服务端注入 app.css/app.js 的 mtime_ns 版本——文件更新 → URL 变 → 浏览器必拉新。
+_DASHBOARD_ASSETS = ("app.css", "app.js")
+
+
+def _asset_version(path: Path) -> str:
+    return str(path.stat().st_mtime_ns)
+
+
+def _dashboard_index_html() -> str:
+    """index.html + 静态资源 mtime 版本注入:文件更新 → URL 变 → 浏览器必拉新。"""
+    html = (_STATIC_DIR / "index.html").read_text(encoding="utf-8")
+    for name in _DASHBOARD_ASSETS:
+        version = _asset_version(_STATIC_DIR / name)
+        html = html.replace(f"/dashboard/static/{name}", f"/dashboard/static/{name}?v={version}")
+    return html
+
+
 @router.get("/", include_in_schema=True)
-def dashboard_index() -> FileResponse:
-    return FileResponse(_STATIC_DIR / "index.html")
+def dashboard_index() -> HTMLResponse:
+    return HTMLResponse(_dashboard_index_html(), headers={"Cache-Control": "no-cache"})
 
 
 @router.get("/api/summary")
@@ -417,7 +435,8 @@ def dashboard_cnnc_auth_login(request: Request) -> JSONResponse:
 def dashboard_actions_list() -> JSONResponse:
     runner = get_action_runner()
     running = [{"action_id": h.action_id, "action_type": h.action_type,
-                "status": h.status, "target": h.target, "started_at": h.started_at}
+                "status": h.status, "target": h.target, "started_at": h.started_at,
+                "business_date": h.business_date}
                for h in runner.list_recent(20) if h.status == "RUNNING"]
     try:
         recent = read_operator_actions(runtime_paths(_today()).run_dir, limit=20)
