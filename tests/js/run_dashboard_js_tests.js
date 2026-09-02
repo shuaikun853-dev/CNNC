@@ -12,9 +12,28 @@
 // 被测对象:app/static/dashboard/app.js 暴露的 createPollController /
 // createSaasFlowPoller / safeProgressText。
 const path = require("path");
+
+// R2 Case 22:renderCnncAuth 前端测试需要的最小 document stub,必须在 require
+// app.js 之前设置。按选择器缓存同一假元素(测试要断言 renderCnncAuth 写入的
+// display),未知选择器返回 null;其他测试不用 document,不受影响。
+const cnncFakeElements = new Map();
+const cnncKnownSelectors = new Set(["#cnnc-auth-chips", "#cnnc-auth-meta", "#cnnc-auth-login"]);
+global.document = {
+  addEventListener() {},
+  querySelector(sel) {
+    if (!cnncKnownSelectors.has(sel)) return null;
+    if (!cnncFakeElements.has(sel)) {
+      cnncFakeElements.set(sel, sel === "#cnnc-auth-login"
+        ? { style: { display: "none" } }
+        : { textContent: "" });
+    }
+    return cnncFakeElements.get(sel);
+  },
+};
+
 const { createPollController, createSaasFlowPoller, safeProgressText, sfPartialNotice,
         sfTreeHtml, sfGrowthText, jobProgressCell, progressDetail, outputDisplayName,
-        createActionClient, actionOutcomeText } = require(
+        createActionClient, actionOutcomeText, renderCnncAuth } = require(
   path.join(__dirname, "..", "..", "app", "static", "dashboard", "app.js"));
 
 let failed = 0;
@@ -567,6 +586,30 @@ function test_action_outcome_text() {
         actionOutcomeText("closeout", { status: "FAILED", outcome: { result_code: "FAILED" } }).includes("收口失败"));
 }
 
+// ---- R2 Case 22(F3):LOGIN_RECOVERY_FAILED 不得隐藏重新登录按钮 ----
+
+function test_r2_case22_login_required_covers_recovery_failure() {
+  const btn = global.document.querySelector("#cnnc-auth-login");
+  // payload 形状对齐后端 get_status 契约(login_required 由后端计算);
+  // last_refresh_at 留空,避免 renderCnncAuth 走 fmtAgoAt/Date 路径
+  const payload = (status, loginRequired) => ({
+    status, last_error: "", last_refresh_at: "", login_required: loginRequired,
+  });
+  for (const status of ["SSO_LOGIN_REQUIRED", "LOGIN_RECOVERY_FAILED"]) {
+    btn.style.display = "none";  // 每个断言前重置,防上一轮结果泄漏
+    renderCnncAuth(payload(status, true));
+    check("R2 Case 22 " + status + " → 重新登录按钮必须显示(不消失)",
+          btn.style.display === "", btn.style.display);
+  }
+  for (const status of ["CNNC_AUTH_OK", "CNNC_AUTH_REFRESHED",
+                        "OC_EXCHANGE_FAILED", "CNNC_WAF_CONTEXT_STALE"]) {
+    btn.style.display = "none";  // 每个断言前重置(WAF 拦截≠需要登录)
+    renderCnncAuth(payload(status, false));
+    check("R2 Case 22 " + status + " → 重新登录按钮必须隐藏",
+          btn.style.display === "none", btn.style.display);
+  }
+}
+
 (async () => {
   await test_304_keeps_sync_fresh_without_rerender();
   await test_hidden_pauses_and_visible_resumes();
@@ -589,6 +632,7 @@ function test_action_outcome_text() {
   await test_action_client_error_and_timeout();
   await test_action_client_headers();
   test_action_outcome_text();
+  test_r2_case22_login_required_covers_recovery_failure();
   if (failed === 0) { console.log("ALL PASS"); process.exit(0); }
   console.error(failed + " failing checks");
   process.exit(1);

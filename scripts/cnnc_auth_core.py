@@ -276,13 +276,19 @@ class CnncAuthProvider:
         为 harvest 浏览器内同源交换得到的 AT，缺失时为 None（provider 回退
         外部裸交换）。实测门户 302 链偶发停滞（WAF 挑战抖动），单次重试即可
         恢复；SSO_LOGIN_REQUIRED 立即上抛不重试（铁律：不反复碰失效会话）。
-        ``timeout_seconds`` 为调用方按剩余 deadline 截断后的 subprocess 超时
-        预算；预算耗尽（<=0）时不再做第二次重试（deadline 契约）。
+        ``timeout_seconds`` 是两次 attempt 共享的总预算：内部按注入时钟建立
+        绝对截止 ``deadline = now + timeout_seconds``，每次 subprocess 只拿
+        剩余量（``timeout=remaining``），两次合计绝不突破调用方预算；剩余
+        预算耗尽（<=0）时不再启动下一次 subprocess（deadline 契约）。
         """
+        deadline = self.monotonic() + timeout_seconds
+        budget_exhausted = False
         last_exit: int | None = None
         for attempt in range(2):
-            if attempt == 1 and timeout_seconds <= 0.0:
-                break  # 无剩余时间预算，不做第二次重试
+            remaining = deadline - self.monotonic()
+            if remaining <= 0.0:
+                budget_exhausted = True
+                break  # 无剩余时间预算，不再启动下一次 subprocess
             try:
                 completed = subprocess.run(
                     [sys.executable, str(self.browser_script), "harvest"],
@@ -290,14 +296,14 @@ class CnncAuthProvider:
                     text=True,
                     encoding="utf-8",
                     errors="replace",
-                    timeout=timeout_seconds,
+                    timeout=remaining,
                 )
             except subprocess.TimeoutExpired as exc:
                 if attempt == 0:
                     continue
                 raise CnncAuthError(
                     CnncAuthStatus.BROWSER_START_FAILED,
-                    f"harvest 子进程超过 {timeout_seconds:.0f}s 未返回",
+                    f"harvest 子进程超过 {remaining:.0f}s 未返回",
                 ) from exc
             stderr = completed.stderr or ""
             if completed.returncode == 2 or "SSO_LOGIN_REQUIRED" in stderr:
@@ -319,6 +325,11 @@ class CnncAuthProvider:
             last_exit = completed.returncode
             if attempt == 0:
                 continue  # 一次有界重试
+        if budget_exhausted:
+            raise CnncAuthError(
+                CnncAuthStatus.AUTH_REFRESH_DEADLINE_EXCEEDED,
+                f"harvest 时间预算 {timeout_seconds:.0f}s 已耗尽（exit={last_exit}）",
+            )
         raise CnncAuthError(
             CnncAuthStatus.OC_NOT_CAPTURED,
             f"harvest 未捕获 OC（exit={last_exit}）",
@@ -722,7 +733,10 @@ class CnncAuthProvider:
         - 无 access_token → 仅 bootstrap（get_access_token，非 refresh）；
         - SSO 冷却未过 → 直接返回 SSO_LOGIN_REQUIRED，不做任何动作；
         - verify 距今 < 6 小时且 last_status==OK → 零网络调用返回 OK；
-        - 否则 verify 一次，失败才尝试 refresh（受冷却断路器约束）。
+        - 否则 verify 一次，失败返回 AT_VERIFY_FAILED，不主动刷新——真正
+          刷新统一交给业务请求 lazy path（401/3333 →
+          refresh(deadline_monotonic=...)，受 snapshot max_elapsed_seconds
+          约束），预检不得突破 tick 预算。
         """
         try:
             state = self._read_state()
@@ -753,13 +767,10 @@ class CnncAuthProvider:
             if current and self._verify(current):
                 self._mark_verify_ok()
                 return CnncAuthStatus.OK
-            try:
-                self.refresh()
-            except CnncAuthError as exc:
-                return exc.status  # state 已由 refresh 落失败状态
-            except Exception:  # noqa: BLE001 — 预检绝不抛异常
-                return CnncAuthStatus.AUTH_RETRY_FAILED
-            return CnncAuthStatus.REFRESHED
+            # R2 Case 21（lazy 契约）：verify 失败只上报状态，不写 state、
+            # 不刷新——预检不得独占/突破 tick 预算（Task Scheduler IgnoreNew
+            # 风险），刷新统一由业务请求 lazy path 带 deadline 执行。
+            return CnncAuthStatus.AT_VERIFY_FAILED
         except Exception:  # noqa: BLE001 — 预检绝不抛异常
             return CnncAuthStatus.AUTH_RETRY_FAILED
 
@@ -844,7 +855,18 @@ class CnncAuthProvider:
                     )
             except urllib.error.HTTPError as exc:
                 if exc.code == 412:
-                    # WAF 拦截 ≠ AT 失效：续签解决不了 412，立即上抛
+                    # WAF 拦截 ≠ AT 失效：续签解决不了 412，立即上抛。
+                    # R2 Case 23：状态必须先落盘（否则 Dashboard 仍恒显
+                    # "正常"）；_failure_mutator 只写 last_status/last_error/
+                    # last_failure_at 失败元数据、绝不触碰 access_token，且
+                    # last_status != SSO_LOGIN_REQUIRED 不会触发 SSO 冷却。
+                    try:
+                        self._record_failure(
+                            CnncAuthStatus.CNNC_WAF_CONTEXT_STALE,
+                            "WAF 上下文失效（HTTP 412），需重新建立 WAF 会话",
+                        )
+                    except Exception:  # noqa: BLE001 — 落盘尽力而为，不影响上抛
+                        pass
                     raise CnncAuthError(
                         CnncAuthStatus.CNNC_WAF_CONTEXT_STALE,
                         "WAF 上下文失效（HTTP 412），需重新建立 WAF 会话",
@@ -904,7 +926,13 @@ class CnncAuthProvider:
             "last_refresh_at": str(state.get("last_refresh_at") or ""),
             "last_verify_at": str(state.get("last_verify_at") or ""),
             "last_error": str(state.get("last_error") or ""),
-            "login_required": status == CnncAuthStatus.SSO_LOGIN_REQUIRED,
+            # R2 Case 22：LOGIN_RECOVERY_FAILED 必须保留重登入口（用户点了
+            # 登录但失败/超时，按钮不能消失）；BROWSER_START_FAILED 语义混杂
+            # （harvest 子进程超时也用它）不纳入。
+            "login_required": status in {
+                CnncAuthStatus.SSO_LOGIN_REQUIRED,
+                CnncAuthStatus.LOGIN_RECOVERY_FAILED,
+            },
             "cooldown_remaining_seconds": round(
                 self._sso_cooldown_remaining_seconds(state), 3
             ),

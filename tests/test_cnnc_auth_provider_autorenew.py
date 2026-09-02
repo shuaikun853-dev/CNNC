@@ -18,6 +18,8 @@
 - Case 19 harvest 双通道：tuple (OC, browser_at) 跳过外部交换发布浏览器 AT
   （ledger exchange=browser）；str 返回旧路径仍走外部交换（exchange=http）；
   _default_harvest 解析 stdout 的 OC=/AT= 两行
+- R2 Case 20-23：_default_harvest 重试预算衰减 / preflight lazy 契约 /
+  login_required 覆盖 LOGIN_RECOVERY_FAILED（后端）/ WAF 412 落失败状态
 
 注入契约：provider 恒以 ``harvest_func(timeout_seconds=...)`` 关键字调用，
 所有 fake harvest 均须接受该关键字参数；返回 ``str``（仅 OC）或
@@ -26,11 +28,14 @@
 
 from __future__ import annotations
 
+import email.message
+import io
 import json
 import os
 import subprocess
 import threading
 import time
+import urllib.error
 import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -772,3 +777,161 @@ def test_case19_default_harvest_parses_oc_and_at_lines(tmp_path, monkeypatch):
 
     monkeypatch.setattr(cnnc_auth_core.subprocess, "run", fake_run_oc_only)
     assert provider._default_harvest(timeout_seconds=30.0) == ("OC-1-x", None)
+
+
+# --------------------------------------------------------------------- Case 20
+
+
+def test_case20_harvest_retry_budget_decays_across_attempts(tmp_path, monkeypatch):
+    """_default_harvest 两次 attempt 共享 timeout_seconds 总预算（R2 F1）。
+
+    旧实现每次 subprocess 各拿满 timeout_seconds，可突破 caller deadline 一倍；
+    新实现内部建立绝对截止，每次 subprocess 只拿剩余量。本用例：预算 10s，
+    第 1 次调用耗时 7s（无 OC 失败），第 2 次只允许拿 <=3s。
+    """
+    now = {"t": 100.0}
+    state_path, ledger_path = _auth_paths(tmp_path)
+    provider = CnncAuthProvider(  # 不注入 harvest_func → 默认 _default_harvest
+        state_path=state_path,
+        ledger_path=ledger_path,
+        curl_files=(),
+        exchange_func=lambda oc, timeout=30.0: NEW_AT,
+        verify_func=lambda at, timeout=30.0: True,
+        opener=_NoNetworkOpener(),
+        monotonic=lambda: now["t"],
+    )
+    timeouts: list[float] = []
+
+    def fake_run(*_args, **kwargs):
+        timeouts.append(kwargs["timeout"])
+        now["t"] += 7.0 if len(timeouts) == 1 else 4.0
+        return subprocess.CompletedProcess(args=[], returncode=5, stdout="", stderr="")
+
+    monkeypatch.setattr(cnnc_auth_core.subprocess, "run", fake_run)
+
+    with pytest.raises(CnncAuthError) as excinfo:
+        provider._default_harvest(timeout_seconds=10.0)
+
+    assert excinfo.value.status == CnncAuthStatus.OC_NOT_CAPTURED  # exit=5 → 原语义
+    assert len(timeouts) == 2  # 两次 attempt 都启动了 subprocess
+    assert timeouts[0] <= 10.0  # 第 1 次拿满总预算
+    assert timeouts[1] <= 3.0  # 第 2 次只拿剩余量（10-7）
+    assert timeouts[1] < timeouts[0]  # 预算随 attempt 衰减
+
+
+def test_case20_harvest_no_second_subprocess_when_budget_exhausted(
+    tmp_path, monkeypatch
+):
+    """第 1 次 subprocess 超时且预算已耗尽 → 不启动第 2 次，抛 DEADLINE_EXCEEDED。"""
+    now = {"t": 0.0}
+    state_path, ledger_path = _auth_paths(tmp_path)
+    provider = CnncAuthProvider(
+        state_path=state_path,
+        ledger_path=ledger_path,
+        curl_files=(),
+        exchange_func=lambda oc, timeout=30.0: NEW_AT,
+        verify_func=lambda at, timeout=30.0: True,
+        opener=_NoNetworkOpener(),
+        monotonic=lambda: now["t"],
+    )
+    run_calls: list[dict] = []
+
+    def fake_run(*_args, **kwargs):
+        run_calls.append(kwargs)
+        now["t"] += 12.0  # 超过 10s 总预算
+        raise subprocess.TimeoutExpired(cmd="x", timeout=kwargs["timeout"])
+
+    monkeypatch.setattr(cnnc_auth_core.subprocess, "run", fake_run)
+
+    with pytest.raises(CnncAuthError) as excinfo:
+        provider._default_harvest(timeout_seconds=10.0)
+
+    assert excinfo.value.status == CnncAuthStatus.AUTH_REFRESH_DEADLINE_EXCEEDED
+    assert len(run_calls) == 1  # 预算耗尽，第 2 次 subprocess 不再启动
+
+
+# --------------------------------------------------------------------- Case 21
+
+
+def test_case21_preflight_verify_failure_returns_status_without_refresh(tmp_path):
+    """preflight verify 失败 → 只返回 AT_VERIFY_FAILED，不主动 refresh（R2 F2）。"""
+    state_path, _ledger_path = _auth_paths(tmp_path)
+    _seed_valid_state(state_path, at=OLD_AT)
+    provider, calls = _make_provider(tmp_path, verify=lambda at, timeout=30.0: False)
+
+    result = provider.preflight_check()
+
+    assert result == CnncAuthStatus.AT_VERIFY_FAILED
+    assert calls["harvest"] == 0  # refresh 未被触发
+    assert calls["exchange"] == 0
+    state = _read_state(state_path)
+    assert state["access_token"] == OLD_AT  # 不写 state、不动凭证
+
+
+def test_case21_preflight_verify_ok_still_returns_ok(tmp_path):
+    """preflight verify 通过 → 仍返回 OK 且 _mark_verify_ok 正常落 last_verify_at。"""
+    state_path, _ledger_path = _auth_paths(tmp_path)
+    _seed_valid_state(state_path, at=OLD_AT)
+    provider, _calls = _make_provider(tmp_path)  # 默认 verify=True
+
+    result = provider.preflight_check()
+
+    assert result == CnncAuthStatus.OK
+    state = _read_state(state_path)
+    assert state["last_verify_at"]
+
+
+# --------------------------------------------------------------------- Case 22
+
+
+def test_case22_login_required_covers_recovery_failure(tmp_path):
+    """login_required 必须覆盖 LOGIN_RECOVERY_FAILED（R2 F3，后端契约）。"""
+    provider, _calls = _make_provider(tmp_path)
+    state_path, _ledger_path = _auth_paths(tmp_path)
+    for status in (
+        CnncAuthStatus.SSO_LOGIN_REQUIRED,
+        CnncAuthStatus.LOGIN_RECOVERY_FAILED,
+    ):
+        _write_state(state_path, access_token=OLD_AT, last_status=status)
+        assert provider.get_status()["login_required"] is True, status
+    for status in (
+        CnncAuthStatus.OK,
+        CnncAuthStatus.REFRESHED,
+        CnncAuthStatus.OC_EXCHANGE_FAILED,
+    ):
+        _write_state(state_path, access_token=OLD_AT, last_status=status)
+        assert provider.get_status()["login_required"] is False, status
+
+
+# --------------------------------------------------------------------- Case 23
+
+
+def test_case23_waf_412_records_failure_state_without_touching_at(tmp_path):
+    """业务请求 HTTP 412 → 落 WAF 失败状态（R2 F4），不刷新、不重试、不动 AT。"""
+    state_path, _ledger_path = _auth_paths(tmp_path)
+    _seed_valid_state(state_path, at=OLD_AT)
+    opener = _FakeOpener(
+        [
+            urllib.error.HTTPError(
+                CUSTOMER_QUERY_URL,
+                412,
+                "Precondition Failed",
+                email.message.Message(),
+                io.BytesIO(b""),
+            )
+        ]
+    )
+    provider, calls = _make_provider(tmp_path, opener=opener)
+
+    with pytest.raises(CnncAuthError) as excinfo:
+        provider.request_json_cnnc(_query_factory(), read_only=True, opener=opener)
+
+    assert excinfo.value.status == CnncAuthStatus.CNNC_WAF_CONTEXT_STALE
+    assert len(opener.requests) == 1  # read_only 的一次重试对 412 不生效
+    state = _read_state(state_path)
+    assert state["last_status"] == CnncAuthStatus.CNNC_WAF_CONTEXT_STALE
+    assert state["last_error"]
+    assert state["last_failure_at"]
+    assert state["access_token"] == OLD_AT  # _failure_mutator 不触碰凭证
+    assert provider._sso_cooldown_remaining_seconds() == 0.0  # 不触发 SSO 冷却
+    assert calls["harvest"] == 0  # 不刷新

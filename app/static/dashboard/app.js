@@ -1048,7 +1048,7 @@
   const api = { start, stop: () => { ctl.stop(); sfPoller.stop(); cnncPoller.stop(); },
     createPollController, createSaasFlowPoller, safeProgressText, sfPartialNotice,
     sfTreeHtml, sfGrowthText, jobProgressCell, progressDetail, outputDisplayName,
-    createActionClient, actionOutcomeText, cnncStatusText };
+    createActionClient, actionOutcomeText, cnncStatusText, renderCnncAuth };
   if (typeof window !== "undefined") { window.Dashboards = api; }
   if (typeof module !== "undefined" && module.exports) { module.exports = api; }
   if (typeof document !== "undefined") { document.addEventListener("DOMContentLoaded", start); }
