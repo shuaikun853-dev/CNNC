@@ -324,9 +324,11 @@ def test_actions_list_degrades_when_read_fails(client, monkeypatch, tmp_path):
         raise OSError("read failed")
 
     monkeypatch.setattr("app.dashboard_api.read_operator_actions", boom)
+    # Review Fix Round 2:顶层新增 additive business_date(服务端权威日期,固定以便精确断言)
+    monkeypatch.setattr("app.dashboard_api._today", lambda: "2026-09-02")
     r = client.get("/dashboard/api/actions")
     assert r.status_code == 200
-    assert r.json() == {"running": [], "recent": []}
+    assert r.json() == {"running": [], "recent": [], "business_date": "2026-09-02"}
 
 
 # ---- 9. summary 进度集成(投影层) ----

@@ -571,3 +571,49 @@ def test_rf2_empty_run_before_first_snapshot_shows_preparing_not_closeout():
     s["model"] = {"pending": 0, "running": 0, "completed": 0, "terminal": 0, "attempts": 0}
     out = compute_overall_status(s)
     assert out["word"] == "正在准备数据"  # 首个快照落地前的空窗不得宣称"已全部完成"
+
+
+# ---- Review Fix Round 2(2026-09-02):P2-1 closeout writer 谓词同源一致性 ----
+# Hero(word)/阶段卡(stages)/final_text/explanation 四处必须同源于单一权威谓词
+# _closeout_writer_active(closeout/finalize 持锁才算收口进行中)。
+
+def _closeout_writer_day(command: str = "closeout", writer: dict | None = None):
+    """清零日(discovered>0、computed_pending=0、未冻结、无阻塞)+ production writer。"""
+    s = _cleared()
+    s["production_writer"] = writer if writer is not None \
+        else {"active": True, "command": command}
+    return s
+
+
+def test_r2_closeout_writer_running_aligns_word_stage_final_text_explanation():
+    s = _closeout_writer_day()
+    out = compute_overall_status(s)
+    assert out["word"] == "正在最终收口" and out["color"] == "blue"
+    assert out["stages"][2]["state"] == "cur"
+    assert out["stages"][2]["sub"] == [("数据冻结", "收口任务已启动，正在准备")]
+    # closeout 正在执行时 final_text 不得宣称"等待下一次 closeout"
+    assert "正在执行" in out["final_text"]
+    assert "等待下一次 closeout" not in out["final_text"]
+    # 未冻结时 explanation 不得声称"已按 18:00 口径冻结"
+    assert "已按 18:00 口径冻结" not in out["explanation"]
+    assert "正在执行" in out["explanation"]
+
+
+def test_r2_tick_writer_lock_keeps_waiting_closeout_baseline():
+    s = _closeout_writer_day(command="tick")
+    out = compute_overall_status(s)
+    assert out["word"] == "等待最终收口"  # 基线不变:tick 持锁不算收口进行中
+    assert out["stages"][2]["state"] == "wait"
+    assert "等待下一次 closeout" in out["final_text"]
+    assert "已按 18:00 口径冻结" not in out["explanation"]
+
+
+def test_r2_frozen_without_writer_keeps_frozen_explanation():
+    s = _closeout_writer_day()
+    s["production_writer"] = {"active": False, "command": None}   # 锁未持有
+    s["final"]["frozen"] = True
+    out = compute_overall_status(s)
+    assert out["word"] == "正在最终收口"
+    # 既有语义保持:真已冻结才说"已按 18:00 口径冻结"
+    assert "已按 18:00 口径冻结" in out["explanation"]
+    assert out["stages"][2]["sub"] == [("数据冻结", "已冻结")]

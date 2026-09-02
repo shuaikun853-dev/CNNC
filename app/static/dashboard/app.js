@@ -121,8 +121,11 @@
   });
 
   function render(p) {
+    // 首个成功 summary 即完成 summary 侧 hydration;writer 权威先于 overlay 计算,
+    // closeoutRunning 覆盖必须施加在每次 summary 重渲上(5s 重刷不打回"○ 等待")。
+    closeoutSummarySeen = true;
+    closeoutWriterRunning = isCloseoutWriter(p.status && p.status.production_writer);
     renderHero(p.overall); renderAttention(p.overall.attention);
-    // closeoutRunning 覆盖必须施加在每次 summary 重渲上(5s 重刷不打回"○ 等待")
     renderStages(applyCloseoutRunningOverlay(p.overall.stages, { closeoutRunning: closeoutUIRunning() }));
     renderZs(p.overall.zs_summary);
     renderFinal(p.overall, p.status); renderMeta(p);
@@ -603,12 +606,26 @@
   }
 
   // ---- 收口进行中(closeoutRunning)统一权威:拒绝猜测 ----
-  // 权威 = 本页 action 在途 OR /api/actions 报告当天 closeout RUNNING。
-  // 后端 writer_active 经 summary stages 参与 fingerprint,自动出新 ETag,无 304 陈旧;
-  // F5/页面重启后靠 /api/actions 轮询恢复同状态,绝不用 localStorage 充当权威。
+  // 权威 = 本页 action 在途 OR /api/actions 报告当天 closeout RUNNING OR summary
+  // 报告 production writer 正被 closeout/finalize 持有。后端 writer_active 经
+  // summary stages 参与 fingerprint,自动出新 ETag,无 304 陈旧;F5/页面重启后靠
+  // /api/actions 轮询恢复同状态,绝不用 localStorage 充当权威。
   let closeoutActionInFlight = false;   // 本页 POST 202 已接受,poll 未到终态
   let closeoutBackendRunning = false;   // /api/actions 报告当天 closeout RUNNING
-  function closeoutUIRunning() { return closeoutActionInFlight || closeoutBackendRunning; }
+  let closeoutWriterRunning = false;    // summary 报告 production writer 被收口链持有
+  // hydration:settle(成功或失败)前按钮不得出现可点击"立即收口"。
+  let closeoutSummarySeen = false, closeoutActionsSeen = false;
+  function closeoutUIRunning() {
+    return closeoutActionInFlight || closeoutBackendRunning || closeoutWriterRunning;
+  }
+
+  // 与后端 _closeout_writer_active 同语义:active 且 command ∈ {closeout,finalize};
+  // tick/harvest-only/drain-only 持锁或 command 缺失都不算。
+  const CLOSEOUT_WRITER_COMMANDS = ["closeout", "finalize"];
+  function isCloseoutWriter(writer) {
+    if (!writer || !writer.active) return false;
+    return CLOSEOUT_WRITER_COMMANDS.indexOf(String(writer.command || "")) !== -1;
+  }
 
   // 纯函数:当天 running 列表是否存在 closeout RUNNING(business_date 优先,target 前缀兜底)
   function computeCloseoutBackendRunning(runningList, businessDate) {
@@ -617,6 +634,13 @@
       r && r.action_type === "closeout" && r.status === "RUNNING" &&
       (date && (String(r.business_date || "") === date ||
                 String(r.target || "").startsWith(date + ":"))));
+  }
+
+  // 纯函数:/api/actions 顶层 business_date(服务端权威)优先;operator-context 的
+  // businessDate 兜底;都无则空串(computeCloseoutBackendRunning 拒绝匹配)。
+  // bootstrap 失败时 businessDate 为空,此前导致该路径永远匹配不到 RUNNING。
+  function resolveCloseoutActionsDate(actionsData, bootstrapBusinessDate) {
+    return String((actionsData && actionsData.business_date) || bootstrapBusinessDate || "");
   }
 
   // 纯函数:summary stages 的 closeout 阶段叠加正在收口覆盖(不 mutate 入参)。
@@ -635,22 +659,30 @@
   }
 
   // 纯 DOM,幂等:summary 重刷(render)反复调用也不闪文案;finalized 后区域隐藏
-  // 仍由 renderFinal 管,这里只负责"进行中/可点"两态。
+  // 仍由 renderFinal 管,这里只负责"进行中/hydration 未完成/可点"三态。
   function updateCloseoutUI() {
     const btn = $("#closeout-btn");
     if (!btn) return;
     if (closeoutUIRunning()) {
       btn.disabled = true;
       if (btn.textContent !== "收口中…") btn.textContent = "收口中…";
-    } else if (!btn.dataset.loading) {
+    } else if (!(closeoutSummarySeen && closeoutActionsSeen)) {
+      btn.disabled = true;   // hydration 未完成:不得出现可点击"立即收口"
+      if (btn.textContent !== "检查收口状态…") btn.textContent = "检查收口状态…";
+    } else {
       btn.disabled = false;
       if (btn.textContent !== "立即收口") btn.textContent = "立即收口";
     }
   }
   // 测试 seam:行为级验证需要驱动模块内权威状态(与生产同源,生产路径绝不调用)。
-  function _setCloseoutRunningForTest(actionInFlight, backendRunning) {
-    closeoutActionInFlight = !!actionInFlight;
-    closeoutBackendRunning = !!backendRunning;
+  // seen 缺省 true,旧式只关心 running 的断言不必每次都传;hydration 专项测试显式传 false。
+  function _setCloseoutStateForTest(state) {
+    const s = state || {};
+    closeoutActionInFlight = !!s.actionInFlight;
+    closeoutBackendRunning = !!s.backendRunning;
+    closeoutWriterRunning = !!s.writerRunning;
+    closeoutSummarySeen = s.summarySeen === undefined ? true : !!s.summarySeen;
+    closeoutActionsSeen = s.actionsSeen === undefined ? true : !!s.actionsSeen;
   }
 
   // actions 轻量轮询:复用 createSaasFlowPoller,零新基建;有 RUNNING 收口时提速到 5s。
@@ -661,13 +693,21 @@
     clearTimeout: (t) => clearTimeout(t),
     intervalMs: CLOSEOUT_ACTIONS_IDLE_MS,
     poll: async () => {
-      const res = await fetch("/dashboard/api/actions");
-      if (!res.ok) throw new Error("HTTP " + res.status);
-      const data = await res.json();
-      closeoutBackendRunning = computeCloseoutBackendRunning(data && data.running, businessDate);
-      closeoutActionsDeps.intervalMs = closeoutBackendRunning ? CLOSEOUT_ACTIONS_ACTIVE_MS : CLOSEOUT_ACTIONS_IDLE_MS;
-      updateCloseoutUI();
-      if (closeoutBackendRunning) ctl.run();   // 立即拉一次 summary,阶段卡马上反映
+      // try/finally 保证首轮读取 settle(成功或失败)都完成 hydration。
+      try {
+        const res = await fetch("/dashboard/api/actions");
+        if (!res.ok) throw new Error("HTTP " + res.status);
+        const data = await res.json();
+        // 权威日期优先取服务端顶层 business_date(bootstrap 失败时 businessDate
+        // 为空,此前导致该路径永远匹配不到);operator-context 兜底。
+        const matchDate = resolveCloseoutActionsDate(data, businessDate);
+        closeoutBackendRunning = computeCloseoutBackendRunning(data && data.running, matchDate);
+        closeoutActionsDeps.intervalMs = closeoutBackendRunning ? CLOSEOUT_ACTIONS_ACTIVE_MS : CLOSEOUT_ACTIONS_IDLE_MS;
+        if (closeoutBackendRunning) ctl.run();   // 立即拉一次 summary,阶段卡马上反映
+      } finally {
+        closeoutActionsSeen = true;
+        updateCloseoutUI();
+      }
     },
   };
   const closeoutActionsPoller = createSaasFlowPoller(closeoutActionsDeps);
@@ -1177,8 +1217,8 @@
     sfTreeHtml, sfGrowthText, jobProgressCell, progressDetail, outputDisplayName,
     createActionClient, actionOutcomeText, cnncStatusText, renderCnncAuth,
     fmtShanghaiDateTime, createCnncAuthFetcher,
-    computeCloseoutBackendRunning, applyCloseoutRunningOverlay,
-    closeoutUIRunning, updateCloseoutUI, _setCloseoutRunningForTest };
+    computeCloseoutBackendRunning, applyCloseoutRunningOverlay, isCloseoutWriter,
+    resolveCloseoutActionsDate, closeoutUIRunning, updateCloseoutUI, _setCloseoutStateForTest };
   if (typeof window !== "undefined") { window.Dashboards = api; }
   if (typeof module !== "undefined" && module.exports) { module.exports = api; }
   if (typeof document !== "undefined") { document.addEventListener("DOMContentLoaded", start); }

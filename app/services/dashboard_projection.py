@@ -78,6 +78,19 @@ def _zs_summary(s: Mapping, recovering: int, recovery_exhausted_invalid: int = 0
             "completed": r["completed"]}
 
 
+# closeout writer 谓词(单一权威):production writer 锁被 closeout/finalize 命令
+# 持有时才算"最终收口执行中"。tick/harvest-only/drain-only 持锁不得让最终收口
+# 显示进行中;锁 active 但 command 缺失(如无 owner 的 force-finalize)按
+# "不能证明是收口"保守判 False。finalize 与 closeout 同为收尾出版链
+# (closeout 锁内完成冻结→观察→finalize),独立 finalize 命令是同一链条尾部。
+_CLOSEOUT_WRITER_COMMANDS = frozenset({"closeout", "finalize"})
+
+
+def _closeout_writer_active(s: Mapping) -> bool:
+    writer = s.get("production_writer") or {}
+    return bool(writer.get("active")) and str(writer.get("command") or "") in _CLOSEOUT_WRITER_COMMANDS
+
+
 def _stages(s: Mapping, finalized: bool, recovery_exhausted_invalid: int = 0) -> list[dict]:
     d, m, r, c = s["detail"], s["model"], s["remote"], s["crawl"]
     h = s.get("remote_health", {})
@@ -119,8 +132,9 @@ def _stages(s: Mapping, finalized: bool, recovery_exhausted_invalid: int = 0) ->
     # closeout 阶段纳入 production writer 权威:手动 closeout 已真实持有 OS 级
     # writer 锁(status.production_writer.active)而数据尚未冻结时,旧逻辑只看
     # finalized/frozen,必然把"进行中"显示成"○ 等待"。优先级:
-    # finalized > 收口执行中(writer 锁真实持有,覆盖手动/自动)> frozen > wait。
-    writer_active = bool((s.get("production_writer") or {}).get("active"))
+    # finalized > 收口执行中(closeout/finalize writer 锁,单一权威谓词,覆盖手动/自动)
+    # > frozen > wait。tick/harvest-only/drain-only 持锁不算收口进行中。
+    writer_active = _closeout_writer_active(s)
     if finalized:
         closeout_state, closeout_word = "done", "✓ 完成"
         freeze_text = "已完成"
@@ -144,7 +158,7 @@ def _stages(s: Mapping, finalized: bool, recovery_exhausted_invalid: int = 0) ->
     return stages
 
 
-def _final_text(s: Mapping) -> tuple[str, str]:
+def _final_text(s: Mapping, closeout_running: bool = False) -> tuple[str, str]:
     f = s["final"]
     if f["finalized"]:
         state = "forced" if f["forced"] else "ok"
@@ -160,6 +174,12 @@ def _final_text(s: Mapping) -> tuple[str, str]:
                ("crawl_unplanned", "条必爬行未规划"), ("crawl_planning_pending", "条必爬行待规划"),
                ("crawl_unknown", "条采集提交待确认"), ("crawl_manual", "条采集需人工")]
     parts = [f"{b[key]} {phrase}" for key, phrase in mapping if b.get(key, 0) > 0]
+    if closeout_running:
+        # closeout 正在执行时不得宣称"下一次 closeout 自动生成"(自相矛盾);
+        # 无阻塞时不重复"正在执行"措辞,一句话说明将自动出表。
+        if parts:
+            return "还不能生成最终 Excel:" + ";".join(parts) + "。本轮 closeout 正在执行。", "pending"
+        return "还不能生成最终 Excel:当前 closeout 正在执行,完成后将自动生成最终 Excel。", "pending"
     if not parts:
         parts = ["全部阻塞已清零,等待下一次 closeout 自动出表"]
     return "还不能生成最终 Excel:" + ";".join(parts) + "。阻塞清零后系统将在下一次 closeout 自动生成。", "pending"
@@ -183,11 +203,12 @@ def compute_overall_status(status: Mapping, *, recovering: int = 0,
     # final.computed_pending(增量状态权威)不含 detail.terminal(终态证据,普通 finalize
     # 放行),不在投影层维护第二套 blocker 判定;discovered>0 排除首个快照落地前的
     # 每日开市空窗,避免把"发现还没开始"误报成"已全部完成"。
+    closeout_running = _closeout_writer_active(status)   # 单一权威,word 与 final_text 共用
     if f["finalized"]:
         word, color = "今日结果已生成", "green"
     elif manual_needed:
         word, color = "需要人工处理", "red"
-    elif f["frozen"]:
+    elif f["frozen"] or closeout_running:
         word, color = "正在最终收口", "blue"
     elif status["counts"]["discovered"] > 0 and f["computed_pending"] == 0:
         word, color = "等待最终收口", "blue"
@@ -199,7 +220,7 @@ def compute_overall_status(status: Mapping, *, recovering: int = 0,
         word, color = "正在准备数据", "blue"
     attention = _attention_items(status, recovery_exhausted_invalid)
     explanation = _explanation(status, attention, recovering, word)
-    final_text, final_state = _final_text(status)
+    final_text, final_state = _final_text(status, closeout_running)
     return {"word": word, "color": color, "explanation": explanation, "attention": attention,
             "stages": _stages(status, f["finalized"], recovery_exhausted_invalid),
             "zs_summary": _zs_summary(status, recovering, recovery_exhausted_invalid),
@@ -227,7 +248,11 @@ def _explanation(s: Mapping, attention: list, recovering: int, word: str) -> str
     elif word == "等待最终收口":
         parts.append("今日数据处理和招商局任务已全部完成,等待 18:00 口径冻结并进入最终收口。")
     elif word == "正在最终收口":
-        parts.append("数据已按 18:00 口径冻结,系统正在收尾并等待阻塞清零。")
+        # closeout writer 已持锁但尚未冻结时不得声称"已冻结"(矛盾)。
+        if s["final"]["frozen"]:
+            parts.append("数据已按 18:00 口径冻结,系统正在收尾并等待阻塞清零。")
+        else:
+            parts.append("最终收口正在执行,数据冻结与阻塞清零进行中。")
     elif word == "今日结果已生成":
         parts.append("今日流程已全部完成。")
     if len(attention) > 3:

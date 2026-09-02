@@ -16,9 +16,16 @@
 //   CACHE index.html 磁盘契约(不手写 ?v=,版本由服务端 mtime 注入);
 //   CLOSE closeoutRunning 统一权威:applyCloseoutRunningOverlay /
 //         computeCloseoutBackendRunning / 收口按钮两态幂等 / summary 重刷不覆盖。
+// 覆盖 Review Fix Round 2 Round 2(2026-09-02):P1-1/P1-2/P2-2 前端同源谓词
+//   isCloseoutWriter(与后端 _closeout_writer_active 同语义:tick/harvest-only/
+//   drain-only 持锁或 command 缺失都不算收口)、closeoutWriterRunning 并入
+//   closeoutUIRunning、hydration 未见 settle 前按钮不得可点(summarySeen/
+//   actionsSeen)、/api/actions 顶层 business_date 服务端权威兜底
+//   (resolveCloseoutActionsDate)、index.html 静态初始态契约。
 // 被测对象:app/static/dashboard/app.js 暴露的 createPollController /
 // createSaasFlowPoller / safeProgressText / fmtShanghaiDateTime /
-// createCnncAuthFetcher / computeCloseoutBackendRunning / applyCloseoutRunningOverlay。
+// createCnncAuthFetcher / computeCloseoutBackendRunning / applyCloseoutRunningOverlay /
+// isCloseoutWriter / resolveCloseoutActionsDate。
 const path = require("path");
 
 // R2 Case 22:renderCnncAuth 前端测试需要的最小 document stub,必须在 require
@@ -46,7 +53,8 @@ const { createPollController, createSaasFlowPoller, safeProgressText, sfPartialN
         sfTreeHtml, sfGrowthText, jobProgressCell, progressDetail, outputDisplayName,
         createActionClient, actionOutcomeText, renderCnncAuth,
         fmtShanghaiDateTime, createCnncAuthFetcher, computeCloseoutBackendRunning,
-        applyCloseoutRunningOverlay, updateCloseoutUI, _setCloseoutRunningForTest } = require(
+        applyCloseoutRunningOverlay, isCloseoutWriter, resolveCloseoutActionsDate,
+        updateCloseoutUI, _setCloseoutStateForTest } = require(
   path.join(__dirname, "..", "..", "app", "static", "dashboard", "app.js"));
 
 let failed = 0;
@@ -877,35 +885,36 @@ function test_closeout_running_seam() {
           [{ action_type: "closeout", status: "SUCCEEDED", business_date: "2026-09-02",
              target: "2026-09-02:-" }], "2026-09-02") === false);
 
-  // 按钮两态(updateCloseoutUI 幂等;权威状态经测试 seam 驱动,与生产同源)
+  // 按钮两态(updateCloseoutUI 幂等;权威状态经测试 seam 驱动,与生产同源;
+  // seen 缺省 true——旧式只关心 running 的断言不必每次都传)
   const btn = global.document.querySelector("#closeout-btn");
-  _setCloseoutRunningForTest(false, false);
+  _setCloseoutStateForTest({ actionInFlight: false, backendRunning: false });
   btn.disabled = false; btn.textContent = "立即收口";
   updateCloseoutUI();
   check("CLOSE 空闲态:按钮 enabled+立即收口",
         btn.disabled === false && btn.textContent === "立即收口",
         btn.disabled + "/" + btn.textContent);
-  _setCloseoutRunningForTest(true, false);
+  _setCloseoutStateForTest({ actionInFlight: true, backendRunning: false });
   updateCloseoutUI();
   check("CLOSE 本页在途:按钮 disabled+收口中…",
         btn.disabled === true && btn.textContent === "收口中…",
         btn.disabled + "/" + btn.textContent);
-  _setCloseoutRunningForTest(true, true);
+  _setCloseoutStateForTest({ actionInFlight: true, backendRunning: true });
   updateCloseoutUI();
   check("CLOSE 本页在途+后端 RUNNING:仍 disabled+收口中…",
         btn.disabled === true && btn.textContent === "收口中…",
         btn.disabled + "/" + btn.textContent);
-  _setCloseoutRunningForTest(false, true);
+  _setCloseoutStateForTest({ actionInFlight: false, backendRunning: true });
   updateCloseoutUI();
   check("CLOSE 仅后端 RUNNING(F5 恢复场景):disabled+收口中…",
         btn.disabled === true && btn.textContent === "收口中…",
         btn.disabled + "/" + btn.textContent);
-  _setCloseoutRunningForTest(false, false);
+  _setCloseoutStateForTest({ actionInFlight: false, backendRunning: false });
   updateCloseoutUI();
   check("CLOSE 终态后恢复:enabled+立即收口",
         btn.disabled === false && btn.textContent === "立即收口",
         btn.disabled + "/" + btn.textContent);
-  _setCloseoutRunningForTest(false, false);
+  _setCloseoutStateForTest({ actionInFlight: false, backendRunning: false });
 }
 
 // F9(Test C 语义):5s summary 重刷反复重渲,overlay 必须每轮都生效,不打回"○ 等待"
@@ -920,6 +929,97 @@ function test_closeout_overlay_survives_summary_rerenders() {
     }
   }
   check("CLOSE 3 轮 summary 重刷每轮都是 ● 正在收口(不被打回等待)", allCur);
+}
+
+// R2 Round 2(2026-09-02):P1-1 前端同源谓词 / P1-2 writerRunning 并入权威 /
+// P2-2 hydration 防护 / actions 顶层 business_date 兜底 / index.html 初始契约。
+function test_closeout_r2_round2() {
+  // ---- isCloseoutWriter 矩阵(与后端 _closeout_writer_active 完全同语义) ----
+  check("R2R2 tick 持锁 → false", isCloseoutWriter({ active: true, command: "tick" }) === false);
+  check("R2R2 harvest-only 持锁 → false",
+        isCloseoutWriter({ active: true, command: "harvest-only" }) === false);
+  check("R2R2 drain-only 持锁 → false",
+        isCloseoutWriter({ active: true, command: "drain-only" }) === false);
+  check("R2R2 closeout 持锁 → true", isCloseoutWriter({ active: true, command: "closeout" }) === true);
+  check("R2R2 finalize 持锁 → true", isCloseoutWriter({ active: true, command: "finalize" }) === true);
+  check("R2R2 active=false + closeout → false",
+        isCloseoutWriter({ active: false, command: "closeout" }) === false);
+  check("R2R2 active 但缺 command → false", isCloseoutWriter({ active: true }) === false);
+  check("R2R2 null/undefined → false",
+        isCloseoutWriter(null) === false && isCloseoutWriter(undefined) === false);
+
+  // ---- P1-2:closeoutWriterRunning 并入 closeoutUIRunning(经 seam + updateCloseoutUI) ----
+  const btn = global.document.querySelector("#closeout-btn");
+  // a. scheduler closeout(writer 权威)持锁:即使 action 权威为空也必须"收口中…"
+  _setCloseoutStateForTest({ writerRunning: true, actionInFlight: false, backendRunning: false });
+  btn.disabled = false; btn.textContent = "立即收口";
+  updateCloseoutUI();
+  check("R2R2 scheduler closeout writer 持锁 → disabled+收口中…(actions 为空也禁用)",
+        btn.disabled === true && btn.textContent === "收口中…",
+        btn.disabled + "/" + btn.textContent);
+  // b. 普通 tick 持锁:不得误判收口中
+  _setCloseoutStateForTest({ writerRunning: false });
+  updateCloseoutUI();
+  check("R2R2 普通 tick(writerRunning=false)→ enabled+立即收口(不误判收口中)",
+        btn.disabled === false && btn.textContent === "立即收口",
+        btn.disabled + "/" + btn.textContent);
+  // c. Dashboard action 内存丢失(进程重启)但 writer closeout 持锁:仍禁用
+  _setCloseoutStateForTest({ writerRunning: true, backendRunning: false, actionInFlight: false });
+  updateCloseoutUI();
+  check("R2R2 action 内存丢失但 writer closeout → disabled+收口中…",
+        btn.disabled === true && btn.textContent === "收口中…",
+        btn.disabled + "/" + btn.textContent);
+  // d. Dashboard action RUNNING(经典后端权威路径)→ disabled
+  _setCloseoutStateForTest({ backendRunning: true });
+  updateCloseoutUI();
+  check("R2R2 Dashboard action RUNNING → disabled+收口中…",
+        btn.disabled === true && btn.textContent === "收口中…",
+        btn.disabled + "/" + btn.textContent);
+
+  // ---- P2-2 hydration:settle 前按钮不得出现可点击"立即收口" ----
+  _setCloseoutStateForTest({ summarySeen: false, actionsSeen: true });
+  btn.disabled = false; btn.textContent = "立即收口";
+  updateCloseoutUI();
+  check("R2R2 summary 未见 settle → disabled+检查收口状态…",
+        btn.disabled === true && btn.textContent === "检查收口状态…",
+        btn.disabled + "/" + btn.textContent);
+  _setCloseoutStateForTest({ summarySeen: true, actionsSeen: false });
+  updateCloseoutUI();
+  check("R2R2 actions 未见 settle → disabled+检查收口状态…",
+        btn.disabled === true && btn.textContent === "检查收口状态…",
+        btn.disabled + "/" + btn.textContent);
+  _setCloseoutStateForTest({ summarySeen: true, actionsSeen: true });
+  updateCloseoutUI();
+  check("R2R2 双侧 settle 且无 running → enabled+立即收口",
+        btn.disabled === false && btn.textContent === "立即收口",
+        btn.disabled + "/" + btn.textContent);
+  _setCloseoutStateForTest({ summarySeen: false, actionsSeen: false });
+  updateCloseoutUI();
+  check("R2R2 双侧都未 settle → disabled+检查收口状态…",
+        btn.disabled === true && btn.textContent === "检查收口状态…",
+        btn.disabled + "/" + btn.textContent);
+
+  // ---- resolveCloseoutActionsDate:/api/actions 顶层 business_date 服务端权威 ----
+  check("R2R2 actions 顶层日期恢复 bootstrap 失败场景",
+        resolveCloseoutActionsDate({ business_date: "2026-09-02" }, "") === "2026-09-02");
+  check("R2R2 服务端权威优先于 operator-context 兜底",
+        resolveCloseoutActionsDate({ business_date: "2026-09-02" }, "2026-09-01") === "2026-09-02");
+  check("R2R2 actions 无日期时回退 bootstrap",
+        resolveCloseoutActionsDate(null, "2026-09-02") === "2026-09-02");
+  check("R2R2 都无日期 → 空串(拒绝匹配)",
+        resolveCloseoutActionsDate(null, "") === "");
+
+  // ---- index.html 静态初始契约(JS 加载前不得出现可点击"立即收口") ----
+  const fs = require("fs");
+  const html = fs.readFileSync(
+    path.join(__dirname, "..", "..", "app", "static", "dashboard", "index.html"), "utf-8");
+  check("R2R2 index.html closeout-btn 初始 disabled",
+        html.includes('id="closeout-btn" disabled'), "missing disabled attr");
+  check("R2R2 index.html closeout-btn 初始文案 检查收口状态…",
+        html.includes("检查收口状态…"), "missing initial text");
+  // 结束前复位 seam(不影响后续/既有断言)
+  _setCloseoutStateForTest({ actionInFlight: false, backendRunning: false,
+                             writerRunning: false, summarySeen: false, actionsSeen: false });
 }
 
 (async () => {
@@ -954,6 +1054,7 @@ function test_closeout_overlay_survives_summary_rerenders() {
   test_index_html_disk_contract();
   test_closeout_running_seam();
   test_closeout_overlay_survives_summary_rerenders();
+  test_closeout_r2_round2();
   if (failed === 0) { console.log("ALL PASS"); process.exit(0); }
   console.error(failed + " failing checks");
   process.exit(1);

@@ -442,7 +442,10 @@ def dashboard_actions_list() -> JSONResponse:
         recent = read_operator_actions(runtime_paths(_today()).run_dir, limit=20)
     except Exception:
         recent = []
-    return JSONResponse({"running": running, "recent": recent}, headers=_NO_STORE)
+    # 顶层 business_date:前端 closeout RUNNING 匹配的服务端权威日期
+    # (bootstrap 失败时 operator-context 的 businessDate 为空,靠它兜底)。
+    return JSONResponse({"running": running, "recent": recent,
+                         "business_date": _today()}, headers=_NO_STORE)
 
 
 @router.get("/api/actions/{action_id}")

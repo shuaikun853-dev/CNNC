@@ -329,6 +329,8 @@ def test_actions_running_entries_carry_business_date(client, monkeypatch):
             return None
 
     monkeypatch.setattr(dashboard_api, "get_action_runner", lambda: _Runner())
+    # R2 additive:顶层 business_date(服务端权威),前端 bootstrap 失败时的匹配兜底。
+    monkeypatch.setattr(dashboard_api, "_today", lambda: "2026-09-02")
     r = client.get("/dashboard/api/actions")
     assert r.status_code == 200
     running = r.json()["running"]
@@ -336,12 +338,17 @@ def test_actions_running_entries_carry_business_date(client, monkeypatch):
     assert running[0]["business_date"] == "2026-09-02"
     assert running[0]["target"] == "2026-09-02:-"
     assert running[0]["action_type"] == "closeout" and running[0]["status"] == "RUNNING"
+    assert r.json()["business_date"] == "2026-09-02"
 
 
 def _stages_status_fixture(*, frozen: bool = False, finalized: bool = False,
-                           writer_active: bool = False) -> dict:
+                           writer_command: str | None = None) -> dict:
     """_stages 所需的最小 status mapping(字段名对齐 incremental_audit_status
-    的 _empty_status 真实形状,只保留 _stages 访问的键)。"""
+    的 _empty_status 真实形状,只保留 _stages 访问的键)。
+    R2:writer_command=None → 锁未持有(active=False 且 command=None);
+    非空字符串 → 锁被该命令持有(active=True, command=writer_command)。
+    run_runtime_command 的 owner.command 实际取值:tick/finalize/drain-only/
+    harvest-only/closeout。"""
     return {
         "counts": {"discovered": 0, "unique_items": 0, "new": 0, "changed": 0},
         "detail": {"pending": 0, "running": 0, "completed": 0, "terminal": 0},
@@ -356,7 +363,8 @@ def _stages_status_fixture(*, frozen: bool = False, finalized: bool = False,
         "remote_health": {},
         "final": {"frozen": frozen, "finalized": finalized, "forced": False,
                   "output_path": None},
-        "production_writer": {"active": writer_active},
+        "production_writer": {"active": writer_command is not None,
+                              "command": writer_command},
     }
 
 
@@ -369,7 +377,7 @@ def test_projection_closeout_writer_active_unfrozen_shows_running():
     不得再显示"○ 等待",必须显示"● 进行中/收口任务已启动,正在准备"。"""
     from app.services.dashboard_projection import _stages
     stage = _closeout_stage(_stages(
-        _stages_status_fixture(writer_active=True, frozen=False, finalized=False), False))
+        _stages_status_fixture(writer_command="closeout", frozen=False, finalized=False), False))
     assert stage["state"] == "cur"
     assert stage["state_word"] == "● 进行中"
     assert stage["sub"] == [("数据冻结", "收口任务已启动，正在准备")]
@@ -378,7 +386,7 @@ def test_projection_closeout_writer_active_unfrozen_shows_running():
 def test_projection_closeout_writer_active_frozen():
     from app.services.dashboard_projection import _stages
     stage = _closeout_stage(_stages(
-        _stages_status_fixture(writer_active=True, frozen=True, finalized=False), False))
+        _stages_status_fixture(writer_command="closeout", frozen=True, finalized=False), False))
     assert stage["state"] == "cur"
     assert stage["sub"] == [("数据冻结", "已冻结，正在收口")]
 
@@ -386,7 +394,7 @@ def test_projection_closeout_writer_active_frozen():
 def test_projection_closeout_frozen_without_writer():
     from app.services.dashboard_projection import _stages
     stage = _closeout_stage(_stages(
-        _stages_status_fixture(writer_active=False, frozen=True, finalized=False), False))
+        _stages_status_fixture(frozen=True, finalized=False), False))
     assert stage["state"] == "cur"
     assert stage["state_word"] == "● 进行中"
     assert stage["sub"] == [("数据冻结", "已冻结")]
@@ -395,7 +403,7 @@ def test_projection_closeout_frozen_without_writer():
 def test_projection_closeout_all_false_waits():
     from app.services.dashboard_projection import _stages
     stage = _closeout_stage(_stages(
-        _stages_status_fixture(writer_active=False, frozen=False, finalized=False), False))
+        _stages_status_fixture(frozen=False, finalized=False), False))
     assert stage["state"] == "wait"
     assert stage["state_word"] == "○ 等待"
     assert stage["sub"] == [("数据冻结", "未开始(等待 18:00)")]
@@ -404,7 +412,7 @@ def test_projection_closeout_all_false_waits():
 def test_projection_closeout_finalized_done():
     from app.services.dashboard_projection import _stages
     stage = _closeout_stage(_stages(
-        _stages_status_fixture(writer_active=False, frozen=True, finalized=True), True))
+        _stages_status_fixture(frozen=True, finalized=True), True))
     assert stage["state"] == "done"
     assert stage["state_word"] == "✓ 完成"
     assert stage["sub"] == [("数据冻结", "已完成")]
@@ -413,8 +421,67 @@ def test_projection_closeout_finalized_done():
 def test_projection_closeout_missing_writer_key_is_defensive():
     """旧 payload/外部构造缺 production_writer 键时按 False 处理,绝不 KeyError。"""
     from app.services.dashboard_projection import _stages
-    status = _stages_status_fixture(writer_active=False, frozen=False, finalized=False)
+    status = _stages_status_fixture(frozen=False, finalized=False)
     status.pop("production_writer")
+    stage = _closeout_stage(_stages(status, False))
+    assert stage["state"] == "wait"
+
+
+# ---- Review Fix Round 2(2026-09-02):P1-1 closeout writer 谓词回归 ----
+# 单一权威谓词 _closeout_writer_active:仅 closeout/finalize 持锁算收口进行中;
+# tick/harvest-only/drain-only 持锁、锁 active 但 command 缺失、active=False
+# 一律保守判"等待"。
+
+def test_rf2_r2_tick_writer_lock_still_waits():
+    from app.services.dashboard_projection import _stages
+    stage = _closeout_stage(_stages(
+        _stages_status_fixture(writer_command="tick"), False))
+    assert stage["state"] == "wait"
+    assert stage["state_word"] == "○ 等待"
+    assert stage["sub"] == [("数据冻结", "未开始(等待 18:00)")]
+
+
+def test_rf2_r2_harvest_only_writer_lock_still_waits():
+    from app.services.dashboard_projection import _stages
+    stage = _closeout_stage(_stages(
+        _stages_status_fixture(writer_command="harvest-only"), False))
+    assert stage["state"] == "wait"
+    assert stage["sub"] == [("数据冻结", "未开始(等待 18:00)")]
+
+
+def test_rf2_r2_drain_only_writer_lock_still_waits():
+    from app.services.dashboard_projection import _stages
+    stage = _closeout_stage(_stages(
+        _stages_status_fixture(writer_command="drain-only"), False))
+    assert stage["state"] == "wait"
+    assert stage["sub"] == [("数据冻结", "未开始(等待 18:00)")]
+
+
+def test_rf2_r2_finalize_writer_counts_as_closeout_running():
+    from app.services.dashboard_projection import _stages
+    stage = _closeout_stage(_stages(
+        _stages_status_fixture(writer_command="finalize"), False))
+    assert stage["state"] == "cur"
+    assert stage["state_word"] == "● 进行中"
+    assert stage["sub"] == [("数据冻结", "收口任务已启动，正在准备")]
+
+
+def test_rf2_r2_inactive_lock_with_closeout_command_waits():
+    """active=False + command="closeout":锁未真实持有,不得判定收口进行中。"""
+    from app.services.dashboard_projection import _stages
+    status = _stages_status_fixture()
+    status["production_writer"] = {"active": False, "command": "closeout"}
+    stage = _closeout_stage(_stages(status, False))
+    assert stage["state"] == "wait"
+    assert stage["sub"] == [("数据冻结", "未开始(等待 18:00)")]
+
+
+def test_rf2_r2_active_lock_without_command_key_waits():
+    """锁 active 但 metadata 缺 command 键(如无 owner 的 force-finalize):
+    "不能证明是收口"保守判等待。"""
+    from app.services.dashboard_projection import _stages
+    status = _stages_status_fixture()
+    status["production_writer"] = {"active": True}
     stage = _closeout_stage(_stages(status, False))
     assert stage["state"] == "wait"
 
