@@ -9,12 +9,15 @@
     - 人工兜底：SSO 会话存活但 AT 失效时强制刷新（--harvest，force 绕过
       SSO 冷却断路器）
     - 运维预检：发现/任务前确认凭证可用（--ensure）
+    - 登录后自动恢复（--login-and-recover，Dashboard 重登按钮的后台载荷）：
+      阻塞等待浏览器 login 完成 → 自动 harvest → 换 AT → verify → publish
     - 离线自测：不触碰网络/浏览器验证 provider 刷新链（--selftest）
 
 用法:
     python scripts/cnnc_auth_refresh.py --harvest
     python scripts/cnnc_auth_refresh.py --status
     python scripts/cnnc_auth_refresh.py --ensure
+    python scripts/cnnc_auth_refresh.py --login-and-recover
     python scripts/cnnc_auth_refresh.py --selftest
 
 退出码:
@@ -28,6 +31,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -112,6 +116,77 @@ def cmd_ensure() -> int:
     return 0
 
 
+# login 子进程预算与 cnnc_auth_browser.LOGIN_TIMEOUT_SEC(15 分钟)一致，另加
+# 60 秒余量给浏览器启动/会话导出；超时视为登录失败（对应 browser 退出码 3）。
+LOGIN_TIMEOUT_SECONDS = 15 * 60
+_BROWSER_SCRIPT = Path(__file__).resolve().parent / "cnnc_auth_browser.py"
+
+
+def _default_login_runner() -> int:
+    """阻塞运行浏览器 login 子进程并返回其退出码。
+
+    仅在 --login-and-recover 模式下执行：本进程本身是 Dashboard 拉起的
+    detached 后台进程，阻塞等待人工完成滑块/短信是有意行为。超时映射为
+    browser login 超时退出码 3，走失败落盘路径。
+    """
+    try:
+        completed = subprocess.run(
+            [sys.executable, str(_BROWSER_SCRIPT), "login"],
+            timeout=LOGIN_TIMEOUT_SECONDS + 60.0,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return 3
+    return int(completed.returncode)
+
+
+def _login_failed_mutator(rc: int):
+    """构造 login 失败落盘 mutator：只写失败元数据，绝不触碰 access_token。"""
+
+    def mutator(state: dict) -> None:
+        state["last_status"] = core.CnncAuthStatus.LOGIN_RECOVERY_FAILED
+        state["last_error"] = "login exit=%d" % rc
+        state["last_failure_at"] = datetime.now(timezone.utc).isoformat()
+
+    return mutator
+
+
+def run_login_and_recover(login_runner=None, provider=None) -> int:
+    """登录后自动恢复（review Finding 3）：login 成功 → force 刷新 → 发布。
+
+    login_runner/provider 可注入（测试 seam）；默认 login_runner 阻塞等待
+    人工完成滑块/短信。返回码：
+        0  login 成功且 refresh(force=True) 发布成功（stdout 打 RECOVERY_OK，
+           AT 已脱敏）
+        1  login 失败（状态落 LOGIN_RECOVERY_FAILED）或其他刷新失败
+        2  refresh 抛 SSO_LOGIN_REQUIRED（失败状态已由 provider 落盘）
+
+    全程不打印完整凭证。
+    """
+    provider = provider if provider is not None else _default_provider()
+    login_runner = login_runner if login_runner is not None else _default_login_runner
+    rc = int(login_runner())
+    if rc != 0:
+        try:
+            provider.mutate_state(_login_failed_mutator(rc))
+        except OSError:
+            pass  # 状态落盘尽力而为，不改变返回码语义
+        print(
+            "LOGIN_RECOVERY_FAILED：登录未完成/失败（exit=%d），请重试或手工运行 "
+            "python scripts/cnnc_auth_browser.py login" % rc,
+            file=sys.stderr,
+        )
+        return 1
+    try:
+        at = provider.refresh(force=True)  # force：人工登录显式重试，绕过 SSO 冷却
+    except core.CnncAuthError as exc:
+        # 失败状态/审计已由 provider 落盘，这里只提示并按状态码定退出码
+        print("REFRESH_FAILED %s: %s" % (exc.status, exc), file=sys.stderr)
+        return 2 if exc.status == core.CnncAuthStatus.SSO_LOGIN_REQUIRED else 1
+    print("RECOVERY_OK at=%s" % core.redact_secret(at))
+    return 0
+
+
 def run_selftest() -> int:
     """离线自测（不走网络/浏览器）：tmp 目录 + 注入 fake 依赖验证刷新链。
 
@@ -124,7 +199,7 @@ def run_selftest() -> int:
 
     calls = {"harvest": 0, "exchange": 0, "verify": 0}
 
-    def fake_harvest() -> str:
+    def fake_harvest(timeout_seconds: float = 180) -> str:
         calls["harvest"] += 1
         return oc
 
@@ -137,7 +212,7 @@ def run_selftest() -> int:
         calls["verify"] += 1
         return at == new_at
 
-    def sso_harvest() -> str:
+    def sso_harvest(timeout_seconds: float = 180) -> str:
         raise core.CnncAuthError(
             core.CnncAuthStatus.SSO_LOGIN_REQUIRED, "SSO 会话已失效（selftest）"
         )
@@ -219,6 +294,7 @@ def run_selftest() -> int:
                     "source": "harvest",
                     "last_status": core.CnncAuthStatus.SSO_LOGIN_REQUIRED,
                     "last_refresh_at": now_iso,
+                    "last_failure_at": now_iso,  # 冷却断路器按该字段起算
                     "last_verify_at": "",
                     "last_error": "SSO（selftest 预置冷却窗口）",
                 },
@@ -275,6 +351,11 @@ def main(argv: list[str] | None = None) -> int:
         help="运维预检：确保凭证可用（必要时自动刷新）",
     )
     group.add_argument(
+        "--login-and-recover",
+        action="store_true",
+        help="Dashboard 重登按钮使用；login 完成→自动 harvest→换 AT→verify→publish",
+    )
+    group.add_argument(
         "--selftest",
         action="store_true",
         help="离线自测（不走网络/浏览器）",
@@ -287,6 +368,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_harvest()
     if args.ensure:
         return cmd_ensure()
+    if args.login_and_recover:
+        return run_login_and_recover()
     return cmd_status()
 
 

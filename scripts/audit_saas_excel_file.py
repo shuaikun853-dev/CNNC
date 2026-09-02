@@ -491,8 +491,9 @@ def call_detail_api(
     timeout: float = 15.0,
     opener: Any | None = None,
 ) -> dict[str, Any]:
-    """调用中核详情接口。返回结构 {ok, payload, error}。
+    """调用中核详情接口。返回结构 {ok, payload, error, http_status}。
 
+    - http_status 仅在 HTTPError 分支携带真实状态码，其余分支为 None。
     - opener 仅用于测试注入；默认使用 urllib.request.urlopen。
     - 不打印任何敏感请求头/Cookie 内容。
     """
@@ -518,16 +519,16 @@ def call_detail_api(
         try:
             payload = json.loads(text)
         except json.JSONDecodeError as exc:
-            return {"ok": False, "payload": None, "error": f"详情接口响应不是 JSON：{exc}"}
-        return {"ok": True, "payload": payload, "error": ""}
+            return {"ok": False, "payload": None, "http_status": None, "error": f"详情接口响应不是 JSON：{exc}"}
+        return {"ok": True, "payload": payload, "http_status": None, "error": ""}
     except urllib.error.HTTPError as exc:
-        return {"ok": False, "payload": None, "error": f"HTTP {exc.code}"}
+        return {"ok": False, "payload": None, "http_status": exc.code, "error": f"HTTP {exc.code}"}
     except urllib.error.URLError as exc:
-        return {"ok": False, "payload": None, "error": f"URL 错误：{exc.reason}"}
+        return {"ok": False, "payload": None, "http_status": None, "error": f"URL 错误：{exc.reason}"}
     except TimeoutError:
-        return {"ok": False, "payload": None, "error": "详情接口超时"}
+        return {"ok": False, "payload": None, "http_status": None, "error": "详情接口超时"}
     except Exception as exc:  # noqa: BLE001
-        return {"ok": False, "payload": None, "error": f"详情接口异常：{type(exc).__name__}"}
+        return {"ok": False, "payload": None, "http_status": None, "error": f"详情接口异常：{type(exc).__name__}"}
 
 
 # ---------------------------------------------------------------------------

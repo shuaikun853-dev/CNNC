@@ -1062,7 +1062,20 @@ def _detail_worker(
                 "customerPriceEvidence": "",
             }
         started = monotonic()
+        detail_deadline = started + timeout_seconds  # detail 总预算（绝对单调时刻）
         detail_lock = lock_factory(detail_lock_path) if detail_lock_path is not None else None
+
+        def _auth_rejected(resp: Mapping[str, Any]) -> bool:
+            payload_obj = resp.get("payload")
+            return (
+                resp.get("ok")
+                and isinstance(payload_obj, dict)
+                and _payload_is_auth_failure(payload_obj)
+            ) or (
+                (not resp.get("ok"))
+                and resp.get("http_status") == 401
+            )
+
         try:
             if detail_lock is not None:
                 while True:
@@ -1088,15 +1101,15 @@ def _detail_worker(
                 category_id,
                 timeout=max(0.001, remaining),
             )
-            if (
-                cnnc_provider is not None
-                and response.get("ok")
-                and isinstance(response.get("payload"), dict)
-                and _payload_is_auth_failure(response["payload"])
-            ):
-                # AT 被拒：刷新一次并重发（第二次结果为准）。refresh 受 SSO
-                # 冷却断路器约束，其 CnncAuthError 是 RuntimeError 子类，直接上抛。
-                current_at = cnnc_provider.refresh(stale_access_token=current_at)
+            if cnnc_provider is not None and _auth_rejected(response):
+                # AT 被拒（payload 认证失败或 HTTP 401）：刷新一次并重发（第二次
+                # 结果为准，不第三次请求）。refresh 受 SSO 冷却断路器与 detail
+                # 总预算 deadline 约束，其 CnncAuthError 是 RuntimeError 子类，
+                # 直接上抛（fail-fast）。
+                current_at = cnnc_provider.refresh(
+                    stale_access_token=current_at,
+                    deadline_monotonic=detail_deadline,
+                )
                 config = dict(template)
                 _apply_cnnc_at(config, current_at)
                 remaining = timeout_seconds - (monotonic() - started)
@@ -1112,13 +1125,9 @@ def _detail_worker(
         remaining = max(0.0, timeout_seconds - (monotonic() - started))
         if request_interval_seconds > 0 and remaining >= request_interval_seconds:
             sleep(request_interval_seconds)
-        if not response.get("ok"):
-            raise RuntimeError("detail request failed")
-        payload = response.get("payload")
         if (
             cnnc_provider is not None
-            and isinstance(payload, dict)
-            and _payload_is_auth_failure(payload)
+            and _auth_rejected(response)
         ):
             try:
                 auth_status = str(
@@ -1128,6 +1137,9 @@ def _detail_worker(
                 auth_status = ""  # duck-typed provider 无 get_status 时不掩盖原错误
             suffix = f"（认证状态: {auth_status}）" if auth_status else ""
             raise RuntimeError(f"CNNC 认证失败：刷新重试后仍被拒{suffix}")
+        if not response.get("ok"):
+            raise RuntimeError("detail request failed")
+        payload = response.get("payload")
         return extract_customer_price_from_detail(payload)
 
     return detail

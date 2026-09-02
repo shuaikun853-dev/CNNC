@@ -378,7 +378,12 @@ def dashboard_cnnc_auth_status() -> JSONResponse:
 
 @router.post("/api/cnnc-auth/login")
 def dashboard_cnnc_auth_login(request: Request) -> JSONResponse:
-    """启动本地 CNNC SSO 登录浏览器(detached 子进程;不占 action 槽、不阻塞)。"""
+    """启动登录+自动恢复后台进程(detached;不占 action 槽、不阻塞)。
+
+    载荷为 cnnc_auth_refresh.py --login-and-recover:其内部再拉起浏览器 login,
+    人工完成滑块/短信后自动 harvest→换 AT→verify→publish(登录后不自动恢复的
+    review Finding 3 修复),本端点只负责 detached 拉起并立即返回。
+    """
     _guard_operator_action(request, "cnnc-auth-login")
     global _cnnc_login_launched_at
     now = time.monotonic()
@@ -393,7 +398,8 @@ def dashboard_cnnc_auth_login(request: Request) -> JSONResponse:
             subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP)
     try:
         subprocess.Popen(
-            [sys.executable, str(_ROOT_DIR / "scripts" / "cnnc_auth_browser.py"), "login"],
+            [sys.executable, str(_ROOT_DIR / "scripts" / "cnnc_auth_refresh.py"),
+             "--login-and-recover"],
             cwd=str(_ROOT_DIR), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             **popen_kwargs)
     except OSError as exc:  # FileNotFoundError 等:简讯返回,不暴露堆栈
@@ -402,7 +408,8 @@ def dashboard_cnnc_auth_login(request: Request) -> JSONResponse:
             "message": "登录浏览器启动失败,请稍后重试"}) from exc
     _cnnc_login_launched_at = now
     return JSONResponse(
-        {"started": True, "note": "登录浏览器已启动，完成滑块/短信后系统自动恢复"},
+        {"started": True,
+         "note": "登录浏览器已启动；完成滑块/短信后系统将自动续签并恢复（无需其他操作）"},
         status_code=202, headers=_NO_STORE)
 
 

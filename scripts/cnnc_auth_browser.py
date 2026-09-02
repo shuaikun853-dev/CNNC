@@ -23,37 +23,53 @@
 
 命令:
     login    人工一次性登录（账号 + 滑块 + 短信），会话持久化到
-             data/cnnc_auth_profile/，并导出 data/cnnc_auth_storage_state.json
+             data/cnnc_auth_profile/，检测到 SSO 根凭证 TGC 后只把 5 个
+             SSO 会话白名单 cookie 导出到 data/cnnc_auth_storage_state.json
     harvest  用已保存会话只注入 5 个 SSO 会话 cookie（全量注入含陈旧 K5 等
              WAF cookie 会让门户首页卡在 412 挑战循环；WAF 空状态挑战自算
              反而秒过），从门户首页 https://sso.cnncecp.com/ 进入，自动跟随
              302 链（→ /portal/rest/selfcare/redirect/user →
              /esc-sso/oauth2.0/authorize）；OC 主通道从 authorize 302 响应的
              Location 头捕获 code=OC-xxx（比等浏览器落地 cnnc-web 更快，且
-             避开 SPA 消费竞态），兜底通道为落地页 URL 含 code=OC-。事先在
-             网络层拦截浏览器内 SPA 的 anon/account/login 请求作兜底，防止
-             OC 授权码被前端消费（OC 一次性，被消费后外部换 token 报
-             040000）；成功后把服务器轮换的 cookie 回写 storage_state
-    smoke    离线自检：headless 启动纯净 Chrome 并 CDP 接管，打印版本验证链路
+             避开 SPA 消费竞态），兜底通道为落地页 URL 含 code=OC-。收割到 OC
+             后立即关闭收割页（防 SPA 消费一次性 OC），并预先打开的
+             one.cnncecp.com 预热页（同源、已过 WAF 挑战）内执行 fetch
+             anon/account/login 完成 OC→AT 交换（2026-09-02 实测：午后 WAF
+             对裸 Python 请求返回 502，浏览器内同源 fetch 返回
+             200/success:true）；交换成功在 OC= 行后追加打印单行 AT=<token>，
+             失败仅 WARN、回退外部裸 HTTP 交换（cnnc_auth_core 通道）。成功后
+             把服务器轮换的 cookie 经白名单过滤回写
+             storage_state（只存 5 个 SSO 会话 cookie，陈旧 K5/SF/UqZ 等
+             WAF cookie 不落盘）。浏览器每次使用一次性临时 Profile（系统
+             TEMP，用后即删），从根上隔离固定 Profile 累积的陈旧持久
+             K5/SF/UqZ cookie（曾导致 harvest 带陈旧 WAF 状态启动、卡进
+             挑战循环）
+    smoke    离线自检：headless 启动纯净 Chrome（一次性临时 Profile）并
+             CDP 接管，打印版本验证链路
 
 退出码:
-    0   成功（harvest 向 stdout 打印单行 OC=<code>）
+    0   成功（harvest 向 stdout 打印 OC=<code>；浏览器内交换成功时在 OC= 行
+        后追加单行 AT=<token>）
     1   启动链路失败（Chrome 未找到 / 端口占用 / CDP 接管失败 / 无浏览器上下文）
     2   SSO 会话已失效（SSO_LOGIN_REQUIRED，需重新 login）
     3   login 超时（LOGIN_TIMEOUT）
     4   storage_state 不存在（需先 login）
-    5   harvest 30 秒内未拿到 OC
+    5   harvest 60 秒内未拿到 OC
     130 用户中断
 """
 
 import argparse
 import json
+import os
 import re
+import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.request
+import uuid
 from pathlib import Path
 
 # ROOT = 本脚本所在目录（scripts/）的上一级，即 cnnc-ops-agent/
@@ -76,6 +92,8 @@ LOGIN_ENTRY = "https://one.cnncecp.com/cnnc-web/"
 
 SSO_ORIGIN = "https://sso.cnncecp.com"
 OC_RE = re.compile(r"OC-[\w-]+")
+# AT 形态（与 cnnc_auth_core.AT_RE 一致）：校验浏览器内交换返回的 token
+AT_RE = re.compile(r"AT-\d+-[A-Za-z0-9]+")
 
 # 只注入 SSO 会话 cookie；陈旧 WAF cookie（K5/SF/UqZB 等）会让 WAF 挑战
 # 卡进慢速循环，实测空 WAF 状态自算反而秒过（2026-09-02 v4 实验）
@@ -92,6 +110,34 @@ def select_session_cookies(cookies):
     卡进 WAF 412 挑战循环，WAF 空状态挑战自算反而秒过。
     """
     return [c for c in (cookies or []) if c.get("name") in SESSION_COOKIE_NAMES]
+
+
+# 实测（2026-09-02 v4 实验）：白名单 5 cookie + 空 WAF 状态即可走通门户
+# 302 链；K5/SF/UqZ 等 WAF cookie 由每次 harvest 的临时浏览器现场生成，
+# 不长期保存，storage_state 只落白名单会话 cookie。
+def save_session_state(cookies: list, path) -> list:
+    """从浏览器全量 cookie 中筛选 SSO 会话白名单并原子写入最小 storage_state。
+
+    原子写：先写同目录 tmp(uuid) 文件再 os.replace，避免读到半截文件。
+    返回本次落盘的 cookie 名单。
+    """
+    session = select_session_cookies(cookies)
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name("%s.tmp-%s" % (path.name, uuid.uuid4().hex))
+    try:
+        tmp_path.write_text(
+            json.dumps({"cookies": session, "origins": []},
+                       ensure_ascii=False, indent=2),
+            encoding="utf-8")
+        os.replace(tmp_path, path)
+    finally:
+        if tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
+    return [c.get("name", "") for c in session]
 
 
 def capture_oc_from_response(response):
@@ -144,11 +190,14 @@ def _force_utf8_stdio():
             pass
 
 
-def _launch_chrome_cdp(url=None, headless=False):
+def _launch_chrome_cdp(url=None, headless=False, user_data_dir=None):
     """子进程启动纯净系统 Chrome（带远程调试端口），并用 CDP 接管。
 
     浏览器本身不带任何自动化标记（无 --enable-automation 等 flag，
     navigator.webdriver=false），用于绕过 WAF 对 Playwright 托管浏览器的检测。
+
+    user_data_dir=None 时用持久 PROFILE_DIR（login 的人工登录场景）；
+    harvest/smoke 显式传入一次性临时目录，隔离陈旧 K5/SF/UqZ 持久 cookie。
 
     返回 (proc, browser, playwright)；调用方负责在 finally 中调用
     _close_cdp(proc, browser, pw) 完成清理。任何失败路径由本函数自行清理。
@@ -182,13 +231,16 @@ def _launch_chrome_cdp(url=None, headless=False):
         raise RuntimeError("CDP 调试端口 %d-%d 全部被占用"
                            % (CDP_PORT_RANGE[0], CDP_PORT_RANGE[-1] - 1))
 
-    PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+    if user_data_dir is None:
+        user_data_dir = PROFILE_DIR
+    user_data_dir = Path(user_data_dir)
+    user_data_dir.mkdir(parents=True, exist_ok=True)
 
     # 3. 启动纯净 Chrome：无任何自动化 flag
     chrome_args = [
         exe,
         "--remote-debugging-port=%d" % port,
-        "--user-data-dir=%s" % PROFILE_DIR,
+        "--user-data-dir=%s" % user_data_dir,
         "--no-first-run",
         "--no-default-browser-check",
     ]
@@ -271,7 +323,8 @@ def _close_cdp(proc, browser, pw):
 
 
 def cmd_login(args):
-    """人工一次性登录：纯净 Chrome 打开真窗口完成登录，检测到 SSO 会话 cookie 后导出 storage_state。"""
+    """人工一次性登录：纯净 Chrome 打开真窗口完成登录，检测到 SSO 根凭证
+    TGC 后只导出 SSO 会话白名单 cookie 到 storage_state。"""
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     print("正在启动纯净 Chrome…请在窗口中完成 CNNC 登录（账号+滑块+短信）",
           flush=True)
@@ -307,12 +360,15 @@ def cmd_login(args):
             cookie_err_count = 0
             cnn = [c for c in all_cookies if "cnncecp" in (c.get("domain") or "")]
             names = {c["name"] for c in cnn}
-            if "TGC" in names or "SESSION" in names:
+            # 只认 TGC（SSO 根凭证）：SESSION 单独出现不足以证明登录完成
+            if "TGC" in names:
                 time.sleep(3)  # 让 cookie 稳定
-                ctx.storage_state(path=str(STORAGE_STATE))
+                # 只落白名单 cookie，不全量导出（陈旧 K5/SF/UqZ 不落盘）
+                saved = save_session_state(ctx.cookies(), STORAGE_STATE)
                 cnn = [c for c in ctx.cookies()
                        if "cnncecp" in (c.get("domain") or "")]
                 print("LOGIN_OK 已导出 storage_state -> %s" % STORAGE_STATE)
+                print("session_state_saved: %s" % ", ".join(saved))
                 # 只打名字和长度，不打值，防泄漏
                 print("sso 域 cookie: %s" % ", ".join(
                     "%s(len=%d)" % (c["name"], len(c.get("value") or ""))
@@ -333,6 +389,14 @@ def cmd_harvest(args):
 
     主通道：监听 /esc-sso/oauth2.0/authorize 的 302 响应，从 Location 头
     提取 code=OC-xxx；兜底：落地页 URL 轮询含 code=OC-。
+    启动后先在 one.cnncecp.com 开预热页让 WAF 挑战完成（2026-09-02 实测：
+    午后 WAF 对裸 Python 请求返回 502，浏览器内同源 fetch 返回
+    200/success:true）；收割到 OC 后关闭收割页，在预热页上执行同源 fetch
+    anon/account/login 交换，成功时在 OC= 行后追加打印 AT=<token>，失败仅
+    WARN 回退外部裸交换。
+    浏览器用一次性临时 Profile：固定持久 Profile 目录会随运行累积陈旧
+    K5/SF/UqZ 持久 cookie，harvest 浏览器会带着陈旧 WAF 状态启动、卡进
+    挑战循环，因此与 login 的持久 Profile 彻底隔离。
     """
     if not STORAGE_STATE.exists():
         print("STORAGE_STATE_NOT_FOUND：未找到 %s，请先运行 "
@@ -340,10 +404,14 @@ def cmd_harvest(args):
               file=sys.stderr)
         return 4
 
+    # 一次性临时 Profile（系统 TEMP，仓库外），用后即删
+    harvest_dir = Path(tempfile.mkdtemp(prefix="cnnc_harvest_"))
+    print("harvest 临时 Profile：%s" % harvest_dir)
     proc = browser = pw = None
     try:
         # 默认有头：WAF 可能检测 headless，真窗口更稳
-        proc, browser, pw = _launch_chrome_cdp(headless=args.headless)
+        proc, browser, pw = _launch_chrome_cdp(
+            headless=args.headless, user_data_dir=harvest_dir)
         ctx = browser.contexts[0] if browser.contexts else None
         if ctx is None:
             print("CDP_NO_CONTEXT：CDP 接管后未找到浏览器上下文", file=sys.stderr)
@@ -371,6 +439,28 @@ def cmd_harvest(args):
             len(session_cookies),
             ", ".join(c.get("name", "") for c in session_cookies)))
 
+        # 预热页（2026-09-02 实测）：先在 one.cnncecp.com 开一页让 WAF 挑战
+        # 完成，后续 OC→AT 交换在该页上以同源 fetch 执行；预热失败仅 WARN
+        # 继续（回退外部裸交换），不打断收割。
+        warm = ctx.new_page()
+        try:
+            warm.goto(LOGIN_ENTRY, wait_until="commit", timeout=30000)
+        except Exception as exc:
+            print("WARN：预热导航异常（继续，回退外部交换）: %s" % exc,
+                  file=sys.stderr)
+        # 等预热页真正加载完成（挑战页 title 为空/readyState 不 complete），
+        # 盲等 3 秒在挑战慢时不够（实测间歇性回退外部 502 的根因）
+        warm_deadline0 = time.time() + 20
+        while time.time() < warm_deadline0:
+            try:
+                state = warm.evaluate(
+                    "() => document.readyState + '|' + (document.title || '')")
+            except Exception:
+                state = ""
+            if state.startswith("complete|") and len(state) > len("complete|"):
+                break
+            time.sleep(0.5)
+
         page = ctx.new_page()
         oc_holder = []
 
@@ -381,17 +471,45 @@ def cmd_harvest(args):
             if oc and not oc_holder:
                 oc_holder.append(oc)
 
-        page.on("response", _on_response)
-        # 注意：不能用上下文级请求拦截（Playwright 路由 API / Fetch 域）拦截
-        # anon/account/login——实测在 CDP 接管的浏览器上启用请求拦截会让门户
-        # 首页的 302 链整体卡死。防 SPA 消费 OC 改用"捕获即关页"：拿到 OC
-        # 立即 page.close()，cnnc-web 的 SPA 根本来不及发起交换请求。
+        # 两段式（2026-09-02 实测矩阵）：全新 Profile 的首次 WAF 挑战与 CDP
+        # Network 域插桩（response 监听器）互相干扰会卡死 412；先无监听器
+        # 热身导航让挑战自然通过（Profile 变热），再插桩+二次导航收割。
         try:
-            # 不能直接 goto AUTHORIZE_URL（会被 WAF 挑战页卡死），改从门户
-            # 首页进入，靠 302 链自然到达 /authorize
             page.goto(HARVEST_ENTRY, wait_until="commit", timeout=20000)
         except Exception as exc:
-            # 超时/异常仅告警，继续轮询
+            print("WARN：热身导航异常（继续）: %s" % exc, file=sys.stderr)
+        warm_deadline = time.time() + 25
+        while time.time() < warm_deadline:
+            try:
+                warm_url = page.url
+            except Exception:
+                warm_url = ""
+            # 挑战页 URL 与入口相同；一旦离开入口说明挑战已过。
+            # 注意：热身段出现的 ?code=OC- 不采集——此时无屏蔽，SPA 会抢先
+            # 消费一次性 OC（实测败因），OC 任由它消费，二次导航重新签发。
+            if warm_url and warm_url.split("#")[0] != HARVEST_ENTRY:
+                break
+            time.sleep(0.5)
+
+        # 二次导航前先在收割页屏蔽 anon/account/login（CDP Network 域
+        # setBlockedURLs——非 Fetch 域路由，不启用请求拦截，与 302 链无冲突；
+        # 热 Profile 上 Network 插桩已证无碍）：SPA 的 OC 消费请求被浏览器
+        # 层直接掐断，一次性 OC 必然保留给预热页的受控交换。
+        try:
+            cdp_session = ctx.new_cdp_session(page)
+            cdp_session.send("Network.enable")
+            cdp_session.send("Network.setBlockedURLs",
+                             {"urls": ["*anon/account/login*"]})
+        except Exception as exc:
+            print("WARN：CDP 屏蔽 anon login 失败（OC 可能被 SPA 抢先消费）: %s"
+                  % exc, file=sys.stderr)
+
+        page.on("response", _on_response)
+        try:
+            # 二次导航：热 Profile 上挑战已过，302 链即时完成，
+            # 监听器从 authorize 302 的 Location 头捕获 OC。
+            page.goto(HARVEST_ENTRY, wait_until="commit", timeout=20000)
+        except Exception as exc:
             print("WARN：goto HARVEST_ENTRY 异常（继续轮询）: %s" % exc,
                   file=sys.stderr)
 
@@ -418,19 +536,93 @@ def cmd_harvest(args):
                     page.close()
                 except Exception:
                     pass
+                # 浏览器内同源交换（2026-09-02 实测：午后 WAF 对裸 Python 请求
+                # 返回 502，浏览器内同源 fetch 返回 200/success:true）：在已过
+                # WAF 挑战的预热页上执行 fetch；失败重载预热页重试一次，仍败
+                # 仅 WARN、回退外部裸交换。
+                browser_at = ""
+                for attempt in range(2):
+                    result = {"status": 0, "ok": False, "token": ""}
+                    try:
+                        result = warm.evaluate(
+                            """async (code) => {
+                                try {
+                                    const r = await fetch(
+                                        '/cnnc-gateway/pm/n/anon/account/login', {
+                                            method: 'POST',
+                                            headers: {
+                                                'Content-Type': 'application/json',
+                                                'mk-request': '41',
+                                                'Accept':
+                                                    'application/json, text/plain, */*'
+                                            },
+                                            body: JSON.stringify({code})
+                                        });
+                                    const j = await r.json().catch(() => null);
+                                    const token =
+                                        (j && ((j.data && j.data.token) || j.token))
+                                        || '';
+                                    return {status: r.status,
+                                            ok: !!(j && j.success), token};
+                                } catch (e) {
+                                    return {status: 0, ok: false, token: ''};
+                                }
+                            }""", code)
+                    except Exception as exc:
+                        print("WARN：浏览器内交换执行异常（尝试 %d）: %s"
+                              % (attempt + 1, exc), file=sys.stderr)
+                    if isinstance(result, dict):
+                        candidate = str(result.get("token") or "").strip()
+                        if (result.get("ok") and candidate
+                                and AT_RE.fullmatch(candidate)):
+                            browser_at = candidate
+                            break
+                    # 重载预热页（重过 WAF）再试一次
+                    if attempt == 0:
+                        try:
+                            warm.goto(LOGIN_ENTRY, wait_until="commit",
+                                      timeout=30000)
+                            time.sleep(3)
+                        except Exception:
+                            pass
+                if not browser_at:
+                    print("WARN：浏览器内交换失败（status=%s），回退外部交换"
+                          % (result.get("status") if isinstance(result, dict)
+                             else "?"), file=sys.stderr)
                 try:
-                    # 回写服务器轮换后的 cookie
-                    ctx.storage_state(path=str(STORAGE_STATE))
+                    # 回写：只保存 SSO 会话白名单 cookie（不再全量导出，
+                    # 陈旧 K5/SF/UqZ 不落盘，由每次临时浏览器现场生成）
+                    names = save_session_state(ctx.cookies(), STORAGE_STATE)
+                    print("session_state_saved: %s" % ", ".join(names))
                 except Exception as exc:
                     print("WARN：storage_state 回写失败（不影响本次 OC）: %s" % exc,
                           file=sys.stderr)
                 print("OC=%s" % code)
+                if browser_at:
+                    # 浏览器内交换成功：追加单行 AT，provider 据此跳过外部裸交换
+                    print("AT=%s" % browser_at)
                 return 0
             if "/esc-sso/login" in final_url or final_url.startswith(SSO_ORIGIN + "/login"):
                 print("SSO_LOGIN_REQUIRED：SSO 会话已失效，请运行 "
                       "cnnc_auth_browser.py login 重新登录", file=sys.stderr)
                 return 2
             time.sleep(0.3)
+        # 超时收尾：采样页面内容识别"登录页原地渲染"（SSO 已死但门户首页
+        # 不跳 /login 的形态）——映射为 SSO_LOGIN_REQUIRED（exit 2），让
+        # provider 的 SSO 冷却断路器生效，避免每 tick 重启浏览器。
+        login_markers = ""
+        try:
+            page_html = page.content()[:4000]
+            for marker in ("mfaLogin", "esc-sso/login", "账号登录", "登录密码"):
+                if marker in page_html:
+                    login_markers = marker
+                    break
+        except Exception:
+            page_html = ""
+        if login_markers:
+            print("SSO_LOGIN_REQUIRED：SSO 会话已失效（页面特征 %s），请运行 "
+                  "cnnc_auth_browser.py login 重新登录" % login_markers, file=sys.stderr)
+            return 2
         print("HARVEST_TIMEOUT：未在 %d 秒内获得 OC，最终 URL: %s"
               % (HARVEST_TIMEOUT_SEC, final_url), file=sys.stderr)
         return 5
@@ -438,14 +630,22 @@ def cmd_harvest(args):
         print("HARVEST_CANCELLED：用户中断", file=sys.stderr)
         return 130
     finally:
+        # Windows 下临时目录被 Chrome 进程占用时删不掉：必须先断开 CDP 并
+        # 杀掉 Chrome 子进程，再删除临时 Profile 目录
         _close_cdp(proc, browser, pw)
+        shutil.rmtree(harvest_dir, ignore_errors=True)
 
 
 def cmd_smoke(args):
-    """离线自检：仅验证 纯净 Chrome 子进程启动 + CDP 接管 链路（headless，不访问页面）。"""
+    """离线自检：仅验证 纯净 Chrome 子进程启动 + CDP 接管 链路（headless，不访问页面）。
+
+    同 harvest 模式：一次性临时 Profile（mkdtemp + rmtree），不污染持久 Profile。
+    """
+    smoke_dir = Path(tempfile.mkdtemp(prefix="cnnc_harvest_"))
     proc = browser = pw = None
     try:
-        proc, browser, pw = _launch_chrome_cdp(url=None, headless=True)
+        proc, browser, pw = _launch_chrome_cdp(url=None, headless=True,
+                                               user_data_dir=smoke_dir)
         print("SMOKE_OK browser.version=%s contexts=%d"
               % (browser.version, len(browser.contexts)))
         return 0
@@ -453,7 +653,9 @@ def cmd_smoke(args):
         print("SMOKE_FAILED：%s" % exc, file=sys.stderr)
         return 1
     finally:
+        # 先杀 Chrome 进程再删目录（Windows 目录占用限制，同 harvest）
         _close_cdp(proc, browser, pw)
+        shutil.rmtree(smoke_dir, ignore_errors=True)
 
 
 def main():
@@ -466,7 +668,10 @@ def main():
 
     sub.add_parser("login", help="人工一次性登录并保存 SSO 会话（storage_state）")
 
-    hp = sub.add_parser("harvest", help="用已有会话收割 OC 授权码（stdout 打印单行 OC=<code>）")
+    hp = sub.add_parser(
+        "harvest",
+        help="用已有会话收割 OC 授权码（stdout 打印 OC=<code>；浏览器内交换"
+             "成功时追加单行 AT=<token>）")
     hp.add_argument("--headless", action="store_true",
                     help="无头模式运行（默认有头：WAF 可能检测 headless，真窗口更稳）")
 

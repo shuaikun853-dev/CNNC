@@ -295,11 +295,13 @@ class CnncSaasSnapshotAdapter:
                 elif side == "customer" and self.cnnc_provider is not None:
                     # CnncAuthProvider 自带一次「刷新 + 重试」；其 CnncAuthError
                     # 不属于可重试异常，会直接向上传播（认证失败即 fail-fast）。
+                    # deadline 为绝对单调时刻，透传后认证刷新也受同一截止约束。
                     response_payload = self.cnnc_provider.request_json_cnnc(
                         factory,
                         read_only=True,
                         opener=self._opener,
                         timeout=timeout,
+                        deadline_monotonic=deadline,
                     )
                 else:
                     with self._opener.open(factory(), timeout=timeout) as response:

@@ -959,6 +959,9 @@
     CNNC_AUTH_REFRESHED: "正常（已自动续签）",
     SSO_LOGIN_REQUIRED: "⚠ 中核 SSO 已失效，需要重新登录",
     CNNC_AUTH_REFRESH_IN_PROGRESS: "正在续签",
+    AUTH_REFRESH_DEADLINE_EXCEEDED: "续签超时（业务预算内未完成）",
+    CNNC_WAF_CONTEXT_STALE: "WAF 安全层拦截（非登录失效）",
+    LOGIN_RECOVERY_FAILED: "恢复失败（查看错误信息）",
   };
   function cnncStatusText(p) {
     return CNNC_STATUS_LABELS[p.status] || ("异常：" + p.status);
