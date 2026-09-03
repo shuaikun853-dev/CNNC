@@ -532,36 +532,94 @@ def test_rf1_summary_overall_reflects_exhausted_proof_validity(tmp_path, monkeyp
 
 def _detail_terminal_day():
     s = _cleared()
-    s["detail"] = {"pending": 0, "running": 0, "completed": 150, "terminal": 1, "attempts": 151}
+    s["detail"] = {"pending": 0, "running": 0, "completed": 150, "terminal": 1, "attempts": 151,
+                   "customer_price_required": 151, "customer_price_ready": 150,
+                   "customer_price_pending": 0, "customer_price_retrying": 0,
+                   "customer_price_missing": 1, "customer_price_failed": 0,
+                   "customer_price_invalid": 0, "customer_price_absent_proven": 0}
     return s
 
 
-def test_detail_terminal_does_not_block_waiting_final_closeout():
+def test_detail_terminal_blocks_as_manual_after_customer_price_gates():
+    """Flipped with the customer-price gates(2026-09-03 一致性修复):detail
+    terminal = 客户价重试预算耗尽,是真实人工阻塞——hero word 与红色 attention
+    同源,不再出现"红色需人工 + 蓝色等待收口"的自相矛盾。"""
     out = compute_overall_status(_detail_terminal_day())
-    assert out["word"] == "等待最终收口"
-    assert out["word"] != "正在准备数据"
-    assert out["word"] != "需要人工处理"
-    assert out["color"] != "red"
+    assert out["word"] == "需要人工处理"
+    assert out["color"] == "red"
+    assert out["stages"][0]["state"] == "bad"          # prep 卡同源显示异常
+    assert out["stages"][0]["state_word"] == "⚠ 异常"
 
 
-def test_rf2_detail_terminal_yellow_attention_and_explanation_rule():
+def test_customer_price_gates_red_attention_replaces_old_detail_terminal_yellow():
+    """Flipped with the customer-price gates(2026-09-03):重试预算耗尽的客户价
+    失败是真实阻塞,旧"Detail 有终态失败/不阻塞出表/客户价留空继续收口"黄条
+    与新 finalize 门禁矛盾,被红色"客户价获取失败"取代。"""
     out = compute_overall_status(_detail_terminal_day())
-    item = next(a for a in out["attention"] if a["title"] == "Detail 有终态失败")
-    assert item["level"] == "yellow"
-    assert out["word"] == "等待最终收口"  # 黄色关注不升级红
+    item = next(a for a in out["attention"] if a["title"] == "客户价获取失败")
+    assert item["level"] == "red" and item["tag"] == "需人工"
+    assert "重试预算耗尽" in item["problem"]
+    assert "禁止自动审批与最终出表" in item["impact"]
+    assert not any(a["title"] == "Detail 有终态失败" for a in out["attention"])
+    assert out["word"] == "需要人工处理" and out["color"] == "red"
     assert "无需人工处理" not in out["explanation"]  # 解释句铁律
-    assert "Detail 有终态失败" in out["explanation"]
+    assert "客户价获取失败" in out["explanation"]
 
 
-def test_rf2_finalized_day_stays_green_with_detail_terminal_history():
+def test_customer_price_failed_prep_card_bad_and_word_manual_consistent():
+    """客户价 failed/invalid(m["terminal"]=0、d["terminal"]=1 同形)场景:
+    prep 卡按 cp_blocking 显示异常,word 升为需要人工处理——三处同源一致。"""
+    s = _cleared()
+    s["detail"] = _cp_detail(customer_price_ready=149, customer_price_failed=2,
+                             customer_price_invalid=1, terminal=3)
+    out = compute_overall_status(s)
+    assert out["word"] == "需要人工处理" and out["color"] == "red"
+    assert out["stages"][0]["state"] == "bad"
+    assert any(a["level"] == "red" and a["title"] == "客户价获取失败"
+               for a in out["attention"])
+
+
+def test_invalid_only_zero_price_success_still_turns_day_red():
+    """INVALID-only(d.terminal==0)也推红:SUCCESS+price<=0 的无效客户价阶段态
+    是 SUCCESS(detail.terminal=0),但 finalize ready 门与 NON_TOLERABLE 同样
+    阻塞——hero word / prep 卡 / 红色 attention 必须与 finalize 同源一致。"""
+    s = _cleared()
+    s["detail"] = _cp_detail(customer_price_ready=150, customer_price_invalid=1)
+    assert s["detail"]["terminal"] == 0
+    out = compute_overall_status(s)
+    assert out["word"] == "需要人工处理" and out["color"] == "red"
+    assert out["stages"][0]["state"] == "bad"
+    assert any(a["level"] == "red" and a["title"] == "客户价获取失败"
+               for a in out["attention"])
+    assert "禁止自动审批与最终出表" in next(
+        a for a in out["attention"] if a["title"] == "客户价获取失败")["impact"]
+
+
+def test_absent_proven_only_never_turns_day_red():
+    """MISSING_PROVEN(证据齐全的确定性缺席)不阻塞:word 不推红、prep 卡不显示
+    异常、attention 仅黄色"关注"——保持"转人工、不阻塞出表"语义。"""
+    s = _cleared()
+    s["detail"] = _cp_detail(customer_price_ready=148, customer_price_absent_proven=3)
+    out = compute_overall_status(s)
+    assert out["word"] == "等待最终收口" and out["color"] != "red"
+    assert out["stages"][0]["state"] != "bad"
+    assert any(a["level"] == "yellow" and a["title"] == "部分商品客户价缺失(证据齐全)"
+               for a in out["attention"])
+    assert not any(a["level"] == "red" for a in out["attention"])
+
+
+def test_rf2_finalized_day_stays_green_with_customer_price_failure_history():
+    """已出表日客户价失败历史不消失:红色条目如实保留(强制收口的缺价可见),
+    但 finalized 主状态不因历史失败翻红。"""
     s = _detail_terminal_day()
     s["final"] = {"pending": 0, "computed_pending": 0, "frozen": True, "finalized": True,
                   "forced": False, "output_path": "x.xlsx", "output_exists": True,
                   "manifest_recorded": True, "blocker_summary": {}}
     out = compute_overall_status(s)
     assert out["word"] == "今日结果已生成" and out["color"] == "green"
-    assert not any(a["level"] == "red" for a in out["attention"])
-    assert any(a["title"] == "Detail 有终态失败" for a in out["attention"])  # 仅历史黄提示
+    item = next(a for a in out["attention"] if a["title"] == "客户价获取失败")
+    assert item["level"] == "red"  # 失败历史不降级、不消失
+    assert not any(a["title"] == "Detail 有终态失败" for a in out["attention"])
 
 
 def test_rf2_empty_run_before_first_snapshot_shows_preparing_not_closeout():
@@ -617,3 +675,113 @@ def test_r2_frozen_without_writer_keeps_frozen_explanation():
     # 既有语义保持:真已冻结才说"已按 18:00 口径冻结"
     assert "已按 18:00 口径冻结" in out["explanation"]
     assert out["stages"][2]["sub"] == [("数据冻结", "已冻结")]
+
+
+# ---- 客户价可观测性(2026-09-03,plan §8):prep 卡 / attention 三态 / final_text ----
+
+def _cp_detail(**over):
+    d = {"pending": 0, "running": 0, "completed": 151, "terminal": 0, "attempts": 151,
+         "customer_price_required": 151, "customer_price_ready": 151,
+         "customer_price_pending": 0, "customer_price_retrying": 0,
+         "customer_price_missing": 0, "customer_price_failed": 0,
+         "customer_price_invalid": 0, "customer_price_absent_proven": 0,
+         "customer_price_ratio": 1.0}
+    d.update(over)
+    return d
+
+
+def test_prep_stage_sub_includes_customer_price_progress_row():
+    s = _cleared()
+    s["detail"] = _cp_detail(customer_price_ready=150)
+    out = compute_overall_status(s)
+    prep = out["stages"][0]
+    assert ("客户价", "150/151") in prep["sub"]
+    assert ("Detail", "151/151") in prep["sub"]      # 既有技术行保留
+
+
+def test_prep_stage_customer_price_placeholder_when_nothing_required():
+    s = _cleared()   # detail 无 customer_price_* 键 → required 0
+    out = compute_overall_status(s)
+    assert ("客户价", "—") in out["stages"][0]["sub"]
+
+
+def test_attention_customer_price_retrying_is_yellow_auto_retry():
+    s = _cleared()
+    s["detail"] = _cp_detail(customer_price_ready=149, customer_price_retrying=2)
+    out = compute_overall_status(s)
+    item = next(a for a in out["attention"] if a["title"] == "客户价获取正在自动重试")
+    assert item["level"] == "yellow" and item["tag"] == "自动重试"
+    assert "2 条商品" in item["problem"]
+    assert "不影响其他链路" in item["impact"] and "无需人工" in item["impact"]
+    assert "3 次" in item["system_action"]           # 重试预算(=3)可见
+    assert "无需操作" in item["suggestion"]
+    assert not any(a["level"] == "red" for a in out["attention"])
+
+
+def test_attention_customer_price_exhausted_failure_is_red_manual():
+    s = _cleared()
+    s["detail"] = _cp_detail(customer_price_ready=148, customer_price_missing=1,
+                             customer_price_failed=2, customer_price_invalid=1)
+    out = compute_overall_status(s)
+    item = next(a for a in out["attention"] if a["title"] == "客户价获取失败")
+    assert item["level"] == "red" and item["tag"] == "需人工"
+    assert "重试预算耗尽仍未取得" in item["problem"]
+    # 正文区分三种失败来源(NOT_FOUND 缺失 / 请求失败 / 无效价)
+    assert "NOT_FOUND 缺失" in item["problem"] and "详情请求或解析失败" in item["problem"] \
+        and "无效客户价" in item["problem"]
+    assert "禁止自动审批与最终出表" in item["impact"]
+    assert "已停止自动重试" in item["system_action"]
+    assert "客户价明细" in item["suggestion"] and "requeue" in item["suggestion"]
+
+
+def test_attention_absent_proven_is_yellow_and_nonblocking():
+    s = _cleared()
+    s["detail"] = _cp_detail(customer_price_ready=148, customer_price_absent_proven=3)
+    out = compute_overall_status(s)
+    item = next(a for a in out["attention"] if a["title"] == "部分商品客户价缺失(证据齐全)")
+    assert item["level"] == "yellow" and item["tag"] == "关注"
+    assert "确定性缺席" in item["problem"]
+    assert "不阻塞最终出表" in item["impact"]
+    assert "绝不自动通过" in item["system_action"]
+    # 证据齐全的缺席不是红色人工项
+    assert not any(a["level"] == "red" and "客户价" in a["title"] for a in out["attention"])
+
+
+def test_final_text_surfaces_customer_price_exhausted_blocker():
+    s = _cleared()
+    s["final"] = {**_cleared()["final"],
+                  "blocker_summary": {"detail_terminal": 2, "customer_price_missing": 2}}
+    out = compute_overall_status(s)
+    assert "2 条客户价获取失败(重试耗尽)" in out["final_text"]
+
+
+def test_build_summary_customer_price_block_and_fingerprint_reacts(tmp_path, monkeypatch):
+    """summary 携带客户价轻量汇总(counts+ratio,无行级数据);ETag 指纹随其变化。"""
+    from app.services import dashboard_projection as dp
+    (tmp_path / "day").mkdir()
+    db = _make_db(tmp_path / "day")
+    state = _cleared()
+    state["detail"] = _cp_detail()
+
+    def build():
+        monkeypatch.setattr(dp, "collect_runtime_status", lambda **kw: state)
+        monkeypatch.setattr(dp, "runtime_paths", lambda bd, root=None: type("P", (), {
+            "state_path": db, "run_dir": db.parent})())
+        monkeypatch.setattr(dp, "project_scheduler_status", lambda: {"available": False})
+        monkeypatch.setattr(dp, "project_recent_days", lambda root, n=14, **kw: [])
+        return dp.build_dashboard_summary("2026-08-26", tmp_path)
+
+    out = build()
+    cp = out["customer_price"]
+    assert cp == {"required": 151, "ready": 151, "pending": 0, "retrying": 0,
+                  "missing": 0, "failed": 0, "invalid": 0, "absent_proven": 0,
+                  "ratio": 1.0}
+    assert out["overall"]["stages"][0]["sub"][-1] == ("客户价", "151/151")
+    fingerprint_before = out["fingerprint"]
+    state["detail"]["customer_price_failed"] = 3   # 重试耗尽的行进入业务失败
+    state["detail"]["customer_price_ready"] = 148
+    state["detail"]["customer_price_ratio"] = round(148 / 151, 2)   # status 层权威值
+    again = build()
+    assert again["customer_price"]["failed"] == 3
+    assert again["customer_price"]["ratio"] == round(148 / 151, 2) < 1.0
+    assert again["fingerprint"] != fingerprint_before   # 指纹必须跟着变(无 304 陈旧)

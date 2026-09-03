@@ -498,6 +498,115 @@ def test_ordinary_finalize_still_blocks_the_same_snapshot(tmp_path):
     assert built.artifact is None
 
 
+# ---- Customer-price gates (plan §6, matrix D force half) -------------------
+
+
+def _rework_detail(store, item_id, *, result=None, error=None):
+    """Replace one DETAIL row's durable evidence with a new outcome."""
+    token = store.acquire_lease(DATE, "rework-detail", 60)
+    detail = next(
+        row for row in store.list_stage_work(token, stage="DETAIL")
+        if row["audit_item_id"] == item_id
+    )
+    detail = store.ensure_stage_work(
+        token, item_id, "DETAIL", str(detail["fingerprint"]) + "-rework"
+    )
+    claimed = store.claim_stage_work(
+        token, detail["id"], max_attempts=1, max_elapsed_seconds=300
+    )
+    assert claimed is not None
+    if error is not None:
+        store.fail_stage_work(
+            token, detail["id"], elapsed_seconds=1, error=error, retryable=True,
+            max_attempts=1, max_elapsed_seconds=1,
+        )
+    else:
+        store.complete_stage_work(token, detail["id"], result)
+    store.release_lease(token)
+
+
+def _proven_absent_result(status):
+    return {
+        "customerPrice": None,
+        "customerPriceStatus": status,
+        "customerPriceSource": "",
+        "customerPriceWarning": "authoritative customer export has no such document",
+        "customerPriceEvidence": "",
+    }
+
+
+@pytest.mark.parametrize(
+    ("rework", "expected_blocker", "expected_count"),
+    [
+        (
+            {"error": "customerPriceStatus=NOT_FOUND；详情接口未返回有效参考价"},
+            "customer_price_missing",
+            1,
+        ),
+        (
+            {"error": "TimeoutError"},
+            "customer_price_failed",
+            1,
+        ),
+        (
+            {"result": {**_proven_absent_result("DETAIL_REQUEST_FAILED"), "customerPriceWarning": "rspCode=500"}},
+            "customer_price_failed",
+            1,
+        ),
+        (
+            {"result": {
+                "customerPrice": "0",
+                "customerPriceStatus": "FOUND",
+                "customerPriceSource": "DETAIL_REFERENCE_INFOS",
+                "customerPriceWarning": "",
+                "customerPriceEvidence": "参考价1=0",
+            }},
+            "customer_price_invalid",
+            1,
+        ),
+    ],
+)
+def test_force_finalize_never_tolerates_unresolved_customer_price(
+    tmp_path, rework, expected_blocker, expected_count
+):
+    store, snapshot, crawls = _seed_force(tmp_path)
+    _link_inflight_job(store, tmp_path, crawls)
+    item = store.ordered_snapshot_items(snapshot["id"])[0]
+    _rework_detail(store, item["id"], **rework)
+    output = tmp_path / "formal.xlsx"
+
+    with pytest.raises(ForceFinalizeRejected) as excinfo:
+        materialize_forced_frozen_daily_run(
+            store, ProcessLock(tmp_path / "finalize.lock"), DATE, output, max_incomplete=10,
+        )
+
+    assert excinfo.value.error_type == "FORCE_FINALIZE_BLOCKED"
+    assert getattr(excinfo.value.readiness, expected_blocker) == expected_count
+    assert not output.exists()
+    assert store.get_run(DATE)["state"] != "FINALIZED"
+
+
+def test_force_finalize_tolerates_proven_absent_customer_price(tmp_path):
+    """Deterministic absence (LOOKUP_FAILED/SKIPPED) closes out; rows stay manual."""
+    store, snapshot, crawls = _seed_force(tmp_path)
+    _link_inflight_job(store, tmp_path, crawls)
+    for item in store.ordered_snapshot_items(snapshot["id"]):
+        _rework_detail(store, item["id"], result=_proven_absent_result("LOOKUP_FAILED"))
+    output = tmp_path / "formal.xlsx"
+
+    publication = materialize_forced_frozen_daily_run(
+        store, ProcessLock(tmp_path / "finalize.lock"), DATE, output, max_incomplete=10,
+    )
+
+    assert publication.already_finalized is False
+    assert publication.readiness.customer_price_absent_proven == 2
+    assert publication.readiness.customer_price_missing == 0
+    assert publication.readiness.customer_price_failed == 0
+    assert publication.readiness.customer_price_invalid == 0
+    assert publication.forced is True
+    assert output.is_file()
+
+
 # CLI wiring.
 def test_cli_force_finalize_outputs_json_and_exit_zero(tmp_path, capsys):
     from scripts.incremental_price_audit import main

@@ -544,6 +544,7 @@ def _decide_action(
         title_result == "SAME"
         and sku_check in {"MATCH", "UNKNOWN"}
         and price_check == "MATCH"
+        and price_vs_customer_check == "WITHIN_THRESHOLD"
         and reachable is not False
         and off_shelf is not True
     ):
@@ -576,6 +577,10 @@ def _reason(
         return "SaaS JSON 价格与页面实际价格不一致，建议人工驳回前复核"
     if price_check == "WAIT_PAGE_PRICE_CHECK":
         return "缺少页面实际价格，待页面价格核验"
+    if price_vs_customer_check == "CUSTOMER_PRICE_MISSING":
+        return "缺少有效客户价，价格审核基准不完整，不予自动通过，建议人工确认价格基准后再审"
+    if price_vs_customer_check == "CUSTOMER_PRICE_INVALID":
+        return "客户价格无效，价格审核基准不完整，不予自动通过，建议人工确认价格基准后再审"
     if title_result == "SAME" and price_check == "MATCH":
         return "标题模型判断同款且价格一致，建议人工审批通过"
     return "需人工核查同款关系、SKU 链接和价格一致性"

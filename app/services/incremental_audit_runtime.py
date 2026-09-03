@@ -21,6 +21,10 @@ from typing import Any, Callable, Mapping
 from zoneinfo import ZoneInfo
 
 from app.services.cnnc_saas_snapshot_adapter import CnncSaasSnapshotAdapter
+from app.services.customer_price_semantics import (
+    CUSTOMER_PRICE_RETRYABLE_DETAIL_STATUSES,
+    DetailBusinessRetryRequired,
+)
 from app.services.batch_zhaoshang_adapter import (
     BatchProgressStatus,
     BatchReconcileStatus,
@@ -1140,7 +1144,17 @@ def _detail_worker(
         if not response.get("ok"):
             raise RuntimeError("detail request failed")
         payload = response.get("payload")
-        return extract_customer_price_from_detail(payload)
+        result = extract_customer_price_from_detail(payload)
+        # RC-1: a retryable business failure must never masquerade as a
+        # successful completion.  NOT_FOUND / REQUEST_FAILED / PARSE_FAILED are
+        # non-deterministic outcomes: raise so the durable stage records a
+        # retryable failure with the structured (sanitized, decodable) error
+        # prefix.  Deterministic skips (EXISTS / LOOKUP_FAILED /
+        # DETAIL_REQUEST_SKIPPED) still return normally — re-running them
+        # cannot change the answer.
+        if str(result.get("customerPriceStatus") or "") in CUSTOMER_PRICE_RETRYABLE_DETAIL_STATUSES:
+            raise DetailBusinessRetryRequired(result)
+        return result
 
     return detail
 

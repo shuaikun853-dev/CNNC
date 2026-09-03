@@ -32,6 +32,31 @@
 
 <nav class="stages" id="stages"></nav>
 
+<!-- 客户价可观测性(一级可见;汇总随 summary 刷新,明细在抽屉中按需拉取) -->
+<section class="card" id="cp-card">
+  <div class="cp-strip">
+    <span class="lab">客户价</span>
+    <span class="counts" id="cp-counts">汇总获取中…</span>
+    <button class="btn more" id="cp-open">查看明细</button>
+  </div>
+  <aside class="drawer" id="cp-drawer">
+    <h3>客户价明细 <button class="btn" style="float:right;padding:0 8px" onclick="document.getElementById('cp-drawer').classList.remove('show')">收起</button></h3>
+    <div class="sec cp-filters" id="cp-filters">
+      <button class="btn cp-filter" data-filter="unacquired">未获取</button>
+      <button class="btn cp-filter" data-filter="retrying">待重试</button>
+      <button class="btn cp-filter" data-filter="terminal">终态失败</button>
+      <button class="btn cp-filter" data-filter="all">全部</button>
+    </div>
+    <div class="sec">
+      <table class="cp-table" id="cp-table">
+        <thead><tr><th>单据</th><th>标题</th><th>skuId</th><th class="num">SaaS价</th><th class="num">客户价</th><th>状态</th><th class="num">尝试</th><th class="num">更新</th><th>错误</th></tr></thead>
+        <tbody></tbody>
+      </table>
+      <div class="cp-meta" id="cp-meta"></div>
+    </div>
+  </aside>
+</section>
+
 <div class="zs" id="zs">
   <span class="lab">招商局</span>
   <span class="counts"></span>

@@ -4,6 +4,16 @@ from __future__ import annotations
 
 from typing import Mapping
 
+from app.services.customer_price_semantics import DETAIL_MAX_ATTEMPTS_DEFAULT
+
+
+def _cp(detail: Mapping, key: str) -> int:
+    """Defensive read of a customer_price_* detail counter (0 when absent)."""
+    try:
+        return max(0, int(detail.get(key, 0) or 0))
+    except (TypeError, ValueError):
+        return 0
+
 
 def _attention_items(s: Mapping, recovery_exhausted_invalid: int = 0) -> list[dict]:
     r, c, m, h = s["remote"], s["crawl"], s["model"], s.get("remote_health", {})
@@ -46,15 +56,41 @@ def _attention_items(s: Mapping, recovery_exhausted_invalid: int = 0) -> list[di
         items.append({"level": "red", "tag": "需人工", "title": "模型校验终态失败",
             "problem": "模型重试预算耗尽后仍失败。", "impact": "对应商品缺模型结论。",
             "system_action": "不再自动重试。", "suggestion": "可按手册 requeue-model-transient/recover-model 处理。"})
-    # Review Fix Round 2:detail.terminal 是终态证据,不在 computed_final_pending 内、
-    # 不阻塞普通 finalize(行以 _detail_failure() 客户价留空+失败证据进入最终表),
-    # 因此是非阻塞黄色关注——既不误报"正在准备数据",也不默默消失。
-    if d["terminal"]:
-        items.append({"level": "yellow", "tag": "关注", "title": "Detail 有终态失败",
-            "problem": "部分商品 Detail 请求已重试耗尽并进入终态失败。",
-            "impact": "不阻塞今日最终出表;对应商品客户价留空并保留失败证据,按现有可用信息继续收口。",
-            "system_action": "该 Detail 已停止自动重试,失败证据保留在 durable 状态中。",
-            "suggestion": "一般无需操作;如需补齐详情可在技术详情中查看对应失败记录。"})
+    # 客户价门禁(2026-09-03):detail 业务计数取代旧"Detail 有终态失败"黄条。
+    # RETRYING=自动重试中(黄,无需人工);MISSING/FAILED/INVALID=重试预算耗尽
+    # (红,阻塞自动审批与最终出表);MISSING_PROVEN=证据齐全的确定性缺席
+    # (黄,转人工不阻塞)。旧黄条声称"不阻塞出表/客户价留空继续收口",与新
+    # finalize 门禁矛盾,已删除;detail_terminal 仍经 blocker_summary 进 final_text。
+    cp_retrying = _cp(d, "customer_price_retrying")
+    cp_missing = _cp(d, "customer_price_missing")
+    cp_failed = _cp(d, "customer_price_failed")
+    cp_invalid = _cp(d, "customer_price_invalid")
+    cp_absent = _cp(d, "customer_price_absent_proven")
+    if cp_retrying:
+        items.append({"level": "yellow", "tag": "自动重试", "title": "客户价获取正在自动重试",
+            "problem": f"{cp_retrying} 条商品客户价获取进入业务失败,已进入 durable 自动重试。",
+            "impact": "只影响对应行的客户价获取,不影响其他链路;重试预算耗尽前无需人工。",
+            "system_action": f"按每行至多 {DETAIL_MAX_ATTEMPTS_DEFAULT} 次的重试预算自动重试。",
+            "suggestion": "无需操作;重试耗尽后本页会升级为红色“客户价获取失败”。"})
+    if cp_missing or cp_failed or cp_invalid:
+        reasons = []
+        if cp_missing:
+            reasons.append(f"{cp_missing} 条客户导出/详情中未找到该商品(NOT_FOUND 缺失)")
+        if cp_failed:
+            reasons.append(f"{cp_failed} 条详情请求或解析失败")
+        if cp_invalid:
+            reasons.append(f"{cp_invalid} 条取得无效客户价")
+        items.append({"level": "red", "tag": "需人工", "title": "客户价获取失败",
+            "problem": "部分商品客户价重试预算耗尽仍未取得:" + "、".join(reasons) + "。",
+            "impact": "对应数据缺失价格审核基准;系统已禁止自动审批与最终出表。",
+            "system_action": "已停止自动重试,保留失败证据。",
+            "suggestion": "在客户价明细中查看失败行;处理上游问题后可人工 requeue 重试。"})
+    if cp_absent:
+        items.append({"level": "yellow", "tag": "关注", "title": "部分商品客户价缺失(证据齐全)",
+            "problem": "客户导出中无该单据/无详情身份,客户价确定性缺席,重试无意义。",
+            "impact": "对应行价格审核转人工,不阻塞最终出表。",
+            "system_action": "证据随最终表输出,绝不自动通过。",
+            "suggestion": "如需补价属人工操作。"})
     if r["unknown"] or c["unknown"]:
         items.append({"level": "yellow", "tag": "关注", "title": "任务提交结果待确认",
             "problem": "提交后结果未知,系统正按精确身份自动对账。",
@@ -104,13 +140,21 @@ def _stages(s: Mapping, finalized: bool, recovery_exhausted_invalid: int = 0) ->
     zs_yellow = bool(r["unknown"] or c["unknown"] or h.get("stall_detected"))
     uniq = s["counts"]["unique_items"]
     stages = []
+    # 客户价门禁(2026-09-03):missing/failed/invalid = 重试预算耗尽的人工阻塞,
+    # prep 卡必须与 hero word 同源显示异常,不得停在"进行中/完成"。
+    cp_blocking = _cp(d, "customer_price_missing") + _cp(d, "customer_price_failed") \
+        + _cp(d, "customer_price_invalid") > 0
+    prep_bad = m["terminal"] or cp_blocking
     stages.append({"key": "prep", "name": "数据准备",
-        "state": "bad" if m["terminal"] else ("cur" if prep_pending else "done"),
-        "state_word": "⚠ 异常" if m["terminal"] else ("● 进行中" if prep_pending else "✓ 完成"),
+        "state": "bad" if prep_bad else ("cur" if prep_pending else "done"),
+        "state_word": "⚠ 异常" if prep_bad else ("● 进行中" if prep_pending else "✓ 完成"),
         "num": f"{m['completed']} / {uniq}" if uniq else "—",
         "sub": [("SaaS 发现", f"{s['counts']['discovered']} 行(新 {s['counts']['new']} / 变 {s['counts']['changed']})"),
                 ("Detail", f"{d['completed']}/{uniq}"),
-                ("模型校验", f"{m['completed']}/{uniq}")]})
+                ("模型校验", f"{m['completed']}/{uniq}"),
+                # 客户价业务口径(门禁可见性):ready/required;无必需求价的行显示占位。
+                ("客户价", f"{_cp(d, 'customer_price_ready')}/{_cp(d, 'customer_price_required')}")
+                if _cp(d, "customer_price_required") else ("客户价", "—")]})
     if finalized:
         zs_state, zs_word = "done", "✓ 完成"
     elif zs_bad:
@@ -170,6 +214,7 @@ def _final_text(s: Mapping, closeout_running: bool = False) -> tuple[str, str]:
     mapping = [("remote_pending", "个招商局任务仍在执行/待回收"), ("remote_intent", "个任务已排队待提交"),
                ("remote_unknown", "个任务提交结果待确认"), ("remote_manual", "项招商局任务需人工"),
                ("model_pending", "条模型处理未完成"), ("model_terminal", "条模型终态失败"),
+               ("detail_terminal", "条客户价获取失败(重试耗尽)"),
                ("detail_pending", "条 Detail 未完成"), ("crawl_pending", "条采集未完成"),
                ("crawl_unplanned", "条必爬行未规划"), ("crawl_planning_pending", "条必爬行待规划"),
                ("crawl_unknown", "条采集提交待确认"), ("crawl_manual", "条采集需人工")]
@@ -194,7 +239,14 @@ def compute_overall_status(status: Mapping, *, recovering: int = 0,
     d, m, r, c, f = status["detail"], status["model"], status["remote"], status["crawl"], status["final"]
     prep_pending = d["pending"] + d["running"] + m["pending"] + m["running"]
     # P1-1:合法 RECOVERY_EXHAUSTED 不再计入 manual;proof 不合法的才按真实阻塞升级红。
-    manual_needed = any((r["manual"], c["manual"], c["unplanned"], m["terminal"])) \
+    # 客户价门禁(2026-09-03):detail terminal = 客户价重试预算耗尽(MISSING/FAILED/
+    # INVALID),是真实人工阻塞——attention 已红"需人工",hero word 必须同源一致。
+    # missing/failed/invalid 直接入判(SUCCESS+price<=0 的 INVALID 阶段态是
+    # SUCCESS、terminal=0,但 finalize ready 门与 NON_TOLERABLE 同样阻塞);
+    # d["terminal"] 保留为防御(旧/不可解码 error_text 的 TERMINAL 行按 FAILED 覆盖)。
+    manual_needed = any((r["manual"], c["manual"], c["unplanned"], m["terminal"], d["terminal"])) \
+        or any(_cp(d, k) for k in ("customer_price_missing", "customer_price_failed",
+                                   "customer_price_invalid")) \
         or recovery_exhausted_invalid > 0
     zs_uncleared = any(r[k] for k in ("intent", "pending", "running", "exported")) or bool(
         c["pending"] + c["running"] + c.get("planning_pending", 0)
@@ -378,6 +430,189 @@ def _has_restart_evidence(job: Mapping) -> bool:
     """任务是否携带 restart 协议证据(任一非空 phase,含零写撤退 DECLINED 等)。"""
     restart = decode_recovery_evidence(job.get("recovery_evidence_json")).get("restart")
     return isinstance(restart, dict) and str(restart.get("phase") or "") != ""
+
+
+# ---- 客户价行级只读投影(plan §8):零写、零网络、全部文本脱敏 ----------------
+
+from app.services.customer_price_semantics import (
+    customer_price_business_state as _cp_state,
+)
+from app.services.customer_price_semantics import (
+    sanitize_customer_price_text as _cp_sanitize,
+)
+
+# 行级分类键 → 过滤语义。unacquired=尚未取得可用客户价(不含证据齐全的缺席);
+# terminal=重试预算耗尽、需要人工的终态。
+_CP_UNFINISHED_KEYS = ("PENDING", "RETRYING", "MISSING", "FAILED", "INVALID")
+_CP_TERMINAL_KEYS = frozenset({"MISSING", "FAILED", "INVALID"})
+_CUSTOMER_PRICE_FILTERS = ("all", "unacquired", "retrying", "terminal")
+# semantics 业务键 → 汇总桶(单一来源:customer_price_business_state)。
+_STATE_BUCKET = {
+    "READY": "ready", "PENDING": "pending", "RETRYING": "retrying",
+    "MISSING": "missing", "MISSING_PROVEN": "absent_proven",
+    "FAILED": "failed", "INVALID": "invalid",
+}
+
+
+def empty_customer_price_projection(business_date: str, filter: str = "all") -> dict:
+    """Shape-stable empty result (no state file / no run / no snapshot yet)."""
+    return {
+        "business_date": business_date,
+        "filter": filter,
+        "total_required": 0,
+        "counts": {"ready": 0, "pending": 0, "retrying": 0, "missing": 0,
+                   "failed": 0, "invalid": 0, "absent_proven": 0},
+        "rows": [],
+        "truncated": 0,
+        "limit": 0,
+        "max_attempts": DETAIL_MAX_ATTEMPTS_DEFAULT,
+    }
+
+
+def project_customer_price(
+    state_path: Path, business_date: str, *, filter: str = "all", limit: int = 500
+) -> dict:
+    """Read-only row-level customer-price projection for one business date.
+
+    Mirrors ``project_remote_jobs``: ``mode=ro`` SQLite, no writes, no network.
+    Rows come from the frozen snapshot when the run has one, otherwise the
+    latest snapshot; members without a DETAIL stage row project as PENDING.
+    Every text field passes ``sanitize_customer_price_text`` before leaving the
+    process — no header/cookie/token material can reach the UI.
+    """
+    if filter not in _CUSTOMER_PRICE_FILTERS:
+        filter = "all"  # projection 层防御;API 层负责 400
+    try:
+        limit = max(0, int(limit))
+    except (TypeError, ValueError):
+        limit = 500
+    uri = f"file:{Path(state_path).resolve().as_posix()}?mode=ro"
+    con = sqlite3.connect(uri, uri=True); con.row_factory = sqlite3.Row
+    try:
+        run = con.execute(
+            "SELECT id, frozen_snapshot_id FROM daily_runs WHERE business_date=?",
+            (business_date,),
+        ).fetchone()
+        if run is None:
+            return empty_customer_price_projection(business_date, filter)
+        if run["frozen_snapshot_id"] is not None:
+            snapshot_id = int(run["frozen_snapshot_id"])
+        else:
+            latest = con.execute(
+                """SELECT id FROM snapshots WHERE run_id=?
+                   ORDER BY observed_at DESC, id DESC LIMIT 1""",
+                (int(run["id"]),),
+            ).fetchone()
+            if latest is None:
+                return empty_customer_price_projection(business_date, filter)
+            snapshot_id = int(latest["id"])
+        rows: list[dict] = []
+        counts = {"ready": 0, "pending": 0, "retrying": 0, "missing": 0,
+                  "failed": 0, "invalid": 0, "absent_proven": 0}
+        for row in con.execute(
+            """SELECT m.row_ordinal, i.row_json, i.v_commodity_id, i.sku_id,
+                      w.state AS detail_state, w.attempts, w.retryable,
+                      w.error_text, w.result_json, w.updated_at
+               FROM snapshot_members m
+               JOIN audit_items i ON i.id=m.audit_item_id
+               LEFT JOIN stage_work w ON w.audit_item_id=i.id AND w.stage='DETAIL'
+               WHERE m.snapshot_id=? ORDER BY m.row_ordinal""",
+            (snapshot_id,),
+        ):
+            try:
+                source = _json.loads(str(row["row_json"] or "{}"))
+            except (TypeError, ValueError):   # JSONDecodeError ⊂ ValueError
+                source = {}
+            if not isinstance(source, dict):
+                source = {}
+            try:
+                decoded = _json.loads(str(row["result_json"] or ""))
+            except (TypeError, ValueError):   # JSONDecodeError ⊂ ValueError
+                decoded = None
+            result = decoded if isinstance(decoded, dict) else None
+            state = _cp_state(row["detail_state"], result, row["error_text"])
+            bucket = _STATE_BUCKET.get(state.key)
+            if bucket is not None:
+                counts[bucket] += 1
+            rows.append({
+                "document_id": _cp_sanitize(
+                    source.get("vCommodityId") or source.get("documentId")
+                    or row["v_commodity_id"]),
+                "title": _cp_sanitize(
+                    source.get("queryStr") or source.get("skuName") or ""),
+                "sku_id": _cp_sanitize(source.get("skuId") or row["sku_id"]),
+                "saas_price": (
+                    _cp_sanitize(source.get("price"))
+                    if source.get("price") is not None else None),
+                "customer_price": (
+                    _cp_sanitize(result.get("customerPrice"))
+                    if result is not None and result.get("customerPrice") is not None
+                    else None),
+                "customer_price_status": _cp_sanitize(state.status),
+                "customer_price_source": _cp_sanitize(
+                    result.get("customerPriceSource")
+                    if isinstance(result, Mapping) else ""),
+                "state": state.key,
+                "detail_state": _cp_sanitize(row["detail_state"]),
+                "attempts": int(row["attempts"] or 0),
+                "max_attempts": DETAIL_MAX_ATTEMPTS_DEFAULT,
+                "retryable": bool(row["retryable"]),
+                "error_text": _cp_sanitize(row["error_text"]),
+                "updated_at": _cp_sanitize(row["updated_at"]),
+            })
+    finally:
+        con.close()
+    if filter == "unacquired":
+        selected = [r for r in rows if r["state"] not in ("READY", "MISSING_PROVEN")]
+    elif filter == "retrying":
+        selected = [r for r in rows if r["state"] == "RETRYING"]
+    elif filter == "terminal":
+        selected = [r for r in rows if r["state"] in _CP_TERMINAL_KEYS]
+    else:
+        selected = rows
+    # 未完成在前(获取中→待重试→缺失→失败→无效),证据缺席次之,已获取最后。
+    order = {**{key: i for i, key in enumerate(_CP_UNFINISHED_KEYS)},
+             "MISSING_PROVEN": len(_CP_UNFINISHED_KEYS), "READY": len(_CP_UNFINISHED_KEYS) + 1}
+    selected.sort(key=lambda r: order.get(r["state"], len(order)))
+    truncated = max(0, len(selected) - limit) if limit else 0
+    return {
+        "business_date": business_date,
+        "filter": filter,
+        "total_required": len(rows),
+        "counts": counts,
+        "rows": selected[:limit] if limit else [],
+        "truncated": truncated,
+        "limit": limit,
+        "max_attempts": DETAIL_MAX_ATTEMPTS_DEFAULT,
+    }
+
+
+_CP_SUMMARY_KEYS = (
+    ("customer_price_required", "required"),
+    ("customer_price_ready", "ready"),
+    ("customer_price_pending", "pending"),
+    ("customer_price_retrying", "retrying"),
+    ("customer_price_missing", "missing"),
+    ("customer_price_failed", "failed"),
+    ("customer_price_invalid", "invalid"),
+    ("customer_price_absent_proven", "absent_proven"),
+)
+
+
+def customer_price_summary_block(detail: Mapping) -> dict:
+    """Lightweight customer-price summary for build_dashboard_summary.
+
+    Counts only (reuse of ``status.detail.customer_price_*``); no row-level
+    data so the summary payload cannot balloon with the commodity pool.
+    ``ratio`` reuses the status layer's rounded ``customer_price_ratio`` when
+    present (single authority) and is only recomputed defensively.
+    """
+    block = {short: _cp(detail, key) for key, short in _CP_SUMMARY_KEYS}
+    ratio = detail.get("customer_price_ratio")
+    if not isinstance(ratio, (int, float)) or isinstance(ratio, bool):
+        ratio = block["ready"] / block["required"] if block["required"] else 0
+    block["ratio"] = ratio
+    return block
 
 
 def project_recovery_timeline(job_row: Mapping) -> dict:
@@ -573,6 +808,8 @@ def build_dashboard_summary(
         "generated_at": _datetime.now(_UTC).isoformat(timespec="seconds"),
         "overall": compute_overall_status(status, recovering=recovering,
                                           recovery_exhausted_invalid=recovery_exhausted_invalid),
+        # 客户价轻量汇总(counts+ratio,无行级数据);fingerprint 自动覆盖。
+        "customer_price": customer_price_summary_block(status.get("detail") or {}),
         "jobs": [{**{k: v for k, v in j.items() if k != "recovery_evidence_json"},
                   "live_progress": dict(progress_map.get(str(j["id"])) or _PROBE_DISABLED_STATUS)}
                  for j in jobs],

@@ -150,6 +150,7 @@
     renderHero(p.overall); renderAttention(p.overall.attention);
     renderStages(applyCloseoutRunningOverlay(p.overall.stages, { closeoutRunning: closeoutUIRunning() }));
     renderZs(p.overall.zs_summary);
+    renderCustomerPrice(p.customer_price);
     renderFinal(p.overall, p.status); renderMeta(p);
     renderJobs(p.jobs);
     window._timelines = p.timelines;
@@ -206,6 +207,115 @@
     counts.innerHTML = map.map(([k, lab, cls]) =>
       `<span><span class="lab">${lab}</span><b class="${cls}">${z[k] ?? 0}</b></span>`).join("");
   }
+
+  // ---- 客户价可观测性(2026-09-03,只读):汇总随 summary 刷新(200/304 机制
+  // 驱动,无独立轮询链);明细仅在用户点击"查看明细"/过滤按钮时拉取。 ----
+  // 纯逻辑 seam(tests/js 直测,无 DOM):状态中文映射与行过滤/排序。
+  const CP_STATUS_CN = {
+    READY: "✓ 已获取", PENDING: "● 获取中", RETRYING: "↻ 待重试",
+    MISSING: "⚠ 客户价缺失", MISSING_PROVEN: "⚠ 客户价缺失",
+    FAILED: "✕ 获取失败", INVALID: "✕ 获取失败",
+  };
+  function cpStatusCn(key) {
+    return CP_STATUS_CN[key] || (key ? String(key) : "—");
+  }
+  function cpStatusPill(key) {
+    if (key === "READY") return "ok";
+    if (key === "RETRYING" || key === "PENDING") return "run";
+    if (key === "MISSING_PROVEN") return "warn";
+    if (key === "MISSING" || key === "FAILED" || key === "INVALID") return "err";
+    return "wait";
+  }
+  // 行是否命中过滤(与后端 project_customer_price 同语义;仅用于前端已拉取数据的本地再过滤兜底)。
+  function cpRowMatchesFilter(row, filter) {
+    const st = row && row.state;
+    if (filter === "retrying") return st === "RETRYING";
+    if (filter === "terminal") return st === "MISSING" || st === "FAILED" || st === "INVALID";
+    if (filter === "unacquired") return st !== "READY" && st !== "MISSING_PROVEN";
+    return true;   // all(含未知 filter,防御为 all)
+  }
+  // 未完成优先排序:获取中→待重试→缺失→失败→无效,证据缺席次之,已获取最后。
+  const CP_ORDER = { PENDING: 0, RETRYING: 1, MISSING: 2, FAILED: 3, INVALID: 4, MISSING_PROVEN: 5, READY: 6 };
+  function cpSortRows(rows) {
+    return (Array.isArray(rows) ? rows : []).slice()
+      .sort((a, b) => (CP_ORDER[a && a.state] ?? CP_ORDER.PENDING) - (CP_ORDER[b && b.state] ?? CP_ORDER.PENDING));
+  }
+  function renderCustomerPrice(cp) {
+    const box = $("#cp-counts");
+    if (!box) return;
+    if (!cp) { box.textContent = "客户价汇总暂不可用"; return; }
+    const pct = cp.required > 0
+      ? Math.round((Number(cp.ready || 0) / Number(cp.required)) * 100) + "%"
+      : "—";
+    const chips = [["已获取", cp.ready, "ok"], ["获取中", cp.pending, "run"],
+      ["待重试", cp.retrying, "warn"], ["缺失", cp.missing, "err"],
+      ["失败", cp.failed, "err"], ["无效", cp.invalid, "err"]];
+    let html = chips.map(([lab, v, cls]) =>
+      `<span><span class="lab">${lab}</span><b class="${cls}">${Number(v || 0)}</b></span>`).join("");
+    if (Number(cp.absent_proven || 0) > 0) {
+      html += `<span><span class="lab">证据齐全缺席</span><b class="warn">${Number(cp.absent_proven)}</b></span>`;
+    }
+    html += `<span><span class="lab">获取率</span><b>${esc(pct)}</b></span>`;
+    box.innerHTML = html;
+  }
+
+  let cpFilter = "unacquired";   // 明细默认"未获取"(先看拿不到的)
+  function renderCpRows(data) {
+    const tbody = $("#cp-table tbody");
+    const meta = $("#cp-meta");
+    if (!tbody) return;
+    const rows = cpSortRows((data && data.rows) || []);
+    tbody.innerHTML = rows.map((r) => `
+      <tr>
+        <td class="mono">${esc(r.document_id || "—")}</td>
+        <td class="cp-title" title="${esc(r.title || "")}">${esc(r.title || "—")}</td>
+        <td class="mono">${esc(r.sku_id || "—")}</td>
+        <td class="num">${r.saas_price == null ? "—" : esc(r.saas_price)}</td>
+        <td class="num">${r.customer_price == null ? "—" : esc(r.customer_price)}</td>
+        <td><span class="pill ${cpStatusPill(r.state)}">${esc(cpStatusCn(r.state))}</span></td>
+        <td class="num">${Number(r.attempts || 0)}/${Number(r.max_attempts || 3)}</td>
+        <td class="num">${r.updated_at ? esc(fmtShanghaiDateTime(r.updated_at)) : "—"}</td>
+        <td class="cp-err" title="${esc(r.error_text || "")}">${r.error_text ? esc(String(r.error_text).slice(0, 40)) : "—"}</td>
+      </tr>`).join("") ||
+      `<tr><td colspan="9" style="color:var(--muted)">当前过滤条件下没有明细行</td></tr>`;
+    if (meta) {
+      const truncated = Number((data && data.truncated) || 0);
+      meta.textContent = `共 ${Number((data && data.total_required) || 0)} 条需求价行,本次显示 ${rows.length}` +
+        (truncated > 0 ? `(已截断 ${truncated} 条,收窄过滤条件可见更多)` : "");
+    }
+  }
+  function markCpFilterButtons() {
+    document.querySelectorAll("#cp-filters .cp-filter").forEach((b) =>
+      b.classList.toggle("active", b.dataset.filter === cpFilter));
+  }
+  async function fetchCpRows() {
+    const tbody = $("#cp-table tbody");
+    if (tbody) tbody.innerHTML = `<tr><td colspan="9" style="color:var(--muted)">加载中…</td></tr>`;
+    try {
+      const res = await fetch(`/dashboard/api/customer-price?filter=${encodeURIComponent(cpFilter)}`);
+      if (!res.ok) throw new Error("HTTP " + res.status);
+      renderCpRows(await res.json());
+    } catch (e) {
+      if (tbody) tbody.innerHTML = `<tr><td colspan="9" style="color:var(--warn)">客户价明细读取失败,请稍后重试</td></tr>`;
+    }
+  }
+  function openCpDrawer() {
+    $("#cp-drawer").classList.add("show");
+    markCpFilterButtons();
+    // 明细只在用户打开/切换过滤时拉取(简单、可预期);汇总行仍随 summary 刷新。
+    fetchCpRows();
+  }
+  function wireCustomerPrice() {
+    const open = $("#cp-open");
+    if (open) open.addEventListener("click", openCpDrawer);
+    document.querySelectorAll("#cp-filters .cp-filter").forEach((b) =>
+      b.addEventListener("click", () => {
+        cpFilter = b.dataset.filter || "all";
+        markCpFilterButtons();
+        fetchCpRows();
+      }));
+  }
+
   function renderFinal(o, status) {
     const f = $("#final");
     f.className = "final" + (o.final_state === "ok" ? " ok" : "");
@@ -1234,6 +1344,7 @@
     });
     const sfRefresh = $("#sf-refresh");
     if (sfRefresh) sfRefresh.addEventListener("click", () => fetchSaasFlow(true));
+    wireCustomerPrice();            // 客户价汇总/明细(只读 GET;无独立轮询链)
     wireOperatorButtons();          // 受控操作按钮(唯一允许 POST 的入口)
     bootstrapOperatorContext();     // 拿 per-process 操作令牌;失败 → 按钮禁用
     setInterval(updateLive, 1000);
@@ -1248,7 +1359,8 @@
     fmtShanghaiDateTime, createCnncAuthFetcher,
     computeCloseoutBackendRunning, applyCloseoutRunningOverlay, isCloseoutWriter,
     resolveCloseoutActionsDate, closeoutUIRunning, updateCloseoutUI,
-    pollDelay, inCloseoutWatchWindow, _setCloseoutStateForTest };
+    pollDelay, inCloseoutWatchWindow, _setCloseoutStateForTest,
+    cpStatusCn, cpStatusPill, cpRowMatchesFilter, cpSortRows };
   if (typeof window !== "undefined") { window.Dashboards = api; }
   if (typeof module !== "undefined" && module.exports) { module.exports = api; }
   if (typeof document !== "undefined") { document.addEventListener("DOMContentLoaded", start); }

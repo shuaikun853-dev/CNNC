@@ -60,7 +60,8 @@ const { createPollController, createSaasFlowPoller, safeProgressText, sfPartialN
         createActionClient, actionOutcomeText, renderCnncAuth,
         fmtShanghaiDateTime, createCnncAuthFetcher, computeCloseoutBackendRunning,
         applyCloseoutRunningOverlay, isCloseoutWriter, resolveCloseoutActionsDate,
-        updateCloseoutUI, pollDelay, inCloseoutWatchWindow, _setCloseoutStateForTest } = require(
+        updateCloseoutUI, pollDelay, inCloseoutWatchWindow, _setCloseoutStateForTest,
+        cpStatusCn, cpStatusPill, cpRowMatchesFilter, cpSortRows } = require(
   path.join(__dirname, "..", "..", "app", "static", "dashboard", "app.js"));
 
 let failed = 0;
@@ -1110,6 +1111,47 @@ function test_closeout_r3_poll_watch_window() {
         typeof inCloseoutWatchWindow() === "boolean");
 }
 
+// ---- 客户价可观测性(2026-09-03,plan §8/§9.E):状态映射 + 过滤/排序纯函数 ----
+function test_customer_price_seams() {
+  check("CP 状态中文映射:READY→✓ 已获取 / PENDING→● 获取中 / RETRYING→↻ 待重试",
+        cpStatusCn("READY") === "✓ 已获取" && cpStatusCn("PENDING") === "● 获取中" &&
+        cpStatusCn("RETRYING") === "↻ 待重试");
+  check("CP 状态中文映射:MISSING 与 MISSING_PROVEN 同为 ⚠ 客户价缺失;FAILED/INVALID → ✕ 获取失败",
+        cpStatusCn("MISSING") === "⚠ 客户价缺失" && cpStatusCn("MISSING_PROVEN") === "⚠ 客户价缺失" &&
+        cpStatusCn("FAILED") === "✕ 获取失败" && cpStatusCn("INVALID") === "✕ 获取失败");
+  check("CP 未知状态透传原文,空值显示 —(esc 由调用方负责)",
+        cpStatusCn("SOMETHING_NEW") === "SOMETHING_NEW" && cpStatusCn("") === "—" &&
+        cpStatusCn(null) === "—");
+  check("CP 状态 pill 配色:ok/run/warn/err 分桶",
+        cpStatusPill("READY") === "ok" && cpStatusPill("PENDING") === "run" &&
+        cpStatusPill("RETRYING") === "run" && cpStatusPill("MISSING_PROVEN") === "warn" &&
+        cpStatusPill("MISSING") === "err" && cpStatusPill("FAILED") === "err" &&
+        cpStatusPill("INVALID") === "err" && cpStatusPill("OTHER") === "wait");
+  const rows = [
+    { id: "a", state: "READY" }, { id: "b", state: "MISSING" }, { id: "c", state: "PENDING" },
+    { id: "d", state: "MISSING_PROVEN" }, { id: "e", state: "RETRYING" },
+    { id: "f", state: "INVALID" }, { id: "g", state: "FAILED" }];
+  const sorted = cpSortRows(rows);
+  check("CP 排序:未完成(获取中→待重试→缺失→失败→无效)在前,证据缺席次之,已获取最后",
+        JSON.stringify(sorted.map((r) => r.id)) ===
+        JSON.stringify(["c", "e", "b", "g", "f", "d", "a"]));
+  check("CP 排序不 mutate 入参,未知状态兜底排最前(先处理)",
+        rows[0].id === "a" &&
+        cpSortRows([{ id: "x", state: "MYSTERY" }, { id: "y", state: "READY" }])[0].id === "x" &&
+        cpSortRows(null).length === 0);
+  check("CP 过滤 unacquired:排除 READY 与 MISSING_PROVEN,其余全含",
+        ["a", "b", "c", "d", "e", "f", "g"].filter((id) =>
+          cpRowMatchesFilter(rows.find((r) => r.id === id), "unacquired")).join(",") ===
+        "b,c,e,f,g");
+  check("CP 过滤 retrying / terminal:语义与后端 project_customer_price 一致",
+        rows.filter((r) => cpRowMatchesFilter(r, "retrying")).map((r) => r.id).join(",") === "e" &&
+        rows.filter((r) => cpRowMatchesFilter(r, "terminal")).map((r) => r.id).join(",") === "b,f,g");
+  check("CP 过滤 all 与未知值防御为全部(含异常入参不抛)",
+        rows.every((r) => cpRowMatchesFilter(r, "all")) &&
+        rows.every((r) => cpRowMatchesFilter(r, ";drop")) &&
+        cpRowMatchesFilter(null, "all") === true);
+}
+
 (async () => {
   await test_304_keeps_sync_fresh_without_rerender();
   await test_hidden_pauses_and_visible_resumes();
@@ -1145,6 +1187,7 @@ function test_closeout_r3_poll_watch_window() {
   test_closeout_r2_round2();
   test_closeout_r3_ops_unavailable();
   test_closeout_r3_poll_watch_window();
+  test_customer_price_seams();
   if (failed === 0) { console.log("ALL PASS"); process.exit(0); }
   console.error(failed + " failing checks");
   process.exit(1);

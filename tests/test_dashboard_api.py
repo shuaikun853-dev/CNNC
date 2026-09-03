@@ -494,6 +494,82 @@ def test_fingerprint_reflects_production_writer_activity():
     assert fingerprint_payload(base) != fingerprint_payload(busy)
 
 
+# ---- 客户价行级只读接口(2026-09-03,plan §8):GET 铁律与参数白名单 ----
+
+def test_customer_price_param_guards(client):
+    r = client.get("/dashboard/api/customer-price?tenant=1")
+    assert r.status_code == 400
+    assert r.json()["detail"]["error_code"] == "UNKNOWN_QUERY_PARAM"
+    r = client.get("/dashboard/api/customer-price?filter=;drop")
+    assert r.status_code == 400
+    assert r.json()["detail"]["error_code"] == "BAD_FILTER_PARAM"
+    r = client.get("/dashboard/api/customer-price?date=2026-02-30")
+    assert r.status_code == 400
+    assert r.json()["detail"]["error_code"] == "BAD_BUSINESS_DATE"
+    r = client.get("/dashboard/api/customer-price?date=2026/08/26")
+    assert r.status_code == 400
+
+
+def test_customer_price_write_methods_not_allowed(client):
+    for method in ("post", "put", "delete", "patch"):
+        r = getattr(client, method)("/dashboard/api/customer-price")
+        assert r.status_code == 405
+
+
+def test_customer_price_empty_200_when_no_state_file(client, monkeypatch, tmp_path):
+    from app import dashboard_api
+    monkeypatch.setattr(dashboard_api, "runtime_paths", lambda bd: type("P", (), {
+        "state_path": tmp_path / "absent.sqlite3"})())
+    r = client.get("/dashboard/api/customer-price?date=2026-08-11")
+    assert r.status_code == 200
+    assert r.headers["Cache-Control"] == "no-store"
+    body = r.json()
+    assert body == {
+        "business_date": "2026-08-11", "filter": "all", "total_required": 0,
+        "counts": {"ready": 0, "pending": 0, "retrying": 0, "missing": 0,
+                   "failed": 0, "invalid": 0, "absent_proven": 0},
+        "rows": [], "truncated": 0, "limit": 0, "max_attempts": 3}
+
+
+def test_customer_price_projects_readonly_payload(client, monkeypatch, tmp_path):
+    from app import dashboard_api
+    state = tmp_path / "state.sqlite3"
+    state.write_bytes(b"sqlite")   # 只需存在;投影被 monkeypatch,不发真 SQL
+    payload = {
+        "business_date": "2026-08-11", "filter": "unacquired", "total_required": 2,
+        "counts": {"ready": 0, "pending": 1, "retrying": 1, "missing": 0,
+                   "failed": 0, "invalid": 0, "absent_proven": 0},
+        "rows": [{"document_id": "v1", "state": "RETRYING", "attempts": 1,
+                  "max_attempts": 3, "error_text": "customerPriceStatus=NOT_FOUND"}],
+        "truncated": 0, "limit": 500, "max_attempts": 3}
+    seen = {}
+
+    def fake_project(state_path, business_date, *, filter="all"):
+        seen["args"] = (str(state_path), business_date, filter)
+        return payload
+
+    monkeypatch.setattr(dashboard_api, "runtime_paths", lambda bd: type("P", (), {
+        "state_path": state})())
+    monkeypatch.setattr(dashboard_api, "project_customer_price", fake_project)
+    r = client.get("/dashboard/api/customer-price?date=2026-08-11&filter=unacquired")
+    assert r.status_code == 200
+    assert r.headers["Cache-Control"] == "no-store"
+    assert r.json() == payload
+    assert seen["args"] == (str(state), "2026-08-11", "unacquired")
+
+
+def test_customer_price_frontend_hooks_and_no_independent_poll(client):
+    """前端契约:客户价区块/抽屉/过滤按钮存在;明细仅在打开/切换过滤时拉取
+    (fetchCpRows = 定义 + 打开触发 + 过滤触发,别无他处→无独立轮询链)。"""
+    html = client.get("/dashboard").text
+    js = client.get("/dashboard/static/app.js").text
+    for hook in ("cp-card", "cp-counts", "cp-open", "cp-drawer", "cp-filters", "cp-table"):
+        assert hook in html, hook
+    assert "/dashboard/api/customer-price" in js
+    assert "renderCustomerPrice" in js and "cpStatusCn" in js
+    assert js.count("fetchCpRows") == 3
+
+
 def test_production_writer_lock_blocks_second_process(tmp_path):
     """DashboardActionRunner._inflight 丢失(进程重启)后,底层 per-day
     production writer ProcessLock(OS 级 msvcrt/fcntl)仍是唯一单 writer fence。"""

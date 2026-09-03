@@ -330,16 +330,20 @@ def test_shared_runtime_detail_lock_serializes_workers_from_two_business_dates(t
         peak = max(peak, active)
         calls += 1
         active -= 1
-        return {"ok": True, "payload": {"referenceInfos": [{"referencePrice": "10"}]}}
+        # Shaped the way extract_customer_price_from_detail reads it so the
+        # worker returns a real success (a top-level referenceInfos used to be
+        # silently NOT_FOUND, which is now a durable business retry).
+        return {"ok": True, "payload": {"data": {"referenceInfos": [{"referencePrice": "10"}]}}}
 
     monkeypatch.setattr(runtime_module, "call_detail_api", detail_api)
     first = _detail_worker({}, detail_lock_path=lock_path, request_interval_seconds=0)
     second = _detail_worker({}, detail_lock_path=lock_path, request_interval_seconds=0)
     row = {"vCommodityId": "v1", "skuId": "s1", "fourCategoryId": "c"}
 
-    first(row, 5)
+    first_result = first(row, 5)
     second(row, 5)
 
+    assert first_result["customerPriceStatus"] == "FOUND_SINGLE_REFERENCE"
     assert calls == 2
     assert peak == 1
 

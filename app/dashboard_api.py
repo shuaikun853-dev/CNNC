@@ -27,7 +27,11 @@ from app.services.dashboard_manual_ops import (
     read_operator_actions,
     refresh_job_progress,
 )
-from app.services.dashboard_projection import build_dashboard_summary
+from app.services.dashboard_projection import (
+    build_dashboard_summary,
+    empty_customer_price_projection,
+    project_customer_price,
+)
 from app.services.incremental_audit_runtime import runtime_paths
 from app.services.saas_flow_diagnostic import get_saas_flow_diagnostic
 
@@ -38,6 +42,9 @@ _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 # saas-flow 只接受 date(YYYY-MM-DD)与 refresh=1(缓存行为标志);
 # tenant/pool/schema/table/sql 等任何 SQL 或 scope 可控参数一律 400。
 _SAAS_FLOW_ALLOWED_PARAMS = frozenset({"date", "refresh"})
+# customer-price 只接受 date(YYYY-MM-DD)与 filter(白名单枚举),其余一律 400。
+_CUSTOMER_PRICE_ALLOWED_PARAMS = frozenset({"date", "filter"})
+_CUSTOMER_PRICE_FILTERS = frozenset({"all", "unacquired", "retrying", "terminal"})
 
 # ---- 本机受控操作台(2026-08-28):进程启动时一次性生成的操作令牌 ----
 _ACTION_TOKEN = secrets.token_urlsafe(32)
@@ -139,6 +146,45 @@ def dashboard_saas_flow(
             "error_code": "SAAS_FLOW_READ_FAILED", "message": "SaaS 链路诊断读取失败,请稍后重试",
             "type": type(exc).__name__}) from exc
     return JSONResponse(payload, headers={"Cache-Control": "no-store"})
+
+
+@router.get("/api/customer-price")
+def dashboard_customer_price(
+    request: Request,
+    date: str = Query(default=None),
+    filter: str = Query(default="all"),
+) -> Response:
+    """客户价行级只读投影:GET 铁律——零业务写、零远端网络、文本全部脱敏。
+
+    state 文件不存在时返回 200 空结构(今日尚未开始不是错误);filter 非法
+    400 BAD_FILTER_PARAM;未知查询参数 400(与 saas-flow 同风格)。
+    """
+    unknown = set(request.query_params.keys()) - _CUSTOMER_PRICE_ALLOWED_PARAMS
+    if unknown:
+        raise HTTPException(status_code=400, detail={
+            "error_code": "UNKNOWN_QUERY_PARAM",
+            "message": "不支持的查询参数:" + ",".join(sorted(unknown))
+                       + ";本接口只接受 date(YYYY-MM-DD)与 filter"})
+    if filter not in _CUSTOMER_PRICE_FILTERS:
+        raise HTTPException(status_code=400, detail={
+            "error_code": "BAD_FILTER_PARAM",
+            "message": "filter 仅接受 all/unacquired/retrying/terminal"})
+    business_date = date or _today()
+    if not _valid_business_date(business_date):
+        raise HTTPException(status_code=400, detail={
+            "error_code": "BAD_BUSINESS_DATE", "message": "business_date 必须为合法的 YYYY-MM-DD 日历日期"})
+    paths = runtime_paths(business_date)
+    if not paths.state_path.is_file():
+        return JSONResponse(
+            empty_customer_price_projection(business_date, filter),
+            headers=_NO_STORE)
+    try:
+        payload = project_customer_price(paths.state_path, business_date, filter=filter)
+    except Exception as exc:  # 只读投影失败统一降级,不暴露堆栈
+        raise HTTPException(status_code=503, detail={
+            "error_code": "CUSTOMER_PRICE_READ_FAILED", "message": "客户价明细读取失败,请稍后重试",
+            "type": type(exc).__name__}) from exc
+    return JSONResponse(payload, headers=_NO_STORE)
 
 
 # ======================================================================

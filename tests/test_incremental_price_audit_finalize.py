@@ -388,7 +388,9 @@ def test_model_pending_and_unplanned_required_crawl_block_official_output(tmp_pa
     store.release_lease(token)
 
 
-def test_detail_terminal_is_materializable_but_missing_crawl_price_is_blocking(tmp_path):
+def test_detail_terminal_blocks_ordinary_finalize_and_counts_failed_price(tmp_path):
+    """Flipped with the customer-price gates: terminal DETAIL is no longer
+    materializable; the row's price evidence classifies as customer_price_failed."""
     store, snapshot = _seed(tmp_path, crawl_result={
         "page_price_value": None, "page_price_status": "PRICE_MISSING", "page_price_source": "招商局-价格不可见",
     })
@@ -405,12 +407,15 @@ def test_detail_terminal_is_materializable_but_missing_crawl_price_is_blocking(t
     built = build_frozen_audit_artifact(store, token, output_identity="daily-final-20260811")
 
     assert built.readiness.detail_terminal >= 1
+    assert built.readiness.customer_price_failed >= 1
     assert built.readiness.crawl_invalid_price >= 1
     assert built.readiness.ready is False
     store.release_lease(token)
 
 
-def test_detail_terminal_keeps_reference_price_blank_and_does_not_block_final(tmp_path):
+def test_detail_terminal_keeps_reference_price_blank_but_blocks_final(tmp_path):
+    """Flipped with the customer-price gates: the terminal DETAIL row keeps its
+    blank reference price, but the day no longer finalizes without it."""
     store, snapshot = _seed(tmp_path, rows=[_row(url="")])
     token = store.acquire_lease("2026-08-11", "terminal-detail", 60)
     item = store.ordered_snapshot_items(snapshot["id"])[0]
@@ -440,9 +445,9 @@ def test_detail_terminal_keeps_reference_price_blank_and_does_not_block_final(tm
     )
 
     assert built.readiness.detail_terminal == 1
-    assert built.readiness.ready is True
-    assert built.artifact is not None
-    assert built.artifact.enriched_rows[0]["customerPrice"] is None
+    assert built.readiness.customer_price_failed == 1
+    assert built.readiness.ready is False
+    assert built.artifact is None
     store.release_lease(token)
 
 
@@ -613,3 +618,156 @@ def test_blocked_readiness_never_writes_formal_workbook(tmp_path):
         )
 
     assert not output.exists()
+
+
+# ---- Customer-price gates (plan §6, matrix D) ------------------------------
+
+
+def _rework_detail(store, token, item_id, *, result=None, error=None):
+    """Give the item's DETAIL row fresh evidence (business gate test helper)."""
+    detail = next(
+        row for row in store.list_stage_work(token, stage="DETAIL")
+        if row["audit_item_id"] == item_id
+    )
+    detail = store.ensure_stage_work(
+        token, item_id, "DETAIL", detail["fingerprint"] + "-rework"
+    )
+    claimed = store.claim_stage_work(
+        token, detail["id"], max_attempts=1, max_elapsed_seconds=300
+    )
+    assert claimed is not None
+    if error is not None:
+        store.fail_stage_work(
+            token, detail["id"], elapsed_seconds=1, error=error, retryable=True,
+            max_attempts=1, max_elapsed_seconds=1,
+        )
+    else:
+        store.complete_stage_work(token, detail["id"], result)
+
+
+NOT_FOUND_ERROR = "customerPriceStatus=NOT_FOUND；详情接口未返回有效参考价"
+
+
+def test_customer_price_pending_blocks_finalize(tmp_path):
+    store, snapshot = _seed(tmp_path, rows=[_row(url="")])
+    token = store.acquire_lease("2026-08-11", "pending", 60)
+    item = store.ordered_snapshot_items(snapshot["id"])[0]
+    detail = next(row for row in store.list_stage_work(token, stage="DETAIL") if row["audit_item_id"] == item["id"])
+    # A changed fingerprint resets the row to durable PENDING.
+    store.ensure_stage_work(token, item["id"], "DETAIL", detail["fingerprint"] + "-pending")
+
+    built = build_frozen_audit_artifact(store, token, output_identity="daily-final-20260811")
+
+    assert built.readiness.customer_price_pending == 1
+    assert built.readiness.detail_pending == 1
+    assert built.readiness.ready is False
+    store.release_lease(token)
+
+
+def test_customer_price_missing_after_not_found_exhaustion_blocks_finalize(tmp_path):
+    store, snapshot = _seed(tmp_path, rows=[_row(url="")])
+    token = store.acquire_lease("2026-08-11", "missing", 60)
+    item = store.ordered_snapshot_items(snapshot["id"])[0]
+    _rework_detail(store, token, item["id"], error=NOT_FOUND_ERROR)
+
+    built = build_frozen_audit_artifact(store, token, output_identity="daily-final-20260811")
+
+    assert built.readiness.customer_price_missing == 1
+    assert built.readiness.detail_terminal == 1
+    assert built.readiness.ready is False
+    assert built.artifact is None
+    store.release_lease(token)
+
+
+def test_legacy_success_without_price_blocks_finalize(tmp_path):
+    """Old invalid-success rows (SUCCESS + status failed + price None) block."""
+    store, snapshot = _seed(tmp_path, rows=[_row(url="")])
+    token = store.acquire_lease("2026-08-11", "legacy", 60)
+    item = store.ordered_snapshot_items(snapshot["id"])[0]
+    _rework_detail(store, token, item["id"], result={
+        "customerPrice": None,
+        "customerPriceStatus": "DETAIL_REQUEST_FAILED",
+        "customerPriceSource": "",
+        "customerPriceWarning": "详情接口业务失败：rspCode=500",
+        "customerPriceEvidence": "",
+    })
+
+    built = build_frozen_audit_artifact(store, token, output_identity="daily-final-20260811")
+
+    assert built.readiness.customer_price_failed == 1
+    assert built.readiness.ready is False
+    assert built.artifact is None
+    store.release_lease(token)
+
+
+def test_zero_price_success_counts_invalid_and_blocks_finalize(tmp_path):
+    store, snapshot = _seed(tmp_path, rows=[_row(url="")])
+    token = store.acquire_lease("2026-08-11", "invalid", 60)
+    item = store.ordered_snapshot_items(snapshot["id"])[0]
+    _rework_detail(store, token, item["id"], result={
+        "customerPrice": "0",
+        "customerPriceStatus": "FOUND",
+        "customerPriceSource": "DETAIL_REFERENCE_INFOS",
+        "customerPriceWarning": "",
+        "customerPriceEvidence": "参考价1=0",
+    })
+
+    built = build_frozen_audit_artifact(store, token, output_identity="daily-final-20260811")
+
+    assert built.readiness.customer_price_invalid == 1
+    assert built.readiness.ready is False
+    store.release_lease(token)
+
+
+def test_valid_customer_price_keeps_finalize_ready(tmp_path):
+    store, _snapshot = _seed(tmp_path, rows=[_row(url="")])
+    token = store.acquire_lease("2026-08-11", "valid", 60)
+
+    built = build_frozen_audit_artifact(store, token, output_identity="daily-final-20260811")
+
+    assert built.readiness.ready is True
+    assert built.readiness.customer_price_missing == 0
+    assert built.readiness.customer_price_failed == 0
+    assert built.readiness.customer_price_invalid == 0
+    assert built.readiness.customer_price_absent_proven == 0
+    assert built.artifact is not None
+    assert built.artifact.enriched_rows[0]["customerPrice"] is not None
+    store.release_lease(token)
+
+
+@pytest.mark.parametrize("status", ["LOOKUP_FAILED", "DETAIL_REQUEST_SKIPPED", "NOT_PROVIDED"])
+def test_proven_absent_customer_price_does_not_block_finalize(tmp_path, status):
+    store, snapshot = _seed(tmp_path, rows=[_row(url="")])
+    token = store.acquire_lease("2026-08-11", "absent", 60)
+    item = store.ordered_snapshot_items(snapshot["id"])[0]
+    _rework_detail(store, token, item["id"], result={
+        "customerPrice": None,
+        "customerPriceStatus": status,
+        "customerPriceSource": "",
+        "customerPriceWarning": "authoritative customer export has no such document",
+        "customerPriceEvidence": "",
+    })
+
+    built = build_frozen_audit_artifact(store, token, output_identity="daily-final-20260811")
+
+    # Evidence-complete deterministic absence closes out without blocking, and
+    # the reference price stays blank in the enriched row.
+    assert built.readiness.ready is True
+    assert built.readiness.customer_price_absent_proven == 1
+    assert built.artifact is not None
+    assert built.artifact.enriched_rows[0]["customerPrice"] is None
+    assert built.artifact.enriched_rows[0]["customerPriceStatus"] == status
+    store.release_lease(token)
+
+
+def test_detail_failure_keeps_decoded_status_from_error_prefix():
+    from app.workflows.incremental_price_audit_finalize import _detail_failure
+
+    decoded = _detail_failure(NOT_FOUND_ERROR)
+    assert decoded["customerPriceStatus"] == "NOT_FOUND"
+    assert decoded["customerPrice"] is None
+    assert "详情接口未返回有效参考价" in decoded["customerPriceWarning"]
+
+    fallback = _detail_failure("TimeoutError")
+    assert fallback["customerPriceStatus"] == "DETAIL_REQUEST_FAILED"
+    assert fallback["customerPriceWarning"].startswith("增量详情阶段失败：TimeoutError")

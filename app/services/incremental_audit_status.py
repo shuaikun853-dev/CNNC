@@ -10,6 +10,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Iterable
 
+from app.services.customer_price_semantics import customer_price_business_state
 from app.services.daily_audit_store import ProcessLock
 from app.services.incremental_audit_runtime import DEFAULT_RUNTIME_ROOT, runtime_paths
 from app.services.legacy_zhaoshang_adapter import EXTERNAL_TOOL_PATH
@@ -33,6 +34,26 @@ def _empty_stage() -> dict[str, int]:
     return {"pending": 0, "running": 0, "completed": 0, "terminal": 0, "attempts": 0}
 
 
+def _empty_customer_price() -> dict[str, int]:
+    """Business view of the customer-price evidence behind ``detail``.
+
+    Additive-only keys (never remove or repurpose); ``ratio`` is
+    ``ready / required`` rounded to two decimals, ``0`` when nothing is
+    required yet.
+    """
+    return {
+        "customer_price_required": 0,
+        "customer_price_ready": 0,
+        "customer_price_pending": 0,
+        "customer_price_retrying": 0,
+        "customer_price_missing": 0,
+        "customer_price_failed": 0,
+        "customer_price_invalid": 0,
+        "customer_price_absent_proven": 0,
+        "customer_price_ratio": 0,
+    }
+
+
 def _empty_crawl_pending_breakdown() -> dict[str, int]:
     """Fine-grained view of crawl.pending; the buckets sum to ``pending``.
 
@@ -53,14 +74,17 @@ def _empty_crawl_pending_breakdown() -> dict[str, int]:
 
 
 def _empty_blocker_summary() -> dict[str, int]:
-    """Exact component decomposition of ``final.computed_pending``.
+    """Component decomposition of ``final.computed_pending`` plus cross-views.
 
-    ``final.pending`` mixes item-level and remote-job-level blockers, so it is
-    never a commodity count.  These components reproduce the computed sum
-    one-to-one and stay additive-only to keep existing consumers stable.
+    The first twelve keys reproduce the computed sum one-to-one and stay
+    additive-only to keep existing consumers stable.  ``detail_terminal`` is
+    part of that sum (a terminal detail now blocks as manual review); the
+    ``customer_price_*`` keys are an additional business cross-cut over the
+    same detail rows and deliberately overlap the detail keys.
     """
     return {
         "detail_pending": 0,
+        "detail_terminal": 0,
         "model_pending": 0,
         "model_terminal": 0,
         "crawl_pending": 0,
@@ -72,6 +96,10 @@ def _empty_blocker_summary() -> dict[str, int]:
         "remote_pending": 0,
         "remote_unknown": 0,
         "remote_manual": 0,
+        "customer_price_pending": 0,
+        "customer_price_missing": 0,
+        "customer_price_failed": 0,
+        "customer_price_invalid": 0,
     }
 
 
@@ -101,7 +129,7 @@ def _empty_status(
         "latest_snapshot": None,
         "frozen_snapshot_id": None,
         "counts": {"discovered": 0, "unique_items": 0, "new": 0, "changed": 0, "processed": 0},
-        "detail": _empty_stage(),
+        "detail": {**_empty_stage(), **_empty_customer_price()},
         "model": _empty_stage(),
         "crawl": {
             "pending": 0, "running": 0, "completed": 0, "no_result": 0,
@@ -179,6 +207,77 @@ def _stage_status(connection: sqlite3.Connection, snapshot_id: int, stage: str, 
     }
 
 
+def _customer_price_summary(
+    connection: sqlite3.Connection, snapshot_id: int, expected: int
+) -> dict[str, int]:
+    """Classify each DETAIL row's evidence with the shared semantics module.
+
+    Read-only: joins the same snapshot membership the technical
+    ``_stage_status`` view uses but additionally reads ``result_json`` /
+    ``error_text``; the technical keys' numbers never come from here.
+
+    Invariant: ready+pending+retrying+missing+failed+invalid+absent_proven
+    equals ``customer_price_required`` — a snapshot member with no DETAIL
+    stage row yet (snapshot landed, the tick has not claimed its detail work)
+    is pending exactly like ``_stage_status`` counts it, never invisible.
+    """
+    summary = {
+        "ready": 0,
+        "pending": 0,
+        "retrying": 0,
+        "missing": 0,
+        "failed": 0,
+        "invalid": 0,
+        "absent_proven": 0,
+    }
+    rows = connection.execute(
+        """SELECT w.state, w.result_json, w.error_text
+           FROM stage_work w
+           JOIN (SELECT DISTINCT audit_item_id FROM snapshot_members WHERE snapshot_id=?) m
+             ON m.audit_item_id=w.audit_item_id
+           WHERE w.stage=?""",
+        (snapshot_id, "DETAIL"),
+    ).fetchall()
+    represented = len(rows)
+    for row in rows:
+        try:
+            decoded = json.loads(str(row["result_json"] or ""))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            decoded = None
+        result = decoded if isinstance(decoded, dict) else None
+        state = customer_price_business_state(row["state"], result, row["error_text"])
+        if state.key == "READY":
+            summary["ready"] += 1
+        elif state.key == "PENDING":
+            summary["pending"] += 1
+        elif state.key == "RETRYING":
+            summary["retrying"] += 1
+        elif state.key == "MISSING":
+            summary["missing"] += 1
+        elif state.key == "MISSING_PROVEN":
+            summary["absent_proven"] += 1
+        elif state.key == "FAILED":
+            summary["failed"] += 1
+        elif state.key == "INVALID":
+            summary["invalid"] += 1
+    required = max(0, int(expected))
+    # Snapshot members without a stage row classify as PENDING (semantics rule
+    # "(no stage row)"), mirroring the max(0, expected - represented) term the
+    # technical ``_stage_status`` pending uses.
+    summary["pending"] += max(0, required - represented)
+    return {
+        "customer_price_required": required,
+        "customer_price_ready": summary["ready"],
+        "customer_price_pending": summary["pending"],
+        "customer_price_retrying": summary["retrying"],
+        "customer_price_missing": summary["missing"],
+        "customer_price_failed": summary["failed"],
+        "customer_price_invalid": summary["invalid"],
+        "customer_price_absent_proven": summary["absent_proven"],
+        "customer_price_ratio": round(summary["ready"] / required, 2) if required else 0,
+    }
+
+
 def _next_actions(status: dict[str, Any]) -> list[str]:
     if status["state"] == "FINALIZED":
         return ["none; the frozen daily workbook is finalized"]
@@ -189,7 +288,10 @@ def _next_actions(status: dict[str, Any]) -> list[str]:
         ]
     if status["remote"]["unknown"]:
         return ["run doctor, then let a later tick reconcile the exact remote identity; do not resubmit"]
-    if status["remote"]["manual"] or status["model"]["terminal"] or status["crawl"]["manual"]:
+    # detail terminal = 客户价重试预算耗尽(MISSING/FAILED/INVALID),与 model terminal
+    # 同为"重试已耗尽、需先看失败证据"的人工检查条件;不得建议继续跑 tick 掩盖它。
+    if status["remote"]["manual"] or status["model"]["terminal"] \
+            or status["crawl"]["manual"] or status["detail"]["terminal"]:
         return ["inspect terminal/manual evidence before rerunning; do not delete durable state"]
     if status["crawl"]["unplanned"]:
         return ["inspect required snapshot rows without crawl work; do not finalize or submit without explicit authorization"]
@@ -253,6 +355,7 @@ def collect_runtime_status(
                 ).fetchone()[0]
             )
             detail = _stage_status(connection, latest_id, "DETAIL", unique_items)
+            detail.update(_customer_price_summary(connection, latest_id, unique_items))
             model = _stage_status(connection, latest_id, "MODEL", unique_items)
 
         crawl_states = _group_counts(
@@ -389,7 +492,7 @@ def collect_runtime_status(
         "superseded": remote_states.get("SUPERSEDED", 0),
     }
     computed_final_pending = (
-        detail["pending"] + detail["running"]
+        detail["pending"] + detail["running"] + detail["terminal"]
         + model["pending"] + model["running"] + model["terminal"]
         + crawl["pending"] + crawl["running"] + crawl["unplanned"]
         + crawl["planning_pending"] + crawl["unknown"] + crawl["manual"]
@@ -440,10 +543,13 @@ def collect_runtime_status(
             "output_path": output_path,
             "output_exists": bool(output_path and Path(output_path).is_file()),
             "manifest_recorded": bool(run["final_manifest_hash"]),
-            # Exact additive decomposition of computed_pending; the components
-            # sum to it one-to-one and never pretend it is a commodity count.
+            # The detail/model/crawl/remote keys decompose computed_pending
+            # one-to-one.  detail_terminal is part of that sum (terminal detail
+            # now blocks); the customer_price_* keys are a business cross-cut
+            # over the same detail rows and deliberately overlap them.
             "blocker_summary": {
                 "detail_pending": detail["pending"] + detail["running"],
+                "detail_terminal": detail["terminal"],
                 "model_pending": model["pending"] + model["running"],
                 "model_terminal": model["terminal"],
                 "crawl_pending": crawl["pending"] + crawl["running"],
@@ -455,6 +561,10 @@ def collect_runtime_status(
                 "remote_pending": remote["pending"] + remote["running"] + remote["exported"],
                 "remote_unknown": remote["unknown"],
                 "remote_manual": remote["manual"],
+                "customer_price_pending": detail.get("customer_price_pending", 0),
+                "customer_price_missing": detail.get("customer_price_missing", 0),
+                "customer_price_failed": detail.get("customer_price_failed", 0),
+                "customer_price_invalid": detail.get("customer_price_invalid", 0),
             },
         },
         "lease": {

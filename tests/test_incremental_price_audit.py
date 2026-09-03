@@ -300,7 +300,10 @@ def test_customer_change_reprocesses_changed_item_and_elapsed_cap_is_terminal(tm
     assert first.counters["detail_requests"] == 0
 
 
-def test_detail_terminal_does_not_require_manual_review_but_model_terminal_does(tmp_path):
+def test_detail_terminal_requires_manual_review_like_model_terminal(tmp_path):
+    """Flipped with the customer-price gates: an exhausted DETAIL retry budget
+    means the row's price-review baseline is unresolved, so the tick ends in
+    MANUAL_REVIEW_REQUIRED exactly like a terminal MODEL row."""
     store = DailyAuditStore(tmp_path / "state.sqlite")
     clock = Clock()
     detail_deps = _deps([], [_row()], clock)
@@ -323,8 +326,11 @@ def test_detail_terminal_does_not_require_manual_review_but_model_terminal_does(
         store, ProcessLock(tmp_path / "tick.lock"), config, detail_deps
     )
 
-    assert detail_summary.outcome == "COMPLETED"
+    assert detail_summary.outcome == "MANUAL_REVIEW_REQUIRED"
     assert detail_summary.backlog["detail_terminal"] == 1
+    # A plain exception carries no business prefix, so the row classifies as
+    # customer-price FAILED rather than MISSING.
+    assert detail_summary.backlog["customer_price_failed"] == 1
     assert detail_summary.backlog["model_terminal"] == 0
 
     model_store = DailyAuditStore(tmp_path / "model-state.sqlite")

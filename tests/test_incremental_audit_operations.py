@@ -9,6 +9,7 @@ import time
 from datetime import UTC, datetime
 from pathlib import Path
 
+from app.services.customer_price_semantics import DetailBusinessRetryRequired
 from app.services.daily_audit_store import DailyAuditStore, ProcessLock
 from app.services.incremental_audit_runtime import RuntimeResult, run_runtime_command, runtime_paths
 from app.services.incremental_audit_status import (
@@ -141,7 +142,10 @@ def test_status_computes_pending_instead_of_trusting_stale_tick_metric(tmp_path)
     assert status["final"]["pending"] == status["final"]["computed_pending"] == 1
 
 
-def test_status_keeps_detail_terminal_evidence_without_counting_it_as_final_pending(tmp_path):
+def test_status_counts_detail_terminal_in_final_pending_after_customer_price_gates(tmp_path):
+    """Flipped with the customer-price gates: a terminal DETAIL row is an
+    unresolved price-review baseline, so it now counts inside computed_pending
+    and its business failure is visible in the customer_price_* projection."""
     root = tmp_path / "runtime"
     dependencies = _dependencies()
     dependencies = TickDependencies(
@@ -164,7 +168,14 @@ def test_status_keeps_detail_terminal_evidence_without_counting_it_as_final_pend
 
     assert status["detail"]["terminal"] == 1
     assert status["model"]["completed"] == 1
-    assert status["final"]["pending"] == status["final"]["computed_pending"] == 0
+    # detail.terminal is now part of the computed pending sum (it blocks as
+    # manual review); a plain exception has no business prefix, so the row
+    # classifies as customer_price_failed.
+    assert status["final"]["pending"] == status["final"]["computed_pending"] == 1
+    assert status["final"]["blocker_summary"]["detail_terminal"] == 1
+    assert status["final"]["blocker_summary"]["customer_price_failed"] == 1
+    assert status["detail"]["customer_price_failed"] == 1
+    assert status["detail"]["customer_price_ratio"] == 0
 
 
 def test_status_reports_no_result_as_nonblocking_business_outcome(tmp_path):
@@ -367,6 +378,7 @@ def test_status_final_blocker_summary_decomposes_computed_pending(tmp_path):
     assert final["computed_pending"] == 8
     assert final["blocker_summary"] == {
         "detail_pending": 0,
+        "detail_terminal": 0,
         "model_pending": 0,
         "model_terminal": 0,
         "crawl_pending": 5,
@@ -378,6 +390,10 @@ def test_status_final_blocker_summary_decomposes_computed_pending(tmp_path):
         "remote_pending": 2,
         "remote_unknown": 0,
         "remote_manual": 1,
+        "customer_price_pending": 0,
+        "customer_price_missing": 0,
+        "customer_price_failed": 0,
+        "customer_price_invalid": 0,
     }
     assert sum(final["blocker_summary"].values()) == final["computed_pending"]
 
@@ -426,6 +442,226 @@ def test_missing_status_and_status_command_are_read_only(tmp_path, capsys):
     assert payload["run_id"] is None
     assert payload["counts"]["discovered"] == 0
     assert not root.exists()
+
+
+# ---- Customer-price projection on the detail stage (plan §7) ---------------
+
+
+def _tick(root, *, detail):
+    dependencies = _dependencies()
+    dependencies = TickDependencies(
+        discover=dependencies.discover,
+        detail=detail,
+        model=dependencies.model,
+        wall_clock=dependencies.wall_clock,
+    )
+    return run_runtime_command(
+        "tick",
+        business_date=BUSINESS_DATE,
+        runtime_root=root,
+        dependencies=dependencies,
+    )
+
+
+_FOUND_RESULT = {
+    "customerPrice": "10",
+    "customerPriceStatus": "FOUND",
+    "customerPriceSource": "DETAIL_REFERENCE_INFOS",
+    "customerPriceWarning": "",
+    "customerPriceEvidence": "参考价1=10",
+}
+
+
+def test_customer_price_projection_ready_row_and_ratio(tmp_path):
+    root = tmp_path / "runtime"
+    _tick(root, detail=lambda _row, _timeout: dict(_FOUND_RESULT))
+
+    status = collect_runtime_status(business_date=BUSINESS_DATE, runtime_root=root)
+    detail = status["detail"]
+
+    # Old technical keys keep their numbers and their sources.
+    assert detail["completed"] == 1
+    assert detail["pending"] == 0
+    assert detail["terminal"] == 0
+    # New business projection.
+    assert detail["customer_price_required"] == 1
+    assert detail["customer_price_ready"] == 1
+    assert detail["customer_price_pending"] == 0
+    assert detail["customer_price_retrying"] == 0
+    assert detail["customer_price_missing"] == 0
+    assert detail["customer_price_failed"] == 0
+    assert detail["customer_price_invalid"] == 0
+    assert detail["customer_price_absent_proven"] == 0
+    assert detail["customer_price_ratio"] == 1.0
+    assert status["final"]["computed_pending"] == 0
+    assert status["final"]["blocker_summary"]["customer_price_missing"] == 0
+
+
+def test_customer_price_projection_retrying_row(tmp_path):
+    root = tmp_path / "runtime"
+
+    def detail(_row, _timeout):
+        raise DetailBusinessRetryRequired({
+            "customerPrice": None,
+            "customerPriceStatus": "NOT_FOUND",
+            "customerPriceSource": "",
+            "customerPriceWarning": "详情接口未返回有效参考价",
+            "customerPriceEvidence": "",
+        })
+
+    _tick(root, detail=detail)
+    status = collect_runtime_status(business_date=BUSINESS_DATE, runtime_root=root)
+    detail_status = status["detail"]
+
+    # Technical view: still retryable work in flight (old pending counts it).
+    assert detail_status["pending"] == 1
+    assert detail_status["terminal"] == 0
+    # Business view: the row is retrying, not yet missing.
+    assert detail_status["customer_price_retrying"] == 1
+    assert detail_status["customer_price_pending"] == 0
+    assert detail_status["customer_price_missing"] == 0
+    assert detail_status["customer_price_ratio"] == 0
+    assert status["final"]["computed_pending"] == 1
+    assert status["final"]["blocker_summary"]["customer_price_pending"] == 0
+    assert status["final"]["blocker_summary"]["customer_price_missing"] == 0
+
+
+def test_customer_price_projection_missing_row_after_budget_exhaustion(tmp_path):
+    root = tmp_path / "runtime"
+
+    def detail(_row, _timeout):
+        raise DetailBusinessRetryRequired({
+            "customerPrice": None,
+            "customerPriceStatus": "NOT_FOUND",
+            "customerPriceSource": "",
+            "customerPriceWarning": "详情接口未返回有效参考价",
+            "customerPriceEvidence": "",
+        })
+
+    for _attempt in range(3):
+        _tick(root, detail=detail)
+
+    status = collect_runtime_status(business_date=BUSINESS_DATE, runtime_root=root)
+    detail_status = status["detail"]
+
+    assert detail_status["terminal"] == 1
+    assert detail_status["pending"] == 0
+    assert detail_status["customer_price_missing"] == 1
+    assert detail_status["customer_price_retrying"] == 0
+    assert detail_status["customer_price_ratio"] == 0
+    # terminal detail now contributes to computed_pending and is named in the
+    # blocker summary next to the business counter.
+    assert status["final"]["computed_pending"] == 1
+    assert status["final"]["blocker_summary"]["detail_terminal"] == 1
+    assert status["final"]["blocker_summary"]["customer_price_missing"] == 1
+
+
+def test_customer_price_projection_flags_legacy_invalid_success_as_failed(tmp_path):
+    """A legacy SUCCESS carrying a retryable business failure classifies as failed."""
+    root = tmp_path / "runtime"
+    _tick(root, detail=lambda _row, _timeout: {
+        "customerPrice": None,
+        "customerPriceStatus": "NOT_FOUND",
+        "customerPriceSource": "",
+        "customerPriceWarning": "详情接口未返回有效参考价",
+        "customerPriceEvidence": "",
+    })
+
+    status = collect_runtime_status(business_date=BUSINESS_DATE, runtime_root=root)
+    detail_status = status["detail"]
+
+    # Technical keys stay SUCCESS-based (unchanged sources).
+    assert detail_status["completed"] == 1
+    assert detail_status["terminal"] == 0
+    # Business view exposes the invalid success.
+    assert detail_status["customer_price_failed"] == 1
+    assert detail_status["customer_price_ready"] == 0
+    assert detail_status["customer_price_ratio"] == 0
+    assert status["final"]["blocker_summary"]["customer_price_failed"] == 1
+
+
+def test_customer_price_projection_absent_proven_row(tmp_path):
+    root = tmp_path / "runtime"
+    _tick(root, detail=lambda _row, _timeout: {
+        "customerPrice": None,
+        "customerPriceStatus": "LOOKUP_FAILED",
+        "customerPriceSource": "",
+        "customerPriceWarning": "customer export did not contain this documentId",
+        "customerPriceEvidence": "",
+    })
+
+    status = collect_runtime_status(business_date=BUSINESS_DATE, runtime_root=root)
+    detail_status = status["detail"]
+
+    assert detail_status["completed"] == 1
+    assert detail_status["customer_price_absent_proven"] == 1
+    assert detail_status["customer_price_missing"] == 0
+    assert detail_status["customer_price_ratio"] == 0
+    assert status["final"]["blocker_summary"]["customer_price_missing"] == 0
+
+
+def test_customer_price_pending_includes_members_without_stage_row(tmp_path):
+    """A snapshot member with no DETAIL stage row yet is customer-price pending.
+
+    Invariant: the seven business buckets always sum to
+    customer_price_required — a row must never become invisible just because
+    the tick has not created its stage work (same evidence _stage_status's
+    max(0, expected - represented) pending term counts).
+    """
+    root = tmp_path / "runtime"
+    _tick(root, detail=lambda _row, _timeout: dict(_FOUND_RESULT))
+
+    # A new snapshot lands with one more commodity before the next detail tick:
+    # the new member has no DETAIL stage_work row yet.
+    paths = runtime_paths(BUSINESS_DATE, root)
+    store = DailyAuditStore(paths.state_path)
+    lease = store.acquire_lease(BUSINESS_DATE, "seed-stage-less-member", 60)
+    try:
+        store.ingest_snapshot(
+            lease,
+            [
+                {
+                    "vCommodityId": "v1",
+                    "documentId": "v1",
+                    "skuId": "sku-1",
+                    "extLink": "",
+                },
+                {
+                    "vCommodityId": "v2",
+                    "documentId": "v2",
+                    "skuId": "sku-2",
+                    "extLink": "",
+                },
+            ],
+            source_fingerprints=["source-v1", "source-v2"],
+            customer_fingerprints=["customer-v1", "customer-v2"],
+        )
+    finally:
+        store.release_lease(lease)
+
+    detail = collect_runtime_status(business_date=BUSINESS_DATE, runtime_root=root)["detail"]
+
+    assert detail["customer_price_required"] == 2
+    assert detail["customer_price_ready"] == 1
+    assert detail["customer_price_pending"] == 1  # the stage-row-less member
+    assert detail["customer_price_retrying"] == 0
+    assert detail["customer_price_missing"] == 0
+    assert detail["customer_price_failed"] == 0
+    assert detail["customer_price_invalid"] == 0
+    assert detail["customer_price_absent_proven"] == 0
+    bucket_sum = sum(
+        detail[key]
+        for key in (
+            "customer_price_ready",
+            "customer_price_pending",
+            "customer_price_retrying",
+            "customer_price_missing",
+            "customer_price_failed",
+            "customer_price_invalid",
+            "customer_price_absent_proven",
+        )
+    )
+    assert bucket_sum == detail["customer_price_required"]
 
 
 def test_daily_status_is_atomic_convenience_snapshot(tmp_path):

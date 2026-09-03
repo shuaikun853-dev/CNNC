@@ -417,9 +417,11 @@ def test_model_same_participates_in_approve():
         extLink="https://item.jd.com/100237336261.html",
         price="10.00",
         pageActualPrice="10.00",
+        customerPrice="10.00",
     ), title_model_result=model)
     assert result.title_match_result == "SAME"
     assert result.title_match_confidence == 0.91
+    assert result.price_vs_customer_check == "WITHIN_THRESHOLD"
     assert result.primary_action == WorkflowAction.APPROVE
 
 
@@ -502,10 +504,12 @@ def test_likely_match_sku_match_price_match_approve():
         extLink="https://item.jd.com/100237336261.html",
         price="10.00",
         pageActualPrice="10.00",
+        customerPrice="10.00",
     ), use_model=False)
     assert result.title_match_result == "SAME"
     assert result.sku_link_check == "MATCH"
     assert result.price_check == "MATCH"
+    assert result.price_vs_customer_check == "WITHIN_THRESHOLD"
     assert result.primary_action == WorkflowAction.APPROVE
 
 
@@ -631,6 +635,8 @@ def test_crawl_customer_price_missing_and_invalid_do_not_trigger_high_price_reje
     assert invalid.price_vs_customer_check == "CUSTOMER_PRICE_INVALID"
     assert missing.primary_action != WorkflowAction.REJECT
     assert invalid.primary_action != WorkflowAction.REJECT
+    assert missing.primary_action != WorkflowAction.APPROVE
+    assert invalid.primary_action != WorkflowAction.APPROVE
 
 
 def test_crawl_result_does_not_call_browser_audit(monkeypatch):
@@ -647,7 +653,7 @@ def test_crawl_result_does_not_call_browser_audit(monkeypatch):
 
 def test_ocr_price_source_cannot_directly_approve():
     model = TitleMatchModelResult(match_result="SAME", confidence=0.91, model_match="exact")
-    result = audit_saas_approval_item(_item(queryStr="阀门 DN20", skuName="阀门 DN20", price="10.00"), title_model_result=model, crawl_results=[_crawl(page_price="10.00", price_source="OCR")], use_crawl_result=True)
+    result = audit_saas_approval_item(_item(queryStr="阀门 DN20", skuName="阀门 DN20", price="10.00", customerPrice="10.00"), title_model_result=model, crawl_results=[_crawl(page_price="10.00", price_source="OCR")], use_crawl_result=True)
     assert result.primary_action == WorkflowAction.MANUAL_CHECK
     assert "价格仅来自 OCR" in " ".join(result.evidence)
 
@@ -737,7 +743,7 @@ def test_page_actual_price_takes_priority_for_customer_price_check():
     assert result.primary_action == WorkflowAction.REJECT
 
 
-def test_customer_price_missing_does_not_trigger_threshold_rule():
+def test_customer_price_missing_blocks_auto_approve():
     model = TitleMatchModelResult(match_result="SAME", confidence=0.91, model_match="exact")
     result = audit_saas_approval_item(_item(
         queryStr="阀门 DN20",
@@ -746,7 +752,9 @@ def test_customer_price_missing_does_not_trigger_threshold_rule():
         pageActualPrice="100",
     ), title_model_result=model)
     assert result.price_vs_customer_check == "CUSTOMER_PRICE_MISSING"
-    assert result.primary_action == WorkflowAction.APPROVE
+    # 客户价是价格审核基准：缺失时绝不允许自动通过（哪怕其余条件全部满足）。
+    assert result.primary_action == WorkflowAction.MANUAL_CHECK
+    assert "缺少有效客户价" in result.reason
 
 
 def test_zero_customer_price_does_not_trigger_high_price_reject():
@@ -760,6 +768,7 @@ def test_zero_customer_price_does_not_trigger_high_price_reject():
     ), title_model_result=model)
     assert result.price_vs_customer_check == "CUSTOMER_PRICE_INVALID"
     assert result.primary_action != WorkflowAction.REJECT
+    assert result.primary_action != WorkflowAction.APPROVE
     evidence = " ".join(result.evidence)
     assert "客户价格无效" in evidence
     assert "候选价格高于客户价格30%以上" not in evidence
@@ -776,6 +785,7 @@ def test_negative_customer_price_does_not_trigger_high_price_reject():
     ), title_model_result=model)
     assert result.price_vs_customer_check == "CUSTOMER_PRICE_INVALID"
     assert result.primary_action != WorkflowAction.REJECT
+    assert result.primary_action != WorkflowAction.APPROVE
     evidence = " ".join(result.evidence)
     assert "客户价格无效" in evidence
     assert "候选价格高于客户价格30%以上" not in evidence

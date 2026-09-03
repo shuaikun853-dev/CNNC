@@ -20,6 +20,8 @@ from datetime import UTC, datetime, timedelta
 from typing import Any, Callable, Mapping, Sequence
 from urllib import error
 
+from app.services import customer_price_semantics
+from app.services.customer_price_semantics import DetailBusinessRetryRequired
 from app.services.daily_audit_store import DailyAuditStore, LeaseToken, LeaseUnavailable, ProcessLock
 from app.services.remote_running_recovery import (
     RECOVERY_CALLBACK_TIMEOUT_SECONDS,
@@ -244,6 +246,7 @@ def _empty_counters() -> dict[str, int]:
         "delta_new": 0, "delta_changed": 0, "detail_requests": 0, "model_attempts": 0,
         "crawl_submitted": 0, "crawl_harvested": 0, "submit_unknown": 0, "crawl_running": 0,
         "harvest_batches": 0, "harvest_swept": 0, "submit_paused": 0, "submit_not_attempted": 0,
+        "detail_business_requeued": 0,
         "customer_count": 0, "saas_count": 0, "source_count_gap": 0,
     }
 
@@ -256,6 +259,11 @@ def _safe_error(exc: BaseException) -> str:
     # This typed pre-send message is built only from the legacy adapter's
     # fixed diagnostic vocabulary, so it can be persisted verbatim.
     if isinstance(exc, SubmitNotAttemptedError):
+        return str(exc)
+    if isinstance(exc, DetailBusinessRetryRequired):
+        # The structured, sanitized customerPriceStatus prefix must survive
+        # into stage_work.error_text so terminal classification and finalize
+        # gates can tell NOT_FOUND apart from transport failures.
         return str(exc)
     code = getattr(exc, "code", None)
     if isinstance(code, int):
@@ -595,6 +603,24 @@ def _is_retryable_model_failure(exc: BaseException) -> bool:
         reason = cause.reason
         return isinstance(reason, (TimeoutError, ConnectionError))
     return isinstance(cause, (TimeoutError, ConnectionError))
+
+
+def _is_retryable_detail_failure(exc: BaseException) -> bool:
+    """Detail retries only for business retries and transient failures.
+
+    ``DetailBusinessRetryRequired`` (NOT_FOUND / DETAIL_REQUEST_FAILED /
+    DETAIL_PARSE_FAILED) and ordinary transient errors stay retryable;
+    ``RuntimeConfigurationError`` is deterministic misconfiguration and goes
+    straight to terminal.  No backoff: ticks are paced by the scheduler and
+    ``detail_max_attempts`` bounds the durable replay budget.
+    """
+    from app.services.incremental_audit_runtime import RuntimeConfigurationError
+
+    if isinstance(exc, DetailBusinessRetryRequired):
+        return True
+    if isinstance(exc, RuntimeConfigurationError):
+        return False
+    return True
 
 
 def _model_retry_backoff_seconds(attempts: int) -> float:
@@ -1006,6 +1032,15 @@ def _submit(
     return True
 
 
+def _decoded_result_dict(row: Mapping[str, Any]) -> Mapping[str, Any] | None:
+    """Decode a stage_work ``result_json`` into a dict, or None when absent/broken."""
+    try:
+        decoded = json.loads(str(row.get("result_json") or ""))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    return decoded if isinstance(decoded, dict) else None
+
+
 def _backlog(
     store: DailyAuditStore,
     token: LeaseToken,
@@ -1026,6 +1061,18 @@ def _backlog(
             for audit_item_id in current_item_ids
             for stage in ("DETAIL", "MODEL")
         )
+    customer_price_missing = 0
+    customer_price_failed = 0
+    for work in stages:
+        if work["stage"] != "DETAIL":
+            continue
+        state = customer_price_semantics.customer_price_business_state(
+            work.get("state"), _decoded_result_dict(work), work.get("error_text")
+        )
+        if state.key == customer_price_semantics.MISSING:
+            customer_price_missing += 1
+        elif state.key == customer_price_semantics.FAILED:
+            customer_price_failed += 1
     return {
         "stage_pending": missing_stages + sum(
             work["state"] in {
@@ -1044,6 +1091,8 @@ def _backlog(
             work["stage"] == "MODEL" and work["state"] == "TERMINAL_FAILED"
             for work in stages
         ),
+        "customer_price_missing": customer_price_missing,
+        "customer_price_failed": customer_price_failed,
         "crawl_pending": sum(work["state"] in {"PENDING", "RUNNING", "RETRYABLE_FAILED", "SUBMITTED", "EXPORTED", "SUBMIT_UNKNOWN"} for work in crawls),
         "remote_pending": sum(job["state"] in {"PRIORITY_PENDING", "SUBMITTED", "RUNNING", "EXPORTED"} for job in jobs),
         "remote_unknown": sum(job["state"] == "SUBMIT_UNKNOWN" for job in jobs),
@@ -1467,12 +1516,19 @@ def run_incremental_tick(
             counters["submit_pass_snapshot_id"] = snapshot_id or 0
 
         trace.append("detail")
+        if deps.detail is not None:
+            # Legacy durable-state compatibility: rows checkpointed as SUCCESS
+            # while actually carrying a retryable business failure are given
+            # back their attempt budget exactly once (under the new worker they
+            # can never be written as SUCCESS again).  Idempotent and bounded.
+            counters["detail_business_requeued"] = store.requeue_invalid_business_success_details(token)
         for item in items:
             if not budget.can_start_heavy():
                 break
             if not _stage(
                 store, token, item, "DETAIL", detail_fingerprint(item["row"], config.business_date, config.detail_schema_version),
                 deps.detail, budget, config.external_timeout_seconds, config.detail_max_attempts, config.detail_max_elapsed_seconds, counters,
+                retry_classifier=_is_retryable_detail_failure,
             ):
                 continue
         trace.append("model")
@@ -1573,7 +1629,10 @@ def run_incremental_tick(
                     run = store.freeze_snapshot(token, snapshot_id)
                 else:
                     waiting_source_count = True
-        if backlog["model_terminal"] or backlog["remote_manual"]:
+        # detail_terminal now also demands human review: an exhausted detail
+        # retry budget means the row's customer-price baseline is provably
+        # unresolved (MISSING or FAILED), never an auto-closable state.
+        if backlog["model_terminal"] or backlog["remote_manual"] or backlog["detail_terminal"]:
             outcome = "MANUAL_REVIEW_REQUIRED"
         elif backlog["remote_unknown"]:
             outcome = "WAITING_REMOTE_RECONCILIATION"
@@ -1588,8 +1647,12 @@ def run_incremental_tick(
         else:
             outcome = "COMPLETED"
         counters["crawl_running"] = backlog["crawl_pending"]
+        # detail_terminal is a manual-review blocker reported on its own, and
+        # the customer_price_* keys are additive cross-cut views of the same
+        # detail rows; both stay out of the coarse outstanding-work sum.
         final_pending = sum(
-            value for key, value in backlog.items() if key != "detail_terminal"
+            value for key, value in backlog.items()
+            if key not in {"detail_terminal", "customer_price_missing", "customer_price_failed"}
         )
         store.update_daily_metrics(token, {**counters, "final_pending": final_pending})
         final_run = store.get_run(config.business_date)

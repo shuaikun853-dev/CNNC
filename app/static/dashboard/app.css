@@ -161,3 +161,19 @@ td.mono{max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowra
 .oplog{list-style:none;margin:0;padding:0;font-size:12px}
 .oplog li{padding:2px 0;color:var(--muted)}
 .oplog time{color:var(--faint);font-family:var(--mono);font-size:11px;margin-right:6px}
+/* 客户价可观测性(2026-09-03):一级汇总条 + 明细抽屉(风格沿用 .zs/.drawer/table) */
+.cp-strip{display:flex;align-items:center;gap:12px;padding:8px 12px;flex-wrap:wrap}
+.cp-strip .lab{font-size:13px;font-weight:600;color:var(--text)}
+.cp-strip .counts{display:flex;gap:12px;flex-wrap:wrap;font-size:12.5px}
+.cp-strip .counts .lab{font-weight:400;font-size:12px;color:var(--muted)}
+.cp-strip .counts b{font-weight:600}
+.cp-strip .counts b.ok{color:var(--ok)} .cp-strip .counts b.run{color:var(--run)}
+.cp-strip .counts b.warn{color:var(--warn)} .cp-strip .counts b.err{color:var(--err)}
+.cp-strip .more{margin-left:auto}
+#cp-drawer{width:760px}
+.cp-filters{display:flex;gap:8px;flex-wrap:wrap}
+.cp-filter.active{border-color:var(--run);color:var(--run);background:var(--run-soft)}
+.cp-table th,.cp-table td{white-space:normal;overflow-wrap:anywhere}
+.cp-table .cp-title{max-width:180px}
+.cp-table .cp-err{max-width:160px;color:var(--muted);font-size:11.5px}
+.cp-meta{font-size:11.5px;color:var(--faint);margin-top:6px}

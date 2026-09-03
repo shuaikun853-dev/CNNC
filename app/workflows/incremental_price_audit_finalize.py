@@ -16,6 +16,12 @@ from typing import Any, Mapping
 from openpyxl import load_workbook
 from openpyxl.styles import PatternFill
 
+from app.services.customer_price_semantics import (
+    CustomerPriceBusinessState,
+    customer_price_business_state,
+    decode_business_error,
+    sanitize_customer_price_text,
+)
 from app.services.daily_audit_store import (
     DailyAuditStore,
     LeaseToken,
@@ -60,6 +66,17 @@ class FinalizeReadiness:
     remote_intent: int = 0
     remote_submit_unknown: int = 0
     remote_priority_pending: int = 0
+    # Additive customer-price business buckets (semantics module is the single
+    # source of truth).  missing/failed/invalid block ordinary finalize and are
+    # non-tolerable for force-finalize; pending duplicates detail_pending
+    # explicitly for observability; absent_proven rows (LOOKUP_FAILED /
+    # SKIPPED / NOT_PROVIDED with complete evidence) close out without
+    # blocking but never auto-APPROVE row-side.
+    customer_price_pending: int = 0
+    customer_price_missing: int = 0
+    customer_price_failed: int = 0
+    customer_price_invalid: int = 0
+    customer_price_absent_proven: int = 0
 
     @property
     def ready(self) -> bool:
@@ -75,6 +92,9 @@ class FinalizeReadiness:
                 self.remote_pending,
                 self.remote_manual,
                 self.remote_invalid,
+                self.customer_price_missing,
+                self.customer_price_failed,
+                self.customer_price_invalid,
             )
         )
 
@@ -152,6 +172,10 @@ FORCE_FINALIZE_INCOMPLETE_TASKS_KEY = "force_finalize_incomplete_tasks"
 # Readiness buckets that force-finalize must never tolerate.  Detail/Model
 # evidence, unplanned or invalid crawl work, unknown submission outcomes,
 # manual/terminal states, and not-yet-submitted intent all stay blocking.
+# Customer-price MISSING/FAILED/INVALID block the same way: publishing a final
+# workbook whose price-review baseline is provably unresolved is never
+# tolerated, and customer_price_pending is intentionally absent because it is
+# the same rows as detail_pending (already listed).
 NON_TOLERABLE_BLOCKERS = (
     "detail_pending",
     "detail_terminal",
@@ -169,6 +193,9 @@ NON_TOLERABLE_BLOCKERS = (
     "remote_intent",
     "remote_submit_unknown",
     "remote_priority_pending",
+    "customer_price_missing",
+    "customer_price_failed",
+    "customer_price_invalid",
 )
 
 
@@ -210,13 +237,39 @@ def _model_key(row: Mapping[str, Any]) -> tuple[str, str, str, str]:
 
 
 def _detail_failure(error_text: object) -> dict[str, Any]:
+    """Build the customer-price evidence for a terminal detail row.
+
+    The structured ``customerPriceStatus=`` prefix (written by the durable
+    retry path) keeps its real business status — a NOT_FOUND exhaustion stays
+    NOT_FOUND instead of being downgraded to a transport failure.  Text without
+    the prefix keeps the historical DETAIL_REQUEST_FAILED fallback.
+    """
+    text = normalize_cell_str(error_text)
+    status, warning = decode_business_error(text)
+    if not status:
+        status = "DETAIL_REQUEST_FAILED"
+        warning = sanitize_customer_price_text(text) or "ExternalError"
     return {
         "customerPrice": None,
-        "customerPriceStatus": "DETAIL_REQUEST_FAILED",
+        "customerPriceStatus": status,
         "customerPriceSource": "",
-        "customerPriceWarning": f"增量详情阶段失败：{normalize_cell_str(error_text) or 'ExternalError'}",
+        "customerPriceWarning": f"增量详情阶段失败：{warning}",
         "customerPriceEvidence": "",
     }
+
+
+def _accumulate_customer_price_state(counts: dict[str, int], state: CustomerPriceBusinessState) -> None:
+    """Fold one row's customer-price classification into readiness counters."""
+    if state.key in {"PENDING", "RETRYING"}:
+        counts["customer_price_pending"] += 1
+    elif state.key == "MISSING":
+        counts["customer_price_missing"] += 1
+    elif state.key == "MISSING_PROVEN":
+        counts["customer_price_absent_proven"] += 1
+    elif state.key == "FAILED":
+        counts["customer_price_failed"] += 1
+    elif state.key == "INVALID":
+        counts["customer_price_invalid"] += 1
 
 
 def _crawl_key(row: Mapping[str, Any]) -> tuple[str, str, str]:
@@ -430,6 +483,11 @@ def build_frozen_audit_artifact(
         "remote_intent": 0,
         "remote_submit_unknown": 0,
         "remote_priority_pending": 0,
+        "customer_price_pending": 0,
+        "customer_price_missing": 0,
+        "customer_price_failed": 0,
+        "customer_price_invalid": 0,
+        "customer_price_absent_proven": 0,
     }
     relevant_remote_job_ids: set[int] = set()
     rows: list[dict[str, Any]] = []
@@ -444,16 +502,25 @@ def build_frozen_audit_artifact(
         if detail is None or detail["state"] in {"PENDING", "CLAIMED", "RETRYABLE_FAILED"}:
             counts["detail_pending"] += 1
             info = {}
+            price_state = customer_price_business_state(
+                detail["state"] if detail is not None else None, None, ""
+            )
         elif detail["state"] == "TERMINAL_FAILED":
             counts["detail_terminal"] += 1
             info = _detail_failure(detail.get("error_text"))
+            price_state = customer_price_business_state(
+                detail["state"], None, detail.get("error_text")
+            )
         elif detail["state"] == "SUCCESS":
             info = _decode_json(detail.get("result_json"), dict, "detail result")
             if "customerPrice" in info:
                 info = {**info, "customerPrice": parse_decimal(info.get("customerPrice"))}
+            price_state = customer_price_business_state(detail["state"], info, detail.get("error_text"))
         else:
             counts["detail_pending"] += 1
             info = {}
+            price_state = customer_price_business_state(detail["state"], None, "")
+        _accumulate_customer_price_state(counts, price_state)
         enriched.append(info)
 
         model = models.get(item_id)

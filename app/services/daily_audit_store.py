@@ -19,6 +19,8 @@ from pathlib import Path
 from time import time_ns
 from typing import Any, Iterator, Mapping, Sequence
 
+from app.services.customer_price_semantics import CUSTOMER_PRICE_RETRYABLE_DETAIL_STATUSES
+
 
 DEFAULT_TENANT_ID = 188605
 DEFAULT_POOL_ID = 222
@@ -1013,6 +1015,46 @@ class DailyAuditStore:
             state = "TERMINAL_FAILED" if terminal else "RETRYABLE_FAILED"
             connection.execute("UPDATE stage_work SET state=?, elapsed_seconds=?, retryable=?, error_text=?, claimed_at=NULL, updated_at=? WHERE id=?", (state, total, 0 if terminal else 1, error, self._utcnow(), work_id))
             return self._row(connection.execute("SELECT * FROM stage_work WHERE id=?", (work_id,)).fetchone())  # type: ignore[return-value]
+
+    def requeue_invalid_business_success_details(self, token: LeaseToken) -> int:
+        """Requeue legacy DETAIL rows checkpointed as SUCCESS but carrying a
+        retryable business failure (NOT_FOUND / DETAIL_REQUEST_FAILED /
+        DETAIL_PARSE_FAILED) in ``result_json``.
+
+        The new detail worker can no longer produce those states as SUCCESS, so
+        each row is requeued at most once: attempts and elapsed budgets reset,
+        the failure evidence survives verbatim in ``error_text`` and the
+        misleading success payload is dropped.  Returns the number of rows
+        actually requeued (idempotent under the ``state='SUCCESS'`` guard).
+        """
+        now = self._utcnow()
+        with self._transaction(immediate=True) as connection:
+            self._validate_lease(connection, token)
+            rows = connection.execute(
+                """SELECT s.id, s.result_json FROM stage_work s
+                   JOIN audit_items a ON a.id=s.audit_item_id
+                   WHERE a.run_id=? AND s.stage='DETAIL' AND s.state='SUCCESS'""",
+                (token.run_id,),
+            ).fetchall()
+            requeued = 0
+            for row in rows:
+                try:
+                    decoded = json.loads(str(row["result_json"] or ""))
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    continue
+                if not isinstance(decoded, dict):
+                    continue
+                status = str(decoded.get("customerPriceStatus") or "")
+                if status not in CUSTOMER_PRICE_RETRYABLE_DETAIL_STATUSES:
+                    continue
+                cursor = connection.execute(
+                    """UPDATE stage_work SET state='PENDING', attempts=0, elapsed_seconds=0,
+                       retryable=1, error_text=?, result_json=NULL, claimed_at=NULL, updated_at=?
+                       WHERE id=? AND state='SUCCESS'""",
+                    (f"requeued invalid business success: customerPriceStatus={status}", now, row["id"]),
+                )
+                requeued += max(0, cursor.rowcount)
+            return requeued
 
     # ---- Batched stage-work transitions -------------------------------------
     # Same per-row semantics and validations as the single-row methods above,
