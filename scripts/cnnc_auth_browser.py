@@ -22,9 +22,12 @@
     python scripts/cnnc_auth_browser.py smoke
 
 命令:
-    login    人工一次性登录（账号 + 滑块 + 短信），会话持久化到
-             data/cnnc_auth_profile/，检测到 SSO 根凭证 TGC 后只把 5 个
+    login    人工一次性登录（账号 + 滑块 + 短信）。浏览器以一次性临时
+             Profile（空 cookie）启动，从根上杜绝陈旧 TGC 被"崩溃恢复"
+             还原导致启动即误判登录成功、窗口秒关（TGC 出现只可能来自
+             本次真人登录新签发）；检测到 SSO 根凭证 TGC 后只把 5 个
              SSO 会话白名单 cookie 导出到 data/cnnc_auth_storage_state.json
+             （登录成功的会话仍经 storage_state 持久化）
     harvest  用已保存会话只注入 5 个 SSO 会话 cookie（全量注入含陈旧 K5 等
              WAF cookie 会让门户首页卡在 412 挑战循环；WAF 空状态挑战自算
              反而秒过），从门户首页 https://sso.cnncecp.com/ 进入，自动跟随
@@ -75,7 +78,6 @@ from pathlib import Path
 # ROOT = 本脚本所在目录（scripts/）的上一级，即 cnnc-ops-agent/
 ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = ROOT / "data"
-PROFILE_DIR = DATA_DIR / "cnnc_auth_profile"
 STORAGE_STATE = DATA_DIR / "cnnc_auth_storage_state.json"
 
 # AUTHORIZE_URL 仅作说明保留，不再作为 harvest 的 goto 目标：直接 goto 该
@@ -190,14 +192,15 @@ def _force_utf8_stdio():
             pass
 
 
-def _launch_chrome_cdp(url=None, headless=False, user_data_dir=None):
+def _launch_chrome_cdp(url=None, headless=False, *, user_data_dir):
     """子进程启动纯净系统 Chrome（带远程调试端口），并用 CDP 接管。
 
     浏览器本身不带任何自动化标记（无 --enable-automation 等 flag，
     navigator.webdriver=false），用于绕过 WAF 对 Playwright 托管浏览器的检测。
 
-    user_data_dir=None 时用持久 PROFILE_DIR（login 的人工登录场景）；
-    harvest/smoke 显式传入一次性临时目录，隔离陈旧 K5/SF/UqZ 持久 cookie。
+    user_data_dir 必填（keyword-only）：调用方显式传入一次性临时目录
+    （login/harvest/smoke 均如此）。空 cookie Profile 启动从根上隔离陈旧
+    持久 cookie（TGC/K5/SF/UqZ），杜绝"崩溃恢复"还原出僵尸会话状态。
 
     返回 (proc, browser, playwright)；调用方负责在 finally 中调用
     _close_cdp(proc, browser, pw) 完成清理。任何失败路径由本函数自行清理。
@@ -231,8 +234,6 @@ def _launch_chrome_cdp(url=None, headless=False, user_data_dir=None):
         raise RuntimeError("CDP 调试端口 %d-%d 全部被占用"
                            % (CDP_PORT_RANGE[0], CDP_PORT_RANGE[-1] - 1))
 
-    if user_data_dir is None:
-        user_data_dir = PROFILE_DIR
     user_data_dir = Path(user_data_dir)
     user_data_dir.mkdir(parents=True, exist_ok=True)
 
@@ -323,15 +324,23 @@ def _close_cdp(proc, browser, pw):
 
 
 def cmd_login(args):
-    """人工一次性登录：纯净 Chrome 打开真窗口完成登录，检测到 SSO 根凭证
-    TGC 后只导出 SSO 会话白名单 cookie 到 storage_state。"""
+    """人工一次性登录：纯净 Chrome 以一次性临时 Profile（空 cookie）打开
+    真窗口完成登录，检测到本次登录新签发的 SSO 根凭证 TGC 后只导出 SSO
+    会话白名单 cookie 到 storage_state。"""
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     print("正在启动纯净 Chrome…请在窗口中完成 CNNC 登录（账号+滑块+短信）",
           flush=True)
+    # 一次性临时 Profile（系统 TEMP，仓库外），空 cookie 启动：持久 Profile
+    # 里物理残留的陈旧 TGC 会被"崩溃恢复"还原（_close_cdp 硬杀 Chrome 从不
+    # 优雅关闭），启动 ~2 秒即误判"登录成功"秒关窗，用户永远没机会输密码
+    # （2026-09-03 实锤 bug）。改空 Profile 后，TGC 出现只可能来自本次真人
+    # 登录新签发，窗口保持打开直到用户真正完成登录。
+    login_dir = Path(tempfile.mkdtemp(prefix="cnnc_login_"))
     proc = browser = pw = None
     try:
         # URL 作为启动参数直接打开，不用 page.goto
-        proc, browser, pw = _launch_chrome_cdp(url=LOGIN_ENTRY)
+        proc, browser, pw = _launch_chrome_cdp(url=LOGIN_ENTRY,
+                                               user_data_dir=login_dir)
         ctx = browser.contexts[0] if browser.contexts else None
         if ctx is None:
             print("CDP_NO_CONTEXT：CDP 接管后未找到浏览器上下文", file=sys.stderr)
@@ -381,7 +390,10 @@ def cmd_login(args):
         print("LOGIN_CANCELLED：用户中断", file=sys.stderr)
         return 130
     finally:
+        # Windows 下临时目录被 Chrome 进程占用时删不掉：必须先断开 CDP 并
+        # 杀掉 Chrome 子进程，再删除临时 Profile 目录（同 harvest）
         _close_cdp(proc, browser, pw)
+        shutil.rmtree(login_dir, ignore_errors=True)
 
 
 def cmd_harvest(args):
@@ -396,7 +408,7 @@ def cmd_harvest(args):
     WARN 回退外部裸交换。
     浏览器用一次性临时 Profile：固定持久 Profile 目录会随运行累积陈旧
     K5/SF/UqZ 持久 cookie，harvest 浏览器会带着陈旧 WAF 状态启动、卡进
-    挑战循环，因此与 login 的持久 Profile 彻底隔离。
+    挑战循环，因此与 login 一样每次都用一次性临时 Profile（互不共享状态）。
     """
     if not STORAGE_STATE.exists():
         print("STORAGE_STATE_NOT_FOUND：未找到 %s，请先运行 "
