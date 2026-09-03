@@ -22,10 +22,16 @@
 //   closeoutUIRunning、hydration 未见 settle 前按钮不得可点(summarySeen/
 //   actionsSeen)、/api/actions 顶层 business_date 服务端权威兜底
 //   (resolveCloseoutActionsDate)、index.html 静态初始态契约。
+// 覆盖 Review Fix Round 3(2026-09-03):
+//   P2-1  updateCloseoutUI 最高优先级 opsUnavailable 四态:operator-context
+//         引导失败 → 按钮 disabled"操作台不可用",不再出现可点"立即收口";
+//   P2-2  pollDelay 上海时区 closeout 监视窗口 [17:55, 20:35](含两端):窗口内
+//         未 finalized 即使 idle 也 5s 轮询(显式 Asia/Shanghai 换算,不依赖本地
+//         时区);writer active / computed_pending 判定优先级不变,finalized 恢复 idle。
 // 被测对象:app/static/dashboard/app.js 暴露的 createPollController /
 // createSaasFlowPoller / safeProgressText / fmtShanghaiDateTime /
 // createCnncAuthFetcher / computeCloseoutBackendRunning / applyCloseoutRunningOverlay /
-// isCloseoutWriter / resolveCloseoutActionsDate。
+// isCloseoutWriter / resolveCloseoutActionsDate / pollDelay / inCloseoutWatchWindow。
 const path = require("path");
 
 // R2 Case 22:renderCnncAuth 前端测试需要的最小 document stub,必须在 require
@@ -54,7 +60,7 @@ const { createPollController, createSaasFlowPoller, safeProgressText, sfPartialN
         createActionClient, actionOutcomeText, renderCnncAuth,
         fmtShanghaiDateTime, createCnncAuthFetcher, computeCloseoutBackendRunning,
         applyCloseoutRunningOverlay, isCloseoutWriter, resolveCloseoutActionsDate,
-        updateCloseoutUI, _setCloseoutStateForTest } = require(
+        updateCloseoutUI, pollDelay, inCloseoutWatchWindow, _setCloseoutStateForTest } = require(
   path.join(__dirname, "..", "..", "app", "static", "dashboard", "app.js"));
 
 let failed = 0;
@@ -1022,6 +1028,88 @@ function test_closeout_r2_round2() {
                              writerRunning: false, summarySeen: false, actionsSeen: false });
 }
 
+// R3 P2-1(2026-09-03):opsUnavailable 最高优先级——operator-context 引导失败时
+// 按钮必须 disabled"操作台不可用",不得出现可点"立即收口"。
+function test_closeout_r3_ops_unavailable() {
+  const btn = global.document.querySelector("#closeout-btn");
+  // bootstrapOperatorContext 失败(#closeout-status 已写"操作台不可用"):按钮同步。
+  _setCloseoutStateForTest({ opsUnavailable: true, summarySeen: true, actionsSeen: true });
+  btn.disabled = false; btn.textContent = "立即收口";
+  updateCloseoutUI();
+  check("R3 opsUnavailable → disabled+操作台不可用(不出现可点立即收口)",
+        btn.disabled === true && btn.textContent === "操作台不可用",
+        btn.disabled + "/" + btn.textContent);
+  // 收口运行态并存时仍"操作台不可用":按钮语义=人工发起面,此时必不可能发起;
+  // 运行态由阶段卡 overlay 传达,disabled 已保证不可点。
+  _setCloseoutStateForTest({ opsUnavailable: true, writerRunning: true });
+  updateCloseoutUI();
+  check("R3 opsUnavailable+writerRunning → disabled+操作台不可用(运行态由阶段卡传达)",
+        btn.disabled === true && btn.textContent === "操作台不可用",
+        btn.disabled + "/" + btn.textContent);
+  // 回归:opsUnavailable=false 时既有三态语义不变。
+  _setCloseoutStateForTest({ opsUnavailable: false, writerRunning: true });
+  updateCloseoutUI();
+  check("R3 回归 opsUnavailable=false+writerRunning → disabled+收口中…",
+        btn.disabled === true && btn.textContent === "收口中…",
+        btn.disabled + "/" + btn.textContent);
+  _setCloseoutStateForTest({});   // seen 缺省 true
+  updateCloseoutUI();
+  check("R3 回归 空状态(seen 缺省 true)→ enabled+立即收口",
+        btn.disabled === false && btn.textContent === "立即收口",
+        btn.disabled + "/" + btn.textContent);
+  // 结束前复位 seam
+  _setCloseoutStateForTest({});
+}
+
+// R3 P2-2(2026-09-03):pollDelay 上海时区 closeout 监视窗口 [17:55, 20:35]。
+// 时间输入一律用带 offset 的 ISO,证明走 offset 换算而非本地时区;ACTIVE_MS /
+// IDLE_MS 未导出,以"断言返回值 === 5000/30000"同时锁定常量未变。
+function test_closeout_r3_poll_watch_window() {
+  const idle = { status: { production_writer: { active: false, command: "tick" },
+                           final: { finalized: false, computed_pending: 0 } } };
+  // 窗口边界(上海分钟闭区间,含两端):
+  check("R3 窗口前 17:54:59 上海 → IDLE 30000",
+        pollDelay(idle, Date.parse("2026-09-02T09:54:59Z")) === 30000);
+  check("R3 窗口起点 17:55:00 上海 → ACTIVE 5000(起点含端)",
+        pollDelay(idle, Date.parse("2026-09-02T09:55:00Z")) === 5000);
+  check("R3 窗口内 18:00 上海 → ACTIVE 5000",
+        pollDelay(idle, Date.parse("2026-09-02T10:00:00Z")) === 5000);
+  check("R3 窗口终点 20:35 上海 → ACTIVE 5000(闭区间含端)",
+        pollDelay(idle, Date.parse("2026-09-02T12:35:00Z")) === 5000);
+  check("R3 窗口后 20:36 上海 → IDLE 30000",
+        pollDelay(idle, Date.parse("2026-09-02T12:36:00Z")) === 30000);
+  // 非上海 offset 表达同一时刻(=09:55Z=17:55 上海):证明按 Asia/Shanghai 换算,
+  // 不依赖浏览器/系统本地时区。
+  check("R3 -07:00 offset 同一时刻 17:55 上海 → ACTIVE 5000",
+        pollDelay(idle, Date.parse("2026-09-02T02:55:00-07:00")) === 5000);
+  // 跨天:16:00Z 是上海次日 00:00,不在窗口。
+  check("R3 跨天窗口外 上海 00:00 → IDLE 30000",
+        pollDelay(idle, Date.parse("2026-09-02T16:00:00Z")) === 30000);
+  // finalized + 窗口内 → IDLE:收口已出版,无需监视,恢复 idle(监视只为尽早发现
+  // 自动收口启动;已终态后 5s 轮询纯属浪费)。
+  const fin = { status: { production_writer: { active: false },
+                          final: { finalized: true, computed_pending: 0 } } };
+  check("R3 finalized+窗口内 → IDLE 30000(收口已出版恢复 idle)",
+        pollDelay(fin, Date.parse("2026-09-02T10:00:00Z")) === 30000);
+  // 回归:writer active / computed_pending 原判定优先级不变(窗口外仍 ACTIVE)。
+  const activeWriter = { status: { production_writer: { active: true, command: "tick" },
+                                   final: { finalized: false, computed_pending: 0 } } };
+  check("R3 回归 writer.active=true 窗口外(03:00 上海)→ ACTIVE 5000",
+        pollDelay(activeWriter, Date.parse("2026-09-01T19:00:00Z")) === 5000);
+  const pending = { status: { production_writer: { active: false, command: "tick" },
+                              final: { finalized: false, computed_pending: 3 } } };
+  check("R3 回归 computed_pending>0 未 finalized 窗口外 → ACTIVE 5000",
+        pollDelay(pending, Date.parse("2026-09-01T19:00:00Z")) === 5000);
+  // inCloseoutWatchWindow 直测(导出即测试面):边界含端 + 无参走 Date.now()。
+  check("R3 inCloseoutWatchWindow 边界含端",
+        inCloseoutWatchWindow(Date.parse("2026-09-02T09:55:00Z")) === true &&
+        inCloseoutWatchWindow(Date.parse("2026-09-02T12:35:00Z")) === true &&
+        inCloseoutWatchWindow(Date.parse("2026-09-02T09:54:59Z")) === false &&
+        inCloseoutWatchWindow(Date.parse("2026-09-02T12:36:00Z")) === false);
+  check("R3 inCloseoutWatchWindow 无参不抛(默认 Date.now())",
+        typeof inCloseoutWatchWindow() === "boolean");
+}
+
 (async () => {
   await test_304_keeps_sync_fresh_without_rerender();
   await test_hidden_pauses_and_visible_resumes();
@@ -1055,6 +1143,8 @@ function test_closeout_r2_round2() {
   test_closeout_running_seam();
   test_closeout_overlay_survives_summary_rerenders();
   test_closeout_r2_round2();
+  test_closeout_r3_ops_unavailable();
+  test_closeout_r3_poll_watch_window();
   if (failed === 0) { console.log("ALL PASS"); process.exit(0); }
   console.error(failed + " failing checks");
   process.exit(1);

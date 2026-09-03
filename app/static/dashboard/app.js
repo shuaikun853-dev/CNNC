@@ -101,12 +101,34 @@
     etag = res.headers.get("ETag");
     return { status: res.status, payload: await res.json() };
   }
-  function pollDelay(payload) {
+  function pollDelay(payload, nowMs) {
     const st = (payload && payload.status) || {};
     const finalized = st.final && st.final.finalized;
     const active = (st.production_writer && st.production_writer.active) ||
       (st.final && st.final.computed_pending > 0 && !finalized);
-    return active ? ACTIVE_MS : IDLE_MS;
+    if (active) return ACTIVE_MS;
+    if (!finalized && inCloseoutWatchWindow(nowMs)) return ACTIVE_MS;   // 自动收口窗口监视
+    return IDLE_MS;
+  }
+  // R3 P2-2:上海时区 closeout 监视窗口 [17:55, 20:35](分钟闭区间,含两端):
+  // Scheduler 18:00 自动 closeout 会让 writer 持锁,idle 30s 轮询最坏 30s 后才反映;
+  // 窗口内即使当前 idle 也用 5s,让按钮/阶段卡在自动收口启动后 ≤5s 内跟上。显式
+  // Asia/Shanghai 换算,不依赖浏览器/系统本地时区。finalized 后收口已出版,无需
+  // 监视,恢复 idle。
+  const CLOSEOUT_WATCH_START_MIN = 17 * 60 + 55;
+  const CLOSEOUT_WATCH_END_MIN = 20 * 60 + 35;
+  function shanghaiMinutesOfDay(nowMs) {
+    const parts = new Intl.DateTimeFormat("en-GB", {
+      timeZone: "Asia/Shanghai", hour12: false,
+      hour: "2-digit", minute: "2-digit",
+    }).formatToParts(new Date(nowMs));
+    const get = (type) => Number((parts.find((p) => p.type === type) || {}).value || 0);
+    const hour = get("hour") === 24 ? 0 : get("hour");   // 个别 ICU 小时档输出 24
+    return hour * 60 + get("minute");
+  }
+  function inCloseoutWatchWindow(nowMs) {
+    const m = shanghaiMinutesOfDay(nowMs === undefined ? Date.now() : nowMs);
+    return m >= CLOSEOUT_WATCH_START_MIN && m <= CLOSEOUT_WATCH_END_MIN;
   }
   const ctl = createPollController({
     poll: fetchSummary,
@@ -659,11 +681,16 @@
   }
 
   // 纯 DOM,幂等:summary 重刷(render)反复调用也不闪文案;finalized 后区域隐藏
-  // 仍由 renderFinal 管,这里只负责"进行中/hydration 未完成/可点"三态。
+  // 仍由 renderFinal 管,这里只负责"操作台不可用/进行中/hydration 未完成/可点"四态。
   function updateCloseoutUI() {
     const btn = $("#closeout-btn");
     if (!btn) return;
-    if (closeoutUIRunning()) {
+    if (opsUnavailable) {
+      // R3 P2-1:操作台不可用是最高优先级——按钮语义是"人工可发起收口",此时必不
+      // 可能发起;收口运行态由阶段卡 overlay 传达,按钮只需不可点+说明原因。
+      btn.disabled = true;
+      if (btn.textContent !== "操作台不可用") btn.textContent = "操作台不可用";
+    } else if (closeoutUIRunning()) {
       btn.disabled = true;
       if (btn.textContent !== "收口中…") btn.textContent = "收口中…";
     } else if (!(closeoutSummarySeen && closeoutActionsSeen)) {
@@ -675,12 +702,14 @@
     }
   }
   // 测试 seam:行为级验证需要驱动模块内权威状态(与生产同源,生产路径绝不调用)。
-  // seen 缺省 true,旧式只关心 running 的断言不必每次都传;hydration 专项测试显式传 false。
+  // seen 缺省 true,旧式只关心 running 的断言不必每次都传;hydration 专项测试显式传 false;
+  // opsUnavailable 缺省 false。
   function _setCloseoutStateForTest(state) {
     const s = state || {};
     closeoutActionInFlight = !!s.actionInFlight;
     closeoutBackendRunning = !!s.backendRunning;
     closeoutWriterRunning = !!s.writerRunning;
+    opsUnavailable = !!s.opsUnavailable;
     closeoutSummarySeen = s.summarySeen === undefined ? true : !!s.summarySeen;
     closeoutActionsSeen = s.actionsSeen === undefined ? true : !!s.actionsSeen;
   }
@@ -1218,7 +1247,8 @@
     createActionClient, actionOutcomeText, cnncStatusText, renderCnncAuth,
     fmtShanghaiDateTime, createCnncAuthFetcher,
     computeCloseoutBackendRunning, applyCloseoutRunningOverlay, isCloseoutWriter,
-    resolveCloseoutActionsDate, closeoutUIRunning, updateCloseoutUI, _setCloseoutStateForTest };
+    resolveCloseoutActionsDate, closeoutUIRunning, updateCloseoutUI,
+    pollDelay, inCloseoutWatchWindow, _setCloseoutStateForTest };
   if (typeof window !== "undefined") { window.Dashboards = api; }
   if (typeof module !== "undefined" && module.exports) { module.exports = api; }
   if (typeof document !== "undefined") { document.addEventListener("DOMContentLoaded", start); }
