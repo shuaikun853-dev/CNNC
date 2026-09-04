@@ -33,3 +33,7 @@ Pygments==2.19.2
 typing-inspection==0.4.2
 # CI 专用（生产机未安装，仅供 pytest-timeout 挂钟保护）
 pytest-timeout==2.3.1
+# CI 必需：代码 import zoneinfo.ZoneInfo("Asia/Shanghai")，Windows 无系统 tz 库，
+# 必须装 tzdata 包（生产机 freeze=2026.1，由其他生态包连带装入、requirements.txt 未声明）。
+# 后续建议把 tzdata 正式补进 requirements.txt（对生产为声明性 no-op）。
+tzdata==2026.1
