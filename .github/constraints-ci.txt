@@ -1,0 +1,29 @@
+# 生产版本冻结 E:\Python314 @2026-09-04，仅 CI 使用，不改生产依赖
+# 直接依赖（与生产机 pip freeze 完全一致）
+fastapi==0.137.0
+uvicorn==0.49.0
+pydantic==2.12.5
+PyYAML==6.0.2
+pytest==9.1.0
+httpx==0.28.1
+openpyxl==3.1.5
+PyMySQL==1.2.0
+# 传递依赖（与生产机 pip freeze 完全一致；pydantic_core/typing_extensions 保留 pip freeze 原拼写）
+annotated-types==0.7.0
+anyio==4.12.1
+certifi==2026.2.25
+click==8.3.1
+colorama==0.4.6
+et-xmlfile==2.0.0
+h11==0.16.0
+httpcore==1.0.9
+idna==3.11
+iniconfig==2.3.0
+packaging==26.2
+pluggy==1.6.0
+pydantic_core==2.41.5
+sniffio==1.3.1
+starlette==1.3.1
+typing_extensions==4.15.0
+# CI 专用（生产机未安装，仅供 pytest-timeout 挂钟保护）
+pytest-timeout==2.3.1
