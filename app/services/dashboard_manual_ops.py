@@ -30,9 +30,13 @@ from app.services.legacy_zhaoshang_adapter import (
     PreparedLegacyJob,
     RestartStatus,
     SubmitStatus,
+    REMOTE_NOT_MATERIALIZED_LEGACY_DIAGNOSTIC,
 )
 from app.services.recovery.common import RecoveryRejected, _acquire_recovery_lease
-from app.services.recovery.harvest import _existing_remote_harvest_core
+from app.services.recovery.harvest import (
+    _existing_remote_harvest_core,
+    live_identity_proof,
+)
 from app.services.recovery.no_result import EXPORT_NO_PRICE_ACCEPTED_ERRORS
 from app.services.recovery.wait_export import (
     WAIT_EXPORT_MANUAL_DIAGNOSTIC,
@@ -158,13 +162,16 @@ def _probe_remote_execution_state(
     adapter: CnncLegacyZhaoshangAdapter,
     identity_parts: list[str],
     timeout_seconds: float,
-) -> RemoteExecutionState:
+) -> tuple[RemoteExecutionState, int]:
     """Read-only live classification of the exact remote task, fail-closed.
 
     Rebuilds the prepared job from the durable payload exactly like the
     harvest core does, then asks the adapter's progress seam.  Any failure --
     payload reconstruction, missing local files, probe transport, business
     failure, unparseable counters -- is UNKNOWN: no export is dispatched.
+    Returns the classification plus the read-only remote call count the probe
+    answer itself reports (0 when nothing parseable came back), so the action
+    record can account for the preflight's remote calls.
     """
     try:
         payload = json.loads(str(job.get("payload_json") or ""))
@@ -179,7 +186,7 @@ def _probe_remote_execution_state(
             batch_state,
         )
     except Exception:
-        return RemoteExecutionState.UNKNOWN
+        return RemoteExecutionState.UNKNOWN, 0
     try:
         answer = adapter.query_task_progress_for_job(
             prepared,
@@ -188,12 +195,98 @@ def _probe_remote_execution_state(
             min(30.0, timeout_seconds),
         )
     except Exception:
-        return RemoteExecutionState.UNKNOWN
+        return RemoteExecutionState.UNKNOWN, 0
+    probe_remote_calls = 0
+    if isinstance(answer, Mapping):
+        try:
+            probe_remote_calls = max(0, int(answer.get("remote_calls") or 0))
+        except (TypeError, ValueError):
+            probe_remote_calls = 0
     progress = answer.get("progress") if isinstance(answer, Mapping) else None
-    return classify_remote_execution_state(
-        progress if isinstance(progress, Mapping) else None,
-        "",
+    return (
+        classify_remote_execution_state(
+            progress if isinstance(progress, Mapping) else None,
+            "",
+        ),
+        probe_remote_calls,
     )
+
+
+def _is_priority_unconfirmed_manual_job(job: Mapping[str, Any]) -> bool:
+    """Strict "priority update never confirmed" durable shape (2026-09-04 hotfix).
+
+    Exactly: MANUAL_REQUIRED + durable POST evidence (post_attempted==1) + the
+    bare legacy zero-rows diagnostic as error_text + no durable
+    ``priority_evidence`` in result_json (missing/empty result_json counts as
+    null).  Nothing else joins the live-proof fallback -- in particular no
+    other MANUAL_REQUIRED error family and no recorded priority evidence.
+    """
+    if str(job.get("state") or "") != "MANUAL_REQUIRED":
+        return False
+    try:
+        if int(job.get("post_attempted") or 0) != 1:
+            return False
+    except (TypeError, ValueError):
+        return False
+    if (
+        str(job.get("error_text") or "").strip()
+        != REMOTE_NOT_MATERIALIZED_LEGACY_DIAGNOSTIC
+    ):
+        return False
+    try:
+        durable_result = json.loads(str(job.get("result_json") or ""))
+    except (TypeError, ValueError):
+        durable_result = None
+    priority_evidence = (
+        durable_result.get("priority_evidence")
+        if isinstance(durable_result, dict)
+        else None
+    )
+    return priority_evidence is None
+
+
+def _probe_live_identity_classification(
+    job: Mapping[str, Any],
+    *,
+    prepared: PreparedLegacyJob,
+    adapter: CnncLegacyZhaoshangAdapter,
+    business_date: str,
+    identity_parts: list[str],
+    timeout_seconds: float,
+    progress_lookup: Callable[[PreparedLegacyJob, str, str, float], Mapping[str, Any]]
+    | None,
+) -> RemoteExecutionState:
+    """The same exact live progress probe the re-export preflight runs.
+
+    Read-only.  The adapter's exact lookup raises on any live/durable identity
+    conflict and every transport/business/parse failure is UNKNOWN, so only a
+    genuinely proven ACTIVE/TERMINAL answer can come back.  An injected
+    ``progress_lookup`` (tests, alternative seams) is honored exactly like the
+    stop-protocol precheck does.
+    """
+    if progress_lookup is not None:
+        try:
+            answer = progress_lookup(
+                prepared,
+                identity_parts[1],
+                identity_parts[2],
+                min(30.0, float(timeout_seconds)),
+            )
+            raw = answer.get("progress") if isinstance(answer, Mapping) else None
+        except Exception:
+            return RemoteExecutionState.UNKNOWN
+        return classify_remote_execution_state(
+            raw if isinstance(raw, Mapping) else None,
+            "",
+        )
+    state, _probe_remote_calls = _probe_remote_execution_state(
+        job,
+        business_date=business_date,
+        adapter=adapter,
+        identity_parts=identity_parts,
+        timeout_seconds=timeout_seconds,
+    )
+    return state
 
 
 def run_manual_reexport(
@@ -212,11 +305,17 @@ def run_manual_reexport(
     Mandatory read-only preflight: the durable job must exist in this run with
     the exact durable identity, and the live remote execution state must be
     provably ACTIVE or TERMINAL before any export is dispatched.  An UNKNOWN
-    state rejects with zero durable writes.  The export itself always runs the
-    shared harvest core (exact identity, immutable payload, linked crawls,
-    ProcessLock + durable lease, latest-or-frozen snapshot scope, manual
-    requeue only for the whitelisted diagnostics); no create channel exists on
-    this path (``create_calls`` is always 0).
+    state rejects with zero durable writes.  A proven probe answer becomes the
+    factory-built live identity proof handed to the shared harvest core, whose
+    exact-priority-evidence gate admits the "remote task intact, priority
+    never confirmed" shape only through that proof (2026-09-04 hotfix).  The
+    export itself always runs the shared harvest core (exact identity,
+    immutable payload, linked crawls, ProcessLock + durable lease,
+    latest-or-frozen snapshot scope, manual requeue only for the whitelisted
+    diagnostics plus that one proven-proof family); no create channel exists
+    on this path (``create_calls`` is always 0).  ``remote_calls`` and
+    ``remote_calls_total`` account for the preflight probe plus the export
+    itself, and the breakdown is recorded per click.
     """
     path = Path(state_path)
     if not path.is_file():
@@ -234,6 +333,10 @@ def run_manual_reexport(
             "outcome": "REEXPORT_REJECTED",
             "error_code": "INVALID_REMOTE_STATE",
             "reason": "exact remote identity is required",
+            "preflight_remote_calls": 0,
+            "export_remote_calls": 0,
+            "remote_calls_total": 0,
+            "remote_calls": 0,
             "create_calls": 0,
         }
     if timeout_seconds <= 0:
@@ -248,6 +351,10 @@ def run_manual_reexport(
             "outcome": "REEXPORT_REJECTED",
             "error_code": "IDENTITY_MISMATCH",
             "reason": f"remote job id does not exist in this run: {remote_job_id}",
+            "preflight_remote_calls": 0,
+            "export_remote_calls": 0,
+            "remote_calls_total": 0,
+            "remote_calls": 0,
             "create_calls": 0,
         }
     if str(job.get("remote_identity") or "").strip() != expected_identity:
@@ -256,6 +363,10 @@ def run_manual_reexport(
             "outcome": "REEXPORT_REJECTED",
             "error_code": "IDENTITY_MISMATCH",
             "reason": "remote identity does not exactly match durable state",
+            "preflight_remote_calls": 0,
+            "export_remote_calls": 0,
+            "remote_calls_total": 0,
+            "remote_calls": 0,
             "create_calls": 0,
         }
 
@@ -268,14 +379,16 @@ def run_manual_reexport(
             if reported == RemoteExecutionState.TERMINAL.value
             else RemoteExecutionState.UNKNOWN
         )
+        preflight_remote_calls = 0
     else:
-        classification = _probe_remote_execution_state(
+        classification, preflight_remote_calls = _probe_remote_execution_state(
             job,
             business_date=business_date,
             adapter=adapter,
             identity_parts=identity_parts,
             timeout_seconds=timeout_seconds,
         )
+    export_remote_calls = 0
 
     if classification is RemoteExecutionState.UNKNOWN:
         return {
@@ -286,9 +399,22 @@ def run_manual_reexport(
                 "remote execution state could not be proven; no export was dispatched"
             ),
             "progress_classification": RemoteExecutionState.UNKNOWN.value,
-            "remote_calls": 0,
+            "preflight_remote_calls": preflight_remote_calls,
+            "export_remote_calls": 0,
+            "remote_calls_total": preflight_remote_calls + export_remote_calls,
+            "remote_calls": preflight_remote_calls + export_remote_calls,
             "create_calls": 0,
         }
+
+    # 2026-09-04 hotfix: the proven probe answer becomes the factory-built
+    # live identity proof for the shared core's exact-priority-evidence gate,
+    # so the "remote task intact, priority never confirmed" shape is no longer
+    # rejected as INVALID_REMOTE_STATE.  The proof is read-only evidence; the
+    # core still validates identity, payload, crawls, lock and lease itself.
+    proof = live_identity_proof(
+        remote_identity=expected_identity,
+        classification=classification,
+    )
 
     try:
         core_result = _existing_remote_harvest_core(
@@ -305,6 +431,7 @@ def run_manual_reexport(
             source_scope="latest",
             operation="manual re-export",
             attempt_headroom=2,
+            live_identity_proof=proof,
         )
     except LeaseUnavailable as exc:
         return {
@@ -313,7 +440,10 @@ def run_manual_reexport(
             "error_code": "LOCK_CONFLICT",
             "reason": str(exc),
             "progress_classification": classification.value,
-            "remote_calls": 0,
+            "preflight_remote_calls": preflight_remote_calls,
+            "export_remote_calls": 0,
+            "remote_calls_total": preflight_remote_calls,
+            "remote_calls": preflight_remote_calls,
             "create_calls": 0,
         }
     except RecoveryRejected as exc:
@@ -323,7 +453,10 @@ def run_manual_reexport(
             "error_code": _reexport_rejection_code(str(exc)),
             "reason": str(exc),
             "progress_classification": classification.value,
-            "remote_calls": 0,
+            "preflight_remote_calls": preflight_remote_calls,
+            "export_remote_calls": 0,
+            "remote_calls_total": preflight_remote_calls,
+            "remote_calls": preflight_remote_calls,
             "create_calls": 0,
         }
 
@@ -332,7 +465,12 @@ def run_manual_reexport(
     result["remote_job_id"] = int(remote_job_id)
     result["remote_identity"] = expected_identity
     result["progress_classification"] = classification.value
-    result["remote_calls"] = int(core_result.get("remote_calls") or 0)
+    export_remote_calls = int(core_result.get("remote_calls") or 0)
+    remote_calls_total = preflight_remote_calls + export_remote_calls
+    result["preflight_remote_calls"] = preflight_remote_calls
+    result["export_remote_calls"] = export_remote_calls
+    result["remote_calls_total"] = remote_calls_total
+    result["remote_calls"] = remote_calls_total
     result["create_calls"] = 0
     if classification is RemoteExecutionState.ACTIVE:
         result["still_active"] = True
@@ -534,6 +672,11 @@ def run_manual_reexport_command(
             "remote_identity": str(remote_identity or "").strip(),
             "outcome": result.get("outcome"),
             "error_code": result.get("error_code"),
+            "reason": result.get("reason"),
+            "progress_classification": result.get("progress_classification"),
+            "preflight_remote_calls": result.get("preflight_remote_calls"),
+            "export_remote_calls": result.get("export_remote_calls"),
+            "remote_calls_total": result.get("remote_calls_total"),
             "remote_calls": result.get("remote_calls"),
             "create_calls": result.get("create_calls", 0),
         },
@@ -553,6 +696,7 @@ def _resume_replaced_rebuild(
     timeout_seconds: float,
     state_path: Path,
     remote_calls: int,
+    breakdown: dict[str, int] | None = None,
 ) -> dict[str, Any]:
     """Answer a rebuild click for a job that already has a replacement row.
 
@@ -633,6 +777,8 @@ def _resume_replaced_rebuild(
         }
     persist_phase("CREATE_SENT")
     remote_calls += 1
+    if breakdown is not None:
+        breakdown["create"] = breakdown.get("create", 0) + 1
     try:
         submit_outcome = adapter.submit(
             new_prepared, timeout_seconds=max(0.001, float(timeout_seconds))
@@ -723,8 +869,14 @@ def _run_manual_rebuild_once(
     reason: str,
     progress_lookup: Callable[[PreparedLegacyJob, str, str, float], Mapping[str, Any]] | None,
     stop_callable: Callable[[PreparedLegacyJob, str, str, float], LegacyRestartOutcome] | None,
+    counters: dict[str, int] | None = None,
 ) -> dict[str, Any]:
-    """One locked manual-rebuild attempt; every protocol answer is a dict."""
+    """One locked manual-rebuild attempt; every protocol answer is a dict.
+
+    ``counters`` (2026-09-04 hotfix, optional out-parameter) accumulates the
+    remote call breakdown by kind (``probe`` / ``stop`` / ``create``) so the
+    operator action record can show it; it never changes protocol behavior.
+    """
     expected_identity = str(remote_identity or "").strip()
     base: dict[str, Any] = {
         "action_id": action_id,
@@ -735,6 +887,13 @@ def _run_manual_rebuild_once(
     store = DailyAuditStore(state_path)
     process_lock = ProcessLock(lock_path)
     remote_calls = 0
+    breakdown = counters if counters is not None else {}
+
+    def bump_remote(kind: str) -> None:
+        nonlocal remote_calls
+        remote_calls += 1
+        breakdown[kind] = breakdown.get(kind, 0) + 1
+
     try:
         token = _acquire_recovery_lease(
             store,
@@ -788,6 +947,7 @@ def _run_manual_rebuild_once(
                 timeout_seconds=timeout_seconds,
                 state_path=state_path,
                 remote_calls=remote_calls,
+                breakdown=breakdown,
             )
         job_state = str(job["state"])
         post_attempted = int(job["post_attempted"])
@@ -858,10 +1018,46 @@ def _run_manual_rebuild_once(
             or prepared.mall_key != str(job.get("mall_key") or "")
         ):
             return rejected_invalid("durable legacy job evidence is inconsistent")
+        # 2026-09-04 hotfix: historical accepted priority evidence stays
+        # mandatory.  The only fallback is the narrow priority-unconfirmed
+        # family (MANUAL_REQUIRED + post_attempted==1 + the exact bare legacy
+        # zero-rows error + null durable priority_evidence) proven live by the
+        # same exact read-only probe the re-export preflight runs: only a
+        # genuinely proven ACTIVE/TERMINAL exact-identity answer re-opens the
+        # gate; UNKNOWN, conflicts and failures all fail closed below.
+        live_proof_classification: RemoteExecutionState | None = None
         if adapter.exact_priority_remote_identity(prepared) != expected_identity:
-            return rejected_invalid(
-                "exact durable priority evidence does not match the remote identity"
+            if not _is_priority_unconfirmed_manual_job(job):
+                rejection = rejected_invalid(
+                    "exact durable priority evidence does not match the remote identity"
+                )
+                rejection["rejection_stage"] = "priority_evidence_gate"
+                return rejection
+            live_proof_classification = _probe_live_identity_classification(
+                job,
+                prepared=prepared,
+                adapter=adapter,
+                business_date=business_date,
+                identity_parts=identity_parts,
+                timeout_seconds=timeout_seconds,
+                progress_lookup=progress_lookup,
             )
+            bump_remote("probe")
+            if live_proof_classification not in (
+                RemoteExecutionState.ACTIVE,
+                RemoteExecutionState.TERMINAL,
+            ):
+                rejection = rejected_invalid(
+                    "live identity proof did not confirm the exact remote task "
+                    f"({live_proof_classification.value}); the durable priority "
+                    "evidence is unconfirmed and no rebuild may start"
+                )
+                rejection["rejection_stage"] = "live_proof"
+                rejection["progress_classification"] = live_proof_classification.value
+                return rejection
+            # The exact task is proven live under the durable identity; keep
+            # the proof classification on every later protocol answer.
+            base["live_proof_classification"] = live_proof_classification.value
 
         # Durable write-ahead protocol: the newest action row for this old job
         # decides whether a crash left an unfinished protocol that this click
@@ -1006,8 +1202,7 @@ def _run_manual_rebuild_once(
             )
 
         def query_progress() -> Mapping[str, Any] | None:
-            nonlocal remote_calls
-            remote_calls += 1
+            bump_remote("probe")
             if progress_lookup is not None:
                 return progress_lookup(
                     prepared, task_id, task_number, min(30.0, float(timeout_seconds))
@@ -1128,7 +1323,7 @@ def _run_manual_rebuild_once(
                 # Write-ahead stop: the phase lands before the remote disable,
                 # so a crash during the disable is always provable.
                 persist_action_phase("STOP_SENT")
-                remote_calls += 1
+                bump_remote("stop")
                 if stop_callable is not None:
                     stop = stop_callable(prepared, task_id, task_number, float(timeout_seconds))
                 else:
@@ -1354,7 +1549,7 @@ def _run_manual_rebuild_once(
                 "remote_calls": remote_calls,
             }
         persist_action_phase("CREATE_SENT")
-        remote_calls += 1
+        bump_remote("create")
         try:
             submit_outcome = adapter.submit(
                 new_prepared, timeout_seconds=max(0.001, float(timeout_seconds))
@@ -1478,6 +1673,7 @@ def run_manual_rebuild(
     if not path.is_file():
         raise RecoveryRejected(f"state database does not exist: {path}")
     resolved_action_id = str(action_id) if action_id else uuid4().hex
+    remote_call_breakdown: dict[str, int] = {}
     result = _run_manual_rebuild_once(
         state_path=path,
         lock_path=Path(lock_path),
@@ -1490,6 +1686,7 @@ def run_manual_rebuild(
         reason=reason,
         progress_lookup=progress_lookup,
         stop_callable=stop_callable,
+        counters=remote_call_breakdown,
     )
     record_operator_action(
         path.parent,
@@ -1509,6 +1706,15 @@ def run_manual_rebuild(
             "migrated_crawl_count": result.get("migrated_crawl_count"),
             "skipped_terminal_crawl_count": result.get("skipped_terminal_crawl_count"),
             "remote_calls": result.get("remote_calls"),
+            "rejection_stage": result.get("rejection_stage") or result.get("error_code"),
+            "progress_classification": (
+                result.get("progress_classification")
+                or result.get("precheck_classification")
+            ),
+            "live_proof_classification": result.get("live_proof_classification"),
+            "probe_remote_calls": int(remote_call_breakdown.get("probe", 0)),
+            "stop_remote_calls": int(remote_call_breakdown.get("stop", 0)),
+            "create_remote_calls": int(remote_call_breakdown.get("create", 0)),
         },
     )
     return result

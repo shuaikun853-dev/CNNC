@@ -61,6 +61,7 @@ const { createPollController, createSaasFlowPoller, safeProgressText, sfPartialN
         fmtShanghaiDateTime, createCnncAuthFetcher, computeCloseoutBackendRunning,
         applyCloseoutRunningOverlay, isCloseoutWriter, resolveCloseoutActionsDate,
         updateCloseoutUI, pollDelay, inCloseoutWatchWindow, _setCloseoutStateForTest,
+        armRebuildDrawerSwitch, resolveRebuildDrawerSwitch,
         cpStatusCn, cpStatusPill, cpRowMatchesFilter, cpSortRows } = require(
   path.join(__dirname, "..", "..", "app", "static", "dashboard", "app.js"));
 
@@ -1152,6 +1153,52 @@ function test_customer_price_seams() {
         cpRowMatchesFilter(null, "all") === true);
 }
 
+// ---- 2026-09-04 hotfix:rebuild 成功后 drawer 自动切到替代任务(纯判定 seam) ----
+function test_rebuild_drawer_switch_seam() {
+  const jobs = [
+    { id: 30, task_name: "cnnc_current_opt_zjmi_111", state: "SUPERSEDED" },
+    { id: 41, task_name: "cnnc_current_opt_zjmi_222", state: "SUBMITTED" }];
+
+  check("重建切换:替代任务已在投影 → switch 到新任务对象",
+        (() => {
+          const pending = armRebuildDrawerSwitch(30, { new_remote_job_id: 41, new_task_name: "cnnc_current_opt_zjmi_222" });
+          const r = resolveRebuildDrawerSwitch(jobs, pending);
+          return r.action === "switch" && r.job.id === 41 && r.job.task_name === "cnnc_current_opt_zjmi_222";
+        })());
+
+  check("重建切换:替代任务尚未进投影 → wait + 明确同步文案(含新任务名)",
+        (() => {
+          const pending = armRebuildDrawerSwitch(30, { new_remote_job_id: 42, new_task_name: "cnnc_current_opt_zjmi_333" });
+          const r = resolveRebuildDrawerSwitch(jobs, pending);
+          return r.action === "wait" &&
+            r.message.indexOf("旧任务已被替代") !== -1 &&
+            r.message.indexOf("cnnc_current_opt_zjmi_333") !== -1 &&
+            r.message.indexOf("正在同步状态") !== -1;
+        })());
+
+  check("重建切换:缺 new_task_name 时文案回退为新任务 id,绝不回退旧视图",
+        (() => {
+          const pending = armRebuildDrawerSwitch(30, { new_remote_job_id: 43 });
+          const r = resolveRebuildDrawerSwitch(jobs, pending);
+          return r.action === "wait" && r.message.indexOf("#43") !== -1;
+        })());
+
+  check("重建切换:无 new_remote_job_id / 新旧同 id / 入参异常 → 不武装或 none",
+        armRebuildDrawerSwitch(30, {}) === null &&
+        armRebuildDrawerSwitch(30, { new_remote_job_id: 30 }) === null &&
+        armRebuildDrawerSwitch("30", { new_remote_job_id: "30" }) === null &&
+        resolveRebuildDrawerSwitch(jobs, null).action === "none" &&
+        resolveRebuildDrawerSwitch(null, { oldJobId: "30", newJobId: "41", newTaskName: "x" }).action === "wait" &&
+        resolveRebuildDrawerSwitch(jobs, undefined).action === "none");
+
+  check("重建切换:id 比较一律字符串化(数字/字符串 id 混排不漏判)",
+        (() => {
+          const pending = armRebuildDrawerSwitch("30", { new_remote_job_id: "41", new_task_name: "n" });
+          const r = resolveRebuildDrawerSwitch([{ id: "41", task_name: "n" }], pending);
+          return r.action === "switch" && r.job.id === "41";
+        })());
+}
+
 (async () => {
   await test_304_keeps_sync_fresh_without_rerender();
   await test_hidden_pauses_and_visible_resumes();
@@ -1188,6 +1235,7 @@ function test_customer_price_seams() {
   test_closeout_r3_ops_unavailable();
   test_closeout_r3_poll_watch_window();
   test_customer_price_seams();
+  test_rebuild_drawer_switch_seam();
   if (failed === 0) { console.log("ALL PASS"); process.exit(0); }
   console.error(failed + " failing checks");
   process.exit(1);

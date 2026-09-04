@@ -6,6 +6,7 @@ import json
 import re
 import time
 from collections import Counter
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
@@ -28,6 +29,104 @@ from app.services.recovery.common import (
 from app.services.recovery.validation import (
     validate_linked_crawls_against_remote_payload,
 )
+from app.services.remote_running_recovery import RemoteExecutionState
+
+
+# ---------------------------------------------------------------------------
+# Live identity proof (2026-09-04 hotfix).  A dashboard read-only probe of the
+# exact remote task may donate liveness evidence to the two fail-closed gates
+# below for the one production shape where the remote task is intact and only
+# the priority confirmation never landed (the bare legacy zero-rows family).
+# The proof never replaces durable evidence and never carries a boolean "skip
+# gate" flag: construction is factory-controlled and the gates decide from the
+# two fields alone.
+# ---------------------------------------------------------------------------
+
+_LIVE_PROOF_FACTORY_TOKEN: Any = object()
+
+_LIVE_PROOF_ADMITTED_CLASSIFICATIONS = frozenset(
+    {RemoteExecutionState.ACTIVE.value, RemoteExecutionState.TERMINAL.value}
+)
+
+
+@dataclass(frozen=True)
+class LiveIdentityProof:
+    """Immutable read-only proof of one exact remote task's live state.
+
+    Fields:
+
+    - ``remote_identity``: the exact three-part identity
+      (``mall|task_id|task_number``) the live probe re-confirmed on the
+      remote platform;
+    - ``classification``: the probe's execution-state classification; only
+      ``REMOTE_ACTIVE`` / ``REMOTE_TERMINAL`` are admissible.
+
+    Construction is factory-controlled (``live_identity_proof``); direct
+    instantiation raises ``TypeError``.  There is deliberately no boolean
+    "skip the gate" flag -- a gate either reads a proof that re-confirms the
+    exact durable identity with a proven classification, or it rejects.
+    """
+
+    remote_identity: str
+    classification: str
+    _factory_token: Any = field(default=None, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        if self._factory_token is not _LIVE_PROOF_FACTORY_TOKEN:
+            raise TypeError(
+                "LiveIdentityProof must be constructed through live_identity_proof()"
+            )
+
+
+def _live_identity_proof_admits(
+    proof: LiveIdentityProof | None, expected_identity: str
+) -> bool:
+    """True only when the proof re-confirms the exact identity and is proven.
+
+    A missing proof, a different identity, or an unproven classification all
+    fail closed: the calling gate keeps its original rejection.
+    """
+    if proof is None:
+        return False
+    if str(proof.remote_identity or "").strip() != str(expected_identity or "").strip():
+        return False
+    return (
+        str(proof.classification or "").strip() in _LIVE_PROOF_ADMITTED_CLASSIFICATIONS
+    )
+
+
+def live_identity_proof(
+    *,
+    remote_identity: str,
+    classification: RemoteExecutionState | str,
+) -> LiveIdentityProof:
+    """Build the only admissible live proof from a proven probe answer.
+
+    Raises ``ValueError`` unless the identity is the exact three-part form and
+    the classification is ``REMOTE_ACTIVE`` or ``REMOTE_TERMINAL``; an
+    UNKNOWN probe must never become a proof.
+    """
+    identity = str(remote_identity or "").strip()
+    parts = identity.split("|")
+    if len(parts) != 3 or not all(parts):
+        raise ValueError(
+            "live identity proof requires an exact three-part remote identity"
+        )
+    resolved = (
+        classification.value
+        if isinstance(classification, RemoteExecutionState)
+        else str(classification or "").strip()
+    )
+    if resolved not in _LIVE_PROOF_ADMITTED_CLASSIFICATIONS:
+        raise ValueError(
+            "live identity proof requires a proven "
+            "REMOTE_ACTIVE/REMOTE_TERMINAL classification"
+        )
+    return LiveIdentityProof(
+        remote_identity=identity,
+        classification=resolved,
+        _factory_token=_LIVE_PROOF_FACTORY_TOKEN,
+    )
 
 
 
@@ -423,6 +522,7 @@ def _existing_remote_harvest_core(
     source_scope: str,
     operation: str,
     attempt_headroom: int = 1,
+    live_identity_proof: LiveIdentityProof | None = None,
 ) -> dict[str, Any]:
     """Shared wait/export + backfill core for one exact existing remote job.
 
@@ -447,6 +547,12 @@ def _existing_remote_harvest_core(
       wrapper passes ``+2`` so a zero-result export followed by one immediate
       operator click stays harvestable instead of cap-flipping straight back
       to MANUAL_REQUIRED.
+    - ``live_identity_proof`` (2026-09-04 hotfix, default ``None``): a
+      factory-built proof from an earlier read-only probe of the exact remote
+      identity.  When present and proven it admits one extra MANUAL_REQUIRED
+      requeue diagnostic (the bare legacy zero-rows family) and re-opens the
+      exact-priority-evidence gate below; with ``None`` or an unproven proof
+      every gate behaves exactly as before.
 
     Everything else is kept verbatim from the original single-purpose
     implementation.
@@ -500,10 +606,25 @@ def _existing_remote_harvest_core(
             )
         needs_manual_requeue = False
         if job["state"] not in admissible_states:
+            job_error_text = str(job.get("error_text") or "").strip()
+            # Live-proof fallback (2026-09-04 hotfix): a proven read-only probe
+            # of the exact durable identity admits exactly one extra MANUAL
+            # diagnostic -- the bare legacy zero-rows family, i.e. the "remote
+            # task intact, priority never confirmed" shape.  Everything else
+            # keeps the original rejection.
             if (
                 allow_manual_requeue
                 and job["state"] == "MANUAL_REQUIRED"
-                and str(job.get("error_text") or "").strip() in manual_requeue_diagnostics
+                and (
+                    job_error_text in manual_requeue_diagnostics
+                    or (
+                        _live_identity_proof_admits(
+                            live_identity_proof, expected_identity
+                        )
+                        and job_error_text
+                        == REMOTE_NOT_MATERIALIZED_LEGACY_DIAGNOSTIC
+                    )
+                )
             ):
                 needs_manual_requeue = True
             else:
@@ -541,7 +662,12 @@ def _existing_remote_harvest_core(
         ):
             raise RecoveryRejected("durable legacy job evidence is inconsistent")
         if adapter.exact_priority_remote_identity(prepared) != expected_identity:
-            raise RecoveryRejected("exact accepted priority evidence is required")
+            # Historical accepted priority evidence stays mandatory.  The only
+            # fallback (2026-09-04 hotfix) is a factory-built live proof from
+            # an earlier read-only probe of the exact same remote identity; a
+            # missing, mismatched, or unproven proof keeps this rejection.
+            if not _live_identity_proof_admits(live_identity_proof, expected_identity):
+                raise RecoveryRejected("exact accepted priority evidence is required")
 
         crawls = store.crawl_work_for_job(int(remote_job_id))
         validate_linked_crawls_against_remote_payload(

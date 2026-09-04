@@ -348,6 +348,7 @@
         (s.next_run ? "下次运行:" + String(s.next_run) : "计划任务:正常")));
   }
   function renderJobs(jobs) {
+    lastSummaryJobs = jobs || [];
     $("#jobs-table tbody").innerHTML = (jobs || []).map((j) => {
       const cell = jobProgressCell(j);
       return `
@@ -362,6 +363,7 @@
       </tr>`; }).join("");
     document.querySelectorAll("#jobs-table tr.row").forEach((tr) =>
       tr.addEventListener("click", () => openDrawer(tr.dataset.id, jobs)));
+    settleRebuildDrawerSwitch();   // 重建后等替代任务进入投影即自动切换
   }
   // P3(Review Fix Round 2):恢复时间线 signature 来自持久化 JSON,页面层不无条件
   // 信任——显式 Number 转换 + Number.isFinite 校验,恶意/损坏内容只能得到"—",
@@ -599,6 +601,58 @@
   }
 
   let drawerJob = null;
+
+  // ---- 重建成功后的 drawer 自动切换(2026-09-04 hotfix) ----
+  // 重建 POST 成功后触发一次 summary 刷新;刷新完成(以及此后每次 summary
+  // 渲染)在投影里找替代任务:找到 → drawer 切到新任务;还没出现 → 明确
+  // "正在同步状态"文案,绝不静默回退成旧任务视图。纯判定逻辑抽成
+  // resolveRebuildDrawerSwitch(tests/js 直测,无 DOM)。
+  let pendingRebuildSwitch = null;
+  let lastSummaryJobs = [];
+
+  function armRebuildDrawerSwitch(oldJobId, oc) {
+    const newId = Number(oc && oc.new_remote_job_id);
+    if (!Number.isFinite(newId) || newId <= 0) return null;
+    if (String(newId) === String(oldJobId)) return null;
+    return {
+      oldJobId: String(oldJobId),
+      newJobId: String(newId),
+      newTaskName: String((oc && (oc.new_task_name || oc.new_batch_number)) || ""),
+    };
+  }
+
+  function resolveRebuildDrawerSwitch(jobs, pending) {
+    if (!pending) return { action: "none" };
+    const list = Array.isArray(jobs) ? jobs : [];
+    const target = list.find((x) => x && String(x.id) === pending.newJobId);
+    if (target) return { action: "switch", job: target };
+    const label = pending.newTaskName || ("#" + pending.newJobId);
+    return { action: "wait", message: "旧任务已被替代,新任务:" + label + ",正在同步状态" };
+  }
+
+  function settleRebuildDrawerSwitch() {
+    const pending = pendingRebuildSwitch;
+    if (!pending) return;
+    const drawer = $("#drawer");
+    // 用户已收起 drawer 或手动打开了别的任务 → 放弃自动切换,不再打扰。
+    if (!drawer || !drawer.classList.contains("show") ||
+        !drawerJob || String(drawerJob.id) !== pending.oldJobId) {
+      pendingRebuildSwitch = null;
+      return;
+    }
+    const r = resolveRebuildDrawerSwitch(lastSummaryJobs, pending);
+    if (r.action === "switch") {
+      pendingRebuildSwitch = null;
+      openDrawer(r.job.id, lastSummaryJobs);
+      const st = drawerActionStatus();
+      if (st) st.textContent = "已切换到替代任务";
+      return;
+    }
+    if (r.action === "wait") {
+      const st = drawerActionStatus();
+      if (st) st.textContent = r.message;
+    }
+  }
 
   function renderLiveProgressBlock(statusDict, crawlTotal) {
     const box = $("#drawer-live .lp-body");
@@ -944,6 +998,13 @@
           j.superseded_by = j.superseded_by || {
             new_task_name: oc.new_task_name || "", new_batch_number: oc.new_batch_number || "" };
           j.state = "SUPERSEDED";
+          // 2026-09-04 hotfix:重建成功后等 summary 刷新完成,自动把 drawer
+          // 切到替代任务;新任务尚未进投影时给出明确同步文案,不回退旧视图。
+          pendingRebuildSwitch = armRebuildDrawerSwitch(j.id, oc);
+          if (pendingRebuildSwitch) {
+            await ctl.run();
+            settleRebuildDrawerSwitch();
+          }
         }
       } catch (e) {
         if (st) st.textContent = "重建请求失败,请稍后重试";
@@ -1362,6 +1423,7 @@
     computeCloseoutBackendRunning, applyCloseoutRunningOverlay, isCloseoutWriter,
     resolveCloseoutActionsDate, closeoutUIRunning, updateCloseoutUI,
     pollDelay, inCloseoutWatchWindow, _setCloseoutStateForTest,
+    armRebuildDrawerSwitch, resolveRebuildDrawerSwitch,
     cpStatusCn, cpStatusPill, cpRowMatchesFilter, cpSortRows };
   if (typeof window !== "undefined") { window.Dashboards = api; }
   if (typeof module !== "undefined" && module.exports) { module.exports = api; }
