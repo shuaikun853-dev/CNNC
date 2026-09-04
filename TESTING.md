@@ -232,3 +232,7 @@ python -m pytest tests\test_diagnose_integration.py tests\test_workflow_api.py -
 ```
 
 健康检查：`GET http://127.0.0.1:8000/health`。旧 `/diagnose` 只返回模板，不执行 SQL。
+
+## 10. 生产就绪只读检查
+
+一行命令：`python scripts\production_readiness_check.py --json`（退出码 0=READY、1=NOT READY、2=意外错误）；只读不注册任务/不连库/不刷新认证/不发网络请求，详见 [docs/runbooks/PRODUCTION_READINESS.md](docs/runbooks/PRODUCTION_READINESS.md)，测试 `tests\test_production_readiness.py`。
