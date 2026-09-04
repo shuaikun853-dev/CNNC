@@ -222,8 +222,8 @@
   function cpStatusPill(key) {
     if (key === "READY") return "ok";
     if (key === "RETRYING" || key === "PENDING") return "run";
-    if (key === "MISSING_PROVEN") return "warn";
-    if (key === "MISSING" || key === "FAILED" || key === "INVALID") return "err";
+    // R2-B:确定性缺席(MISSING_PROVEN)与缺失/失败/无效同为阻塞 → err。
+    if (key === "MISSING_PROVEN" || key === "MISSING" || key === "FAILED" || key === "INVALID") return "err";
     return "wait";
   }
   // 行是否命中过滤(与后端 project_customer_price 同语义;仅用于前端已拉取数据的本地再过滤兜底)。
@@ -231,7 +231,8 @@
     const st = row && row.state;
     if (filter === "retrying") return st === "RETRYING";
     if (filter === "terminal") return st === "MISSING" || st === "FAILED" || st === "INVALID";
-    if (filter === "unacquired") return st !== "READY" && st !== "MISSING_PROVEN";
+    // R2-B:确定性缺席(MISSING_PROVEN)同属未获取——unacquired 只排除 READY。
+    if (filter === "unacquired") return st !== "READY";
     return true;   // all(含未知 filter,防御为 all)
   }
   // 未完成优先排序:获取中→待重试→缺失→失败→无效,证据缺席次之,已获取最后。
@@ -253,7 +254,8 @@
     let html = chips.map(([lab, v, cls]) =>
       `<span><span class="lab">${lab}</span><b class="${cls}">${Number(v || 0)}</b></span>`).join("");
     if (Number(cp.absent_proven || 0) > 0) {
-      html += `<span><span class="lab">证据齐全缺席</span><b class="warn">${Number(cp.absent_proven)}</b></span>`;
+      // R2-B:确定性缺失同为阻塞 → err 配色,与“缺失/失败/无效”一致。
+      html += `<span><span class="lab">确定性缺失</span><b class="err">${Number(cp.absent_proven)}</b></span>`;
     }
     html += `<span><span class="lab">获取率</span><b>${esc(pct)}</b></span>`;
     box.innerHTML = html;

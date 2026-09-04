@@ -736,7 +736,10 @@ def test_valid_customer_price_keeps_finalize_ready(tmp_path):
 
 
 @pytest.mark.parametrize("status", ["LOOKUP_FAILED", "DETAIL_REQUEST_SKIPPED", "NOT_PROVIDED"])
-def test_proven_absent_customer_price_does_not_block_finalize(tmp_path, status):
+def test_proven_absent_customer_price_blocks_finalize(tmp_path, status):
+    """Round-2 fail-closed ruling: a required row with no valid customer price
+    blocks formal finalization even when the absence is deterministic and
+    evidence-complete.  (Flipped from the round-1 'does not block' contract.)"""
     store, snapshot = _seed(tmp_path, rows=[_row(url="")])
     token = store.acquire_lease("2026-08-11", "absent", 60)
     item = store.ordered_snapshot_items(snapshot["id"])[0]
@@ -750,13 +753,10 @@ def test_proven_absent_customer_price_does_not_block_finalize(tmp_path, status):
 
     built = build_frozen_audit_artifact(store, token, output_identity="daily-final-20260811")
 
-    # Evidence-complete deterministic absence closes out without blocking, and
-    # the reference price stays blank in the enriched row.
-    assert built.readiness.ready is True
+    # The enriched evidence is preserved for review, but the formal final is blocked.
+    assert built.readiness.ready is False
     assert built.readiness.customer_price_absent_proven == 1
-    assert built.artifact is not None
-    assert built.artifact.enriched_rows[0]["customerPrice"] is None
-    assert built.artifact.enriched_rows[0]["customerPriceStatus"] == status
+    assert built.artifact is None
     store.release_lease(token)
 
 
@@ -771,3 +771,49 @@ def test_detail_failure_keeps_decoded_status_from_error_prefix():
     fallback = _detail_failure("TimeoutError")
     assert fallback["customerPriceStatus"] == "DETAIL_REQUEST_FAILED"
     assert fallback["customerPriceWarning"].startswith("增量详情阶段失败：TimeoutError")
+
+
+# ---- is_recoverable_finalize_wait (round 2, matrix E) ----------------------
+
+
+def test_recoverable_finalize_wait_is_true_for_pure_pending_only():
+    from app.workflows.incremental_price_audit_finalize import FinalizeReadiness, is_recoverable_finalize_wait
+
+    assert is_recoverable_finalize_wait(None) is False
+    assert is_recoverable_finalize_wait(FinalizeReadiness()) is False
+    assert is_recoverable_finalize_wait(FinalizeReadiness(detail_pending=1)) is True
+    assert is_recoverable_finalize_wait(FinalizeReadiness(crawl_pending=2, remote_pending=1)) is True
+
+
+@pytest.mark.parametrize(
+    "blocker",
+    [
+        {"detail_terminal": 1},
+        {"customer_price_missing": 1},
+        {"customer_price_failed": 1},
+        {"customer_price_invalid": 1},
+        {"customer_price_absent_proven": 1},
+        {"model_terminal": 1},
+        {"crawl_terminal": 1},
+        {"remote_manual": 1},
+        {"remote_invalid": 1},
+        {"crawl_unplanned": 1},
+        {"crawl_invalid_price": 1},
+    ],
+)
+def test_actionable_blockers_are_never_a_recoverable_wait(blocker):
+    """Any actionable blocker (including every customer_price_* bucket and
+    detail_terminal) must stop the closeout from idling as if it were only a
+    pending wait."""
+    from app.workflows.incremental_price_audit_finalize import FinalizeReadiness, is_recoverable_finalize_wait
+
+    readiness = FinalizeReadiness(detail_pending=1, **blocker)
+    assert is_recoverable_finalize_wait(readiness) is False
+
+
+def test_absent_proven_alone_is_an_actionable_blocker_not_a_wait():
+    """Even without pending work, absent_proven must read as not-recoverable:
+    the closeout must not idle-wait on a gate only a human can resolve."""
+    from app.workflows.incremental_price_audit_finalize import FinalizeReadiness, is_recoverable_finalize_wait
+
+    assert is_recoverable_finalize_wait(FinalizeReadiness(customer_price_absent_proven=1)) is False

@@ -606,16 +606,23 @@ def _is_retryable_model_failure(exc: BaseException) -> bool:
 
 
 def _is_retryable_detail_failure(exc: BaseException) -> bool:
-    """Detail retries only for business retries and transient failures.
+    """Detail retries follow typed HTTP semantics plus business retries.
 
-    ``DetailBusinessRetryRequired`` (NOT_FOUND / DETAIL_REQUEST_FAILED /
-    DETAIL_PARSE_FAILED) and ordinary transient errors stay retryable;
-    ``RuntimeConfigurationError`` is deterministic misconfiguration and goes
-    straight to terminal.  No backoff: ticks are paced by the scheduler and
-    ``detail_max_attempts`` bounds the durable replay budget.
+    - ``DetailRequestError``: decided by its HTTP status via
+      ``is_retryable_detail_http_status`` (None/408/429/5xx/403/412 retryable;
+      other 4xx deterministic and terminal).
+    - ``DetailBusinessRetryRequired`` (NOT_FOUND / DETAIL_REQUEST_FAILED /
+      DETAIL_PARSE_FAILED): retryable business failure.
+    - ``RuntimeConfigurationError``: deterministic misconfiguration, straight
+      to terminal.
+    - Everything else (auth rejection after refresh, TimeoutError, URLError,
+      ...) stays retryable.  No backoff: ticks are paced by the scheduler and
+      ``detail_max_attempts`` bounds the durable replay budget.
     """
     from app.services.incremental_audit_runtime import RuntimeConfigurationError
 
+    if isinstance(exc, customer_price_semantics.DetailRequestError):
+        return bool(exc.retryable)
     if isinstance(exc, DetailBusinessRetryRequired):
         return True
     if isinstance(exc, RuntimeConfigurationError):
@@ -1050,8 +1057,16 @@ def _backlog(
     crawls = store.list_crawl_work(token)
     jobs = store.list_remote_jobs(token)
     missing_stages = 0
+    # DETAIL rows are only re-scoped when the caller passes a non-empty
+    # authoritative snapshot: DETAIL work has no cross-snapshot reclaim, so
+    # rows dropped from the current snapshot must not pollute the backlog.
+    # MODEL rows always count in full — _model_items_with_retry_backlog
+    # deliberately reclaims same-day retryable MODEL work across snapshots.
+    # Drain/harvest-only/FAILED fallback paths pass no snapshot and keep the
+    # historical whole-run DETAIL view.
+    scope_detail_to_current = bool(snapshot_items)
+    current_item_ids = {int(item["id"]) for item in snapshot_items} if snapshot_items else set()
     if snapshot_items is not None:
-        current_item_ids = {int(item["id"]) for item in snapshot_items}
         established = {
             (int(work["audit_item_id"]), str(work["stage"]))
             for work in stages
@@ -1061,10 +1076,33 @@ def _backlog(
             for audit_item_id in current_item_ids
             for stage in ("DETAIL", "MODEL")
         )
+
+    def _in_current_detail_scope(work: Mapping[str, Any]) -> bool:
+        return (
+            not scope_detail_to_current
+            or int(work["audit_item_id"]) in current_item_ids
+        )
+
+    def _is_stage_pending(work: Mapping[str, Any]) -> bool:
+        return work["state"] in {
+            "PENDING",
+            "CLAIMED",
+            "RETRYABLE_FAILED",
+            "RECOVERED_PENDING_REVIEW",
+        }
+
+    detail_pending = sum(
+        work["stage"] == "DETAIL" and _is_stage_pending(work) and _in_current_detail_scope(work)
+        for work in stages
+    )
+    model_pending = sum(
+        work["stage"] == "MODEL" and _is_stage_pending(work)
+        for work in stages
+    )
     customer_price_missing = 0
     customer_price_failed = 0
     for work in stages:
-        if work["stage"] != "DETAIL":
+        if work["stage"] != "DETAIL" or not _in_current_detail_scope(work):
             continue
         state = customer_price_semantics.customer_price_business_state(
             work.get("state"), _decoded_result_dict(work), work.get("error_text")
@@ -1074,17 +1112,11 @@ def _backlog(
         elif state.key == customer_price_semantics.FAILED:
             customer_price_failed += 1
     return {
-        "stage_pending": missing_stages + sum(
-            work["state"] in {
-                "PENDING",
-                "CLAIMED",
-                "RETRYABLE_FAILED",
-                "RECOVERED_PENDING_REVIEW",
-            }
-            for work in stages
-        ),
+        "stage_pending": missing_stages + detail_pending + model_pending,
         "detail_terminal": sum(
-            work["stage"] == "DETAIL" and work["state"] == "TERMINAL_FAILED"
+            work["stage"] == "DETAIL"
+            and work["state"] == "TERMINAL_FAILED"
+            and _in_current_detail_scope(work)
             for work in stages
         ),
         "model_terminal": sum(
@@ -1516,12 +1548,19 @@ def run_incremental_tick(
             counters["submit_pass_snapshot_id"] = snapshot_id or 0
 
         trace.append("detail")
-        if deps.detail is not None:
-            # Legacy durable-state compatibility: rows checkpointed as SUCCESS
-            # while actually carrying a retryable business failure are given
-            # back their attempt budget exactly once (under the new worker they
-            # can never be written as SUCCESS again).  Idempotent and bounded.
-            counters["detail_business_requeued"] = store.requeue_invalid_business_success_details(token)
+        if deps.detail is not None and snapshot_id is not None:
+            # Legacy durable-state compatibility, scoped to THIS tick's
+            # authoritative snapshot (the frozen snapshot when the run is
+            # already frozen, otherwise the snapshot just ingested): rows
+            # checkpointed as SUCCESS while actually carrying a retryable
+            # business failure are given back their attempt budget exactly
+            # once.  Invalid-SUCCESS rows outside the current snapshot
+            # membership are never requeued — a historical row nobody will
+            # process this tick must not be flipped to PENDING where it would
+            # pollute the durable backlog forever.  Idempotent and bounded.
+            counters["detail_business_requeued"] = store.requeue_invalid_business_success_details(
+                token, snapshot_id
+            )
         for item in items:
             if not budget.can_start_heavy():
                 break

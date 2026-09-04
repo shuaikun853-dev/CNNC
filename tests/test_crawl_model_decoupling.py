@@ -88,7 +88,16 @@ def _deps(events, rows, clock, *, with_submit=True, plan_returns_none=False):
 
     def detail(row, timeout):
         events.append(f"detail:{row['vCommodityId']}")
-        return {"customerPrice": "10"}
+        # Full evidence shape the production _detail_worker returns; a bare
+        # price without customerPriceStatus is fail-closed INVALID evidence
+        # under the round-2 rule table and would turn the status red.
+        return {
+            "customerPrice": "10",
+            "customerPriceStatus": "FOUND",
+            "customerPriceSource": "DETAIL_REFERENCE_INFOS",
+            "customerPriceWarning": "",
+            "customerPriceEvidence": "参考价1=10",
+        }
 
     def model(row, timeout):
         events.append(f"model:{row['vCommodityId']}")

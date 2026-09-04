@@ -394,8 +394,17 @@ def test_status_final_blocker_summary_decomposes_computed_pending(tmp_path):
         "customer_price_missing": 0,
         "customer_price_failed": 0,
         "customer_price_invalid": 0,
+        "customer_price_absent_proven": 0,
     }
-    assert sum(final["blocker_summary"].values()) == final["computed_pending"]
+    # customer_price_* keys are a deliberate business cross-cut over the same
+    # detail rows, so only the technical keys must decompose the computed sum.
+    technical_keys = (
+        "detail_pending", "detail_terminal", "model_pending", "model_terminal",
+        "crawl_pending", "crawl_unplanned", "crawl_planning_pending",
+        "crawl_unknown", "crawl_manual", "remote_intent", "remote_pending",
+        "remote_unknown", "remote_manual",
+    )
+    assert sum(final["blocker_summary"][key] for key in technical_keys) == final["computed_pending"]
 
 
 def test_status_pending_breakdown_reports_unclassified_instead_of_guessing(tmp_path):
@@ -598,6 +607,15 @@ def test_customer_price_projection_absent_proven_row(tmp_path):
     assert detail_status["customer_price_missing"] == 0
     assert detail_status["customer_price_ratio"] == 0
     assert status["final"]["blocker_summary"]["customer_price_missing"] == 0
+    # Round-2: the absent-proven bucket is projected into the blocker summary
+    # (it blocks ordinary and force finalize via the finalize gates).
+    assert status["final"]["blocker_summary"]["customer_price_absent_proven"] == 1
+    # R2-B: the row is SUCCESS (detail.terminal==0) but provably price-less, so
+    # next_actions must send the operator to the terminal/manual inspection
+    # branch instead of suggesting more ticks.
+    assert status["next_actions"] == [
+        "inspect terminal/manual evidence before rerunning; do not delete durable state"
+    ]
 
 
 def test_customer_price_pending_includes_members_without_stage_row(tmp_path):

@@ -14,9 +14,13 @@ from __future__ import annotations
 from datetime import UTC, datetime
 import json
 
+import pytest
+
 from app.services.customer_price_semantics import (
     DetailBusinessRetryRequired,
+    DetailRequestError,
     encode_business_error,
+    is_retryable_detail_http_status,
 )
 from app.services.daily_audit_store import DailyAuditStore, ProcessLock
 from app.services.incremental_audit_runtime import RuntimeConfigurationError
@@ -369,6 +373,7 @@ def test_requeue_resets_budget_and_keeps_status_evidence_in_error_text(tmp_path)
         "customerPriceEvidence": "参考价1=10",
     })
     run_incremental_tick(store, lock, _config(), deps)
+    snapshot_id = int(store.latest_snapshot(DATE)["id"])
 
     token = store.acquire_lease(DATE, "corrupt", 30)
     work = _detail_state(store, token)
@@ -386,7 +391,7 @@ def test_requeue_resets_budget_and_keeps_status_evidence_in_error_text(tmp_path)
         "customerPriceWarning": "详情接口未返回有效参考价",
         "customerPriceEvidence": "",
     })
-    assert store.requeue_invalid_business_success_details(token) == 1
+    assert store.requeue_invalid_business_success_details(token, snapshot_id) == 1
     requeued = store.get_stage_work(int(work["id"]))
     assert requeued["state"] == "PENDING"
     assert requeued["attempts"] == 0
@@ -398,7 +403,7 @@ def test_requeue_resets_budget_and_keeps_status_evidence_in_error_text(tmp_path)
         "requeued invalid business success: customerPriceStatus=NOT_FOUND"
     )
     # Second call finds nothing: the row is no longer an invalid success.
-    assert store.requeue_invalid_business_success_details(token) == 0
+    assert store.requeue_invalid_business_success_details(token, snapshot_id) == 0
     # A healthy FOUND success is never requeued.
     store.claim_stage_work(token, work["id"], max_attempts=3, max_elapsed_seconds=300)
     store.complete_stage_work(token, work["id"], {
@@ -408,5 +413,148 @@ def test_requeue_resets_budget_and_keeps_status_evidence_in_error_text(tmp_path)
         "customerPriceWarning": "",
         "customerPriceEvidence": "参考价1=10",
     })
-    assert store.requeue_invalid_business_success_details(token) == 0
+    assert store.requeue_invalid_business_success_details(token, snapshot_id) == 0
     store.release_lease(token)
+
+
+# ---- typed transport-failure retry classification (round 2, P1-4) ----------
+
+
+@pytest.mark.parametrize(
+    ("http_status", "retryable"),
+    [
+        (None, True),   # transport/timeout/decode: no status, transient
+        (408, True),
+        (429, True),
+        (500, True),
+        (503, True),
+        (403, True),    # CNNC gateway auth/WAF rotation window
+        (412, True),
+        (400, False),   # deterministic request errors: terminal on first attempt
+        (404, False),
+    ],
+)
+def test_typed_detail_request_error_follows_http_semantics(
+    tmp_path, http_status, retryable
+):
+    store = DailyAuditStore(tmp_path / f"state-{http_status}.sqlite")
+    lock = ProcessLock(tmp_path / f"tick-{http_status}.lock")
+    calls = []
+
+    def detail(row, timeout):
+        calls.append(row["vCommodityId"])
+        # Mirror the real worker: retryable comes from the HTTP status helper.
+        raise DetailRequestError(
+            http_status=http_status,
+            message=f"HTTP {http_status}",
+            retryable=is_retryable_detail_http_status(http_status),
+        )
+
+    deps = _deps([_row()], detail)
+    first = run_incremental_tick(store, lock, _config(), deps)
+
+    token = store.acquire_lease(DATE, "inspect", 30)
+    work = _detail_state(store, token)
+    store.release_lease(token)
+    assert len(calls) == 1
+    if retryable:
+        assert work["state"] == "RETRYABLE_FAILED"
+        assert work["attempts"] == 1
+        assert first.outcome == "PENDING_RETRY"
+        # The durable replay window reclaims the row on the next tick.
+        run_incremental_tick(store, lock, _config(), deps)
+        token = store.acquire_lease(DATE, "inspect-2", 30)
+        work = _detail_state(store, token)
+        store.release_lease(token)
+        assert len(calls) == 2
+        assert work["attempts"] == 2
+    else:
+        assert work["state"] == "TERMINAL_FAILED"
+        assert work["attempts"] == 1
+        assert first.outcome == "MANUAL_REVIEW_REQUIRED"
+
+
+def test_timeout_and_connection_errors_stay_retryable(tmp_path):
+    for exc_kind in ("timeout", "connection"):
+        store = DailyAuditStore(tmp_path / f"state-{exc_kind}.sqlite")
+        lock = ProcessLock(tmp_path / f"tick-{exc_kind}.lock")
+        calls = []
+
+        def detail(row, timeout, _exc_kind=exc_kind):
+            calls.append(row["vCommodityId"])
+            raise TimeoutError("deadline") if _exc_kind == "timeout" else ConnectionError("reset")
+
+        deps = _deps([_row()], detail)
+        summary = run_incremental_tick(store, lock, _config(), deps)
+
+        token = store.acquire_lease(DATE, "inspect", 30)
+        work = _detail_state(store, token)
+        store.release_lease(token)
+        assert len(calls) == 1, exc_kind
+        assert work["state"] == "RETRYABLE_FAILED", exc_kind
+        assert summary.outcome == "PENDING_RETRY", exc_kind
+
+
+class _FakeAuthProvider:
+    """duck-type CnncAuthProvider: worker only needs get/refresh/get_status."""
+
+    def __init__(self):
+        self.refresh_calls = 0
+
+    def get_access_token(self):
+        return "AT-1"
+
+    def refresh(self, *, stale_access_token=None, deadline_monotonic=None, **_kwargs):
+        self.refresh_calls += 1
+        return "AT-2"
+
+    def get_status(self):
+        return {"status": "REFRESHED"}
+
+
+def test_401_after_refresh_retries_durably_without_third_immediate(tmp_path, monkeypatch):
+    """Real worker in the tick loop: claim 1 runs refresh + exactly one retry
+    (two HTTP calls); still rejected -> durable RETRYABLE_FAILED.  The next
+    tick claims again; there is never a third immediate call inside a claim."""
+    import app.services.incremental_audit_runtime as runtime_module
+
+    detail_calls: list[dict] = []
+
+    def fake_call_detail_api(config, document_id, category_id, timeout):
+        detail_calls.append({"access_token": dict(config.get("headers") or ()).get("access-token")})
+        return {"ok": False, "http_status": 401, "payload": None, "error": "HTTP 401"}
+
+    monkeypatch.setattr(runtime_module, "call_detail_api", fake_call_detail_api)
+    provider = _FakeAuthProvider()
+    worker = runtime_module._detail_worker(
+        {"url": "https://detail.invalid", "headers": [("access-token", "PLACEHOLDER")]},
+        request_interval_seconds=0,
+        cnnc_provider=provider,
+    )
+
+    store = DailyAuditStore(tmp_path / "state.sqlite")
+    lock = ProcessLock(tmp_path / "tick.lock")
+    deps = _deps([_row()], worker)
+
+    first = run_incremental_tick(store, lock, _config(), deps)
+
+    token = store.acquire_lease(DATE, "inspect", 30)
+    work = _detail_state(store, token)
+    store.release_lease(token)
+    # First claim: refresh once, one immediate retry, no third call.
+    assert len(detail_calls) == 2
+    assert detail_calls[0]["access_token"] == "AT-1"
+    assert detail_calls[1]["access_token"] == "AT-2"
+    assert provider.refresh_calls == 1
+    assert work["state"] == "RETRYABLE_FAILED"
+    assert work["attempts"] == 1
+    assert first.outcome == "PENDING_RETRY"
+
+    # Second tick: durable retry re-claims; again exactly two HTTP calls.
+    run_incremental_tick(store, lock, _config(), deps)
+    token = store.acquire_lease(DATE, "inspect-2", 30)
+    work = _detail_state(store, token)
+    store.release_lease(token)
+    assert len(detail_calls) == 4
+    assert work["attempts"] == 2
+    assert work["state"] == "RETRYABLE_FAILED"

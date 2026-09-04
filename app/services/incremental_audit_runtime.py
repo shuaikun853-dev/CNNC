@@ -24,6 +24,8 @@ from app.services.cnnc_saas_snapshot_adapter import CnncSaasSnapshotAdapter
 from app.services.customer_price_semantics import (
     CUSTOMER_PRICE_RETRYABLE_DETAIL_STATUSES,
     DetailBusinessRetryRequired,
+    DetailRequestError,
+    is_retryable_detail_http_status,
 )
 from app.services.batch_zhaoshang_adapter import (
     BatchProgressStatus,
@@ -1142,7 +1144,14 @@ def _detail_worker(
             suffix = f"（认证状态: {auth_status}）" if auth_status else ""
             raise RuntimeError(f"CNNC 认证失败：刷新重试后仍被拒{suffix}")
         if not response.get("ok"):
-            raise RuntimeError("detail request failed")
+            # Typed transport failure: keep the real HTTP status so the durable
+            # retry classifier can separate transient (None/408/429/5xx/403/412)
+            # from deterministic request errors (other 4xx).
+            raise DetailRequestError(
+                http_status=response.get("http_status"),
+                message=response.get("error"),
+                retryable=is_retryable_detail_http_status(response.get("http_status")),
+            )
         payload = response.get("payload")
         result = extract_customer_price_from_detail(payload)
         # RC-1: a retryable business failure must never masquerade as a

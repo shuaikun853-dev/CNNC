@@ -10,10 +10,12 @@ from app.services.customer_price_semantics import (
     CUSTOMER_PRICE_RETRYABLE_DETAIL_STATUSES,
     DETAIL_MAX_ATTEMPTS_DEFAULT,
     DetailBusinessRetryRequired,
+    DetailRequestError,
     customer_price_business_state,
     customer_price_required,
     decode_business_error,
     encode_business_error,
+    is_retryable_detail_http_status,
     sanitize_customer_price_text,
 )
 
@@ -110,12 +112,30 @@ def test_terminal_parse_failed_prefix_is_failed():
     assert classified.status == "DETAIL_PARSE_FAILED"
 
 
-def test_success_with_positive_price_is_ready_regardless_of_status():
-    for status in sorted(CUSTOMER_PRICE_FOUND_STATUSES | {"NOT_FOUND"}):
+def test_success_with_positive_price_and_found_status_is_ready():
+    """Round-2 fail-closed rule: READY requires a positive price AND a
+    FOUND-family status.  A positive price alone is never success."""
+    for status in sorted(CUSTOMER_PRICE_FOUND_STATUSES):
         classified = customer_price_business_state("SUCCESS", _success_result("10", status), "")
         assert classified.key == "READY"
         assert classified.blocking is False
         assert classified.wait_class == "NONE"
+
+
+def test_positive_price_with_failure_status_is_invalid_contradiction():
+    """Contradictory evidence (price=100 + failed status) is never READY."""
+    for status in sorted(CUSTOMER_PRICE_RETRYABLE_DETAIL_STATUSES | CUSTOMER_PRICE_PROVEN_ABSENT_STATUSES):
+        classified = customer_price_business_state("SUCCESS", _success_result("100", status), "")
+        assert classified.key == "INVALID", status
+        assert classified.blocking is True
+        assert classified.wait_class == "MANUAL_REVIEW"
+
+
+def test_positive_price_with_unknown_or_missing_status_is_invalid():
+    for status in ("", "SOME_FUTURE_STATUS"):
+        classified = customer_price_business_state("SUCCESS", _success_result("100", status), "")
+        assert classified.key == "INVALID", status
+        assert classified.blocking is True
 
 
 def test_success_accepts_decimal_and_numeric_string_prices():
@@ -124,7 +144,8 @@ def test_success_accepts_decimal_and_numeric_string_prices():
     assert customer_price_business_state("SUCCESS", _success_result(10), "").key == "READY"
 
 
-def test_success_lookup_failed_is_missing_proven_and_never_blocks():
+def test_success_lookup_failed_is_missing_proven_and_blocks_finalization():
+    """Round-2 ruling: deterministic absence blocks formal finalization too."""
     classified = customer_price_business_state(
         "SUCCESS",
         _success_result(None, "LOOKUP_FAILED", customerPriceWarning="customer export did not contain this documentId"),
@@ -132,15 +153,16 @@ def test_success_lookup_failed_is_missing_proven_and_never_blocks():
     )
     assert classified.key == "MISSING_PROVEN"
     assert classified.status == "LOOKUP_FAILED"
-    assert classified.blocking is False
-    assert classified.wait_class == "PROVEN_ABSENT"
+    assert classified.blocking is True
+    assert classified.wait_class == "MANUAL_REVIEW"
 
 
-def test_success_request_skipped_and_not_provided_are_missing_proven():
+def test_success_request_skipped_and_not_provided_are_missing_proven_and_blocking():
     for status in ("DETAIL_REQUEST_SKIPPED", "NOT_PROVIDED"):
         classified = customer_price_business_state("SUCCESS", _success_result(None, status), "")
         assert classified.key == "MISSING_PROVEN"
-        assert classified.blocking is False
+        assert classified.blocking is True
+        assert classified.wait_class == "MANUAL_REVIEW"
 
 
 def test_success_with_legacy_retryable_status_is_invalid_success_and_blocks():
@@ -187,6 +209,36 @@ def test_detail_business_retry_required_carries_result_and_encoded_str():
     assert exc.result["customerPriceStatus"] == "NOT_FOUND"
     assert str(exc) == encode_business_error("NOT_FOUND", "详情接口未返回有效参考价")
     assert decode_business_error(str(exc))[0] == "NOT_FOUND"
+
+
+# ---- typed detail transport failure (round 2, P1-4) ------------------------
+
+
+def test_detail_request_error_renders_http_status_or_message():
+    with_status = DetailRequestError(http_status=500, message="HTTP 500", retryable=True)
+    assert with_status.http_status == 500
+    assert with_status.retryable is True
+    assert str(with_status) == "detail request failed: HTTP 500"
+    without_status = DetailRequestError(http_status=None, message="详情接口超时", retryable=True)
+    assert without_status.http_status is None
+    assert str(without_status) == "detail request failed: 详情接口超时"
+    assert isinstance(without_status, RuntimeError)
+
+
+def test_retryable_detail_http_status_classification():
+    # No status (transport/timeout/decode): transient by definition.
+    assert is_retryable_detail_http_status(None) is True
+    # Classic transient statuses.
+    assert is_retryable_detail_http_status(408) is True
+    assert is_retryable_detail_http_status(429) is True
+    for code in (500, 502, 503, 504, 599):
+        assert is_retryable_detail_http_status(code) is True, code
+    # CNNC gateway auth/WAF rotation window: retryable within the bounded budget.
+    assert is_retryable_detail_http_status(403) is True
+    assert is_retryable_detail_http_status(412) is True
+    # Deterministic request errors never retry.
+    for code in (400, 401, 404, 405, 418, 422):
+        assert is_retryable_detail_http_status(code) is False, code
 
 
 # ---- sanitize --------------------------------------------------------------

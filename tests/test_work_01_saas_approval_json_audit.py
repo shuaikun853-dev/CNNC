@@ -158,8 +158,13 @@ class TestCurlUtils:
   --insecure""",
             encoding="utf-8",
         )
-        monkeypatch.delenv("BLADE_AUTH", raising=False)
-        monkeypatch.delenv("COOKIE", raising=False)
+        # Pre-seed sentinel values through monkeypatch (NOT delenv): the loader
+        # writes BLADE_AUTH/COOKIE straight into os.environ, and only a setenv
+        # undo entry makes teardown erase that write.  delenv records nothing
+        # when the key is absent, so the state-token used to leak into the
+        # process env and deterministically broke later env-isolation tests.
+        monkeypatch.setenv("BLADE_AUTH", "")
+        monkeypatch.setenv("COOKIE", "")
 
         class FakeAuthManager:
             state_path = tmp_path / "auth_state.json"
@@ -753,6 +758,26 @@ def test_customer_price_missing_blocks_auto_approve():
     ), title_model_result=model)
     assert result.price_vs_customer_check == "CUSTOMER_PRICE_MISSING"
     # 客户价是价格审核基准：缺失时绝不允许自动通过（哪怕其余条件全部满足）。
+    assert result.primary_action == WorkflowAction.MANUAL_CHECK
+    assert "缺少有效客户价" in result.reason
+
+
+def test_lookup_failed_enriched_row_never_auto_approves():
+    """Round-2: a proven-absent (LOOKUP_FAILED) enriched row carries no valid
+    customer price, so it must be unreachable for APPROVE like any other
+    price-less row.  The enriched row's customerPriceStatus /
+    customerPriceWarning evidence flows through the workbook columns; the
+    audit item itself only ever sees customerPrice=None."""
+    model = TitleMatchModelResult(match_result="SAME", confidence=0.91, model_match="exact")
+    result = audit_saas_approval_item(_item(
+        queryStr="阀门 DN20",
+        skuName="阀门 DN20",
+        price="100",
+        pageActualPrice="100",
+        customerPrice=None,  # enriched LOOKUP_FAILED row: no usable customer price
+    ), title_model_result=model)
+    assert result.price_vs_customer_check == "CUSTOMER_PRICE_MISSING"
+    assert result.primary_action != WorkflowAction.APPROVE
     assert result.primary_action == WorkflowAction.MANUAL_CHECK
     assert "缺少有效客户价" in result.reason
 

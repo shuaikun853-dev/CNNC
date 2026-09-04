@@ -165,8 +165,12 @@ def test_row_fields_and_unfinished_first_ordering(tmp_path):
 def test_filters_unacquired_retrying_terminal(tmp_path):
     db = _seed(tmp_path)
     unacquired = project_customer_price(db, BUSINESS_DATE, filter="unacquired")
+    # R2-B:确定性缺席(v-absent / MISSING_PROVEN)同属未获取——只排除 READY。
     assert sorted(r["document_id"] for r in unacquired["rows"]) == [
-        "v-failed", "v-invalid", "v-legacy", "v-missing", "v-nostage", "v-retrying"]
+        "v-absent", "v-failed", "v-invalid", "v-legacy", "v-missing", "v-nostage",
+        "v-retrying"]
+    assert unacquired["rows"][0]["state"] == "PENDING"   # 未完成优先排序不变
+    assert "v-ready" not in [r["document_id"] for r in unacquired["rows"]]
     retrying = project_customer_price(db, BUSINESS_DATE, filter="retrying")
     assert [r["document_id"] for r in retrying["rows"]] == ["v-retrying"]
     terminal = project_customer_price(db, BUSINESS_DATE, filter="terminal")

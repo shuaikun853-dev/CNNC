@@ -100,6 +100,7 @@ def _empty_blocker_summary() -> dict[str, int]:
         "customer_price_missing": 0,
         "customer_price_failed": 0,
         "customer_price_invalid": 0,
+        "customer_price_absent_proven": 0,
     }
 
 
@@ -290,8 +291,11 @@ def _next_actions(status: dict[str, Any]) -> list[str]:
         return ["run doctor, then let a later tick reconcile the exact remote identity; do not resubmit"]
     # detail terminal = 客户价重试预算耗尽(MISSING/FAILED/INVALID),与 model terminal
     # 同为"重试已耗尽、需先看失败证据"的人工检查条件;不得建议继续跑 tick 掩盖它。
+    # R2-B:absent_proven(确定性缺席)同样阻塞正式出表,这些行是 SUCCESS 态
+    # (detail.terminal==0),必须并入同一人工检查分支。
     if status["remote"]["manual"] or status["model"]["terminal"] \
-            or status["crawl"]["manual"] or status["detail"]["terminal"]:
+            or status["crawl"]["manual"] or status["detail"]["terminal"] \
+            or status["detail"].get("customer_price_absent_proven", 0):
         return ["inspect terminal/manual evidence before rerunning; do not delete durable state"]
     if status["crawl"]["unplanned"]:
         return ["inspect required snapshot rows without crawl work; do not finalize or submit without explicit authorization"]
@@ -565,6 +569,7 @@ def collect_runtime_status(
                 "customer_price_missing": detail.get("customer_price_missing", 0),
                 "customer_price_failed": detail.get("customer_price_failed", 0),
                 "customer_price_invalid": detail.get("customer_price_invalid", 0),
+                "customer_price_absent_proven": detail.get("customer_price_absent_proven", 0),
             },
         },
         "lease": {

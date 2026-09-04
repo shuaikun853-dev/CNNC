@@ -1016,10 +1016,22 @@ class DailyAuditStore:
             connection.execute("UPDATE stage_work SET state=?, elapsed_seconds=?, retryable=?, error_text=?, claimed_at=NULL, updated_at=? WHERE id=?", (state, total, 0 if terminal else 1, error, self._utcnow(), work_id))
             return self._row(connection.execute("SELECT * FROM stage_work WHERE id=?", (work_id,)).fetchone())  # type: ignore[return-value]
 
-    def requeue_invalid_business_success_details(self, token: LeaseToken) -> int:
+    def requeue_invalid_business_success_details(self, token: LeaseToken, snapshot_id: int) -> int:
         """Requeue legacy DETAIL rows checkpointed as SUCCESS but carrying a
         retryable business failure (NOT_FOUND / DETAIL_REQUEST_FAILED /
-        DETAIL_PARSE_FAILED) in ``result_json``.
+        DETAIL_PARSE_FAILED) in ``result_json`` — only rows that are members of
+        the given authoritative snapshot.
+
+        Scope contract (round-2 fail-closed ruling): the requeue exists so the
+        CURRENT tick's detail loop can redo legacy invalid successes it is
+        about to process anyway.  It therefore only touches rows belonging to
+        ``snapshot_id`` via ``snapshot_members`` — the frozen snapshot when the
+        run is already frozen, otherwise the snapshot just ingested this tick.
+        Rows outside that membership would be requeued into a PENDING state no
+        tick ever revisits (FINALIZED runs exit ticks via ALREADY_FINALIZED
+        before any detail work), permanently polluting the durable backlog.
+        Historical data repair is out of scope and needs an explicit future
+        recovery command.
 
         The new detail worker can no longer produce those states as SUCCESS, so
         each row is requeued at most once: attempts and elapsed budgets reset,
@@ -1033,8 +1045,10 @@ class DailyAuditStore:
             rows = connection.execute(
                 """SELECT s.id, s.result_json FROM stage_work s
                    JOIN audit_items a ON a.id=s.audit_item_id
+                   JOIN (SELECT DISTINCT audit_item_id FROM snapshot_members WHERE snapshot_id=?)
+                     m ON m.audit_item_id=s.audit_item_id
                    WHERE a.run_id=? AND s.stage='DETAIL' AND s.state='SUCCESS'""",
-                (token.run_id,),
+                (int(snapshot_id), token.run_id),
             ).fetchall()
             requeued = 0
             for row in rows:

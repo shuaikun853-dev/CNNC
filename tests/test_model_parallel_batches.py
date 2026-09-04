@@ -344,8 +344,16 @@ def test_concurrent_429_retries_are_bounded_and_jittered(monkeypatch):
     sleep_durations: list[float] = []
     sleep_lock = threading.Lock()
     attempts = {}
+    own_threads: set[threading.Thread] = set()
+    threads_lock = threading.Lock()
 
     def fake_sleep(seconds):
+        # ``adapter.time`` is the global time module: the patch is visible to
+        # every thread in the process, including unrelated leaked background
+        # threads from earlier tests.  Count only sleeps issued by the six
+        # threads this test created so the ==12 bound stays exact.
+        if threading.current_thread() not in own_threads:
+            return
         with sleep_lock:
             sleep_durations.append(seconds)
 
@@ -365,6 +373,8 @@ def test_concurrent_429_retries_are_bounded_and_jittered(monkeypatch):
     errors: dict[str, BaseException] = {}
 
     def run_one(name):
+        with threads_lock:
+            own_threads.add(threading.current_thread())
         try:
             results[name] = adapter.call_title_match_model_batch(
                 [adapter.TitleMatchModelRequest(query_str=f"q-{name}", sku_name=f"s-{name}")],

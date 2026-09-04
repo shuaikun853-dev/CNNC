@@ -35,7 +35,9 @@ RC-4 Dashboard 只有 Detail 技术计数
 
 - LOOKUP_FAILED / DETAIL_REQUEST_SKIPPED 是"当日权威客户导出中无此单据"的
   确定性缺席（重试无意义；9-01、9-02 每天 5 行）→ 归类
-  MISSING_PROVEN：允许 finalize 收口（行级 MANUAL，证据随表），绝不自动 APPROVE。
+  MISSING_PROVEN。Round-2 收敛裁定（fail-closed）：取不到 ≠ 不需要，
+  MISSING_PROVEN 同样阻塞普通与强制出表（enriched 证据照旧随 review 输出），
+  绝不自动 APPROVE；历史日（9-01/9-02）不追溯，需未来显式 recovery 命令。
 - NOT_FOUND / DETAIL_REQUEST_FAILED / DETAIL_PARSE_FAILED 是可重试业务失败
   → 进入 durable retry（detail_max_attempts=3），预算耗尽后：
   NOT_FOUND → MISSING（阻塞）；REQUEST/PARSE → FAILED（阻塞）。
@@ -66,10 +68,11 @@ RC-4 Dashboard 只有 Detail 技术计数
     | RETRYABLE_FAILED | - | RETRYING | True |
     | TERMINAL_FAILED | error 前缀 NOT_FOUND | MISSING | True |
     | TERMINAL_FAILED | error 前缀 REQUEST/PARSE 失败或无前缀 | FAILED | True |
-    | SUCCESS | price>0（任意 status）| READY | False |
-    | SUCCESS | status∈PROVEN_ABSENT | MISSING_PROVEN | False |
-    | SUCCESS | status∈RETRYABLE（旧兼容 invalid-success）| FAILED | True |
-    | SUCCESS | price<=0 / 不可解析 | INVALID | True |
+    | SUCCESS | price>0 AND FOUND 族 | READY | False |
+    | SUCCESS | price>0 AND 其他 status（矛盾证据）| INVALID | True |
+    | SUCCESS | 无价 AND status∈PROVEN_ABSENT | MISSING_PROVEN | True(R2) |
+    | SUCCESS | 无价 AND status∈RETRYABLE（旧 invalid-success）| FAILED | True |
+    | SUCCESS | 价无效 / status 未知 | INVALID | True |
     | （无 stage 行） | - | PENDING | True |
 - `customer_price_required(row) -> True`（集中谓词 + docstring 说明）
 - `DETAIL_MAX_ATTEMPTS_DEFAULT = 3`（与 TickConfig.detail_max_attempts 一致，仅展示用）
@@ -85,13 +88,19 @@ RC-4 Dashboard 只有 Detail 技术计数
   RuntimeConfigurationError → 不 retry（快速终态）。不加 backoff（tick 间距 15min，
   attempts 上限 3，无 busy-loop 风险）。
 - 旧 durable state 兼容（不篡改历史、幂等、有界）：
-  tick 在 detail 循环前（仅当 deps.detail 不为 None）调用新 store 方法
-  `requeue_invalid_business_success_details(token)`：扫描 stage=DETAIL 且
-  state=SUCCESS 且 result_json.status∈RETRYABLE 集合的行 →
+  tick 在 detail 循环前（仅当 deps.detail 不为 None 且本轮 authoritative
+  snapshot 非空）调用新 store 方法
+  `requeue_invalid_business_success_details(token, snapshot_id)`：只扫描属于
+  该 snapshot（frozen 用 frozen_snapshot_id，否则本轮 ingest 的 snapshot）
+  membership 的、stage=DETAIL 且 state=SUCCESS 且
+  result_json.status∈RETRYABLE 集合的行 →
   state=PENDING, attempts=0, elapsed_seconds=0, retryable=1,
   error_text='requeued invalid business success: customerPriceStatus=X',
   result_json=NULL。每行至多一次（新代码下这些 status 不可能再产出 SUCCESS）；
   证据保留在 error_text。counter: detail_business_requeued。
+  Round-2 修正：requeue 只作用于未 FINALIZED 运行的当前 authoritative
+  snapshot；FINALIZED 历史日 tick 早退 ALREADY_FINALIZED 不会触发 requeue，
+  也不会重跑 detail；历史数据修复需要未来独立的显式 recovery 命令。
 - `_backlog` 增 additive 计数 customer_price_missing / customer_price_failed；
   tick outcome：`detail_terminal` 并入 MANUAL_REVIEW_REQUIRED 条件。
 
@@ -107,7 +116,8 @@ RC-4 Dashboard 只有 Detail 技术计数
 
 - `FinalizeReadiness` 新增 additive 字段：customer_price_pending /
   customer_price_missing / customer_price_failed / customer_price_invalid /
-  customer_price_absent_proven（仅信息展示，不阻塞）。
+  customer_price_absent_proven（Round-2：absent_proven 阻塞，进 ready 门与
+  NON_TOLERABLE，force-finalize 不可绕过）。
 - `ready` 增加：customer_price_missing/failed/invalid（pending 已由 detail_pending
   覆盖，同时用独立计数器显式化）。
 - `NON_TOLERABLE_BLOCKERS` 增加：customer_price_missing / customer_price_failed /
@@ -146,6 +156,9 @@ RC-4 Dashboard 只有 Detail 技术计数
 - 前端：数据准备卡"客户价 n/N"行 + 点击打开客户价 Drawer（表格 + 过滤按钮
   只看未获取/待重试/终态失败）；app.js 沿用 esc()/Drawer/poll 既有模式；
   不新增独立轮询链（打开时拉取 + summary 渲染时若 Drawer 开着刷新）。
+- R2-B 同步 fail-closed：MISSING_PROVEN 显示独立红条"客户价确定性缺失"
+  （tag 需人工，与 retry 耗尽红条并列），进 hero word/prep 卡/final_text
+  阻塞口径；unacquired 过滤=非 READY（确定性缺席同属未获取）。
 
 ## 9. 测试矩阵（新增+翻转）
 

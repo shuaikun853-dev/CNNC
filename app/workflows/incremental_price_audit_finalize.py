@@ -67,11 +67,13 @@ class FinalizeReadiness:
     remote_submit_unknown: int = 0
     remote_priority_pending: int = 0
     # Additive customer-price business buckets (semantics module is the single
-    # source of truth).  missing/failed/invalid block ordinary finalize and are
-    # non-tolerable for force-finalize; pending duplicates detail_pending
-    # explicitly for observability; absent_proven rows (LOOKUP_FAILED /
-    # SKIPPED / NOT_PROVIDED with complete evidence) close out without
-    # blocking but never auto-APPROVE row-side.
+    # source of truth).  missing/failed/invalid/absent_proven block ordinary
+    # finalize and are non-tolerable for force-finalize (round-2 fail-closed
+    # ruling: every required row needs a valid price; deterministic absence is
+    # evidence, not an exemption); pending duplicates detail_pending
+    # explicitly for observability.  Absent-proven rows (LOOKUP_FAILED /
+    # SKIPPED / NOT_PROVIDED with complete evidence) keep their enriched
+    # evidence for review output but never auto-APPROVE row-side.
     customer_price_pending: int = 0
     customer_price_missing: int = 0
     customer_price_failed: int = 0
@@ -95,6 +97,7 @@ class FinalizeReadiness:
                 self.customer_price_missing,
                 self.customer_price_failed,
                 self.customer_price_invalid,
+                self.customer_price_absent_proven,
             )
         )
 
@@ -140,12 +143,17 @@ def is_recoverable_finalize_wait(readiness: FinalizeReadiness | None) -> bool:
         readiness.remote_pending,
     ))
     has_actionable_blocker = any((
+        readiness.detail_terminal,
         readiness.model_terminal,
         readiness.crawl_terminal,
         readiness.crawl_unplanned,
         readiness.crawl_invalid_price,
         readiness.remote_manual,
         readiness.remote_invalid,
+        readiness.customer_price_missing,
+        readiness.customer_price_failed,
+        readiness.customer_price_invalid,
+        readiness.customer_price_absent_proven,
     ))
     return has_pending and not has_actionable_blocker
 
@@ -172,10 +180,11 @@ FORCE_FINALIZE_INCOMPLETE_TASKS_KEY = "force_finalize_incomplete_tasks"
 # Readiness buckets that force-finalize must never tolerate.  Detail/Model
 # evidence, unplanned or invalid crawl work, unknown submission outcomes,
 # manual/terminal states, and not-yet-submitted intent all stay blocking.
-# Customer-price MISSING/FAILED/INVALID block the same way: publishing a final
-# workbook whose price-review baseline is provably unresolved is never
-# tolerated, and customer_price_pending is intentionally absent because it is
-# the same rows as detail_pending (already listed).
+# Customer-price MISSING/FAILED/INVALID/ABSENT_PROVEN block the same way
+# (round-2 fail-closed ruling): publishing a final workbook whose price-review
+# baseline is provably unresolved — including a deterministically absent price
+# — is never tolerated, and customer_price_pending is intentionally absent
+# because it is the same rows as detail_pending (already listed).
 NON_TOLERABLE_BLOCKERS = (
     "detail_pending",
     "detail_terminal",
@@ -196,6 +205,7 @@ NON_TOLERABLE_BLOCKERS = (
     "customer_price_missing",
     "customer_price_failed",
     "customer_price_invalid",
+    "customer_price_absent_proven",
 )
 
 

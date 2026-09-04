@@ -595,17 +595,19 @@ def test_invalid_only_zero_price_success_still_turns_day_red():
         a for a in out["attention"] if a["title"] == "客户价获取失败")["impact"]
 
 
-def test_absent_proven_only_never_turns_day_red():
-    """MISSING_PROVEN(证据齐全的确定性缺席)不阻塞:word 不推红、prep 卡不显示
-    异常、attention 仅黄色"关注"——保持"转人工、不阻塞出表"语义。"""
+def test_absent_proven_only_turns_day_red_and_blocks():
+    """R2-B 翻转(Round-1 为黄条不阻塞):MISSING_PROVEN(证据齐全的确定性缺席)
+    与 retry 耗尽同为阻塞——hero word 推红、prep 卡显示异常、attention 独立
+    红色"客户价确定性缺失"。"""
     s = _cleared()
     s["detail"] = _cp_detail(customer_price_ready=148, customer_price_absent_proven=3)
     out = compute_overall_status(s)
-    assert out["word"] == "等待最终收口" and out["color"] != "red"
-    assert out["stages"][0]["state"] != "bad"
-    assert any(a["level"] == "yellow" and a["title"] == "部分商品客户价缺失(证据齐全)"
-               for a in out["attention"])
-    assert not any(a["level"] == "red" for a in out["attention"])
+    assert out["word"] == "需要人工处理" and out["color"] == "red"
+    assert out["stages"][0]["state"] == "bad"
+    assert any(a["level"] == "red" and a["tag"] == "需人工"
+               and a["title"] == "客户价确定性缺失" for a in out["attention"])
+    # 旧黄条(证据齐全缺席/不阻塞出表)必须彻底消失。
+    assert not any(a["title"] == "部分商品客户价缺失(证据齐全)" for a in out["attention"])
 
 
 def test_rf2_finalized_day_stays_green_with_customer_price_failure_history():
@@ -734,17 +736,50 @@ def test_attention_customer_price_exhausted_failure_is_red_manual():
     assert "客户价明细" in item["suggestion"] and "requeue" in item["suggestion"]
 
 
-def test_attention_absent_proven_is_yellow_and_nonblocking():
+def test_attention_absent_proven_is_red_blocking_and_distinct_from_exhausted():
+    """R2-B 翻转:确定性缺席是独立红条(tag 需人工),与"客户价获取失败"
+    (retry 耗尽)并列——一个 proven missing、一个 retryable exhausted。"""
     s = _cleared()
     s["detail"] = _cp_detail(customer_price_ready=148, customer_price_absent_proven=3)
     out = compute_overall_status(s)
-    item = next(a for a in out["attention"] if a["title"] == "部分商品客户价缺失(证据齐全)")
-    assert item["level"] == "yellow" and item["tag"] == "关注"
-    assert "确定性缺席" in item["problem"]
-    assert "不阻塞最终出表" in item["impact"]
-    assert "绝不自动通过" in item["system_action"]
-    # 证据齐全的缺席不是红色人工项
-    assert not any(a["level"] == "red" and "客户价" in a["title"] for a in out["attention"])
+    item = next(a for a in out["attention"] if a["title"] == "客户价确定性缺失")
+    assert item["level"] == "red" and item["tag"] == "需人工"
+    assert "确定性缺席" in item["problem"] and "自动重试无意义" in item["problem"]
+    assert "缺少价格审核基准" in item["impact"] and "阻塞最终出表" in item["impact"]
+    assert "不再自动重试" in item["system_action"] and "客户价明细" in item["system_action"]
+    assert "无业务豁免路径" in item["suggestion"] and "业务显式决策" in item["suggestion"]
+    # 仅 absent_proven 时不得出现"客户价获取失败"(那是 retry 耗尽条目)。
+    assert not any(a["title"] == "客户价获取失败" for a in out["attention"])
+
+
+def test_absent_proven_and_exhausted_failures_are_two_parallel_red_items():
+    s = _cleared()
+    s["detail"] = _cp_detail(customer_price_ready=147, customer_price_missing=1,
+                             customer_price_failed=2, customer_price_absent_proven=3)
+    out = compute_overall_status(s)
+    titles = [a["title"] for a in out["attention"] if a["level"] == "red"]
+    assert "客户价获取失败" in titles and "客户价确定性缺失" in titles
+
+
+def test_absent_proven_lowers_customer_price_ratio_and_blocks_prep():
+    """获取率仍是 ready/required(absent_proven 降低获取率):318/322 → 99%。"""
+    s = _cleared()
+    s["detail"] = _cp_detail(customer_price_ready=318, customer_price_required=322,
+                             customer_price_completed=322, customer_price_absent_proven=4,
+                             customer_price_ratio=round(318 / 322, 2))
+    out = compute_overall_status(s)
+    prep = out["stages"][0]
+    assert prep["state"] == "bad" and prep["state_word"] == "⚠ 异常"
+    assert ("客户价", "318/322") in prep["sub"]
+    assert out["word"] == "需要人工处理" and out["color"] == "red"
+
+
+def test_final_text_surfaces_absent_proven_blocker():
+    s = _cleared()
+    s["final"] = {**_cleared()["final"],
+                  "blocker_summary": {"customer_price_absent_proven": 5}}
+    out = compute_overall_status(s)
+    assert "5 条客户价确定性缺失(上游无此单据)" in out["final_text"]
 
 
 def test_final_text_surfaces_customer_price_exhausted_blocker():

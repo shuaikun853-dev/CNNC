@@ -586,25 +586,26 @@ def test_force_finalize_never_tolerates_unresolved_customer_price(
     assert store.get_run(DATE)["state"] != "FINALIZED"
 
 
-def test_force_finalize_tolerates_proven_absent_customer_price(tmp_path):
-    """Deterministic absence (LOOKUP_FAILED/SKIPPED) closes out; rows stay manual."""
+@pytest.mark.parametrize("status", ["LOOKUP_FAILED", "DETAIL_REQUEST_SKIPPED", "NOT_PROVIDED"])
+def test_force_finalize_never_tolerates_proven_absent_customer_price(tmp_path, status):
+    """Round-2 fail-closed ruling (flipped from round-1 tolerance): a required
+    row without a valid customer price blocks force-finalize too, even when
+    the absence is deterministic and evidence-complete."""
     store, snapshot, crawls = _seed_force(tmp_path)
     _link_inflight_job(store, tmp_path, crawls)
     for item in store.ordered_snapshot_items(snapshot["id"]):
-        _rework_detail(store, item["id"], result=_proven_absent_result("LOOKUP_FAILED"))
+        _rework_detail(store, item["id"], result=_proven_absent_result(status))
     output = tmp_path / "formal.xlsx"
 
-    publication = materialize_forced_frozen_daily_run(
-        store, ProcessLock(tmp_path / "finalize.lock"), DATE, output, max_incomplete=10,
-    )
+    with pytest.raises(ForceFinalizeRejected) as excinfo:
+        materialize_forced_frozen_daily_run(
+            store, ProcessLock(tmp_path / "finalize.lock"), DATE, output, max_incomplete=10,
+        )
 
-    assert publication.already_finalized is False
-    assert publication.readiness.customer_price_absent_proven == 2
-    assert publication.readiness.customer_price_missing == 0
-    assert publication.readiness.customer_price_failed == 0
-    assert publication.readiness.customer_price_invalid == 0
-    assert publication.forced is True
-    assert output.is_file()
+    assert excinfo.value.error_type == "FORCE_FINALIZE_BLOCKED"
+    assert excinfo.value.readiness.customer_price_absent_proven == 2
+    assert not output.exists()
+    assert store.get_run(DATE)["state"] != "FINALIZED"
 
 
 # CLI wiring.

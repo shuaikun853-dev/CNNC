@@ -45,6 +45,17 @@ from app.workflows.incremental_price_audit_finalize import (
 BUSINESS_DATE = "2026-08-11"
 CUTOFF = datetime(2026, 8, 11, 10, 0, tzinfo=UTC)
 
+# Canonical five-field detail evidence the production _detail_worker returns.
+# A bare price without customerPriceStatus is fail-closed INVALID evidence
+# under the round-2 rule table and would block every real finalize here.
+_FOUND_EVIDENCE = {
+    "customerPrice": "10",
+    "customerPriceStatus": "FOUND",
+    "customerPriceSource": "DETAIL_REFERENCE_INFOS",
+    "customerPriceWarning": "",
+    "customerPriceEvidence": "参考价1=10",
+}
+
 
 class VirtualClock:
     """Monotonic + sleep that advance together so closeout waits are virtual."""
@@ -101,7 +112,7 @@ def _config(**overrides) -> TickConfig:
 def _deps_for(rows, observed_at: datetime) -> TickDependencies:
     return TickDependencies(
         discover=lambda _timeout: _observation(rows, observed_at),
-        detail=lambda _row_value, _timeout: {"customerPrice": "10"},
+        detail=lambda _row_value, _timeout: dict(_FOUND_EVIDENCE),
         model_batch=lambda batch, _timeout: {
             index: {"match_result": "SAME", "confidence": 1}
             for index, _row_value in enumerate(batch)
@@ -295,7 +306,7 @@ class CloseoutHarness:
 
         def detail(row, _timeout):
             self.events.append(f"detail:{row['vCommodityId']}")
-            return {"customerPrice": "10"}
+            return dict(_FOUND_EVIDENCE)
 
         def model_batch(batch, _timeout):
             for row in batch:
@@ -805,7 +816,7 @@ def _seed_recoverable_manual_job(tmp_path: Path, *, rows_count: int = 2):
         for item in store.ordered_snapshot_items(snapshot_id):
             detail = store.ensure_stage_work(token, int(item["id"]), "DETAIL", f"detail-{item['id']}")
             store.claim_stage_work(token, int(detail["id"]), max_attempts=1, max_elapsed_seconds=60)
-            store.complete_stage_work(token, int(detail["id"]), {"customerPrice": "10"})
+            store.complete_stage_work(token, int(detail["id"]), dict(_FOUND_EVIDENCE))
             model = store.ensure_stage_work(token, int(item["id"]), "MODEL", f"model-{item['id']}")
             store.claim_stage_work(token, int(model["id"]), max_attempts=1, max_elapsed_seconds=60)
             store.complete_stage_work(token, int(model["id"]), {"match_result": "SAME", "confidence": 1})

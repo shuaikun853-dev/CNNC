@@ -2742,3 +2742,263 @@ def test_repeated_pre_send_failures_keep_releasing_claim_without_unknown(tmp_pat
     assert jobs[0]["post_attempted"] is False
     assert jobs[0]["error_text"]
     store.release_lease(inspect)
+
+
+# ---- requeue / backlog snapshot scoping (round 2, matrix C) ----------------
+
+INVALID_SUCCESS_PAYLOAD = {
+    "customerPrice": None,
+    "customerPriceStatus": "NOT_FOUND",
+    "customerPriceSource": "",
+    "customerPriceWarning": "详情接口未返回有效参考价",
+    "customerPriceEvidence": "",
+}
+
+FOUND_PAYLOAD = {
+    "customerPrice": "10",
+    "customerPriceStatus": "FOUND",
+    "customerPriceSource": "DETAIL_REFERENCE_INFOS",
+    "customerPriceWarning": "",
+    "customerPriceEvidence": "参考价1=10",
+}
+
+
+def _quiet_row(v, sku):
+    return _row(v, sku, extLink="")
+
+
+def _ingest(store, token, rows, observed_at, evidence=None):
+    kwargs = {
+        "source_fingerprints": [f"source-{row['vCommodityId']}" for row in rows],
+        "customer_fingerprints": [f"customer-{row['fourCategoryId']}" for row in rows],
+        "headers": ["vCommodityId"],
+    }
+    if evidence is not None:
+        kwargs["evidence"] = evidence
+    return store.ingest_snapshot(token, rows, observed_at, **kwargs)["snapshot"]
+
+
+def _quiet_deps(rows, *, forbidden=False):
+    """Crawl-free deps: no plan/submit, so outcomes reflect stage work only."""
+    def discover(timeout):
+        if forbidden:
+            raise AssertionError("frozen tick must not rediscover")
+        return DiscoveredState(
+            observed_at=datetime(2026, 8, 11, 10, 1, tzinfo=UTC),
+            headers=["vCommodityId"],
+            rows=rows,
+            source_fingerprints=[f"source-{row['vCommodityId']}" for row in rows],
+            customer_fingerprints=[f"customer-{row['fourCategoryId']}" for row in rows],
+            evidence={"saas_count": len(rows), "customer_count": len(rows)},
+        )
+
+    if forbidden:
+        def guard(*_args, **_kwargs):
+            raise AssertionError("this tick must not run external stage work")
+        # The opening harvest sweep legitimately invokes the callback once with
+        # no eligible jobs; everything else must stay untouched.
+        return TickDependencies(
+            discover=guard, harvest=lambda jobs, timeout: {}, detail=guard, model=guard,
+            monotonic=Clock().monotonic,
+            wall_clock=lambda: datetime(2026, 8, 11, 10, 2, tzinfo=UTC),
+        )
+
+    def detail(row, timeout):
+        return dict(FOUND_PAYLOAD)
+
+    def model(row, timeout):
+        return {"match_result": "SAME", "confidence": 1, "model_match": "exact"}
+
+    return TickDependencies(
+        discover=discover, harvest=lambda jobs, timeout: {}, detail=detail, model=model,
+        monotonic=Clock().monotonic,
+        wall_clock=lambda: datetime(2026, 8, 11, 10, 2, tzinfo=UTC),
+    )
+
+
+def _complete_stage(store, token, item_id, stage, fingerprint, payload):
+    work = store.ensure_stage_work(token, item_id, stage, fingerprint)
+    claimed = store.claim_stage_work(token, work["id"], max_attempts=3, max_elapsed_seconds=300)
+    assert claimed is not None
+    store.complete_stage_work(token, work["id"], payload)
+
+
+def _item_id_by_v(store, snapshot_id, v):
+    for item in store.ordered_snapshot_items(snapshot_id):
+        if item["row"]["vCommodityId"] == v:
+            return int(item["id"])
+    raise AssertionError(f"no snapshot item for {v}")
+
+
+def _write_invalid_success(store, item_id):
+    """Checkpoint the exact legacy invalid-SUCCESS the old worker produced."""
+    token = store.acquire_lease("2026-08-11", "seed-invalid-success", 60)
+    work = store.ensure_stage_work(token, item_id, "DETAIL", f"manual-{item_id}")
+    claimed = store.claim_stage_work(token, work["id"], max_attempts=3, max_elapsed_seconds=300)
+    assert claimed is not None
+    store.complete_stage_work(token, work["id"], dict(INVALID_SUCCESS_PAYLOAD))
+    store.release_lease(token)
+    return int(work["id"])
+
+
+def _detail_works(store):
+    token = store.acquire_lease("2026-08-11", "inspect-detail", 30)
+    works = store.list_stage_work(token, stage="DETAIL")
+    store.release_lease(token)
+    return works
+
+
+def test_requeue_skips_rows_outside_the_current_snapshot_membership(tmp_path):
+    """Snapshot A held row A (invalid-SUCCESS), snapshot B only row B: the tick
+    requeues nothing outside its authoritative snapshot, row A's legacy state
+    stays untouched, and the backlog is not polluted by the dropped row."""
+    store = DailyAuditStore(tmp_path / "state.sqlite")
+    store.ensure_run("2026-08-11")
+    seed = store.acquire_lease("2026-08-11", "seed-snapshots", 60)
+    snapshot_a = _ingest(store, seed, [_quiet_row("doc-a", "sku-a")], "2026-08-11T09:00:00+00:00")
+    snapshot_b = _ingest(store, seed, [_quiet_row("doc-b", "sku-b")], "2026-08-11T09:30:00+00:00")
+    store.release_lease(seed)
+    bad_work_id = _write_invalid_success(store, _item_id_by_v(store, snapshot_a["id"], "doc-a"))
+
+    clock = Clock()
+    summary = run_incremental_tick(
+        store,
+        ProcessLock(tmp_path / "tick.lock"),
+        _config(clock),
+        _quiet_deps([_quiet_row("doc-b", "sku-b")]),
+    )
+
+    assert summary.counters["detail_business_requeued"] == 0
+    works = {int(work["id"]): work for work in _detail_works(store)}
+    assert int(bad_work_id) in works
+    dropped = works[bad_work_id]
+    # Not requeued: still the legacy SUCCESS with its result payload intact.
+    assert dropped["state"] == "SUCCESS"
+    assert json.loads(dropped["result_json"])["customerPriceStatus"] == "NOT_FOUND"
+    assert dropped["error_text"] is None
+    # Row B processed normally in the same tick.
+    good = next(work for work in works.values() if int(work["id"]) != bad_work_id)
+    assert good["state"] == "SUCCESS"
+    assert json.loads(good["result_json"])["customerPriceStatus"] == "FOUND"
+    # No stale-row pollution: the outcome is not stuck on retry-backlog.
+    assert summary.outcome != "PENDING_RETRY"
+    assert summary.backlog["stage_pending"] == 0
+    assert summary.backlog["customer_price_missing"] == 0
+    assert summary.backlog["customer_price_failed"] == 0
+
+
+def test_requeue_still_recovers_invalid_success_inside_current_snapshot(tmp_path):
+    """A single-snapshot run (the common case): invalid-SUCCESS rows inside the
+    authoritative snapshot are requeued exactly once and retried to SUCCESS."""
+    store = DailyAuditStore(tmp_path / "state.sqlite")
+    store.ensure_run("2026-08-11")
+    seed = store.acquire_lease("2026-08-11", "seed-snapshot", 60)
+    snapshot = _ingest(store, seed, [_quiet_row("doc-bad", "sku-bad")], "2026-08-11T09:00:00+00:00")
+    store.release_lease(seed)
+    _write_invalid_success(store, _item_id_by_v(store, snapshot["id"], "doc-bad"))
+
+    events: list[str] = []
+    clock = Clock()
+    summary = run_incremental_tick(
+        store,
+        ProcessLock(tmp_path / "tick.lock"),
+        _config(clock),
+        _quiet_deps([_quiet_row("doc-bad", "sku-bad")]),
+    )
+
+    assert summary.counters["detail_business_requeued"] == 1
+    works = _detail_works(store)
+    assert len(works) == 1
+    assert works[0]["state"] == "SUCCESS"
+    assert json.loads(works[0]["result_json"])["customerPriceStatus"] == "FOUND"
+    assert summary.outcome == "COMPLETED"
+
+
+def test_requeue_on_frozen_run_uses_frozen_membership(tmp_path):
+    """A frozen run requeues strictly within its frozen snapshot: an
+    invalid-SUCCESS row outside that membership is never resurrected."""
+    store = DailyAuditStore(tmp_path / "state.sqlite")
+    store.ensure_run("2026-08-11")
+    seed = store.acquire_lease("2026-08-11", "seed-frozen", 60)
+    frozen_snapshot = _ingest(store, seed, [_quiet_row("doc-keep", "sku-keep")], "2026-08-11T09:00:00+00:00")
+    keep_item = _item_id_by_v(store, frozen_snapshot["id"], "doc-keep")
+    # A later observation the run never froze (both ingested pre-freeze).
+    other_snapshot = _ingest(store, seed, [_quiet_row("doc-late", "sku-late")], "2026-08-11T09:30:00+00:00")
+    store.freeze_snapshot(seed, int(frozen_snapshot["id"]))
+    # Frozen membership work is already complete; the tick must find nothing to do.
+    _complete_stage(store, seed, keep_item, "DETAIL", f"detail-{keep_item}", dict(FOUND_PAYLOAD))
+    _complete_stage(store, seed, keep_item, "MODEL", f"model-{keep_item}", {"match_result": "SAME"})
+    store.release_lease(seed)
+    late_work_id = _write_invalid_success(store, _item_id_by_v(store, other_snapshot["id"], "doc-late"))
+
+    summary = run_incremental_tick(
+        store, ProcessLock(tmp_path / "tick.lock"), _config(Clock()),
+        _quiet_deps([], forbidden=True),
+    )
+
+    assert summary.counters["detail_business_requeued"] == 0
+    works = {int(work["id"]): work for work in _detail_works(store)}
+    late = works[late_work_id]
+    assert late["state"] == "SUCCESS"
+    assert json.loads(late["result_json"])["customerPriceStatus"] == "NOT_FOUND"
+
+
+# ---- FINALIZED runs are a full durable no-op (round 2, matrix F) -----------
+
+
+def test_finalized_run_tick_neither_requeues_nor_touches_durable_state(tmp_path):
+    """FINALIZED history stays immutable: a plain tick exits before any detail
+    work, so even a legacy invalid-SUCCESS row is left exactly as it was, and
+    final_output_path never moves.  (Corrects the round-1 claim that rerunning
+    the tick would repair historical days.)"""
+    store = DailyAuditStore(tmp_path / "state.sqlite")
+    store.ensure_run("2026-08-11")
+    seed = store.acquire_lease("2026-08-11", "seed-final", 60)
+    snapshot = _ingest(
+        store, seed, [_quiet_row("doc-1", "sku-1")], "2026-08-11T09:00:00+00:00",
+        evidence={"saas_count": 1, "customer_count": 1},
+    )
+    item_id = _item_id_by_v(store, snapshot["id"], "doc-1")
+    store.freeze_snapshot(seed, int(snapshot["id"]))
+    _complete_stage(store, seed, item_id, "DETAIL", f"detail-{item_id}", dict(FOUND_PAYLOAD))
+    _complete_stage(store, seed, item_id, "MODEL", f"model-{item_id}", {"match_result": "SAME"})
+    final_output = tmp_path / "final.xlsx"
+    store.prepare_finalization(seed, str(final_output))
+    store.mark_finalized(seed, str(final_output), "manifest")
+    store.release_lease(seed)
+
+    # Poison left behind from the legacy era: an invalid-SUCCESS DETAIL row.
+    poisoned_id = _write_invalid_success(store, item_id)
+
+    def before(work):
+        return (work["id"], work["state"], work["attempts"], work["result_json"], work["error_text"], work["elapsed_seconds"], work["retryable"])
+
+    stage_before = sorted(before(work) for work in _detail_works(store))
+    run_before = store.get_run("2026-08-11")
+
+    deps = TickDependencies(
+        discover=lambda *_a: pytest.fail("already-finalized tick must not discover"),
+        harvest=lambda *_a: pytest.fail("already-finalized tick must not harvest"),
+        detail=lambda *_a: pytest.fail("already-finalized tick must not run detail"),
+        model=lambda *_a: pytest.fail("already-finalized tick must not run model"),
+        plan_crawl=lambda *_a: pytest.fail("already-finalized tick must not plan"),
+        submit_crawl=lambda *_a: pytest.fail("already-finalized tick must not submit"),
+        monotonic=Clock().monotonic, wall_clock=lambda: datetime(2026, 8, 11, 20, tzinfo=UTC),
+    )
+    summary = run_incremental_tick(
+        store, ProcessLock(tmp_path / "tick.lock"),
+        TickConfig(business_date="2026-08-11", runtime_budget_seconds=60, heavy_work_reserve_seconds=5),
+        deps,
+    )
+
+    assert summary.outcome == "ALREADY_FINALIZED"
+    assert summary.phase_trace == ("noop:already_finalized",)
+    assert summary.counters["detail_business_requeued"] == 0
+    stage_after = sorted(before(work) for work in _detail_works(store))
+    assert stage_after == stage_before
+    poisoned = next(work for work in _detail_works(store) if int(work["id"]) == poisoned_id)
+    assert poisoned["state"] == "SUCCESS"
+    assert json.loads(poisoned["result_json"])["customerPriceStatus"] == "NOT_FOUND"
+    run_after = store.get_run("2026-08-11")
+    assert run_after["final_output_path"] == run_before["final_output_path"] == str(final_output.resolve())
+    assert run_after["state"] == "FINALIZED"

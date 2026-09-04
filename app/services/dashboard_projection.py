@@ -56,11 +56,12 @@ def _attention_items(s: Mapping, recovery_exhausted_invalid: int = 0) -> list[di
         items.append({"level": "red", "tag": "需人工", "title": "模型校验终态失败",
             "problem": "模型重试预算耗尽后仍失败。", "impact": "对应商品缺模型结论。",
             "system_action": "不再自动重试。", "suggestion": "可按手册 requeue-model-transient/recover-model 处理。"})
-    # 客户价门禁(2026-09-03):detail 业务计数取代旧"Detail 有终态失败"黄条。
-    # RETRYING=自动重试中(黄,无需人工);MISSING/FAILED/INVALID=重试预算耗尽
-    # (红,阻塞自动审批与最终出表);MISSING_PROVEN=证据齐全的确定性缺席
-    # (黄,转人工不阻塞)。旧黄条声称"不阻塞出表/客户价留空继续收口",与新
-    # finalize 门禁矛盾,已删除;detail_terminal 仍经 blocker_summary 进 final_text。
+    # 客户价门禁(2026-09-03,R2-B 同步 fail-closed):detail 业务计数取代旧
+    # "Detail 有终态失败"黄条。RETRYING=自动重试中(黄,无需人工);
+    # MISSING/FAILED/INVALID=重试预算耗尽(红,阻塞自动审批与最终出表);
+    # MISSING_PROVEN=确定性缺席(R2-B 起同为红条阻塞,与"客户价获取失败"
+    # 并列——一个 retryable exhausted、一个 proven missing)。旧"不阻塞出表"
+    # 黄条与 finalize 门禁矛盾,已删除。
     cp_retrying = _cp(d, "customer_price_retrying")
     cp_missing = _cp(d, "customer_price_missing")
     cp_failed = _cp(d, "customer_price_failed")
@@ -86,11 +87,11 @@ def _attention_items(s: Mapping, recovery_exhausted_invalid: int = 0) -> list[di
             "system_action": "已停止自动重试,保留失败证据。",
             "suggestion": "在客户价明细中查看失败行;处理上游问题后可人工 requeue 重试。"})
     if cp_absent:
-        items.append({"level": "yellow", "tag": "关注", "title": "部分商品客户价缺失(证据齐全)",
-            "problem": "客户导出中无该单据/无详情身份,客户价确定性缺席,重试无意义。",
-            "impact": "对应行价格审核转人工,不阻塞最终出表。",
-            "system_action": "证据随最终表输出,绝不自动通过。",
-            "suggestion": "如需补价属人工操作。"})
+        items.append({"level": "red", "tag": "需人工", "title": "客户价确定性缺失",
+            "problem": "客户导出中无该单据/无详情身份,客户价确定性缺席,自动重试无意义。",
+            "impact": "该数据缺少价格审核基准;当前阻塞最终出表。",
+            "system_action": "不再自动重试;证据已保留在客户价明细。",
+            "suggestion": "核对上游客户导出;当前无业务豁免路径,如需放行需业务显式决策。"})
     if r["unknown"] or c["unknown"]:
         items.append({"level": "yellow", "tag": "关注", "title": "任务提交结果待确认",
             "problem": "提交后结果未知,系统正按精确身份自动对账。",
@@ -140,10 +141,11 @@ def _stages(s: Mapping, finalized: bool, recovery_exhausted_invalid: int = 0) ->
     zs_yellow = bool(r["unknown"] or c["unknown"] or h.get("stall_detected"))
     uniq = s["counts"]["unique_items"]
     stages = []
-    # 客户价门禁(2026-09-03):missing/failed/invalid = 重试预算耗尽的人工阻塞,
-    # prep 卡必须与 hero word 同源显示异常,不得停在"进行中/完成"。
+    # 客户价门禁(2026-09-03,R2-B 同步 fail-closed):missing/failed/invalid =
+    # 重试预算耗尽的人工阻塞;absent_proven = 确定性缺席,同样阻塞正式出表
+    # (round-2 裁定)。prep 卡必须与 hero word 同源显示异常,不得停在"进行中/完成"。
     cp_blocking = _cp(d, "customer_price_missing") + _cp(d, "customer_price_failed") \
-        + _cp(d, "customer_price_invalid") > 0
+        + _cp(d, "customer_price_invalid") + _cp(d, "customer_price_absent_proven") > 0
     prep_bad = m["terminal"] or cp_blocking
     stages.append({"key": "prep", "name": "数据准备",
         "state": "bad" if prep_bad else ("cur" if prep_pending else "done"),
@@ -215,6 +217,7 @@ def _final_text(s: Mapping, closeout_running: bool = False) -> tuple[str, str]:
                ("remote_unknown", "个任务提交结果待确认"), ("remote_manual", "项招商局任务需人工"),
                ("model_pending", "条模型处理未完成"), ("model_terminal", "条模型终态失败"),
                ("detail_terminal", "条客户价获取失败(重试耗尽)"),
+               ("customer_price_absent_proven", "条客户价确定性缺失(上游无此单据)"),
                ("detail_pending", "条 Detail 未完成"), ("crawl_pending", "条采集未完成"),
                ("crawl_unplanned", "条必爬行未规划"), ("crawl_planning_pending", "条必爬行待规划"),
                ("crawl_unknown", "条采集提交待确认"), ("crawl_manual", "条采集需人工")]
@@ -239,14 +242,16 @@ def compute_overall_status(status: Mapping, *, recovering: int = 0,
     d, m, r, c, f = status["detail"], status["model"], status["remote"], status["crawl"], status["final"]
     prep_pending = d["pending"] + d["running"] + m["pending"] + m["running"]
     # P1-1:合法 RECOVERY_EXHAUSTED 不再计入 manual;proof 不合法的才按真实阻塞升级红。
-    # 客户价门禁(2026-09-03):detail terminal = 客户价重试预算耗尽(MISSING/FAILED/
-    # INVALID),是真实人工阻塞——attention 已红"需人工",hero word 必须同源一致。
-    # missing/failed/invalid 直接入判(SUCCESS+price<=0 的 INVALID 阶段态是
-    # SUCCESS、terminal=0,但 finalize ready 门与 NON_TOLERABLE 同样阻塞);
-    # d["terminal"] 保留为防御(旧/不可解码 error_text 的 TERMINAL 行按 FAILED 覆盖)。
+    # 客户价门禁(2026-09-03,R2-B 同步 fail-closed):detail terminal = 客户价
+    # 重试预算耗尽(MISSING/FAILED/INVALID),是真实人工阻塞——attention 已红
+    # "需人工",hero word 必须同源一致。missing/failed/invalid 直接入判
+    # (SUCCESS+price<=0 的 INVALID 阶段态是 SUCCESS、terminal=0,但 finalize
+    # ready 门与 NON_TOLERABLE 同样阻塞);absent_proven=确定性缺席,R2-B 起
+    # 同为阻塞。d["terminal"] 保留为防御(旧/不可解码 error_text 的 TERMINAL
+    # 行按 FAILED 覆盖)。
     manual_needed = any((r["manual"], c["manual"], c["unplanned"], m["terminal"], d["terminal"])) \
         or any(_cp(d, k) for k in ("customer_price_missing", "customer_price_failed",
-                                   "customer_price_invalid")) \
+                                   "customer_price_invalid", "customer_price_absent_proven")) \
         or recovery_exhausted_invalid > 0
     zs_uncleared = any(r[k] for k in ("intent", "pending", "running", "exported")) or bool(
         c["pending"] + c["running"] + c.get("planning_pending", 0)
@@ -441,8 +446,9 @@ from app.services.customer_price_semantics import (
     sanitize_customer_price_text as _cp_sanitize,
 )
 
-# 行级分类键 → 过滤语义。unacquired=尚未取得可用客户价(不含证据齐全的缺席);
-# terminal=重试预算耗尽、需要人工的终态。
+# 行级分类键 → 过滤语义。R2-B 起 unacquired=尚未取得可用客户价,确定性缺席
+# (MISSING_PROVEN)同属未获取(finalize 同样被其阻塞);terminal=重试预算耗尽、
+# 需要人工的终态。
 _CP_UNFINISHED_KEYS = ("PENDING", "RETRYING", "MISSING", "FAILED", "INVALID")
 _CP_TERMINAL_KEYS = frozenset({"MISSING", "FAILED", "INVALID"})
 _CUSTOMER_PRICE_FILTERS = ("all", "unacquired", "retrying", "terminal")
@@ -563,7 +569,8 @@ def project_customer_price(
     finally:
         con.close()
     if filter == "unacquired":
-        selected = [r for r in rows if r["state"] not in ("READY", "MISSING_PROVEN")]
+        # R2-B:确定性缺席(MISSING_PROVEN)同属未获取——只排除 READY。
+        selected = [r for r in rows if r["state"] != "READY"]
     elif filter == "retrying":
         selected = [r for r in rows if r["state"] == "RETRYING"]
     elif filter == "terminal":

@@ -1122,9 +1122,9 @@ function test_customer_price_seams() {
   check("CP 未知状态透传原文,空值显示 —(esc 由调用方负责)",
         cpStatusCn("SOMETHING_NEW") === "SOMETHING_NEW" && cpStatusCn("") === "—" &&
         cpStatusCn(null) === "—");
-  check("CP 状态 pill 配色:ok/run/warn/err 分桶",
+  check("CP 状态 pill 配色:ok/run/warn/err 分桶;R2-B MISSING_PROVEN 阻塞 → err",
         cpStatusPill("READY") === "ok" && cpStatusPill("PENDING") === "run" &&
-        cpStatusPill("RETRYING") === "run" && cpStatusPill("MISSING_PROVEN") === "warn" &&
+        cpStatusPill("RETRYING") === "run" && cpStatusPill("MISSING_PROVEN") === "err" &&
         cpStatusPill("MISSING") === "err" && cpStatusPill("FAILED") === "err" &&
         cpStatusPill("INVALID") === "err" && cpStatusPill("OTHER") === "wait");
   const rows = [
@@ -1139,10 +1139,10 @@ function test_customer_price_seams() {
         rows[0].id === "a" &&
         cpSortRows([{ id: "x", state: "MYSTERY" }, { id: "y", state: "READY" }])[0].id === "x" &&
         cpSortRows(null).length === 0);
-  check("CP 过滤 unacquired:排除 READY 与 MISSING_PROVEN,其余全含",
+  check("CP 过滤 unacquired:R2-B 只排除 READY(确定性缺席同属未获取)",
         ["a", "b", "c", "d", "e", "f", "g"].filter((id) =>
           cpRowMatchesFilter(rows.find((r) => r.id === id), "unacquired")).join(",") ===
-        "b,c,e,f,g");
+        "b,c,d,e,f,g");
   check("CP 过滤 retrying / terminal:语义与后端 project_customer_price 一致",
         rows.filter((r) => cpRowMatchesFilter(r, "retrying")).map((r) => r.id).join(",") === "e" &&
         rows.filter((r) => cpRowMatchesFilter(r, "terminal")).map((r) => r.id).join(",") === "b,f,g");

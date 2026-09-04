@@ -17,7 +17,13 @@ and the detail worker's deterministic skips):
 - PROVEN_ABSENT: ``LOOKUP_FAILED`` / ``DETAIL_REQUEST_SKIPPED`` /
   ``NOT_PROVIDED`` — the row provably has no customer price today (it is not in
   the authoritative customer export, or it has no detail identity).  Retrying
-  is meaningless; the row may close out but must never auto-APPROVE.
+  is meaningless; the enriched evidence still flows into review output, but the
+  row must block formal finalization (round-2 fail-closed ruling: no valid
+  price means the price-review baseline is unresolved) and never auto-APPROVE.
+
+Fail-closed invariant: any SUCCESS evidence without a positive price AND a
+FOUND-family status is never READY — contradictory evidence (positive price
+plus a failure/absence/unknown status) classifies as INVALID.
 """
 
 from __future__ import annotations
@@ -61,6 +67,49 @@ class DetailBusinessRetryRequired(RuntimeError):
         status = _status_text(self.result)
         warning = sanitize_customer_price_text(str(self.result.get("customerPriceWarning") or ""))
         super().__init__(encode_business_error(status, warning))
+
+
+class DetailRequestError(RuntimeError):
+    """A detail HTTP transport-level failure with typed retry semantics.
+
+    ``call_detail_api`` reports ``{ok, payload, http_status, error}``; the
+    worker converts a not-ok response into this exception so the durable retry
+    classifier can decide from the real HTTP status instead of a bare
+    ``RuntimeError``.  ``http_status`` is ``None`` for non-HTTP failures
+    (transport/timeout/decode); ``retryable`` mirrors
+    :func:`is_retryable_detail_http_status`.
+    """
+
+    def __init__(self, *, http_status: int | None, message: object, retryable: bool) -> None:
+        self.http_status = http_status
+        self.message = str(message or "")
+        self.retryable = retryable
+        if http_status is not None:
+            super().__init__(f"detail request failed: HTTP {http_status}")
+        else:
+            super().__init__(f"detail request failed: {self.message or 'transport error'}")
+
+
+def is_retryable_detail_http_status(status: int | None) -> bool:
+    """HTTP-semantic retry decision for one detail request failure.
+
+    - ``None`` (transport/timeout/decode failure) is treated as transient.
+    - 408/429 and all 5xx are classic transient/retry-after signals.
+    - 403/412: in production the CNNC gateway answers 403/412 during its
+      auth/WAF rotation window and the request succeeds again within the
+      bounded retry budget, so they stay retryable here.
+    - Every other 4xx (400/404/405/...) is a deterministic request error;
+      retrying cannot change the answer.
+    """
+    if status is None:
+        return True
+    if not isinstance(status, int) or isinstance(status, bool):
+        return True
+    if status in {408, 429, 403, 412}:
+        return True
+    if status >= 500:
+        return True
+    return not 400 <= status < 500
 
 
 def encode_business_error(status: str, warning: str) -> str:
@@ -111,11 +160,12 @@ class CustomerPriceBusinessState:
 
     ``key`` is one of READY / PENDING / RETRYING / MISSING / MISSING_PROVEN /
     FAILED / INVALID.  ``blocking`` marks whether the state must block ordinary
-    finalize (MISSING_PROVEN and READY never block).  ``wait_class`` tells a
-    consumer how the row is expected to move on its own:
-    ``WAIT_WORK`` / ``WAIT_RETRY`` resolve automatically, ``PROVEN_ABSENT``
-    rows close as row-level manual with complete evidence, ``MANUAL_REVIEW``
-    rows need a human, and ``NONE`` needs nothing.
+    finalize (only READY never blocks; round-2 ruling made MISSING_PROVEN
+    blocking because a required row without a valid price must not ship a
+    formal workbook).  ``wait_class`` tells a consumer how the row is expected
+    to move on its own: ``WAIT_WORK`` / ``WAIT_RETRY`` resolve automatically,
+    ``MANUAL_REVIEW`` rows (including proven-absent rows) need a human, and
+    ``NONE`` needs nothing.
     """
 
     key: str
@@ -151,12 +201,28 @@ def _parse_price(value: Any) -> Decimal | None:
 
 
 def _classify_success(result: Mapping[str, Any] | None) -> CustomerPriceBusinessState:
+    """Fail-closed classification of a SUCCESS detail row (rule table authoritative).
+
+    A positive price alone is never success: READY requires BOTH a positive
+    price AND a FOUND-family status.  Any positive price combined with a
+    failure/absence/unknown status is contradictory evidence -> INVALID.  A
+    proven-absent status with no valid price is MISSING_PROVEN (blocking, round
+    2); a retryable business failure with no valid price is the legacy
+    invalid-success -> FAILED.  Everything else is INVALID.
+    """
     price = _parse_price(result.get("customerPrice")) if isinstance(result, Mapping) else None
-    if price is not None and price > 0:
-        return CustomerPriceBusinessState(READY, _status_text(result), "SUCCESS", False, "NONE")
     status = _status_text(result)
+    if price is not None and price > 0:
+        if status in CUSTOMER_PRICE_FOUND_STATUSES:
+            return CustomerPriceBusinessState(READY, status, "SUCCESS", False, "NONE")
+        # Contradictory evidence (positive price + failed/absent/unknown
+        # status) must never look like a usable price.
+        return CustomerPriceBusinessState(INVALID, status, "SUCCESS", True, "MANUAL_REVIEW")
     if status in CUSTOMER_PRICE_PROVEN_ABSENT_STATUSES:
-        return CustomerPriceBusinessState(MISSING_PROVEN, status, "SUCCESS", False, "PROVEN_ABSENT")
+        # Deterministic absence: retrying is meaningless, but the row still
+        # lacks its price-review baseline, so it blocks formal finalization
+        # (round-2 fail-closed ruling) with the enriched evidence preserved.
+        return CustomerPriceBusinessState(MISSING_PROVEN, status, "SUCCESS", True, "MANUAL_REVIEW")
     if status in CUSTOMER_PRICE_RETRYABLE_DETAIL_STATUSES:
         # Legacy durable state: a retryable business failure was checkpointed
         # as SUCCESS.  It is evidence of failure, never of a usable price.
@@ -183,10 +249,11 @@ def customer_price_business_state(
     RETRYABLE_FAILED -                              RETRYING       yes
     TERMINAL_FAILED  error prefix NOT_FOUND         MISSING        yes
     TERMINAL_FAILED  REQUEST/PARSE prefix or none   FAILED         yes
-    SUCCESS          price > 0 (any status)         READY          no
-    SUCCESS          status in PROVEN_ABSENT        MISSING_PROVEN no
-    SUCCESS          status in RETRYABLE (legacy)   FAILED         yes
-    SUCCESS          price <= 0 / unparseable       INVALID        yes
+    SUCCESS          price>0 AND FOUND-family       READY          no
+    SUCCESS          price>0 AND other status       INVALID        yes
+    SUCCESS          no price AND PROVEN_ABSENT     MISSING_PROVEN yes
+    SUCCESS          no price AND RETRYABLE (legacy) FAILED        yes
+    SUCCESS          price invalid / unknown status INVALID        yes
     (no stage row)   -                              PENDING        yes
     ================ ============================== ============== ========
     """
@@ -212,5 +279,7 @@ def customer_price_required(row: Mapping[str, Any] | None) -> bool:
     customer price as the price-review baseline, so the predicate is
     unconditionally True; keep callers on this function (never inline the
     assumption) so a future exemption stays a one-line change here.
+    取不到 ≠ 不需要：确定性缺席（MISSING_PROVEN）同样阻塞正式出表，
+    除非未来找到明确业务豁免。
     """
     return True
