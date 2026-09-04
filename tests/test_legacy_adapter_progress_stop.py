@@ -15,6 +15,7 @@ import pytest
 from app.services.legacy_zhaoshang_adapter import (
     CnncLegacyZhaoshangAdapter,
     LegacyRestartOutcome,
+    LegacyZhaoshangAdapterError,
     RemoteTaskIdentityConflictError,
     RestartStatus,
 )
@@ -60,6 +61,7 @@ class _FakeSession:
         self.progress_rsp_desc = progress_rsp_desc
         self.progress_payload = progress_payload
         self.update_calls: list[dict] = []
+        self.get_calls: list[dict] = []
         self.disable_calls = 0
         self.enable_calls = 0
 
@@ -85,12 +87,22 @@ class _FakeSession:
         return _FakeRestartResponse({"data": [dict(self.task)]})
 
     def get(self, url, params=None, timeout=None):
+        self.get_calls.append(
+            {"url": url, "params": dict(params) if params is not None else None}
+        )
         if self.progress_payload is not None:
             return _FakeRestartResponse(self.progress_payload)
         return _FakeRestartResponse({"rspDesc": self.progress_rsp_desc, "success": True})
 
 
-def _fake_tool(task: dict, session: _FakeSession):
+def _fake_tool(
+    task: dict,
+    session: _FakeSession,
+    *,
+    lookup_error: Exception | None = None,
+    lookup_none: bool = False,
+    identity_error: Exception | None = None,
+):
     class _Module:
         EXPORT_TASK_URL = "https://platform.invalid/exportTask"
         QUERY_PROGRESS_URL = "https://platform.invalid/queryTaskProgress"
@@ -109,6 +121,10 @@ def _fake_tool(task: dict, session: _FakeSession):
 
         @staticmethod
         def check_existing_task(session, task_name, mall_code):
+            if lookup_error is not None:
+                raise lookup_error
+            if lookup_none:
+                return None
             payload = session.post(
                 "https://platform.invalid/queryList",
                 json={"taskName": task_name},
@@ -118,6 +134,8 @@ def _fake_tool(task: dict, session: _FakeSession):
 
         @staticmethod
         def get_task_identity(task, mall_code):
+            if identity_error is not None:
+                raise identity_error
             return task["taskId"], task["taskNumber"], mall_code
 
         @staticmethod
@@ -189,14 +207,24 @@ def _running_task_record(*, task_id: str = TASK_ID, task_number: str = TASK_NUMB
     }
 
 
-def _prepared_job(tmp_path, monkeypatch, task: dict, session: _FakeSession):
+def _prepared_job(
+    tmp_path,
+    monkeypatch,
+    task: dict,
+    session: _FakeSession,
+    *,
+    auth_manager=None,
+    monotonic=None,
+    **tool_kwargs,
+):
     run_dir = tmp_path / "zhaoshang"
     run_dir.mkdir(parents=True, exist_ok=True)
     batch_state = run_dir / "BATCH_STATE.md"
     batch_state.write_text("# batch\n", encoding="utf-8")
-    adapter = CnncLegacyZhaoshangAdapter(
-        mappings=[], db_env_path=None, auth_manager=_FakeAuthManager()
-    )
+    adapter_kwargs = {"auth_manager": auth_manager or _FakeAuthManager()}
+    if monotonic is not None:
+        adapter_kwargs["monotonic"] = monotonic
+    adapter = CnncLegacyZhaoshangAdapter(mappings=[], db_env_path=None, **adapter_kwargs)
     prepared = adapter.prepare_job(
         BUSINESS_DATE,
         [
@@ -222,7 +250,7 @@ def _prepared_job(tmp_path, monkeypatch, task: dict, session: _FakeSession):
     monkeypatch.setattr(
         type(adapter),
         "_load_module",
-        classmethod(lambda cls, path, name: _fake_tool(task, session)),
+        classmethod(lambda cls, path, name: _fake_tool(task, session, **tool_kwargs)),
     )
     return adapter, prepared
 
@@ -302,6 +330,188 @@ def test_query_task_progress_identity_mismatch_raises_conflict(tmp_path, monkeyp
 
     with pytest.raises(RemoteTaskIdentityConflictError):
         adapter.query_task_progress_for_job(prepared, TASK_ID, TASK_NUMBER, timeout_seconds=60.0)
+
+
+# ---------------------------------------------------------------------------
+# query_task_progress_for_job — characterization tests
+#
+# These pin the CURRENT production behavior (fallbacks, exception types and
+# message fragments) as a safety net before the progress-query capability is
+# extracted out of the adapter.  They assert what the implementation does
+# today, not what it ideally should do.
+# ---------------------------------------------------------------------------
+
+
+def test_progress_lookup_runtime_error_maps_to_identity_conflict(tmp_path, monkeypatch) -> None:
+    task = _running_task_record()
+    session = _FakeSession(task)
+    adapter, prepared = _prepared_job(
+        tmp_path,
+        monkeypatch,
+        task,
+        session,
+        lookup_error=RuntimeError("queryList exact match is ambiguous"),
+    )
+
+    with pytest.raises(RemoteTaskIdentityConflictError) as excinfo:
+        adapter.query_task_progress_for_job(prepared, TASK_ID, TASK_NUMBER, timeout_seconds=60.0)
+
+    assert "queryList exact match is ambiguous" in str(excinfo.value)
+    assert session.update_calls == []
+
+
+def test_progress_identity_mall_marker_mismatch_maps_to_identity_conflict(tmp_path, monkeypatch) -> None:
+    task = _running_task_record()
+    session = _FakeSession(task)
+    adapter, prepared = _prepared_job(
+        tmp_path,
+        monkeypatch,
+        task,
+        session,
+        identity_error=RuntimeError("任务商城标识不一致: 期望 lxwl, 实际 other"),
+    )
+
+    with pytest.raises(RemoteTaskIdentityConflictError) as excinfo:
+        adapter.query_task_progress_for_job(prepared, TASK_ID, TASK_NUMBER, timeout_seconds=60.0)
+
+    assert "商城标识不一致" in str(excinfo.value)
+
+
+def test_progress_identity_other_runtime_error_propagates_untyped(tmp_path, monkeypatch) -> None:
+    task = _running_task_record()
+    session = _FakeSession(task)
+    adapter, prepared = _prepared_job(
+        tmp_path,
+        monkeypatch,
+        task,
+        session,
+        identity_error=RuntimeError("身份字段缺失"),
+    )
+
+    with pytest.raises(RuntimeError) as excinfo:
+        adapter.query_task_progress_for_job(prepared, TASK_ID, TASK_NUMBER, timeout_seconds=60.0)
+
+    # Malformed payloads stay untyped: NOT a RemoteTaskIdentityConflictError.
+    assert not isinstance(excinfo.value, RemoteTaskIdentityConflictError)
+    assert "身份字段缺失" in str(excinfo.value)
+
+
+def test_progress_lookup_none_raises_no_exact_existing_task(tmp_path, monkeypatch) -> None:
+    task = _running_task_record()
+    session = _FakeSession(task)
+    adapter, prepared = _prepared_job(tmp_path, monkeypatch, task, session, lookup_none=True)
+
+    with pytest.raises(LegacyZhaoshangAdapterError) as excinfo:
+        adapter.query_task_progress_for_job(prepared, TASK_ID, TASK_NUMBER, timeout_seconds=60.0)
+
+    assert not isinstance(excinfo.value, RemoteTaskIdentityConflictError)
+    assert "no exact existing task" in str(excinfo.value)
+    assert session.update_calls == []
+
+
+def test_progress_missing_batch_number_falls_back_to_task_name(tmp_path, monkeypatch) -> None:
+    task = _running_task_record()
+    del task["batchNumber"]
+    session = _FakeSession(task)
+    adapter, prepared = _prepared_job(tmp_path, monkeypatch, task, session)
+
+    result = adapter.query_task_progress_for_job(prepared, TASK_ID, TASK_NUMBER, timeout_seconds=60.0)
+
+    # batchNumber fallback semantics: the resolved browser task name is the key.
+    assert result["batch_number"] == TASK_NAME
+    assert [call["params"]["batchNumber"] for call in session.get_calls] == [TASK_NAME]
+
+
+def test_progress_disabled_task_record_reports_enabled_false(tmp_path, monkeypatch) -> None:
+    task = _running_task_record(enabled=False)
+    session = _FakeSession(task)
+    adapter, prepared = _prepared_job(tmp_path, monkeypatch, task, session)
+
+    result = adapter.query_task_progress_for_job(prepared, TASK_ID, TASK_NUMBER, timeout_seconds=60.0)
+
+    # Success path still runs; only the enabled flag mirrors the remote record.
+    assert result["progress"] is not None
+    assert result["enabled"] is False
+
+
+def test_progress_rejects_non_positive_timeout(tmp_path, monkeypatch) -> None:
+    task = _running_task_record()
+    session = _FakeSession(task)
+    adapter, prepared = _prepared_job(tmp_path, monkeypatch, task, session)
+
+    with pytest.raises(TimeoutError) as excinfo:
+        adapter.query_task_progress_for_job(prepared, TASK_ID, TASK_NUMBER, timeout_seconds=0.0)
+
+    assert "timeout must be positive" in str(excinfo.value)
+    assert session.update_calls == []
+    assert session.get_calls == []
+
+
+def test_progress_missing_blade_auth_raises_session_auth_unavailable(tmp_path, monkeypatch) -> None:
+    task = _running_task_record()
+    session = _FakeSession(task)
+
+    class _CookieOnlyAuthManager:
+        def export_environment(
+            self, system, refresh=False, timeout_seconds=None, deadline=None, monotonic=None
+        ):
+            return {"COOKIE": "x-access-token=fake; refreshToken=fake"}
+
+    adapter, prepared = _prepared_job(
+        tmp_path, monkeypatch, task, session, auth_manager=_CookieOnlyAuthManager()
+    )
+
+    with pytest.raises(LegacyZhaoshangAdapterError) as excinfo:
+        adapter.query_task_progress_for_job(prepared, TASK_ID, TASK_NUMBER, timeout_seconds=60.0)
+
+    assert not isinstance(excinfo.value, RemoteTaskIdentityConflictError)
+    assert "session auth is unavailable" in str(excinfo.value)
+    assert session.get_calls == []
+
+
+def test_progress_success_payload_key_set_is_pinned(tmp_path, monkeypatch) -> None:
+    task = _running_task_record()
+    session = _FakeSession(task)
+    adapter, prepared = _prepared_job(tmp_path, monkeypatch, task, session)
+
+    result = adapter.query_task_progress_for_job(prepared, TASK_ID, TASK_NUMBER, timeout_seconds=60.0)
+
+    assert set(result) == {
+        "task_id",
+        "task_number",
+        "batch_number",
+        "progress",
+        "rsp_desc",
+        "enabled",
+        "remote_calls",
+    }
+    assert result["remote_calls"] == 2
+
+
+def test_progress_deadline_exhausted_before_query_times_out(tmp_path, monkeypatch) -> None:
+    task = _running_task_record()
+    session = _FakeSession(task)
+    # Stepped clock clamped at 60.0 == deadline (timeout_seconds=60.0): auth
+    # refresh and the exact-task lookup still fit, then the remaining-time
+    # check right before the progress query sees remaining == 0.
+    values = [0.0, 1.0, 2.0, 3.0, 60.0]
+    state = {"index": 0}
+
+    def stepped_monotonic() -> float:
+        value = values[min(state["index"], len(values) - 1)]
+        state["index"] += 1
+        return value
+
+    adapter, prepared = _prepared_job(
+        tmp_path, monkeypatch, task, session, monotonic=stepped_monotonic
+    )
+
+    with pytest.raises(TimeoutError) as excinfo:
+        adapter.query_task_progress_for_job(prepared, TASK_ID, TASK_NUMBER, timeout_seconds=60.0)
+
+    assert "deadline exhausted before progress query" in str(excinfo.value)
+    # The progress GET never left after the deadline hit.
+    assert session.get_calls == []
 
 
 # ---------------------------------------------------------------------------
