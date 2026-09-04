@@ -16,9 +16,12 @@ Data-layer contract (no producer, scheduler, or business flow is wired here):
   verbatim; URL parsing never promotes a SKU to ``CONFIRMED``.
 - Placeholder codes (``zhpq-*`` by default) and ``crawl_id`` echoes are
   rejected as ``real_sku_id`` even when the caller claims ``CONFIRMED``.
-- A ``(mall, url)`` alias permanently belongs to one identity; a conflicting
-  record raises :class:`AliasConflictError` and rolls the whole transaction
-  back (fail-closed).
+- A ``(mall, url)`` alias permanently belongs to one identity.  Each record
+  collects identity evidence from its whole URL chain: zero known identities
+  creates a fresh one, exactly one merges the chain into it (a dirty URL
+  follows its known returned/canonical URL), and two or more distinct
+  identities raise :class:`AliasConflictError` before any write and roll the
+  whole transaction back (fail-closed; existing groups are never merged).
 
 Connection handling mirrors ``app/services/daily_audit_store.py``: connections
 are never cached, ``PRAGMA foreign_keys=ON`` / ``busy_timeout=5000`` / WAL,
@@ -168,7 +171,7 @@ class SharedCrawlCache:
 
     @staticmethod
     def _utcnow() -> str:
-        return datetime.now(UTC).isoformat(timespec="seconds")
+        return datetime.now(UTC).isoformat(timespec="microseconds")
 
     @staticmethod
     def _utc_timestamp(value: str | None, *, field: str) -> str | None:
@@ -180,7 +183,7 @@ class SharedCrawlCache:
             raise ValueError(f"{field} must be an explicit ISO-8601 UTC timestamp") from exc
         if parsed.tzinfo is None or parsed.utcoffset() is None:
             raise ValueError(f"{field} must include an explicit UTC offset")
-        return parsed.astimezone(UTC).isoformat(timespec="seconds")
+        return parsed.astimezone(UTC).isoformat(timespec="microseconds")
 
     @staticmethod
     def _canonical_json(value: Any) -> str:
@@ -250,40 +253,48 @@ class SharedCrawlCache:
         returned: str | None,
         canonical: str | None,
     ) -> int:
+        """Collect identity evidence for the whole URL chain, then decide.
+
+        Evidence is the set of distinct existing identity ids reachable from
+        (a) the ``(mall, url)`` alias rows of every chain URL
+        (original/submitted/returned/canonical) and (b) the parsed
+        ``(mall, product_identity)`` row when the mall parser hits.  Decision:
+        zero evidence creates a fresh identity; exactly one reuses it (the
+        chain's new URLs then register as its aliases, so a dirty submitted
+        URL merges into its known returned/canonical identity); two or more
+        distinct identities raise :class:`AliasConflictError` before any
+        INSERT - existing identity groups are never merged automatically.
+        """
         product_identity = self._parsed_identity(
             mall, (returned, canonical, submitted, original)
         )
-        if product_identity is not None:
-            row = connection.execute(
-                "SELECT id FROM crawl_identities WHERE mall=? AND product_identity=?",
-                (mall, product_identity),
-            ).fetchone()
-            if row is not None:
-                return int(row["id"])
-            cursor = connection.execute(
-                "INSERT INTO crawl_identities(mall, product_identity, created_at) VALUES (?, ?, ?)",
-                (mall, product_identity, self._utcnow()),
-            )
-            return int(cursor.lastrowid)
-        # Parser MISS: a repeat record of an already-registered *input* URL
-        # belongs to that URL's identity so repeat successes append history
-        # under one identity.  Redirect outputs (returned/canonical) never
-        # drive adoption - an unknown input with a redirect onto a foreign
-        # identity stays a fresh NULL identity and must fail closed in the
-        # alias step.  The partial unique index deliberately allows many NULL
-        # product_identity rows.
-        for candidate in (original, submitted):
+        evidence: list[int] = []
+        for candidate in (original, submitted, returned, canonical):
             if candidate is None:
                 continue
             alias = connection.execute(
                 "SELECT identity_id FROM crawl_urls WHERE mall=? AND url=?",
                 (mall, candidate),
             ).fetchone()
-            if alias is not None:
-                return int(alias["identity_id"])
+            if alias is not None and int(alias["identity_id"]) not in evidence:
+                evidence.append(int(alias["identity_id"]))
+        if product_identity is not None:
+            parsed_row = connection.execute(
+                "SELECT id FROM crawl_identities WHERE mall=? AND product_identity=?",
+                (mall, product_identity),
+            ).fetchone()
+            if parsed_row is not None and int(parsed_row["id"]) not in evidence:
+                evidence.append(int(parsed_row["id"]))
+        if len(evidence) > 1:
+            raise AliasConflictError(
+                f"URL chain for mall={mall} spans multiple known identities "
+                f"{sorted(evidence)}; refusing to merge"
+            )
+        if evidence:
+            return evidence[0]
         cursor = connection.execute(
-            "INSERT INTO crawl_identities(mall, product_identity, created_at) VALUES (?, NULL, ?)",
-            (mall, self._utcnow()),
+            "INSERT INTO crawl_identities(mall, product_identity, created_at) VALUES (?, ?, ?)",
+            (mall, product_identity, self._utcnow()),
         )
         return int(cursor.lastrowid)
 

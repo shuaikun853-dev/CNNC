@@ -26,7 +26,10 @@ contextmanager `_transaction(immediate=True)` / `_reader()`。
 1. Level1/Level2(EXACT): `crawl_urls` alias 表按 `(mall, url)` 精确命中
    (alias 表同时涵盖 exact URL 与已学习的历史链路 URL)。
 2. Level3(MALL_PARSER): 商城隔离解析器把 URL 解析为 product_identity
-   (v1 仅 `ofs`:`path` 以 `/product-<纯数字>.html` 结尾,大小写不敏感、允许尾斜杠),
+   (v1 仅 `ofs`:hostname 必须是 `ofs.cn`、`www.ofs.cn` 或任意真实子域
+   `*.ofs.cn`(endswith 允许策略),`path` 以 `/product-<纯数字>.html` 结尾,
+   大小写不敏感、允许尾斜杠;identity 只取自 path,query/fragment 伪装一律
+   MISS;其他域名含 `evilofs.cn`、`ofs.cn.evil.com` 一律 None),
    再按 `(mall, product_identity)` 查 `crawl_identities`。
 3. 全 MISS ⇒ `None`,保守不命中。永不模糊匹配,永不把 SKU 当 identity 键。
 
@@ -48,13 +51,23 @@ crawl_id,一律 `ValueError` 拒绝落库——即使调用方声称 CONFIRMED�
 ## current 唯一性
 
 `ux_crawl_results_current ON crawl_results(identity_id) WHERE is_current=1`
-部分唯一索引硬约束每个 identity 至多一行 current。选举规则:新行
-`(succeeded_at, id)` 字典序大于现有 current 行才接管,乱序迟到的历史不夺 current。
+部分唯一索引硬约束每个 identity 至多一行 current。选举规则:succeeded_at
+归一化为 UTC 并保留微秒精度,新行 `(succeeded_at, id)` 字典序大于现有 current
+行才接管(微秒即分出先后,id 仅在完全相等时 tie-break),乱序迟到的历史不夺
+current。
 
-## alias fail-closed 冲突策略
+## alias fail-closed 冲突策略(证据收集决策表)
 
-`(mall, url)` 永久归属唯一 identity(`UNIQUE(mall, url)`)。写入时发现某 URL
-已属于另一 identity ⇒ `AliasConflictError`,整个事务回滚、零残留(fail-closed)。
+写入时对整条 URL 链路(original/submitted/returned/canonical)收集已有
+identity 证据:各 URL 在 `crawl_urls` 的 `(mall, url)` 归属,加上 parser 命中的
+`(mall, product_identity)` 行。决策表:
+- 证据 0 个 → 新建 identity(parser 命中则带 product_identity,否则 NULL);
+- 证据 1 个 → 复用该 identity,链路中的新 URL 随后注册为它的 alias
+  (脏 submitted URL 经已知 returned/canonical 归并进既有身份);
+- 证据 ≥2 个不同 identity → `AliasConflictError`,在任何 INSERT 之前判定、
+  整事务回滚、零残留;绝不自动合并两个已存在的身份组(fail-closed)。
+
+`(mall, url)` 仍永久归属唯一 identity(`UNIQUE(mall, url)`);
 `document_references` 的 UNIQUE 冲突同理:identity 相同幂等,不同则冲突。
 
 ## migration 策略
