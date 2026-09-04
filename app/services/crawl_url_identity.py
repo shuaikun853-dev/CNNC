@@ -30,7 +30,8 @@ PLACEHOLDER_PREFIXES_DEFAULT = ("zhpq-",)
 # case-insensitive) counts as an ofs product URL.  The pattern is applied to
 # the parsed URL *path* only - never to the whole URL string - so a disguised
 # suffix inside a query string or fragment is a conservative MISS.  Bare
-# numeric paths are also rejected.
+# numeric paths are also rejected.  The hostname must pass the ofs.cn allow
+# policy (see ofs_product_identity).
 _OFS_PRODUCT_PATTERN = re.compile(r"/product-([0-9]+)\.html/?\Z", re.IGNORECASE)
 
 
@@ -51,9 +52,17 @@ def is_placeholder_code(
 def ofs_product_identity(url: str) -> str | None:
     """Return the numeric ofs product id when the URL path ends with ``/product-<digits>.html``.
 
+    Hostname allow policy: only ``ofs.cn``, ``www.ofs.cn``, and any real
+    subdomain ``*.ofs.cn`` count as ofs URLs; other hostnames (including
+    lookalikes such as ``evilofs.cn`` or ``ofs.cn.evil.com``) are a
+    conservative MISS.  Only the parsed URL *path* is matched - a
+    ``/product-<digits>.html`` tail inside a query string or fragment never
+    contributes an identity.
+
     Examples:
         ``https://www.ofs.cn/product-6287660.html`` -> ``"6287660"``
         ``https://www.ofs.cn/x/product-6287660.html`` -> ``"6287660"``
+        ``https://www.ofs.cn/redirect?to=/product-1.html`` -> ``None``
         ``https://www.ofs.cn/other/6287660`` -> ``None`` (conservative MISS)
     """
     if not isinstance(url, str):
@@ -61,13 +70,16 @@ def ofs_product_identity(url: str) -> str | None:
     stripped = url.strip()
     if not stripped:
         return None
-    # Match the path component only: a /product-<digits>.html tail inside a
-    # query string or fragment must not merge identities.
     try:
-        path = urlparse(stripped).path or ""
+        parsed = urlparse(stripped)
     except ValueError:  # pragma: no cover - malformed URL, conservative MISS
         return None
-    match = _OFS_PRODUCT_PATTERN.search(path)
+    # Hostname gate first: identity extraction is only trusted on real ofs
+    # hosts; urlparse already returns the hostname lowercased.
+    host = (parsed.hostname or "").strip().lower()
+    if host != "ofs.cn" and not host.endswith(".ofs.cn"):
+        return None
+    match = _OFS_PRODUCT_PATTERN.search(parsed.path or "")
     if match is None:
         return None
     return match.group(1)

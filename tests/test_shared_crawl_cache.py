@@ -53,6 +53,15 @@ def _current_row_count(cache: SharedCrawlCache, identity_id: int | None = None) 
         connection.close()
 
 
+def _table_row_count(cache: SharedCrawlCache, table: str) -> int:
+    """Direct sqlite3 row count of one table; bypasses the public API on purpose."""
+    connection = sqlite3.connect(str(cache.path))
+    try:
+        return int(connection.execute(f'SELECT COUNT(*) FROM "{table}"').fetchone()[0])
+    finally:
+        connection.close()
+
+
 # ---- URL identity module (Level 3 parser) -----------------------------------
 
 
@@ -76,6 +85,18 @@ def test_ofs_product_identity_parsing():
         is None
     )
     assert ofs_product_identity("https://www.ofs.cn/x#product-999.html") is None
+
+
+def test_ofs_product_identity_hostname_policy():
+    # Hostname allow policy: ofs.cn, www.ofs.cn, and any real subdomain
+    # *.ofs.cn.  Anything else (evilofs.cn, ofs.cn.evil.com, example.com)
+    # must be a conservative MISS.
+    assert ofs_product_identity("https://www.ofs.cn/product-1.html") == "1"
+    assert ofs_product_identity("https://ofs.cn/product-1.html") == "1"
+    assert ofs_product_identity("https://foo.ofs.cn/product-1.html") == "1"
+    assert ofs_product_identity("https://evilofs.cn/product-1.html") is None
+    assert ofs_product_identity("https://ofs.cn.evil.com/product-1.html") is None
+    assert ofs_product_identity("https://example.com/product-1.html") is None
 
 
 def test_resolve_mall_product_identity_is_mall_scoped():
@@ -155,8 +176,8 @@ def test_case3_multiple_successes_keep_history_and_single_current(cache):
     assert len(history) == 2
     assert [row["price"] for row in history] == ["30", "28"]
     assert [row["succeeded_at"] for row in history] == [
-        "2026-08-20T10:00:00+00:00",
-        "2026-08-25T10:00:00+00:00",
+        "2026-08-20T10:00:00.000000+00:00",
+        "2026-08-25T10:00:00.000000+00:00",
     ]
     current = cache.lookup_current("jd", url)
     assert current is not None
@@ -303,21 +324,71 @@ def test_case9_document_provenance(cache):
 
 
 def test_case10_alias_conflict_fails_closed(cache):
-    url1 = "https://item.jd.com/1.html"
-    url2 = "https://item.jd.com/2.html"
-    first = cache.record_success(mall="jd", submitted_url=url1, source="unit-test")
+    # A true dual-identity conflict: URL A and URL B already own two distinct
+    # NULL identities (jd has no parser); a record whose chain spans both must
+    # fail closed instead of merging the two existing identity groups.
+    url_a = "https://item.jd.com/a.html"
+    url_b = "https://item.jd.com/b.html"
+    first_a = cache.record_success(mall="jd", submitted_url=url_a, source="unit-test")
+    first_b = cache.record_success(mall="jd", submitted_url=url_b, source="unit-test")
+    assert first_a["identity_id"] != first_b["identity_id"]
     with pytest.raises(AliasConflictError):
         cache.record_success(
             mall="jd",
-            submitted_url=url2,
-            returned_url=url1,
+            submitted_url=url_a,
+            original_url=url_a,
+            returned_url=url_b,
             source="unit-test",
         )
-    # The whole transaction rolled back: no residue for the conflicting record.
-    assert cache.lookup_current("jd", url2) is None
-    hit1 = cache.lookup_current("jd", url1)
-    assert hit1 is not None
-    assert hit1["entry"]["id"] == first["id"]
+    # The whole transaction rolled back: both identities keep their original
+    # single success, and no new alias rows were left behind.
+    hit_a = cache.lookup_current("jd", url_a)
+    hit_b = cache.lookup_current("jd", url_b)
+    assert hit_a is not None
+    assert hit_b is not None
+    assert hit_a["entry"]["id"] == first_a["id"]
+    assert hit_b["entry"]["id"] == first_b["id"]
+    assert hit_a["identity_id"] != hit_b["identity_id"]
+    assert hit_a["history_count"] == 1
+    assert hit_b["history_count"] == 1
+    assert _table_row_count(cache, "crawl_urls") == 2
+
+
+def test_case10a_dirty_url_merges_into_known_returned_identity(cache):
+    # A brand-new dirty submitted URL whose returned/canonical URL is already
+    # known must merge into that identity, not conflict (this also covers the
+    # simplest unknown-submitted + known-returned variant).
+    dirty_a = "https://item.jd.com/dirty-a.html"
+    dirty_c = "https://item.jd.com/dirty-c.html"
+    canonical_b = "https://item.jd.com/canonical-b.html"
+    cache.record_success(
+        mall="jd",
+        submitted_url=dirty_a,
+        returned_url=canonical_b,
+        price="first",
+        source="unit-test",
+    )
+    cache.record_success(
+        mall="jd",
+        submitted_url=dirty_c,
+        returned_url=canonical_b,
+        price="second",
+        source="unit-test",
+    )
+    hit_a = cache.lookup_current("jd", dirty_a)
+    hit_b = cache.lookup_current("jd", canonical_b)
+    hit_c = cache.lookup_current("jd", dirty_c)
+    assert hit_a is not None
+    assert hit_b is not None
+    assert hit_c is not None
+    identity_id = hit_a["identity_id"]
+    assert hit_b["identity_id"] == identity_id
+    assert hit_c["identity_id"] == identity_id
+    assert hit_a["history_count"] == 2
+    assert hit_b["history_count"] == 2
+    assert hit_c["history_count"] == 2
+    assert hit_c["entry"]["price"] == "second"
+    assert hit_c["entry"]["is_current"] is True
 
 
 # ---- Behavioural hard rules --------------------------------------------------
@@ -390,6 +461,52 @@ def test_late_older_success_does_not_steal_current(cache):
     assert len(cache.history("jd", url)) == 3
 
 
+def test_microsecond_precision_decides_current(cache):
+    url = "https://item.jd.com/600.html"
+    cache.record_success(
+        mall="jd",
+        submitted_url=url,
+        price="NEWER",
+        source="unit-test",
+        succeeded_at="2026-09-04T10:00:00.900000+00:00",
+    )
+    cache.record_success(
+        mall="jd",
+        submitted_url=url,
+        price="OLDER",
+        source="unit-test",
+        succeeded_at="2026-09-04T10:00:00.100000+00:00",
+    )
+    history = cache.history("jd", url)
+    assert len(history) == 2
+    current = cache.lookup_current("jd", url)
+    assert current is not None
+    assert current["entry"]["price"] == "NEWER"
+    assert _current_row_count(cache) == 1
+
+
+def test_identical_timestamp_id_tiebreak(cache):
+    url = "https://item.jd.com/601.html"
+    cache.record_success(
+        mall="jd",
+        submitted_url=url,
+        price="FIRST",
+        source="unit-test",
+        succeeded_at="2026-09-04T11:00:00.000000+00:00",
+    )
+    cache.record_success(
+        mall="jd",
+        submitted_url=url,
+        price="SECOND",
+        source="unit-test",
+        succeeded_at="2026-09-04T11:00:00.000000+00:00",
+    )
+    current = cache.lookup_current("jd", url)
+    assert current is not None
+    assert current["entry"]["price"] == "SECOND"
+    assert _current_row_count(cache) == 1
+
+
 def test_lookup_miss_returns_none(cache):
     assert cache.lookup_current("jd", "https://item.jd.com/not-recorded.html") is None
     assert cache.lookup_current("", JD_URL) is None
@@ -454,7 +571,7 @@ def test_succeeded_at_requires_explicit_utc_offset(cache):
         source="unit-test",
         succeeded_at="2026-08-20T18:00:00+08:00",
     )
-    assert entry["succeeded_at"] == "2026-08-20T10:00:00+00:00"
+    assert entry["succeeded_at"] == "2026-08-20T10:00:00.000000+00:00"
 
 
 def test_price_accepts_numeric_types(cache):
