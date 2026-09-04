@@ -54,10 +54,23 @@ else:
         }
     )
 
+# Re-exports: these names moved to zhaoshang_remote_task (2026-09 Zhaoshang
+# boundary migration); kept importable from here for existing callers/tests.
+from app.services.zhaoshang_remote_task import (
+    LegacyPreSendFailure,
+    LegacyProbeEvidenceError,
+    LegacyZhaoshangAdapterError,
+    PriorityEvidenceConflictError,
+    RemoteTaskIdentityConflictError,
+    SubmissionEvidenceConflictError,
+    TemplateConflictError,
+    remote_task_is_enabled,
+)
 from app.services.zhaoshang_result_adapter import (
     read_zhaoshang_result_xlsx,
     read_zhaoshang_result_xlsx_by_identity,
 )
+from app.services.zhaoshang_task_progress import query_task_progress
 from app.services.saas_audit_core import parse_decimal
 from scripts.auth_manager import AuthManager
 from scripts.curl_utils import internal_subprocess_env
@@ -234,48 +247,6 @@ class RestartStatus(str, Enum):
     # Stop-only outcome: the single exact disable was confirmed and no enable
     # follows (dashboard manual-ops stop seam).
     STOPPED = "STOPPED"
-
-
-class LegacyZhaoshangAdapterError(RuntimeError):
-    pass
-
-
-class TemplateConflictError(LegacyZhaoshangAdapterError):
-    pass
-
-
-class PriorityEvidenceConflictError(LegacyZhaoshangAdapterError):
-    pass
-
-
-class SubmissionEvidenceConflictError(LegacyZhaoshangAdapterError):
-    pass
-
-
-class LegacyPreSendFailure(LegacyZhaoshangAdapterError):
-    """The legacy subprocess provably never started; no remote POST occurred."""
-
-
-class LegacyProbeEvidenceError(LegacyZhaoshangAdapterError):
-    """A read-only probe completed with no usable execution evidence.
-
-    Transport success (HTTP answered, no exception) does not by itself prove
-    anything about the remote task: a business-failed, malformed, or
-    contradictory progress payload with no trusted terminal status and no
-    actual export result leaves the execution state unprovable, so the probe
-    refuses to return it as a healthy result and surfaces this typed failure
-    instead.
-    """
-
-
-class RemoteTaskIdentityConflictError(LegacyZhaoshangAdapterError):
-    """The live exact task provably conflicts with the durable remote identity.
-
-    Raised only where the conflict is PROVEN (live task id/number mismatch
-    against the durable identity, a non-unique exact task lookup, or a mall
-    mismatch reported by the external tool).  Malformed payloads, timeouts,
-    and transport faults are NOT identity conflicts and stay untyped.
-    """
 
 
 @dataclass(frozen=True)
@@ -1219,18 +1190,10 @@ class CnncLegacyZhaoshangAdapter:
             break
         return ""
 
-    @staticmethod
-    def _remote_is_enabled(remote: Mapping[str, Any]) -> bool:
-        enabled = remote.get("enabled")
-        if isinstance(enabled, bool):
-            return enabled
-        state = _text(
-            remote.get("state")
-            or remote.get("taskState")
-            or remote.get("task_state")
-            or remote.get("enableState")
-        ).lower()
-        return state in {"1", "enabled", "enable", "running", "active"}
+    # Moved to zhaoshang_remote_task.remote_task_is_enabled; kept as a
+    # staticmethod alias so existing self._remote_is_enabled call sites
+    # (and subclass/test access) are unchanged.
+    _remote_is_enabled = staticmethod(remote_task_is_enabled)
 
     def _default_reconciler(self, task_name: str, mall_key: str, timeout_seconds: float) -> Mapping[str, Any] | None:
         if timeout_seconds <= 0:
@@ -1959,61 +1922,16 @@ class CnncLegacyZhaoshangAdapter:
                 monotonic=self._monotonic,
                 deadline=deadline,
             )
-        mall_code = tool.priority_mall_code_for_key(job.mall_key)
-        resolved_task_name, _batch_number = tool.build_browser_task_identifiers(
-            job.task_name, job.mall_key
+        return query_task_progress(
+            session,
+            tool,
+            task_name=job.task_name,
+            mall_key=job.mall_key,
+            task_id=task_id,
+            task_number=task_number,
+            deadline=deadline,
+            monotonic=self._monotonic,
         )
-        # Identity verification boundary (same proof rules as the running
-        # probe): the external tool's exact-task lookup RuntimeError sites
-        # and get_task_identity's 商城标识不一致 marker are PROVEN
-        # conflicts with the durable remote identity; malformed payloads
-        # stay untyped so they keep counting transient.
-        try:
-            task = tool.check_existing_task(session, resolved_task_name, mall_code)
-        except RuntimeError as exc:
-            raise RemoteTaskIdentityConflictError(str(exc)) from exc
-        if task is None:
-            raise LegacyZhaoshangAdapterError(
-                "progress query found no exact existing task"
-            )
-        try:
-            live_task_id, live_task_number, _mall_logo = tool.get_task_identity(task, mall_code)
-        except RuntimeError as exc:
-            if "商城标识不一致" in str(exc):
-                raise RemoteTaskIdentityConflictError(str(exc)) from exc
-            raise
-        if str(live_task_id) != str(task_id) or str(live_task_number) != str(task_number):
-            raise RemoteTaskIdentityConflictError(
-                "live task identity does not match the durable remote identity"
-            )
-        remaining = deadline - self._monotonic()
-        if remaining <= 0:
-            raise TimeoutError("progress query deadline exhausted before progress query")
-        # The progress endpoint keys on the task record's batchNumber, not
-        # the RW- taskNumber; mirror run_auto_task's identifier choice.
-        batch_number = _text(task.get("batchNumber")) or resolved_task_name
-        progress_json = tool.query_task_progress(session, batch_number)
-        # Business-response gate (same rule as the probe path): a business-
-        # failed progress response donates no counter evidence, so it returns
-        # progress=None (REMOTE_UNKNOWN upstream) instead of raising; the raw
-        # rspDesc is still surfaced for the dashboard.
-        from app.services.remote_running_recovery import remote_business_response_ok
-
-        rsp_desc = _text(progress_json.get("rspDesc"))
-        progress = (
-            dict(tool.parse_task_progress_desc(rsp_desc))
-            if remote_business_response_ok(progress_json)
-            else None
-        )
-        return {
-            "task_id": str(live_task_id),
-            "task_number": str(live_task_number),
-            "batch_number": batch_number,
-            "progress": progress,
-            "rsp_desc": rsp_desc,
-            "enabled": self._remote_is_enabled(task),
-            "remote_calls": 2,
-        }
 
     def restart_running_task(
         self,
