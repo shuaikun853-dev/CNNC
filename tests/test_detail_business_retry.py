@@ -233,7 +233,11 @@ def test_lookup_failed_is_deterministic_success_and_never_retried(tmp_path):
     assert work["state"] == "SUCCESS"
     assert second.counters["detail_requests"] == 0
     assert len(calls) == 1
-    assert first.outcome != "MANUAL_REVIEW_REQUIRED"
+    # Round-3 contract update: LOOKUP_FAILED SUCCESS is a deterministic,
+    # never-retried SUCCESS whose business state is MISSING_PROVEN — a proven
+    # blocker that finalize refuses, so the tick now (correctly) ends in
+    # MANUAL_REVIEW_REQUIRED instead of silently completing past it.
+    assert first.outcome == "MANUAL_REVIEW_REQUIRED"
 
 
 def test_runtime_configuration_error_goes_terminal_on_first_attempt(tmp_path):

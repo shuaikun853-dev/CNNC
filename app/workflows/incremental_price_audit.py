@@ -1057,15 +1057,18 @@ def _backlog(
     crawls = store.list_crawl_work(token)
     jobs = store.list_remote_jobs(token)
     missing_stages = 0
-    # DETAIL rows are only re-scoped when the caller passes a non-empty
-    # authoritative snapshot: DETAIL work has no cross-snapshot reclaim, so
-    # rows dropped from the current snapshot must not pollute the backlog.
-    # MODEL rows always count in full — _model_items_with_retry_backlog
-    # deliberately reclaims same-day retryable MODEL work across snapshots.
-    # Drain/harvest-only/FAILED fallback paths pass no snapshot and keep the
-    # historical whole-run DETAIL view.
-    scope_detail_to_current = bool(snapshot_items)
-    current_item_ids = {int(item["id"]) for item in snapshot_items} if snapshot_items else set()
+    # DETAIL rows are only re-scoped when the caller passes an authoritative
+    # snapshot.  ``None`` means "no authoritative snapshot this pass"
+    # (drain/harvest/sweep or no-snapshot fallback) and keeps the historical
+    # whole-run DETAIL view; ``[]`` is a real authoritative snapshot that is
+    # legitimately empty, so its DETAIL scope is empty too — rows dropped from
+    # it must not pollute the backlog.  MODEL rows always count in full —
+    # _model_items_with_retry_backlog deliberately reclaims same-day retryable
+    # MODEL work across snapshots.
+    scope_detail_to_current = snapshot_items is not None
+    current_item_ids = (
+        {int(item["id"]) for item in snapshot_items} if snapshot_items is not None else set()
+    )
     if snapshot_items is not None:
         established = {
             (int(work["audit_item_id"]), str(work["stage"]))
@@ -1101,6 +1104,9 @@ def _backlog(
     )
     customer_price_missing = 0
     customer_price_failed = 0
+    customer_price_invalid = 0
+    customer_price_absent_proven = 0
+    customer_price_success_blockers = 0
     for work in stages:
         if work["stage"] != "DETAIL" or not _in_current_detail_scope(work):
             continue
@@ -1111,6 +1117,24 @@ def _backlog(
             customer_price_missing += 1
         elif state.key == customer_price_semantics.FAILED:
             customer_price_failed += 1
+        elif state.key == customer_price_semantics.INVALID:
+            customer_price_invalid += 1
+        elif state.key == customer_price_semantics.MISSING_PROVEN:
+            customer_price_absent_proven += 1
+        if (
+            work["state"] == "SUCCESS"
+            and state.key in {
+                customer_price_semantics.MISSING,
+                customer_price_semantics.MISSING_PROVEN,
+                customer_price_semantics.FAILED,
+                customer_price_semantics.INVALID,
+            }
+        ):
+            # Cross-view anti-double-count: a TERMINAL-stage blocker is already
+            # carried by detail_terminal, so only SUCCESS-stage business
+            # blockers are additive here (MISSING cannot occur on SUCCESS but
+            # is kept in the set defensively).
+            customer_price_success_blockers += 1
     return {
         "stage_pending": missing_stages + detail_pending + model_pending,
         "detail_terminal": sum(
@@ -1125,6 +1149,9 @@ def _backlog(
         ),
         "customer_price_missing": customer_price_missing,
         "customer_price_failed": customer_price_failed,
+        "customer_price_invalid": customer_price_invalid,
+        "customer_price_absent_proven": customer_price_absent_proven,
+        "customer_price_success_blockers": customer_price_success_blockers,
         "crawl_pending": sum(work["state"] in {"PENDING", "RUNNING", "RETRYABLE_FAILED", "SUBMITTED", "EXPORTED", "SUBMIT_UNKNOWN"} for work in crawls),
         "remote_pending": sum(job["state"] in {"PRIORITY_PENDING", "SUBMITTED", "RUNNING", "EXPORTED"} for job in jobs),
         "remote_unknown": sum(job["state"] == "SUBMIT_UNKNOWN" for job in jobs),
@@ -1535,7 +1562,12 @@ def run_incremental_tick(
         items: Sequence[Mapping[str, Any]] = (
             store.ordered_snapshot_items(snapshot_id) if snapshot_id is not None else ()
         )
-        snapshot_items = items
+        # ``None`` = this pass has no authoritative snapshot (drain/harvest/
+        # sweep-only) and the backlog keeps its whole-run fallback view;
+        # ``[]`` = the authoritative snapshot is legitimately empty, which must
+        # scope the DETAIL backlog to nothing instead of silently degrading to
+        # the whole run.  ``items`` stays a plain sequence for the stage loops.
+        snapshot_items = items if snapshot_id is not None else None
 
         # Crawl planning/submission precedes DETAIL and MODEL on purpose: the
         # crawl request is derived only from the discovered row (extLink /
@@ -1670,8 +1702,24 @@ def run_incremental_tick(
                     waiting_source_count = True
         # detail_terminal now also demands human review: an exhausted detail
         # retry budget means the row's customer-price baseline is provably
-        # unresolved (MISSING or FAILED), never an auto-closable state.
-        if backlog["model_terminal"] or backlog["remote_manual"] or backlog["detail_terminal"]:
+        # unresolved (MISSING or FAILED), never an auto-closable state.  Any
+        # blocking customer-price business state (SUCCESS-stage
+        # INVALID/MISSING_PROVEN included) blocks the same way — finalize
+        # would refuse these rows, so the tick must not report COMPLETED.
+        # RETRYING/PENDING stay out: they are already carried by
+        # stage_pending and surface as PENDING_RETRY, not manual review.
+        customer_price_manual_blockers = (
+            backlog["customer_price_missing"]
+            + backlog["customer_price_failed"]
+            + backlog["customer_price_invalid"]
+            + backlog["customer_price_absent_proven"]
+        )
+        if (
+            backlog["model_terminal"]
+            or backlog["remote_manual"]
+            or backlog["detail_terminal"]
+            or customer_price_manual_blockers
+        ):
             outcome = "MANUAL_REVIEW_REQUIRED"
         elif backlog["remote_unknown"]:
             outcome = "WAITING_REMOTE_RECONCILIATION"
@@ -1686,12 +1734,27 @@ def run_incremental_tick(
         else:
             outcome = "COMPLETED"
         counters["crawl_running"] = backlog["crawl_pending"]
-        # detail_terminal is a manual-review blocker reported on its own, and
-        # the customer_price_* keys are additive cross-cut views of the same
-        # detail rows; both stay out of the coarse outstanding-work sum.
-        final_pending = sum(
-            value for key, value in backlog.items()
-            if key not in {"detail_terminal", "customer_price_missing", "customer_price_failed"}
+        # final_pending mirrors status.computed_pending: the coarse technical
+        # work sum, plus detail_terminal, plus the SUCCESS-stage customer-price
+        # business blockers.  The four customer_price_* buckets are cross-cut
+        # views of the same detail rows and stay out of the sum (TERMINAL-stage
+        # blockers are already carried by detail_terminal; SUCCESS-stage ones
+        # are added back exactly once via customer_price_success_blockers), so
+        # nothing is double-counted.
+        final_pending = (
+            sum(
+                value for key, value in backlog.items()
+                if key not in {
+                    "detail_terminal",
+                    "customer_price_missing",
+                    "customer_price_failed",
+                    "customer_price_invalid",
+                    "customer_price_absent_proven",
+                    "customer_price_success_blockers",
+                }
+            )
+            + backlog["detail_terminal"]
+            + backlog["customer_price_success_blockers"]
         )
         store.update_daily_metrics(token, {**counters, "final_pending": final_pending})
         final_run = store.get_run(config.business_date)

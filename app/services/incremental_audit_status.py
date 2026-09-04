@@ -50,6 +50,7 @@ def _empty_customer_price() -> dict[str, int]:
         "customer_price_failed": 0,
         "customer_price_invalid": 0,
         "customer_price_absent_proven": 0,
+        "customer_price_success_blockers": 0,
         "customer_price_ratio": 0,
     }
 
@@ -221,6 +222,12 @@ def _customer_price_summary(
     equals ``customer_price_required`` — a snapshot member with no DETAIL
     stage row yet (snapshot landed, the tick has not claimed its detail work)
     is pending exactly like ``_stage_status`` counts it, never invisible.
+
+    ``customer_price_success_blockers`` counts business-blocking rows whose
+    stage state is SUCCESS (INVALID / MISSING_PROVEN, plus legacy FAILED and
+    defensively MISSING).  Together with ``detail.terminal`` it is the exact
+    set finalize treats as actionable blockers, and the two sets are disjoint
+    by stage state, so adding both never double-counts.
     """
     summary = {
         "ready": 0,
@@ -230,6 +237,7 @@ def _customer_price_summary(
         "failed": 0,
         "invalid": 0,
         "absent_proven": 0,
+        "success_blockers": 0,
     }
     rows = connection.execute(
         """SELECT w.state, w.result_json, w.error_text
@@ -246,7 +254,8 @@ def _customer_price_summary(
         except (TypeError, ValueError, json.JSONDecodeError):
             decoded = None
         result = decoded if isinstance(decoded, dict) else None
-        state = customer_price_business_state(row["state"], result, row["error_text"])
+        stage_state = str(row["state"])
+        state = customer_price_business_state(stage_state, result, row["error_text"])
         if state.key == "READY":
             summary["ready"] += 1
         elif state.key == "PENDING":
@@ -261,6 +270,11 @@ def _customer_price_summary(
             summary["failed"] += 1
         elif state.key == "INVALID":
             summary["invalid"] += 1
+        if (
+            stage_state == "SUCCESS"
+            and state.key in {"MISSING", "MISSING_PROVEN", "FAILED", "INVALID"}
+        ):
+            summary["success_blockers"] += 1
     required = max(0, int(expected))
     # Snapshot members without a stage row classify as PENDING (semantics rule
     # "(no stage row)"), mirroring the max(0, expected - represented) term the
@@ -275,6 +289,7 @@ def _customer_price_summary(
         "customer_price_failed": summary["failed"],
         "customer_price_invalid": summary["invalid"],
         "customer_price_absent_proven": summary["absent_proven"],
+        "customer_price_success_blockers": summary["success_blockers"],
         "customer_price_ratio": round(summary["ready"] / required, 2) if required else 0,
     }
 
@@ -341,6 +356,13 @@ def collect_runtime_status(
             (run_id,),
         ).fetchone()
         latest_id = int(latest["id"]) if latest else None
+        # Frozen-authoritative scope: once the run is frozen, the
+        # detail/model/customer-price statistics must describe exactly the
+        # frozen snapshot (the one finalize will materialize), never a later
+        # observation; without a freeze this is simply the latest snapshot.
+        target_snapshot_id = (
+            int(run["frozen_snapshot_id"]) if run["frozen_snapshot_id"] is not None else latest_id
+        )
         membership: dict[str, int] = {}
         unique_items = 0
         detail = _empty_stage()
@@ -355,12 +377,12 @@ def collect_runtime_status(
             unique_items = int(
                 connection.execute(
                     "SELECT COUNT(DISTINCT audit_item_id) FROM snapshot_members WHERE snapshot_id=?",
-                    (latest_id,),
+                    (target_snapshot_id,),
                 ).fetchone()[0]
             )
-            detail = _stage_status(connection, latest_id, "DETAIL", unique_items)
-            detail.update(_customer_price_summary(connection, latest_id, unique_items))
-            model = _stage_status(connection, latest_id, "MODEL", unique_items)
+            detail = _stage_status(connection, target_snapshot_id, "DETAIL", unique_items)
+            detail.update(_customer_price_summary(connection, target_snapshot_id, unique_items))
+            model = _stage_status(connection, target_snapshot_id, "MODEL", unique_items)
 
         crawl_states = _group_counts(
             connection.execute(
@@ -392,7 +414,6 @@ def collect_runtime_status(
                 crawl_pending_breakdown["blocked_manual"] += count
             else:
                 crawl_pending_breakdown["unclassified"] += count
-        target_snapshot_id = int(run["frozen_snapshot_id"]) if run["frozen_snapshot_id"] is not None else latest_id
         crawl_unplanned = 0
         if target_snapshot_id is not None:
             crawl_keys = {
@@ -502,6 +523,13 @@ def collect_runtime_status(
         + crawl["planning_pending"] + crawl["unknown"] + crawl["manual"]
         + remote["intent"] + remote["pending"] + remote["running"]
         + remote["exported"] + remote["unknown"] + remote["manual"]
+        # SUCCESS-stage customer-price blockers (INVALID/MISSING_PROVEN/legacy
+        # FAILED) sit on rows with detail.terminal==0, so the terminal term
+        # does not carry them; this additive key completes the finalize
+        # blocker view.  No double-count: TERMINAL-stage blockers are covered
+        # by detail["terminal"], SUCCESS-stage ones by this key — the two sets
+        # are disjoint by stage state.
+        + detail.get("customer_price_success_blockers", 0)
     )
     # This is a live operational value.  A normal tick used to persist zero in
     # metrics, which could hide unfinished work from status until finalize.

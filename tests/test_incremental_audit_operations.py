@@ -71,7 +71,15 @@ def _dependencies() -> TickDependencies:
             customer_fingerprints=["customer-v1"],
             evidence={"saas_count": 1, "customer_count": 1},
         ),
-        detail=lambda _row, _timeout: {"customerPrice": "10"},
+        # Round-3 contract: healthy detail evidence is READY (positive price
+        # AND a FOUND-family status); a bare price alone is INVALID and blocks.
+        detail=lambda _row, _timeout: {
+            "customerPrice": "10",
+            "customerPriceStatus": "FOUND",
+            "customerPriceSource": "DETAIL_REFERENCE_INFOS",
+            "customerPriceWarning": "",
+            "customerPriceEvidence": "参考价1=10",
+        },
         model=lambda _row, _timeout: {
             "match_result": "SAME",
             "confidence": 1,

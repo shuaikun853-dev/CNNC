@@ -790,6 +790,17 @@ def test_final_text_surfaces_customer_price_exhausted_blocker():
     assert "2 条客户价获取失败(重试耗尽)" in out["final_text"]
 
 
+def test_final_text_surfaces_customer_price_invalid_only_blocker():
+    """INVALID-only 天不得显示"全部阻塞已清零":证据无效(价格与状态矛盾)
+    同样阻塞最终出表,必须逐条出现。"""
+    s = _cleared()
+    s["final"] = {**_cleared()["final"],
+                  "blocker_summary": {"customer_price_invalid": 3}}
+    out = compute_overall_status(s)
+    assert "3 条客户价证据无效(价格与状态矛盾)" in out["final_text"]
+    assert "全部阻塞已清零" not in out["final_text"]
+
+
 def test_build_summary_customer_price_block_and_fingerprint_reacts(tmp_path, monkeypatch):
     """summary 携带客户价轻量汇总(counts+ratio,无行级数据);ETag 指纹随其变化。"""
     from app.services import dashboard_projection as dp

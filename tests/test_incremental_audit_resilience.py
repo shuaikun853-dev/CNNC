@@ -76,7 +76,12 @@ def _dependencies(
             },
         ),
         harvest=lambda _jobs, _timeout: {},
-        detail=detail or (lambda _row_value, _timeout: {"customerPrice": "10"}),
+        # Round-3 contract: healthy detail evidence is READY (price + FOUND).
+        detail=detail or (lambda _row_value, _timeout: {
+            "customerPrice": "10", "customerPriceStatus": "FOUND",
+            "customerPriceSource": "DETAIL_REFERENCE_INFOS", "customerPriceWarning": "",
+            "customerPriceEvidence": "参考价1=10",
+        }),
         model_batch=model_batch or (
             lambda batch, _timeout: {
                 index: {"match_result": "SAME"}
@@ -134,7 +139,11 @@ def _run_blocking_detail_tick(
         release.wait(120)
         with active.get_lock():
             active.value -= 1
-        return {"customerPrice": "10"}
+        return {
+            "customerPrice": "10", "customerPriceStatus": "FOUND",
+            "customerPriceSource": "DETAIL_REFERENCE_INFOS", "customerPriceWarning": "",
+            "customerPriceEvidence": "参考价1=10",
+        }
 
     summary = run_incremental_tick(
         DailyAuditStore(state_path),

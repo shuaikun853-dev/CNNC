@@ -66,7 +66,12 @@ def _dependencies(events: list[str]) -> TickDependencies:
 
     return TickDependencies(
         discover=discover,
-        detail=lambda row, timeout: {"customerPrice": "10"},
+        # Round-3 contract: healthy detail evidence is READY (price + FOUND).
+        detail=lambda row, timeout: {
+            "customerPrice": "10", "customerPriceStatus": "FOUND",
+            "customerPriceSource": "DETAIL_REFERENCE_INFOS", "customerPriceWarning": "",
+            "customerPriceEvidence": "参考价1=10",
+        },
         model=lambda row, timeout: {"match_result": "SAME", "confidence": 1, "model_match": "exact", "spec_match": True},
         wall_clock=lambda: datetime(2026, 8, 11, 10, 2, tzinfo=UTC),
     )

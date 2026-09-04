@@ -218,6 +218,7 @@ def _final_text(s: Mapping, closeout_running: bool = False) -> tuple[str, str]:
                ("model_pending", "条模型处理未完成"), ("model_terminal", "条模型终态失败"),
                ("detail_terminal", "条客户价获取失败(重试耗尽)"),
                ("customer_price_absent_proven", "条客户价确定性缺失(上游无此单据)"),
+               ("customer_price_invalid", "条客户价证据无效(价格与状态矛盾)"),
                ("detail_pending", "条 Detail 未完成"), ("crawl_pending", "条采集未完成"),
                ("crawl_unplanned", "条必爬行未规划"), ("crawl_planning_pending", "条必爬行待规划"),
                ("crawl_unknown", "条采集提交待确认"), ("crawl_manual", "条采集需人工")]

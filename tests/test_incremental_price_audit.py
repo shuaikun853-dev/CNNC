@@ -26,6 +26,7 @@ from app.workflows.incremental_price_audit import (
     TickBudget,
     TickConfig,
     TickDependencies,
+    _backlog,
     _safe_error,
     _harvest,
     run_existing_remote_drain,
@@ -90,7 +91,10 @@ def _deps(events, rows, clock, *, post_raises=False):
 
     def detail(row, timeout):
         events.append(f"detail:{row['vCommodityId']}")
-        return {"customerPrice": "10"}
+        # Round-3 contract: a healthy detail callback yields READY evidence
+        # (positive price AND a FOUND-family status).  A bare price with no
+        # status is contradictory evidence (INVALID) and blocks the tick.
+        return dict(FOUND_PAYLOAD)
 
     def model(row, timeout):
         events.append(f"model:{row['vCommodityId']}")
@@ -3002,3 +3006,170 @@ def test_finalized_run_tick_neither_requeues_nor_touches_durable_state(tmp_path)
     run_after = store.get_run("2026-08-11")
     assert run_after["final_output_path"] == run_before["final_output_path"] == str(final_output.resolve())
     assert run_after["state"] == "FINALIZED"
+
+
+# ---- Round 3 final-state consistency (tick/backlog/outcome/metric) --------
+
+
+def _seed_terminal_detail(store, item_id, *, error="permanent detail failure"):
+    """Checkpoint one DETAIL row as TERMINAL_FAILED (retry budget exhausted)."""
+    token = store.acquire_lease("2026-08-11", "seed-terminal-detail", 60)
+    try:
+        work = store.ensure_stage_work(token, item_id, "DETAIL", f"manual-{item_id}")
+        claimed = store.claim_stage_work(token, work["id"], max_attempts=1, max_elapsed_seconds=300)
+        assert claimed is not None
+        return store.fail_stage_work(
+            token, work["id"], elapsed_seconds=0.1, error=error, retryable=False,
+            max_attempts=1, max_elapsed_seconds=300,
+        )
+    finally:
+        store.release_lease(token)
+
+
+def test_empty_authoritative_snapshot_clears_dropped_detail_blockers(tmp_path):
+    """Snapshot A held row A (DETAIL terminal), snapshot B is the current
+    authoritative snapshot with zero rows: the DETAIL backlog — technical and
+    customer-price alike — must be scoped to nothing (final-state language:
+    nothing blocks the final sheet), while a caller without an authoritative
+    snapshot (drain/harvest) still sees the whole-run view."""
+    store = DailyAuditStore(tmp_path / "state.sqlite")
+    store.ensure_run("2026-08-11")
+    seed = store.acquire_lease("2026-08-11", "seed-empty-snapshot", 60)
+    snapshot_a = _ingest(store, seed, [_quiet_row("doc-a", "sku-a")], "2026-08-11T09:00:00+00:00")
+    item_a = _item_id_by_v(store, snapshot_a["id"], "doc-a")
+    store.release_lease(seed)
+    _seed_terminal_detail(store, item_a)
+
+    clock = Clock()
+    summary = run_incremental_tick(
+        store,
+        ProcessLock(tmp_path / "tick.lock"),
+        _config(clock),
+        _quiet_deps([]),
+    )
+
+    # Snapshot B (0 rows) is the authoritative scope: the dropped row A must
+    # not pollute any DETAIL backlog bucket.
+    assert summary.backlog["detail_terminal"] == 0
+    assert summary.backlog["customer_price_missing"] == 0
+    assert summary.backlog["customer_price_failed"] == 0
+    assert summary.backlog["customer_price_invalid"] == 0
+    assert summary.backlog["customer_price_absent_proven"] == 0
+    assert summary.backlog["customer_price_success_blockers"] == 0
+    assert summary.backlog["stage_pending"] == 0
+    assert summary.outcome == "COMPLETED"
+
+    # Whole-run fallback: a caller without an authoritative snapshot
+    # (drain/harvest paths call _backlog without items) still counts row A.
+    token = store.acquire_lease("2026-08-11", "inspect-backlog", 30)
+    try:
+        whole_run = _backlog(store, token)
+    finally:
+        store.release_lease(token)
+    assert whole_run["detail_terminal"] == 1
+    assert whole_run["customer_price_failed"] == 1
+
+
+ABSENT_PROVEN_PAYLOAD = {
+    "customerPrice": None,
+    "customerPriceStatus": "LOOKUP_FAILED",
+    "customerPriceSource": "",
+    "customerPriceWarning": "上游查询失败",
+    "customerPriceEvidence": "",
+}
+
+CONTRADICTORY_PRICE_PAYLOAD = {
+    "customerPrice": "100",
+    "customerPriceStatus": "NOT_FOUND",
+    "customerPriceSource": "",
+    "customerPriceWarning": "详情接口未返回有效参考价",
+    "customerPriceEvidence": "",
+}
+
+
+def test_success_absent_proven_detail_blocks_tick_as_manual_review(tmp_path):
+    """SUCCESS + proven-absent status: the row is not terminal and not
+    retrying, but finalize would refuse it — the tick must end in
+    MANUAL_REVIEW_REQUIRED, never COMPLETED."""
+    store = DailyAuditStore(tmp_path / "state.sqlite")
+    clock = Clock()
+    deps = _quiet_deps([_quiet_row("doc-1", "sku-1")])
+    deps.detail = lambda _row, _timeout: dict(ABSENT_PROVEN_PAYLOAD)
+
+    summary = run_incremental_tick(store, ProcessLock(tmp_path / "tick.lock"), _config(clock), deps)
+
+    assert summary.backlog["customer_price_absent_proven"] == 1
+    assert summary.backlog["customer_price_success_blockers"] == 1
+    assert summary.backlog["detail_terminal"] == 0
+    assert summary.outcome == "MANUAL_REVIEW_REQUIRED"
+
+
+def test_success_contradictory_price_detail_blocks_tick_as_manual_review(tmp_path):
+    """SUCCESS + positive price + NOT_FOUND status: contradictory evidence is
+    INVALID and blocks — the tick must not report COMPLETED."""
+    store = DailyAuditStore(tmp_path / "state.sqlite")
+    clock = Clock()
+    deps = _quiet_deps([_quiet_row("doc-1", "sku-1")])
+    deps.detail = lambda _row, _timeout: dict(CONTRADICTORY_PRICE_PAYLOAD)
+
+    summary = run_incremental_tick(store, ProcessLock(tmp_path / "tick.lock"), _config(clock), deps)
+
+    assert summary.backlog["customer_price_invalid"] == 1
+    assert summary.backlog["customer_price_success_blockers"] == 1
+    assert summary.outcome == "MANUAL_REVIEW_REQUIRED"
+    assert summary.outcome != "COMPLETED"
+
+
+def test_retryable_detail_failure_stays_pending_retry_not_manual(tmp_path):
+    """RETRYING must not be escalated to manual review: it is ordinary retry
+    backlog and surfaces as PENDING_RETRY."""
+    store = DailyAuditStore(tmp_path / "state.sqlite")
+    clock = Clock()
+    deps = _quiet_deps([_quiet_row("doc-1", "sku-1")])
+    deps.detail = lambda _row, _timeout: (_ for _ in ()).throw(ValueError("transient detail failure"))
+
+    summary = run_incremental_tick(store, ProcessLock(tmp_path / "tick.lock"), _config(clock), deps)
+
+    assert summary.outcome == "PENDING_RETRY"
+    assert summary.backlog["stage_pending"] == 1
+    assert summary.backlog["customer_price_missing"] == 0
+    assert summary.backlog["customer_price_failed"] == 0
+    assert summary.backlog["customer_price_invalid"] == 0
+    assert summary.backlog["customer_price_absent_proven"] == 0
+
+
+def test_found_price_completes_without_customer_price_blockers(tmp_path):
+    store = DailyAuditStore(tmp_path / "state.sqlite")
+    clock = Clock()
+    deps = _quiet_deps([_quiet_row("doc-1", "sku-1")])
+
+    summary = run_incremental_tick(store, ProcessLock(tmp_path / "tick.lock"), _config(clock), deps)
+
+    assert summary.outcome == "COMPLETED"
+    assert summary.backlog["customer_price_missing"] == 0
+    assert summary.backlog["customer_price_failed"] == 0
+    assert summary.backlog["customer_price_invalid"] == 0
+    assert summary.backlog["customer_price_absent_proven"] == 0
+    assert summary.backlog["customer_price_success_blockers"] == 0
+
+
+def test_final_pending_metric_matches_status_computed_pending(tmp_path):
+    """The persisted final_pending metric and the status projection must speak
+    the same language: one SUCCESS-stage absent-proven blocker is exactly one
+    unit of final pending in both views."""
+    from app.services.incremental_audit_runtime import runtime_paths
+    from app.services.incremental_audit_status import collect_runtime_status
+
+    root = tmp_path / "runtime"
+    store = DailyAuditStore(runtime_paths("2026-08-11", root).state_path)
+    clock = Clock()
+    deps = _quiet_deps([_quiet_row("doc-1", "sku-1")])
+    deps.detail = lambda _row, _timeout: dict(ABSENT_PROVEN_PAYLOAD)
+
+    summary = run_incremental_tick(store, ProcessLock(tmp_path / "tick.lock"), _config(clock), deps)
+
+    status = collect_runtime_status(business_date="2026-08-11", runtime_root=root)
+    assert summary.outcome == "MANUAL_REVIEW_REQUIRED"
+    assert status["metrics"]["final_pending"] == 1
+    assert status["final"]["computed_pending"] == 1
+    assert status["final"]["computed_pending"] == status["metrics"]["final_pending"]

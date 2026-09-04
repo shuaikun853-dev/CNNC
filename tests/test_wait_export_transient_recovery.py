@@ -390,7 +390,11 @@ def _tick_with_bridge(store, tmp_path, seed, tick_index: int):
     )
     deps = TickDependencies(
         discover=lambda _timeout: pytest.fail("frozen run must not discover"),
-        detail=lambda _row, _timeout: {"customerPrice": "10"},
+        detail=lambda _row, _timeout: {
+            "customerPrice": "10", "customerPriceStatus": "FOUND",
+            "customerPriceSource": "DETAIL_REFERENCE_INFOS", "customerPriceWarning": "",
+            "customerPriceEvidence": "参考价1=10",
+        },
         model=lambda _row, _timeout: {"match_result": "SAME"},
         harvest=harvest,
         submit_crawl=lambda *_args: pytest.fail(

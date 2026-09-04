@@ -81,7 +81,12 @@ def _deps(wall: WallClock, rows):
         )
 
     def detail(_row, _timeout):
-        return {"customerPrice": "10"}
+        # Round-3 contract: healthy detail evidence is READY (price + FOUND).
+        return {
+            "customerPrice": "10", "customerPriceStatus": "FOUND",
+            "customerPriceSource": "DETAIL_REFERENCE_INFOS", "customerPriceWarning": "",
+            "customerPriceEvidence": "参考价1=10",
+        }
 
     return TickDependencies(
         discover=discover,

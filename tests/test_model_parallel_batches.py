@@ -94,7 +94,12 @@ def _deps_with_tracker(tracker: InflightTracker, latency: float = BATCH_LATENCY_
     return TickDependencies(
         discover=discover,
         harvest=lambda jobs, timeout: {},
-        detail=lambda row, timeout: {"customerPrice": "10"},
+        # Round-3 contract: healthy detail evidence is READY (price + FOUND).
+        detail=lambda row, timeout: {
+            "customerPrice": "10", "customerPriceStatus": "FOUND",
+            "customerPriceSource": "DETAIL_REFERENCE_INFOS", "customerPriceWarning": "",
+            "customerPriceEvidence": "参考价1=10",
+        },
         model_batch=model_batch,
         plan_crawl=None,
         submit_crawl=None,
@@ -297,7 +302,11 @@ def test_budget_exhaustion_stops_dispatch_and_recovers_threads(tmp_path):
             evidence={"saas_count": len(rows), "customer_count": len(rows)},
         ),
         harvest=lambda jobs, timeout: {},
-        detail=lambda row, timeout: (clock.advance(0.05) or {"customerPrice": "10"}),
+        detail=lambda row, timeout: (clock.advance(0.05) or {
+            "customerPrice": "10", "customerPriceStatus": "FOUND",
+            "customerPriceSource": "DETAIL_REFERENCE_INFOS", "customerPriceWarning": "",
+            "customerPriceEvidence": "参考价1=10",
+        }),
         model_batch=model_batch,
         monotonic=clock.monotonic,
         wall_clock=lambda: datetime(2026, 8, 11, 10, 2, tzinfo=UTC),
