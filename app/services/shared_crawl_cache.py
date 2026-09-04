@@ -17,11 +17,13 @@ Data-layer contract (no producer, scheduler, or business flow is wired here):
 - Placeholder codes (``zhpq-*`` by default) and ``crawl_id`` echoes are
   rejected as ``real_sku_id`` even when the caller claims ``CONFIRMED``.
 - A ``(mall, url)`` alias permanently belongs to one identity.  Each record
-  collects identity evidence from its whole URL chain: zero known identities
-  creates a fresh one, exactly one merges the chain into it (a dirty URL
-  follows its known returned/canonical URL), and two or more distinct
-  identities raise :class:`AliasConflictError` before any write and roll the
-  whole transaction back (fail-closed; existing groups are never merged).
+  parses every URL of its chain separately: a chain whose URLs disagree on
+  the parsed product identity raises :class:`AliasConflictError` before any
+  write.  Otherwise identity evidence (chain alias ownership plus the parsed
+  identity row) decides: zero creates a fresh identity, exactly one merges
+  the chain into it - promoting a NULL ``product_identity`` to the parsed
+  value when safe - and two or more raise :class:`AliasConflictError`
+  (fail-closed; existing groups are never merged).
 
 Connection handling mirrors ``app/services/daily_audit_store.py``: connections
 are never cached, ``PRAGMA foreign_keys=ON`` / ``busy_timeout=5000`` / WAL,
@@ -225,7 +227,12 @@ class SharedCrawlCache:
     # ---- identity resolution ---------------------------------------------------
 
     def _parsed_identity(self, mall: str, candidates: Sequence[str | None]) -> str | None:
-        """First parser hit over the ordered URL candidates, or None (conservative MISS)."""
+        """First parser hit over the ordered URL candidates, or None (conservative MISS).
+
+        Single-URL / read-path helper (e.g. ``_resolve_identity_id``); the
+        write path must use :meth:`_parsed_identity_set` so a contradictory
+        chain cannot hide behind its first hit.
+        """
         parser = self._url_parsers.get(mall)
         if parser is None:
             return None
@@ -243,6 +250,31 @@ class SharedCrawlCache:
                 return identity
         return None
 
+    def _parsed_identity_set(self, mall: str, urls: Sequence[str | None]) -> set[str]:
+        """All distinct non-None parser identities across the chain's URLs.
+
+        Every URL is parsed separately so two URLs in one chain that disagree
+        on the product identity are visible as a set of size two (Rule A),
+        instead of being masked by the first hit.
+        """
+        parser = self._url_parsers.get(mall)
+        if parser is None:
+            return set()
+        parsed: set[str] = set()
+        for url in urls:
+            if not url:
+                continue
+            try:
+                identity = parser(url)
+            except Exception:  # noqa: BLE001 - conservative MISS on parser failure
+                identity = None
+            if identity is None:
+                continue
+            value = str(identity).strip()
+            if value:
+                parsed.add(value)
+        return parsed
+
     def _resolve_or_create_identity(
         self,
         connection: sqlite3.Connection,
@@ -253,23 +285,41 @@ class SharedCrawlCache:
         returned: str | None,
         canonical: str | None,
     ) -> int:
-        """Collect identity evidence for the whole URL chain, then decide.
+        """Parse every chain URL separately, collect evidence, then decide.
 
-        Evidence is the set of distinct existing identity ids reachable from
-        (a) the ``(mall, url)`` alias rows of every chain URL
-        (original/submitted/returned/canonical) and (b) the parsed
-        ``(mall, product_identity)`` row when the mall parser hits.  Decision:
-        zero evidence creates a fresh identity; exactly one reuses it (the
-        chain's new URLs then register as its aliases, so a dirty submitted
-        URL merges into its known returned/canonical identity); two or more
-        distinct identities raise :class:`AliasConflictError` before any
-        INSERT - existing identity groups are never merged automatically.
+        ``parsed_product_identities`` is the deduplicated set of parser
+        results over all chain URLs (original/submitted/returned/canonical).
+
+        - Rule A (|parsed| >= 2): the chain is self-contradictory;
+          :class:`AliasConflictError` before any write, even when neither
+          parsed identity exists yet.
+        - Rule B (|parsed| == 1, value P): evidence is the set of existing
+          identity ids reachable from the chain URLs' ``(mall, url)`` alias
+          rows plus the ``(mall, product_identity=P)`` identity row.  Zero
+          evidence creates a fresh identity carrying P; exactly one reuses it
+          and promotes a NULL ``product_identity`` to P inside this
+          transaction (the partial unique index
+          ``ux_crawl_identities_mall_product`` is the concurrency backstop; an
+          ``IntegrityError`` surfaces as :class:`AliasConflictError`); an
+          identity already carrying a different parsed value, or two or more
+          evidence identities, raise :class:`AliasConflictError` - existing
+          identity groups are never merged automatically.
+        - Rule C (|parsed| == 0): alias evidence only; zero creates a NULL
+          identity, one reuses it (a dirty URL follows its known
+          returned/canonical URL), two or more conflict.
         """
-        product_identity = self._parsed_identity(
-            mall, (returned, canonical, submitted, original)
-        )
+        chain_urls = (original, submitted, returned, canonical)
+        parsed_product_identities = self._parsed_identity_set(mall, chain_urls)
+        if len(parsed_product_identities) > 1:
+            # Rule A: the chain contradicts itself - fail before any write.
+            raise AliasConflictError(
+                f"URL chain for mall={mall} parses to multiple product identities "
+                f"{sorted(parsed_product_identities)}; refusing to merge"
+            )
+        product_identity = next(iter(parsed_product_identities), None)
+
         evidence: list[int] = []
-        for candidate in (original, submitted, returned, canonical):
+        for candidate in chain_urls:
             if candidate is None:
                 continue
             alias = connection.execute(
@@ -291,12 +341,36 @@ class SharedCrawlCache:
                 f"{sorted(evidence)}; refusing to merge"
             )
         if evidence:
-            return evidence[0]
-        cursor = connection.execute(
-            "INSERT INTO crawl_identities(mall, product_identity, created_at) VALUES (?, ?, ?)",
-            (mall, product_identity, self._utcnow()),
-        )
-        return int(cursor.lastrowid)
+            identity_id = evidence[0]
+        else:
+            cursor = connection.execute(
+                "INSERT INTO crawl_identities(mall, product_identity, created_at) VALUES (?, ?, ?)",
+                (mall, product_identity, self._utcnow()),
+            )
+            identity_id = int(cursor.lastrowid)
+        if product_identity is not None:
+            row = connection.execute(
+                "SELECT product_identity FROM crawl_identities WHERE id=?", (identity_id,)
+            ).fetchone()
+            current_value = None if row is None else row["product_identity"]
+            if current_value is None:
+                try:
+                    connection.execute(
+                        "UPDATE crawl_identities SET product_identity=? WHERE id=?",
+                        (product_identity, identity_id),
+                    )
+                except sqlite3.IntegrityError as exc:
+                    raise AliasConflictError(
+                        f"identity {identity_id} cannot be promoted to "
+                        f"product_identity {product_identity!r}: "
+                        "already taken by another identity"
+                    ) from exc
+            elif current_value != product_identity:
+                raise AliasConflictError(
+                    f"identity {identity_id} already carries product_identity "
+                    f"{current_value!r}, not {product_identity!r}"
+                )
+        return identity_id
 
     def _resolve_identity_id(
         self, connection: sqlite3.Connection, mall: str, url: str

@@ -56,16 +56,22 @@ crawl_id,一律 `ValueError` 拒绝落库——即使调用方声称 CONFIRMED�
 行才接管(微秒即分出先后,id 仅在完全相等时 tie-break),乱序迟到的历史不夺
 current。
 
-## alias fail-closed 冲突策略(证据收集决策表)
+## alias fail-closed 冲突策略(Rule A/B/C 证据决策表)
 
-写入时对整条 URL 链路(original/submitted/returned/canonical)收集已有
-identity 证据:各 URL 在 `crawl_urls` 的 `(mall, url)` 归属,加上 parser 命中的
-`(mall, product_identity)` 行。决策表:
-- 证据 0 个 → 新建 identity(parser 命中则带 product_identity,否则 NULL);
-- 证据 1 个 → 复用该 identity,链路中的新 URL 随后注册为它的 alias
-  (脏 submitted URL 经已知 returned/canonical 归并进既有身份);
-- 证据 ≥2 个不同 identity → `AliasConflictError`,在任何 INSERT 之前判定、
-  整事务回滚、零残留;绝不自动合并两个已存在的身份组(fail-closed)。
+写入时对链路去重后的四个 URL(original/submitted/returned/canonical)**分别**
+执行 mall parser,收集非空解析结果的去重集合 `parsed_product_identities`;
+再收集已有 identity 证据(各 URL 在 `crawl_urls` 的 `(mall, url)` 归属 ∪
+`(mall, product_identity)` 既有行):
+
+- **Rule A**(|parsed| ≥ 2):链路自相矛盾,在任何写入前抛
+  `AliasConflictError`——即使这些 identity 库里从未出现过。
+- **Rule B**(|parsed| = 1,记 P):按证据集合决策——0 个 → 新建携带 P 的
+  identity;恰 1 个 → 复用,且该 identity 自身 product_identity 为 NULL 时
+  在本事务内安全 UPDATE 为 P(唯一索引 `ux_crawl_identities_mall_product`
+  是并发后盾,IntegrityError 以 AliasConflictError 语义上抛),已携带其他值
+  或证据 ≥2 个不同 identity → `AliasConflictError`,绝不合并/覆写已有组;
+- **Rule C**(|parsed| = 0):仅 alias 证据——0 个 → 新建 NULL identity,
+  1 个 → 复用(脏 submitted URL 经已知 returned/canonical 归并),≥2 → 冲突。
 
 `(mall, url)` 仍永久归属唯一 identity(`UNIQUE(mall, url)`);
 `document_references` 的 UNIQUE 冲突同理:identity 相同幂等,不同则冲突。
