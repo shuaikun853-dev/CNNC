@@ -33,6 +33,7 @@ from app.services.dashboard_projection import (
     project_customer_price,
 )
 from app.services.incremental_audit_runtime import runtime_paths
+from app.services.production_identity import get_production_identity_service
 from app.services.saas_flow_diagnostic import get_saas_flow_diagnostic
 
 router = APIRouter(prefix="/dashboard", tags=["step1-dashboard"])
@@ -475,6 +476,40 @@ def dashboard_cnnc_auth_login(request: Request) -> JSONResponse:
         {"started": True,
          "note": "登录浏览器已启动；完成滑块/短信后系统将自动续签并恢复（无需其他操作）"},
         status_code=202, headers=_NO_STORE)
+
+
+# ======================================================================
+# 生产运行版本(Production Deployment Identity):只读部署身份投影
+# ======================================================================
+
+@router.get("/api/production-identity")
+def dashboard_production_identity(request: Request) -> JSONResponse:
+    """生产运行版本只读投影:进程启动身份/本地 git/GitHub 生产分支 HEAD/
+    计划任务注册状态四路证据 + comparison 结论。
+
+    纯 GET 只读;不接受任何查询参数;service.snapshot() 契约永不抛,
+    此处仍兜底 503(不暴露堆栈)。绝不触发任何 git/调度器/网络写操作。
+    """
+    if request.query_params:
+        unknown = sorted(request.query_params.keys())
+        raise HTTPException(status_code=400, detail={
+            "error_code": "UNKNOWN_QUERY_PARAM",
+            "message": "不支持的查询参数:" + ",".join(unknown)
+                       + ";本接口不接受任何查询参数"})
+    try:
+        payload = get_production_identity_service().snapshot()
+    except Exception as exc:  # 契约兜底:snapshot 永不抛,仍防御 503
+        raise HTTPException(status_code=503, detail={
+            "error_code": "PRODUCTION_IDENTITY_READ_FAILED",
+            "message": "生产运行版本读取失败,请稍后重试",
+            "type": type(exc).__name__}) from exc
+    return JSONResponse(payload, headers=_NO_STORE)
+
+
+# 进程启动即捕获 startup 身份:uvicorn 导入 app.main 的此刻创建单例。
+# 若懒创建到首次请求才初始化,startup SHA 会捕获于首访时刻而非进程启动,
+# 从而掩盖“代码已更新但进程没重启”(git pull 后未重启的真实场景)。
+get_production_identity_service()
 
 
 @router.get("/api/actions")

@@ -177,3 +177,7 @@ td.mono{max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowra
 .cp-table .cp-title{max-width:180px}
 .cp-table .cp-err{max-width:160px;color:var(--muted);font-size:11.5px}
 .cp-meta{font-size:11.5px;color:var(--faint);margin-top:6px}
+/* 生产运行版本(2026-09-04):折叠卡复用 details.saasflow 结构,配色走既有语义 token */
+.pi-status{display:grid;gap:2px;margin:2px 0 6px;font-size:12.5px;overflow-wrap:anywhere}
+.pi-status div{min-width:0}
+#prod-identity .kv span{overflow-wrap:anywhere;word-break:break-word;min-width:0}
