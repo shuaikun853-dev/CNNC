@@ -62,6 +62,18 @@ def _table_row_count(cache: SharedCrawlCache, table: str) -> int:
         connection.close()
 
 
+def _identity_product_identity(cache: SharedCrawlCache, identity_id: int) -> str | None:
+    """Direct sqlite3 read of one crawl_identities.product_identity."""
+    connection = sqlite3.connect(str(cache.path))
+    try:
+        row = connection.execute(
+            "SELECT product_identity FROM crawl_identities WHERE id=?", (identity_id,)
+        ).fetchone()
+        return None if row is None else row[0]
+    finally:
+        connection.close()
+
+
 # ---- URL identity module (Level 3 parser) -----------------------------------
 
 
@@ -389,6 +401,128 @@ def test_case10a_dirty_url_merges_into_known_returned_identity(cache):
     assert hit_c["history_count"] == 2
     assert hit_c["entry"]["price"] == "second"
     assert hit_c["entry"]["is_current"] is True
+
+
+# ---- Round 3: parser evidence set (whole-chain parsing, NULL promotion) ------
+
+
+def test_case_r3_1_known_product_not_polluted_by_returned_conflict(cache):
+    url_111 = "https://ofs.cn/product-111.html"
+    url_222 = "https://ofs.cn/product-222.html"
+    first = cache.record_success(mall="ofs", submitted_url=url_111, source="unit-test")
+    with pytest.raises(AliasConflictError):
+        cache.record_success(
+            mall="ofs",
+            submitted_url=url_111,
+            original_url=url_111,
+            returned_url=url_222,
+            source="unit-test",
+        )
+    # The chain itself parses to two product identities: fail-closed with no
+    # residue, and the known 111 identity stays untouched.
+    assert _table_row_count(cache, "crawl_urls") == 1
+    assert _table_row_count(cache, "crawl_results") == 1
+    connection = sqlite3.connect(str(cache.path))
+    try:
+        row_222 = connection.execute(
+            "SELECT COUNT(*) FROM crawl_urls WHERE url=?", (url_222,)
+        ).fetchone()[0]
+    finally:
+        connection.close()
+    assert row_222 == 0
+    hit = cache.lookup_current("ofs", url_111)
+    assert hit is not None
+    assert hit["entry"]["id"] == first["id"]
+    assert hit["history_count"] == 1
+
+
+def test_case_r3_2_two_fresh_parser_identities_conflict(cache):
+    # Rule A: even when neither parsed identity exists yet, one chain whose
+    # URLs parse to two different product identities is self-contradictory.
+    with pytest.raises(AliasConflictError):
+        cache.record_success(
+            mall="ofs",
+            submitted_url="https://ofs.cn/product-111.html",
+            original_url="https://ofs.cn/product-111.html",
+            returned_url="https://ofs.cn/product-222.html",
+            source="unit-test",
+        )
+    assert _table_row_count(cache, "crawl_identities") == 0
+    assert _table_row_count(cache, "crawl_urls") == 0
+    assert _table_row_count(cache, "crawl_results") == 0
+
+
+def test_case_r3_3_null_identity_promotes_to_parsed_identity(cache):
+    dirty = "https://ofs.cn/detail?id=999"
+    product = "https://ofs.cn/product-999.html"
+    cache.record_success(mall="ofs", submitted_url=dirty, source="unit-test")
+    cache.record_success(
+        mall="ofs",
+        submitted_url=dirty,
+        returned_url=product,
+        price="second",
+        source="unit-test",
+    )
+    hit_dirty = cache.lookup_current("ofs", dirty)
+    assert hit_dirty is not None
+    identity_id = hit_dirty["identity_id"]
+    # The formerly NULL identity learned its parsed product identity.
+    assert _identity_product_identity(cache, identity_id) == "999"
+    assert hit_dirty["history_count"] == 2
+    hit_product = cache.lookup_current("ofs", product)
+    assert hit_product is not None
+    assert hit_product["identity_id"] == identity_id
+    # Level 3 now resolves unregistered aliases of the learned identity.
+    unregistered = "https://ofs.cn/foo/product-999.html"
+    hit_level3 = cache.lookup_current("ofs", unregistered)
+    assert hit_level3 is not None
+    assert hit_level3["match_level"] == "MALL_PARSER"
+    assert hit_level3["identity_id"] == identity_id
+
+
+def test_case_r3_4_promotion_blocked_when_identity_taken(cache):
+    dirty = "https://ofs.cn/detail?id=999"
+    product = "https://ofs.cn/product-999.html"
+    cache.record_success(mall="ofs", submitted_url=dirty, source="unit-test")
+    cache.record_success(mall="ofs", submitted_url=product, source="unit-test")
+    hit_dirty = cache.lookup_current("ofs", dirty)
+    hit_product = cache.lookup_current("ofs", product)
+    assert hit_dirty is not None
+    assert hit_product is not None
+    identity_null = hit_dirty["identity_id"]
+    identity_parsed = hit_product["identity_id"]
+    assert identity_null != identity_parsed
+    # The chain reaches both identities (dirty alias -> I1, parsed 999 -> I2):
+    # promotion must not merge or overwrite either side.
+    with pytest.raises(AliasConflictError):
+        cache.record_success(
+            mall="ofs",
+            submitted_url=dirty,
+            original_url=dirty,
+            returned_url=product,
+            source="unit-test",
+        )
+    assert _identity_product_identity(cache, identity_null) is None
+    assert _identity_product_identity(cache, identity_parsed) == "999"
+    assert _table_row_count(cache, "crawl_identities") == 2
+    assert _table_row_count(cache, "crawl_urls") == 2
+    assert _table_row_count(cache, "crawl_results") == 2
+
+
+def test_case_r3_5_same_parsed_identity_multiple_urls_ok(cache):
+    entry = cache.record_success(
+        mall="ofs",
+        submitted_url="https://ofs.cn/product-999.html",
+        original_url="https://ofs.cn/foo/product-999.html",
+        source="unit-test",
+    )
+    hit_original = cache.lookup_current("ofs", "https://ofs.cn/foo/product-999.html")
+    hit_submitted = cache.lookup_current("ofs", "https://ofs.cn/product-999.html")
+    assert hit_original is not None
+    assert hit_submitted is not None
+    assert hit_original["identity_id"] == entry["identity_id"]
+    assert hit_submitted["identity_id"] == entry["identity_id"]
+    assert hit_original["history_count"] == 1
 
 
 # ---- Behavioural hard rules --------------------------------------------------
