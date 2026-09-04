@@ -1,0 +1,127 @@
+{
+  "schema_version": 1,
+  "architecture_id": "cnnc-step1-incremental-daily",
+  "canonical_markdown": "docs/architecture/STEP_1_AGENT_ARCHITECTURE.md",
+  "source_baseline": {
+    "branch": "prod/closeout-20260818",
+    "commit": "077a5428c3a9d02c2e57fed4d12ffac498346482",
+    "created_date": "2026-09-04",
+    "drift_rule": "Current code plus current runbook override this contract; update the contract in the same change when semantics drift."
+  },
+  "scope": {
+    "tenant_id": 188605,
+    "commodity_pool_id": 222,
+    "scheduler_task": "CNNC-PriceAudit-Incremental",
+    "runtime_root": "runtime/incremental_price_audit",
+    "state_authority": "state.sqlite3"
+  },
+  "files": {
+    "scheduler": "scripts/run_incremental_price_audit_scheduled.ps1",
+    "cli": "scripts/incremental_price_audit.py",
+    "runtime": "app/services/incremental_audit_runtime.py",
+    "workflow": "app/workflows/incremental_price_audit.py",
+    "store": "app/services/daily_audit_store.py",
+    "closeout": "app/services/incremental_audit_closeout.py",
+    "finalize": "app/workflows/incremental_price_audit_finalize.py",
+    "materializer": "app/services/incremental_audit_materializer.py",
+    "dashboard_projection": "app/services/dashboard_projection.py",
+    "dashboard_actions": "app/services/dashboard_actions.py",
+    "dashboard_manual_ops": "app/services/dashboard_manual_ops.py"
+  },
+  "tick_phase_order": [
+    "single_writer_guard",
+    "recover",
+    "opening_harvest",
+    "discover",
+    "submit",
+    "detail",
+    "model",
+    "post_harvest",
+    "running_recovery",
+    "checkpoint"
+  ],
+  "nodes": [
+    {"id":"single_writer_guard","kind":"safety","state":["ProcessLock","daily_runs lease"]},
+    {"id":"recover","kind":"recovery","state":["stage_work","remote_jobs"]},
+    {"id":"opening_harvest","kind":"remote_reconcile","state":["remote_jobs","crawl_work"]},
+    {"id":"discover","kind":"source","external":["SaaS pending","CNNC customer"],"state":["snapshots","audit_items","snapshot_members"]},
+    {"id":"submit","kind":"remote_submit","external":["Zhaoshang"],"state":["crawl_work","remote_jobs"]},
+    {"id":"detail","kind":"stage","external":["CNNC detail/customer price"],"state":["stage_work:DETAIL"]},
+    {"id":"model","kind":"stage","external":["Title Match Model"],"state":["stage_work:MODEL"]},
+    {"id":"post_harvest","kind":"remote_reconcile","state":["remote_jobs","crawl_work"]},
+    {"id":"running_recovery","kind":"remote_recovery","state":["remote_jobs","crawl_work"]},
+    {"id":"checkpoint","kind":"summary","state":["daily_runs.metrics_json"]},
+    {"id":"freeze","kind":"gate","state":["snapshots","daily_runs.frozen_snapshot_id"]},
+    {"id":"readiness","kind":"gate","state":["stage_work","remote_jobs","crawl_work"]},
+    {"id":"materialize","kind":"publication","artifact":"saas_audit_final_YYYYMMDD.xlsx"},
+    {"id":"dashboard_read_model","kind":"projection","file":"app/services/dashboard_projection.py"},
+    {"id":"dashboard_command_plane","kind":"operator_command","actions":["closeout","re-export","rebuild"],"file":"app/services/dashboard_actions.py"},
+    {"id":"dashboard_manual_ops","kind":"operator_recovery","file":"app/services/dashboard_manual_ops.py"}
+  ],
+  "edges": [
+    {"from":"single_writer_guard","to":"recover"},
+    {"from":"recover","to":"opening_harvest"},
+    {"from":"opening_harvest","to":"discover"},
+    {"from":"discover","to":"submit","relation":"crawl planning from discovered row"},
+    {"from":"discover","to":"detail"},
+    {"from":"discover","to":"model"},
+    {"from":"submit","to":"post_harvest"},
+    {"from":"detail","to":"checkpoint"},
+    {"from":"model","to":"checkpoint"},
+    {"from":"post_harvest","to":"running_recovery"},
+    {"from":"running_recovery","to":"checkpoint"},
+    {"from":"checkpoint","to":"freeze","relation":"finalize-mode source stability gate"},
+    {"from":"freeze","to":"readiness"},
+    {"from":"readiness","to":"materialize","relation":"only when ordinary readiness passes"},
+    {"from":"dashboard_command_plane","to":"dashboard_manual_ops","relation":"reuse existing CLI/service protocols"}
+  ],
+  "forbidden_edges": [
+    {"from":"model","to":"submit","reason":"MODEL must not gate crawl eligibility."},
+    {"from":"detail","to":"submit","reason":"DETAIL must not gate crawl eligibility."},
+    {"from":"dashboard_read_model","to":"workflow","reason":"Projection must not become a second business state machine."}
+  ],
+  "state_store": {
+    "authority":"runtime/incremental_price_audit/<business_date>/state.sqlite3",
+    "convenience_projection":"daily_status.json",
+    "handoff":"BATCH_STATE.md",
+    "core_tables":["daily_runs","snapshots","audit_items","snapshot_members","stage_work","remote_jobs","crawl_work"],
+    "dashboard_rebuild_tables":["remote_job_replacements","remote_job_rebuild_actions"]
+  },
+  "freeze_contract": {
+    "complete_discovery_required": true,
+    "source_stability_seconds_default": 600,
+    "source_observation_interval_seconds_default": 300,
+    "stable_identity":["row_count","ordered_hash"],
+    "requires":"snapshot.row_count == saas_count",
+    "customer_count_is_equality_gate": false,
+    "after_freeze":["no source discovery","continue local and remote backlog","final output bound to frozen snapshot"]
+  },
+  "finalize_blockers": [
+    "detail_pending","model_pending","model_terminal","crawl_pending","crawl_terminal","crawl_unplanned","crawl_invalid_price","remote_pending","remote_manual","remote_invalid","customer_price_missing","customer_price_failed","customer_price_invalid","customer_price_absent_proven"
+  ],
+  "invariants": [
+    {"id":"INV-01","rule":"state.sqlite3 is STEP_1 machine truth."},
+    {"id":"INV-02","rule":"MODEL result must not gate crawl planning or submission."},
+    {"id":"INV-03","rule":"Crawl planning derives from discovered-row crawl inputs, not DETAIL/MODEL conclusions."},
+    {"id":"INV-04","rule":"One business-date production writer requires ProcessLock plus fenced lease; IgnoreNew is only extra protection."},
+    {"id":"INV-05","rule":"Remote create uses durable immutable intent; uncertain send results reconcile instead of blind resubmit."},
+    {"id":"INV-06","rule":"Frozen snapshot is immutable and discovery stops after freeze."},
+    {"id":"INV-07","rule":"FINALIZED tick/closeout/finalize paths no-op before new source or remote side effects."},
+    {"id":"INV-08","rule":"Closeout reuses the finite tick engine and materializer; no duplicate state machine."},
+    {"id":"INV-09","rule":"Dashboard command plane reuses existing CLI/services; no duplicate STEP_1 state machine."},
+    {"id":"INV-10","rule":"Remote operations use exact durable identity/evidence, never fuzzy task guesses."},
+    {"id":"INV-11","rule":"Missing/failed/invalid/absent-proven customer price blocks ordinary finalize."},
+    {"id":"INV-12","rule":"Scope stays tenant_id=188605 and commodity_pool_id=222."}
+  ],
+  "bug_routing": [
+    {"symptom":"dashboard count stale","inspect":["snapshots","snapshot_members","daily_runs.metrics_json","dashboard_projection.py"]},
+    {"symptom":"customer price missing","inspect":["stage_work:DETAIL","customer_price_semantics.py"]},
+    {"symptom":"model slow/stuck","inspect":["stage_work:MODEL","model batching/concurrency","title_match_model_adapter.py"]},
+    {"symptom":"Zhaoshang task not created","inspect":["submit_pass_snapshot_id","crawl_work","remote_jobs","_submit"]},
+    {"symptom":"remote job stuck","inspect":["remote_jobs","crawl_work","priority","harvest","running recovery"]},
+    {"symptom":"re-export/rebuild issue","inspect":["dashboard_actions.jsonl","dashboard_actions.py","dashboard_manual_ops.py"]},
+    {"symptom":"18:00+ never freezes","inspect":["snapshots row_count/ordered_hash/observed_at","saas_count","closeout pacing"]},
+    {"symptom":"frozen but no final workbook","inspect":["FinalizeReadiness buckets","stage_work","crawl_work","remote_jobs","customer-price blockers"]},
+    {"symptom":"overlapping process","inspect":["Task Scheduler IgnoreNew","ProcessLock","daily_runs lease","scheduler logs"]}
+  ]
+}
