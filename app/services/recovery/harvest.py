@@ -129,6 +129,65 @@ def live_identity_proof(
     )
 
 
+# ---------------------------------------------------------------------------
+# Strict "priority update never confirmed" job family (2026-09-04 review
+# round 2).  The live-proof fallback may only ever admit this one durable
+# shape, and every gate verifies the family independently of its caller:
+# MANUAL_REQUIRED + durable POST evidence (post_attempted==1) + the bare
+# legacy zero-rows diagnostic + a result_json that proves the priority step
+# started but never confirmed (state PRIORITY_PENDING, priority_evidence
+# present and null).  NULL/empty/malformed/partial result_json fails closed:
+# corrupted durable evidence is never silently repaired by a live probe.
+# ---------------------------------------------------------------------------
+
+
+def is_priority_unconfirmed_result_shape(result_json: Any) -> bool:
+    """True only for the strict priority-unconfirmed durable result shape.
+
+    Exactly: ``result_json`` parses via ``json.loads`` into a mapping whose
+    ``state`` is ``PRIORITY_PENDING`` and whose ``priority_evidence`` key is
+    present with value ``None``.  A parsed mapping input is accepted as-is;
+    NULL/empty/malformed JSON, a non-mapping payload, a missing or different
+    ``state``, and non-``None`` evidence all fail closed.
+    """
+    durable: Any = result_json
+    if not isinstance(durable, Mapping):
+        try:
+            durable = json.loads(str(result_json))
+        except (TypeError, ValueError):
+            return False
+    if not isinstance(durable, Mapping):
+        return False
+    return (
+        durable.get("state") == "PRIORITY_PENDING"
+        and "priority_evidence" in durable
+        and durable["priority_evidence"] is None
+    )
+
+
+def is_priority_unconfirmed_manual_family(job: Mapping[str, Any]) -> bool:
+    """True only for the exact priority-unconfirmed MANUAL_REQUIRED family.
+
+    The single durable shape any live-proof fallback may admit:
+    ``MANUAL_REQUIRED`` + ``post_attempted==1`` + the bare legacy zero-rows
+    diagnostic as ``error_text`` + ``is_priority_unconfirmed_result_shape``
+    on ``result_json``.  Shared by the dashboard rebuild gate and the harvest
+    gates so no gate depends on its caller to have verified the family.
+    """
+    if str(job.get("state") or "") != "MANUAL_REQUIRED":
+        return False
+    try:
+        if int(job.get("post_attempted") or 0) != 1:
+            return False
+    except (TypeError, ValueError):
+        return False
+    if (
+        str(job.get("error_text") or "").strip()
+        != REMOTE_NOT_MATERIALIZED_LEGACY_DIAGNOSTIC
+    ):
+        return False
+    return is_priority_unconfirmed_result_shape(job.get("result_json"))
+
 
 def run_local_remote_harvest_recovery(
     *,
@@ -610,19 +669,21 @@ def _existing_remote_harvest_core(
             # Live-proof fallback (2026-09-04 hotfix): a proven read-only probe
             # of the exact durable identity admits exactly one extra MANUAL
             # diagnostic -- the bare legacy zero-rows family, i.e. the "remote
-            # task intact, priority never confirmed" shape.  Everything else
-            # keeps the original rejection.
+            # task intact, priority never confirmed" shape.  Review round 2:
+            # the strict priority-unconfirmed family is re-verified here
+            # independently of the caller (including the strict result_json
+            # shape), so a proof alone can never widen the admission.
+            # Everything else keeps the original rejection.
             if (
                 allow_manual_requeue
                 and job["state"] == "MANUAL_REQUIRED"
                 and (
                     job_error_text in manual_requeue_diagnostics
                     or (
-                        _live_identity_proof_admits(
+                        is_priority_unconfirmed_manual_family(job)
+                        and _live_identity_proof_admits(
                             live_identity_proof, expected_identity
                         )
-                        and job_error_text
-                        == REMOTE_NOT_MATERIALIZED_LEGACY_DIAGNOSTIC
                     )
                 )
             ):
@@ -664,9 +725,16 @@ def _existing_remote_harvest_core(
         if adapter.exact_priority_remote_identity(prepared) != expected_identity:
             # Historical accepted priority evidence stays mandatory.  The only
             # fallback (2026-09-04 hotfix) is a factory-built live proof from
-            # an earlier read-only probe of the exact same remote identity; a
-            # missing, mismatched, or unproven proof keeps this rejection.
-            if not _live_identity_proof_admits(live_identity_proof, expected_identity):
+            # an earlier read-only probe of the exact same remote identity --
+            # and (review round 2) only for the exact priority-unconfirmed
+            # MANUAL family, re-verified here independently of the caller, so
+            # a proof can never rescue SUBMITTED/RUNNING/EXPORTED jobs nor a
+            # corrupted historical-evidence shape.  A missing, mismatched, or
+            # unproven proof keeps this rejection.
+            if not (
+                _live_identity_proof_admits(live_identity_proof, expected_identity)
+                and is_priority_unconfirmed_manual_family(job)
+            ):
                 raise RecoveryRejected("exact accepted priority evidence is required")
 
         crawls = store.crawl_work_for_job(int(remote_job_id))

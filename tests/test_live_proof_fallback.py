@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
 from openpyxl import Workbook
 
 from app.services.daily_audit_store import DailyAuditStore
@@ -48,6 +49,10 @@ OLD_TASK_NAME = f"cnnc_current_opt_{MALL_NAME}_{OLD_TASK_DIGITS}"
 NEW_TASK_ID = "8899001"
 NEW_TASK_NUMBER = "RW-20260828REBUILD"
 ZERO_ROWS_ERROR = "PriorityUpdateZeroRowsError"
+# Review round 2: the strict durable production shape of the priority-
+# unconfirmed family (job 30).  Anything looser (NULL/empty/malformed/partial
+# result_json) stays outside the live-proof fallback.
+PRIORITY_PENDING_RESULT_JSON = '{"state": "PRIORITY_PENDING", "priority_evidence": null}'
 
 
 def _row(index: int) -> dict[str, object]:
@@ -205,8 +210,15 @@ class _Seed:
         priority_updated: bool = True,
         job_state: str | None = None,
         error_text: str | None = None,
+        result_json: str | None = None,
     ):
-        """Seed one durable job; result_json stays NULL (priority_evidence null)."""
+        """Seed one durable job.
+
+        ``result_json`` pins an exact durable result shape; the default leaves
+        result_json NULL (the accepted-evidence shape -- the strict
+        priority-unconfirmed fixtures pass the exact
+        PRIORITY_PENDING_RESULT_JSON production shape explicitly).
+        """
         import sqlite3
 
         task_name = OLD_TASK_NAME if self.rebuild else "task-target"
@@ -292,7 +304,7 @@ class _Seed:
             )
             store.link_crawl_work_to_remote_job(lease, int(crawl["id"]), int(job["id"]))
         store.release_lease(lease)
-        if error_text is not None or job_state is not None:
+        if error_text is not None or job_state is not None or result_json is not None:
             connection = sqlite3.connect(str(self.state_path), timeout=5)
             try:
                 if error_text is not None:
@@ -304,6 +316,11 @@ class _Seed:
                     connection.execute(
                         "UPDATE remote_jobs SET state=? WHERE id=?",
                         (job_state, int(job["id"])),
+                    )
+                if result_json is not None:
+                    connection.execute(
+                        "UPDATE remote_jobs SET result_json=? WHERE id=?",
+                        (result_json, int(job["id"])),
                     )
                 connection.commit()
             finally:
@@ -391,12 +408,22 @@ class _Seed:
 # ---------------------------------------------------------------------------
 
 
-def _seeded_reexport(tmp_path, *, error_text, remote_progress):
+def _seeded_reexport(
+    tmp_path,
+    *,
+    error_text,
+    remote_progress,
+    result_json: str | None = PRIORITY_PENDING_RESULT_JSON,
+):
     seed = _Seed(tmp_path)
     seed.remote_progress = remote_progress
     requests = seed.build_requests(3)
     store, job = seed.seed(
-        3, priority_updated=False, error_text=error_text, job_state="MANUAL_REQUIRED"
+        3,
+        priority_updated=False,
+        job_state="MANUAL_REQUIRED",
+        error_text=error_text,
+        result_json=result_json,
     )
     return seed, store, job
 
@@ -553,11 +580,60 @@ def test_reexport_5_other_manual_errors_get_no_fallback(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# REEXPORT-6 (review round 2): the live proof alone never admits a job whose
+# durable state is not the strict priority-unconfirmed MANUAL family.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("durable_state", ["SUBMITTED", "RUNNING", "EXPORTED"])
+def test_reexport_6_live_proof_never_admits_non_manual_durable_state(
+    tmp_path, durable_state
+):
+    """A proven TERMINAL probe cannot rescue SUBMITTED/RUNNING/EXPORTED jobs
+    whose historical priority evidence is missing: still rejected, zero
+    export, durable state untouched -- corrupted evidence is never silently
+    repaired by the fallback."""
+    seed = _Seed(tmp_path)
+    seed.remote_progress = seed.terminal_progress(3)  # a live probe would admit
+    seed.runner = seed.exporting_runner(_priced_rows(3))
+    store, job = seed.seed(3, priority_updated=False, job_state=durable_state)
+
+    result = run_manual_reexport(
+        state_path=seed.state_path,
+        lock_path=seed.lock_path,
+        business_date=BUSINESS_DATE,
+        remote_job_id=int(job["id"]),
+        remote_identity=IDENTITY,
+        adapter=seed.adapter,
+        timeout_seconds=60.0,
+    )
+
+    assert result["outcome"] == "REEXPORT_REJECTED"
+    assert result["error_code"] == "INVALID_REMOTE_STATE"
+    assert "exact accepted priority evidence is required" in result["reason"]
+    # The preflight probe ran (and proved TERMINAL), but the export never
+    # dispatched: zero export/prioritize/stop calls, zero durable change.
+    assert seed.probe_calls == [(TASK_ID, TASK_NUMBER)]
+    assert result["export_remote_calls"] == 0
+    assert result["remote_calls_total"] == result["preflight_remote_calls"]
+    assert seed.runner_calls == []
+    assert seed.prioritize_calls == []
+    assert seed.stop_calls == []
+    assert store.get_remote_job(int(job["id"]))["state"] == durable_state
+
+
+# ---------------------------------------------------------------------------
 # REBUILD: live proof fallback on the manual rebuild path.
 # ---------------------------------------------------------------------------
 
 
-def _seeded_rebuild(tmp_path, *, remote_progress, error_text=ZERO_ROWS_ERROR):
+def _seeded_rebuild(
+    tmp_path,
+    *,
+    remote_progress,
+    error_text=ZERO_ROWS_ERROR,
+    result_json: str | None = PRIORITY_PENDING_RESULT_JSON,
+):
     seed = _Seed(tmp_path, rebuild=True)
     seed.remote_progress = remote_progress
     requests = seed.build_requests(3)
@@ -566,6 +642,7 @@ def _seeded_rebuild(tmp_path, *, remote_progress, error_text=ZERO_ROWS_ERROR):
         priority_updated=False,
         job_state="MANUAL_REQUIRED",
         error_text=error_text,
+        result_json=result_json,
     )
     return seed, store, job
 
@@ -739,6 +816,132 @@ def test_rebuild_non_family_shape_keeps_original_gate(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# REBUILD-4 (review round 2): only the strict PRIORITY_PENDING/null-evidence
+# result_json joins the fallback; every corrupt shape keeps the original gate.
+# ---------------------------------------------------------------------------
+
+
+_REBUILD_CORRUPT_RESULT_JSON = [
+    pytest.param(None, id="null-result-json"),
+    pytest.param("", id="empty-result-json"),
+    pytest.param("not-json{{", id="malformed-result-json"),
+    pytest.param("{}", id="empty-object"),
+    pytest.param('{"priority_evidence": null}', id="missing-state"),
+    pytest.param(
+        '{"state": "SUBMITTED", "priority_evidence": null}', id="wrong-state"
+    ),
+    pytest.param(
+        '{"state": "PRIORITY_PENDING", "priority_evidence": "updated"}',
+        id="evidence-not-null",
+    ),
+]
+
+
+@pytest.mark.parametrize("corrupt_result_json", _REBUILD_CORRUPT_RESULT_JSON)
+def test_rebuild_4_corrupt_result_json_fails_priority_gate(
+    tmp_path, corrupt_result_json
+):
+    """NULL/empty/malformed/partial result_json is not "null evidence": the
+    rebuild keeps the original priority_evidence_gate rejection with zero
+    stop/create/replacement and no live probe spent."""
+    seed, store, job = _seeded_rebuild(
+        tmp_path, remote_progress=None, result_json=corrupt_result_json
+    )
+    seed.remote_progress = seed.terminal_progress(3)  # a live probe would admit
+    seed.runner = seed.creating_runner()
+
+    result = run_manual_rebuild(
+        state_path=seed.state_path,
+        lock_path=seed.lock_path,
+        business_date=BUSINESS_DATE,
+        remote_job_id=int(job["id"]),
+        remote_identity=IDENTITY,
+        adapter=seed.adapter,
+        action_id="liveproof-rebuild-4",
+        timeout_seconds=60.0,
+    )
+
+    assert result["outcome"] == "REBUILD_REJECTED"
+    assert result["error_code"] == "INVALID_REMOTE_STATE"
+    assert result["rejection_stage"] == "priority_evidence_gate"
+    assert (
+        "exact durable priority evidence does not match the remote identity"
+        in result["reason"]
+    )
+    # No live probe spent, zero remote writes, zero durable protocol rows.
+    assert seed.probe_calls == []
+    assert seed.stop_calls == []
+    assert seed.runner_calls == []
+    assert store.get_latest_rebuild_action_for_job(int(job["id"])) is None
+    assert store.get_replacement_for_job(int(job["id"])) is None
+    assert store.get_remote_job(int(job["id"]))["state"] == "MANUAL_REQUIRED"
+
+
+# ---------------------------------------------------------------------------
+# Shared strict family helpers (review round 2): unit pinning for the exact
+# shape the harvest core and the dashboard rebuild gate both enforce.
+# ---------------------------------------------------------------------------
+
+
+def test_strict_priority_unconfirmed_helpers_unit():
+    """The shared helpers accept exactly the strict shape and nothing else."""
+    from app.services.recovery.harvest import (
+        is_priority_unconfirmed_manual_family,
+        is_priority_unconfirmed_result_shape,
+    )
+
+    strict = '{"state": "PRIORITY_PENDING", "priority_evidence": null}'
+    assert is_priority_unconfirmed_result_shape(strict)
+    assert is_priority_unconfirmed_result_shape(
+        {"state": "PRIORITY_PENDING", "priority_evidence": None}
+    )
+    for bad in (
+        None,
+        "",
+        "not-json{{",
+        "{}",
+        "[]",
+        '"PRIORITY_PENDING"',
+        '{"state": "PRIORITY_PENDING"}',
+        '{"state": "SUBMITTED", "priority_evidence": null}',
+        '{"state": "PRIORITY_PENDING", "priority_evidence": "updated"}',
+    ):
+        assert not is_priority_unconfirmed_result_shape(bad), bad
+
+    def _family_job(**overrides):
+        job = {
+            "state": "MANUAL_REQUIRED",
+            "post_attempted": 1,
+            "error_text": ZERO_ROWS_ERROR,
+            "result_json": strict,
+        }
+        job.update(overrides)
+        return job
+
+    assert is_priority_unconfirmed_manual_family(_family_job())
+    assert not is_priority_unconfirmed_manual_family(
+        _family_job(state="SUBMITTED")
+    )
+    assert not is_priority_unconfirmed_manual_family(
+        _family_job(post_attempted=0)
+    )
+    assert not is_priority_unconfirmed_manual_family(
+        _family_job(error_text="some unrelated manual error")
+    )
+    assert not is_priority_unconfirmed_manual_family(
+        _family_job(result_json=None)
+    )
+    assert not is_priority_unconfirmed_manual_family(
+        _family_job(result_json='{"state": "PRIORITY_PENDING"}')
+    )
+    assert not is_priority_unconfirmed_manual_family(
+        _family_job(
+            result_json='{"state": "PRIORITY_PENDING", "priority_evidence": "updated"}'
+        )
+    )
+
+
+# ---------------------------------------------------------------------------
 # OBS-1: re-export action record accounts for the preflight remote calls.
 # ---------------------------------------------------------------------------
 
@@ -804,9 +1007,11 @@ def test_obs_1b_rebuild_record_carries_stage_and_breakdown(tmp_path):
     assert len(actions) == 1
     record = actions[0]
     assert record["outcome"] == "REBUILD_DISPATCHED"
-    assert record["probe_remote_calls"] == 2
-    assert record["stop_remote_calls"] == 1
-    assert record["create_remote_calls"] == 1
+    # Review round 2: adapter operation counters (probe/stop/create dispatches),
+    # renamed from *_remote_calls -- these are not HTTP call counts.
+    assert record["probe_operations"] == 2
+    assert record["stop_operations"] == 1
+    assert record["create_operations"] == 1
     assert record["remote_calls"] == 4
     assert record["progress_classification"] == "REMOTE_ACTIVE"
     assert record["live_proof_classification"] == "REMOTE_ACTIVE"
@@ -832,8 +1037,8 @@ def test_obs_1b_rebuild_record_carries_stage_and_breakdown(tmp_path):
     ]
     assert records[0]["rejection_stage"] == "live_proof"
     assert records[0]["progress_classification"] == "REMOTE_UNKNOWN"
-    assert records[0]["stop_remote_calls"] == 0
-    assert records[0]["create_remote_calls"] == 0
+    assert records[0]["stop_operations"] == 0
+    assert records[0]["create_operations"] == 0
 
 
 # ---------------------------------------------------------------------------

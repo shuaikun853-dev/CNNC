@@ -39,6 +39,14 @@ PriorityUpdateZeroRowsError(RuntimeError)            # :46 裸基类
    （adapter :136-141 注释），无法区分以上 7 类中的任何一类；因此 2026-09-04 hotfix
    的放行通道不信任该字符串本身，只把它作为窄家族判定条件之一，并强制要求
    exact live progress probe（ACTIVE/TERMINAL）作为放行证据。
-3. 全部 raise 最终经 :454-457 `except Exception → conn.rollback() → raise`，
-   均为零/可回滚副作用路径，无半提交状态。
+3. raise 站点按副作用时序分两类，**不能**一概而论"全部零/可回滚副作用"：
+   - **PRE_COMMIT**（:166 / :315 / :319 / :342 / :394 / :418）：raise 发生在
+     :421 `conn.commit()` 之前，最终经 :454-457 `except Exception →
+     conn.rollback() → raise`，事务整体回滚，零持久化副作用，无半提交状态；
+   - **POST_COMMIT**（:444，`"post-commit priority verification failed"`）：
+     raise 发生在 :421 `conn.commit()` 之后（提交后用 `_id_readback_sql`
+     读回校验失败）。此刻提优 UPDATE **已经提交落库**，:454-457 的
+     `conn.rollback()` 只能结束当前（空）事务，**不能撤销已提交的提优写**。
+     该路径留下的是"已提交但未通过提交后验证"的提优状态，不是零副作用路径，
+     需要下游以持久化证据另行确认，不能按可回滚处理。
 4. `PriorityScopeSafetyError`（:58）的 7 个 raise 站点（:146/:149/:170/:172/:176/:178/:181/:184/:303/:347/:412/:439/:450/:452）不属于本次审计的 ZeroRows 家族，未列入清单。

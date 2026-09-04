@@ -30,11 +30,11 @@ from app.services.legacy_zhaoshang_adapter import (
     PreparedLegacyJob,
     RestartStatus,
     SubmitStatus,
-    REMOTE_NOT_MATERIALIZED_LEGACY_DIAGNOSTIC,
 )
 from app.services.recovery.common import RecoveryRejected, _acquire_recovery_lease
 from app.services.recovery.harvest import (
     _existing_remote_harvest_core,
+    is_priority_unconfirmed_manual_family,
     live_identity_proof,
 )
 from app.services.recovery.no_result import EXPORT_NO_PRICE_ACCEPTED_ERRORS
@@ -215,34 +215,17 @@ def _probe_remote_execution_state(
 def _is_priority_unconfirmed_manual_job(job: Mapping[str, Any]) -> bool:
     """Strict "priority update never confirmed" durable shape (2026-09-04 hotfix).
 
-    Exactly: MANUAL_REQUIRED + durable POST evidence (post_attempted==1) + the
-    bare legacy zero-rows diagnostic as error_text + no durable
-    ``priority_evidence`` in result_json (missing/empty result_json counts as
-    null).  Nothing else joins the live-proof fallback -- in particular no
-    other MANUAL_REQUIRED error family and no recorded priority evidence.
+    Exactly the shared strict family (see
+    :func:`app.services.recovery.harvest.is_priority_unconfirmed_manual_family`):
+    MANUAL_REQUIRED + durable POST evidence (post_attempted==1) + the bare
+    legacy zero-rows diagnostic as error_text + a result_json that parses to
+    ``{"state": "PRIORITY_PENDING", "priority_evidence": null}``.  Review
+    round 2: NULL/empty/malformed result_json no longer counts as "null
+    evidence" -- anything that is not exactly the strict shape fails closed,
+    and no other MANUAL error family and no recorded priority evidence joins
+    the live-proof fallback.
     """
-    if str(job.get("state") or "") != "MANUAL_REQUIRED":
-        return False
-    try:
-        if int(job.get("post_attempted") or 0) != 1:
-            return False
-    except (TypeError, ValueError):
-        return False
-    if (
-        str(job.get("error_text") or "").strip()
-        != REMOTE_NOT_MATERIALIZED_LEGACY_DIAGNOSTIC
-    ):
-        return False
-    try:
-        durable_result = json.loads(str(job.get("result_json") or ""))
-    except (TypeError, ValueError):
-        durable_result = None
-    priority_evidence = (
-        durable_result.get("priority_evidence")
-        if isinstance(durable_result, dict)
-        else None
-    )
-    return priority_evidence is None
+    return is_priority_unconfirmed_manual_family(job)
 
 
 def _probe_live_identity_classification(
@@ -1712,9 +1695,15 @@ def run_manual_rebuild(
                 or result.get("precheck_classification")
             ),
             "live_proof_classification": result.get("live_proof_classification"),
-            "probe_remote_calls": int(remote_call_breakdown.get("probe", 0)),
-            "stop_remote_calls": int(remote_call_breakdown.get("stop", 0)),
-            "create_remote_calls": int(remote_call_breakdown.get("create", 0)),
+            # Adapter operation counters (review round 2 renamed from
+            # *_remote_calls: these count legacy-adapter operations -- one
+            # probe/stop/create dispatch each -- not raw HTTP remote calls;
+            # the manual_reexport record's preflight_remote_calls /
+            # export_remote_calls / remote_calls_total are the true HTTP
+            # remote-call counters and keep their names).
+            "probe_operations": int(remote_call_breakdown.get("probe", 0)),
+            "stop_operations": int(remote_call_breakdown.get("stop", 0)),
+            "create_operations": int(remote_call_breakdown.get("create", 0)),
         },
     )
     return result

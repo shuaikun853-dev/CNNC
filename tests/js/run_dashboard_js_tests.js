@@ -28,6 +28,10 @@
 //   P2-2  pollDelay 上海时区 closeout 监视窗口 [17:55, 20:35](含两端):窗口内
 //         未 finalized 即使 idle 也 5s 轮询(显式 Asia/Shanghai 换算,不依赖本地
 //         时区);writer active / computed_pending 判定优先级不变,finalized 恢复 idle。
+// 覆盖 Independent Review Fix Round 2(2026-09-04):P1 rebuild 本地降级门
+//   rebuildOutcomeAdmitsLocalSupersede:仅确认的重建成功 outcome + 有效
+//   new_remote_job_id 才本地降级 SUPERSEDED/武装自动切换;REBUILD_REJECTED
+//   (含 TASK_NAME_CONFLICT 候选名形状)零 mutate、不武装。
 // 被测对象:app/static/dashboard/app.js 暴露的 createPollController /
 // createSaasFlowPoller / safeProgressText / fmtShanghaiDateTime /
 // createCnncAuthFetcher / computeCloseoutBackendRunning / applyCloseoutRunningOverlay /
@@ -62,6 +66,7 @@ const { createPollController, createSaasFlowPoller, safeProgressText, sfPartialN
         applyCloseoutRunningOverlay, isCloseoutWriter, resolveCloseoutActionsDate,
         updateCloseoutUI, pollDelay, inCloseoutWatchWindow, _setCloseoutStateForTest,
         armRebuildDrawerSwitch, resolveRebuildDrawerSwitch,
+        rebuildOutcomeAdmitsLocalSupersede,
         cpStatusCn, cpStatusPill, cpRowMatchesFilter, cpSortRows } = require(
   path.join(__dirname, "..", "..", "app", "static", "dashboard", "app.js"));
 
@@ -1153,6 +1158,58 @@ function test_customer_price_seams() {
         cpRowMatchesFilter(null, "all") === true);
 }
 
+// ---- 2026-09-04 Review Round 2:rebuild 本地 SUPERSEDED 降级门(纯判定 seam) ----
+// 只有确认的重建成功 outcome(REBUILD_DISPATCHED/QUEUED/SUBMIT_UNKNOWN/
+// ALREADY_REPLACED)+ 有效 new_remote_job_id 才允许把旧任务本地降级为
+// SUPERSEDED 并武装 drawer 自动切换;REBUILD_REJECTED / REBUILD_NOT_ALLOWED
+// 即使带候选 new_task_name(TASK_NAME_CONFLICT 形状)也绝不 mutate 旧任务。
+function test_rebuild_local_supersede_gate() {
+  const LEGACY_MANUAL_JOB = { id: 30, task_name: "cnnc_current_opt_zjmi_111", state: "MANUAL_REQUIRED", superseded_by: null };
+
+  check("重建降级门:REBUILD_DISPATCHED 带完整字段 → 允许(UI-1 正例不回归)",
+        rebuildOutcomeAdmitsLocalSupersede({
+          outcome: "REBUILD_DISPATCHED", new_remote_job_id: 41,
+          new_task_name: "cnnc_current_opt_zjmi_222", new_batch_number: "cnnc_current_opt_zjmi_222" }) === true);
+
+  check("重建降级门:QUEUED / SUBMIT_UNKNOWN / ALREADY_REPLACED + 有效新任务 id → 允许",
+        rebuildOutcomeAdmitsLocalSupersede({ outcome: "REBUILD_QUEUED", new_remote_job_id: 41 }) === true &&
+        rebuildOutcomeAdmitsLocalSupersede({ outcome: "REBUILD_SUBMIT_UNKNOWN", new_remote_job_id: 41 }) === true &&
+        rebuildOutcomeAdmitsLocalSupersede({ outcome: "REBUILD_ALREADY_REPLACED", new_remote_job_id: 41 }) === true);
+
+  check("重建降级门:REBUILD_REJECTED 带候选 new_task_name、无 new_remote_job_id → 拒绝,不武装切换、不改旧任务",
+        (() => {
+          const j = { ...LEGACY_MANUAL_JOB };
+          // 服务端拒绝负载:候选名可能出现在错误负载里(TASK_NAME_CONFLICT 形状)。
+          const oc = { outcome: "REBUILD_REJECTED", error_code: "INVALID_REMOTE_STATE",
+                       new_task_name: "cnnc_current_opt_zjmi_999", new_batch_number: "cnnc_current_opt_zjmi_999" };
+          // 旧前端条件(过宽)会走进 mutate 分支;新门必须拒绝。
+          if (rebuildOutcomeAdmitsLocalSupersede(oc)) return false;
+          // 拒绝 → 不武装 drawer 自动切换,旧任务对象保持原状。
+          if (armRebuildDrawerSwitch(j.id, oc) !== null) return false;
+          return j.state === "MANUAL_REQUIRED" && j.superseded_by === null && j.task_name === LEGACY_MANUAL_JOB.task_name;
+        })());
+
+  check("重建降级门:TASK_NAME_CONFLICT 形状(REBUILD_REJECTED + 候选名)同样零 mutate",
+        (() => {
+          const j = { ...LEGACY_MANUAL_JOB };
+          const oc = { outcome: "REBUILD_REJECTED", error_code: "TASK_NAME_CONFLICT",
+                       reason: "replacement task name already exists", new_task_name: "cnnc_current_opt_zjmi_888" };
+          if (rebuildOutcomeAdmitsLocalSupersede(oc)) return false;
+          if (armRebuildDrawerSwitch(j.id, oc) !== null) return false;
+          return j.state === "MANUAL_REQUIRED" && j.superseded_by === null;
+        })());
+
+  check("重建降级门:REBUILD_NOT_ALLOWED / 未知 outcome / 缺 new_remote_job_id / 非法 id / 非对象 → 拒绝",
+        rebuildOutcomeAdmitsLocalSupersede({ outcome: "REBUILD_NOT_ALLOWED", new_remote_job_id: 41 }) === false &&
+        rebuildOutcomeAdmitsLocalSupersede({ outcome: "SOMETHING_ELSE", new_remote_job_id: 41 }) === false &&
+        rebuildOutcomeAdmitsLocalSupersede({ outcome: "REBUILD_DISPATCHED", new_task_name: "n" }) === false &&
+        rebuildOutcomeAdmitsLocalSupersede({ outcome: "REBUILD_DISPATCHED", new_remote_job_id: 0 }) === false &&
+        rebuildOutcomeAdmitsLocalSupersede({ outcome: "REBUILD_DISPATCHED", new_remote_job_id: -1 }) === false &&
+        rebuildOutcomeAdmitsLocalSupersede({ outcome: "REBUILD_DISPATCHED" }) === false &&
+        rebuildOutcomeAdmitsLocalSupersede(null) === false &&
+        rebuildOutcomeAdmitsLocalSupersede("REBUILD_DISPATCHED") === false);
+}
+
 // ---- 2026-09-04 hotfix:rebuild 成功后 drawer 自动切到替代任务(纯判定 seam) ----
 function test_rebuild_drawer_switch_seam() {
   const jobs = [
@@ -1235,6 +1292,7 @@ function test_rebuild_drawer_switch_seam() {
   test_closeout_r3_ops_unavailable();
   test_closeout_r3_poll_watch_window();
   test_customer_price_seams();
+  test_rebuild_local_supersede_gate();
   test_rebuild_drawer_switch_seam();
   if (failed === 0) { console.log("ALL PASS"); process.exit(0); }
   console.error(failed + " failing checks");

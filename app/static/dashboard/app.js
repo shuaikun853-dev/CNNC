@@ -621,6 +621,22 @@
     };
   }
 
+  // ---- 重建成功分支收紧(2026-09-04 Review Round 2) ----
+  // 本地立即降级为 SUPERSEDED 视图只允许出现在服务端确认的重建成功 outcome
+  // 上,且必须带有有效 new_remote_job_id。REBUILD_REJECTED / REBUILD_NOT_ALLOWED
+  // 即使错误负载带了候选 new_task_name(例如 TASK_NAME_CONFLICT 的候选名)也
+  // 绝不能把旧任务改写成 SUPERSEDED、绝不武装 drawer 自动切换。纯判定 seam
+  // (tests/js 直测,无 DOM)。
+  const REBUILD_LOCAL_SUPERSEDE_OUTCOMES = new Set([
+    "REBUILD_DISPATCHED", "REBUILD_QUEUED", "REBUILD_SUBMIT_UNKNOWN", "REBUILD_ALREADY_REPLACED"]);
+
+  function rebuildOutcomeAdmitsLocalSupersede(oc) {
+    if (!oc || typeof oc !== "object") return false;
+    if (!REBUILD_LOCAL_SUPERSEDE_OUTCOMES.has(oc.outcome)) return false;
+    const newId = Number(oc.new_remote_job_id);
+    return Number.isFinite(newId) && newId > 0;
+  }
+
   function resolveRebuildDrawerSwitch(jobs, pending) {
     if (!pending) return { action: "none" };
     const list = Array.isArray(jobs) ? jobs : [];
@@ -993,7 +1009,10 @@
         const res = await client.post(`/dashboard/api/jobs/${j.id}/rebuild`, { business_date: businessDate, confirm: true });
         if (st) st.textContent = actionOutcomeText("rebuild", res);
         const oc = (res && res.outcome) || {};
-        if (res && !res.error && (oc.new_task_name || oc.outcome === "REBUILD_ALREADY_REPLACED")) {
+        // Review Round 2:只有确认的重建成功 outcome + 有效 new_remote_job_id
+        // 才本地降级为 superseded 视图;REBUILD_REJECTED(含 TASK_NAME_CONFLICT
+        // 带候选名)不改旧任务、不武装自动切换。
+        if (res && !res.error && rebuildOutcomeAdmitsLocalSupersede(oc)) {
           // 本地即时降级为 superseded 视图,等下一次 summary 校正
           j.superseded_by = j.superseded_by || {
             new_task_name: oc.new_task_name || "", new_batch_number: oc.new_batch_number || "" };
@@ -1424,6 +1443,7 @@
     resolveCloseoutActionsDate, closeoutUIRunning, updateCloseoutUI,
     pollDelay, inCloseoutWatchWindow, _setCloseoutStateForTest,
     armRebuildDrawerSwitch, resolveRebuildDrawerSwitch,
+    rebuildOutcomeAdmitsLocalSupersede,
     cpStatusCn, cpStatusPill, cpRowMatchesFilter, cpSortRows };
   if (typeof window !== "undefined") { window.Dashboards = api; }
   if (typeof module !== "undefined" && module.exports) { module.exports = api; }
