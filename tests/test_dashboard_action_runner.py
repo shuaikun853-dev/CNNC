@@ -68,12 +68,31 @@ class _FakeProcess:
         self.returncode = 1
 
 
-def _wait_done(handle, timeout=5.0):
+def _wait_done(handle, timeout=15.0, run_dir=None):
+    """等 supervisor 翻转内存状态;closeout 场景(runner 契约含 runner 写的
+    finished 记录)同时等持久化记录落地。只等内存状态会在重载慢机
+    (GitHub Runner 2026-09-07 run#15)上与账本写竞态。"""
     deadline = time.monotonic() + timeout
-    while handle.status == "RUNNING" and time.monotonic() < deadline:
+    while time.monotonic() < deadline:
+        if handle.status != "RUNNING" and (
+            run_dir is None or _finished_record(run_dir, handle.action_id)
+        ):
+            return handle
         time.sleep(0.01)
     assert handle.status != "RUNNING", "supervisor thread did not finish"
+    assert run_dir is None or _finished_record(
+        run_dir, handle.action_id
+    ), "durable finished record missing for " + handle.action_id
     return handle
+
+
+def _finished_record(run_dir, action_id):
+    records = read_operator_actions(Path(run_dir), limit=200)
+    return any(
+        record.get("event") == "finished"
+        and record.get("action_id") == action_id
+        for record in records
+    )
 
 
 def _runner(tmp_path: Path, *processes: _FakeProcess):
@@ -105,7 +124,7 @@ def test_closeout_publication_maps_finalized(tmp_path):
     runner, calls = _runner(tmp_path, _FakeProcess(returncode=0, stdout=stdout))
     handle = runner.start(action_type="closeout", business_date=BUSINESS_DATE)
     assert handle.pid == 4242
-    _wait_done(handle)
+    _wait_done(handle, run_dir=tmp_path / "runtime" / BUSINESS_DATE)
     assert handle.status == "SUCCEEDED"
     assert handle.outcome["result_code"] == "FINALIZED"
     assert handle.outcome["publication"].endswith("saas_audit_final_20260828.xlsx")
@@ -155,7 +174,8 @@ def test_closeout_lock_conflict_text_maps_already_running(tmp_path):
 def test_closeout_timeout_terminates_subprocess(tmp_path):
     process = _FakeProcess(hang=True)
     runner, _ = _runner(tmp_path, process)
-    handle = _wait_done(runner.start(action_type="closeout", business_date=BUSINESS_DATE))
+    handle = runner.start(action_type="closeout", business_date=BUSINESS_DATE)
+    _wait_done(handle, run_dir=tmp_path / "runtime" / BUSINESS_DATE)
     assert process.terminated and not process.killed
     assert handle.status == "FAILED"
     assert handle.outcome["result_code"] == "TIMEOUT"
@@ -229,8 +249,9 @@ def test_durable_status_roundtrip(tmp_path):
     stdout = json.dumps({"outcome": "FINALIZED", "publication": "x.xlsx",
                          "publication_blocked": None})
     runner, _ = _runner(tmp_path, _FakeProcess(returncode=0, stdout=stdout))
-    handle = _wait_done(runner.start(action_type="closeout", business_date=BUSINESS_DATE))
+    handle = runner.start(action_type="closeout", business_date=BUSINESS_DATE)
     run_dir = tmp_path / "runtime" / BUSINESS_DATE
+    _wait_done(handle, run_dir=run_dir)
     durable = runner.durable_status(handle.action_id, run_dir)
     assert durable is not None
     assert durable["action_type"] == "closeout"
