@@ -206,6 +206,11 @@ class TickDependencies:
     # pass is a no-op.
     remote_recovery_probe: Callable[[Mapping[str, Any], float], Mapping[str, Any] | None] | None = None
     remote_recovery_restart: Callable[[Mapping[str, Any], str | None, float], Mapping[str, Any]] | None = None
+    # Issue #9 customer-prewarm sidecar: best-effort enqueue of discovered
+    # documents into the prewarm inbox. Optional and None by default; any
+    # exception is caught below and only counted - it can never change the
+    # tick outcome, trace, approval, closeout, price or model behaviour.
+    prewarm_intake: Callable[[str, Sequence[Mapping[str, Any]]], None] | None = None
     monotonic: Callable[[], float] = time.monotonic
     wall_clock: Callable[[], datetime] = lambda: datetime.now(UTC)
 
@@ -1558,6 +1563,13 @@ def run_incremental_tick(
             counters["today_discovered"] = int(ingested["member_count"])
             counters["delta_new"] = int(ingested["status_counts"].get("NEW", 0))
             counters["delta_changed"] = int(ingested["status_counts"].get("CHANGED", 0))
+            if deps.prewarm_intake is not None:
+                # Issue #9 sidecar gate: enqueue only; failure is a counter.
+                try:
+                    deps.prewarm_intake(config.business_date, discovered.rows)
+                    counters["prewarm_intake_ok"] = counters.get("prewarm_intake_ok", 0) + 1
+                except Exception:  # noqa: BLE001 - never fail the tick
+                    counters["prewarm_intake_failures"] = counters.get("prewarm_intake_failures", 0) + 1
         snapshot_id = int(snapshot["id"]) if snapshot is not None else None
         items: Sequence[Mapping[str, Any]] = (
             store.ordered_snapshot_items(snapshot_id) if snapshot_id is not None else ()
