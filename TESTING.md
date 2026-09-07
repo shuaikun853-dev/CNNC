@@ -66,6 +66,8 @@ python -m pytest tests\test_daily_audit_store.py tests\test_cnnc_saas_snapshot_a
   tests\test_incremental_audit_operations.py tests\test_incremental_audit_resilience.py tests\test_incremental_audit_recovery.py tests\test_scheduler_frequency_simulation.py tests\test_partial_exact_harvest.py `
   tests\test_incremental_price_audit_finalize.py tests\test_incremental_production_readiness_audit.py tests\test_incremental_audit_materializer.py tests\test_legacy_zhaoshang_adapter.py `
   tests\test_incremental_price_audit_history.py tests\test_incremental_history_benchmark.py -q
+# Issue #9 客户参考链接预爬旁路:提取等价/发现状态/缓存复用/每日同步幂等/STEP1 隔离/scanner CLI 与 installer 文本门禁
+python -m pytest tests\test_customer_reference_links.py tests\test_customer_prewarm_store.py tests\test_customer_prewarm_discovery.py tests\test_customer_prewarm_daily_sync.py tests\test_customer_prewarm_step1_isolation.py tests\test_customer_prewarm_scan_cli.py -q
 ```
 历史 fixture 缺失时，最后一项会 skip；不得用生产接口补齐它。
 ### Dashboard 测试（只读看板）

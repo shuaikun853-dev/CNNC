@@ -698,3 +698,25 @@ class SharedCrawlCache:
                 (document_value,),
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def find_id_by_source_event_key(self, source: str, source_event_key: str) -> int | None:
+        """Newest crawl_results id whose payload embeds this producer event marker, or None.
+
+        Cross-DB crash-recovery probe for the daily-sync ledger (Issue #9): the
+        sync writes ``source_event_key`` verbatim into ``payload_json``, so a
+        committed-but-unfinalized ledger claim can be linked back to its cache
+        row by a substring probe instead of re-recording a duplicate.  Empty
+        inputs resolve to ``None`` (never a whole-table match).
+        """
+        source_value = source.strip() if isinstance(source, str) else ""
+        key_value = source_event_key.strip() if isinstance(source_event_key, str) else ""
+        if not source_value or not key_value:
+            return None
+        with self._reader() as connection:
+            row = connection.execute(
+                """SELECT id FROM crawl_results
+                   WHERE source=? AND instr(payload_json, ?) > 0
+                   ORDER BY id DESC LIMIT 1""",
+                (source_value, key_value),
+            ).fetchone()
+        return int(row["id"]) if row is not None else None
