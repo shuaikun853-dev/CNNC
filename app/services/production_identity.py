@@ -150,8 +150,8 @@ def build_comparison(startup: dict, local: dict, remote: dict, is_ancestor=None)
         elif is_ancestor is not None and is_ancestor(remote_sha, local_sha):
             local_vs_remote = "AHEAD"
         else:
-            # 分叉历史或对象缺失(rc128)——方向未知,统一 DIFFERENT
-            local_vs_remote = "DIFFERENT"
+            # Local != Remote 且无法可靠判定祖先方向(merge-base rc128/分叉)
+            local_vs_remote = "REMOTE_DIFFERS"
 
     version_status = (
         "CODE_CHANGED_AFTER_PROCESS_START"
@@ -165,7 +165,7 @@ def build_comparison(startup: dict, local: dict, remote: dict, is_ancestor=None)
         alerts.append("工作区存在代码改动")
     if local_vs_remote == "REMOTE_UNKNOWN":
         alerts.append("GitHub 生产分支 HEAD 暂不可达")
-    if local_vs_remote == "DIFFERENT":
+    if local_vs_remote == "REMOTE_DIFFERS":
         alerts.append("本地与 GitHub 生产分支不一致(方向未知)")
     return {
         "process_vs_local": process_vs_local,
@@ -348,7 +348,8 @@ class ProductionIdentityService:
                     all_queries_ok = False
                 if isinstance(data, dict):
                     if "error" in data:
-                        entry["state"] = "UNKNOWN"   # 单任务降级,不拖垮整块
+                        entry["state"] = "UNKNOWN"   # error payload = 查询失败 → 整块降级
+                        all_queries_ok = False
                     else:
                         entry.update({
                             "registered": True,

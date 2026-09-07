@@ -1269,7 +1269,7 @@ function test_production_identity_seams() {
         piStatusText("CODE_CHANGED_AFTER_PROCESS_START") === "⚠ 代码已更新但进程未重启(进程仍在运行旧版本)" &&
         piStatusText("BEHIND") === "⚠ 当前生产机运行版本落后于 GitHub Production HEAD" &&
         piStatusText("AHEAD") === "⚠ 本地存在未推送的生产提交" &&
-        piStatusText("DIFFERENT") === "⚠ 本地与 GitHub 生产分支不一致(方向未知)" &&
+        piStatusText("REMOTE_DIFFERS") === "⚠ 本机代码与 GitHub 生产分支不一致" &&
         piStatusText("REMOTE_UNKNOWN") === "GitHub 生产分支 HEAD 暂不可达(本地版本状态未知)" &&
         piStatusText("UNKNOWN") === "运行版本状态未知" &&
         piStatusText(null) === "运行版本状态未知" &&
@@ -1286,7 +1286,7 @@ function test_production_identity_seams() {
         piStatusWord("CODE_CHANGED_AFTER_PROCESS_START") === "代码已更新未重启" &&
         piStatusWord("BEHIND") === "落后远端" &&
         piStatusWord("AHEAD") === "领先远端" &&
-        piStatusWord("DIFFERENT") === "与远端分叉" &&
+        piStatusWord("REMOTE_DIFFERS") === "与远端不一致" &&
         piStatusWord("REMOTE_UNKNOWN") === "远端不可达" &&
         piStatusWord("UNKNOWN") === "未知" &&
         piStatusWord(undefined) === "未知");

@@ -1419,7 +1419,7 @@
     CODE_CHANGED_AFTER_PROCESS_START: "⚠ 代码已更新但进程未重启(进程仍在运行旧版本)",
     BEHIND: "⚠ 当前生产机运行版本落后于 GitHub Production HEAD",
     AHEAD: "⚠ 本地存在未推送的生产提交",
-    DIFFERENT: "⚠ 本地与 GitHub 生产分支不一致(方向未知)",
+    REMOTE_DIFFERS: "⚠ 本机代码与 GitHub 生产分支不一致",
     REMOTE_UNKNOWN: "GitHub 生产分支 HEAD 暂不可达(本地版本状态未知)",
   };
   function piStatusText(versionStatus) {
@@ -1430,7 +1430,7 @@
     CODE_CHANGED_AFTER_PROCESS_START: "代码已更新未重启",
     BEHIND: "落后远端",
     AHEAD: "领先远端",
-    DIFFERENT: "与远端分叉",
+    REMOTE_DIFFERS: "与远端不一致",
     REMOTE_UNKNOWN: "远端不可达",
   };
   function piStatusWord(versionStatus) {

@@ -144,6 +144,7 @@ def test_case3_ls_remote_failure_degrades_remote_only():
     assert snap["startup"]["status"] == "OK"
     assert snap["scheduler"]["status"] == "OK"
     assert snap["comparison"]["version_status"] == "REMOTE_UNKNOWN"
+    assert snap["comparison"]["local_vs_remote"] == "REMOTE_UNKNOWN"
     assert "GitHub 生产分支 HEAD 暂不可达" in snap["comparison"]["alerts"]
 
 
@@ -233,7 +234,7 @@ def test_case5_runner_returns_minus_one_everywhere():
     assert snap["scheduler"]["status"] == "UNKNOWN"
 
 
-# ---- Case 6:调度器查询失败(垃圾输出/超时)→ scheduler UNKNOWN 不抛;"null" → registered False ----
+# ---- Case 6:调度器查询失败(垃圾输出/超时/error payload)→ scheduler UNKNOWN 不抛;"null" → registered False ----
 
 def test_case6_scheduler_garbage_output_is_unknown():
     scripts = base_scripts(SHA_A, remote_sha=SHA_A)
@@ -281,18 +282,18 @@ def test_case6_scheduler_registered_task_fields_mapped():
     assert task["action"] == "C:\\Windows\\SYSTEM32\\cmd.exe"
 
 
-def test_case6_scheduler_error_json_degrades_task_not_block():
+def test_case6_scheduler_error_payload_degrades_block():
     scripts = base_scripts(SHA_A, remote_sha=SHA_A)
     scripts["query_scheduled_task_json"] = ok('{"error":"Something failed"}')
     svc, _ = make_service(scripts)
-    snap = svc.snapshot()
-    # ps1 契约:异常也会以 JSON+exit 0 返回 → 查询管道可用,仅该任务降级
-    assert snap["scheduler"]["status"] == "OK"
+    snap = svc.snapshot()  # 不抛
+    # error payload = 查询失败,整块降级
+    assert snap["scheduler"]["status"] == "UNKNOWN"
     assert snap["scheduler"]["tasks"][0]["registered"] is False
     assert snap["scheduler"]["tasks"][0]["state"] == "UNKNOWN"
 
 
-# ---- BEHIND / AHEAD / DIFFERENT:merge-base --is-ancestor rc 组合 ----
+# ---- BEHIND / AHEAD / REMOTE_DIFFERS:merge-base --is-ancestor rc 组合 ----
 
 def test_remote_ahead_of_local_is_behind():
     scripts = base_scripts(SHA_A, remote_sha=SHA_B)
@@ -312,24 +313,41 @@ def test_local_ahead_of_remote_is_ahead():
     assert svc.snapshot()["comparison"]["local_vs_remote"] == "AHEAD"
 
 
-def test_ancestor_both_ways_fail_is_different():
+def test_ancestor_both_ways_fail_is_remote_differs():
     scripts = base_scripts(SHA_A, remote_sha=SHA_B)
     scripts[f"is-ancestor {SHA_A} {SHA_B}"] = fail("", rc=1)
     scripts[f"is-ancestor {SHA_B} {SHA_A}"] = fail("", rc=1)
     svc, _ = make_service(scripts)
     cmp = svc.snapshot()["comparison"]
-    assert cmp["local_vs_remote"] == "DIFFERENT"
+    assert cmp["local_vs_remote"] == "REMOTE_DIFFERS"
+    assert cmp["version_status"] == "REMOTE_DIFFERS"
     assert "本地与 GitHub 生产分支不一致(方向未知)" in cmp["alerts"]
 
 
-def test_ancestor_missing_objects_rc128_falls_to_different():
+def test_ancestor_missing_objects_rc128_falls_to_remote_differs():
     scripts = base_scripts(SHA_A, remote_sha=SHA_B)
     scripts[f"is-ancestor {SHA_A} {SHA_B}"] = fail("fatal: Not all commits exist\n", rc=128)
     scripts[f"is-ancestor {SHA_B} {SHA_A}"] = fail("fatal: Not all commits exist\n", rc=128)
     svc, _ = make_service(scripts)
     cmp = svc.snapshot()["comparison"]
-    assert cmp["local_vs_remote"] == "DIFFERENT"
+    assert cmp["local_vs_remote"] == "REMOTE_DIFFERS"
+    assert cmp["local_vs_remote"] not in ("MATCH", "BEHIND", "AHEAD")
     assert "本地与 GitHub 生产分支不一致(方向未知)" in cmp["alerts"]
+
+
+def test_code_changed_priority_over_remote_differs():
+    """CODE_CHANGED_AFTER_PROCESS_START 优先级最高:local 与 remote 也不一致
+    (双向 is-ancestor 失败)时,version_status 仍是进程未重启,不被改写。"""
+    scripts = base_scripts(SHA_A, remote_sha=SHA_B)
+    # startup 捕获吃掉第一个 SHA_A;local 快照刷新得到 SHA_C
+    scripts["rev-parse HEAD"] = [ok(SHA_A + "\n"), ok(SHA_C + "\n")]
+    scripts[f"is-ancestor {SHA_C} {SHA_B}"] = fail("", rc=1)
+    scripts[f"is-ancestor {SHA_B} {SHA_C}"] = fail("", rc=1)
+    svc, _ = make_service(scripts)
+    cmp = svc.snapshot()["comparison"]
+    assert cmp["process_vs_local"] == "CODE_CHANGED_AFTER_PROCESS_START"
+    assert cmp["version_status"] == "CODE_CHANGED_AFTER_PROCESS_START"
+    assert cmp["local_vs_remote"] == "REMOTE_DIFFERS"
 
 
 def test_build_comparison_pure_function_without_runner():
