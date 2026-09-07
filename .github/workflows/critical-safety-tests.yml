@@ -54,6 +54,25 @@ jobs:
           python -m pip install -r requirements.txt --constraint .github/constraints-ci.txt
           # tzdata：ZoneInfo("Asia/Shanghai") 在 Windows 必需（requirements.txt 未声明，见 constraints 注释）
           python -m pip install --constraint .github/constraints-ci.txt pytest-timeout tzdata
+      # 部分安全测试与生产机绝对路径耦合：适配器对招商局外部工具做 is_file()
+      # 存在性预检（测试自身已 monkeypatch _load_module 注入假工具，桩文件永不执行）；
+      # 自启 preview 语义测试真实执行 E:\Python314\python.exe 探针。
+      # 本步骤只在 Runner 临时盘构造这两条路径（subst + junction），不触任何外部系统。
+      - name: Prepare production-shape paths (CI only)
+        shell: pwsh
+        run: |
+          $eRoot = Join-Path $env:RUNNER_TEMP "e_drive"
+          New-Item -ItemType Directory -Force $eRoot | Out-Null
+          cmd /c subst E: "$eRoot"
+          if ($LASTEXITCODE -ne 0) { throw "subst E: failed" }
+          python -c "from pathlib import Path; p = Path('E:/.A2026/' + '\u62db\u5546\u5c40\u81ea\u52a8\u5efa\u4efb\u52a1' + '/external_tools/crawl_task_tool/auto_crawl_task.py'); p.parent.mkdir(parents=True, exist_ok=True); p.write_text('# CI existence stub: tests monkeypatch _load_module; only the is_file() preflight reads this path.\n', encoding='utf-8'); print('STUB_OK', p.is_file())"
+          if ($LASTEXITCODE -ne 0) { throw "external tool stub creation failed" }
+          $pyDir = Split-Path -Parent (Get-Command python).Source
+          cmd /c mklink /J "E:\Python314" "$pyDir"
+          if ($LASTEXITCODE -ne 0) { throw "mklink E:\Python314 failed" }
+          & "E:\Python314\python.exe" --version
+          if ($LASTEXITCODE -ne 0) { throw "junction python not executable" }
+          Write-Host "PREPARE_OK"
       # 清单来源：2026-09-04 审计确认的 CI_SAFE 纯逻辑安全测试（50 个文件）；
       # 本地干净 worktree 实测 1376 收集 / 1375 通过 / 1 失败（唯一失败即下方
       # --deselect 的那个，因生产机 gitignored data/ 的 curl 文件在 CI 不存在）。
@@ -113,4 +132,4 @@ jobs:
           tests/test_legacy_adapter_progress_stop.py
           tests/test_cnnc_saas_snapshot_adapter.py
           --deselect "tests/test_remote_running_recovery.py::test_default_dependencies_wire_probe_and_write_gated_restart"
-          -q --timeout=600 --timeout-method=thread
+          -q -l --timeout=600 --timeout-method=thread
