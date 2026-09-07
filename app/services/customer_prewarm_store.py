@@ -90,6 +90,12 @@ CREATE TABLE IF NOT EXISTS prewarm_sync_ledger (
     created_at TEXT NOT NULL,
     UNIQUE(source, source_event_key)
 );
+CREATE TABLE IF NOT EXISTS prewarm_recovery_runs (
+    id INTEGER PRIMARY KEY,
+    business_date TEXT NOT NULL,
+    ran_at TEXT NOT NULL,
+    documents_seen INTEGER NOT NULL
+);
 """
 
 CACHE_STATUS_PENDING_LOOKUP = "PENDING_LOOKUP"
@@ -638,6 +644,28 @@ class CustomerPrewarmStore:
                    WHERE source=? AND source_event_key=?
                      AND cache_result_id IS NULL AND error IS NULL""",
                 (source_value, key_value),
+            )
+
+    # ---- scanner recovery runs (Issue #9 Round 3 Finding A) -----------------------
+
+    def last_recovery_run_at(self) -> str | None:
+        """``ran_at`` of the most recent scanner recovery run (None if never run)."""
+        with self._reader() as connection:
+            row = connection.execute(
+                "SELECT MAX(ran_at) AS ran_at FROM prewarm_recovery_runs"
+            ).fetchone()
+        value = row["ran_at"] if row is not None else None
+        return value or None
+
+    def record_recovery_run(self, business_date: str, documents_seen: int) -> None:
+        """Append one scanner recovery run row (throttle bookkeeping, Issue #9)."""
+        business_date_value = self._require_text(business_date, "business_date")
+        with self._transaction(immediate=True) as connection:
+            connection.execute(
+                """INSERT INTO prewarm_recovery_runs
+                   (business_date, ran_at, documents_seen)
+                   VALUES (?, ?, ?)""",
+                (business_date_value, self._utcnow(), int(documents_seen)),
             )
 
     # ---- stats ---------------------------------------------------------------------

@@ -21,6 +21,7 @@ EXPECTED_TABLES = {
     "prewarm_candidates",
     "prewarm_links",
     "prewarm_sync_ledger",
+    "prewarm_recovery_runs",
 }
 
 

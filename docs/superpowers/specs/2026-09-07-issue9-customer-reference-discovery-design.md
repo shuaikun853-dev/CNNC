@@ -168,3 +168,35 @@ Dashboard/手动重爬(#13)、STEP2 三表(#8)。#9 到 `PENDING_PREWARM` 为止
    legacy 招商局导出历史=#10 契约。
 6. **dry-run 真实化(F6)**:见上文"Dry-run"节;`sync_daily_internet_results` /
    `run_prewarm_scan` 不再有 dry_run 参数(写入安全性由 CLI 组合 sandbox 路径保证)。
+
+## Round 3 修订记录(2026-09-07,生产 restack 至 ccfc226 之后)
+
+基线移动(2bc7cc6→ccfc226,CI/Production Identity/Readiness/Dashboard,与 #7/#9 零文件
+重叠)触发非破坏性 restack:#7 三提交→`feat/issue-7-shared-crawl-cache-restack-20260907`
+@8ab92ce(零冲突,#7 五文件与 32457a4 逐字节一致);#9 两提交→
+`feat/issue-9-customer-reference-discovery-restack-20260907`(零冲突,TESTING.md 双侧
+内容保留:生产 CI/Readiness 说明 + #9 prewarm 命令块)。
+
+1. **Finding A — customer-only scanner 恢复 seam**:新增
+   `CnncSaasSnapshotAdapter.fetch_customer_documents()`(纯增量,同 fetch() 的冻结
+   scope 校验与 customer 分页/重试/漂移机制,只跳过 SaaS 侧——满足"窄 seam、不重复
+   重 SaaS 工作");scanner Phase B2 `recover_customer_documents()`(新表
+   prewarm_recovery_runs 节流,默认 300s,0=每轮;source='scanner-recovery';
+   CLI 在两个 curl 模板齐备时接线,缺失 WARNING 降级)。event intake 整次失败时
+   customer-only 文档最迟 5 分钟内可由该只读查询恢复;STEP1 state.sqlite3 字节零变化
+   (hash 断言);dry-run 走同一真实 seam。行整形 `prewarm_rows_from_customer_rows`
+   first-wins 去重(重复 documentId 不抛错,scanner 不因奇异数据崩溃)。
+2. **Finding B — daily-internet SKU evidence 降级**：沿真实调用链核实
+   (saas skuId→CrawlRequest.sku_id→模板商品编码→export 回显→crawl_work.result_json):
+   identity 映射按构造强制 result code == 提交 sku(URL-only 回退也继承唯一提交 sku),
+   result_json 无任何独立页面 SKU 列 → 证据类别=A(请求/模板回显)。#7 冻结枚举
+   无"上游 SaaS 提供、非页面确认"状态 → **SPEC_CONFLICT**(已上报);在用户决策前
+   按许可的保守路线落地:`sku_status=UNRESOLVED`+`real_sku_id=None` 恒定,上游值
+   原样保留于 `payload["request_sku_id"]`(未来若增加 UPSTREAM_PROVIDED 类状态,
+   可凭 payload 重记历史而无需重爬)。placeholder(zhpq-*)/ROW* 结构上不可能再进入
+   real_sku_id;#7 防护与其余 producer 的 CONFIRMED/URL_PARSED_UNVERIFIED 路径不受影响。
+3. **dry-run sandbox 缓存新鲜度**:`snapshot_cache_readonly(source, dest, *,
+   sandbox_root=None)` 增加守卫式全新快照语义——仅当 dest 严格位于 sandbox_root
+   内时,复制前(及 source 缺失时)删除 dest 及其 -wal/-shm 伴生;source 缺失时
+   绝不再静默沿用上一次 dry-run 的旧 sandbox 缓存(返回 stale_sandbox_removed)。
+   沙箱外/未传 sandbox_root 行为逐字节不变——生产路径永不可删。
