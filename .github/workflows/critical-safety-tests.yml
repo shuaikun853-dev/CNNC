@@ -4,20 +4,22 @@
 # 2. --deselect 排除的 tests/test_remote_running_recovery.py::test_default_dependencies_wire_probe_and_write_gated_restart
 #    依赖生产机上 gitignored data/ 目录下的 curl 文件（环境差异，非代码 bug）。
 # 3. 本 workflow 只读只测：无 Secret、无部署、无生产写。
+# 4. 触发契约：开发分支(feat/fix/hotfix/refactor)重要文件 push 自动测试；
+#    任何 → prod 的 PR 必定产生 Check；workflow_dispatch 已移除
+#    （默认分支 main 无本文件，入口不可用）。
 name: CNNC Critical Safety Tests
 
 on:
-  pull_request:
-    branches: [prod/closeout-20260818]
-    paths:
-      - app/**
-      - scripts/**
-      - tests/**
-      - requirements.txt
-      - .github/workflows/critical-safety-tests.yml
-      - .github/constraints-ci.txt
+  # 契约 1：GLM 开发分支重要代码 push -> 自动 CI（paths 过滤节省 Actions 分钟；
+  # 只改文档/README 等不触发）。分支模式 = 仓库实际开发命名（feat/fix/hotfix/refactor），
+  # tmp/*、wip/* 等临时/旁支目录有意不触发。
   push:
-    branches: [prod/closeout-20260818]
+    branches:
+      - feat/**
+      - fix/**
+      - hotfix/**
+      - refactor/**
+      - prod/closeout-20260818
     paths:
       - app/**
       - scripts/**
@@ -25,7 +27,11 @@ on:
       - requirements.txt
       - .github/workflows/critical-safety-tests.yml
       - .github/constraints-ci.txt
-  workflow_dispatch: {}
+  # 契约 2：任何指向生产的 PR 必定产生本 Check（不设 paths——
+  # 兼容未来 Required Status Check，避免 Workflow 被跳过导致 Check 永远 Pending）。
+  pull_request:
+    branches:
+      - prod/closeout-20260818
 
 permissions:
   contents: read
