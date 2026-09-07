@@ -17,7 +17,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, time
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Mapping, Sequence
 from zoneinfo import ZoneInfo
 
 from app.services.cnnc_saas_snapshot_adapter import CnncSaasSnapshotAdapter
@@ -27,6 +27,8 @@ from app.services.customer_price_semantics import (
     DetailRequestError,
     is_retryable_detail_http_status,
 )
+from app.services.customer_prewarm_discovery import intake_documents
+from app.services.customer_prewarm_store import CustomerPrewarmStore
 from app.services.batch_zhaoshang_adapter import (
     BatchProgressStatus,
     BatchReconcileStatus,
@@ -1027,6 +1029,20 @@ def snapshot_discoverer(
     return discover
 
 
+def _prewarm_intake_worker(store_path: Path) -> Callable[[str, Sequence[Mapping[str, Any]]], None]:
+    """Issue #9 sidecar intake: upsert discovered documents into the prewarm store.
+
+    Exceptions propagate to the tick hook, which counts them and continues;
+    this worker itself performs no network or remote action.
+    """
+    store = CustomerPrewarmStore(store_path)
+
+    def intake(business_date: str, rows: Sequence[Mapping[str, Any]]) -> None:
+        intake_documents(store, business_date, rows, source="event")
+
+    return intake
+
+
 def _detail_worker(
     template: Mapping[str, Any],
     *,
@@ -1921,6 +1937,12 @@ def build_default_dependencies(
         # Read-only wait/export and exact unknown-submit reconciliation remain
         # available on ordinary ticks. Only planner+submit are write-capable.
         dependencies.harvest = harvester
+        # Issue #9 sidecar: best-effort enqueue of discovered documents into
+        # the prewarm inbox. The tick hook catches every exception and only
+        # counts it; drain-only dependencies stay without it on purpose.
+        dependencies.prewarm_intake = _prewarm_intake_worker(
+            paths.run_dir.parent / "customer_prewarm.sqlite3"
+        )
     if enable_zhaoshang:
         if paths is None or business_date is None:
             raise RuntimeConfigurationError("Zhaoshang runtime paths and business date are required")
