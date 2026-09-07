@@ -99,25 +99,42 @@ foreign_keys=ON、busy_timeout=5000、WAL、写事务 BEGIN IMMEDIATE、短事�
 - 每 1 分钟一次、无窗口、不长驻:`ProcessLock(<runtime_root>/customer_prewarm.lock)`
   非阻塞,冲突→打印 `SKIPPED_ALREADY_RUNNING` exit 0;预算默认 50s(<60s 间隔)。
 - Phase 顺序 A→B→C→D(A 先于 D,当日新同步当天可被 refresh 吸收);每 Phase 独立
-  try/except,单条失败记录后继续(Case 8),bounded(detail_max_attempts 默认 5 → FAILED)。
+  try/except,单条失败记录后继续(Case 8);单轮 bounded(max_documents),失败条按
+  指数退避延后重试,永不因次数变终态(Round 2 F3)。
 - detail 只读、走全局 `detail.lock`(非阻塞拿不到则本轮跳过 detail,下一分钟再来)。
 - 不注册生产计划任务;`scripts/register_customer_prewarm_scan_tasks.ps1` 仅提供
   installer(PT1M、IgnoreNew、Hidden、Limited,模式复制既有 register 脚本),由用户后续授权执行。
 
-## Dry-run(§十五)
+## Dry-run(§十五;Round 2 修订)
 
-`--dry-run`:prewarm store 写入 `--sandbox-root`(明确测试目录);shared cache 只读
-(`--cache-path`,默认 sandbox 新库)——lookup 照常、`record_success` 只计数
-`would_record` 不写;detail 真实只读调用(验证发现量);禁招商局/史泰博/SaaS write/
-审批/推送。输出统计:发现 document 数、reference URL 数、商城分布、历史/daily 命中数、
-MISS 数、重复 document→URL 数、detail 失败数。
+`--dry-run`:prewarm store 与锁全部落在 `--sandbox-root`(默认 `<runtime_root>/prewarm_dry_run`);
+写入目标缓存恒为 sandbox。扫描前先把**来源**缓存(默认生产 `shared_crawl_cache.sqlite3`,
+或 `--cache-path` 指定的源)以只读快照复制进 sandbox——SQLite `mode=ro` 连接 + backup API,
+对源零写入(无 schema init/WAL/DDL,主文件字节不变;只读访问可能触碰瞬态 `-shm/-wal` 伴生文件)。
+随后正常扫描:当日 daily internet 成功行**真实写入 sandbox 缓存**,Phase C/D 因此能看见
+"今天正常互联网已爬过"的命中;生产缓存与 state 库字节级零变化(测试以 sha256 断言)。
+detail 真实只读调用(验证发现量);禁招商局/史泰博/SaaS write/审批/推送。
+`--cache-path` 在 dry-run 下语义=只读快照来源;与 sandbox 写入目标相同则 exit 2 拒绝自拍。
+
+## 历史 backfill(Round 2 新增)
+
+- **#9 本票实现**:过去 N 天(≤90)`state.sqlite3` 的 daily-internet 历史成功行回填——
+  `backfill_daily_history()` 复用 `sync_daily_internet_results`(同一行级成功语义、同一
+  `source_event_key` 幂等账本,business_date 已嵌入 key → 全局唯一、可中断续跑、重跑零重复);
+  CLI `--backfill-history N` 单独模式(不跑扫描相位,同锁防重入)。只读历史 state 库,
+  不建任何招商局任务,不按 SKU 合并。
+- **#10 验收契约(本票不实现)**:legacy STEP3 招商局导出工作簿(zs_result xlsx)的历史
+  成功结果导入 Shared Crawl Cache——必须复用既有成熟映射
+  (`zhaoshang_result_adapter.read_zhaoshang_result_xlsx_by_identity`)而非新写 parser,
+  以 `source='zhaoshang-history'` 走同一 record_success + 幂等账本,且不执行任何新招商局任务。
+  在 #10 落地前,"历史招商局成功复用"的数据来源owner为 #10,#9 不重写映射。
 
 ## 明确不做(本票)
 
 招商局 create/priority=-1/任务复用(#10)、史泰博(#11)、STEP3 cache-first/zhImport(#12)、
 Dashboard/手动重爬(#13)、STEP2 三表(#8)。#9 到 `PENDING_PREWARM` 为止。
 
-## 实现注记(独立验收后)
+## 实现注记(独立验收后;Round 2 修订)
 
 - 提取器对畸形 `referenceInfos` 项按项跳过(永不抛出);STEP3 原块遇此项整篇失败。
   该偏差在 `customer_reference_links.py` 模块注释与等价性测试中双记录。
@@ -125,12 +142,29 @@ Dashboard/手动重爬(#13)、STEP2 三表(#8)。#9 到 `PENDING_PREWARM` 为止
   `_auth_rejected`(payload 认证失败或 401)窄);payload 级认证失败交给下一分钟
   重试与 AT 自然轮换自愈。`provider.refresh` 失败上抛由 process_document 计为
   detail 失败(sidecar 降级,不 fail-fast)。
-- dry-run 默认不指向生产共享缓存;若操作者显式 `--cache-path` 生产库,
-  `SharedCrawlCache` 构造仍会执行幂等 `CREATE TABLE IF NOT EXISTS`(无数据变更)。
-- `prewarm_candidates` 同 mall 场景下 lookup_url 不随路由规则变化刷新;跨 mall
-  变化在未 CACHE_HIT 时保守复用并更新(见 `upsert_link`)。
-- 事件/补扫的 document 集合 = STEP1 已观察并持久化的 joined 行
-  (`audit_items.row_json`);当前生产管线不持久化未匹配 saas 的纯客户文档。
-- detail lock 拿不到时单条计一次 attempt("detail lock busy");5 次/分钟窗口内
-  持续被 STEP1 detail 阶段占锁的极端场景会把文档推入 FAILED,直至 category 变化
-  重置——生产 detail 阶段为短突发,风险接受并在此记录。
+- `prewarm_candidates` identity 严格 `(mall, original_url)`:重见只 bump last_seen;
+  映射表变化使同一 original_url 改路由到另一 mall 时**新建**候选,旧候选与历史证据
+  原样保留;link 行(document_id, original_url)跟随当前路由指向当前候选。
+- prewarm document 集合 = `DiscoveredState.prewarm_rows`(snapshot_discoverer 从
+  customer index 构建的**全部**客户文档,含 customer-only 与缺类目文档);缺
+  fourCategoryId 保持 WAITING(pending 扫描排除空类目,后续 sighting 补类目即恢复)。
+  customer-only 文档不进 STEP1 权威快照(rows 仍为 joined)。
+
+## Round 2 修订记录(2026-09-07,基于 6 项 review findings)
+
+1. **lazy 隔离(F1)**:`_prewarm_intake_worker` 延迟构造 store 到首次 intake 调用
+   (tick try/except 之内);prewarm DB 损坏/权限/锁失败不可能破坏 STEP1 dependency
+   composition,只累计 `prewarm_intake_failures`,下一 tick 自动重试构造。
+2. **全客户覆盖(F2)**:`DiscoveredState.prewarm_rows` 旁路通道(默认 None,STEP1 阶段
+   永不消费);hook 优先取 prewarm_rows,旧 fakes 回落 rows。STEP1 权威 rows/join 语义
+   逐字节不变(测试断言 DOC-B 不出现在 rows)。
+3. **可恢复重试(F3)**:detail 失败不再有 attempt 数终态——`consecutive_failures` +
+   `next_retry_at` 指数退避(min(60·2^(n-1), 3600)s),旧库幂等 ALTER 迁移;
+   detail.lock busy/网络/认证瞬时失败一律可恢复,第 6 次成功即 DONE;
+   FAILED 保留为"可证明确定性"场景的预留值,当前无任何代码路径设置它。
+4. **严格 mall-scoped 候选(F4)**:删除跨 mall 复用/改写分支;A/B 两个候选独立演进,
+   A 的 CACHE_HIT 不影响 B,B 命中保存自己的 resolved_identity_id。
+5. **历史 backfill(F5)**:见上文"历史 backfill"节;daily-internet 历史=#9 已实现,
+   legacy 招商局导出历史=#10 契约。
+6. **dry-run 真实化(F6)**:见上文"Dry-run"节;`sync_daily_internet_results` /
+   `run_prewarm_scan` 不再有 dry_run 参数(写入安全性由 CLI 组合 sandbox 路径保证)。
