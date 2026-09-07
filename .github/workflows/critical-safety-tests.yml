@@ -44,7 +44,8 @@ jobs:
   critical-safety-tests:
     name: CNNC Critical Safety Tests
     runs-on: windows-latest
-    timeout-minutes: 30
+    # 40min:run #15 实测测试步 24:05(1518 用例,冷 Runner 子进程类放大),30min 余量不足。
+    timeout-minutes: 40
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -63,9 +64,13 @@ jobs:
       # （测试自身已 monkeypatch _load_module 注入假工具，桩文件永不执行）；
       # test_dashboard_api 真跑 E:\Python314\python.exe junction 探针。
       # 本步骤只在 Runner 临时盘构造这两条路径（subst + junction），不触任何外部系统。
-      - name: Prepare production-shape paths (CI only)
+      - name: Prepare production-shape environment (CI only)
         shell: pwsh
         run: |
+          # 生产形状:生产机时区=China Standard Time;production_readiness 的
+          # Timezone 检查审计真实宿主(tzutil/UTC偏移/本地日期),Runner 默认 UTC
+          # 会让 all-green 用例真 WARN。设为上海让宿主审计真实通过(非 mock)。
+          try { Set-Timezone -Id "China Standard Time" -ErrorAction Stop } catch { throw "Set-Timezone failed: $_" }
           $eRoot = Join-Path $env:RUNNER_TEMP "e_drive"
           New-Item -ItemType Directory -Force $eRoot | Out-Null
           cmd /c subst E: "$eRoot"
@@ -90,4 +95,4 @@ jobs:
           PYTHONUTF8: "1"  # JS harness 输出 UTF-8，避免 cp1252 Runner 上 subprocess 文本解码崩溃
         run: >
           python -m pytest tests -m critical_safety
-          -q -l --timeout=600 --timeout-method=thread
+          -q -l --durations=25 --timeout=600 --timeout-method=thread
