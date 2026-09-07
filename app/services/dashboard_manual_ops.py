@@ -33,9 +33,9 @@ from app.services.legacy_zhaoshang_adapter import (
 )
 from app.services.recovery.common import RecoveryRejected, _acquire_recovery_lease
 from app.services.recovery.harvest import (
-    _existing_remote_harvest_core,
     is_priority_unconfirmed_manual_family,
     live_identity_proof,
+    run_existing_remote_reexport,
 )
 from app.services.recovery.no_result import EXPORT_NO_PRICE_ACCEPTED_ERRORS
 from app.services.recovery.wait_export import (
@@ -292,8 +292,9 @@ def run_manual_reexport(
     factory-built live identity proof handed to the shared harvest core, whose
     exact-priority-evidence gate admits the "remote task intact, priority
     never confirmed" shape only through that proof (2026-09-04 hotfix).  The
-    export itself always runs the shared harvest core (exact identity,
-    immutable payload, linked crawls, ProcessLock + durable lease,
+    export itself always runs the manual-channel re-export operation
+    ``run_existing_remote_reexport`` over the shared harvest core (exact
+    identity, immutable payload, linked crawls, ProcessLock + durable lease,
     latest-or-frozen snapshot scope, manual requeue only for the whitelisted
     diagnostics plus that one proven-proof family); no create channel exists
     on this path (``create_calls`` is always 0).  ``remote_calls`` and
@@ -400,7 +401,7 @@ def run_manual_reexport(
     )
 
     try:
-        core_result = _existing_remote_harvest_core(
+        core_result = run_existing_remote_reexport(
             state_path=state_path,
             lock_path=lock_path,
             business_date=business_date,
@@ -408,12 +409,7 @@ def run_manual_reexport(
             remote_identity=remote_identity,
             adapter=adapter,
             timeout_seconds=timeout_seconds,
-            admissible_states=frozenset({"SUBMITTED", "RUNNING", "EXPORTED"}),
-            allow_manual_requeue=True,
             manual_requeue_diagnostics=REEXPORT_MANUAL_REQUEUE_DIAGNOSTICS,
-            source_scope="latest",
-            operation="manual re-export",
-            attempt_headroom=2,
             live_identity_proof=proof,
         )
     except LeaseUnavailable as exc:

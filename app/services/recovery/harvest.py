@@ -976,3 +976,48 @@ def run_existing_remote_harvest(
         operation="existing harvest",
         attempt_headroom=1,
     )
+
+
+def run_existing_remote_reexport(
+    *,
+    state_path: Path | str,
+    lock_path: Path | str,
+    business_date: str,
+    remote_job_id: int,
+    remote_identity: str,
+    adapter: CnncLegacyZhaoshangAdapter,
+    timeout_seconds: float,
+    manual_requeue_diagnostics: frozenset[str],
+    live_identity_proof: LiveIdentityProof | None = None,
+) -> dict[str, Any]:
+    """Manually re-export one exact existing remote job; never creates.
+
+    Manual-channel wrapper over the shared harvest protocol: no create path
+    exists and the single remote call is wait-export-only.  This channel owns
+    its admission policy -- SUBMITTED/RUNNING/EXPORTED durable states,
+    whitelisted MANUAL requeue with the exact diagnostics supplied by the
+    operator channel (``manual_requeue_diagnostics``), latest-or-frozen
+    snapshot scope so a re-export works before the freeze, and ``+2`` attempt
+    headroom so a zero-result export plus one immediate re-click stays
+    harvestable.  ``live_identity_proof`` (a factory-built proof from an
+    earlier read-only probe) optionally admits the strict
+    priority-unconfirmed MANUAL family.  Every gate, the ProcessLock +
+    durable lease, payload/crawl validation and durable backfill stay owned
+    by the shared core.
+    """
+    return _existing_remote_harvest_core(
+        state_path=state_path,
+        lock_path=lock_path,
+        business_date=business_date,
+        remote_job_id=remote_job_id,
+        remote_identity=remote_identity,
+        adapter=adapter,
+        timeout_seconds=timeout_seconds,
+        admissible_states=frozenset({"SUBMITTED", "RUNNING", "EXPORTED"}),
+        allow_manual_requeue=True,
+        manual_requeue_diagnostics=manual_requeue_diagnostics,
+        source_scope="latest",
+        operation="manual re-export",
+        attempt_headroom=2,
+        live_identity_proof=live_identity_proof,
+    )
