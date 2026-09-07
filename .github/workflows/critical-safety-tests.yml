@@ -73,9 +73,10 @@ jobs:
           & "E:\Python314\python.exe" --version
           if ($LASTEXITCODE -ne 0) { throw "junction python not executable" }
           Write-Host "PREPARE_OK"
-      # 清单来源：2026-09-04 审计确认的 CI_SAFE 纯逻辑安全测试（50 个文件）；
-      # 本地干净 worktree 实测 1376 收集 / 1375 通过 / 1 失败（唯一失败即下方
-      # --deselect 的那个，因生产机 gitignored data/ 的 curl 文件在 CI 不存在）。
+      # 清单来源：2026-09-04 审计确认的 CI_SAFE 纯逻辑安全测试（50 个文件）+
+      # 2026-09-07 Issue #10 新增 5 个文件（55 个）；本地干净 worktree 实测 1376
+      # 收集 / 1375 通过 / 1 失败（唯一失败即下方 --deselect 的那个，因生产机
+      # gitignored data/ 的 curl 文件在 CI 不存在）。
       - name: Run critical safety tests
         env:
           PYTHONIOENCODING: utf-8
@@ -84,6 +85,9 @@ jobs:
           python -m pytest
           tests/test_customer_price_semantics.py
           tests/test_customer_price_projection.py
+          tests/test_customer_reference_routing.py
+          tests/test_customer_prewarm_dispatch.py
+          tests/test_customer_prewarm_dispatch_cli.py
           tests/test_detail_business_retry.py
           tests/test_incremental_price_audit_finalize.py
           tests/test_incremental_price_audit_force_finalize.py
@@ -131,6 +135,8 @@ jobs:
           tests/test_cnnc_auth_recover.py
           tests/test_legacy_zhaoshang_adapter.py
           tests/test_legacy_adapter_progress_stop.py
+          tests/test_zhaoshang_mall_mapping_aliases.py
+          tests/test_zhaoshang_reference_reuse_dedupe.py
           tests/test_cnnc_saas_snapshot_adapter.py
           --deselect "tests/test_remote_running_recovery.py::test_default_dependencies_wire_probe_and_write_gated_restart"
           -q -l --timeout=600 --timeout-method=thread
