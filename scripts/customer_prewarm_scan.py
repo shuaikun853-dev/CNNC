@@ -5,8 +5,18 @@ never creates a remote task, and never writes the STEP_1 state database.
 Every minute it runs phases A-D (daily sync, catch-up intake, detail scan,
 candidate refresh) against the shared crawl cache under a wall-clock budget.
 Overlap is prevented by a non-blocking process lock; a second instance prints
-``SKIPPED_ALREADY_RUNNING`` and exits 0.  Dry-run mode routes every write into
-an explicit sandbox directory and keeps the shared cache read-only.
+``SKIPPED_ALREADY_RUNNING`` and exits 0.
+
+``--dry-run`` models the real deployment inside a sandbox: the production
+shared cache is snapshotted read-only (SQLite URI ``mode=ro`` + backup API)
+into ``<sandbox_root>/shared_crawl_cache.sqlite3``, and the scan then really
+records into that sandbox copy — the production cache is never written.
+``--cache-path`` in dry-run therefore selects the read-only SOURCE cache to
+snapshot, not the write target.
+
+``--backfill-history N`` runs ONLY the historical backfill: past N calendar
+days (ending at ``--business-date`` inclusive) per-day state DBs are mirrored
+into the shared cache idempotently; scan phases A-D do not run.
 """
 
 from __future__ import annotations
@@ -16,14 +26,18 @@ import json
 import os
 import sys
 import time
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from app.services.customer_prewarm_discovery import run_prewarm_scan
+from app.services.customer_prewarm_discovery import (
+    backfill_daily_history,
+    run_prewarm_scan,
+    snapshot_cache_readonly,
+)
 from app.services.customer_prewarm_store import CustomerPrewarmStore
 from app.services.daily_audit_store import LeaseUnavailable, ProcessLock
 from app.services.incremental_audit_runtime import (
@@ -176,10 +190,22 @@ def build_parser() -> argparse.ArgumentParser:
         "pending document consumes an attempt and no detail request is made",
     )
     parser.add_argument(
+        "--backfill-history",
+        type=int,
+        default=None,
+        metavar="N",
+        help="backfill-only mode: mirror historical daily-internet successes "
+        "from the past N per-day state DBs (calendar days ending at "
+        "--business-date inclusive, 1..90); scan phases A-D do not run",
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="route prewarm writes into the sandbox root and keep the shared "
-        "crawl cache read-only (lookup only, record_success never called)",
+        help="model the real deployment inside the sandbox: the source shared "
+        "cache is snapshotted read-only into "
+        "<sandbox_root>/shared_crawl_cache.sqlite3 and the scan really "
+        "records into that sandbox copy (the production cache is never "
+        "written; prewarm store and lock live under --sandbox-root)",
     )
     parser.add_argument(
         "--sandbox-root",
@@ -192,8 +218,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--cache-path",
         type=Path,
         default=None,
-        help="shared crawl cache path; default <runtime_root>/shared_crawl_cache.sqlite3, "
-        "in dry-run <sandbox_root>/shared_crawl_cache.sqlite3",
+        help="shared crawl cache path; in normal runs this is the write target "
+        "(default <runtime_root>/shared_crawl_cache.sqlite3); in dry-run it is "
+        "the read-only SOURCE cache to snapshot (same default), while the "
+        "write target is always <sandbox_root>/shared_crawl_cache.sqlite3",
     )
     parser.add_argument(
         "--json-output",
@@ -211,7 +239,12 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _resolve_paths(args: argparse.Namespace, business_date: str):
-    """Resolve all concrete paths; returns a dict of resolved Path values."""
+    """Resolve all concrete paths; returns a dict of resolved Path values.
+
+    Dry-run splits the cache into a read-only SOURCE (snapshot input,
+    ``cache_source``) and the sandbox write target (``cache_write_path``);
+    normal runs write the cache path directly (``cache_source`` is unused).
+    """
     runtime_root = Path(args.runtime_root).resolve()
     paths = runtime_paths(business_date, runtime_root)
     sandbox_root = (
@@ -222,22 +255,29 @@ def _resolve_paths(args: argparse.Namespace, business_date: str):
     if args.dry_run:
         prewarm_store_path = sandbox_root / PREWARM_STORE_NAME
         lock_path = sandbox_root / PREWARM_LOCK_NAME
+        cache_write_path = sandbox_root / SHARED_CACHE_NAME
+        cache_source = (
+            Path(args.cache_path).resolve()
+            if args.cache_path is not None
+            else runtime_root / SHARED_CACHE_NAME
+        )
     else:
         prewarm_store_path = runtime_root / PREWARM_STORE_NAME
         lock_path = runtime_root / PREWARM_LOCK_NAME
-    if args.cache_path is not None:
-        cache_path = Path(args.cache_path).resolve()
-    elif args.dry_run:
-        cache_path = sandbox_root / SHARED_CACHE_NAME
-    else:
-        cache_path = runtime_root / SHARED_CACHE_NAME
+        cache_write_path = (
+            Path(args.cache_path).resolve()
+            if args.cache_path is not None
+            else runtime_root / SHARED_CACHE_NAME
+        )
+        cache_source = cache_write_path
     return {
         "runtime_root": runtime_root,
         "sandbox_root": sandbox_root,
         "state_db_path": paths.state_path,
         "prewarm_store_path": prewarm_store_path,
         "lock_path": lock_path,
-        "cache_path": cache_path,
+        "cache_write_path": cache_write_path,
+        "cache_source": cache_source,
         "detail_lock_path": runtime_root / DETAIL_LOCK_NAME,
     }
 
@@ -265,11 +305,20 @@ def main(argv: list[str] | None = None) -> int:
     if args.detail_timeout <= 0:
         print("ERROR --detail-timeout must be positive")
         return 2
+    if args.backfill_history is not None and not 1 <= args.backfill_history <= 90:
+        print("ERROR --backfill-history must be between 1 and 90")
+        return 2
     if args.sandbox_root is not None and not args.dry_run:
         print("ERROR --sandbox-root is only used with --dry-run")
         return 2
 
     resolved = _resolve_paths(args, business_date)
+    if args.dry_run and resolved["cache_source"] == resolved["cache_write_path"]:
+        print(
+            f"ERROR --dry-run --cache-path {resolved['cache_source']} equals the "
+            "sandbox write target; refusing to snapshot a cache onto itself"
+        )
+        return 2
     lock = ProcessLock(resolved["lock_path"])
     try:
         lock.acquire(
@@ -285,90 +334,171 @@ def main(argv: list[str] | None = None) -> int:
         print("SKIPPED_ALREADY_RUNNING")
         return 0
     try:
-        # Detail phase C is skipped by max_documents=0 (no attempts consumed);
-        # a missing detail template degrades to the same behaviour.
-        detail_fetch = _disabled_detail_fetch
-        max_documents = 0
-        if not args.skip_detail:
-            template_path = PROJECT_DATA_ROOT / "detail_request.curl"
-            try:
-                template = (
-                    load_curl_command(template_path) if template_path.is_file() else None
-                )
-            except Exception as exc:  # noqa: BLE001 - degraded template is expected
-                print(f"WARNING detail template unreadable ({type(exc).__name__}); behaving like --skip-detail")
-                template = None
-            if template is None:
-                if template_path.is_file():
-                    print("WARNING detail template empty; behaving like --skip-detail")
-                else:
-                    print(f"WARNING detail template missing: {template_path}; behaving like --skip-detail")
-            else:
-                detail_fetch = _build_detail_fetcher(
-                    template,
-                    detail_lock_path=resolved["detail_lock_path"],
-                    detail_timeout=args.detail_timeout,
-                    provider=shared_cnnc_provider(),
-                )
-                max_documents = args.max_documents
-
-        mappings = load_zhaoshang_mall_mappings(args.mapping_path)
-        try:
-            summary = run_prewarm_scan(
-                prewarm_store=CustomerPrewarmStore(resolved["prewarm_store_path"]),
-                shared_cache=SharedCrawlCache(resolved["cache_path"]),
-                business_date=business_date,
-                state_db_path=resolved["state_db_path"],
-                mappings=mappings,
-                detail_fetch=detail_fetch,
-                max_documents=max_documents,
-                refresh_limit=args.refresh_limit,
-                dry_run=args.dry_run,
-                budget_seconds=args.budget_seconds,
-            )
-        except Exception as exc:  # noqa: BLE001 - scheduler-facing failure
-            print(
-                json.dumps(
-                    {
-                        "business_date": business_date,
-                        "outcome": "SCAN_FAILED",
-                        "error_type": type(exc).__name__,
-                    },
-                    ensure_ascii=False,
-                    sort_keys=True,
-                )
-            )
-            return 2
-        summary["business_date"] = business_date
-        summary["dry_run"] = bool(args.dry_run)
-        summary["detail_enabled"] = detail_fetch is not _disabled_detail_fetch
-        summary["mappings"] = len(mappings)
-        print(
-            f"customer_prewarm_scan business_date={business_date} "
-            f"dry_run={bool(args.dry_run)} detail_enabled={summary['detail_enabled']}"
-        )
-        print(
-            f"intake={summary.get('intake_count', 0)} "
-            f"documents_processed={summary.get('documents_processed', 0)} "
-            f"detail_failures={summary.get('detail_failures', 0)} "
-            f"candidate_hits={summary.get('candidate_hits', 0)} "
-            f"candidate_misses={summary.get('candidate_misses', 0)} "
-            f"refresh_checked={summary.get('refresh_checked', 0)} "
-            f"refresh_hits={summary.get('refresh_hits', 0)} "
-            f"ok_synced={summary.get('ok_synced', 0)} "
-            f"already_synced={summary.get('already_synced', 0)} "
-            f"would_record={summary.get('would_record', 0)} "
-            f"phase_errors={len(summary.get('phase_errors', []))}"
-        )
-        if args.json_output is not None:
-            args.json_output.parent.mkdir(parents=True, exist_ok=True)
-            args.json_output.write_text(
-                json.dumps(summary, ensure_ascii=False, sort_keys=True, indent=2),
-                encoding="utf-8",
-            )
-        return 0
+        if args.backfill_history is not None:
+            return _run_backfill(args, business_date, resolved)
+        return _run_scan_pass(args, business_date, resolved)
     finally:
         lock.release()
+
+
+def _backfill_dates(business_date: str, days: int) -> list[str]:
+    """The N calendar days ending at business_date, inclusive, ascending."""
+    end = datetime.fromisoformat(business_date).date()
+    return [
+        (end - timedelta(days=offset)).isoformat() for offset in range(days - 1, -1, -1)
+    ]
+
+
+def _write_json_output(path: Path, summary: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(summary, ensure_ascii=False, sort_keys=True, indent=2),
+        encoding="utf-8",
+    )
+
+
+def _run_backfill(args: argparse.Namespace, business_date: str, resolved: dict) -> int:
+    """--backfill-history mode: only mirror past per-day state DBs, no scan."""
+    dates = _backfill_dates(business_date, args.backfill_history)
+    cache_snapshot: dict[str, object] | None = None
+    try:
+        if args.dry_run:
+            cache_snapshot = snapshot_cache_readonly(
+                resolved["cache_source"], resolved["cache_write_path"]
+            )
+        summary = backfill_daily_history(
+            CustomerPrewarmStore(resolved["prewarm_store_path"]),
+            SharedCrawlCache(resolved["cache_write_path"]),
+            runtime_root=resolved["runtime_root"],
+            business_dates=dates,
+        )
+    except Exception as exc:  # noqa: BLE001 - scheduler-facing failure
+        print(
+            json.dumps(
+                {
+                    "business_date": business_date,
+                    "outcome": "BACKFILL_FAILED",
+                    "error_type": type(exc).__name__,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+        )
+        return 2
+    summary["business_date"] = business_date
+    summary["mode"] = "backfill-history"
+    summary["backfill"] = True
+    summary["backfill_dates"] = dates
+    summary["dry_run"] = bool(args.dry_run)
+    if cache_snapshot is not None:
+        summary["cache_source"] = str(resolved["cache_source"])
+        summary["cache_snapshot"] = cache_snapshot
+    print(
+        f"customer_prewarm_scan backfill-history business_date={business_date} "
+        f"dry_run={bool(args.dry_run)} dates={len(dates)}"
+    )
+    print(
+        f"dates_scanned={summary['dates_scanned']} "
+        f"dates_missing={len(summary['dates_missing'])} "
+        f"ok_synced={summary['ok_synced']} "
+        f"already_synced={summary['already_synced']} "
+        f"transient_failures={summary['transient_failures']} "
+        f"deterministic_failures={summary['deterministic_failures']} "
+        f"errors={len(summary['errors'])}"
+    )
+    if args.json_output is not None:
+        _write_json_output(args.json_output, summary)
+    return 0
+
+
+def _run_scan_pass(args: argparse.Namespace, business_date: str, resolved: dict) -> int:
+    # Detail phase C is skipped by max_documents=0 (no attempts consumed);
+    # a missing detail template degrades to the same behaviour.
+    detail_fetch = _disabled_detail_fetch
+    max_documents = 0
+    if not args.skip_detail:
+        template_path = PROJECT_DATA_ROOT / "detail_request.curl"
+        try:
+            template = (
+                load_curl_command(template_path) if template_path.is_file() else None
+            )
+        except Exception as exc:  # noqa: BLE001 - degraded template is expected
+            print(f"WARNING detail template unreadable ({type(exc).__name__}); behaving like --skip-detail")
+            template = None
+        if template is None:
+            if template_path.is_file():
+                print("WARNING detail template empty; behaving like --skip-detail")
+            else:
+                print(f"WARNING detail template missing: {template_path}; behaving like --skip-detail")
+        else:
+            detail_fetch = _build_detail_fetcher(
+                template,
+                detail_lock_path=resolved["detail_lock_path"],
+                detail_timeout=args.detail_timeout,
+                provider=shared_cnnc_provider(),
+            )
+            max_documents = args.max_documents
+
+    mappings = load_zhaoshang_mall_mappings(args.mapping_path)
+    try:
+        # Dry-run models the real deployment: the source cache is snapshotted
+        # read-only into the sandbox target BEFORE the scan; the scan then
+        # really records into that sandbox copy (see snapshot_cache_readonly).
+        cache_snapshot = None
+        if args.dry_run:
+            cache_snapshot = snapshot_cache_readonly(
+                resolved["cache_source"], resolved["cache_write_path"]
+            )
+        summary = run_prewarm_scan(
+            prewarm_store=CustomerPrewarmStore(resolved["prewarm_store_path"]),
+            shared_cache=SharedCrawlCache(resolved["cache_write_path"]),
+            business_date=business_date,
+            state_db_path=resolved["state_db_path"],
+            mappings=mappings,
+            detail_fetch=detail_fetch,
+            max_documents=max_documents,
+            refresh_limit=args.refresh_limit,
+            budget_seconds=args.budget_seconds,
+        )
+    except Exception as exc:  # noqa: BLE001 - scheduler-facing failure
+        print(
+            json.dumps(
+                {
+                    "business_date": business_date,
+                    "outcome": "SCAN_FAILED",
+                    "error_type": type(exc).__name__,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+        )
+        return 2
+    summary["business_date"] = business_date
+    summary["dry_run"] = bool(args.dry_run)
+    if args.dry_run:
+        summary["cache_source"] = str(resolved["cache_source"])
+        summary["cache_snapshot"] = cache_snapshot
+    summary["detail_enabled"] = detail_fetch is not _disabled_detail_fetch
+    summary["mappings"] = len(mappings)
+    print(
+        f"customer_prewarm_scan business_date={business_date} "
+        f"dry_run={bool(args.dry_run)} detail_enabled={summary['detail_enabled']}"
+    )
+    print(
+        f"intake={summary.get('intake_count', 0)} "
+        f"documents_processed={summary.get('documents_processed', 0)} "
+        f"detail_failures={summary.get('detail_failures', 0)} "
+        f"candidate_hits={summary.get('candidate_hits', 0)} "
+        f"candidate_misses={summary.get('candidate_misses', 0)} "
+        f"refresh_checked={summary.get('refresh_checked', 0)} "
+        f"refresh_hits={summary.get('refresh_hits', 0)} "
+        f"ok_synced={summary.get('ok_synced', 0)} "
+        f"already_synced={summary.get('already_synced', 0)} "
+        f"phase_errors={len(summary.get('phase_errors', []))}"
+    )
+    if args.json_output is not None:
+        _write_json_output(args.json_output, summary)
+    return 0
 
 
 if __name__ == "__main__":

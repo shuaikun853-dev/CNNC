@@ -3,13 +3,25 @@
 This store is deliberately a standalone database file
 (``customer_prewarm.sqlite3``): discovery state must survive across business
 days, so it can never live inside STEP1's per-day ``state.sqlite3``.  The
-schema is pure-addition and idempotent (``CREATE TABLE IF NOT EXISTS``);
+schema is pure-addition and idempotent (``CREATE TABLE IF NOT EXISTS`` plus
+``PRAGMA table_info``/``ALTER TABLE`` migrations for pre-existing databases);
 initialization never touches any other database or sibling file.
 
 Connection handling mirrors ``app/services/shared_crawl_cache.py``:
 connections are never cached, ``PRAGMA foreign_keys=ON`` / ``busy_timeout=5000``
 / WAL, writes run in short ``BEGIN IMMEDIATE`` transactions, reads use
 short-lived connections.
+
+Detail failures are transient by construction (detail.lock busy, network
+errors, auth failures): a document always stays PENDING and is deferred by an
+exponential backoff instead of ever becoming terminal.  ``FAILED`` remains a
+reserved ``detail_state`` value for provably-deterministic cases only; no
+current failure is classified deterministic.
+
+Candidate identity is strictly ``(mall, original_url)``: the same
+``original_url`` under a different mall is a separate candidate and an
+existing candidate is never mutated across malls (cache hits stay append-only
+and mall-attributed).
 
 Phase 1 scope: durable discovery state only (documents, link candidates,
 document-link association, idempotent sync ledger).  Mall routing and Shared
@@ -20,7 +32,7 @@ from __future__ import annotations
 
 import sqlite3
 from contextlib import contextmanager
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -33,6 +45,8 @@ CREATE TABLE IF NOT EXISTS prewarm_documents (
     source TEXT NOT NULL DEFAULT 'event',
     detail_state TEXT NOT NULL DEFAULT 'PENDING',
     detail_attempts INTEGER NOT NULL DEFAULT 0,
+    consecutive_failures INTEGER NOT NULL DEFAULT 0,
+    next_retry_at TEXT,
     last_error TEXT,
     last_checked_at TEXT,
     first_seen_at TEXT NOT NULL,
@@ -95,6 +109,15 @@ _ALLOWED_TRANSITIONS: dict[str, set[str]] = {
     CACHE_STATUS_CACHE_HIT: set(),
 }
 
+# 瞬时 detail 失败的指数退避:60s, 120s, 240s, ... 封顶 1 小时。
+_DETAIL_RETRY_BACKOFF_CAP_SECONDS = 3600
+
+
+def _detail_retry_backoff_seconds(consecutive_failures: int) -> int:
+    if consecutive_failures <= 0:
+        return 0
+    return min(60 * 2 ** (consecutive_failures - 1), _DETAIL_RETRY_BACKOFF_CAP_SECONDS)
+
 
 class CustomerPrewarmStore:
     """Standalone SQLite store for customer prewarm discovery state."""
@@ -142,6 +165,22 @@ class CustomerPrewarmStore:
     def _initialize(self) -> None:
         with self._transaction(immediate=True) as connection:
             connection.executescript(_SCHEMA)
+            # Pure-addition migration for pre-existing (Round-1) databases,
+            # mirroring daily_audit_store._initialize: check PRAGMA
+            # table_info, then ALTER TABLE; idempotent on every open.
+            columns = {
+                row["name"]
+                for row in connection.execute("PRAGMA table_info(prewarm_documents)")
+            }
+            if "consecutive_failures" not in columns:
+                connection.execute(
+                    "ALTER TABLE prewarm_documents "
+                    "ADD COLUMN consecutive_failures INTEGER NOT NULL DEFAULT 0"
+                )
+            if "next_retry_at" not in columns:
+                connection.execute(
+                    "ALTER TABLE prewarm_documents ADD COLUMN next_retry_at TEXT"
+                )
 
     # ---- shared helpers ------------------------------------------------------
 
@@ -211,11 +250,12 @@ class CustomerPrewarmStore:
                 # business_date 是首见日,永不更新;一旦被 event 见过就保持 event。
                 new_source = row["source"] if row["source"] == "event" else source_value
                 if bool(category_value) and category_value != row["four_category_id"]:
-                    # category 变化(含空→非空)→ 重置 PENDING 并清零 attempts。
+                    # category 变化(含空→非空)→ 重置 PENDING 并清零 attempts 与退避。
                     connection.execute(
                         """UPDATE prewarm_documents
                            SET last_seen_at=?, source=?, four_category_id=?,
-                               detail_state='PENDING', detail_attempts=0, last_error=NULL
+                               detail_state='PENDING', detail_attempts=0,
+                               consecutive_failures=0, next_retry_at=NULL, last_error=NULL
                            WHERE document_id=?""",
                         (now, new_source, category_value, document_value),
                     )
@@ -229,17 +269,25 @@ class CustomerPrewarmStore:
             ).fetchone()
             return dict(refreshed) if refreshed is not None else {}
 
-    def pending_documents(self, limit: int, *, max_attempts: int = 5) -> list[dict[str, Any]]:
-        """PENDING docs with a category and attempts left, oldest id first."""
+    def pending_documents(self, limit: int, *, now: datetime | None = None) -> list[dict[str, Any]]:
+        """PENDING docs with a category whose backoff window has passed.
+
+        Oldest id first.  ``now`` is injectable for tests and normalized to
+        the same UTC microsecond ISO format the store writes, so the
+        ``next_retry_at`` comparison is exact.
+        """
         if limit <= 0:
             return []
+        now_value = (
+            now if now is not None else datetime.now(UTC)
+        ).astimezone(UTC).isoformat(timespec="microseconds")
         with self._reader() as connection:
             rows = connection.execute(
                 """SELECT * FROM prewarm_documents
-                   WHERE detail_state='PENDING' AND detail_attempts < ?
-                     AND four_category_id != ''
+                   WHERE detail_state='PENDING' AND four_category_id != ''
+                     AND (next_retry_at IS NULL OR next_retry_at <= ?)
                    ORDER BY id LIMIT ?""",
-                (int(max_attempts), int(limit)),
+                (now_value, int(limit)),
             ).fetchall()
         return [dict(row) for row in rows]
 
@@ -249,29 +297,45 @@ class CustomerPrewarmStore:
         with self._transaction(immediate=True) as connection:
             connection.execute(
                 """UPDATE prewarm_documents
-                   SET detail_state='DONE', last_error=NULL, last_checked_at=?
+                   SET detail_state='DONE', consecutive_failures=0, next_retry_at=NULL,
+                       last_error=NULL, last_checked_at=?
                    WHERE document_id=?""",
                 (self._utcnow(), document_value),
             )
 
     def record_document_detail_failure(
-        self, document_id: str, error: str, *, max_attempts: int = 5
+        self, document_id: str, error: str, *, now: datetime | None = None
     ) -> None:
-        """Bump attempts; at ``max_attempts`` the doc becomes FAILED (terminal
-        until its category changes)."""
+        """Record one transient detail failure; the document always stays PENDING.
+
+        FAILED remains a reserved value for provably-deterministic cases only;
+        no current failure is classified deterministic (detail.lock busy,
+        network errors and auth failures are all transient by construction).
+        The document is deferred by an exponential backoff:
+        ``next_retry_at = now + min(60 * 2**(consecutive_failures - 1), 3600)``
+        seconds.  ``now`` is injectable for tests.
+        """
         document_value = self._require_text(document_id, "document_id")
-        now = self._utcnow()
+        retry_base = (now if now is not None else datetime.now(UTC)).astimezone(UTC)
+        now_text = self._utcnow()
         with self._transaction(immediate=True) as connection:
+            row = connection.execute(
+                "SELECT consecutive_failures FROM prewarm_documents WHERE document_id=?",
+                (document_value,),
+            ).fetchone()
+            consecutive = (int(row["consecutive_failures"]) if row is not None else 0) + 1
+            next_retry_at = retry_base + timedelta(
+                seconds=_detail_retry_backoff_seconds(consecutive)
+            )
             connection.execute(
                 """UPDATE prewarm_documents
                    SET detail_attempts=detail_attempts+1,
+                       consecutive_failures=?,
+                       next_retry_at=?,
                        last_error=?,
-                       last_checked_at=?,
-                       detail_state=CASE
-                           WHEN detail_attempts+1 >= ? THEN 'FAILED'
-                           ELSE detail_state END
+                       last_checked_at=?
                    WHERE document_id=?""",
-                (str(error), now, int(max_attempts), document_value),
+                (consecutive, next_retry_at.isoformat(), str(error), now_text, document_value),
             )
 
     # ---- links / candidates ------------------------------------------------------
@@ -308,52 +372,39 @@ class CustomerPrewarmStore:
         )
         now = self._utcnow()
         with self._transaction(immediate=True) as connection:
+            # Rationale: candidate identity is strictly (mall, original_url).
+            # A mapping-table change that routes the same original_url to a
+            # different mall creates a NEW candidate; an existing candidate is
+            # NEVER re-attributed across malls (mutation would silently rewrite
+            # history and could attach another mall's links to a CACHE_HIT
+            # row).  Only last_seen_at is bumped on re-sight of the same
+            # identity; lookup outcome fields move exclusively through
+            # record_candidate_result.
             candidate = connection.execute(
                 "SELECT * FROM prewarm_candidates WHERE mall=? AND original_url=?",
                 (mall_value, original_value),
             ).fetchone()
             if candidate is None:
-                # Rationale: candidate identity is (mall, original_url).  The
-                # cross-mall same-original_url lookup below handles mapping-table
-                # changes conservatively: reuse the existing candidate only when
-                # it has never been a cache hit (routing may still change before
-                # any hit); CACHE_HIT rows are left untouched (append-only).
+                cursor = connection.execute(
+                    """INSERT INTO prewarm_candidates
+                       (mall, original_url, lookup_url, routing_url, business_date,
+                        source, cache_status, match_level, resolved_identity_id,
+                        last_error, last_checked_at, first_seen_at, last_seen_at)
+                       VALUES (?, ?, ?, ?, ?, ?, 'PENDING_LOOKUP', NULL, NULL, NULL, NULL, ?, ?)""",
+                    (
+                        mall_value,
+                        original_value,
+                        lookup_value,
+                        routing_value,
+                        business_date_value,
+                        source_value,
+                        now,
+                        now,
+                    ),
+                )
                 candidate = connection.execute(
-                    "SELECT * FROM prewarm_candidates WHERE original_url=? ORDER BY id LIMIT 1",
-                    (original_value,),
+                    "SELECT * FROM prewarm_candidates WHERE id=?", (int(cursor.lastrowid),)
                 ).fetchone()
-                if candidate is None:
-                    cursor = connection.execute(
-                        """INSERT INTO prewarm_candidates
-                           (mall, original_url, lookup_url, routing_url, business_date,
-                            source, cache_status, match_level, resolved_identity_id,
-                            last_error, last_checked_at, first_seen_at, last_seen_at)
-                           VALUES (?, ?, ?, ?, ?, ?, 'PENDING_LOOKUP', NULL, NULL, NULL, NULL, ?, ?)""",
-                        (
-                            mall_value,
-                            original_value,
-                            lookup_value,
-                            routing_value,
-                            business_date_value,
-                            source_value,
-                            now,
-                            now,
-                        ),
-                    )
-                    candidate = connection.execute(
-                        "SELECT * FROM prewarm_candidates WHERE id=?", (int(cursor.lastrowid),)
-                    ).fetchone()
-                elif candidate["cache_status"] != CACHE_STATUS_CACHE_HIT:
-                    connection.execute(
-                        """UPDATE prewarm_candidates
-                           SET mall=?, lookup_url=?, routing_url=?, last_seen_at=?
-                           WHERE id=?""",
-                        (mall_value, lookup_value, routing_value, now, int(candidate["id"])),
-                    )
-                    candidate = connection.execute(
-                        "SELECT * FROM prewarm_candidates WHERE id=?", (int(candidate["id"]),)
-                    ).fetchone()
-                # else: CACHE_HIT candidate under another mall - leave untouched.
             else:
                 connection.execute(
                     "UPDATE prewarm_candidates SET last_seen_at=? WHERE id=?",

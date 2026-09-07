@@ -1,7 +1,8 @@
-"""customer_prewarm_store 行为测试(Issue #9 Phase 1)。
+"""customer_prewarm_store 行为测试(Issue #9 Phase 1 + Round 2)。
 
-覆盖:初始化幂等、document 幂等与 category 重置、pending 过滤、detail 成功/
-失败路径、link/candidate 幂等与跨商城复用、状态迁移、ledger 幂等与崩溃恢复、
+覆盖:初始化幂等与旧库迁移、document 幂等与 category 重置、pending 过滤与
+backoff 门控、detail 成功/失败路径(瞬时失败永不 FAILED)、link/candidate
+幂等与严格 (mall, original_url) 身份、状态迁移、ledger 幂等与崩溃恢复、
 stats、WAL/busy 冒烟。
 """
 
@@ -9,6 +10,7 @@ from __future__ import annotations
 
 import sqlite3
 import threading
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -133,43 +135,129 @@ def test_pending_documents_filters_order_and_limit(store):
     store.upsert_document("2026-09-07", "D4", "C4")
     store.upsert_document("2026-09-07", "D5")  # 无 category → 永远排除
     store.record_document_detail_success("D2")  # DONE → 排除
+    at = datetime(2026, 9, 7, 12, 0, 0, tzinfo=UTC)
     for _ in range(5):
-        store.record_document_detail_failure("D3", "x")  # FAILED → 排除
-    store.record_document_detail_failure("D4", "x")
-    store.record_document_detail_failure("D4", "x")  # attempts=2
-    # D5 无 category → 永远排除
-    assert [r["document_id"] for r in store.pending_documents(10)] == ["D1", "D4"]
-    assert [r["document_id"] for r in store.pending_documents(10, max_attempts=2)] == ["D1"]
-    assert [r["document_id"] for r in store.pending_documents(1)] == ["D1"]  # limit + id 升序
+        store.record_document_detail_failure("D3", "x", now=at)  # backoff → 暂时排除
+    store.record_document_detail_failure("D4", "x", now=at)
+    # D5 无 category → 永远排除;D3(960s)/D4(60s)在 backoff 窗口内;D1 无失败始终可领取
+    assert [r["document_id"] for r in store.pending_documents(10, now=at)] == ["D1"]
+    # D4 的 60s backoff 到期后重新可见;D3 的 960s backoff 仍未到期
+    assert [r["document_id"] for r in store.pending_documents(10, now=at + timedelta(seconds=60))] == ["D1", "D4"]
+    assert [r["document_id"] for r in store.pending_documents(10, now=at + timedelta(seconds=960))] == ["D1", "D3", "D4"]
+    assert [r["document_id"] for r in store.pending_documents(1, now=at + timedelta(seconds=960))] == ["D1"]  # limit + id 升序
 
 
 def test_failure_then_success_lifecycle(store):
     store.upsert_document("2026-09-07", "D1", "C1")
-    store.record_document_detail_failure("D1", "网络超时")
-    row = store.pending_documents(10)[0]
+    at = datetime(2026, 9, 7, 12, 0, 0, tzinfo=UTC)
+    store.record_document_detail_failure("D1", "网络超时", now=at)
+    row = store.pending_documents(10, now=at + timedelta(seconds=60))[0]
     assert row["detail_attempts"] == 1
     assert row["last_error"] == "网络超时"
     assert row["last_checked_at"] is not None
     store.record_document_detail_success("D1")
-    assert store.pending_documents(10) == []
+    assert store.pending_documents(10, now=at + timedelta(seconds=60)) == []
     stored = _doc_row(store, "D1")
     assert stored["detail_state"] == "DONE"
     assert stored["last_error"] is None
     assert stored["last_checked_at"] is not None
 
 
-def test_failure_at_max_attempts_becomes_failed(store):
+def test_repeated_failures_never_become_failed_and_backoff_schedule(store):
+    """瞬时失败(detail.lock busy/网络/认证)永不终态:始终 PENDING,按 backoff 推迟。
+
+    FAILED 只是保留值,留给"可证明确定性"的失败;当前不存在任何确定性分类。
+    """
     store.upsert_document("2026-09-07", "D1", "C1")
-    for attempt in range(1, 6):
-        store.record_document_detail_failure("D1", f"e{attempt}")
-        if attempt < 5:
-            assert [r["document_id"] for r in store.pending_documents(10, max_attempts=5)] == ["D1"]
+    base = datetime(2026, 9, 7, 12, 0, 0, tzinfo=UTC)
+    expected_backoffs = [60, 120, 240, 480, 960, 1920, 3600, 3600]
+    for attempt, backoff in enumerate(expected_backoffs, start=1):
+        store.record_document_detail_failure("D1", f"e{attempt}", now=base)
+        stored = _doc_row(store, "D1")
+        assert stored["detail_state"] == "PENDING"
+        assert stored["detail_attempts"] == attempt
+        assert stored["consecutive_failures"] == attempt
+        assert stored["next_retry_at"] == (base + timedelta(seconds=backoff)).isoformat()
+
+
+def test_pending_documents_gates_on_next_retry_at(store):
+    store.upsert_document("2026-09-07", "D1", "C1")
+    at = datetime(2026, 9, 7, 12, 0, 0, tzinfo=UTC)
+    store.record_document_detail_failure("D1", "detail lock busy", now=at)
+    assert store.pending_documents(10, now=at) == []
+    assert store.pending_documents(10, now=at + timedelta(seconds=59)) == []
+    due = at + timedelta(seconds=60)
+    assert [r["document_id"] for r in store.pending_documents(10, now=due)] == ["D1"]
+    # 到期后保持可领取,直到成功/分类变化重置
+    assert [r["document_id"] for r in store.pending_documents(10, now=due + timedelta(days=1))] == ["D1"]
+
+
+def test_success_resets_failure_backoff_state(store):
+    store.upsert_document("2026-09-07", "D1", "C1")
+    base = datetime(2026, 9, 7, 12, 0, 0, tzinfo=UTC)
+    store.record_document_detail_failure("D1", "e1", now=base)
+    store.record_document_detail_failure("D1", "e2", now=base)
+    store.record_document_detail_success("D1")
     stored = _doc_row(store, "D1")
-    assert stored["detail_state"] == "FAILED"
-    assert stored["detail_attempts"] == 5
-    # FAILED 终态:同 category 复见不复活;category 变化才重置
-    assert store.upsert_document("2026-09-07", "D1", "C1")["detail_state"] == "FAILED"
-    assert store.upsert_document("2026-09-07", "D1", "C2")["detail_state"] == "PENDING"
+    assert stored["detail_state"] == "DONE"
+    assert stored["consecutive_failures"] == 0
+    assert stored["next_retry_at"] is None
+    assert store.pending_documents(10, now=base) == []
+
+
+def test_category_change_clears_backoff_state(store):
+    store.upsert_document("2026-09-07", "D1", "C1")
+    base = datetime(2026, 9, 7, 12, 0, 0, tzinfo=UTC)
+    for _ in range(3):
+        store.record_document_detail_failure("D1", "boom", now=base)
+    changed = store.upsert_document("2026-09-07", "D1", "C2")
+    assert changed["detail_state"] == "PENDING"
+    assert changed["consecutive_failures"] == 0
+    assert changed["next_retry_at"] is None
+    # 分类变化立即重新可领取,尽管原 backoff 窗口还没过
+    assert [r["document_id"] for r in store.pending_documents(10, now=base)] == ["D1"]
+
+
+def test_round1_schema_migrates_and_preserves_rows(tmp_path):
+    db = tmp_path / "prewarm.sqlite3"
+    connection = sqlite3.connect(str(db))
+    try:
+        # Round-1 的 prewarm_documents 建表语句(无 consecutive_failures/next_retry_at)
+        connection.execute(
+            """CREATE TABLE prewarm_documents (
+                   id INTEGER PRIMARY KEY,
+                   document_id TEXT NOT NULL UNIQUE,
+                   business_date TEXT NOT NULL,
+                   four_category_id TEXT NOT NULL DEFAULT '',
+                   source TEXT NOT NULL DEFAULT 'event',
+                   detail_state TEXT NOT NULL DEFAULT 'PENDING',
+                   detail_attempts INTEGER NOT NULL DEFAULT 0,
+                   last_error TEXT,
+                   last_checked_at TEXT,
+                   first_seen_at TEXT NOT NULL,
+                   last_seen_at TEXT NOT NULL
+               )"""
+        )
+        connection.execute(
+            """INSERT INTO prewarm_documents
+               (document_id, business_date, four_category_id, source, detail_state,
+                detail_attempts, last_error, last_checked_at, first_seen_at, last_seen_at)
+               VALUES ('D-OLD', '2026-09-06', 'C1', 'event', 'PENDING', 2, 'boom',
+                       NULL, '2026-09-06T00:00:00+00:00', '2026-09-06T00:00:00+00:00')"""
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    store = CustomerPrewarmStore(db)
+    with store._reader() as opened:
+        columns = {row["name"] for row in opened.execute("PRAGMA table_info(prewarm_documents)")}
+    assert {"consecutive_failures", "next_retry_at"} <= columns
+    stored = _doc_row(store, "D-OLD")
+    assert stored["detail_attempts"] == 2
+    assert stored["consecutive_failures"] == 0
+    assert stored["next_retry_at"] is None
+    assert [r["document_id"] for r in store.pending_documents(10, now=datetime(2027, 1, 1, tzinfo=UTC))] == ["D-OLD"]
 
 
 def test_success_sets_done_regardless_of_attempts(store):
@@ -223,34 +311,53 @@ def test_three_documents_share_one_candidate(store):
     assert [link["document_id"] for link in links] == ["D1", "D2", "D3"]
 
 
-def test_cross_mall_reuse_updates_mall_for_non_hit(store):
-    first = store.upsert_link("D1", "https://x.example/1", mall="a")
-    candidate_id = first["candidate"]["id"]
-    second = store.upsert_link("D2", "https://x.example/1", mall="b")
-    assert second["candidate"]["id"] == candidate_id  # 同一 candidate 被复用
-    assert second["candidate"]["mall"] == "b"
-    assert second["candidate"]["cache_status"] == "PENDING_LOOKUP"
-    assert len(store.candidates()) == 1
+def test_cross_mall_same_url_creates_two_strictly_scoped_candidates(store):
+    """候选身份严格为 (mall, original_url):同 URL 换商城 = 新候选,旧候选原样保留。"""
+    first = store.upsert_link("doc-1", "https://x.example/1", mall="A")
+    candidate_a = first["candidate"]
+    assert candidate_a["mall"] == "A"
+    second = store.upsert_link("doc-2", "https://x.example/1", mall="B")
+    candidate_b = second["candidate"]
+    # 第二个候选(商城 B,同 URL)被创建;两个候选 id 不同,字段互不改写
+    assert candidate_b["mall"] == "B"
+    assert candidate_b["original_url"] == candidate_a["original_url"] == "https://x.example/1"
+    assert candidate_b["id"] != candidate_a["id"]
+    assert len(store.candidates()) == 2
+    # 各 document 的 link 指向各自商城的候选
+    assert first["link"]["candidate_id"] == candidate_a["id"]
+    assert second["link"]["candidate_id"] == candidate_b["id"]
+    assert [link["candidate_id"] for link in store.links_for_document("doc-1")] == [candidate_a["id"]]
+    assert [link["candidate_id"] for link in store.links_for_document("doc-2")] == [candidate_b["id"]]
 
 
-def test_cross_mall_reuse_never_touches_cache_hit(store):
+def test_cross_mall_cache_hit_isolation_between_candidates(store):
+    """商城 A 的 CACHE_HIT 不影响商城 B 同 URL 候选的独立状态机。"""
     first = store.upsert_link(
-        "D1", "https://y.example/1", mall="a", routing_url="https://r.example/1"
+        "doc-1", "https://y.example/1", mall="A", routing_url="https://r.example/1"
     )
-    candidate_id = first["candidate"]["id"]
+    candidate_a = first["candidate"]
+    candidate_b = store.upsert_link("doc-2", "https://y.example/1", mall="B")["candidate"]
     store.record_candidate_result(
-        candidate_id, cache_status="CACHE_HIT", match_level="EXACT", resolved_identity_id=42
+        candidate_a["id"], cache_status="CACHE_HIT", match_level="EXACT", resolved_identity_id=42
     )
-    before = store.candidates()[0]
-    second = store.upsert_link("D2", "https://y.example/1", mall="b")
-    after = second["candidate"]
-    assert after["id"] == candidate_id
-    assert after["mall"] == "a"  # CACHE_HIT 行不被改道
-    assert after["routing_url"] == "https://r.example/1"
-    assert after == before
-    # link 仍然挂到同一 candidate
-    assert [link["document_id"] for link in store.links_for_candidate(candidate_id)] == ["D1", "D2"]
-    assert second["link"]["mall"] == "b"
+    # 候选 B 独立走 miss:候选 A 的命中不迁移、不回退、不改道
+    miss_b = store.record_candidate_result(
+        candidate_b["id"], cache_status="PENDING_PREWARM", error="cache miss"
+    )
+    assert miss_b["cache_status"] == "PENDING_PREWARM"
+    assert miss_b["mall"] == "B"
+    # 独立命中:候选 B 拿到自己的 resolved_identity_id
+    hit_b = store.record_candidate_result(
+        candidate_b["id"], cache_status="CACHE_HIT", match_level="MALL_PARSER", resolved_identity_id=99
+    )
+    assert hit_b["cache_status"] == "CACHE_HIT"
+    assert hit_b["resolved_identity_id"] == 99
+    refreshed = {candidate["id"]: candidate for candidate in store.candidates()}
+    assert refreshed[candidate_a["id"]]["resolved_identity_id"] == 42
+    assert refreshed[candidate_a["id"]]["mall"] == "A"
+    assert refreshed[candidate_b["id"]]["resolved_identity_id"] == 99
+    assert refreshed[candidate_b["id"]]["mall"] == "B"
+    assert refreshed[candidate_a["id"]]["routing_url"] == "https://r.example/1"
 
 
 # ---- candidate 状态迁移 --------------------------------------------------------
@@ -361,7 +468,7 @@ def test_stats_counts(store):
     store.upsert_document("2026-09-07", "D4", "C3")
     store.record_document_detail_success("D3")  # DONE
     for _ in range(5):
-        store.record_document_detail_failure("D4", "x")  # FAILED
+        store.record_document_detail_failure("D4", "x")  # 瞬时失败:仍 PENDING
     hit = store.upsert_link("D2", "https://hit.example/1", mall="m")["candidate"]["id"]
     miss = store.upsert_link("D2", "https://miss.example/1")["candidate"]["id"]
     store.upsert_link("D3", "https://lookup.example/1")
@@ -377,7 +484,7 @@ def test_stats_counts(store):
     store.ledger_claim("daily-internet", "evt-pending")
 
     stats = store.stats()
-    assert stats["documents"] == {"PENDING": 2, "DONE": 1, "FAILED": 1}
+    assert stats["documents"] == {"PENDING": 3, "DONE": 1}
     assert stats["candidates"] == {"PENDING_LOOKUP": 1, "PENDING_PREWARM": 1, "CACHE_HIT": 1}
     assert stats["links"] == 4
     assert stats["ledger"] == {"pending": 1, "completed": 1, "errored": 1}

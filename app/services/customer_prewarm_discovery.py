@@ -20,6 +20,12 @@ Cache (:mod:`app.services.shared_crawl_cache`, Issue #7):
   the authoritative per-row semantics of
   ``read_zhaoshang_result_xlsx_by_identity``) into the shared cache through an
   idempotent ledger with crash recovery.
+- :func:`backfill_daily_history` reuses the same sync across past per-day
+  state DBs to backfill daily-internet history (idempotent, resumable,
+  read-only on every historical state DB).
+- :func:`snapshot_cache_readonly` copies a shared cache file into a sandbox
+  with SQLite ``mode=ro`` + the backup API (dry-run support; the source is
+  never opened read-write).
 - :func:`run_prewarm_scan` orchestrates phases A-D with a time budget and
   per-phase error isolation.
 
@@ -49,7 +55,6 @@ from app.services.customer_reference_links import extract_reference_links
 from app.services.shared_crawl_cache import SharedCrawlCache
 from scripts.zhaoshang_mall_mapping import ZhaoshangMallMapping
 
-DETAIL_MAX_ATTEMPTS = 5
 DETAIL_BUDGET_RESERVE_SECONDS = 5.0
 
 
@@ -150,9 +155,10 @@ def process_document(
     ``{"ok": bool, "payload": mapping | None, "error": str | None}``; its
     exceptions are caught and counted as detail failures.  Per-link failures
     are isolated (collected, scan continues).  A detail failure never raises
-    and bumps the bounded attempt counter (FAILED at ``max_attempts=5``).
+    and never becomes terminal: the document stays PENDING and is deferred by
+    the store's exponential backoff, so the next pass retries it.
     A document whose links hit per-link errors (e.g. sqlite busy) also stays
-    retryable: it is recorded as a bounded failure instead of DONE, so the
+    retryable: it is recorded as a deferred failure instead of DONE, so the
     next pass re-processes it and the missing links are not lost.
     """
     document_id = str(document_row["document_id"])
@@ -162,12 +168,12 @@ def process_document(
         response = detail_fetch(document_id, four_category_id)
     except Exception as exc:  # noqa: BLE001 - detail failure must never raise
         error = f"detail fetch exception: {exc}"
-        store.record_document_detail_failure(document_id, error, max_attempts=DETAIL_MAX_ATTEMPTS)
+        store.record_document_detail_failure(document_id, error)
         return {"document_id": document_id, "detail_ok": False, "error": error}
     if not isinstance(response, Mapping) or not response.get("ok"):
         raw_error = response.get("error") if isinstance(response, Mapping) else None
         error = str(raw_error) if raw_error else "detail fetch reported failure"
-        store.record_document_detail_failure(document_id, error, max_attempts=DETAIL_MAX_ATTEMPTS)
+        store.record_document_detail_failure(document_id, error)
         return {"document_id": document_id, "detail_ok": False, "error": error}
 
     links = extract_reference_links(response.get("payload"))
@@ -241,11 +247,10 @@ def process_document(
         if errors:
             # Link-level errors must not mark the document DONE: DONE would hide
             # the not-yet-upserted links forever (they are only written by the
-            # next detail pass). Record a bounded failure so the scan retries.
+            # next detail pass). Record a deferred failure so the scan retries.
             store.record_document_detail_failure(
                 document_id,
                 "link processing errors: " + "; ".join(errors[:3]),
-                max_attempts=DETAIL_MAX_ATTEMPTS,
             )
         else:
             store.record_document_detail_success(document_id)
@@ -332,11 +337,14 @@ def sync_daily_internet_results(
     state_db_path: str | Path,
     business_date: str,
     source: str = "daily-internet",
-    dry_run: bool = False,
     stale_claim_seconds: int = 600,
     now: datetime | None = None,
 ) -> dict[str, Any]:
     """Mirror successful daily crawl rows into the shared cache, idempotently.
+
+    The function always records into whatever cache the caller passed in;
+    safety comes from the caller composing sandbox paths (dry-run snapshots a
+    read-only copy of the production cache and writes into the sandbox).
 
     Row-level success is ``crawl_work.state='SUCCESS'`` AND
     ``result_json.page_price_status=='OK'``.  Each row is keyed by a producer
@@ -359,7 +367,6 @@ def sync_daily_internet_results(
         "skipped_invalid": 0,
         "already_synced": 0,
         "errored_before": 0,
-        "would_record": 0,
         "ok_synced": 0,
         "transient_failures": 0,
         "deterministic_failures": 0,
@@ -449,11 +456,6 @@ def sync_daily_internet_results(
                 continue
         prewarm_store.ledger_claim(source, event_key)
 
-        if dry_run:
-            summary["would_record"] += 1
-            prewarm_store.ledger_complete(source, event_key, error="dry_run")
-            continue
-
         # succeeded_at = crawl_work.updated_at(真实成功时序);无效时间戳降级为
         # None(cache 取当前时刻)并把原文保留进 payload。
         updated_at_raw = row["updated_at"]
@@ -507,6 +509,109 @@ def sync_daily_internet_results(
     return summary
 
 
+# ---- historical backfill (Finding 5) ------------------------------------------------
+
+_SYNC_COUNTER_KEYS = (
+    "scanned",
+    "skipped_non_ok",
+    "skipped_invalid",
+    "already_synced",
+    "errored_before",
+    "ok_synced",
+    "transient_failures",
+    "deterministic_failures",
+    "recovered_claims",
+    "dropped_claims",
+)
+
+
+def backfill_daily_history(
+    prewarm_store: CustomerPrewarmStore,
+    shared_cache: SharedCrawlCache,
+    *,
+    runtime_root: str | Path,
+    business_dates: Sequence[str],
+    source: str = "daily-internet",
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Backfill historical daily-internet successes from past per-day state DBs.
+
+    Reuses sync_daily_internet_results per business date; the sync ledger's
+    source_event_key already embeds business_date, so backfilled events are
+    globally unique, idempotent and resumable: an interrupted run can simply
+    be re-run (completed keys skip, transient failures retry).  Read-only on
+    every historical state DB; never creates remote tasks; no SKU-only merge
+    (SharedCrawlCache URL-identity model only).
+
+    The summary merges the per-sync counters (``per_date[date]`` keeps each
+    date's own summary); one date failing with an unexpected exception is
+    collected into ``errors`` and never aborts the remaining dates.
+    """
+    summary: dict[str, Any] = {
+        "dates_scanned": 0,
+        "dates_missing": [],
+        "errors": [],
+        "per_date": {},
+    }
+    for key in _SYNC_COUNTER_KEYS:
+        summary[key] = 0
+    root = Path(runtime_root)
+    for date in business_dates:
+        state_db = root / str(date) / "state.sqlite3"
+        try:
+            per_date = sync_daily_internet_results(
+                prewarm_store,
+                shared_cache,
+                state_db_path=state_db,
+                business_date=str(date),
+                source=source,
+                now=now,
+            )
+        except Exception as exc:  # noqa: BLE001 - 单日失败不中断整体回填
+            summary["errors"].append(f"{date}: {type(exc).__name__}: {exc}")
+            continue
+        summary["per_date"][str(date)] = per_date
+        if per_date.get("state_db") == "missing":
+            summary["dates_missing"].append(str(date))
+            continue
+        summary["dates_scanned"] += 1
+        for key in _SYNC_COUNTER_KEYS:
+            summary[key] += int(per_date.get(key, 0))
+        summary["errors"].extend(f"{date}: {item}" for item in per_date.get("errors", []))
+    return summary
+
+
+# ---- dry-run cache snapshot (Finding 6) ---------------------------------------------
+
+
+def snapshot_cache_readonly(source: str | Path, dest: str | Path) -> dict[str, object]:
+    """Copy a Shared Crawl Cache file into the sandbox WITHOUT touching the source.
+
+    Opens the source with SQLite URI mode=ro (no schema init, no WAL/DDL, no
+    directory creation) and uses the sqlite backup API to write a consistent
+    snapshot into dest.  A missing source leaves dest untouched (the scan then
+    creates a fresh empty sandbox cache).
+
+    Note: read-only access to a WAL-mode database may leave transient SQLite
+    ``-shm``/``-wal`` sidecar files next to the source; the main database file
+    itself is never written (read-only connections cannot checkpoint).
+    """
+    source_path = Path(source)
+    dest_path = Path(dest)
+    if not source_path.is_file():
+        return {"copied": False, "reason": "missing"}
+    dest_path.parent.mkdir(parents=True, exist_ok=True)
+    src = sqlite3.connect(source_path.resolve().as_uri() + "?mode=ro", uri=True)
+    dst = sqlite3.connect(str(dest_path))
+    try:
+        src.backup(dst)
+        rows = int(dst.execute("SELECT COUNT(*) FROM crawl_results").fetchone()[0])
+    finally:
+        dst.close()
+        src.close()
+    return {"copied": True, "crawl_results": rows}
+
+
 # ---- orchestration ---------------------------------------------------------------
 
 
@@ -544,7 +649,6 @@ def run_prewarm_scan(
     detail_fetch: Callable[[str, str], Mapping[str, Any]],
     max_documents: int = 10,
     refresh_limit: int | None = None,
-    dry_run: bool = False,
     monotonic: Callable[[], float] | None = None,
     budget_seconds: float = 50.0,
 ) -> dict[str, Any]:
@@ -559,7 +663,7 @@ def run_prewarm_scan(
     deadline = clock() + budget_seconds
     summary: dict[str, Any] = {"phase_errors": []}
 
-    # Phase A: daily internet sync (dry_run passthrough)
+    # Phase A: daily internet sync
     try:
         summary.update(
             sync_daily_internet_results(
@@ -567,7 +671,6 @@ def run_prewarm_scan(
                 shared_cache,
                 state_db_path=state_db_path,
                 business_date=business_date,
-                dry_run=dry_run,
             )
         )
     except Exception as exc:  # noqa: BLE001 - phase isolation
@@ -592,9 +695,7 @@ def run_prewarm_scan(
     candidate_hits = 0
     candidate_misses = 0
     try:
-        for document_row in prewarm_store.pending_documents(
-            max_documents, max_attempts=DETAIL_MAX_ATTEMPTS
-        ):
+        for document_row in prewarm_store.pending_documents(max_documents):
             if deadline - clock() <= DETAIL_BUDGET_RESERVE_SECONDS:
                 break
             outcome = process_document(

@@ -12,13 +12,17 @@ SharedCrawlCache;幂等账本防重复;确定性失败记账不重试;瞬时失�
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import sqlite3
 from datetime import UTC, datetime
+from pathlib import Path
 
 import pytest
 
+import app.services.customer_prewarm_discovery as discovery_module
 from app.services.customer_prewarm_discovery import (
+    backfill_daily_history,
     process_document,
     sync_daily_internet_results,
 )
@@ -59,13 +63,18 @@ def shared_cache(tmp_path):
 # ---- state.sqlite3 fixture -----------------------------------------------------
 
 
-def make_state_db(tmp_path, business_date, rows, *, name="state"):
+def make_state_db(tmp_path, business_date, rows, *, name="state", path=None):
     """建真实 per-day state.sqlite3:DailyAuditStore 建 schema,原始 SQL 填行。
 
     ``rows`` 每项可指定:mall_key、sku_id、exact_url、result(dict)、
     updated_at、task_name、state(默认 'SUCCESS')。crawl_id 由自增主键分配。
+    ``path`` 可显式指定输出文件(如 <runtime_root>/<date>/state.sqlite3),
+    缺省为 ``tmp_path/{name}-{business_date}.sqlite3``。
     """
-    path = tmp_path / f"{name}-{business_date}.sqlite3"
+    if path is None:
+        path = tmp_path / f"{name}-{business_date}.sqlite3"
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
     DailyAuditStore(path)  # schema creation (idempotent)
     now = datetime.now(UTC).isoformat(timespec="seconds")
     connection = sqlite3.connect(str(path), isolation_level=None)
@@ -328,10 +337,15 @@ def test_non_ok_and_invalid_rows_skipped(tmp_path, prewarm_store, shared_cache):
     assert ledger["error"].startswith("invalid crawl row")
 
 
-# ---- dry-run ---------------------------------------------------------------------------
+# ---- 同步总是真实写入:不再存在 dry_run 旁路 ---------------------------------------------
 
 
-def test_dry_run_records_nothing_would_record(tmp_path, prewarm_store, shared_cache):
+def test_sync_records_into_given_cache_and_never_writes_dry_run_ledger_error(
+    tmp_path, prewarm_store, shared_cache
+):
+    """sync 永远写入调用方传入的缓存(沙箱安全由 CLI 组合路径保证);
+    任何路径都不再产生 'dry_run' 账本错误。"""
+    assert "dry_run" not in inspect.signature(sync_daily_internet_results).parameters
     url = "https://b2b.nbdeli.com/goods/907.html"
     path = make_state_db(
         tmp_path,
@@ -339,20 +353,149 @@ def test_dry_run_records_nothing_would_record(tmp_path, prewarm_store, shared_ca
         [_ok_row("nbdeli", "SKU-D", url, "9.90", "2026-09-07T02:00:00+00:00", "task-d")],
     )
     summary = sync_daily_internet_results(
-        prewarm_store,
-        shared_cache,
-        state_db_path=path,
-        business_date=BUSINESS_DATE,
-        dry_run=True,
+        prewarm_store, shared_cache, state_db_path=path, business_date=BUSINESS_DATE
     )
-    assert summary["would_record"] == 1
-    assert summary["ok_synced"] == 0
-    assert shared_cache.lookup_current("nbdeli", url) is None
+    assert "would_record" not in summary
+    assert summary["ok_synced"] == 1
+    assert shared_cache.lookup_current("nbdeli", url) is not None
     key = _state_event_key(path, BUSINESS_DATE)
     ledger = prewarm_store.ledger_get(SOURCE, key)
     assert ledger is not None
-    assert ledger["error"] == "dry_run"
-    assert ledger["cache_result_id"] is None
+    assert ledger["cache_result_id"] is not None
+    assert not ledger["error"]
+    # 全库无任何 'dry_run' 账本错误行
+    connection = sqlite3.connect(str(prewarm_store.path))
+    try:
+        dry_run_rows = connection.execute(
+            "SELECT COUNT(*) FROM prewarm_sync_ledger WHERE error='dry_run'"
+        ).fetchone()[0]
+    finally:
+        connection.close()
+    assert dry_run_rows == 0
+
+
+# ---- 历史回填(Finding 5) ---------------------------------------------------------------
+
+
+def _seed_history_day(runtime_root, business_date, rows):
+    """在 <runtime_root>/<business_date>/state.sqlite3 造一天的历史状态库。"""
+    return make_state_db(
+        runtime_root,
+        business_date,
+        rows,
+        path=Path(runtime_root) / business_date / "state.sqlite3",
+    )
+
+
+def test_backfill_history_idempotent_and_resumable(tmp_path, prewarm_store, shared_cache, monkeypatch):
+    runtime_root = tmp_path / "runtime"
+    d2, d_missing, d1 = "2026-09-05", "2026-09-06", "2026-09-07"
+    url_a = "https://b2b.nbdeli.com/goods/930.html"
+    url_b = "https://b2b.nbdeli.com/goods/931.html"
+    path_d2 = _seed_history_day(
+        runtime_root,
+        d2,
+        [_ok_row("nbdeli", "S1", url_a, "1.1", "2026-09-05T02:00:00+00:00", "task-a")],
+    )
+    path_d1 = _seed_history_day(
+        runtime_root,
+        d1,
+        [_ok_row("nbdeli", "S2", url_b, "2.2", "2026-09-07T02:00:00+00:00", "task-b")],
+    )
+    dates = [d2, d_missing, d1]
+
+    first = backfill_daily_history(
+        prewarm_store, shared_cache, runtime_root=runtime_root, business_dates=dates
+    )
+    assert first["dates_scanned"] == 2
+    assert first["dates_missing"] == [d_missing]
+    assert first["errors"] == []
+    assert first["scanned"] == 2
+    assert first["ok_synced"] == 2
+    assert set(first["per_date"]) == {d2, d_missing, d1}
+    assert first["per_date"][d2]["ok_synced"] == 1
+    assert first["per_date"][d1]["ok_synced"] == 1
+    assert first["per_date"][d_missing]["state_db"] == "missing"
+    assert len(shared_cache.history("nbdeli", url_a)) == 1
+    assert len(shared_cache.history("nbdeli", url_b)) == 1
+
+    # 再跑一遍:零新缓存行,已同步行按 already_synced 计数
+    second = backfill_daily_history(
+        prewarm_store, shared_cache, runtime_root=runtime_root, business_dates=dates
+    )
+    assert second["ok_synced"] == 0
+    assert second["already_synced"] == 2
+    assert len(shared_cache.history("nbdeli", url_a)) == 1
+    assert len(shared_cache.history("nbdeli", url_b)) == 1
+
+    # 中断模拟:第二个 date 的同步直接抛错 → 该日计入 errors,其余日照常处理
+    real_sync = discovery_module.sync_daily_internet_results
+    calls = {"n": 0}
+
+    def interrupted_sync(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise RuntimeError("simulated interruption")
+        return real_sync(*args, **kwargs)
+
+    monkeypatch.setattr(discovery_module, "sync_daily_internet_results", interrupted_sync)
+    third = backfill_daily_history(
+        prewarm_store, shared_cache, runtime_root=runtime_root, business_dates=dates
+    )
+    monkeypatch.undo()
+    assert len(third["errors"]) == 1
+    assert third["errors"][0].startswith(f"{d_missing}: ")
+    assert "simulated interruption" in third["errors"][0]
+    assert third["per_date"][d2]["already_synced"] == 1  # 报错日之前照常
+    assert third["per_date"][d1]["already_synced"] == 1  # 报错日之后不中断
+
+    # 修复后重跑:每一行恰好记录一次(无重复,可续跑)
+    fourth = backfill_daily_history(
+        prewarm_store, shared_cache, runtime_root=runtime_root, business_dates=dates
+    )
+    assert fourth["ok_synced"] == 0
+    assert fourth["already_synced"] == 2
+    assert fourth["errors"] == []
+    assert len(shared_cache.history("nbdeli", url_a)) == 1
+    assert len(shared_cache.history("nbdeli", url_b)) == 1
+    # 幂等账本落位在真实 per-day state 库对应的 event key 上
+    for path, date in ((path_d2, d2), (path_d1, d1)):
+        key = _state_event_key(path, date)
+        ledger = prewarm_store.ledger_get(SOURCE, key)
+        assert ledger is not None and ledger["cache_result_id"] is not None
+
+
+def test_backfill_never_terminal_on_transient(tmp_path, prewarm_store, shared_cache, monkeypatch):
+    runtime_root = tmp_path / "runtime"
+    d = "2026-09-06"
+    url = "https://b2b.nbdeli.com/goods/932.html"
+    path = _seed_history_day(
+        runtime_root,
+        d,
+        [_ok_row("nbdeli", "S3", url, "3.3", "2026-09-06T02:00:00+00:00", "task-t")],
+    )
+
+    def locked_record_success(*args, **kwargs):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(shared_cache, "record_success", locked_record_success)
+    first = backfill_daily_history(
+        prewarm_store, shared_cache, runtime_root=runtime_root, business_dates=[d]
+    )
+    monkeypatch.undo()
+    assert first["dates_scanned"] == 1
+    assert first["transient_failures"] == 1
+    assert first["ok_synced"] == 0
+    assert first["errors"] == []
+    key = _state_event_key(path, d)
+    # claim 已丢弃:不记 ledger,下一轮允许重试(回填永不终态化)
+    assert prewarm_store.ledger_get(SOURCE, key) is None
+    second = backfill_daily_history(
+        prewarm_store, shared_cache, runtime_root=runtime_root, business_dates=[d]
+    )
+    assert second["ok_synced"] == 1
+    assert second["transient_failures"] == 0
+    assert len(shared_cache.history("nbdeli", url)) == 1
 
 
 # ---- 瞬时失败:丢 claim,下轮重试 ------------------------------------------------------------

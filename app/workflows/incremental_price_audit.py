@@ -155,6 +155,10 @@ class DiscoveredState:
     customer_fingerprints: Sequence[str] | None = None
     complete: bool = True
     evidence: Mapping[str, Any] = field(default_factory=dict)
+    # Issue #9 sidecar-only channel: every observed customer document
+    # (documentId-keyed), including customer-only docs with no SaaS row.
+    # NEVER consumed by STEP1 stages; only the prewarm intake hook reads it.
+    prewarm_rows: Sequence[Mapping[str, Any]] | None = None
 
 
 @dataclass(frozen=True)
@@ -1565,8 +1569,13 @@ def run_incremental_tick(
             counters["delta_changed"] = int(ingested["status_counts"].get("CHANGED", 0))
             if deps.prewarm_intake is not None:
                 # Issue #9 sidecar gate: enqueue only; failure is a counter.
+                # The default fallback keeps injectable fakes that predate the
+                # dedicated prewarm_rows channel working unchanged.
                 try:
-                    deps.prewarm_intake(config.business_date, discovered.rows)
+                    deps.prewarm_intake(
+                        config.business_date,
+                        discovered.prewarm_rows if discovered.prewarm_rows is not None else discovered.rows,
+                    )
                     counters["prewarm_intake_ok"] = counters.get("prewarm_intake_ok", 0) + 1
                 except Exception:  # noqa: BLE001 - never fail the tick
                     counters["prewarm_intake_failures"] = counters.get("prewarm_intake_failures", 0) + 1
