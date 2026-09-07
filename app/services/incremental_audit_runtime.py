@@ -996,6 +996,22 @@ def snapshot_discoverer(
                 pass  # preflight 失败不阻塞发现；lazy 刷新路径兜底
         snapshot = adapter.fetch(source_label="incremental-runtime", max_elapsed_seconds=timeout_seconds)
         customer = _customer_index(snapshot.customer_rows)
+        # Issue #9 sidecar-only channel: every observed customer document,
+        # including customer-only docs with no SaaS pending row.  A row lacking
+        # fourCategoryId keeps "" (WAITING_CATEGORY semantics: the prewarm
+        # store parks it out of detail scanning until a later sighting supplies
+        # one).  NEVER consumed by STEP1 stages; only the prewarm intake hook
+        # reads it.
+        prewarm_rows = [
+            {
+                "documentId": document_id,
+                "fourCategoryId": str(row.get("fourCategoryId") or ""),
+                "fourCategoryName": str(row.get("fourCategoryName") or ""),
+                "commodityName": str(row.get("commodityName") or ""),
+                "referenceLink": str(row.get("referenceLink") or ""),
+            }
+            for document_id, row in sorted(customer.items())
+        ]
         saas_rows = [normalize_saas_pending_row(dict(row)) for row in snapshot.saas_rows]
         joined = join_saas_with_customer(saas_rows, customer)
         # Eligibility is part of the authoritative daily snapshot. An URL on
@@ -1024,20 +1040,27 @@ def snapshot_discoverer(
                 "customer_count": snapshot.customer_count,
                 "pages": [evidence.__dict__ for evidence in snapshot.page_evidence],
             },
+            prewarm_rows=prewarm_rows,
         )
 
     return discover
 
 
 def _prewarm_intake_worker(store_path: Path) -> Callable[[str, Sequence[Mapping[str, Any]]], None]:
-    """Issue #9 sidecar intake: upsert discovered documents into the prewarm store.
+    """Issue #9 sidecar intake (lazy, fail-open): the prewarm store is only
+    constructed on the first intake call, inside the tick hook's try/except.
 
+    A corrupt/locked/unwritable prewarm DB therefore can never break STEP1
+    dependency composition; it only counts ``prewarm_intake_failures``.
     Exceptions propagate to the tick hook, which counts them and continues;
     this worker itself performs no network or remote action.
     """
-    store = CustomerPrewarmStore(store_path)
+    store: CustomerPrewarmStore | None = None
 
     def intake(business_date: str, rows: Sequence[Mapping[str, Any]]) -> None:
+        nonlocal store
+        if store is None:
+            store = CustomerPrewarmStore(store_path)
         intake_documents(store, business_date, rows, source="event")
 
     return intake

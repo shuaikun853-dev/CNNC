@@ -417,8 +417,12 @@ python -m pytest tests\test_incremental_audit_runtime.py tests\test_incremental_
 - 状态落在独立跨日库 `runtime\incremental_price_audit\customer_prewarm.sqlite3`;共享缓存为
   `runtime\incremental_price_audit\shared_crawl_cache.sqlite3`。STEP1 tick 通过 `prewarm_intake` 旁路入队,
   任何异常只计数,绝不改变 tick 结果、trace、审批或收口。
-- dry-run 一行用法:`python scripts\customer_prewarm_scan.py --dry-run`(写入全部落在 `--sandbox-root`,
-  默认 `<runtime_root>\prewarm_dry_run`,共享缓存只读、`record_success` 只计数)。
+- dry-run 一行用法:`python scripts\customer_prewarm_scan.py --dry-run`(prewarm 状态与缓存写入全部落在
+  `--sandbox-root`,默认 `<runtime_root>\prewarm_dry_run`)。dry-run 会先把生产共享缓存以只读快照
+  (SQLite `mode=ro` + backup API,零写入生产)复制进 sandbox,当日 daily internet 成功行真实写入 sandbox
+  缓存,因此命中/MISS 分布接近部署后真实状态;`--cache-path` 在 dry-run 下指只读快照的**来源**缓存。
+- 历史 daily-internet 回填:`--backfill-history N`(N≤90,只读过去 N 天 state 库,幂等可续跑);
+  legacy 招商局导出结果的历史导入归 Issue #10 契约,本票不实现。
 - 注册脚本 `scripts\register_customer_prewarm_scan_tasks.ps1` 默认只预览;必须显式 `-Apply` 且经用户授权后
   才能注册(1 分钟重复、IgnoreNew、Hidden、Limited)。Issue #9 本身不注册任何计划任务。
 

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -386,7 +387,8 @@ def test_link_error_keeps_document_pending_and_retryable(
     assert first["retried"] is True
     assert len(first["errors"]) == 1
     # 文档必须保持 PENDING(而不是 DONE),本轮失败链接下一轮重扫补齐
-    pending = {row["document_id"]: row for row in prewarm_store.pending_documents(10)}
+    due = datetime.now(UTC) + timedelta(days=1)
+    pending = {row["document_id"]: row for row in prewarm_store.pending_documents(10, now=due)}
     assert set(pending) == {"DOC-1"}
     assert pending["DOC-1"]["detail_state"] == "PENDING"
     assert pending["DOC-1"]["detail_attempts"] == 1
@@ -397,7 +399,7 @@ def test_link_error_keeps_document_pending_and_retryable(
     second = process_document(
         prewarm_store,
         shared_cache,
-        prewarm_store.pending_documents(10)[0],
+        prewarm_store.pending_documents(10, now=due)[0],
         mappings=MAPPINGS,
         detail_fetch=make_fetcher({"DOC-1": detail_payload(urls)}),
     )
@@ -409,10 +411,10 @@ def test_link_error_keeps_document_pending_and_retryable(
     assert len(prewarm_store.links_for_document("DOC-1")) == 2
 
 
-# ---- Case 8: detail 失败隔离与有界重试 -----------------------------------------------
+# ---- Case 8: detail 失败隔离;瞬时失败永不终态,按 backoff 推迟 -----------------------
 
 
-def test_case8_detail_failure_isolation_and_bounded_retry(prewarm_store, shared_cache):
+def test_case8_transient_detail_failures_stay_recoverable(prewarm_store, shared_cache):
     make_document(prewarm_store, "DOC-1")
     make_document(prewarm_store, "DOC-2")
     payload_by_document = {"DOC-2": detail_payload(["https://b2b.nbdeli.com/goods/800.html"])}
@@ -425,29 +427,105 @@ def test_case8_detail_failure_isolation_and_bounded_retry(prewarm_store, shared_
             mappings=MAPPINGS,
             detail_fetch=make_fetcher(payload_by_document),
         )
-    rows = {row["document_id"]: row for row in prewarm_store.pending_documents(10)}
+    due = datetime.now(UTC) + timedelta(days=1)
+    rows = {row["document_id"]: row for row in prewarm_store.pending_documents(10, now=due)}
     assert set(rows) == {"DOC-1"}
     assert rows["DOC-1"]["detail_attempts"] == 1
     assert rows["DOC-1"]["detail_state"] == "PENDING"
     doc_row = prewarm_store.upsert_document(BUSINESS_DATE, "DOC-2", "CAT-1")
     assert doc_row["detail_state"] == "DONE"
     assert len(prewarm_store.links_for_document("DOC-2")) == 1
-    # 连续 5 次失败 → FAILED(有界重试)
+    # 连续 5 次失败(detail lock busy 等):永不 FAILED,只按 backoff 推迟
     for _ in range(4):
-        process_document(
+        outcome = process_document(
             prewarm_store,
             shared_cache,
-            prewarm_store.pending_documents(10)[0],
+            prewarm_store.pending_documents(10, now=due)[0],
             mappings=MAPPINGS,
             detail_fetch=make_fetcher({}),
         )
+        assert outcome["detail_ok"] is False
+    # 默认墙钟仍在 backoff 窗口内:文档被推迟,不是被丢弃
     assert prewarm_store.pending_documents(10) == []
-    failed = prewarm_store.upsert_document(BUSINESS_DATE, "DOC-1", "CAT-1")
-    assert failed["detail_state"] == "FAILED"
-    assert failed["detail_attempts"] == 5
+    deferred = prewarm_store.upsert_document(BUSINESS_DATE, "DOC-1", "CAT-1")
+    assert deferred["detail_state"] == "PENDING"
+    assert deferred["detail_attempts"] == 5
+    assert deferred["consecutive_failures"] == 5
+    assert deferred["next_retry_at"] is not None
+    # 注入越过 backoff 的 now → 第 6 次尝试成功 → DONE,链接落库,候选状态正确
+    recovered = process_document(
+        prewarm_store,
+        shared_cache,
+        prewarm_store.pending_documents(10, now=due)[0],
+        mappings=MAPPINGS,
+        detail_fetch=make_fetcher(
+            {"DOC-1": detail_payload(["https://b2b.nbdeli.com/goods/801.html"])}
+        ),
+    )
+    assert recovered["detail_ok"] is True
+    done = prewarm_store.upsert_document(BUSINESS_DATE, "DOC-1", "CAT-1")
+    assert done["detail_state"] == "DONE"
+    assert done["consecutive_failures"] == 0
+    assert done["next_retry_at"] is None
+    assert len(prewarm_store.links_for_document("DOC-1")) == 1
+    statuses = {
+        row["original_url"]: row["cache_status"] for row in prewarm_store.candidates()
+    }
+    assert statuses["https://b2b.nbdeli.com/goods/801.html"] == "PENDING_PREWARM"
 
 
 # ---- Case 12: original_url 溯源(jslink 改写不改原文) --------------------------------
+
+
+def test_mapping_change_creates_second_strictly_scoped_candidate(
+    prewarm_store, shared_cache
+):
+    """映射表变化(同 URL 换商城)= 两个候选;link 状态指向当前路由候选,旧候选不动。"""
+    url = "https://b2b.nbdeli.com/goods/900.html"
+    nbdeli_only = [MAPPINGS[0]]  # b2b.nbdeli.com → mall_key "nbdeli"
+    remapped_comix = ZhaoshangMallMapping(
+        mall_name="齐心商城",
+        source_id="S2",
+        mall_key="comix",
+        domains=("b2b.nbdeli.com",),
+        vendor_keywords=("comix",),
+    )
+    make_document(prewarm_store, "DOC-1")
+    document_row = prewarm_store.pending_documents(10)[0]
+    fetcher = make_fetcher({"DOC-1": detail_payload([url])})
+    first = process_document(
+        prewarm_store,
+        shared_cache,
+        document_row,
+        mappings=nbdeli_only,
+        detail_fetch=fetcher,
+    )
+    assert first["detail_ok"] is True
+    candidates = prewarm_store.candidates()
+    assert len(candidates) == 1
+    assert candidates[0]["mall"] == "nbdeli"
+    first_candidate = candidates[0]
+
+    # 映射表变化后,同一 URL 路由到另一个商城
+    second = process_document(
+        prewarm_store,
+        shared_cache,
+        document_row,
+        mappings=[remapped_comix],
+        detail_fetch=fetcher,
+    )
+    assert second["detail_ok"] is True
+    by_mall = {candidate["mall"]: candidate for candidate in prewarm_store.candidates()}
+    assert set(by_mall) == {"nbdeli", "comix"}
+    # 旧候选逐字节保留(mall 仍是 nbdeli,绝不被改写)
+    assert by_mall["nbdeli"] == first_candidate
+    # 新 link 状态指向当前路由(mall B)的候选
+    link = prewarm_store.links_for_document("DOC-1")[0]
+    assert link["candidate_id"] == by_mall["comix"]["id"]
+    assert link["mall"] == "comix"
+    # 两个候选各自独立走到 PENDING_PREWARM
+    assert by_mall["nbdeli"]["cache_status"] == "PENDING_PREWARM"
+    assert by_mall["comix"]["cache_status"] == "PENDING_PREWARM"
 
 
 def test_case12_original_url_provenance_jslink(prewarm_store, shared_cache):
