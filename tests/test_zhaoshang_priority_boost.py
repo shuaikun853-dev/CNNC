@@ -14,6 +14,12 @@ EXTERNAL_HELPER = Path(
     r"E:\.A2026\招商局自动建任务\external_tools\crawl_task_tool\zhaoshang_priority_boost.py"
 )
 
+if not EXTERNAL_HELPER.is_file():
+    pytest.skip(
+        "zhaoshang external priority helper unavailable (PRODUCTION_MACHINE_ONLY)",
+        allow_module_level=True,
+    )
+
 
 def _load_module(path, name):
     spec = importlib.util.spec_from_file_location(name, path)

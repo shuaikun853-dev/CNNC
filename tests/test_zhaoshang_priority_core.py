@@ -10,8 +10,16 @@ from app.services.legacy_zhaoshang_adapter import (
 )
 
 
+_PRIORITY_TOOL = EXTERNAL_TOOL_PATH.with_name("zhaoshang_priority_boost.py")
+
+if not _PRIORITY_TOOL.is_file():
+    pytest.skip(
+        "zhaoshang external priority tool unavailable (PRODUCTION_MACHINE_ONLY)",
+        allow_module_level=True,
+    )
+
 priority = CnncLegacyZhaoshangAdapter._load_module(
-    EXTERNAL_TOOL_PATH.with_name("zhaoshang_priority_boost.py"),
+    _PRIORITY_TOOL,
     "test_zhaoshang_priority_core_module",
 )
 

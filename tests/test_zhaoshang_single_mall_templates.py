@@ -14,6 +14,28 @@ EXTERNAL_TOOL = Path(
 )
 
 
+def _external_tool_loadable() -> bool:
+    if not EXTERNAL_TOOL.is_file():
+        return False
+    try:
+        spec = importlib.util.spec_from_file_location(
+            "_governance_availability_probe", EXTERNAL_TOOL
+        )
+        module = importlib.util.module_from_spec(spec)
+        assert spec.loader is not None
+        spec.loader.exec_module(module)
+    except Exception:
+        return False
+    return hasattr(module, "read_subtasks_from_excel")
+
+
+if not _external_tool_loadable():
+    pytest.skip(
+        "zhaoshang external tool not loadable (PRODUCTION_MACHINE_ONLY)",
+        allow_module_level=True,
+    )
+
+
 def _load_external_tool():
     tool_dir = str(EXTERNAL_TOOL.parent)
     if tool_dir not in sys.path:
