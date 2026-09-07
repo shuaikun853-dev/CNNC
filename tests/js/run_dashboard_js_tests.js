@@ -32,6 +32,9 @@
 //   rebuildOutcomeAdmitsLocalSupersede:仅确认的重建成功 outcome + 有效
 //   new_remote_job_id 才本地降级 SUPERSEDED/武装自动切换;REBUILD_REJECTED
 //   (含 TASK_NAME_CONFLICT 候选名形状)零 mutate、不武装。
+// 覆盖 Production Identity(2026-09-04):
+//   PI    piStatusText/piStatusWord/piWorkingTreeText 纯文案 seam
+//   (与后端 comparison.version_status / dirty.classification 枚举一一对应)。
 // 被测对象:app/static/dashboard/app.js 暴露的 createPollController /
 // createSaasFlowPoller / safeProgressText / fmtShanghaiDateTime /
 // createCnncAuthFetcher / computeCloseoutBackendRunning / applyCloseoutRunningOverlay /
@@ -67,7 +70,8 @@ const { createPollController, createSaasFlowPoller, safeProgressText, sfPartialN
         updateCloseoutUI, pollDelay, inCloseoutWatchWindow, _setCloseoutStateForTest,
         armRebuildDrawerSwitch, resolveRebuildDrawerSwitch,
         rebuildOutcomeAdmitsLocalSupersede,
-        cpStatusCn, cpStatusPill, cpRowMatchesFilter, cpSortRows } = require(
+        cpStatusCn, cpStatusPill, cpRowMatchesFilter, cpSortRows,
+        piStatusText, piStatusWord, piWorkingTreeText } = require(
   path.join(__dirname, "..", "..", "app", "static", "dashboard", "app.js"));
 
 let failed = 0;
@@ -1256,6 +1260,38 @@ function test_rebuild_drawer_switch_seam() {
         })());
 }
 
+// ---- 2026-09-04:生产运行版本(Production Deployment Identity)状态文案 seam ----
+// piStatusText 七态中文句逐字匹配(与后端 comparison.version_status 枚举一一对应);
+// piWorkingTreeText 工作区四态;piStatusWord 折叠卡 chips 短词。
+function test_production_identity_seams() {
+  check("PI 状态文案:七态中文句逐字匹配,未知/null 兜底",
+        piStatusText("MATCH") === "✅ 当前生产代码与 GitHub 生产分支一致" &&
+        piStatusText("CODE_CHANGED_AFTER_PROCESS_START") === "⚠ 代码已更新但进程未重启(进程仍在运行旧版本)" &&
+        piStatusText("BEHIND") === "⚠ 当前生产机运行版本落后于 GitHub Production HEAD" &&
+        piStatusText("AHEAD") === "⚠ 本地存在未推送的生产提交" &&
+        piStatusText("REMOTE_DIFFERS") === "⚠ 本机代码与 GitHub 生产分支不一致" &&
+        piStatusText("REMOTE_UNKNOWN") === "GitHub 生产分支 HEAD 暂不可达(本地版本状态未知)" &&
+        piStatusText("UNKNOWN") === "运行版本状态未知" &&
+        piStatusText(null) === "运行版本状态未知" &&
+        piStatusText("SOMETHING") === "运行版本状态未知");
+  check("PI 工作区文案:CLEAN/仅运行产物/含代码改动/未知(含异常入参不抛)",
+        piWorkingTreeText({ working_tree: "CLEAN" }) === "CLEAN" &&
+        piWorkingTreeText({ working_tree: "DIRTY", dirty: { classification: "ALL_ARTIFACTS" } }) === "DIRTY(仅运行产物)" &&
+        piWorkingTreeText({ working_tree: "DIRTY", dirty: { classification: "HAS_CODE_CHANGES" } }) === "DIRTY(含代码改动)" &&
+        piWorkingTreeText({ working_tree: "DIRTY" }) === "DIRTY" &&
+        piWorkingTreeText({ working_tree: "UNKNOWN" }) === "未知" &&
+        piWorkingTreeText(null) === "未知");
+  check("PI chips 短词:六态 + 未知兜底",
+        piStatusWord("MATCH") === "版本一致" &&
+        piStatusWord("CODE_CHANGED_AFTER_PROCESS_START") === "代码已更新未重启" &&
+        piStatusWord("BEHIND") === "落后远端" &&
+        piStatusWord("AHEAD") === "领先远端" &&
+        piStatusWord("REMOTE_DIFFERS") === "与远端不一致" &&
+        piStatusWord("REMOTE_UNKNOWN") === "远端不可达" &&
+        piStatusWord("UNKNOWN") === "未知" &&
+        piStatusWord(undefined) === "未知");
+}
+
 (async () => {
   await test_304_keeps_sync_fresh_without_rerender();
   await test_hidden_pauses_and_visible_resumes();
@@ -1294,6 +1330,7 @@ function test_rebuild_drawer_switch_seam() {
   test_customer_price_seams();
   test_rebuild_local_supersede_gate();
   test_rebuild_drawer_switch_seam();
+  test_production_identity_seams();
   if (failed === 0) { console.log("ALL PASS"); process.exit(0); }
   console.error(failed + " failing checks");
   process.exit(1);

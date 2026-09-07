@@ -68,7 +68,7 @@ def test_static_assets_served(client):
     # 不可见暂停/回前台补刷不再用字符串存在性冒充行为测试:
     # 真实行为由 tests/js/run_dashboard_js_tests.js(node)驱动 createPollController 验证。
     assert "cdn" not in css.lower() and "http://" not in css and "https://" not in css  # 零外链
-    for hook in ("hero", "attn", "stages", "zs", "final", "more", "jobs-table", "drawer", "tech", "conn-lost", "live", "refresh", "jobs-toggle"):
+    for hook in ("hero", "attn", "stages", "zs", "final", "more", "jobs-table", "drawer", "tech", "conn-lost", "live", "refresh", "jobs-toggle", "prod-identity", "pi-chips"):
         assert hook in html, hook
 
 

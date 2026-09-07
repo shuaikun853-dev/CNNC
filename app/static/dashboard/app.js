@@ -1411,12 +1411,135 @@
     }
   }
 
+  // ---- 生产运行版本(Production Deployment Identity;只读 60s 轮询,与主看板解耦) ----
+  const PI_POLL_INTERVAL_MS = 60000;
+  const PI_FETCH_TIMEOUT_MS = 8000;
+  const PI_STATUS_TEXTS = {
+    MATCH: "✅ 当前生产代码与 GitHub 生产分支一致",
+    CODE_CHANGED_AFTER_PROCESS_START: "⚠ 代码已更新但进程未重启(进程仍在运行旧版本)",
+    BEHIND: "⚠ 当前生产机运行版本落后于 GitHub Production HEAD",
+    AHEAD: "⚠ 本地存在未推送的生产提交",
+    REMOTE_DIFFERS: "⚠ 本机代码与 GitHub 生产分支不一致",
+    REMOTE_UNKNOWN: "GitHub 生产分支 HEAD 暂不可达(本地版本状态未知)",
+  };
+  function piStatusText(versionStatus) {
+    return PI_STATUS_TEXTS[versionStatus] || "运行版本状态未知";
+  }
+  const PI_STATUS_WORDS = {
+    MATCH: "版本一致",
+    CODE_CHANGED_AFTER_PROCESS_START: "代码已更新未重启",
+    BEHIND: "落后远端",
+    AHEAD: "领先远端",
+    REMOTE_DIFFERS: "与远端不一致",
+    REMOTE_UNKNOWN: "远端不可达",
+  };
+  function piStatusWord(versionStatus) {
+    return PI_STATUS_WORDS[versionStatus] || "未知";
+  }
+  function piWorkingTreeText(local) {
+    const wt = local && local.working_tree;
+    if (wt !== "CLEAN" && wt !== "DIRTY") return "未知";
+    if (wt === "CLEAN") return "CLEAN";
+    const cls = local.dirty && local.dirty.classification;
+    if (cls === "ALL_ARTIFACTS") return "DIRTY(仅运行产物)";
+    if (cls === "HAS_CODE_CHANGES") return "DIRTY(含代码改动)";
+    return "DIRTY";
+  }
+  function piShaText(sha) {
+    if (!sha) return "未知";
+    return sha.length > 16 ? sha.slice(0, 8) + "…" + sha.slice(-6) : sha;
+  }
+  function renderProductionIdentity(p) {
+    const chips = $("#pi-chips");
+    if (!chips) return;
+    const local = p.local || {}, startup = p.startup || {};
+    const remote = p.remote || {}, cmp = p.comparison || {};
+    const schedOk = p.scheduler && p.scheduler.status === "OK";
+    chips.textContent = "版本 " + piStatusWord(cmp.version_status) +
+      " · " + (local.git_branch || remote.branch || "—") +
+      " · " + (local.git_sha || startup.git_sha || "").slice(0, 8) +
+      " · 调度器 " + (schedOk ? "已注册" : "未知");
+    const statusEl = $("#pi-status");
+    if (statusEl) {
+      const color = cmp.version_status === "MATCH" ? "var(--ok)"
+        : (cmp.version_status === "REMOTE_UNKNOWN" || !cmp.version_status ||
+           cmp.version_status === "UNKNOWN") ? "var(--muted)"
+        : "var(--warn)";
+      let html = '<div style="color:' + color + ';font-weight:600">' +
+        esc(piStatusText(cmp.version_status)) + "</div>";
+      (cmp.alerts || []).forEach((a) => {
+        html += '<div style="color:var(--warn)">⚠ ' + esc(a) + "</div>";
+      });
+      statusEl.innerHTML = html;
+    }
+    const kv = $("#pi-kv");
+    if (kv) {
+      const proc = startup.process || {}, py = startup.python || {};
+      const rows = [
+        ["运行进程版本 Startup SHA", piShaText(startup.git_sha)],
+        ["本地仓库 HEAD", piShaText(local.git_sha)],
+        ["GitHub 生产分支 HEAD", piShaText(remote.git_sha)],
+        ["生产分支", remote.branch || "—"],
+        ["工作区", piWorkingTreeText(local)],
+        ["进程启动时间", (proc.started_at || "—") +
+          (proc.started_at_source ? "(" + proc.started_at_source + ")" : "")],
+        ["Python", (py.version || "—") + (py.virtualenv ? " · venv" : " · 系统")],
+      ];
+      ((p.scheduler && p.scheduler.tasks) || []).forEach((t) => {
+        rows.push(["计划任务 " + (t.name || "—"),
+          (t.registered ? "已注册" : "未注册") +
+          " · " + (t.state || "—") +
+          " · LastRun " + (t.last_run_time || "—") +
+          " · Result " + (t.last_task_result == null ? "—" : t.last_task_result)]);
+      });
+      kv.innerHTML = rows.map((r) => "<b>" + esc(r[0]) + "</b><span>" + esc(r[1]) + "</span>").join("");
+    }
+    const meta = $("#pi-meta");
+    if (meta) meta.textContent = "生成于 " + (p.generated_at || "—");
+  }
+  // fetch 必须有超时(与 cnnc-auth 同型 factory;失败只降级本卡 chips 文案)
+  function createProductionIdentityFetcher(deps) {
+    const fetchImpl = deps.fetchImpl || ((url, opts) => fetch(url, opts));
+    const timers = deps.timers || {
+      setTimeout: (fn, ms) => setTimeout(fn, ms),
+      clearTimeout: (t) => clearTimeout(t),
+    };
+    const timeoutMs = deps.timeoutMs == null ? PI_FETCH_TIMEOUT_MS : Number(deps.timeoutMs);
+    const st = { inFlight: false };
+    async function run() {
+      if (st.inFlight) return;
+      st.inFlight = true;
+      const abort = new AbortController();
+      const timer = timers.setTimeout(() => abort.abort(), timeoutMs);
+      try {
+        const res = await fetchImpl("/dashboard/api/production-identity", { signal: abort.signal });
+        if (!res.ok) throw new Error("HTTP " + res.status);
+        renderProductionIdentity(await res.json());
+      } catch (e) {
+        const chips = $("#pi-chips");
+        if (chips) chips.textContent = "状态 — · 生产运行版本读取失败，稍后自动重试";
+      } finally {
+        timers.clearTimeout(timer);
+        st.inFlight = false;
+      }
+    }
+    return { run, state: st };
+  }
+  const prodIdentityFetcher = createProductionIdentityFetcher({});
+  const prodIdentityPoller = createSaasFlowPoller({
+    poll: () => prodIdentityFetcher.run(),
+    visible: () => document.visibilityState === "visible",
+    setTimeout: (fn, ms) => setTimeout(fn, ms),
+    clearTimeout: (t) => clearTimeout(t),
+    intervalMs: PI_POLL_INTERVAL_MS,
+  });
+
   function start() {
     document.addEventListener("visibilitychange", () => {
       if (document.visibilityState === "visible") {
-        ctl.onVisible(); sfPoller.onVisible(); cnncPoller.onVisible(); closeoutActionsPoller.onVisible();
+        ctl.onVisible(); sfPoller.onVisible(); cnncPoller.onVisible(); prodIdentityPoller.onVisible(); closeoutActionsPoller.onVisible();
       } else {
-        ctl.onHidden(); sfPoller.onHidden(); cnncPoller.onHidden(); closeoutActionsPoller.onHidden();
+        ctl.onHidden(); sfPoller.onHidden(); cnncPoller.onHidden(); prodIdentityPoller.onHidden(); closeoutActionsPoller.onHidden();
       }
     });
     $("#refresh").addEventListener("click", () => ctl.run());
@@ -1433,12 +1556,15 @@
     ctl.run();
     sfPoller.run();  // SaaS Flow 独立启动,不等 summary
     cnncPoller.run();  // CNNC 认证状态独立启动(30s 只读轮询)
+    prodIdentityPoller.run();  // 生产运行版本独立启动(60s 只读轮询)
   }
-  const api = { start, stop: () => { ctl.stop(); sfPoller.stop(); cnncPoller.stop(); closeoutActionsPoller.stop(); },
+  const api = { start, stop: () => { ctl.stop(); sfPoller.stop(); cnncPoller.stop(); prodIdentityPoller.stop(); closeoutActionsPoller.stop(); },
     createPollController, createSaasFlowPoller, safeProgressText, sfPartialNotice,
     sfTreeHtml, sfGrowthText, jobProgressCell, progressDetail, outputDisplayName,
     createActionClient, actionOutcomeText, cnncStatusText, renderCnncAuth,
     fmtShanghaiDateTime, createCnncAuthFetcher,
+    piStatusText, piStatusWord, piWorkingTreeText, renderProductionIdentity,
+    createProductionIdentityFetcher,
     computeCloseoutBackendRunning, applyCloseoutRunningOverlay, isCloseoutWriter,
     resolveCloseoutActionsDate, closeoutUIRunning, updateCloseoutUI,
     pollDelay, inCloseoutWatchWindow, _setCloseoutStateForTest,

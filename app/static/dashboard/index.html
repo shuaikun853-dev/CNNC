@@ -112,6 +112,22 @@
   </details>
 </section>
 
+<!-- 生产运行版本(Production Deployment Identity;只读 60s 轮询,与主看板解耦) -->
+<section class="card">
+  <details class="saasflow" id="prod-identity">
+    <summary style="cursor:pointer">
+      <span class="lab">生产运行版本</span>
+      <span class="sf-chips" id="pi-chips">状态 — · 检测中…</span>
+      <span class="sf-hint">点击展开部署身份详情</span>
+    </summary>
+    <div class="sf-body">
+      <div class="pi-status" id="pi-status"></div>
+      <div class="kv" id="pi-kv"></div>
+      <div class="sf-meta" id="pi-meta"></div>
+    </div>
+  </details>
+</section>
+
 <!-- 二级详情(默认收起):任务全表 + 抽屉 + 技术详情 -->
 <div class="more-block" id="more">
   <section class="card">
