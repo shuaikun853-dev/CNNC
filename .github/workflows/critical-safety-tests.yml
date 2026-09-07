@@ -79,6 +79,7 @@ jobs:
       - name: Run critical safety tests
         env:
           PYTHONIOENCODING: utf-8
+          PYTHONUTF8: "1"  # JS harness 输出 UTF-8，避免 cp1252 Runner 上 subprocess 文本解码崩溃
         run: >
           python -m pytest
           tests/test_customer_price_semantics.py
