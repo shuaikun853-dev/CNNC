@@ -234,7 +234,11 @@ def test_dry_run_snapshots_source_cache_and_shows_daily_reuse(tmp_path):
     summary = json.loads(json_output.read_text(encoding="utf-8"))
     assert summary["dry_run"] is True
     assert summary["cache_source"] == str(prod_cache_path.resolve())
-    assert summary["cache_snapshot"] == {"copied": True, "crawl_results": 1}
+    assert summary["cache_snapshot"] == {
+        "copied": True,
+        "crawl_results": 1,
+        "stale_sandbox_removed": False,
+    }
     assert "would_record" not in summary
     assert summary["intake_count"] == 1
     assert summary["ok_synced"] == 1  # 当日 daily internet 行真实写入(sandbox)
@@ -346,7 +350,11 @@ def test_dry_run_cache_path_is_source_not_target(tmp_path):
     assert exit_code == 0
     summary = json.loads(json_output.read_text(encoding="utf-8"))
     assert summary["cache_source"] == str(external.resolve())
-    assert summary["cache_snapshot"] == {"copied": True, "crawl_results": 1}
+    assert summary["cache_snapshot"] == {
+        "copied": True,
+        "crawl_results": 1,
+        "stale_sandbox_removed": False,
+    }
     assert _file_sha256(external) == external_hash
     sandbox_cache = SharedCrawlCache(runtime_root / "prewarm_dry_run" / "shared_crawl_cache.sqlite3")
     assert sandbox_cache.lookup_current("nbdeli", url_today) is not None
@@ -380,7 +388,11 @@ def test_scan_cli_dry_run_without_source_cache_records_into_sandbox(tmp_path):
     assert (sandbox_root / "shared_crawl_cache.sqlite3").is_file()
     summary = json.loads(json_output.read_text(encoding="utf-8"))
     assert summary["dry_run"] is True
-    assert summary["cache_snapshot"] == {"copied": False, "reason": "missing"}
+    assert summary["cache_snapshot"] == {
+        "copied": False,
+        "reason": "missing",
+        "stale_sandbox_removed": False,
+    }
     assert "would_record" not in summary
     assert summary["intake_count"] == 1
     assert summary["ok_synced"] == 1  # 当日行真实写入 sandbox 缓存
@@ -431,6 +443,108 @@ def test_scan_cli_backfill_history_range_guard(tmp_path, capsys):
         assert exit_code == 2
     out = capsys.readouterr().out
     assert "--backfill-history" in out
+
+
+# ---- (b3) Phase 5: dry-run 沙箱缓存永远新鲜,绝不复用陈旧副本 ---------------------------
+
+
+def test_missing_source_never_reuses_stale_sandbox(tmp_path):
+    runtime_root = tmp_path / "runtime"
+    runtime_root.mkdir()
+    # 生产式 runtime:历史共享缓存(1 行)+ 当日 state db 只有 audit_items
+    # (无 OK crawl 行 → 扫描不写缓存,行数差异只来自快照复制)。
+    prod_cache_path = runtime_root / "shared_crawl_cache.sqlite3"
+    prod_cache = SharedCrawlCache(prod_cache_path)
+    prod_cache.record_success(
+        mall="nbdeli",
+        submitted_url="https://b2b.nbdeli.com/goods/947.html",
+        source="zhaoshang-history",
+    )
+    _seed_state_db(
+        runtime_root,
+        BUSINESS_DATE,
+        audit_items=[{"documentId": "DOC-STALE", "fourCategoryId": "CAT-S"}],
+    )
+    json_output_1 = tmp_path / "dry1-summary.json"
+    exit_code = _run_scan(runtime_root, "--dry-run", "--skip-detail", json_output=json_output_1)
+    assert exit_code == 0
+    summary_1 = json.loads(json_output_1.read_text(encoding="utf-8"))
+    assert summary_1["cache_snapshot"]["copied"] is True
+    sandbox_cache_path = runtime_root / "prewarm_dry_run" / "shared_crawl_cache.sqlite3"
+    assert _cache_row_counts(sandbox_cache_path)["crawl_results"] == 1
+
+    # 删除生产缓存后再次 dry-run:绝不复用上一轮的沙箱陈旧副本
+    prod_cache_path.unlink()
+    json_output_2 = tmp_path / "dry2-summary.json"
+    exit_code = _run_scan(runtime_root, "--dry-run", "--skip-detail", json_output=json_output_2)
+    assert exit_code == 0
+    summary_2 = json.loads(json_output_2.read_text(encoding="utf-8"))
+    assert summary_2["cache_snapshot"] == {
+        "copied": False,
+        "reason": "missing",
+        "stale_sandbox_removed": True,
+    }
+    # 沙箱缓存是全新空库(0 行),不是上一轮的陈旧副本;hit/miss 不被污染
+    assert sandbox_cache_path.is_file()
+    assert _cache_row_counts(sandbox_cache_path)["crawl_results"] == 0
+    assert summary_2["candidate_hits"] == 0
+    assert summary_2["candidate_misses"] == 0
+    sandbox_store = CustomerPrewarmStore(
+        runtime_root / "prewarm_dry_run" / "customer_prewarm.sqlite3"
+    )
+    assert sandbox_store.candidates() == []
+
+
+def test_fresh_copy_replaces_stale(tmp_path):
+    source = tmp_path / "prod" / "shared_crawl_cache.sqlite3"
+    SharedCrawlCache(source).record_success(
+        mall="nbdeli",
+        submitted_url="https://b2b.nbdeli.com/goods/948.html",
+        source="zhaoshang-history",
+    )
+    sandbox_root = tmp_path / "sandbox"
+    dest = sandbox_root / "shared_crawl_cache.sqlite3"
+    stale = SharedCrawlCache(dest)
+    stale.record_success(
+        mall="comix", submitted_url="https://qx.com/old-1", source="stale-run"
+    )
+    stale.record_success(
+        mall="nbdeli",
+        submitted_url="https://b2b.nbdeli.com/goods/949.html",
+        source="stale-run",
+    )
+    assert _cache_row_counts(dest)["crawl_results"] == 2
+    # 陈旧 SQLite 伴生文件也要一并清掉
+    (sandbox_root / "shared_crawl_cache.sqlite3-wal").write_bytes(b"junk")
+    (sandbox_root / "shared_crawl_cache.sqlite3-shm").write_bytes(b"junk")
+
+    result = snapshot_cache_readonly(source, dest, sandbox_root=sandbox_root)
+
+    assert result == {"copied": True, "crawl_results": 1, "stale_sandbox_removed": True}
+    # dest 行数与 source 完全一致:陈旧行全部消失
+    assert _cache_row_counts(dest) == _cache_row_counts(source)
+    fresh = SharedCrawlCache(dest)
+    assert fresh.lookup_current("comix", "https://qx.com/old-1") is None
+    assert fresh.lookup_current("nbdeli", "https://b2b.nbdeli.com/goods/948.html") is not None
+    assert not (sandbox_root / "shared_crawl_cache.sqlite3-wal").exists()
+    assert not (sandbox_root / "shared_crawl_cache.sqlite3-shm").exists()
+
+
+def test_delete_guard_never_touches_paths_outside_sandbox(tmp_path):
+    dest = tmp_path / "elsewhere" / "cache.sqlite3"
+    dest.parent.mkdir(parents=True)
+    dest.write_bytes(b"stale-but-precious")
+
+    result = snapshot_cache_readonly(
+        tmp_path / "missing-source.sqlite3",
+        dest,
+        sandbox_root=tmp_path / "sandbox",
+    )
+
+    # dest 在 sandbox_root 之外 → 行为完全不变:不删除、返回结构不变
+    assert result == {"copied": False, "reason": "missing"}
+    assert dest.is_file()
+    assert dest.read_bytes() == b"stale-but-precious"
 
 
 # ---- (c) 锁冲突:SKIPPED_ALREADY_RUNNING 且 exit 0 -----------------------------------

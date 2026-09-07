@@ -39,6 +39,7 @@ from app.services.customer_prewarm_discovery import (
     snapshot_cache_readonly,
 )
 from app.services.customer_prewarm_store import CustomerPrewarmStore
+from app.services.cnnc_saas_snapshot_adapter import CnncSaasSnapshotAdapter
 from app.services.daily_audit_store import LeaseUnavailable, ProcessLock
 from app.services.incremental_audit_runtime import (
     DEFAULT_RUNTIME_ROOT,
@@ -50,6 +51,7 @@ from app.services.incremental_audit_runtime import (
 )
 from app.services.shared_crawl_cache import SharedCrawlCache
 from scripts.audit_saas_excel_file import call_detail_api
+from scripts.auth_manager import AuthManager
 from scripts.curl_utils import load_curl_command
 from scripts.zhaoshang_mall_mapping import load_zhaoshang_mall_mappings
 
@@ -58,9 +60,12 @@ DETAIL_LOCK_NAME = "detail.lock"
 PREWARM_STORE_NAME = "customer_prewarm.sqlite3"
 PREWARM_LOCK_NAME = "customer_prewarm.lock"
 SHARED_CACHE_NAME = "shared_crawl_cache.sqlite3"
+RECOVERY_SAAS_CURL_NAME = "latest_saas_sameAudit_queryAll.curl"
+RECOVERY_CUSTOMER_CURL_NAME = "latest_cnnc_query.curl"
 DEFAULT_BUDGET_SECONDS = 50.0
 DEFAULT_MAX_DOCUMENTS = 10
 DEFAULT_DETAIL_TIMEOUT_SECONDS = 30.0
+DEFAULT_RECOVERY_INTERVAL_SECONDS = 300.0
 
 
 def _disabled_detail_fetch(_document_id: str, _four_category_id: str) -> dict[str, object]:
@@ -142,6 +147,45 @@ def _build_detail_fetcher(
     return detail_fetch
 
 
+def _build_customer_recovery_fetch(detail_timeout: float):
+    """Phase B2 customer-side-only recovery fetch, or None when not wired.
+
+    Both snapshot curl templates must exist under the project data root; a
+    missing template set degrades to running WITHOUT recovery (one WARNING,
+    same pattern as the unreadable detail template), so the scan itself never
+    fails on it.  The adapter is constructed lazily on the first fetch so a
+    pass that never reaches Phase B2 pays no auth/provider setup cost, and the
+    heavy SaaS query side of ``fetch`` is never repeated per minute
+    (``fetch_customer_documents`` reads the customer side only).
+    """
+    saas_curl = PROJECT_DATA_ROOT / RECOVERY_SAAS_CURL_NAME
+    customer_curl = PROJECT_DATA_ROOT / RECOVERY_CUSTOMER_CURL_NAME
+    if not (saas_curl.is_file() and customer_curl.is_file()):
+        print(
+            "WARNING customer recovery curl templates missing "
+            f"({saas_curl.name}, {customer_curl.name}); "
+            "running without customer-side recovery"
+        )
+        return None
+    adapter: list[CnncSaasSnapshotAdapter] = []
+
+    def customer_recovery_fetch():
+        if not adapter:
+            adapter.append(
+                CnncSaasSnapshotAdapter(
+                    saas_curl,
+                    customer_curl,
+                    auth_manager=AuthManager(),
+                    cnnc_provider=shared_cnnc_provider(),
+                )
+            )
+        return adapter[0].fetch_customer_documents(
+            max_elapsed_seconds=detail_timeout
+        ).customer_rows
+
+    return customer_recovery_fetch
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Issue #9 customer prewarm scan: bounded read-only sidecar pass"
@@ -188,6 +232,13 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="skip Phase C entirely: the pass uses max_documents=0 so no "
         "pending document consumes an attempt and no detail request is made",
+    )
+    parser.add_argument(
+        "--customer-recovery-interval-seconds",
+        type=float,
+        default=DEFAULT_RECOVERY_INTERVAL_SECONDS,
+        help="minimum spacing between customer-side recovery reads (Phase B2); "
+        f"0 runs recovery on every pass; default {DEFAULT_RECOVERY_INTERVAL_SECONDS:g}",
     )
     parser.add_argument(
         "--backfill-history",
@@ -305,6 +356,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.detail_timeout <= 0:
         print("ERROR --detail-timeout must be positive")
         return 2
+    if args.customer_recovery_interval_seconds < 0:
+        print("ERROR --customer-recovery-interval-seconds must not be negative")
+        return 2
     if args.backfill_history is not None and not 1 <= args.backfill_history <= 90:
         print("ERROR --backfill-history must be between 1 and 90")
         return 2
@@ -364,7 +418,9 @@ def _run_backfill(args: argparse.Namespace, business_date: str, resolved: dict) 
     try:
         if args.dry_run:
             cache_snapshot = snapshot_cache_readonly(
-                resolved["cache_source"], resolved["cache_write_path"]
+                resolved["cache_source"],
+                resolved["cache_write_path"],
+                sandbox_root=resolved["sandbox_root"],
             )
         summary = backfill_daily_history(
             CustomerPrewarmStore(resolved["prewarm_store_path"]),
@@ -440,14 +496,22 @@ def _run_scan_pass(args: argparse.Namespace, business_date: str, resolved: dict)
             max_documents = args.max_documents
 
     mappings = load_zhaoshang_mall_mappings(args.mapping_path)
+    # Phase B2 recovery is independent of detail scanning: it is wired even
+    # with --skip-detail, and degrades to no-recovery when the snapshot curl
+    # templates are missing.
+    customer_recovery_fetch = _build_customer_recovery_fetch(args.detail_timeout)
     try:
         # Dry-run models the real deployment: the source cache is snapshotted
         # read-only into the sandbox target BEFORE the scan; the scan then
         # really records into that sandbox copy (see snapshot_cache_readonly).
+        # The sandbox guard keeps that copy FRESH: a stale leftover from a
+        # previous dry-run is removed first, even when the source is gone.
         cache_snapshot = None
         if args.dry_run:
             cache_snapshot = snapshot_cache_readonly(
-                resolved["cache_source"], resolved["cache_write_path"]
+                resolved["cache_source"],
+                resolved["cache_write_path"],
+                sandbox_root=resolved["sandbox_root"],
             )
         summary = run_prewarm_scan(
             prewarm_store=CustomerPrewarmStore(resolved["prewarm_store_path"]),
@@ -459,6 +523,8 @@ def _run_scan_pass(args: argparse.Namespace, business_date: str, resolved: dict)
             max_documents=max_documents,
             refresh_limit=args.refresh_limit,
             budget_seconds=args.budget_seconds,
+            customer_recovery_fetch=customer_recovery_fetch,
+            customer_recovery_interval_seconds=args.customer_recovery_interval_seconds,
         )
     except Exception as exc:  # noqa: BLE001 - scheduler-facing failure
         print(
@@ -486,6 +552,8 @@ def _run_scan_pass(args: argparse.Namespace, business_date: str, resolved: dict)
     )
     print(
         f"intake={summary.get('intake_count', 0)} "
+        f"customer_recovery_intaked={summary.get('customer_recovery_intaked', 0)} "
+        f"customer_recovery_throttled={summary.get('customer_recovery_throttled', 0)} "
         f"documents_processed={summary.get('documents_processed', 0)} "
         f"detail_failures={summary.get('detail_failures', 0)} "
         f"candidate_hits={summary.get('candidate_hits', 0)} "

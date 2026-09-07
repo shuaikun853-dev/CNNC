@@ -19,7 +19,13 @@ Cache (:mod:`app.services.shared_crawl_cache`, Issue #7):
   (``crawl_work.state='SUCCESS'`` AND ``result_json.page_price_status=='OK'``,
   the authoritative per-row semantics of
   ``read_zhaoshang_result_xlsx_by_identity``) into the shared cache through an
-  idempotent ledger with crash recovery.
+  idempotent ledger with crash recovery.  The crawl row's ``sku_id`` is only a
+  request/template echo, so rows are recorded ``UNRESOLVED`` and the value is
+  kept as ``payload["request_sku_id"]`` (Round 3 Finding B).
+- :func:`recover_customer_documents` re-reads the customer side only for the
+  scanner so documents the event sidecar never delivered still reach the
+  store, throttled via the ``prewarm_recovery_runs`` table (Round 3 Finding
+  A; run by :func:`run_prewarm_scan` as Phase B2).
 - :func:`backfill_daily_history` reuses the same sync across past per-day
   state DBs to backfill daily-internet history (idempotent, resumable,
   read-only on every historical state DB).
@@ -42,10 +48,10 @@ import time
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, Callable, Mapping, Sequence
+from typing import Any, Callable, Iterable, Mapping, Sequence
 from urllib.parse import urlparse
 
-from app.services.crawl_url_identity import SKU_STATUS_CONFIRMED, SKU_STATUS_UNRESOLVED
+from app.services.crawl_url_identity import SKU_STATUS_UNRESOLVED
 from app.services.customer_prewarm_store import (
     CACHE_STATUS_CACHE_HIT,
     CACHE_STATUS_PENDING_PREWARM,
@@ -135,6 +141,82 @@ def intake_documents(
         store.upsert_document(business_date, document_id, category, source=source)
         seen.add(document_id)
     return len(seen)
+
+
+def prewarm_rows_from_customer_rows(rows: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """Shape RAW customer query rows into the prewarm intake row shape.
+
+    Takes the unfiltered customer-side rows (dicts carrying documentId /
+    fourCategoryId / fourCategoryName / commodityName / referenceLink) and
+    outputs the same 5-field shape as ``snapshot_discoverer``'s
+    ``prewarm_rows``.  Duplicate documentIds are deduplicated FIRST-WINS (the
+    scanner must never crash on odd pagination) and rows without a non-empty
+    ``documentId`` are skipped; this helper never raises on row content.
+    """
+    shaped: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for raw in rows:
+        if not isinstance(raw, Mapping):
+            continue
+        document_id = str(raw.get("documentId") or "").strip()
+        if not document_id or document_id in seen:
+            continue
+        seen.add(document_id)
+        shaped.append(
+            {
+                "documentId": document_id,
+                "fourCategoryId": str(raw.get("fourCategoryId") or ""),
+                "fourCategoryName": str(raw.get("fourCategoryName") or ""),
+                "commodityName": str(raw.get("commodityName") or ""),
+                "referenceLink": str(raw.get("referenceLink") or ""),
+            }
+        )
+    return shaped
+
+
+# ---- Phase B2: customer-side-only scanner recovery (Round 3 Finding A) -------------
+
+
+def recover_customer_documents(
+    prewarm_store: CustomerPrewarmStore,
+    *,
+    customer_fetch: Callable[[], Sequence[Mapping[str, Any]]],
+    business_date: str,
+    interval_seconds: float = 300.0,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Customer-side-only recovery intake for the scanner (Round 3 Finding A).
+
+    When the STEP1 event sidecar intake failed for a whole day, the per-minute
+    scanner would otherwise never see customer-only documents (they exist only
+    in the authoritative customer query, not in the per-day state DB).  This
+    recovery reads the customer side ONLY (no SaaS query) and upserts the
+    rows as ``source="scanner-recovery"``.
+
+    Throttled by the append-only ``prewarm_recovery_runs`` table: when a
+    previous run exists and ``(now - last_ran_at) < interval_seconds``, the
+    function returns ``{"throttled": True, "documents_intaked": 0}`` without
+    calling ``customer_fetch``.  ``interval_seconds=0`` disables throttling
+    (run every pass).  ``customer_fetch`` exceptions propagate to the phase
+    guard — a failed recovery must never record a run row, so the next pass
+    retries.
+    """
+    now_value = now if now is not None else datetime.now(UTC)
+    last_ran_at = prewarm_store.last_recovery_run_at()
+    if last_ran_at is not None and interval_seconds > 0:
+        elapsed_seconds = (now_value - datetime.fromisoformat(last_ran_at)).total_seconds()
+        if elapsed_seconds < interval_seconds:
+            return {"throttled": True, "documents_intaked": 0}
+    rows = customer_fetch()
+    documents_seen = len(rows)
+    intaked = intake_documents(
+        prewarm_store,
+        business_date,
+        prewarm_rows_from_customer_rows(rows),
+        source="scanner-recovery",
+    )
+    prewarm_store.record_recovery_run(business_date, documents_seen)
+    return {"throttled": False, "documents_intaked": intaked, "documents_seen": documents_seen}
 
 
 # ---- Phase C: detail scan -------------------------------------------------------
@@ -358,6 +440,22 @@ def sync_daily_internet_results(
     never retried; transient failures (sqlite busy/locked) drop the claim so
     the next scan retries.  A missing state db returns ``state_db='missing'``
     without raising.
+
+    SKU evidence note (Issue #9 Round 3 Finding B): the crawl row's
+    ``sku_id`` is the submitted template code echoed back by the export
+    result workbook (app-side mapping keys by (code, url), so any
+    successfully mapped row's code equals the submitted SKU by construction).
+    That is request/template evidence, NOT page/crawler evidence, so every
+    daily-internet row is recorded ``UNRESOLVED`` with an empty ``real_sku_id``
+    while the upstream value is preserved verbatim as
+    ``payload["request_sku_id"]``.
+
+    SPEC_CONFLICT: the #7 frozen enum has no state for "upstream
+    SaaS/request-supplied, not page-verified while retaining the value"
+    (``crawl_work.result_json`` carries no independent page/crawler SKU
+    column).  When such a state (e.g. ``UPSTREAM_PROVIDED``) is ever added,
+    history can be re-recorded from ``payload["request_sku_id"]`` without
+    re-crawling.
     """
     now_value = now if now is not None else datetime.now(UTC)
     summary: dict[str, Any] = {
@@ -482,14 +580,20 @@ def sync_daily_internet_results(
         if succeeded_at is None:
             payload["raw_updated_at"] = updated_at_raw
 
+        # Finding B: the row's sku_id is the submitted template code echoed
+        # back by the export workbook — request/template evidence, never page
+        # evidence.  Keep the value verbatim as payload evidence and record
+        # the cache entry UNRESOLVED with an empty real_sku_id (#7 rule:
+        # UNRESOLVED must not carry a SKU).
         sku_value = str(row["sku_id"] or "").strip()
+        payload["request_sku_id"] = sku_value
         try:
             row_out = shared_cache.record_success(
                 mall=mall_key,
                 submitted_url=exact_url,
                 crawl_id=task_name or None,
-                real_sku_id=sku_value or None,
-                sku_status=SKU_STATUS_CONFIRMED if sku_value else SKU_STATUS_UNRESOLVED,
+                real_sku_id=None,
+                sku_status=SKU_STATUS_UNRESOLVED,
                 price=result.get("page_price_value"),
                 source=source,
                 succeeded_at=succeeded_at,
@@ -584,13 +688,28 @@ def backfill_daily_history(
 # ---- dry-run cache snapshot (Finding 6) ---------------------------------------------
 
 
-def snapshot_cache_readonly(source: str | Path, dest: str | Path) -> dict[str, object]:
+def snapshot_cache_readonly(
+    source: str | Path,
+    dest: str | Path,
+    *,
+    sandbox_root: str | Path | None = None,
+) -> dict[str, object]:
     """Copy a Shared Crawl Cache file into the sandbox WITHOUT touching the source.
 
     Opens the source with SQLite URI mode=ro (no schema init, no WAL/DDL, no
     directory creation) and uses the sqlite backup API to write a consistent
-    snapshot into dest.  A missing source leaves dest untouched (the scan then
-    creates a fresh empty sandbox cache).
+    snapshot into dest.
+
+    Fresh-destination semantics (Issue #9 Round 3): when ``sandbox_root`` is
+    given AND ``dest`` resolves strictly inside it, any stale sandbox copy is
+    removed BEFORE the copy — ``dest`` plus its SQLite ``-wal``/``-shm``
+    sidecars — also in the missing-source case, so the sandbox cache is always
+    a fresh snapshot of the source, never a leftover from a previous dry-run
+    (whose production source may since have been deleted).  The returned dict
+    gains ``"stale_sandbox_removed"`` for sandboxed destinations.  When
+    ``sandbox_root`` is None OR dest resolves outside it, nothing is ever
+    deleted and the behaviour/shape is unchanged — production paths can never
+    be unlinked.
 
     Note: read-only access to a WAL-mode database may leave transient SQLite
     ``-shm``/``-wal`` sidecar files next to the source; the main database file
@@ -598,8 +717,33 @@ def snapshot_cache_readonly(source: str | Path, dest: str | Path) -> dict[str, o
     """
     source_path = Path(source)
     dest_path = Path(dest)
+    sandboxed = False
+    if sandbox_root is not None:
+        try:
+            sandboxed = dest_path.resolve().is_relative_to(Path(sandbox_root).resolve())
+        except (OSError, ValueError):  # pragma: no cover - unresolvable paths stay unsandboxed
+            sandboxed = False
+    removed_stale = False
+    if sandboxed:
+        for stale in (
+            dest_path,
+            dest_path.with_name(dest_path.name + "-wal"),
+            dest_path.with_name(dest_path.name + "-shm"),
+        ):
+            try:
+                stale.unlink()
+                removed_stale = True
+            except FileNotFoundError:
+                continue
+            except OSError:
+                # Best-effort: a locked leftover must not fail the dry-run; the
+                # backup copy below still replaces the database content.
+                continue
     if not source_path.is_file():
-        return {"copied": False, "reason": "missing"}
+        result: dict[str, object] = {"copied": False, "reason": "missing"}
+        if sandboxed:
+            result["stale_sandbox_removed"] = removed_stale
+        return result
     dest_path.parent.mkdir(parents=True, exist_ok=True)
     src = sqlite3.connect(source_path.resolve().as_uri() + "?mode=ro", uri=True)
     dst = sqlite3.connect(str(dest_path))
@@ -609,7 +753,10 @@ def snapshot_cache_readonly(source: str | Path, dest: str | Path) -> dict[str, o
     finally:
         dst.close()
         src.close()
-    return {"copied": True, "crawl_results": rows}
+    result = {"copied": True, "crawl_results": rows}
+    if sandboxed:
+        result["stale_sandbox_removed"] = removed_stale
+    return result
 
 
 # ---- orchestration ---------------------------------------------------------------
@@ -651,13 +798,24 @@ def run_prewarm_scan(
     refresh_limit: int | None = None,
     monotonic: Callable[[], float] | None = None,
     budget_seconds: float = 50.0,
+    customer_recovery_fetch: Callable[[], Sequence[Mapping[str, Any]]] | None = None,
+    customer_recovery_interval_seconds: float = 300.0,
 ) -> dict[str, Any]:
-    """One bounded scanner pass: daily sync, catch-up intake, detail scan, refresh.
+    """One bounded scanner pass: daily sync, catch-up intake, recovery intake,
+    detail scan, refresh.
 
-    Phases run strictly A->B->C->D so same-day syncs are visible to the detail
-    scan and the refresh.  Every phase is individually guarded: a phase failure
-    is recorded in ``phase_errors`` and later phases still run; per-document /
-    per-candidate / per-row isolation lives inside the lower layers.
+    Phases run strictly A->B->B2->C->D so same-day syncs are visible to the
+    detail scan and the refresh.  Every phase is individually guarded: a phase
+    failure is recorded in ``phase_errors`` and later phases still run;
+    per-document / per-candidate / per-row isolation lives inside the lower
+    layers.
+
+    Phase B2 (Round 3 Finding A) runs only when ``customer_recovery_fetch`` is
+    wired: it re-reads the customer side only (no SaaS query) so documents the
+    event sidecar never delivered still reach the store; the phase is
+    throttled by ``customer_recovery_interval_seconds`` (0 = every pass) and
+    its counters are ``customer_recovery_intaked`` /
+    ``customer_recovery_throttled``.
     """
     clock = monotonic if monotonic is not None else time.monotonic
     deadline = clock() + budget_seconds
@@ -688,6 +846,22 @@ def run_prewarm_scan(
     except Exception as exc:  # noqa: BLE001 - phase isolation
         summary["phase_errors"].append({"phase": "catch_up_intake", "error": str(exc)})
     summary["intake_count"] = intake_count
+
+    # Phase B2: customer-side-only recovery intake (Round 3 Finding A)
+    summary["customer_recovery_intaked"] = 0
+    summary["customer_recovery_throttled"] = 0
+    try:
+        if customer_recovery_fetch is not None:
+            recovery = recover_customer_documents(
+                prewarm_store,
+                customer_fetch=customer_recovery_fetch,
+                business_date=business_date,
+                interval_seconds=customer_recovery_interval_seconds,
+            )
+            summary["customer_recovery_intaked"] = int(recovery.get("documents_intaked", 0))
+            summary["customer_recovery_throttled"] = 1 if recovery.get("throttled") else 0
+    except Exception as exc:  # noqa: BLE001 - phase isolation
+        summary["phase_errors"].append({"phase": "customer_recovery", "error": str(exc)})
 
     # Phase C: detail scan, bounded by the remaining budget (keep a reserve)
     documents_processed = 0
