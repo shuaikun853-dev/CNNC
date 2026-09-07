@@ -25,6 +25,9 @@ python -m pytest tests -q
 
 不要在文档中长期写死测试总数；以收集命令实时输出为准。`StarletteDeprecationWarning` 和本机 requests 依赖兼容警告目前不等于测试失败，但应在升级依赖时单独处理。
 
+### Critical Safety Suite（CI 同款 selector）
+- gate 命令 `E:\Python314\python.exe -m pytest tests -m critical_safety -q`；membership 唯一权威 = 测试文件内一行 `pytestmark = pytest.mark.critical_safety`（marker 在 `pytest.ini` 注册，`--strict-markers` 全局生效），本地与 GitHub workflow 用同一 selector，Workflow 不再维护文件清单。新增关键 regression 加该行即进 gate；不能进 CI 的测试必须在 `tests/test_critical_suite_governance.py` 的 `EXCLUSIONS` 登记理由（`PRODUCTION_MACHINE_ONLY`/`NON_CRITICAL_TOOLING`/`HERMETIC_UNGATED`）；守卫拦截未分类新文件、陈旧排除条目、marker 与排除重叠、关键能力哨兵缺失、收集数跌破单调性基线。`PRODUCTION_MACHINE_ONLY` = 依赖生产机真实外部工具（E:\.A2026）或公司机夹具；CI 存在性桩下执行等于 FAKE_GREEN，只在本机全量运行。
+
 ### 按改动范围
 
 ```powershell
@@ -107,12 +110,9 @@ $secretPatterns = @(
   ('sk-' + '[A-Za-z0-9]{20,}'),
   ('password' + '\s*=\s*[^<]')
 )
-Select-String `
-  -Path AGENTS.md,CURRENT_STATE.md,TESTING.md,README.md,docs\runbooks\*.md `
-  -Pattern $secretPatterns
+Select-String -Path AGENTS.md,CURRENT_STATE.md,TESTING.md,README.md,docs\runbooks\*.md -Pattern $secretPatterns
 
-Get-ChildItem runtime -Recurse -Filter BATCH_STATE.md |
-  Select-String -Pattern $secretPatterns
+Get-ChildItem runtime -Recurse -Filter BATCH_STATE.md | Select-String -Pattern $secretPatterns
 ```
 
 验收：
