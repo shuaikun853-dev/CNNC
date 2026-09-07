@@ -63,6 +63,7 @@ CREATE TABLE IF NOT EXISTS prewarm_candidates (
     cache_status TEXT NOT NULL DEFAULT 'PENDING_LOOKUP',
     match_level TEXT,
     resolved_identity_id INTEGER,
+    remote_job_id INTEGER,
     last_error TEXT,
     last_checked_at TEXT,
     first_seen_at TEXT NOT NULL,
@@ -101,19 +102,56 @@ CREATE TABLE IF NOT EXISTS prewarm_recovery_runs (
 CACHE_STATUS_PENDING_LOOKUP = "PENDING_LOOKUP"
 CACHE_STATUS_PENDING_PREWARM = "PENDING_PREWARM"
 CACHE_STATUS_CACHE_HIT = "CACHE_HIT"
+CACHE_STATUS_STAPLES_PENDING = "STAPLES_PENDING"
+CACHE_STATUS_MANUAL_SKIP = "MANUAL_SKIP"
+CACHE_STATUS_ROUTING_BLOCKED = "ROUTING_BLOCKED"
+CACHE_STATUS_REMOTE_DISPATCHED = "REMOTE_DISPATCHED"
+CACHE_STATUS_REMOTE_REUSED = "REMOTE_REUSED"
 
 _ALLOWED_CACHE_STATUS = {
     CACHE_STATUS_PENDING_LOOKUP,
     CACHE_STATUS_PENDING_PREWARM,
     CACHE_STATUS_CACHE_HIT,
+    CACHE_STATUS_STAPLES_PENDING,
+    CACHE_STATUS_MANUAL_SKIP,
+    CACHE_STATUS_ROUTING_BLOCKED,
+    CACHE_STATUS_REMOTE_DISPATCHED,
+    CACHE_STATUS_REMOTE_REUSED,
 }
 
 # 命中是终态:历史 append-only,CACHE_HIT 永不回退或改道。
 _ALLOWED_TRANSITIONS: dict[str, set[str]] = {
     CACHE_STATUS_PENDING_LOOKUP: {CACHE_STATUS_PENDING_PREWARM, CACHE_STATUS_CACHE_HIT},
-    CACHE_STATUS_PENDING_PREWARM: {CACHE_STATUS_CACHE_HIT},
+    CACHE_STATUS_PENDING_PREWARM: {
+        CACHE_STATUS_CACHE_HIT,
+        CACHE_STATUS_STAPLES_PENDING,
+        CACHE_STATUS_MANUAL_SKIP,
+        CACHE_STATUS_ROUTING_BLOCKED,
+        CACHE_STATUS_REMOTE_DISPATCHED,
+        CACHE_STATUS_REMOTE_REUSED,
+    },
+    # 路由被阻塞时可重新分类(映射补全后),也允许事后命中缓存或补挂远端结果。
+    CACHE_STATUS_ROUTING_BLOCKED: {
+        CACHE_STATUS_ROUTING_BLOCKED,
+        CACHE_STATUS_CACHE_HIT,
+        CACHE_STATUS_STAPLES_PENDING,
+        CACHE_STATUS_MANUAL_SKIP,
+        CACHE_STATUS_REMOTE_DISPATCHED,
+        CACHE_STATUS_REMOTE_REUSED,
+    },
+    # #11 可能稍后补缓存;STAPLES_PENDING 只能自愈为命中或保持原状。
+    CACHE_STATUS_STAPLES_PENDING: {CACHE_STATUS_STAPLES_PENDING, CACHE_STATUS_CACHE_HIT},
+    # 人工处理是终态。
+    CACHE_STATUS_MANUAL_SKIP: set(),
+    CACHE_STATUS_REMOTE_DISPATCHED: {CACHE_STATUS_REMOTE_DISPATCHED, CACHE_STATUS_CACHE_HIT},
+    CACHE_STATUS_REMOTE_REUSED: {CACHE_STATUS_REMOTE_REUSED, CACHE_STATUS_CACHE_HIT},
     CACHE_STATUS_CACHE_HIT: set(),
 }
+
+# remote_job_id 仅允许记录在远端复用/新派发的候选上,保留任务溯源。
+_REMOTE_JOB_STATUSES = frozenset(
+    {CACHE_STATUS_REMOTE_DISPATCHED, CACHE_STATUS_REMOTE_REUSED}
+)
 
 # 瞬时 detail 失败的指数退避:60s, 120s, 240s, ... 封顶 1 小时。
 _DETAIL_RETRY_BACKOFF_CAP_SECONDS = 3600
@@ -186,6 +224,14 @@ class CustomerPrewarmStore:
             if "next_retry_at" not in columns:
                 connection.execute(
                     "ALTER TABLE prewarm_documents ADD COLUMN next_retry_at TEXT"
+                )
+            candidate_columns = {
+                row["name"]
+                for row in connection.execute("PRAGMA table_info(prewarm_candidates)")
+            }
+            if "remote_job_id" not in candidate_columns:
+                connection.execute(
+                    "ALTER TABLE prewarm_candidates ADD COLUMN remote_job_id INTEGER"
                 )
 
     # ---- shared helpers ------------------------------------------------------
@@ -463,11 +509,24 @@ class CustomerPrewarmStore:
         match_level: str | None = None,
         resolved_identity_id: int | None = None,
         error: str | None = None,
+        remote_job_id: int | None = None,
     ) -> dict[str, Any]:
-        """Apply one cache-status transition (see ``_ALLOWED_TRANSITIONS``)."""
+        """Apply one cache-status transition (see ``_ALLOWED_TRANSITIONS``).
+
+        ``remote_job_id`` is only accepted for the remote statuses
+        (``REMOTE_DISPATCHED`` / ``REMOTE_REUSED``) and keeps the remote-task
+        provenance on the candidate row; when omitted the stored value is left
+        untouched so later re-calls never erase prior evidence.
+        """
         if cache_status not in _ALLOWED_CACHE_STATUS:
             raise ValueError(
                 f"cache_status must be one of {sorted(_ALLOWED_CACHE_STATUS)}, got {cache_status!r}"
+            )
+        remote_job_value = None if remote_job_id is None else int(remote_job_id)
+        if remote_job_value is not None and cache_status not in _REMOTE_JOB_STATUSES:
+            raise ValueError(
+                f"remote_job_id is only allowed for cache_status in "
+                f"{sorted(_REMOTE_JOB_STATUSES)}, got {cache_status!r}"
             )
         match_value = self._optional_text(match_level)
         error_value = self._optional_text(error)
@@ -480,11 +539,18 @@ class CustomerPrewarmStore:
                 raise ValueError(f"candidate {candidate_id} does not exist")
             current = row["cache_status"]
             if current == cache_status:
-                # 同状态幂等:仅刷新 last_checked_at,其余字段不动。
-                connection.execute(
-                    "UPDATE prewarm_candidates SET last_checked_at=? WHERE id=?",
-                    (now, int(candidate_id)),
-                )
+                # 同状态幂等:仅刷新 last_checked_at(以及新提供的 remote_job_id),
+                # 其余字段不动。
+                if remote_job_value is not None:
+                    connection.execute(
+                        "UPDATE prewarm_candidates SET remote_job_id=?, last_checked_at=? WHERE id=?",
+                        (remote_job_value, now, int(candidate_id)),
+                    )
+                else:
+                    connection.execute(
+                        "UPDATE prewarm_candidates SET last_checked_at=? WHERE id=?",
+                        (now, int(candidate_id)),
+                    )
             elif current == CACHE_STATUS_CACHE_HIT:
                 raise ValueError(
                     f"candidate {candidate_id} is CACHE_HIT; a hit is permanent and "
@@ -494,6 +560,22 @@ class CustomerPrewarmStore:
                 raise ValueError(
                     f"candidate {candidate_id}: transition {current!r} -> "
                     f"{cache_status!r} is not allowed"
+                )
+            elif remote_job_value is not None:
+                connection.execute(
+                    """UPDATE prewarm_candidates
+                       SET cache_status=?, match_level=?, resolved_identity_id=?,
+                           remote_job_id=?, last_error=?, last_checked_at=?
+                       WHERE id=?""",
+                    (
+                        cache_status,
+                        match_value,
+                        resolved_identity_id,
+                        remote_job_value,
+                        error_value,
+                        now,
+                        int(candidate_id),
+                    ),
                 )
             else:
                 connection.execute(

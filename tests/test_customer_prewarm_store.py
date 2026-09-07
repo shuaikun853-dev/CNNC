@@ -14,7 +14,17 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from app.services.customer_prewarm_store import CustomerPrewarmStore
+from app.services.customer_prewarm_store import (
+    CACHE_STATUS_CACHE_HIT,
+    CACHE_STATUS_MANUAL_SKIP,
+    CACHE_STATUS_REMOTE_DISPATCHED,
+    CACHE_STATUS_REMOTE_REUSED,
+    CACHE_STATUS_ROUTING_BLOCKED,
+    CACHE_STATUS_STAPLES_PENDING,
+    CustomerPrewarmStore,
+    _ALLOWED_CACHE_STATUS,
+    _ALLOWED_TRANSITIONS,
+)
 
 EXPECTED_TABLES = {
     "prewarm_documents",
@@ -537,3 +547,204 @@ def test_two_instances_short_busy_lock_smoke(tmp_path):
         assert check.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
     finally:
         check.close()
+
+
+# ---- Issue #10:新 cache_status / 迁移矩阵 / remote_job_id -----------------------
+
+
+def _candidate_in_status(store, url, status):
+    """构建一个处于指定状态的候选(PENDING_LOOKUP → PENDING_PREWARM → status)。"""
+    candidate_id = store.upsert_link("D1", url)["candidate"]["id"]
+    if status != "PENDING_LOOKUP":
+        store.record_candidate_result(candidate_id, cache_status="PENDING_PREWARM")
+    if status not in ("PENDING_LOOKUP", "PENDING_PREWARM"):
+        store.record_candidate_result(candidate_id, cache_status=status)
+    return candidate_id
+
+
+def test_issue10_new_statuses_are_in_allowed_set():
+    new_statuses = {
+        CACHE_STATUS_STAPLES_PENDING,
+        CACHE_STATUS_MANUAL_SKIP,
+        CACHE_STATUS_ROUTING_BLOCKED,
+        CACHE_STATUS_REMOTE_DISPATCHED,
+        CACHE_STATUS_REMOTE_REUSED,
+    }
+    assert new_statuses <= _ALLOWED_CACHE_STATUS
+    # 两个终态保持为空迁移集合
+    assert _ALLOWED_TRANSITIONS[CACHE_STATUS_MANUAL_SKIP] == set()
+    assert _ALLOWED_TRANSITIONS[CACHE_STATUS_CACHE_HIT] == set()
+    # 终态键完整覆盖全部合法状态
+    assert set(_ALLOWED_TRANSITIONS) == _ALLOWED_CACHE_STATUS
+
+
+def test_issue10_pending_prewarm_reaches_every_new_status(store):
+    targets = (
+        CACHE_STATUS_STAPLES_PENDING,
+        CACHE_STATUS_MANUAL_SKIP,
+        CACHE_STATUS_ROUTING_BLOCKED,
+        CACHE_STATUS_REMOTE_DISPATCHED,
+        CACHE_STATUS_REMOTE_REUSED,
+    )
+    for index, target in enumerate(targets):
+        candidate_id = store.upsert_link(f"D{index}", f"https://x.example/{index}")["candidate"]["id"]
+        store.record_candidate_result(candidate_id, cache_status="PENDING_PREWARM")
+        moved = store.record_candidate_result(candidate_id, cache_status=target)
+        assert moved["cache_status"] == target
+
+
+def test_issue10_manual_skip_is_terminal(store):
+    candidate_id = _candidate_in_status(store, "https://skip.example/1", CACHE_STATUS_MANUAL_SKIP)
+    with pytest.raises(ValueError):
+        store.record_candidate_result(candidate_id, cache_status="CACHE_HIT")
+    assert store.candidates()[0]["cache_status"] == CACHE_STATUS_MANUAL_SKIP
+    # 同状态幂等刷新仍然允许
+    again = store.record_candidate_result(candidate_id, cache_status=CACHE_STATUS_MANUAL_SKIP)
+    assert again["cache_status"] == CACHE_STATUS_MANUAL_SKIP
+
+
+def test_issue10_cache_hit_remains_terminal(store):
+    candidate_id = _candidate_in_status(store, "https://hit.example/1", CACHE_STATUS_REMOTE_DISPATCHED)
+    hit = store.record_candidate_result(candidate_id, cache_status="CACHE_HIT")
+    assert hit["cache_status"] == "CACHE_HIT"
+    with pytest.raises(ValueError):
+        store.record_candidate_result(candidate_id, cache_status=CACHE_STATUS_REMOTE_DISPATCHED)
+    with pytest.raises(ValueError):
+        store.record_candidate_result(candidate_id, cache_status=CACHE_STATUS_REMOTE_REUSED)
+    assert store.candidates()[0]["cache_status"] == "CACHE_HIT"
+
+
+def test_issue10_routing_blocked_reclassification_matrix(store):
+    blocked = _candidate_in_status(store, "https://blocked.example/1", CACHE_STATUS_ROUTING_BLOCKED)
+    # 同状态重分类(映射补全后再次评估)合法
+    same = store.record_candidate_result(
+        blocked, cache_status=CACHE_STATUS_ROUTING_BLOCKED, error="unmapped mall: x.example"
+    )
+    assert same["cache_status"] == CACHE_STATUS_ROUTING_BLOCKED
+    # 阻塞态可以走向全部非 PENDING_LOOKUP/PENDING_PREWARM 的结果
+    for target in (
+        CACHE_STATUS_CACHE_HIT,
+        CACHE_STATUS_STAPLES_PENDING,
+        CACHE_STATUS_MANUAL_SKIP,
+        CACHE_STATUS_REMOTE_DISPATCHED,
+        CACHE_STATUS_REMOTE_REUSED,
+    ):
+        candidate_id = store.upsert_link("D1", f"https://blocked.example/{target}")["candidate"]["id"]
+        store.record_candidate_result(candidate_id, cache_status="PENDING_PREWARM")
+        store.record_candidate_result(candidate_id, cache_status=CACHE_STATUS_ROUTING_BLOCKED)
+        moved = store.record_candidate_result(candidate_id, cache_status=target)
+        assert moved["cache_status"] == target
+    # 不允许回退到 PENDING_LOOKUP / PENDING_PREWARM
+    candidate_id = _candidate_in_status(store, "https://blocked2.example/1", CACHE_STATUS_ROUTING_BLOCKED)
+    with pytest.raises(ValueError):
+        store.record_candidate_result(candidate_id, cache_status="PENDING_LOOKUP")
+    with pytest.raises(ValueError):
+        store.record_candidate_result(candidate_id, cache_status="PENDING_PREWARM")
+
+
+def test_issue10_staples_pending_transitions(store):
+    candidate_id = _candidate_in_status(store, "https://staples.example/1", CACHE_STATUS_STAPLES_PENDING)
+    again = store.record_candidate_result(candidate_id, cache_status=CACHE_STATUS_STAPLES_PENDING)
+    assert again["cache_status"] == CACHE_STATUS_STAPLES_PENDING
+    hit = store.record_candidate_result(candidate_id, cache_status="CACHE_HIT")
+    assert hit["cache_status"] == "CACHE_HIT"
+    # 其它出口全部非法
+    for blocked in ("PENDING_PREWARM", CACHE_STATUS_REMOTE_DISPATCHED, CACHE_STATUS_REMOTE_REUSED):
+        candidate_id = store.upsert_link("D1", f"https://staples.example/{blocked}")["candidate"]["id"]
+        store.record_candidate_result(candidate_id, cache_status="PENDING_PREWARM")
+        store.record_candidate_result(candidate_id, cache_status=CACHE_STATUS_STAPLES_PENDING)
+        with pytest.raises(ValueError):
+            store.record_candidate_result(candidate_id, cache_status=blocked)
+
+
+def test_issue10_remote_statuses_move_to_cache_hit(store):
+    for index, status in enumerate((CACHE_STATUS_REMOTE_DISPATCHED, CACHE_STATUS_REMOTE_REUSED)):
+        candidate_id = _candidate_in_status(store, f"https://remote.example/{index}", status)
+        hit = store.record_candidate_result(candidate_id, cache_status="CACHE_HIT")
+        assert hit["cache_status"] == "CACHE_HIT"
+
+
+def test_issue10_remote_job_id_persisted_and_validated(store):
+    candidate_id = store.upsert_link("D1", "https://x.example/remote")["candidate"]["id"]
+    store.record_candidate_result(candidate_id, cache_status="PENDING_PREWARM")
+    # remote_job_id 只允许出现在远端状态上
+    with pytest.raises(ValueError):
+        store.record_candidate_result(
+            candidate_id, cache_status="PENDING_PREWARM", remote_job_id=5
+        )
+    dispatched = store.record_candidate_result(
+        candidate_id, cache_status=CACHE_STATUS_REMOTE_DISPATCHED, remote_job_id=77
+    )
+    assert dispatched["cache_status"] == CACHE_STATUS_REMOTE_DISPATCHED
+    assert dispatched["remote_job_id"] == 77
+    # 同状态幂等重调用:不带 remote_job_id 时保持既有证据
+    refreshed = store.record_candidate_result(
+        candidate_id, cache_status=CACHE_STATUS_REMOTE_DISPATCHED
+    )
+    assert refreshed["remote_job_id"] == 77
+    # 转移到 CACHE_HIT 时不带参数也不抹掉溯源
+    hit = store.record_candidate_result(candidate_id, cache_status="CACHE_HIT")
+    assert hit["remote_job_id"] == 77
+    # CACHE_HIT 上提供 remote_job_id 直接拒绝(校验先于状态机)
+    with pytest.raises(ValueError):
+        store.record_candidate_result(candidate_id, cache_status="CACHE_HIT", remote_job_id=88)
+
+    reused_id = store.upsert_link("D2", "https://x.example/reused")["candidate"]["id"]
+    store.record_candidate_result(reused_id, cache_status="PENDING_PREWARM")
+    reused = store.record_candidate_result(
+        reused_id, cache_status=CACHE_STATUS_REMOTE_REUSED, remote_job_id=99
+    )
+    assert reused["remote_job_id"] == 99
+
+
+def test_issue10_legacy_candidates_schema_migrates_and_preserves_rows(tmp_path):
+    db = tmp_path / "prewarm.sqlite3"
+    connection = sqlite3.connect(str(db))
+    try:
+        # Issue-#9 时代的 prewarm_candidates 建表语句(无 remote_job_id)
+        connection.execute(
+            """CREATE TABLE prewarm_candidates (
+                   id INTEGER PRIMARY KEY,
+                   mall TEXT NOT NULL,
+                   original_url TEXT NOT NULL,
+                   lookup_url TEXT NOT NULL,
+                   routing_url TEXT,
+                   business_date TEXT NOT NULL,
+                   source TEXT NOT NULL DEFAULT 'detail',
+                   cache_status TEXT NOT NULL DEFAULT 'PENDING_LOOKUP',
+                   match_level TEXT,
+                   resolved_identity_id INTEGER,
+                   last_error TEXT,
+                   last_checked_at TEXT,
+                   first_seen_at TEXT NOT NULL,
+                   last_seen_at TEXT NOT NULL,
+                   UNIQUE(mall, original_url)
+               )"""
+        )
+        connection.execute(
+            """INSERT INTO prewarm_candidates
+               (mall, original_url, lookup_url, routing_url, business_date, source,
+                cache_status, match_level, resolved_identity_id, last_error,
+                last_checked_at, first_seen_at, last_seen_at)
+               VALUES ('jd', 'https://item.jd.com/1', 'https://item.jd.com/1', NULL,
+                       '2026-09-06', 'detail', 'PENDING_PREWARM', NULL, NULL, 'miss',
+                       NULL, '2026-09-06T00:00:00+00:00', '2026-09-06T00:00:00+00:00')"""
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    store = CustomerPrewarmStore(db)
+    with store._reader() as opened:
+        columns = {row["name"] for row in opened.execute("PRAGMA table_info(prewarm_candidates)")}
+    assert "remote_job_id" in columns
+    rows = store.candidates()
+    assert len(rows) == 1
+    assert rows[0]["mall"] == "jd"
+    assert rows[0]["cache_status"] == "PENDING_PREWARM"
+    assert rows[0]["remote_job_id"] is None
+    # 迁移后的行可以正常携带 remote_job_id 走完整状态机
+    dispatched = store.record_candidate_result(
+        rows[0]["id"], cache_status=CACHE_STATUS_REMOTE_DISPATCHED, remote_job_id=42
+    )
+    assert dispatched["remote_job_id"] == 42
