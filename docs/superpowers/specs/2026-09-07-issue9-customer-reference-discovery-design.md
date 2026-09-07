@@ -186,17 +186,49 @@ Dashboard/手动重爬(#13)、STEP2 三表(#8)。#9 到 `PENDING_PREWARM` 为止
    customer-only 文档最迟 5 分钟内可由该只读查询恢复;STEP1 state.sqlite3 字节零变化
    (hash 断言);dry-run 走同一真实 seam。行整形 `prewarm_rows_from_customer_rows`
    first-wins 去重(重复 documentId 不抛错,scanner 不因奇异数据崩溃)。
-2. **Finding B — daily-internet SKU evidence 降级**：沿真实调用链核实
-   (saas skuId→CrawlRequest.sku_id→模板商品编码→export 回显→crawl_work.result_json):
-   identity 映射按构造强制 result code == 提交 sku(URL-only 回退也继承唯一提交 sku),
-   result_json 无任何独立页面 SKU 列 → 证据类别=A(请求/模板回显)。#7 冻结枚举
-   无"上游 SaaS 提供、非页面确认"状态 → **SPEC_CONFLICT**(已上报);在用户决策前
-   按许可的保守路线落地:`sku_status=UNRESOLVED`+`real_sku_id=None` 恒定,上游值
-   原样保留于 `payload["request_sku_id"]`(未来若增加 UPSTREAM_PROVIDED 类状态,
-   可凭 payload 重记历史而无需重爬)。placeholder(zhpq-*)/ROW* 结构上不可能再进入
-   real_sku_id;#7 防护与其余 producer 的 CONFIRMED/URL_PARSED_UNVERIFIED 路径不受影响。
+2. **Finding B — daily-internet SKU evidence（Round 3 上报 SPEC_CONFLICT，最终收口已决策解决）**：
+   沿真实调用链核实(saas skuId→CrawlRequest.sku_id→模板商品编码→export 回显→
+   crawl_work.result_json):identity 映射按构造强制 result code == 提交 sku(URL-only
+   回退也继承唯一提交 sku),result_json 无任何独立页面 SKU 列 → 证据类别=上游提供。
+   用户决策(2026-09-07)新增第四证据态 **UPSTREAM_PROVIDED**(#7 契约同步扩展,四态
+   语义见 2026-09-04 设计文档):daily sync 现将合法非临时 `crawl_work.sku_id` 编码为
+   `real_sku_id=<request_sku>`+`sku_status=UPSTREAM_PROVIDED`;`payload["request_sku_id"]`
+   恒保留作 provenance;临时相关码(zhpq-* 前缀 / ROW&lt;n&gt; 模板回退 / crawl_id 回显,
+   见 `is_temporary_request_code`)安全降级为 UNRESOLVED 且**不丢该条合法价格结果**,
+   原码保留于 payload 审计。R3 时代 UNRESOLVED+request_sku_id 历史可经
+   `upgrade_upstream_sku_evidence()` 确定性升级(append-only 追加新行,succeeded_at
+   相同经 id tie-break 成为 current,幂等键 `sku-upgrade:<event_key>`,无需重爬)。
 3. **dry-run sandbox 缓存新鲜度**:`snapshot_cache_readonly(source, dest, *,
    sandbox_root=None)` 增加守卫式全新快照语义——仅当 dest 严格位于 sandbox_root
    内时,复制前(及 source 缺失时)删除 dest 及其 -wal/-shm 伴生;source 缺失时
    绝不再静默沿用上一次 dry-run 的旧 sandbox 缓存(返回 stale_sandbox_removed)。
    沙箱外/未传 sandbox_root 行为逐字节不变——生产路径永不可删。
+
+## 最终收口修订(2026-09-07,latest production restack 至 a1baf01)
+
+- 基线再次移动(ccfc226→a1baf01,招商局 capability-boundary 重构 7 文件)触发最终
+  restack:#7×3 + #9×3 按原序 cherry-pick 到 `feat/issue-9-final-restack-20260907`,
+  零冲突;#9 未触碰任何招商局边界文件(legacy_zhaoshang_adapter / zhaoshang_remote_task /
+  zhaoshang_task_progress / remote_running_recovery / ZHAOSHANG_BOUNDARY.md)。
+- **SKU SPEC_CONFLICT 已决策解决**:#7 契约新增第四证据态 UPSTREAM_PROVIDED
+  (crawl_url_identity.SKU_STATUSES 扩展,Shared Crawl Cache 校验/文档/测试同步;
+  sku_status 列仍为 TEXT,无破坏性 schema rebuild;placeholder/crawl_id 回显防护对
+  全部非空 SKU 证据态继续生效)。#9 daily sync 语义改写见上文 Finding B 修订。
+
+## #12 SKUID 消费契约(跨 ticket,本票只定契约不实现)
+
+STEP3 cache-first/zhImport(#12)消费 Shared Crawl Cache current 行时,SKUID 列按
+`sku_status` 分流,**四种来源永不混用 warning label**:
+
+| sku_status | SKUID 列 | 标记要求 |
+|---|---|---|
+| `CONFIRMED` | 正常填写 | 无警告 |
+| `UPSTREAM_PROVIDED` | 可填写 | 必须明确标记"上游提供 / 未经本次页面独立确认"(独立 label) |
+| `URL_PARSED_UNVERIFIED` | 可填写 | 必须明显标记"URL解析 / 未确认"(与 UPSTREAM_PROVIDED 不同的独立 label) |
+| `UNRESOLVED` | 留空 | — |
+
+- `crawl_id` / `zhpq-*` / 任何 placeholder 或临时相关码(含 ROW&lt;n&gt;)**永远不能进入
+  最终 SKUID**;#7 落库防护与 #9 `is_temporary_request_code` 双层拒绝。
+- UPSTREAM_PROVIDED 与 URL_PARSED_UNVERIFIED 是两类不同强度的证据(前者=上游权威
+  输入未复核,后者=URL 推导),#12 的 Excel/Dashboard 呈现必须可区分,禁止合并成
+  同一个"未确认"标签。

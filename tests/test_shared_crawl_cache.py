@@ -17,6 +17,7 @@ from app.services.crawl_url_identity import (
     SKU_STATUSES,
     SKU_STATUS_CONFIRMED,
     SKU_STATUS_UNRESOLVED,
+    SKU_STATUS_UPSTREAM_PROVIDED,
     SKU_STATUS_URL_PARSED_UNVERIFIED,
     is_placeholder_code,
     ofs_product_identity,
@@ -128,7 +129,7 @@ def test_placeholder_and_status_constants():
     assert not is_placeholder_code("")
     assert is_placeholder_code("xx-1", prefixes=("xx-",))
     assert SKU_STATUSES == frozenset(
-        {"CONFIRMED", "URL_PARSED_UNVERIFIED", "UNRESOLVED"}
+        {"CONFIRMED", "URL_PARSED_UNVERIFIED", "UNRESOLVED", "UPSTREAM_PROVIDED"}
     )
     assert PLACEHOLDER_PREFIXES_DEFAULT == ("zhpq-",)
 
@@ -771,3 +772,147 @@ def test_attach_document_reference_requires_resolved_identity(cache):
         is None
     )
     assert cache.document_references("DOC-X") == []
+
+
+# ---- Issue #7 closure: fourth SKU evidence state (UPSTREAM_PROVIDED) ----------
+
+
+def test_upstream_provided_requires_sku(cache):
+    """UPSTREAM_PROVIDED carries an upstream SKU: empty real_sku_id is rejected."""
+    with pytest.raises(ValueError, match="UPSTREAM_PROVIDED"):
+        cache.record_success(
+            mall="jd",
+            submitted_url=JD_URL,
+            real_sku_id=None,
+            sku_status=SKU_STATUS_UPSTREAM_PROVIDED,
+            source="unit-test",
+        )
+
+
+def test_upstream_provided_stores_sku(cache):
+    """UPSTREAM_PROVIDED stores the SKU verbatim, never auto-promotes."""
+    url = "https://b2b.nbdeli.com/goods/971.html"
+    upstream = cache.record_success(
+        mall="nbdeli",
+        submitted_url=url,
+        real_sku_id="SKU-9",
+        sku_status=SKU_STATUS_UPSTREAM_PROVIDED,
+        source="unit-test",
+        succeeded_at="2026-09-01T00:00:00+00:00",
+    )
+    assert upstream["sku_status"] == "UPSTREAM_PROVIDED"
+    assert upstream["real_sku_id"] == "SKU-9"
+    hit = cache.lookup_current("nbdeli", url)
+    assert hit is not None
+    assert hit["entry"]["sku_status"] == "UPSTREAM_PROVIDED"
+    assert hit["entry"]["real_sku_id"] == "SKU-9"
+    # A later URL_PARSED record keeps its own state: UPSTREAM_PROVIDED never
+    # promotes it (symmetric to the existing URL_PARSED never-promotes rule).
+    later = cache.record_success(
+        mall="nbdeli",
+        submitted_url=url,
+        real_sku_id="SKU-9B",
+        sku_status=SKU_STATUS_URL_PARSED_UNVERIFIED,
+        source="unit-test",
+        succeeded_at="2026-09-02T00:00:00+00:00",
+    )
+    assert later["sku_status"] == SKU_STATUS_URL_PARSED_UNVERIFIED
+    assert lookup_status(cache, "nbdeli", url) == SKU_STATUS_URL_PARSED_UNVERIFIED
+    assert [
+        row["sku_status"] for row in cache.history("nbdeli", url)
+    ] == ["UPSTREAM_PROVIDED", SKU_STATUS_URL_PARSED_UNVERIFIED]
+    # And a URL_PARSED row followed by a later UPSTREAM_PROVIDED row keeps
+    # UPSTREAM_PROVIDED - no state promotes another in either direction.
+    third = cache.record_success(
+        mall="nbdeli",
+        submitted_url=url,
+        real_sku_id="SKU-9C",
+        sku_status=SKU_STATUS_UPSTREAM_PROVIDED,
+        source="unit-test",
+        succeeded_at="2026-09-03T00:00:00+00:00",
+    )
+    assert third["sku_status"] == SKU_STATUS_UPSTREAM_PROVIDED
+    assert lookup_status(cache, "nbdeli", url) == SKU_STATUS_UPSTREAM_PROVIDED
+
+
+def lookup_status(cache: SharedCrawlCache, mall: str, url: str) -> str | None:
+    hit = cache.lookup_current(mall, url)
+    return None if hit is None else hit["entry"]["sku_status"]
+
+
+def test_placeholder_defense_covers_upstream_provided(cache):
+    """#7 placeholder / crawl_id-echo defenses apply to UPSTREAM_PROVIDED too."""
+    with pytest.raises(ValueError, match="placeholder"):
+        cache.record_success(
+            mall="jd",
+            submitted_url=JD_URL,
+            real_sku_id="zhpq-77",
+            sku_status=SKU_STATUS_UPSTREAM_PROVIDED,
+            source="unit-test",
+        )
+    with pytest.raises(ValueError, match="equals crawl_id"):
+        cache.record_success(
+            mall="jd",
+            submitted_url=JD_URL,
+            crawl_id="task-echo-1",
+            real_sku_id="task-echo-1",
+            sku_status=SKU_STATUS_UPSTREAM_PROVIDED,
+            source="unit-test",
+        )
+
+
+def test_get_result_reads_history_and_current(cache):
+    """get_result reads any row by id - current or superseded history - and
+    legacy three-state rows remain readable verbatim."""
+    url = "https://example.com/p/item"
+    first = cache.record_success(
+        mall="m1",
+        submitted_url=url,
+        price="1",
+        source="unit-test",
+        succeeded_at="2026-09-01T00:00:00+00:00",
+    )
+    second = cache.record_success(
+        mall="m1",
+        submitted_url=url,
+        price="2",
+        source="unit-test",
+        succeeded_at="2026-09-02T00:00:00+00:00",
+    )
+    got_old = cache.get_result(int(first["id"]))
+    assert got_old is not None
+    assert got_old["id"] == first["id"]
+    assert got_old["is_current"] is False
+    assert got_old["price"] == "1"
+    got_current = cache.get_result(int(second["id"]))
+    assert got_current is not None
+    assert got_current["is_current"] is True
+    assert got_current["payload"] == {}
+    assert cache.get_result(10**9) is None
+    # Every legacy status row stays readable through get_result.
+    legacy_rows = [
+        cache.record_success(
+            mall="m2",
+            submitted_url="https://example.com/p/confirmed",
+            real_sku_id="C-1",
+            sku_status=SKU_STATUS_CONFIRMED,
+            source="unit-test",
+        ),
+        cache.record_success(
+            mall="m3",
+            submitted_url="https://example.com/p/url-parsed",
+            real_sku_id="P-1",
+            sku_status=SKU_STATUS_URL_PARSED_UNVERIFIED,
+            source="unit-test",
+        ),
+        cache.record_success(
+            mall="m4",
+            submitted_url="https://example.com/p/unresolved",
+            sku_status=SKU_STATUS_UNRESOLVED,
+            source="unit-test",
+        ),
+    ]
+    for row in legacy_rows:
+        got = cache.get_result(int(row["id"]))
+        assert got is not None
+        assert got["sku_status"] == row["sku_status"]

@@ -618,6 +618,18 @@ class CustomerPrewarmStore:
             ).fetchone()
             return dict(refreshed)
 
+    def ledger_completed_entries(self, source: str) -> list[dict[str, Any]]:
+        """Completed ledger entries (cache_result_id set) of one source, id order."""
+        source_value = self._require_text(source, "source")
+        with self._reader() as connection:
+            rows = connection.execute(
+                """SELECT * FROM prewarm_sync_ledger
+                   WHERE source=? AND cache_result_id IS NOT NULL
+                   ORDER BY id""",
+                (source_value,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
     def ledger_pending_claims(self, source: str, *, older_than: str) -> list[dict[str, Any]]:
         """Un-finalized claims older than the cutoff (crash recovery probes)."""
         source_value = self._require_text(source, "source")

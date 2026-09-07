@@ -37,16 +37,27 @@ contextmanager `_transaction(immediate=True)` / `_reader()`。
 取第一个 parser 命中;全 MISS 且输入 URL 未注册过时新建 `product_identity=NULL`
 的 identity;输入 URL 已注册则认领原 identity(同 URL 重复成功追加同一身份历史)。
 
-## SKU evidence 三态
+## SKU evidence 四态(最终收口 2026-09-07 新增第四态)
 
-`CONFIRMED` / `URL_PARSED_UNVERIFIED` / `UNRESOLVED`,校验后原样落库:
-UNRESOLVED 必须 无 real_sku_id;后两者必须提供 real_sku_id。URL 解析出的 SKU
-只允许 `URL_PARSED_UNVERIFIED`,不存在任何把状态静默升级为 CONFIRMED 的 API。
+`CONFIRMED` / `UPSTREAM_PROVIDED` / `URL_PARSED_UNVERIFIED` / `UNRESOLVED`,
+校验后原样落库:UNRESOLVED 必须无 real_sku_id;其余三种必须提供 real_sku_id。
+
+- `CONFIRMED`:仅 crawler/page 独立证据可证真实 SKU。
+- `UPSTREAM_PROVIDED`:SKU 来自 SaaS/上游权威输入(如请求模板商品编码回显),
+  本次 crawl 未独立复核——明确不是 CONFIRMED(#9 daily-internet 同步的诚实编码;
+  #12 消费契约见 2026-09-07 设计文档)。
+- `URL_PARSED_UNVERIFIED`:仅商城 URL parser 推导。
+- `UNRESOLVED`:无任何可用 SKU。
+
+状态间永不互相静默升级;不存在任何把 UPSTREAM_PROVIDED/URL_PARSED_UNVERIFIED
+升级为 CONFIRMED 的 API。sku_status 列保持 TEXT,四态为纯枚举扩展,无 schema rebuild。
 
 ## placeholder 防护
 
 real_sku_id 若匹配 placeholder 前缀(默认 `zhpq-`,strip 后小写比较)或等于
-crawl_id,一律 `ValueError` 拒绝落库——即使调用方声称 CONFIRMED。
+crawl_id,一律 `ValueError` 拒绝落库——即使调用方声称 CONFIRMED。该防护对全部
+非空 SKU 证据状态(含 UPSTREAM_PROVIDED)生效;ROW&lt;n&gt; 类模板临时码由 #9 调用层
+(`is_temporary_request_code`)在落库前拒绝。
 
 ## current 唯一性
 

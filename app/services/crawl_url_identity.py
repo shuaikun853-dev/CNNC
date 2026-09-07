@@ -9,6 +9,19 @@ pattern may contribute an identity.
 
 Malls without a registered parser (everything except ``ofs`` in v1) always
 resolve to ``None`` so callers stay fail-closed.
+
+SKU evidence states (``SKU_STATUSES``, Issue #7 closure 2026-09-07):
+
+- ``CONFIRMED``: SKU backed by independent crawler/page evidence gathered by
+  this crawl.
+- ``UPSTREAM_PROVIDED``: SKU taken from SaaS/upstream authoritative input,
+  NOT independently re-confirmed by this crawl - it is explicitly NOT
+  ``CONFIRMED``.
+- ``URL_PARSED_UNVERIFIED``: SKU derived from the mall URL parser only;
+  never auto-promotes to any other state.
+- ``UNRESOLVED``: no SKU at all.
+
+Evidence states are stored verbatim and never promote one another.
 """
 
 from __future__ import annotations
@@ -18,10 +31,16 @@ from typing import Callable, Mapping, Sequence
 from urllib.parse import urlparse
 
 SKU_STATUS_CONFIRMED = "CONFIRMED"
+SKU_STATUS_UPSTREAM_PROVIDED = "UPSTREAM_PROVIDED"
 SKU_STATUS_URL_PARSED_UNVERIFIED = "URL_PARSED_UNVERIFIED"
 SKU_STATUS_UNRESOLVED = "UNRESOLVED"
 SKU_STATUSES = frozenset(
-    {SKU_STATUS_CONFIRMED, SKU_STATUS_URL_PARSED_UNVERIFIED, SKU_STATUS_UNRESOLVED}
+    {
+        SKU_STATUS_CONFIRMED,
+        SKU_STATUS_UPSTREAM_PROVIDED,
+        SKU_STATUS_URL_PARSED_UNVERIFIED,
+        SKU_STATUS_UNRESOLVED,
+    }
 )
 
 PLACEHOLDER_PREFIXES_DEFAULT = ("zhpq-",)

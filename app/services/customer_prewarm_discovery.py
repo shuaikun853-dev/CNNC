@@ -19,9 +19,19 @@ Cache (:mod:`app.services.shared_crawl_cache`, Issue #7):
   (``crawl_work.state='SUCCESS'`` AND ``result_json.page_price_status=='OK'``,
   the authoritative per-row semantics of
   ``read_zhaoshang_result_xlsx_by_identity``) into the shared cache through an
-  idempotent ledger with crash recovery.  The crawl row's ``sku_id`` is only a
-  request/template echo, so rows are recorded ``UNRESOLVED`` and the value is
-  kept as ``payload["request_sku_id"]`` (Round 3 Finding B).
+  idempotent ledger with crash recovery.  The crawl row's ``sku_id`` is the
+  SaaS/upstream authoritative input (not independently re-confirmed by this
+  crawl), so usable values are honestly encoded ``UPSTREAM_PROVIDED``
+  (explicitly NOT ``CONFIRMED``) while temporary codes (``zhpq-*``
+  placeholders, the STEP3 ``ROW<n>`` template fallback shape, or an echo of
+  the crawl/task id) degrade to ``UNRESOLVED``; the original value is always
+  kept as ``payload["request_sku_id"]`` (Round 3 Finding B, resolved by user
+  decision 2026-09-07).
+- :func:`upgrade_upstream_sku_evidence` deterministically converts R3-era
+  rows (``UNRESOLVED`` with a usable ``payload["request_sku_id"]``) into
+  appended ``UPSTREAM_PROVIDED`` rows - append-only history preserved,
+  current moved to the upgraded row, no re-crawl, idempotent via
+  ``sku-upgrade:*`` ledger keys.
 - :func:`recover_customer_documents` re-reads the customer side only for the
   scanner so documents the event sidecar never delivered still reach the
   store, throttled via the ``prewarm_recovery_runs`` table (Round 3 Finding
@@ -43,6 +53,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import sqlite3
 import time
 from dataclasses import dataclass
@@ -51,14 +62,18 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Sequence
 from urllib.parse import urlparse
 
-from app.services.crawl_url_identity import SKU_STATUS_UNRESOLVED
+from app.services.crawl_url_identity import (
+    SKU_STATUS_UNRESOLVED,
+    SKU_STATUS_UPSTREAM_PROVIDED,
+    is_placeholder_code,
+)
 from app.services.customer_prewarm_store import (
     CACHE_STATUS_CACHE_HIT,
     CACHE_STATUS_PENDING_PREWARM,
     CustomerPrewarmStore,
 )
 from app.services.customer_reference_links import extract_reference_links
-from app.services.shared_crawl_cache import SharedCrawlCache
+from app.services.shared_crawl_cache import AliasConflictError, SharedCrawlCache
 from scripts.zhaoshang_mall_mapping import ZhaoshangMallMapping
 
 DETAIL_BUDGET_RESERVE_SECONDS = 5.0
@@ -412,6 +427,25 @@ def _open_state_db_readonly(state_db_path: str | Path) -> sqlite3.Connection | N
     return connection
 
 
+# STEP3 的模板兜底形状:导出结果里出现 ROW<n> 说明上游没有给出真实 SKU。
+_ROW_CODE_PATTERN = re.compile(r"^row\d+$", re.IGNORECASE)
+
+
+def is_temporary_request_code(value: str, *, crawl_id: str | None = None) -> bool:
+    """True when a request-side code is a temporary correlation code, never real SKU evidence.
+
+    Covers #7 placeholder prefixes (zhpq-*), the STEP3 template fallback shape ROW<n>,
+    and an echo of the crawl/remote task id."""
+    stripped = str(value or "").strip()
+    if not stripped:
+        return False
+    if is_placeholder_code(stripped):
+        return True
+    if _ROW_CODE_PATTERN.match(stripped):
+        return True
+    return crawl_id is not None and stripped == str(crawl_id).strip() and bool(str(crawl_id).strip())
+
+
 def sync_daily_internet_results(
     prewarm_store: CustomerPrewarmStore,
     shared_cache: SharedCrawlCache,
@@ -441,21 +475,18 @@ def sync_daily_internet_results(
     the next scan retries.  A missing state db returns ``state_db='missing'``
     without raising.
 
-    SKU evidence note (Issue #9 Round 3 Finding B): the crawl row's
-    ``sku_id`` is the submitted template code echoed back by the export
-    result workbook (app-side mapping keys by (code, url), so any
-    successfully mapped row's code equals the submitted SKU by construction).
-    That is request/template evidence, NOT page/crawler evidence, so every
-    daily-internet row is recorded ``UNRESOLVED`` with an empty ``real_sku_id``
-    while the upstream value is preserved verbatim as
-    ``payload["request_sku_id"]``.
-
-    SPEC_CONFLICT: the #7 frozen enum has no state for "upstream
-    SaaS/request-supplied, not page-verified while retaining the value"
-    (``crawl_work.result_json`` carries no independent page/crawler SKU
-    column).  When such a state (e.g. ``UPSTREAM_PROVIDED``) is ever added,
-    history can be re-recorded from ``payload["request_sku_id"]`` without
-    re-crawling.
+    SKU evidence note (Issue #9 Round 3 Finding B, RESOLVED by user decision
+    2026-09-07): the crawl row's ``sku_id`` is the SaaS/upstream authoritative
+    input echoed back by the export result workbook (app-side mapping keys by
+    (code, url), so any successfully mapped row's code equals the submitted
+    SKU by construction).  It is upstream evidence, NOT independently
+    re-confirmed page/crawler evidence, so a usable value is honestly encoded
+    ``UPSTREAM_PROVIDED`` (explicitly NOT ``CONFIRMED``) while temporary codes
+    (``zhpq-*`` placeholders, the STEP3 ``ROW<n>`` template fallback shape, or
+    an echo of the crawl/remote task id) degrade to ``UNRESOLVED``.  Either
+    way the original value is preserved verbatim as
+    ``payload["request_sku_id"]`` - a valid price result is never lost because
+    of a placeholder rejection.
     """
     now_value = now if now is not None else datetime.now(UTC)
     summary: dict[str, Any] = {
@@ -580,20 +611,29 @@ def sync_daily_internet_results(
         if succeeded_at is None:
             payload["raw_updated_at"] = updated_at_raw
 
-        # Finding B: the row's sku_id is the submitted template code echoed
-        # back by the export workbook — request/template evidence, never page
-        # evidence.  Keep the value verbatim as payload evidence and record
-        # the cache entry UNRESOLVED with an empty real_sku_id (#7 rule:
-        # UNRESOLVED must not carry a SKU).
+        # Finding B (RESOLVED 2026-09-07): the row's sku_id is upstream
+        # (SaaS/request-side) evidence, never independently re-confirmed page
+        # evidence.  A usable value is honestly encoded UPSTREAM_PROVIDED
+        # (explicitly not CONFIRMED); temporary codes (zhpq-*, ROW<n>,
+        # crawl-id echo) degrade to UNRESOLVED.  Either way the original
+        # value is preserved verbatim as payload evidence, and a valid price
+        # result is never lost because of a placeholder rejection.
         sku_value = str(row["sku_id"] or "").strip()
+        crawl_label = task_name or None
+        if sku_value and not is_temporary_request_code(sku_value, crawl_id=crawl_label):
+            real_sku_id: str | None = sku_value
+            sku_status = SKU_STATUS_UPSTREAM_PROVIDED
+        else:
+            real_sku_id = None
+            sku_status = SKU_STATUS_UNRESOLVED
         payload["request_sku_id"] = sku_value
         try:
             row_out = shared_cache.record_success(
                 mall=mall_key,
                 submitted_url=exact_url,
-                crawl_id=task_name or None,
-                real_sku_id=None,
-                sku_status=SKU_STATUS_UNRESOLVED,
+                crawl_id=crawl_label,
+                real_sku_id=real_sku_id,
+                sku_status=sku_status,
                 price=result.get("page_price_value"),
                 source=source,
                 succeeded_at=succeeded_at,
@@ -610,6 +650,111 @@ def sync_daily_internet_results(
             continue
         prewarm_store.ledger_complete(source, event_key, cache_result_id=int(row_out["id"]))
         summary["ok_synced"] += 1
+    return summary
+
+
+# ---- R3 历史数据一次性确定性升级(免重爬) ---------------------------------------------
+
+_UPGRADE_KEY_PREFIX = "sku-upgrade:"
+
+
+def upgrade_upstream_sku_evidence(
+    prewarm_store: CustomerPrewarmStore,
+    shared_cache: SharedCrawlCache,
+    *,
+    source: str = "daily-internet",
+) -> dict[str, Any]:
+    """Deterministically upgrade R3-era SKU evidence, without any re-crawl.
+
+    R3 conservatively recorded every daily-internet row as ``UNRESOLVED`` and
+    preserved the upstream value as ``payload["request_sku_id"]``.  This
+    one-shot seam converts those rows into appended ``UPSTREAM_PROVIDED``
+    rows: append-only history is preserved, the identity's current row moves
+    to the upgraded row (the upgrade reuses the original ``succeeded_at``,
+    so the appended row wins current via the ``(succeeded_at, id)`` id
+    tie-break), and nothing is re-crawled.
+
+    Mechanics per completed sync-ledger entry of ``source``:
+
+    - Read the cache row via :meth:`SharedCrawlCache.get_result`; skip
+      non-``UNRESOLVED`` rows (already honest under the new encoding).
+    - Skip when the payload has no usable ``request_sku_id``
+      (``skipped_no_sku``) or the value is a temporary code - #7 placeholder
+      prefix, the STEP3 ``ROW<n>`` template fallback shape, or a crawl-id
+      echo (``skipped_temporary``).
+    - Idempotency: each upgrade is keyed ``sku-upgrade:<event_key>`` in the
+      sync ledger; an entry that already carries a ``cache_result_id`` is
+      counted ``already_upgraded`` and skipped.  ``sku-upgrade:*`` marker
+      entries themselves are never re-scanned, so re-runs stay bounded.
+    - Deterministic failures (``ValueError``/``AliasConflictError``) are
+      ledgered and counted ``failed``; transient sqlite contention drops the
+      claim so the next run retries (``transient``).
+    """
+    summary: dict[str, Any] = {
+        "scanned": 0,
+        "upgraded": 0,
+        "already_upgraded": 0,
+        "skipped_no_sku": 0,
+        "skipped_temporary": 0,
+        "failed": 0,
+        "transient": 0,
+    }
+    for ledger in prewarm_store.ledger_completed_entries(source):
+        event_key = str(ledger["source_event_key"])
+        if event_key.startswith(_UPGRADE_KEY_PREFIX):
+            # 升级标记行不是 R3 候选:永不重复扫描,保证可无限重跑。
+            continue
+        summary["scanned"] += 1
+        upgrade_key = f"{_UPGRADE_KEY_PREFIX}{event_key}"
+        existing = prewarm_store.ledger_get(source, upgrade_key)
+        if existing is not None and existing.get("cache_result_id") is not None:
+            summary["already_upgraded"] += 1
+            continue
+        row = shared_cache.get_result(int(ledger["cache_result_id"]))
+        if row is None or row.get("sku_status") != SKU_STATUS_UNRESOLVED:
+            continue
+        request_sku = str((row.get("payload") or {}).get("request_sku_id") or "").strip()
+        if not request_sku:
+            summary["skipped_no_sku"] += 1
+            continue
+        if is_temporary_request_code(request_sku, crawl_id=row.get("crawl_id")):
+            summary["skipped_temporary"] += 1
+            continue
+        prewarm_store.ledger_claim(source, upgrade_key)
+        try:
+            upgraded = shared_cache.record_success(
+                mall=row["mall"],
+                submitted_url=row["submitted_url"],
+                original_url=row["original_url"],
+                returned_url=row["returned_url"],
+                canonical_url=row["canonical_url"],
+                crawl_id=row["crawl_id"],
+                real_sku_id=request_sku,
+                sku_status=SKU_STATUS_UPSTREAM_PROVIDED,
+                title=row["title"],
+                price=row["price"],
+                comment_count=row["comment_count"],
+                source=source,
+                succeeded_at=row["succeeded_at"],
+                payload={
+                    **(row.get("payload") or {}),
+                    "sku_evidence_upgraded_from_result_id": int(row["id"]),
+                },
+            )
+        except sqlite3.OperationalError:
+            # 瞬时失败(库锁/繁忙):丢 claim,下一轮重试。
+            prewarm_store.ledger_drop_claim(source, upgrade_key)
+            summary["transient"] += 1
+            continue
+        except (ValueError, AliasConflictError) as exc:
+            # 确定性失败:记账,永不重试。
+            prewarm_store.ledger_complete(source, upgrade_key, error=str(exc))
+            summary["failed"] += 1
+            continue
+        prewarm_store.ledger_complete(
+            source, upgrade_key, cache_result_id=int(upgraded["id"])
+        )
+        summary["upgraded"] += 1
     return summary
 
 

@@ -23,14 +23,18 @@ import pytest
 import app.services.customer_prewarm_discovery as discovery_module
 from app.services.customer_prewarm_discovery import (
     backfill_daily_history,
+    is_temporary_request_code,
     process_document,
     sync_daily_internet_results,
+    upgrade_upstream_sku_evidence,
 )
 from app.services.customer_prewarm_store import CustomerPrewarmStore
 from app.services.crawl_url_identity import (
     SKU_STATUS_CONFIRMED,
     SKU_STATUS_UNRESOLVED,
+    SKU_STATUS_UPSTREAM_PROVIDED,
     SKU_STATUS_URL_PARSED_UNVERIFIED,
+    is_placeholder_code,
 )
 from app.services.daily_audit_store import DEFAULT_POOL_ID, DEFAULT_TENANT_ID, DailyAuditStore
 from app.services.shared_crawl_cache import AliasConflictError, SharedCrawlCache
@@ -197,10 +201,11 @@ def test_case9_daily_sync_then_customer_hit(tmp_path, prewarm_store, shared_cach
     assert datetime.fromisoformat(entry["succeeded_at"]) == datetime.fromisoformat(
         "2026-09-07T02:00:00+00:00"
     )
-    # Finding B:请求/模板回显的 sku_id 不是页面证据 → 恒 UNRESOLVED,
-    # 原值只作为 payload["request_sku_id"] 证据保留。
-    assert entry["sku_status"] == SKU_STATUS_UNRESOLVED
-    assert entry["real_sku_id"] is None
+    # Finding B(SPEC_CONFLICT 已于 2026-09-07 由用户决策解决):请求/模板
+    # 回显的 sku_id 是上游权威输入 → 诚实编码 UPSTREAM_PROVIDED(显式非
+    # CONFIRMED),原值同时保留在 payload["request_sku_id"]。
+    assert entry["sku_status"] == SKU_STATUS_UPSTREAM_PROVIDED
+    assert entry["real_sku_id"] == "SKU-A"
     assert entry["payload"]["request_sku_id"] == "SKU-A"
     assert entry["payload"]["source_event_key"] == _state_event_key(path, BUSINESS_DATE)
     # 客户 referenceLink 发现当轮即可复用刚同步的条目
@@ -673,10 +678,11 @@ def test_find_id_by_source_event_key(tmp_path, shared_cache):
     assert shared_cache.find_id_by_source_event_key("", "evt-1") is None
 
 
-# ---- Finding B: 请求/模板回显 sku 永不 CONFIRMED -----------------------------------------
+# ---- Finding B (RESOLVED 2026-09-07): 上游 sku 编码 ---------------------------------------
 
 
-def test_request_sku_echo_never_confirmed(tmp_path, prewarm_store, shared_cache):
+def test_upstream_saas_sku_becomes_upstream_provided(tmp_path, prewarm_store, shared_cache):
+    """上游 SaaS 输入的真实 sku → UPSTREAM_PROVIDED(显式非 CONFIRMED)。"""
     url = "https://b2b.nbdeli.com/goods/933.html"
     path = make_state_db(
         tmp_path,
@@ -690,34 +696,52 @@ def test_request_sku_echo_never_confirmed(tmp_path, prewarm_store, shared_cache)
     hit = shared_cache.lookup_current("nbdeli", url)
     assert hit is not None
     entry = hit["entry"]
-    # 回显 sku 绝不 CONFIRMED;证据保留在 payload
-    assert entry["real_sku_id"] is None
-    assert entry["sku_status"] == SKU_STATUS_UNRESOLVED
+    # 上游证据诚实编码;绝不是页面证据 CONFIRMED
+    assert entry["sku_status"] == SKU_STATUS_UPSTREAM_PROVIDED
+    assert entry["real_sku_id"] == "SKU-77"
     assert entry["payload"]["request_sku_id"] == "SKU-77"
 
 
-def test_placeholder_and_row_codes_never_real_sku(tmp_path, prewarm_store, shared_cache):
-    url_zhpq = "https://b2b.nbdeli.com/goods/934.html"
-    url_row = "https://b2b.nbdeli.com/goods/935.html"
+def test_upstream_empty_sku_stays_unresolved(tmp_path, prewarm_store, shared_cache):
+    """上游 sku 为空 → 无任何 SKU 证据,保持 UNRESOLVED。"""
+    url = "https://b2b.nbdeli.com/goods/943.html"
     path = make_state_db(
         tmp_path,
         BUSINESS_DATE,
-        [
-            _ok_row("nbdeli", "zhpq-123", url_zhpq, "1.1", "2026-09-07T02:00:00+00:00", "task-p1"),
-            _ok_row("nbdeli", "ROW3", url_row, "2.2", "2026-09-07T02:00:00+00:00", "task-p2"),
-        ],
+        [_ok_row("nbdeli", "", url, "7.7", "2026-09-07T02:00:00+00:00", "task-empty")],
     )
-    # 占位码/行号回显同步不崩、不落 real_sku_id
     summary = sync_daily_internet_results(
         prewarm_store, shared_cache, state_db_path=path, business_date=BUSINESS_DATE
     )
-    assert summary["ok_synced"] == 2
-    for url in (url_zhpq, url_row):
-        hit = shared_cache.lookup_current("nbdeli", url)
-        assert hit is not None
-        assert hit["entry"]["real_sku_id"] is None
-        assert hit["entry"]["sku_status"] == SKU_STATUS_UNRESOLVED
-    # #7 的占位码防御原样保留:claimed CONFIRMED 的占位码直接 ValueError
+    assert summary["ok_synced"] == 1
+    hit = shared_cache.lookup_current("nbdeli", url)
+    assert hit is not None
+    assert hit["entry"]["sku_status"] == SKU_STATUS_UNRESOLVED
+    assert hit["entry"]["real_sku_id"] is None
+    assert hit["entry"]["payload"]["request_sku_id"] == ""
+
+
+def test_zhpq_upstream_never_real_sku(tmp_path, prewarm_store, shared_cache):
+    """zhpq-* 占位码降级为 UNRESOLVED,但有效价格结果绝不丢失。"""
+    url = "https://b2b.nbdeli.com/goods/934.html"
+    path = make_state_db(
+        tmp_path,
+        BUSINESS_DATE,
+        [_ok_row("nbdeli", "zhpq-9", url, "1.1", "2026-09-07T02:00:00+00:00", "task-p1")],
+    )
+    # 占位码回显同步不崩、不落 real_sku_id,价格行照常落库
+    summary = sync_daily_internet_results(
+        prewarm_store, shared_cache, state_db_path=path, business_date=BUSINESS_DATE
+    )
+    assert summary["ok_synced"] == 1
+    hit = shared_cache.lookup_current("nbdeli", url)
+    assert hit is not None
+    assert hit["entry"]["real_sku_id"] is None
+    assert hit["entry"]["sku_status"] == SKU_STATUS_UNRESOLVED
+    # 被拒的临时码原值保留(payload 溯源),价格仍在
+    assert hit["entry"]["payload"]["request_sku_id"] == "zhpq-9"
+    assert hit["entry"]["price"] == "1.1"
+    # #7 的占位码防御原样保留:claimed SKU 的占位码直接 ValueError
     with pytest.raises(ValueError, match="placeholder"):
         shared_cache.record_success(
             mall="nbdeli",
@@ -726,10 +750,59 @@ def test_placeholder_and_row_codes_never_real_sku(tmp_path, prewarm_store, share
             sku_status=SKU_STATUS_CONFIRMED,
             source=SOURCE,
         )
+    # 与 #7 冻结前缀一致
+    assert is_placeholder_code("zhpq-9")
+    assert not is_placeholder_code("SKU-77")
 
 
-def test_page_evidence_still_confirmed_via_other_producers(tmp_path, shared_cache):
-    """#9 的保守化只约束 daily sync;#7 的页面证据/URL 解析模型不受限。"""
+def test_row_upstream_never_real_sku(tmp_path, prewarm_store, shared_cache):
+    """STEP3 模板兜底形状 ROW<n>(任意大小写)永不成为真实 SKU。"""
+    url_row3 = "https://b2b.nbdeli.com/goods/935.html"
+    url_row12 = "https://b2b.nbdeli.com/goods/944.html"
+    path = make_state_db(
+        tmp_path,
+        BUSINESS_DATE,
+        [
+            _ok_row("nbdeli", "ROW3", url_row3, "2.2", "2026-09-07T02:00:00+00:00", "task-p2"),
+            _ok_row("nbdeli", "row12", url_row12, "3.3", "2026-09-07T02:00:00+00:00", "task-p3"),
+        ],
+    )
+    summary = sync_daily_internet_results(
+        prewarm_store, shared_cache, state_db_path=path, business_date=BUSINESS_DATE
+    )
+    assert summary["ok_synced"] == 2
+    for url, code in ((url_row3, "ROW3"), (url_row12, "row12")):
+        hit = shared_cache.lookup_current("nbdeli", url)
+        assert hit is not None
+        assert hit["entry"]["real_sku_id"] is None
+        assert hit["entry"]["sku_status"] == SKU_STATUS_UNRESOLVED
+        assert hit["entry"]["payload"]["request_sku_id"] == code
+        # 有效价格结果不因占位/临时码拒绝而丢失
+        assert hit["entry"]["price"] is not None
+
+
+def test_crawl_id_echo_never_real_sku(tmp_path, prewarm_store, shared_cache):
+    """sku_id 等于 crawl/remote 任务名的回显永不成为真实 SKU。"""
+    url = "https://b2b.nbdeli.com/goods/945.html"
+    path = make_state_db(
+        tmp_path,
+        BUSINESS_DATE,
+        [_ok_row("nbdeli", "task-echo-7", url, "8.8", "2026-09-07T02:00:00+00:00", "task-echo-7")],
+    )
+    summary = sync_daily_internet_results(
+        prewarm_store, shared_cache, state_db_path=path, business_date=BUSINESS_DATE
+    )
+    assert summary["ok_synced"] == 1
+    hit = shared_cache.lookup_current("nbdeli", url)
+    assert hit is not None
+    assert hit["entry"]["real_sku_id"] is None
+    assert hit["entry"]["sku_status"] == SKU_STATUS_UNRESOLVED
+    assert hit["entry"]["payload"]["request_sku_id"] == "task-echo-7"
+    assert hit["entry"]["crawl_id"] == "task-echo-7"
+
+
+def test_page_evidence_still_confirmed_for_other_producers(tmp_path, shared_cache):
+    """#9 的编码约束只作用于 daily sync;#7 的页面证据模型不受限。"""
     # 真页面证据(producer 自带)仍可 CONFIRMED
     seeded = shared_cache.record_success(
         mall="nbdeli",
@@ -744,7 +817,10 @@ def test_page_evidence_still_confirmed_via_other_producers(tmp_path, shared_cach
     assert seeded["sku_status"] == SKU_STATUS_CONFIRMED
     hit = shared_cache.lookup_current("nbdeli", "https://b2b.nbdeli.com/goods/937.html")
     assert hit["entry"]["sku_status"] == SKU_STATUS_CONFIRMED
-    # URL 解析证据(producer 自带)走 URL_PARSED_UNVERIFIED
+
+
+def test_url_parser_evidence_is_url_parsed_unverified(tmp_path, shared_cache):
+    """URL 解析证据(producer 自带)走 URL_PARSED_UNVERIFIED,永不 CONFIRMED。"""
     parsed = shared_cache.record_success(
         mall="nbdeli",
         submitted_url="https://b2b.nbdeli.com/goods/938.html",
@@ -755,9 +831,11 @@ def test_page_evidence_still_confirmed_via_other_producers(tmp_path, shared_cach
         succeeded_at="2026-09-01T00:00:00+00:00",
     )
     assert parsed["sku_status"] == SKU_STATUS_URL_PARSED_UNVERIFIED
+    hit = shared_cache.lookup_current("nbdeli", "https://b2b.nbdeli.com/goods/938.html")
+    assert hit["entry"]["sku_status"] == SKU_STATUS_URL_PARSED_UNVERIFIED
 
 
-def test_url_identity_never_sku_merged(tmp_path, prewarm_store, shared_cache):
+def test_same_sku_different_urls_never_merge(tmp_path, prewarm_store, shared_cache):
     """同一 sku_id、不同 URL → 两个独立身份/候选;绝不按 SKU 合并。"""
     url_a = "https://b2b.nbdeli.com/goods/939.html"
     url_b = "https://b2b.nbdeli.com/goods/940.html"
@@ -776,9 +854,110 @@ def test_url_identity_never_sku_merged(tmp_path, prewarm_store, shared_cache):
     hit_a = shared_cache.lookup_current("nbdeli", url_a)
     hit_b = shared_cache.lookup_current("nbdeli", url_b)
     assert hit_a is not None and hit_b is not None
-    # URL 身份模型:两个不同 identity,绝不按相同 sku_id 合并
+    # URL 身份模型:两个不同 identity,绝不按相同 sku_id 合并;
+    # 各自独立命中各自的上游证据条目。
     assert hit_a["identity_id"] != hit_b["identity_id"]
-    assert hit_a["entry"]["real_sku_id"] is None
-    assert hit_b["entry"]["real_sku_id"] is None
+    assert hit_a["entry"]["real_sku_id"] == "SAME-SKU"
+    assert hit_a["entry"]["sku_status"] == SKU_STATUS_UPSTREAM_PROVIDED
+    assert hit_b["entry"]["real_sku_id"] == "SAME-SKU"
+    assert hit_b["entry"]["sku_status"] == SKU_STATUS_UPSTREAM_PROVIDED
     assert len(shared_cache.history("nbdeli", url_a)) == 1
     assert len(shared_cache.history("nbdeli", url_b)) == 1
+
+
+# ---- is_temporary_request_code(临时码判定单元) --------------------------------------------
+
+
+def test_is_temporary_request_code_shapes():
+    assert is_temporary_request_code("zhpq-000001")
+    assert is_temporary_request_code(" ROW3 ")
+    assert is_temporary_request_code("row12")
+    assert is_temporary_request_code("ROW", crawl_id="ROW") is True  # crawl_id echo
+    assert is_temporary_request_code("task-1", crawl_id="task-1")
+    assert not is_temporary_request_code("SKU-77")
+    assert not is_temporary_request_code("")
+    assert not is_temporary_request_code("   ")
+    assert not is_temporary_request_code("task-1")  # 无 crawl_id 时不误伤
+    assert not is_temporary_request_code("ROW3X")  # 非精确 ROW<n> 形状
+    assert not is_temporary_request_code("xrow1")
+
+
+# ---- R3 历史数据确定性升级(免重爬) --------------------------------------------------------
+
+
+def test_historical_r3_payload_upgrades_deterministically(
+    tmp_path, prewarm_store, shared_cache
+):
+    """R3 时代 UNRESOLVED + payload["request_sku_id"] 的历史行被一次性确定性
+    升级为追加的 UPSTREAM_PROVIDED 行:历史保留、current 移到新行、免重爬、
+    幂等可重跑;临时码行原样跳过。"""
+    url_real = "https://b2b.nbdeli.com/goods/946.html"
+    url_temp = "https://b2b.nbdeli.com/goods/947.html"
+    # 模拟 R3-era 数据:UNRESOLVED + request_sku_id 保留,账本已完成指向缓存行
+    real_row = shared_cache.record_success(
+        mall="nbdeli",
+        submitted_url=url_real,
+        real_sku_id=None,
+        sku_status=SKU_STATUS_UNRESOLVED,
+        price="5.5",
+        source=SOURCE,
+        succeeded_at="2026-09-01T02:00:00+00:00",
+        payload={"request_sku_id": "SKU-55"},
+    )
+    temp_row = shared_cache.record_success(
+        mall="nbdeli",
+        submitted_url=url_temp,
+        real_sku_id=None,
+        sku_status=SKU_STATUS_UNRESOLVED,
+        price="6.6",
+        source=SOURCE,
+        succeeded_at="2026-09-01T02:30:00+00:00",
+        payload={"request_sku_id": "ROW5"},
+    )
+    prewarm_store.ledger_claim(SOURCE, f"r3-event-real-{real_row['id']}")
+    prewarm_store.ledger_complete(
+        SOURCE, f"r3-event-real-{real_row['id']}", cache_result_id=int(real_row["id"])
+    )
+    prewarm_store.ledger_claim(SOURCE, f"r3-event-temp-{temp_row['id']}")
+    prewarm_store.ledger_complete(
+        SOURCE, f"r3-event-temp-{temp_row['id']}", cache_result_id=int(temp_row["id"])
+    )
+
+    summary = upgrade_upstream_sku_evidence(prewarm_store, shared_cache, source=SOURCE)
+    assert summary == {
+        "scanned": 2,
+        "upgraded": 1,
+        "already_upgraded": 0,
+        "skipped_no_sku": 0,
+        "skipped_temporary": 1,
+        "failed": 0,
+        "transient": 0,
+    }
+    # 升级行:current 移到新追加的 UPSTREAM_PROVIDED 行,历史 2 行
+    hit = shared_cache.lookup_current("nbdeli", url_real)
+    assert hit["entry"]["sku_status"] == SKU_STATUS_UPSTREAM_PROVIDED
+    assert hit["entry"]["real_sku_id"] == "SKU-55"
+    assert hit["entry"]["price"] == "5.5"
+    assert hit["entry"]["payload"]["request_sku_id"] == "SKU-55"
+    assert hit["entry"]["payload"]["sku_evidence_upgraded_from_result_id"] == int(
+        real_row["id"]
+    )
+    assert len(shared_cache.history("nbdeli", url_real)) == 2
+    # 临时码 R3 行原样保留,不升级
+    temp_hit = shared_cache.lookup_current("nbdeli", url_temp)
+    assert temp_hit["entry"]["sku_status"] == SKU_STATUS_UNRESOLVED
+    assert temp_hit["entry"]["real_sku_id"] is None
+    assert len(shared_cache.history("nbdeli", url_temp)) == 1
+
+    # 重跑幂等:已升级行计入 already_upgraded,历史不再增长
+    again = upgrade_upstream_sku_evidence(prewarm_store, shared_cache, source=SOURCE)
+    assert again == {
+        "scanned": 2,
+        "upgraded": 0,
+        "already_upgraded": 1,
+        "skipped_no_sku": 0,
+        "skipped_temporary": 1,
+        "failed": 0,
+        "transient": 0,
+    }
+    assert len(shared_cache.history("nbdeli", url_real)) == 2

@@ -11,11 +11,18 @@ Data-layer contract (no producer, scheduler, or business flow is wired here):
 - History is append-only: every success inserts a new ``crawl_results`` row.
 - Each identity has at most one ``is_current=1`` row, enforced by a partial
   unique index; a later-but-older success never steals current.
-- SKU evidence is a three-state value (``CONFIRMED``,
-  ``URL_PARSED_UNVERIFIED``, ``UNRESOLVED``) that is validated and stored
-  verbatim; URL parsing never promotes a SKU to ``CONFIRMED``.
+- SKU evidence is a four-state value (``CONFIRMED``,
+  ``UPSTREAM_PROVIDED``, ``URL_PARSED_UNVERIFIED``, ``UNRESOLVED``) that is
+  validated and stored verbatim.  ``CONFIRMED`` means the SKU is backed by
+  independent crawler/page evidence; ``UPSTREAM_PROVIDED`` means the SKU
+  comes from SaaS/upstream authoritative input and is explicitly NOT
+  independently re-confirmed by this crawl; ``URL_PARSED_UNVERIFIED`` is
+  derived from the mall URL parser only; ``UNRESOLVED`` means no SKU at
+  all.  No evidence state ever auto-promotes another.
 - Placeholder codes (``zhpq-*`` by default) and ``crawl_id`` echoes are
-  rejected as ``real_sku_id`` even when the caller claims ``CONFIRMED``.
+  rejected as ``real_sku_id`` for every SKU-carrying evidence state
+  (``CONFIRMED``, ``UPSTREAM_PROVIDED``, ``URL_PARSED_UNVERIFIED``), and an
+  ``UNRESOLVED`` row must not carry a SKU.
 - A ``(mall, url)`` alias permanently belongs to one identity.  Each record
   parses every URL of its chain separately: a chain whose URLs disagree on
   the parsed product identity raises :class:`AliasConflictError` before any
@@ -606,6 +613,14 @@ class SharedCrawlCache:
                 "SELECT * FROM crawl_results WHERE id=?", (new_id,)
             ).fetchone()
             return self._result_row(row)  # type: ignore[return-value]
+
+    def get_result(self, result_id: int) -> dict[str, Any] | None:
+        """One crawl_results row by id (history/current both readable)."""
+        with self._reader() as connection:
+            row = connection.execute(
+                "SELECT * FROM crawl_results WHERE id=?", (int(result_id),)
+            ).fetchone()
+        return self._result_row(row)
 
     def lookup_current(self, mall: str, url: str) -> dict[str, Any] | None:
         """Three-level read-only lookup: alias exact, then mall-parser identity."""
