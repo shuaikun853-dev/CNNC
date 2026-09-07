@@ -24,7 +24,9 @@ CLI 子命令 → dashboard_manual_ops.py / incremental_audit_runtime.py(recover
    ▼
 CnncLegacyZhaoshangAdapter(app/services/legacy_zhaoshang_adapter.py:478)
    ├── zhaoshang_task_progress.query_task_progress   [已抽出,只读进度]
-   ├── zhaoshang_remote_task                          [已抽出,异常族+enabled 判读]
+   │        └── zhaoshang_remote_task(共享远端语义)
+   ├── zhaoshang_remote_task                          [已抽出,共享远端语义层:异常族+enabled 判读+业务响应门]
+   │        ↑ remote_running_recovery(recovery)同样从这里 import 业务响应门
    ├── zhaoshang_progress_probe(观测缓存层,独立模块)
    ├── 外部工具子进程/模块加载(E:\.A2026\...\auto_crawl_task.py)
    │      └── zhaoshang_priority_boost.py(唯一 DB UPDATE 所在地,仓库外)
@@ -50,7 +52,7 @@ CnncLegacyZhaoshangAdapter(app/services/legacy_zhaoshang_adapter.py:478)
 | **Restart / Stop(写控制)** | `restart_running_task` :1936;`_restart_protocol` :2029;`stop_running_task` :2278;`_stop_protocol` :2336 | NOT STARTED |
 | **Export(收割/验收)** | `_matches_legacy_export_url` :1383;`probe_export_no_price` :1473;`_validate_result_workbook` :2512;`harvest_existing` :2709;`validate_existing_export_exact_requests` :2758;`classify_existing_export_partial` :2964;`harvest` :3160;死代码 `_classify_existing_export_partial_legacy` :2776(审计 L-5,零引用) | NOT STARTED |
 | **共享基础设施** | 状态枚举 :211-250;outcome dataclass :282-366;`_BoundedReadOnlySession` :368;`_locked_session_construction` :455;模板发布 `_write_or_verify_template` :613;`prepare_job` :659;`_load_module` :970 | 留在 adapter(后续随各能力逐步分流) |
-| **已抽出模块** | `zhaoshang_remote_task.py`(异常族 + `remote_task_is_enabled`);`zhaoshang_task_progress.py`(`query_task_progress`) | 2026-09-05 |
+| **已抽出模块** | `zhaoshang_remote_task.py`(共享远端语义:异常族 + `remote_task_is_enabled` + 业务响应门 `remote_business_response_ok`/`PROVEN_BUSINESS_SUCCESS_RSP_CODES`,2026-09-05 r1 迁入);`zhaoshang_task_progress.py`(`query_task_progress`);`remote_running_recovery.py` 保留 re-export 兼容旧 import | 2026-09-05 |
 
 外部观察层(不在 adapter 内):`zhaoshang_progress_probe.py`(Dashboard 只读进度缓存/TTL/single-flight,经延迟 import 构造 adapter)。
 
@@ -79,7 +81,7 @@ CnncLegacyZhaoshangAdapter(app/services/legacy_zhaoshang_adapter.py:478)
 ## 5. Progress(进度)【已迁移能力,迁移模板】
 
 - 实现:`zhaoshang_task_progress.query_task_progress`(领域)+ adapter `query_task_progress_for_job`(:1855,facade:工具箱 ①timeout守卫 ②工具文件检查 ③deadline ④模块加载 ⑤auth 刷新有界 ⑥BLADE_AUTH+COOKIE 双变量 ⑦有锁 session 构建)。
-- 语义:exact lookup→身份冲突分类(RuntimeError 查找失败/商城标识不一致/live≠durable → RemoteTaskIdentityConflictError;畸形响应保持无类型)→batchNumber 键控(缺失回退 resolved_task_name)→业务门(success/rspCode 不过→progress=None,REMOTE_UNKNOWN)。
+- 语义:exact lookup→身份冲突分类(RuntimeError 查找失败/商城标识不一致/live≠durable → RemoteTaskIdentityConflictError;畸形响应保持无类型)→batchNumber 键控(缺失回退 resolved_task_name)→业务门(`remote_business_response_ok`,实现在 `zhaoshang_remote_task` 共享层,Recovery 同源;success/rspCode 不过→progress=None,REMOTE_UNKNOWN)。
 - 返回形状(钉死,特征化测试保护):`{"task_id","task_number","batch_number","progress","rsp_desc","enabled","remote_calls":2}`。
 - **Dashboard 子任务数显示不均的根因**(记录,非 bug):投影 `subtasks` 字段只来自 `recovery_evidence_json.observations.signature`(6 元计数签名,dashboard_projection.py:409-413);未经恢复观测、或 rspDesc 缺计数标签/业务失败的任务天然无计数。live 进度是独立的 `live_progress` overlay(:822)。
 - 保护测试:`tests/test_legacy_adapter_progress_stop.py`(22 个,含 10 个特征化)、`tests/test_zhaoshang_progress_probe.py`。
@@ -121,7 +123,7 @@ CnncLegacyZhaoshangAdapter(app/services/legacy_zhaoshang_adapter.py:478)
 
 - 三态铁律:**UNKNOWN ≠ FAILED ≠ RETRY CREATE**。SUBMIT_UNKNOWN 只能 reconcile;EXPORT/waite-export 未知→RUNNING 同身份重排;只有 deterministic 证据才 MANUAL。
 - 异常分类表(已抽出至 zhaoshang_remote_task):RemoteTaskIdentityConflictError=**被证明的**身份冲突(live≠durable/查找歧义/商城标识不一致);畸形/超时/传输故障**不是**身份冲突,保持无类型计 transient。LegacyPreSendFailure=发送从未发生。LegacyProbeEvidenceError=探针无可用证据。
-- 业务门:success=false 或 rspCode∉{None,"0000"} 的响应不得捐献证据(计数/终态/重启授权)。
+- 业务门:success=false 或 rspCode∉{None,"0000"} 的响应不得捐献证据(计数/终态/重启授权)。唯一实现 `zhaoshang_remote_task.remote_business_response_ok`(2026-09-05 r1 起;`remote_running_recovery` 保留 re-export 兼容旧 import,`legacy_zhaoshang_adapter` probe/restart/stop 区段仍走旧路径,待相应能力迁移时换源)。
 
 ## 12. Forbidden Patterns(禁止模式)
 
@@ -139,7 +141,7 @@ CnncLegacyZhaoshangAdapter(app/services/legacy_zhaoshang_adapter.py:478)
 
 ## 13. 迁移台账与下一步
 
-**已完成(2026-09-05)**:Progress 能力 MOVE-only 抽出(zhaoshang_task_progress + zhaoshang_remote_task 种子;adapter re-export 全兼容;22 特征化测试 + 243 集群回归绿)。
+**已完成(2026-09-05)**:Progress 能力 MOVE-only 抽出(zhaoshang_task_progress + zhaoshang_remote_task 种子;adapter re-export 全兼容;22 特征化测试 + 243 集群回归绿)。**Review Fix R1(2026-09-05)**:业务响应门 `remote_business_response_ok`/`PROVEN_BUSINESS_SUCCESS_RSP_CODES` 自 remote_running_recovery 逐字迁入 zhaoshang_remote_task(共享远端语义层),Task Progress 与 Recovery 平级依赖共享层,re-export 保旧路径,单一实现守护测试在位。
 
 **推荐下一步(仅一个)**:迁移 **Running Probe**(`probe_running_task` :1617-1853,只读):与 Progress 同族(只读、共享 zhaoshang_remote_task 身份语义、复用会话工具箱),顺手把 adapter→remote_running_recovery 的函数级延迟 import 债务理顺;先补特征化测试再 MOVE。
 

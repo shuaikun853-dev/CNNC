@@ -14,6 +14,7 @@ from typing import Any, Callable, Mapping
 from app.services.zhaoshang_remote_task import (
     LegacyZhaoshangAdapterError,
     RemoteTaskIdentityConflictError,
+    remote_business_response_ok,
     remote_task_is_enabled,
 )
 
@@ -72,8 +73,6 @@ def query_task_progress(
     # failed progress response donates no counter evidence, so it returns
     # progress=None (REMOTE_UNKNOWN upstream) instead of raising; the raw
     # rspDesc is still surfaced for the dashboard.
-    from app.services.remote_running_recovery import remote_business_response_ok
-
     rsp_desc = _text(progress_json.get("rspDesc"))
     progress = (
         dict(tool.parse_task_progress_desc(rsp_desc))

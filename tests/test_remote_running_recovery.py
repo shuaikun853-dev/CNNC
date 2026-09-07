@@ -2868,6 +2868,33 @@ def test_round5_c0_business_response_truth_table() -> None:
     assert not remote_business_response_ok(None)
 
 
+def test_remote_business_response_ok_has_single_shared_implementation() -> None:
+    import app.services.remote_running_recovery
+    import app.services.zhaoshang_remote_task
+
+    assert (
+        app.services.remote_running_recovery.remote_business_response_ok
+        is app.services.zhaoshang_remote_task.remote_business_response_ok
+    )
+    assert (
+        app.services.remote_running_recovery.PROVEN_BUSINESS_SUCCESS_RSP_CODES
+        is app.services.zhaoshang_remote_task.PROVEN_BUSINESS_SUCCESS_RSP_CODES
+    )
+    assert (
+        app.services.zhaoshang_remote_task.remote_business_response_ok(
+            {"success": True, "rspCode": "0000"}
+        )
+        is True
+    )
+    assert (
+        app.services.zhaoshang_remote_task.remote_business_response_ok(
+            {"success": True, "rspCode": "9999"}
+        )
+        is False
+    )
+    assert app.services.zhaoshang_remote_task.remote_business_response_ok({}) is True
+
+
 def test_round5_c1_failed_progress_counters_are_not_stall_evidence(tmp_path, monkeypatch) -> None:
     from app.services.legacy_zhaoshang_adapter import LegacyProbeEvidenceError
 
