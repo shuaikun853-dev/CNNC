@@ -1536,11 +1536,21 @@ def test_adapter_probe_running_task_reports_progress_and_export(tmp_path, monkey
     assert probe.export_rsp_desc == NO_PRICE_RSP
 
 
-def test_default_dependencies_wire_probe_and_write_gated_restart(tmp_path) -> None:
+def test_default_dependencies_wire_probe_and_write_gated_restart(tmp_path, monkeypatch) -> None:
     from app.services.incremental_audit_runtime import (
         build_default_dependencies,
         runtime_paths,
     )
+    from app.services import incremental_audit_runtime as runtime_module
+
+    # 构造期不再读取生产 data/ curl(PRODUCTION_MACHINE_ONLY 依赖),
+    # 与 test_incremental_audit_runtime 的 stub 模式一致。
+    class _SnapshotAdapterStub:
+        def __init__(self, saas_path, cnnc_path, *, auth_manager, cnnc_provider=None):
+            pass
+
+    monkeypatch.setattr(runtime_module, "CnncSaasSnapshotAdapter", _SnapshotAdapterStub)
+    monkeypatch.setattr(runtime_module, "load_curl_command", lambda path: {})
 
     paths = runtime_paths(BUSINESS_DATE, tmp_path / "runtime")
     read_only = build_default_dependencies(
