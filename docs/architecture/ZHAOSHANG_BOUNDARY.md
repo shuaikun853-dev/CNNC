@@ -90,7 +90,7 @@ CnncLegacyZhaoshangAdapter(app/services/legacy_zhaoshang_adapter.py:478)
 
 - `harvest`(:3160)= wait-export-only 子进程(**无 create 路径**);已存在文件→`harvest_existing`(:2709,零远端调用)。
 - 验收门 `_validate_result_workbook`(:2512):provenance 必需(执行编号/批次号==task_name/商城标识==mall_key)+ 外批行过滤 + 全量 Counter 严格相等。部分导出走 `classify_existing_export_partial`(:2964,执行编号前缀 `{task_number}-` + ambiguous/exact_absent)。**此处是 Z-1/Z-2 历史 Bug 区,测试最密(30+),改动必须先读测试**。
-- Re-export(Dashboard"重新导出")与首次导出共用 `_existing_remote_harvest_core`(recovery/harvest.py:569):create_calls 恒 0;admissible_states={SUBMITTED,RUNNING,EXPORTED};attempt_headroom=2;2026-09-04 hotfix 后 live_identity_proof(progress probe 答案)可替代 priority 证据过 exact-identity 门——修掉了"远端任务完好但 priority 从未确认→re-export 被 INVALID_REMOTE_STATE 拒"的根因。
+- **Existing Remote Harvest seam(2026-09-07 闲时任务 2 正式化)**:"对一个 exact 既有远端任务 wait/export+回填"的协议唯一 owner 是 `recovery/harvest.py`:私有核心 `_existing_remote_harvest_core`(:569)之上只有两个公开通道操作——自动通道 `run_existing_remote_harvest`(frozen、SUBMITTED/RUNNING、无 MANUAL requeue、+1 headroom)与人工通道 `run_existing_remote_reexport`(latest-or-frozen、SUBMITTED/RUNNING/EXPORTED、白名单 MANUAL requeue、+2 headroom、可选 live proof;operation 标签 `"manual re-export"` 恒定,Dashboard 按其 rejection reason 映射 error_code)。Dashboard re-export(`dashboard_manual_ops.run_manual_reexport`)只调公开操作,不再 import Recovery 私有实现;requeue 诊断白名单(`REEXPORT_MANUAL_REQUEUE_DIAGNOSTICS`)与 error_code/响应形状/accounting 仍归 Dashboard。两通道 create_calls 恒 0;2026-09-04 hotfix 语义不变:live_identity_proof 仅对 strict priority-unconfirmed 族替代 priority 证据过 exact-identity 门。特征化:tests/test_existing_remote_harvest_seam.py(双通道 16 例)。
 - 导出失败重试:子进程内 exportTask 重试≤5(读性质);启动失败分 transient(→RUNNING 同身份重排)与 deterministic(→MANUAL fail-closed)。
 
 ## 7. Rebuild(重建)——与 Re-export 严格互斥的语义
@@ -142,6 +142,8 @@ CnncLegacyZhaoshangAdapter(app/services/legacy_zhaoshang_adapter.py:478)
 ## 13. 迁移台账与下一步
 
 **已完成(2026-09-05)**:Progress 能力 MOVE-only 抽出(zhaoshang_task_progress + zhaoshang_remote_task 种子;adapter re-export 全兼容;22 特征化测试 + 243 集群回归绿)。**Review Fix R1(2026-09-05)**:业务响应门 `remote_business_response_ok`/`PROVEN_BUSINESS_SUCCESS_RSP_CODES` 自 remote_running_recovery 逐字迁入 zhaoshang_remote_task(共享远端语义层),Task Progress 与 Recovery 平级依赖共享层,re-export 保旧路径,单一实现守护测试在位。
+
+**2026-09-07 闲时任务 2(Dashboard↔Recovery seam)**:`run_existing_remote_reexport` 公开为人工通道操作(channel policy 归 seam:EXPORTED 准入/latest 范围/+2 headroom/operation 标签),`dashboard_manual_ops` 摘除 `_existing_remote_harvest_core` 私有 import(rebuild 的 `_acquire_recovery_lease` 私有 import 属 rebuild seam,留待后续轮);16 例双通道特征化测试先行(987042d),MOVE-only 语义保持,全量 1402 绿。
 
 **推荐下一步(仅一个)**:迁移 **Running Probe**(`probe_running_task` :1617-1853,只读):与 Progress 同族(只读、共享 zhaoshang_remote_task 身份语义、复用会话工具箱),顺手把 adapter→remote_running_recovery 的函数级延迟 import 债务理顺;先补特征化测试再 MOVE。
 
