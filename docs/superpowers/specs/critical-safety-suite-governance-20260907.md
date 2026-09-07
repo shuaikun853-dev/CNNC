@@ -85,3 +85,21 @@ YAML 同时承担"执行入口"+"测试集合定义"两个职责 → 未通过 D
 - 本地:selector 全绿;OLD 集合 ⊆ NEW 集合(节点级对比脚本);guard 全绿。
 - GitHub Runner:push 分支后 CNNC Critical Safety Tests 真跑,COLLECTED/PASSED 与本地一致,deselected 仅为非 gate 集合。
 - SAFETY:无 Secret、无生产写、permissions contents:read 不变。
+
+## Runner 实证与二轮修复(2026-09-07 run #15 → #16)
+
+Run #15(18cdd59)真实结果:4 failed / 1514 passed / 4 skipped / 860 deselected @ 24:05。
+marker 选择器在 Runner 上与本地分毫不差(1514+4=1518),但暴露两类真问题:
+
+1. **测试侧竞态(TEST_BUG)**:`test_dashboard_action_runner.py` 三个 closeout 用例的
+   `_wait_done` 只等内存 handle 状态,而 `_supervise` 写序为"先翻转 status、后写持久化
+   finished 记录"(app/services/dashboard_actions.py:414-431,设计内语义,未改)。
+   重载 2 核 Runner 上读账本必输竞态。修复 = `_wait_done` 增加 run_dir 参数,
+   同时等 finished 记录落地(commit 9b9a73a)。
+2. **宿主时区形状**:`production_readiness.check_timezone` 除 FakeRunner 覆盖的 tzutil 外
+   还审计真实宿主 UTC 偏移与本地日期(app/services/production_readiness.py:421-432)。
+   Runner 默认 UTC → all-green 用例真 WARN。修复 = CI 构造生产形状
+   `Set-Timezone "China Standard Time"`(与 E:\ junction 同类,宿主审计真实通过,非 mock;
+   commit 1b9eec6)。
+3. **运行时长**:1518 用例在冷 Runner 实测 24:05,30 分钟上限余量不足;
+   timeout 30→40(有实测证据)+ `--durations=25` 观测(commit 1b9eec6)。
