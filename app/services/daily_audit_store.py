@@ -1870,6 +1870,106 @@ class DailyAuditStore:
             connection.execute("UPDATE remote_jobs SET state=?, harvest_elapsed_seconds=?, error_text=?, updated_at=? WHERE id=?", (state, elapsed, error, self._utcnow(), job_id))
             return self._row(connection.execute("SELECT * FROM remote_jobs WHERE id=?", (job_id,)).fetchone())  # type: ignore[return-value]
 
+    def close_harvest_still_running(
+        self,
+        token: LeaseToken,
+        job_id: int,
+        *,
+        remote_identity: str,
+        diagnostic: str | None,
+        elapsed_seconds: float,
+        max_attempts: int,
+        max_elapsed_seconds: float,
+    ) -> dict[str, Any]:
+        """Close one claimed harvest whose bounded wait only proved the remote
+        task still executing: reconcile the job to RUNNING, advance every
+        non-terminal linked crawl to RUNNING, and close the claim accounting
+        under the caller's limits.  Ordering is load-bearing: reconcile before
+        record so a capped claim may flip to MANUAL_REQUIRED exactly as before.
+        """
+        self.reconcile_remote_job(token, job_id, remote_identity=remote_identity, state="RUNNING")
+        self.advance_crawl_work_for_job(token, job_id, "RUNNING")
+        return self.record_harvest(token, job_id, elapsed_seconds=elapsed_seconds, max_attempts=max_attempts, max_elapsed_seconds=max_elapsed_seconds, error=diagnostic)
+
+    def close_harvest_manual(
+        self,
+        token: LeaseToken,
+        job_id: int,
+        *,
+        diagnostic: str,
+        elapsed_seconds: float,
+        max_attempts: int,
+        max_elapsed_seconds: float,
+    ) -> dict[str, Any]:
+        """Close one claimed harvest with a manual-review outcome:
+        terminalize the job MANUAL_REQUIRED with the diagnostic and close the
+        claim accounting; crawl rows are never touched by this outcome.
+        """
+        self.mark_remote_manual(token, job_id, diagnostic)
+        return self.record_harvest(token, job_id, elapsed_seconds=elapsed_seconds, max_attempts=max_attempts, max_elapsed_seconds=max_elapsed_seconds, error=diagnostic)
+
+    def close_harvest_exported(
+        self,
+        token: LeaseToken,
+        job_id: int,
+        *,
+        remote_identity: str,
+        matched: Mapping[int, Any],
+        no_result_crawl_ids: Sequence[int],
+        manual_crawls: Sequence[tuple[int, str]],
+        export_path: str,
+        result: Any,
+        elapsed_seconds: float,
+        max_attempts: int,
+        max_elapsed_seconds: float,
+    ) -> dict[str, Any]:
+        """Close one claimed harvest with a finished export.
+
+        Owned invariants:
+
+        1. The write order matched -> no_result -> reconcile -> manual marks
+           -> record is fixed.
+        2. The job lands COMPLETED only when no crawl is manual; otherwise it
+           lands EXPORTED and then MANUAL_REQUIRED via the "harvest has
+           unresolved provenance mappings" diagnostic.
+        3. The reconcile happens BEFORE ``record_harvest`` so terminal
+           evidence wins over the retry cap.
+        4. The closing record runs without an error, so the job-level
+           diagnostic is not persisted (current production behavior, frozen
+           by tests/test_harvest_claim_closure_store.py).
+        5. Per-crawl terminal-evidence protection and identity immutability
+           are enforced by the composed methods themselves.
+        """
+        for crawl_id, crawl_result in matched.items():
+            self.complete_crawl_work(token, int(crawl_id), crawl_result)
+        for crawl_id in no_result_crawl_ids:
+            self.complete_partial_exact_no_result(
+                token,
+                int(crawl_id),
+                remote_job_id=job_id,
+                remote_identity=remote_identity,
+                result_path=export_path,
+                reason="provenance-valid remote request has no result row",
+            )
+        manual = list(manual_crawls)
+        self.reconcile_remote_job(
+            token,
+            job_id,
+            remote_identity=remote_identity,
+            state="EXPORTED" if manual else "COMPLETED",
+            export_path=export_path,
+            result=result,
+        )
+        if manual:
+            self.mark_remote_manual(token, job_id, "harvest has unresolved provenance mappings")
+            for crawl_id, error in manual:
+                self.mark_partial_exact_crawl_manual(
+                    token, int(crawl_id), remote_job_id=job_id, remote_identity=remote_identity, error=error,
+                )
+        return self.record_harvest(
+            token, job_id, elapsed_seconds=elapsed_seconds, max_attempts=max_attempts, max_elapsed_seconds=max_elapsed_seconds,
+        )
+
     def update_remote_recovery_evidence(self, token: LeaseToken, job_id: int, evidence: Mapping[str, Any]) -> dict[str, Any]:
         """Persist the RUNNING-stall recovery evidence document for one job.
 

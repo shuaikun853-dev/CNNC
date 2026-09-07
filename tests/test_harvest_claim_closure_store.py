@@ -1,14 +1,17 @@
 """Characterization of the harvest claim-closure protocol at the store level.
 
 These tests pin the CURRENT durable behavior of ``DailyAuditStore`` when a
-claimed remote harvest job is closed.  They drive, method for method, the
-exact sequences that production drives today:
+claimed remote harvest job is closed.  They drive the harvest claim closure
+seam (``close_harvest_*``) that production uses today:
 
 * ``app/services/recovery/harvest.py`` — ``_existing_remote_harvest_core``
   (RUNNING / MANUAL / EXPORTED outcome branches) and
   ``run_local_remote_harvest_recovery``.
 * ``app/services/recovery/wait_export.py`` —
   ``run_remote_wait_export_recovery``.
+
+The frozen behavior was characterized against the primitive store sequence
+in commit bc81477.
 
 The point is the store-call sequence and its full durable end state, so the
 tests use the store directly (no adapters, no workflows).
@@ -58,40 +61,16 @@ def _seed_job(tmp_path, *, crawl_count=3, identity=IDENTITY, result_path=None):
 
 
 def close_exported(store, token, job_id, matched, no_result_ids, manual, export_path, result, *, elapsed, max_attempts, max_elapsed):
-    """EXPORTED branch (harvest.py 880-920 / wait_export.py 275-315)."""
-    for crawl_id, crawl_result in matched.items():
-        store.complete_crawl_work(token, crawl_id, crawl_result)
-    for crawl_id in no_result_ids:
-        store.complete_partial_exact_no_result(
-            token,
-            crawl_id,
-            remote_job_id=job_id,
-            remote_identity=IDENTITY,
-            result_path=export_path,
-            reason=NO_RESULT_REASON,
-        )
-    remote_state = "EXPORTED" if manual else "COMPLETED"
-    store.reconcile_remote_job(
+    """EXPORTED branch via ``close_harvest_exported``."""
+    store.close_harvest_exported(
         token,
         job_id,
         remote_identity=IDENTITY,
-        state=remote_state,
+        matched=matched,
+        no_result_crawl_ids=no_result_ids,
+        manual_crawls=manual,
         export_path=export_path,
         result=result,
-    )
-    if manual:
-        store.mark_remote_manual(token, job_id, MANUAL_JOB_ERROR)
-        for crawl_id, error in manual:
-            store.mark_partial_exact_crawl_manual(
-                token,
-                crawl_id,
-                remote_job_id=job_id,
-                remote_identity=IDENTITY,
-                error=error,
-            )
-    store.record_harvest(
-        token,
-        job_id,
         elapsed_seconds=elapsed,
         max_attempts=max_attempts,
         max_elapsed_seconds=max_elapsed,
@@ -99,29 +78,27 @@ def close_exported(store, token, job_id, matched, no_result_ids, manual, export_
 
 
 def close_running(store, token, job_id, *, diagnostic, elapsed, max_attempts, max_elapsed):
-    """RUNNING branch (harvest.py 781-795 / wait_export.py 173-187)."""
-    store.reconcile_remote_job(token, job_id, remote_identity=IDENTITY, state="RUNNING")
-    store.advance_crawl_work_for_job(token, job_id, "RUNNING")
-    store.record_harvest(
+    """RUNNING branch via ``close_harvest_still_running``."""
+    store.close_harvest_still_running(
         token,
         job_id,
+        remote_identity=IDENTITY,
+        diagnostic=diagnostic,
         elapsed_seconds=elapsed,
         max_attempts=max_attempts,
         max_elapsed_seconds=max_elapsed,
-        error=diagnostic,
     )
 
 
 def close_manual(store, token, job_id, *, diagnostic, elapsed, max_attempts, max_elapsed):
-    """MANUAL branch (harvest.py 805-815 / wait_export.py 198-208)."""
-    store.mark_remote_manual(token, job_id, diagnostic)
-    store.record_harvest(
+    """MANUAL branch via ``close_harvest_manual``."""
+    store.close_harvest_manual(
         token,
         job_id,
+        diagnostic=diagnostic,
         elapsed_seconds=elapsed,
         max_attempts=max_attempts,
         max_elapsed_seconds=max_elapsed,
-        error=diagnostic,
     )
 
 

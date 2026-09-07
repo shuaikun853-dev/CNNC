@@ -318,19 +318,15 @@ def run_local_remote_harvest_recovery(
         )
         if claim is None:
             raise RecoveryRejected("manual remote job could not enter harvestable state")
-        for crawl_id, result in crawl_results.items():
-            store.complete_crawl_work(token, crawl_id, result)
-        store.reconcile_remote_job(
+        store.close_harvest_exported(
             token,
             int(remote_job_id),
             remote_identity=expected_identity,
-            state="COMPLETED",
+            matched=crawl_results,
+            no_result_crawl_ids=[],
+            manual_crawls=[],
             export_path=str(prepared.result_path),
             result=result_map,
-        )
-        store.record_harvest(
-            token,
-            int(remote_job_id),
             elapsed_seconds=0,
             max_attempts=int(job["harvest_attempts"]) + 1,
             max_elapsed_seconds=max(float(job["harvest_elapsed_seconds"]) + 60.0, 60.0),
@@ -778,20 +774,14 @@ def _existing_remote_harvest_core(
         outcome = adapter.harvest(prepared, timeout_seconds=timeout_seconds)
         elapsed_seconds = max(0.0, time.monotonic() - started)
         if outcome.status is HarvestStatus.RUNNING:
-            store.reconcile_remote_job(
+            store.close_harvest_still_running(
                 token,
                 int(remote_job_id),
                 remote_identity=expected_identity,
-                state="RUNNING",
-            )
-            store.advance_crawl_work_for_job(token, int(remote_job_id), "RUNNING")
-            store.record_harvest(
-                token,
-                int(remote_job_id),
+                diagnostic=outcome.diagnostic,
                 elapsed_seconds=elapsed_seconds,
                 max_attempts=max_attempts,
                 max_elapsed_seconds=max_elapsed_seconds,
-                error=outcome.diagnostic,
             )
             return {
                 "outcome": "REMOTE_EXISTING_HARVEST_RUNNING",
@@ -804,14 +794,13 @@ def _existing_remote_harvest_core(
             }
         if outcome.status is not HarvestStatus.EXPORTED:
             diagnostic = outcome.diagnostic or "legacy wait-export-only requires manual review"
-            store.mark_remote_manual(token, int(remote_job_id), diagnostic)
-            store.record_harvest(
+            store.close_harvest_manual(
                 token,
                 int(remote_job_id),
+                diagnostic=diagnostic,
                 elapsed_seconds=elapsed_seconds,
                 max_attempts=max_attempts,
                 max_elapsed_seconds=max_elapsed_seconds,
-                error=diagnostic,
             )
             return {
                 "outcome": "REMOTE_EXISTING_HARVEST_MANUAL",
@@ -825,14 +814,13 @@ def _existing_remote_harvest_core(
             }
         if adapter.exact_export_remote_identity(prepared) != expected_identity:
             diagnostic = "exact EXPORTED evidence does not match durable remote identity"
-            store.mark_remote_manual(token, int(remote_job_id), diagnostic)
-            store.record_harvest(
+            store.close_harvest_manual(
                 token,
                 int(remote_job_id),
+                diagnostic=diagnostic,
                 elapsed_seconds=elapsed_seconds,
                 max_attempts=max_attempts,
                 max_elapsed_seconds=max_elapsed_seconds,
-                error=diagnostic,
             )
             return {
                 "outcome": "REMOTE_EXISTING_HARVEST_MANUAL",
@@ -877,43 +865,15 @@ def _existing_remote_harvest_core(
                     )
                 )
 
-        for crawl_id, result in matched.items():
-            store.complete_crawl_work(token, crawl_id, result)
-        for crawl_id in no_result_ids:
-            store.complete_partial_exact_no_result(
-                token,
-                crawl_id,
-                remote_job_id=int(remote_job_id),
-                remote_identity=expected_identity,
-                result_path=str(prepared.result_path),
-                reason="provenance-valid remote request has no result row",
-            )
-        remote_state = "EXPORTED" if manual else "COMPLETED"
-        store.reconcile_remote_job(
+        store.close_harvest_exported(
             token,
             int(remote_job_id),
             remote_identity=expected_identity,
-            state=remote_state,
+            matched=matched,
+            no_result_crawl_ids=no_result_ids,
+            manual_crawls=manual,
             export_path=str(prepared.result_path),
             result=result_map,
-        )
-        if manual:
-            store.mark_remote_manual(
-                token,
-                int(remote_job_id),
-                "harvest has unresolved provenance mappings",
-            )
-            for crawl_id, error in manual:
-                store.mark_partial_exact_crawl_manual(
-                    token,
-                    crawl_id,
-                    remote_job_id=int(remote_job_id),
-                    remote_identity=expected_identity,
-                    error=error,
-                )
-        store.record_harvest(
-            token,
-            int(remote_job_id),
             elapsed_seconds=elapsed_seconds,
             max_attempts=max_attempts,
             max_elapsed_seconds=max_elapsed_seconds,
