@@ -10,6 +10,8 @@ from pathlib import Path
 
 import pytest
 
+pytestmark = pytest.mark.critical_safety
+
 
 class FakeResponse:
     def __init__(self, payload: dict, status: int = 200):

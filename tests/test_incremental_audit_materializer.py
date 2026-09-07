@@ -13,6 +13,8 @@ from app.services.incremental_audit_materializer import (
     MaterializationValidationError,
 )
 
+pytestmark = pytest.mark.critical_safety
+
 
 HEADERS = ("vCommodityId", "skuId", "extLink", "queryStr")
 

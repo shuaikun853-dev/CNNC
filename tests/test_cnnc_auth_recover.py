@@ -20,6 +20,8 @@ from app.services.incremental_audit_runtime import _detail_worker
 from scripts import cnnc_auth_core as core
 from scripts import cnnc_auth_refresh
 
+pytestmark = pytest.mark.critical_safety
+
 OLD_AT = "AT-1-old"
 NEW_AT = "AT-2-new"
 

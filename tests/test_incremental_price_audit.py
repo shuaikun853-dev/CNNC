@@ -33,6 +33,8 @@ from app.workflows.incremental_price_audit import (
     run_incremental_tick,
 )
 
+pytestmark = pytest.mark.critical_safety
+
 
 @dataclass
 class Clock:

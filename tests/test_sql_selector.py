@@ -2,6 +2,8 @@ import pytest
 from unittest.mock import patch
 from app.agent.sql_selector import get_sql_templates, _is_empty_value, _render_sql
 
+pytestmark = pytest.mark.critical_safety
+
 
 _DANGEROUS_TEMPLATE = {
     "scenario": "test_dangerous",

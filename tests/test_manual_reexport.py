@@ -24,6 +24,8 @@ from app.services.recovery.wait_export import (
     WAIT_EXPORT_STILL_RUNNING_DIAGNOSTIC,
 )
 
+pytestmark = pytest.mark.critical_safety
+
 
 BUSINESS_DATE = "2026-08-28"
 TASK_ID = "1246803"

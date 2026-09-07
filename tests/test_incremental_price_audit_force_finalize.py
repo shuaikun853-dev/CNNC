@@ -31,6 +31,8 @@ from app.workflows.incremental_price_audit_finalize import (
 )
 from scripts.audit_saas_excel_file import RESULT_APPENDED_COLUMNS
 
+pytestmark = pytest.mark.critical_safety
+
 
 DATE = "2026-08-24"
 NO_RESULT_REASON = "legacy export missing safe skuId / exact URL result"

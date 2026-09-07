@@ -17,6 +17,10 @@ from collections.abc import Callable
 from datetime import datetime, timedelta
 from pathlib import Path
 
+import pytest
+
+pytestmark = pytest.mark.critical_safety
+
 ROOT = Path(__file__).resolve().parents[1]
 WEEKDAY = datetime(2026, 8, 10)  # Monday
 

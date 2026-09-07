@@ -27,6 +27,8 @@ from app.services.production_identity import (
     get_production_identity_service,
 )
 
+pytestmark = pytest.mark.critical_safety
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SHA_A = "a" * 40
 SHA_B = "b" * 40

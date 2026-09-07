@@ -24,6 +24,8 @@ from app.services.legacy_zhaoshang_adapter import (
 from app.services import legacy_zhaoshang_adapter as legacy_module
 from scripts.zhaoshang_mall_mapping import ZhaoshangMallMapping
 
+pytestmark = pytest.mark.critical_safety
+
 
 MAPPING = ZhaoshangMallMapping(
     mall_name="京东",

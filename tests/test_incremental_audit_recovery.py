@@ -23,6 +23,8 @@ from app.services.legacy_zhaoshang_adapter import (
     CrawlRequest,
 )
 
+pytestmark = pytest.mark.critical_safety
+
 
 BUSINESS_DATE = "2026-08-11"
 MODEL_NAME = "title-match"

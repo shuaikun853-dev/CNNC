@@ -23,6 +23,8 @@ from app.workflows.incremental_price_audit import (
 )
 import scripts.incremental_price_audit as cli
 
+pytestmark = pytest.mark.critical_safety
+
 
 DATE = "2026-08-11"
 

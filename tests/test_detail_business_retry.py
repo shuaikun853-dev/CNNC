@@ -32,6 +32,8 @@ from app.workflows.incremental_price_audit import (
 )
 from app.workflows.incremental_price_audit_finalize import build_frozen_audit_artifact
 
+pytestmark = pytest.mark.critical_safety
+
 DATE = "2026-08-11"
 
 

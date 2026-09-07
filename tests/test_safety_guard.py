@@ -1,6 +1,8 @@
 import pytest
 from app.agent.safety_guard import validate_sql, validate_and_explain
 
+pytestmark = pytest.mark.critical_safety
+
 
 class TestValidateSqlBasic:
     def test_select_allowed(self):

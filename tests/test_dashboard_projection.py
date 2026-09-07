@@ -1,5 +1,9 @@
 # tests/test_dashboard_projection.py
+import pytest
+
 from app.services.dashboard_projection import compute_overall_status
+
+pytestmark = pytest.mark.critical_safety
 
 
 def _status(**over):

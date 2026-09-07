@@ -6,6 +6,8 @@ import pytest
 import app.services.title_match_model_adapter as adapter
 from app.workflows.incremental_price_audit import _safe_error
 
+pytestmark = pytest.mark.critical_safety
+
 
 def _clear_retry_policy(monkeypatch):
     for name in (

@@ -10,6 +10,8 @@ import subprocess
 from datetime import datetime
 from pathlib import Path
 
+import pytest
+
 from app.services import legacy_zhaoshang_adapter
 from app.services.production_readiness import (
     STATUS_FAIL,
@@ -20,6 +22,8 @@ from app.services.production_readiness import (
     ReadinessReport,
     build_readiness_report,
 )
+
+pytestmark = pytest.mark.critical_safety
 
 EXPECTED_BRANCH = "prod/closeout-20260818"
 FIXED_CLOCK = datetime(2026, 9, 4, 12, 0, 0)

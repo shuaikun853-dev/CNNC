@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from decimal import Decimal
 
+import pytest
+
 from app.services.customer_price_semantics import (
     CUSTOMER_PRICE_FOUND_STATUSES,
     CUSTOMER_PRICE_PROVEN_ABSENT_STATUSES,
@@ -18,6 +20,8 @@ from app.services.customer_price_semantics import (
     is_retryable_detail_http_status,
     sanitize_customer_price_text,
 )
+
+pytestmark = pytest.mark.critical_safety
 
 
 def _success_result(price=None, status="FOUND", **extra):

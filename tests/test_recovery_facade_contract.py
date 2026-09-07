@@ -8,6 +8,10 @@ contract must pass on the unmodified baseline and after every refactor task.
 
 import app.services.incremental_audit_recovery as recovery_facade
 
+import pytest
+
+pytestmark = pytest.mark.critical_safety
+
 PUBLIC_FUNCTIONS = (
     "validate_linked_crawls_against_remote_payload",
     "requeue_model_transient_failures",

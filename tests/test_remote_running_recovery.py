@@ -23,6 +23,8 @@ from app.workflows.incremental_price_audit import (
     run_incremental_tick,
 )
 
+pytestmark = pytest.mark.critical_safety
+
 
 BUSINESS_DATE = "2026-08-25"
 NOW = datetime(2026, 8, 25, 10, 0, 0, tzinfo=UTC)

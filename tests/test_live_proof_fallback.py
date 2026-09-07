@@ -37,6 +37,8 @@ from app.services.legacy_zhaoshang_adapter import (
     RemoteTaskIdentityConflictError,
 )
 
+pytestmark = pytest.mark.critical_safety
+
 
 BUSINESS_DATE = "2026-08-28"
 MALL_KEY = "lxwl"

@@ -15,6 +15,8 @@ import sqlite3
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
+import pytest
+
 from app.services.daily_audit_store import DailyAuditStore, ProcessLock
 from app.services.dashboard_projection import compute_overall_status
 from app.services.incremental_audit_runtime import runtime_paths
@@ -27,6 +29,8 @@ from app.workflows.incremental_price_audit import (
     TickDependencies,
     run_incremental_tick,
 )
+
+pytestmark = pytest.mark.critical_safety
 
 
 @dataclass

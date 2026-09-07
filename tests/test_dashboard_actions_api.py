@@ -14,6 +14,8 @@ from app.main import app
 from app.services.dashboard_actions import DashboardActionError
 from app.services.dashboard_manual_ops import record_operator_action
 
+pytestmark = pytest.mark.critical_safety
+
 BUSINESS_DATE = "2026-08-28"
 IDENTITY = "JD|8899|1024"
 

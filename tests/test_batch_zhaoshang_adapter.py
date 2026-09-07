@@ -13,6 +13,8 @@ from app.services.batch_zhaoshang_adapter import (
 )
 from app.services.legacy_zhaoshang_adapter import CrawlRequest
 
+pytestmark = pytest.mark.critical_safety
+
 
 FIXTURES = Path(__file__).parent / "fixtures" / "zhaoshang_batch"
 

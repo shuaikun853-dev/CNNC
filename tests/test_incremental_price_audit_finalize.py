@@ -15,6 +15,8 @@ from app.workflows.incremental_price_audit_finalize import (
     materialize_frozen_daily_run,
 )
 
+pytestmark = pytest.mark.critical_safety
+
 
 def _row(v="v-1", sku="sku-1", url="https://shop.example/item", **extra):
     return {

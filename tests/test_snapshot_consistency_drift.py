@@ -24,6 +24,8 @@ from tests.test_cnnc_saas_snapshot_adapter import (
     _saas_config,
 )
 
+pytestmark = pytest.mark.critical_safety
+
 
 def _customer_ok(count=1):
     return _ok([{"documentId": f"c{index}"} for index in range(count)], count)

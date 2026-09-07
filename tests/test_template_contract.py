@@ -4,6 +4,8 @@ from pathlib import Path
 from app.config import TEMPLATES_DIR
 from app.agent.safety_guard import validate_sql
 
+pytestmark = pytest.mark.critical_safety
+
 
 def _load_all_templates() -> list[dict]:
     all_tpls = []

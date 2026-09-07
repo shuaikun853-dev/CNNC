@@ -8,12 +8,16 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from app.services.customer_price_semantics import encode_business_error
 from app.services.daily_audit_store import DailyAuditStore
 from app.services.dashboard_projection import (
     empty_customer_price_projection,
     project_customer_price,
 )
+
+pytestmark = pytest.mark.critical_safety
 
 BUSINESS_DATE = "2026-08-11"
 

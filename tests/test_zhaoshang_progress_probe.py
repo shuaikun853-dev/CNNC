@@ -9,12 +9,16 @@ from __future__ import annotations
 
 import threading
 
+import pytest
+
 from app.services.legacy_zhaoshang_adapter import RemoteTaskIdentityConflictError
 from app.services.zhaoshang_progress_probe import (
     REFRESH_RATE_LIMIT_SECONDS,
     ZhaoshangProgressService,
     get_progress_service,
 )
+
+pytestmark = pytest.mark.critical_safety
 
 TASK_NAME = "cnnc_current_opt_领先未来商城_61284593895349"
 

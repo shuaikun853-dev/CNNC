@@ -20,6 +20,8 @@ from app.services.legacy_zhaoshang_adapter import (
     CrawlRequest,
 )
 
+pytestmark = pytest.mark.critical_safety
+
 
 BUSINESS_DATE = "2026-08-19"
 FROZEN_SOURCES = {"source-a", "source-b", "source-c", "source-d", "source-e"}

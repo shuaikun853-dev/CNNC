@@ -25,6 +25,8 @@ from app.workflows.incremental_price_audit import (
 )
 from datetime import UTC, datetime
 
+pytestmark = pytest.mark.critical_safety
+
 BUSINESS_DATE = "2026-08-11"
 IDENTITY = "jd|1242978|RW-20260818110643"
 

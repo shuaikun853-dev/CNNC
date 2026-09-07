@@ -18,6 +18,8 @@ from app.services.dashboard_actions import (
 )
 from app.services.dashboard_manual_ops import read_operator_actions
 
+pytestmark = pytest.mark.critical_safety
+
 BUSINESS_DATE = "2026-08-28"
 IDENTITY = "JD|8899|1024"
 

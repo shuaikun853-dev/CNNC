@@ -19,6 +19,8 @@ from app.services.daily_audit_store import (
     StaleLease,
 )
 
+pytestmark = pytest.mark.critical_safety
+
 
 @pytest.fixture
 def store(tmp_path):

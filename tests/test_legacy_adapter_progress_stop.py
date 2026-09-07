@@ -20,6 +20,8 @@ from app.services.legacy_zhaoshang_adapter import (
     RestartStatus,
 )
 
+pytestmark = pytest.mark.critical_safety
+
 BUSINESS_DATE = "2026-08-28"
 TASK_NAME = "cnnc_current_opt_领先未来商城_61284593895349"
 TASK_ID = "1269504"

@@ -11,6 +11,8 @@ from app.services import incremental_audit_recovery as recovery
 from app.services.daily_audit_store import DailyAuditStore
 from app.services.legacy_zhaoshang_adapter import CnncLegacyZhaoshangAdapter, CrawlRequest
 
+pytestmark = pytest.mark.critical_safety
+
 
 BUSINESS_DATE = "2026-08-14"
 

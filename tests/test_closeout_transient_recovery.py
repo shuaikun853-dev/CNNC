@@ -13,6 +13,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from app.services.daily_audit_store import DailyAuditStore, ProcessLock
 from app.services.incremental_audit_closeout import (
     CloseoutConfig,
@@ -31,6 +33,8 @@ from app.workflows.incremental_price_audit import (
     TickSummary,
 )
 from app.services.incremental_audit_runtime import RuntimeConfigurationError
+
+pytestmark = pytest.mark.critical_safety
 
 
 BUSINESS_DATE = "2026-08-11"

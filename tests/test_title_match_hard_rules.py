@@ -19,6 +19,8 @@ from app.services.title_match_model_adapter import (
     call_title_match_model_batch,
 )
 
+pytestmark = pytest.mark.critical_safety
+
 
 # ---------------------------------------------------------------------------
 # R1 — model-code single-sided / conflicting

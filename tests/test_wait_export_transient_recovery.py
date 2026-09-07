@@ -35,6 +35,8 @@ from tests.test_legacy_zhaoshang_adapter import (
     _write_result,
 )
 
+pytestmark = pytest.mark.critical_safety
+
 TASK_ID = "1246803"
 TASK_NUMBER = "RW-20260819160830"
 IDENTITY = f"lxwl|{TASK_ID}|{TASK_NUMBER}"

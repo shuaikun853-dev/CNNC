@@ -28,6 +28,8 @@ from app.workflows.incremental_price_audit import (
     run_incremental_tick,
 )
 
+pytestmark = pytest.mark.critical_safety
+
 
 BUSINESS_DATE = "2026-08-11"
 

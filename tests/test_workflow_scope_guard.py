@@ -6,6 +6,8 @@ from app.workflows.scope_guard import (
 )
 from app.schemas.workflow import WorkflowScope
 
+pytestmark = pytest.mark.critical_safety
+
 
 def _cnnc_scope():
     return WorkflowScope(project="CNNC", tenant_id=188605, commodity_pool_id=222)

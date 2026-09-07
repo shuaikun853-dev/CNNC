@@ -22,6 +22,8 @@ from app.services.legacy_zhaoshang_adapter import (
 from app.workflows.incremental_price_audit_finalize import build_frozen_audit_artifact
 from scripts.zhaoshang_mall_mapping import ZhaoshangMallMapping
 
+pytestmark = pytest.mark.critical_safety
+
 
 BUSINESS_DATE = "2026-08-11"
 

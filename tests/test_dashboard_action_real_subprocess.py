@@ -19,6 +19,8 @@ from app.services import dashboard_actions
 from app.services.dashboard_actions import DashboardActionError, DashboardActionRunner
 from app.services.dashboard_manual_ops import read_operator_actions
 
+pytestmark = pytest.mark.critical_safety
+
 BUSINESS_DATE = "2026-01-01"
 
 # __EXPECTED_CWD__ 会被替换成 repr(str(repo)),Windows 反斜杠安全。

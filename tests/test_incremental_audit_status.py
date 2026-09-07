@@ -9,9 +9,13 @@ the detail statistics follow the frozen-authoritative snapshot.
 
 from __future__ import annotations
 
+import pytest
+
 from app.services.daily_audit_store import DailyAuditStore
 from app.services.incremental_audit_runtime import runtime_paths
 from app.services.incremental_audit_status import collect_runtime_status
+
+pytestmark = pytest.mark.critical_safety
 
 BUSINESS_DATE = "2026-08-11"
 

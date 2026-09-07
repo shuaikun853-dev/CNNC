@@ -5,6 +5,8 @@ from fastapi.testclient import TestClient
 
 from app.main import app
 
+pytestmark = pytest.mark.critical_safety
+
 
 @pytest.fixture()
 def client():

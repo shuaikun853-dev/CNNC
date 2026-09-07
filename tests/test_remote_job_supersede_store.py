@@ -9,6 +9,8 @@ import pytest
 
 from app.services.daily_audit_store import DailyAuditStore, RemoteIntentConflict
 
+pytestmark = pytest.mark.critical_safety
+
 
 @pytest.fixture
 def store(tmp_path):

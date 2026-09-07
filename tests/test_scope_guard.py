@@ -1,6 +1,8 @@
 import pytest
 from app.agent.router import check_scope
 
+pytestmark = pytest.mark.critical_safety
+
 
 class TestScopeGuardWhitelist:
     def test_874649_explicit_tenant_rejected(self):

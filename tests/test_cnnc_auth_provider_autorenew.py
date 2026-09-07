@@ -46,6 +46,8 @@ import scripts.cnnc_auth_core as cnnc_auth_core
 from app.services.cnnc_saas_snapshot_adapter import CnncSaasSnapshotAdapter
 from scripts.cnnc_auth_core import CnncAuthError, CnncAuthProvider, CnncAuthStatus
 
+pytestmark = pytest.mark.critical_safety
+
 OLD_AT = "AT-1-old"
 NEW_AT = "AT-2-new"
 CUSTOMER_QUERY_URL = (

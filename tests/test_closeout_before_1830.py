@@ -14,6 +14,8 @@ from typing import Any
 
 from openpyxl import Workbook
 
+import pytest
+
 import app.services.incremental_audit_runtime as runtime_module
 from app.services.daily_audit_store import DailyAuditStore, ProcessLock
 from app.services.incremental_audit_runtime import (
@@ -40,6 +42,8 @@ from app.workflows.incremental_price_audit_finalize import (
     FinalizeReadiness,
     materialize_frozen_daily_run,
 )
+
+pytestmark = pytest.mark.critical_safety
 
 
 BUSINESS_DATE = "2026-08-11"

@@ -11,6 +11,8 @@ from app.services.cnnc_saas_snapshot_adapter import (
     snapshot_to_json_payloads,
 )
 
+pytestmark = pytest.mark.critical_safety
+
 
 class _Headers:
     def get_content_charset(self):

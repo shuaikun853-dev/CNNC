@@ -5,6 +5,8 @@ from __future__ import annotations
 import sqlite3
 from datetime import UTC, datetime, timedelta
 
+import pytest
+
 from app.services.daily_audit_store import DailyAuditStore
 from app.services.incremental_audit_runtime import run_runtime_command
 from app.services.incremental_audit_status import collect_runtime_status
@@ -19,6 +21,8 @@ from app.workflows.incremental_price_audit import (
     DiscoveredState,
     TickDependencies,
 )
+
+pytestmark = pytest.mark.critical_safety
 
 
 BUSINESS_DATE = "2026-08-19"
