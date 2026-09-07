@@ -1,10 +1,14 @@
 # CNNC 关键安全测试 CI（只读、只测）。
 # 说明：
-# 1. 测试清单 = CI_SAFE 纯逻辑安全测试（审计 2026-09-04）。
-# 2. --deselect 排除的 tests/test_remote_running_recovery.py::test_default_dependencies_wire_probe_and_write_gated_restart
-#    依赖生产机上 gitignored data/ 目录下的 curl 文件（环境差异，非代码 bug）。
-# 3. 本 workflow 只读只测：无 Secret、无部署、无生产写。
-# 4. 触发契约：开发分支(feat/fix/hotfix/refactor)重要文件 push 自动测试；
+# 1. membership 唯一权威 = 测试文件内的 pytestmark = pytest.mark.critical_safety
+#    （marker 在 pytest.ini 注册，--strict-markers 全局生效）；GitHub 与本地
+#    使用同一 selector：python -m pytest tests -m critical_safety。
+# 2. 守卫 = tests/test_critical_suite_governance.py：闭合世界审计（未分类新文件、
+#    marker/排除重叠、陈旧排除条目）、关键能力哨兵、收集数单调性基线。
+# 3. 原 --deselect（default-dependencies wiring 测试读生产机 gitignored data/
+#    curl）已因测试 hermetic 化（stub CnncSaasSnapshotAdapter/load_curl_command）移除。
+# 4. 本 workflow 只读只测：无 Secret、无部署、无生产写。
+# 5. 触发契约：开发分支(feat/fix/hotfix/refactor)重要文件 push 自动测试；
 #    任何 → prod 的 PR 必定产生 Check；workflow_dispatch 已移除
 #    （默认分支 main 无本文件，入口不可用）。
 name: CNNC Critical Safety Tests
@@ -54,9 +58,10 @@ jobs:
           python -m pip install -r requirements.txt --constraint .github/constraints-ci.txt
           # tzdata：ZoneInfo("Asia/Shanghai") 在 Windows 必需（requirements.txt 未声明，见 constraints 注释）
           python -m pip install --constraint .github/constraints-ci.txt pytest-timeout tzdata
-      # 部分安全测试与生产机绝对路径耦合：适配器对招商局外部工具做 is_file()
-      # 存在性预检（测试自身已 monkeypatch _load_module 注入假工具，桩文件永不执行）；
-      # 自启 preview 语义测试真实执行 E:\Python314\python.exe 探针。
+      # production-shape prep 保留原因：-m critical_safety 选择器在收集期仍会导入
+      # 全部 tests/ 文件——适配器对招商局外部工具做 is_file() 存在性预检
+      # （测试自身已 monkeypatch _load_module 注入假工具，桩文件永不执行）；
+      # test_dashboard_api 真跑 E:\Python314\python.exe junction 探针。
       # 本步骤只在 Runner 临时盘构造这两条路径（subst + junction），不触任何外部系统。
       - name: Prepare production-shape paths (CI only)
         shell: pwsh
@@ -73,64 +78,16 @@ jobs:
           & "E:\Python314\python.exe" --version
           if ($LASTEXITCODE -ne 0) { throw "junction python not executable" }
           Write-Host "PREPARE_OK"
-      # 清单来源：2026-09-04 审计确认的 CI_SAFE 纯逻辑安全测试（50 个文件）；
-      # 本地干净 worktree 实测 1376 收集 / 1375 通过 / 1 失败（唯一失败即下方
-      # --deselect 的那个，因生产机 gitignored data/ 的 curl 文件在 CI 不存在）。
+      # Membership 唯一权威 = 测试文件内 pytestmark（pytest.ini 注册 + 全局
+      # --strict-markers）；本地与 CI 同 selector，本文件不再维护测试清单。
+      # 治理守卫 = tests/test_critical_suite_governance.py（闭合世界/能力哨兵/
+      # 单调性基线）。2026-09-07 迁移实测：1512 收集 / 0 deselect（旧 50 文件
+      # 清单为 1387 收集/1 deselect；wiring 测试 hermetic 化后回归 + 新增 8 个
+      # gate 文件）。
       - name: Run critical safety tests
         env:
           PYTHONIOENCODING: utf-8
           PYTHONUTF8: "1"  # JS harness 输出 UTF-8，避免 cp1252 Runner 上 subprocess 文本解码崩溃
         run: >
-          python -m pytest
-          tests/test_customer_price_semantics.py
-          tests/test_customer_price_projection.py
-          tests/test_detail_business_retry.py
-          tests/test_incremental_price_audit_finalize.py
-          tests/test_incremental_price_audit_force_finalize.py
-          tests/test_closeout_before_1830.py
-          tests/test_closeout_transient_recovery.py
-          tests/test_finalize_superseded.py
-          tests/test_incremental_audit_materializer.py
-          tests/test_daily_audit_store.py
-          tests/test_incremental_audit_resilience.py
-          tests/test_incremental_price_audit.py
-          tests/test_incremental_audit_status.py
-          tests/test_harvest_only.py
-          tests/test_partial_exact_harvest.py
-          tests/test_snapshot_consistency_drift.py
-          tests/test_incremental_production_readiness_audit.py
-          tests/test_crawl_model_decoupling.py
-          tests/test_incremental_audit_recovery.py
-          tests/test_recovery_fanout_gate.py
-          tests/test_recovery_facade_contract.py
-          tests/test_remote_running_recovery.py
-          tests/test_remote_stall_breaker.py
-          tests/test_remote_stall_classification.py
-          tests/test_remote_wait_export_recovery.py
-          tests/test_wait_export_transient_recovery.py
-          tests/test_remote_priority_zero_rows_recovery.py
-          tests/test_priority_retryable_recovery.py
-          tests/test_remote_export_no_price_resolution.py
-          tests/test_rebuild_crash_recovery.py
-          tests/test_model_transient_recovery.py
-          tests/test_title_match_model_retry.py
-          tests/test_manual_reexport.py
-          tests/test_manual_rebuild.py
-          tests/test_remote_job_supersede_store.py
-          tests/test_live_proof_fallback.py
-          tests/test_dashboard_projection.py
-          tests/test_dashboard_api.py
-          tests/test_safety_guard.py
-          tests/test_template_contract.py
-          tests/test_sql_selector.py
-          tests/test_scope_guard.py
-          tests/test_workflow_scope_guard.py
-          tests/test_title_match_hard_rules.py
-          tests/test_auth_manager.py
-          tests/test_cnnc_auth_provider_autorenew.py
-          tests/test_cnnc_auth_recover.py
-          tests/test_legacy_zhaoshang_adapter.py
-          tests/test_legacy_adapter_progress_stop.py
-          tests/test_cnnc_saas_snapshot_adapter.py
-          --deselect "tests/test_remote_running_recovery.py::test_default_dependencies_wire_probe_and_write_gated_restart"
+          python -m pytest tests -m critical_safety
           -q -l --timeout=600 --timeout-method=thread
