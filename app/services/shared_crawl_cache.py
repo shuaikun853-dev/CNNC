@@ -120,7 +120,14 @@ CREATE TABLE IF NOT EXISTS document_references (
 
 
 class SharedCrawlCache:
-    """Standalone SQLite store for cross-day crawl evidence and URL identity."""
+    """Standalone SQLite store for cross-day crawl evidence and URL identity.
+
+    ``read_only=True`` (or :meth:`open_read_only`) opens an EXISTING cache for
+    diagnostics / plan-only reports: no directory creation, no schema
+    initialization, no WAL pragma — a missing cache file raises
+    :class:`FileNotFoundError` instead of being silently created, and every
+    write API raises :class:`RuntimeError`.
+    """
 
     def __init__(
         self,
@@ -128,15 +135,29 @@ class SharedCrawlCache:
         *,
         url_parsers: Mapping[str, Callable[[str], str | None]] | None = None,
         placeholder_prefixes: Sequence[str] = PLACEHOLDER_PREFIXES_DEFAULT,
+        read_only: bool = False,
     ) -> None:
         self.path = Path(path)
-        if self.path != Path(":memory:"):
-            self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._read_only = bool(read_only)
+        if self._read_only:
+            if self.path != Path(":memory:") and not self.path.is_file():
+                raise FileNotFoundError(
+                    f"shared crawl cache not found (read-only): {self.path}"
+                )
+        else:
+            if self.path != Path(":memory:"):
+                self.path.parent.mkdir(parents=True, exist_ok=True)
         self._url_parsers: dict[str, Callable[[str], str | None]] = (
             dict(url_parsers) if url_parsers is not None else dict(MALL_IDENTITY_PARSERS)
         )
         self._placeholder_prefixes = tuple(placeholder_prefixes)
-        self._initialize()
+        if not self._read_only:
+            self._initialize()
+
+    @classmethod
+    def open_read_only(cls, path: str | Path) -> "SharedCrawlCache":
+        """Open an existing cache read-only; never create or migrate anything."""
+        return cls(path, read_only=True)
 
     # Connections are intentionally never cached (same rationale as
     # DailyAuditStore): ticks may be interrupted or cross threads.
@@ -150,6 +171,21 @@ class SharedCrawlCache:
         except sqlite3.DatabaseError:
             pass
         return connection
+
+    def _connect_ro(self) -> sqlite3.Connection:
+        # Mirrors customer_prewarm_discovery._open_state_db_readonly: the
+        # mode=ro URI never creates files; no journal_mode pragma on ro
+        # connections (busy_timeout alone is safe).
+        connection = sqlite3.connect(
+            self.path.resolve().as_uri() + "?mode=ro", uri=True
+        )
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA busy_timeout = 5000")
+        return connection
+
+    def _assert_writable(self) -> None:
+        if self._read_only:
+            raise RuntimeError("shared crawl cache opened read-only")
 
     @contextmanager
     def _transaction(self, immediate: bool = False) -> Iterator[sqlite3.Connection]:
@@ -166,7 +202,7 @@ class SharedCrawlCache:
 
     @contextmanager
     def _reader(self) -> Iterator[sqlite3.Connection]:
-        connection = self._connect()
+        connection = self._connect_ro() if self._read_only else self._connect()
         try:
             yield connection
         finally:
@@ -462,6 +498,7 @@ class SharedCrawlCache:
         document_id: str | None = None,
     ) -> dict[str, Any]:
         """Record one successful crawl as a new append-only evidence row."""
+        self._assert_writable()
         mall_value = self._require_text(mall, "mall")
         submitted_value = self._require_text(submitted_url, "submitted_url")
         source_value = self._require_text(source, "source")
@@ -675,6 +712,7 @@ class SharedCrawlCache:
         source: str = "",
     ) -> dict[str, Any] | None:
         """Attach one document provenance row; unresolved URLs are not stored."""
+        self._assert_writable()
         document_value = self._require_text(document_id, "document_id")
         mall_value = mall.strip() if isinstance(mall, str) else ""
         url_value = url.strip() if isinstance(url, str) else ""

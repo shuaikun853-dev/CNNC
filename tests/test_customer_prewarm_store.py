@@ -748,3 +748,86 @@ def test_issue10_legacy_candidates_schema_migrates_and_preserves_rows(tmp_path):
         rows[0]["id"], cache_status=CACHE_STATUS_REMOTE_DISPATCHED, remote_job_id=42
     )
     assert dispatched["remote_job_id"] == 42
+
+
+# ---- read_only 模式(Issue #10 Review Round 2 Finding 1)-----------------------------
+
+
+def test_read_only_store_reads_existing_file_without_writes(tmp_path):
+    path = tmp_path / "prewarm.sqlite3"
+    writer = CustomerPrewarmStore(path)
+    upsert = writer.upsert_link(
+        "D1", "https://x.example/1", mall="comix", lookup_url="https://qx.com/1"
+    )
+    candidate_id = int(upsert["candidate"]["id"])
+    writer.record_candidate_result(candidate_id, cache_status="PENDING_PREWARM")
+
+    read_only = CustomerPrewarmStore.open_read_only(path)
+    assert read_only.path == path
+    misses = read_only.list_unique_cache_misses()
+    assert [int(row["id"]) for row in misses] == [candidate_id]
+    assert read_only.candidates("PENDING_PREWARM")[0]["original_url"] == "https://x.example/1"
+    assert read_only.links_for_document("D1")[0]["candidate_id"] == candidate_id
+    assert read_only.links_for_candidate(candidate_id)[0]["document_id"] == "D1"
+    assert read_only.stats()["candidates"] == {"PENDING_PREWARM": 1}
+
+
+def test_read_only_store_missing_file_raises_without_creating_anything(tmp_path):
+    target = tmp_path / "not-yet" / "prewarm.sqlite3"
+    with pytest.raises(FileNotFoundError):
+        CustomerPrewarmStore.open_read_only(target)
+    # 缺文件只诊断,绝不就地创建库或目录。
+    assert not target.exists()
+    assert not target.parent.exists()
+
+
+def test_read_only_store_write_apis_all_raise_runtime_error(tmp_path):
+    path = tmp_path / "prewarm.sqlite3"
+    writer = CustomerPrewarmStore(path)
+    writer.upsert_document("2026-09-07", "DOC-1", four_category_id="CAT")
+    candidate_id = int(writer.upsert_link("D1", "https://x.example/1")["candidate"]["id"])
+    read_only = CustomerPrewarmStore.open_read_only(path)
+
+    with pytest.raises(RuntimeError):
+        read_only.upsert_document("2026-09-07", "DOC-2")
+    with pytest.raises(RuntimeError):
+        read_only.record_document_detail_success("DOC-1")
+    with pytest.raises(RuntimeError):
+        read_only.record_document_detail_failure("DOC-1", "boom")
+    with pytest.raises(RuntimeError):
+        read_only.upsert_link("D2", "https://x.example/2")
+    with pytest.raises(RuntimeError):
+        read_only.record_candidate_result(candidate_id, cache_status="PENDING_PREWARM")
+    with pytest.raises(RuntimeError):
+        read_only.ledger_claim("zhaoshang-history", "k1")
+    with pytest.raises(RuntimeError):
+        read_only.ledger_complete("zhaoshang-history", "k1")
+    with pytest.raises(RuntimeError):
+        read_only.ledger_drop_claim("zhaoshang-history", "k1")
+    with pytest.raises(RuntimeError):
+        read_only.record_recovery_run("2026-09-07", 3)
+    # 写守卫全部拒绝后,数据未被改动,读路径仍可用。
+    assert read_only.stats()["documents"] == {"PENDING": 1}
+    assert read_only.candidates()[0]["cache_status"] == "PENDING_LOOKUP"
+
+
+def test_same_status_record_keeps_prior_evidence_but_lands_new_error_note(tmp_path):
+    path = tmp_path / "prewarm.sqlite3"
+    store = CustomerPrewarmStore(path)
+    upsert = store.upsert_link("D1", "https://x.example/1")
+    candidate_id = int(upsert["candidate"]["id"])
+    store.record_candidate_result(candidate_id, cache_status="PENDING_PREWARM")
+
+    # 同状态 + error:诊断落地(不覆盖 remote_job_id 语义)。
+    noted = store.record_candidate_result(
+        candidate_id, cache_status="PENDING_PREWARM", error="cache miss"
+    )
+    assert noted["last_error"] == "cache miss"
+    # 同状态 + 无 error:既有证据绝不擦除。
+    again = store.record_candidate_result(candidate_id, cache_status="PENDING_PREWARM")
+    assert again["last_error"] == "cache miss"
+    # 状态迁移仍然清空(迁移路径语义不变)。
+    hit = store.record_candidate_result(
+        candidate_id, cache_status="CACHE_HIT", match_level="EXACT", resolved_identity_id=7
+    )
+    assert hit["last_error"] is None

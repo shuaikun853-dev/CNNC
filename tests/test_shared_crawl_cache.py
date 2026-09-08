@@ -916,3 +916,62 @@ def test_get_result_reads_history_and_current(cache):
         got = cache.get_result(int(row["id"]))
         assert got is not None
         assert got["sku_status"] == row["sku_status"]
+
+
+# ---- read_only mode (Issue #10 Review Round 2, Finding 1) ----------------------
+
+
+def test_read_only_cache_reads_existing_file(cache_path):
+    writer = SharedCrawlCache(cache_path)
+    recorded = writer.record_success(mall="comix", submitted_url=JD_URL, source="t", price="1.0")
+    writer.attach_document_reference("DOC-1", mall="comix", url=JD_URL, source="t")
+
+    read_only = SharedCrawlCache.open_read_only(cache_path)
+    assert read_only.path == cache_path
+    hit = read_only.lookup_current("comix", JD_URL)
+    assert hit is not None and hit["match_level"] == "EXACT"
+    assert read_only.history("comix", JD_URL)[0]["id"] == recorded["id"]
+    assert read_only.get_result(recorded["id"])["price"] == "1.0"
+    assert [row["document_id"] for row in read_only.document_references("DOC-1")] == ["DOC-1"]
+    assert read_only.table_names() >= {
+        "crawl_identities",
+        "crawl_urls",
+        "crawl_results",
+        "document_references",
+    }
+
+
+def test_read_only_cache_find_id_by_source_event_key_works(cache_path):
+    writer = SharedCrawlCache(cache_path)
+    writer.record_success(
+        mall="comix",
+        submitted_url=JD_URL,
+        source="zhaoshang-history",
+        price="1.0",
+        payload={"source_event_key": "evt-1"},
+    )
+    read_only = SharedCrawlCache.open_read_only(cache_path)
+    assert read_only.find_id_by_source_event_key("zhaoshang-history", "evt-1") is not None
+
+
+def test_read_only_cache_missing_file_raises_without_creating_anything(tmp_path):
+    target = tmp_path / "not-yet" / "cache.sqlite3"
+    with pytest.raises(FileNotFoundError):
+        SharedCrawlCache.open_read_only(target)
+    # A missing cache file is a diagnosis, never a fresh empty store.
+    assert not target.exists()
+    assert not target.parent.exists()
+
+
+def test_read_only_cache_write_apis_raise_runtime_error(cache_path):
+    SharedCrawlCache(cache_path).record_success(
+        mall="comix", submitted_url=JD_URL, source="t", price="1.0"
+    )
+    read_only = SharedCrawlCache.open_read_only(cache_path)
+
+    with pytest.raises(RuntimeError):
+        read_only.record_success(mall="comix", submitted_url=JD_URL, source="t", price="2.0")
+    with pytest.raises(RuntimeError):
+        read_only.attach_document_reference("DOC-1", mall="comix", url=JD_URL, source="t")
+    # Read paths keep working after every rejected write.
+    assert read_only.lookup_current("comix", JD_URL) is not None

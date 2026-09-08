@@ -30,6 +30,18 @@ introduces a second remote-task store:
 - boost: reused jobs with a confirmed remote identity in a non-terminal state
   get one idempotent :meth:`adapter.prioritize` call (evidence replay is
   durable); ``UNCONFIRMED`` fails closed and is retried next pass.
+- priority proof: a weight_type of ``-1`` is PROVEN, never assumed.  A fresh
+  create is reconciled to ``PRIORITY_PENDING`` first (submit-time
+  ``priority_evidence`` is ignored for state) and then confirmed in the same
+  pass via :meth:`adapter.prioritize`; only an outcome whose status is
+  ``UPDATED``/``ALREADY_HIGHEST`` AND whose ``weight_type == -1`` reconciles
+  the job to ``SUBMITTED`` (counter ``priority_confirmed``).  Anything else —
+  ``UNCONFIRMED``, an exception, or a readback whose weight_type is not -1 —
+  leaves the job ``PRIORITY_PENDING`` and retries next pass (candidates
+  ``REMOTE_DISPATCHED``/``REMOTE_REUSED`` stay, never re-created).
+  ``priority_boosted`` keeps counting the idempotent evidence-replay boosts of
+  reused jobs.  ``PRIORITY_PENDING`` jobs with a remote identity re-enter the
+  confirm list from BOTH remote candidate statuses every pass.
 - plan-only: the whole report is built from read-only probes and returns
   BEFORE any lock, store write, or adapter construction — provably zero-write.
 
@@ -122,13 +134,13 @@ _REPLANNABLE_CRAWL_STATES = frozenset({"PENDING", "RETRYABLE_FAILED"})
 _BOOSTABLE_JOB_STATES = frozenset(
     {"PRIORITY_PENDING", "SUBMITTED", "RUNNING", "EXPORTED"}
 )
-_PRIORITY_EVIDENCE_STATES = {"updated", "already_highest_priority"}
 
 _CACHE_SYNC_PENDING_NOTE = "cache sync pending: terminal crawl success awaits Phase A cache sync"
 _TERMINAL_FAILURE_NOTE = "terminal crawl failure"
 _SUBMIT_UNKNOWN_NOTE = "submit unknown; reconcile pending"
 _SUBMIT_NOT_ATTEMPTED_NOTE = "submit not attempted (pre-send); retry next pass"
 _PRIORITY_UNCONFIRMED_PREFIX = "PRIORITY_UNCONFIRMED"
+_PRIORITY_PENDING_NOTE = "priority pending confirmation"
 
 
 def _status_value(value: Any) -> str:
@@ -250,6 +262,12 @@ def _empty_summary(business_date: str, plan_only: bool) -> dict[str, Any]:
         "jobs_reused": 0,
         "submit_unknown": 0,
         "submit_not_attempted": 0,
+        # priority_confirmed: distinct jobs PROVEN weight_type == -1 this pass
+        # (same-pass confirms of fresh creates + PRIORITY_PENDING confirms of
+        # REMOTE_* candidates; state reconciled to SUBMITTED).
+        # priority_boosted: idempotent evidence-replay boosts of reused jobs
+        # (status-level confirmation only; the legacy job state is untouched).
+        "priority_confirmed": 0,
         "priority_boosted": 0,
         "priority_unconfirmed": 0,
         "phase_errors": [],
@@ -260,6 +278,34 @@ def _empty_summary(business_date: str, plan_only: bool) -> dict[str, Any]:
 
 def _status_of(store: CustomerPrewarmStore, status: str) -> list[dict[str, Any]]:
     return store.candidates(status)
+
+
+def _priority_proven(priority: Any) -> bool:
+    """True only when the outcome status is accepted AND weight_type == -1.
+
+    A status without the DB-side ``weight_type = -1`` proof is NOT a confirmed
+    boost (fail-closed; the job stays ``PRIORITY_PENDING``).
+    """
+    status = _status_value(getattr(priority, "status", None))
+    return status in (
+        PriorityStatus.UPDATED.value,
+        PriorityStatus.ALREADY_HIGHEST.value,
+    ) and getattr(priority, "weight_type", None) == -1
+
+
+def _read_remote_job_readonly(state_db_path: str | Path, job_id: int) -> dict[str, Any] | None:
+    """mode=ro probe of one remote_jobs row (plan-only priority planning)."""
+    connection = _open_state_db_readonly(state_db_path)
+    if connection is None:
+        return None
+    try:
+        row = connection.execute(
+            "SELECT id, state, remote_identity FROM remote_jobs WHERE id=?",
+            (int(job_id),),
+        ).fetchone()
+    finally:
+        connection.close()
+    return dict(row) if row is not None else None
 
 
 def _candidate_mall(candidate: Mapping[str, Any], mappings: Sequence[ZhaoshangMallMapping]) -> str:
@@ -321,6 +367,9 @@ def _plan_only_report(
     create_groups: dict[str, list[str]] = {}
     reused_planned = 0
     boostable_reused_planned = 0
+    # Job ids already covered by a planned reuse-boost; the PRIORITY_PENDING
+    # bucket below must not count the same job twice.
+    seen_priority_job_ids: set[int] = set()
     for candidate in misses:
         candidate_id = int(candidate["id"])
         routing = classify_reference_url(str(candidate["lookup_url"] or ""), mappings)
@@ -345,6 +394,9 @@ def _plan_only_report(
                 reused_planned += 1
                 bucket["reused"] += 1
                 job = unfinished.get("job") or {}
+                job_id = int(job.get("id") or 0)
+                if job_id:
+                    seen_priority_job_ids.add(job_id)
                 identity = str(job.get("remote_identity") or "").strip()
                 if identity and str(job.get("state") or "") in _BOOSTABLE_JOB_STATES:
                     boostable_reused_planned += 1
@@ -365,11 +417,35 @@ def _plan_only_report(
         else:
             summary["routing_blocked"] += 1
 
+    # Third bucket: REMOTE_* candidates whose bound job is still exactly
+    # PRIORITY_PENDING with a remote identity — each needs a prioritize-only
+    # confirm pass before its -1 is proven.
+    pending_priority_planned = 0
+    for status in (CACHE_STATUS_REMOTE_DISPATCHED, CACHE_STATUS_REMOTE_REUSED):
+        for candidate in prewarm_store.candidates(status):
+            job_id = candidate.get("remote_job_id")
+            if job_id is None or int(job_id) in seen_priority_job_ids:
+                continue
+            job = _read_remote_job_readonly(state_db_path, int(job_id))
+            if job is None:
+                continue
+            if (
+                str(job.get("state") or "") == "PRIORITY_PENDING"
+                and str(job.get("remote_identity") or "").strip()
+            ):
+                seen_priority_job_ids.add(int(job_id))
+                pending_priority_planned += 1
+
     planned_jobs = min(len(create_groups), max_jobs_per_pass)
     summary["existing_remote_reused_planned"] = reused_planned
     summary["new_remote_urls_planned"] = sum(len(urls) for urls in create_groups.values())
     summary["new_remote_jobs_planned"] = planned_jobs
-    summary["priority_updates_planned"] = boostable_reused_planned + planned_jobs
+    # Every planned priority update needs one prioritize call until -1 is
+    # proven: boostable reused jobs, ALL planned new jobs (creates are never
+    # assumed -1), and already-dispatched jobs still PRIORITY_PENDING.
+    summary["priority_updates_planned"] = (
+        boostable_reused_planned + planned_jobs + pending_priority_planned
+    )
     summary["by_mall"] = by_mall
     summary["batch_sizes"] = [
         len(create_groups[mall]) for mall in list(create_groups)[:max_jobs_per_pass]
@@ -428,6 +504,7 @@ def run_prewarm_dispatch_pass(
     *,
     business_date: str,
     runtime_root: str | Path,
+    state_runtime_root: str | Path | None = None,
     mappings: Sequence[ZhaoshangMallMapping],
     adapter: Any | None = None,
     budget_seconds: float = DEFAULT_BUDGET_SECONDS,
@@ -444,10 +521,18 @@ def run_prewarm_dispatch_pass(
     plan-only and pure-read passes never construct it.  ``now`` is accepted for
     call-site symmetry with the discovery scan; this pass derives all evidence
     from durable state and uses no wall clock.
+
+    ``state_runtime_root`` optionally separates the STEP1 data source (per-day
+    ``<date>/state.sqlite3``, per-day lock and zhaoshang job dirs) from
+    ``runtime_root`` (prewarm-store / shared-cache base and the dispatcher's
+    own instance lock); ``None`` keeps both on ``runtime_root``.
     """
     monotonic_value = monotonic or time.monotonic
     deadline = monotonic_value() + max(0.0, float(budget_seconds))
-    paths = runtime_paths(business_date, runtime_root)
+    paths = runtime_paths(
+        business_date,
+        state_runtime_root if state_runtime_root is not None else runtime_root,
+    )
 
     if plan_only:
         return _plan_only_report(
@@ -549,10 +634,14 @@ def _run_leased_pass(
     max_jobs_per_pass: int,
     summary: dict[str, Any],
 ) -> None:
-    """Absorb → route → reuse/create → boost.  Caller owns lease and locks."""
+    """Absorb → route → reuse/create → priority proof → boost.  Caller owns lease and locks."""
     phase_errors = summary["phase_errors"]
     counters = summary
-    reuse_items: list[dict[str, int]] = []
+    reuse_items: list[dict[str, Any]] = []
+    # confirm_items: REMOTE_* candidates bound to a job that may still be
+    # PRIORITY_PENDING — they re-enter the prioritize-only confirm pass (Phase
+    # 4a) every pass until weight_type == -1 is proven.
+    confirm_items: list[dict[str, Any]] = []
     # jobs_reused must count only NEW reuses wired this pass (phase 3); the
     # absorb phase also feeds reuse_items with boost-retry entries.
     reused_job_ids_this_pass: set[int] = set()
@@ -583,13 +672,15 @@ def _run_leased_pass(
                 ):
                     counters["absorbed"] += 1
                 continue
-            if (
-                status == CACHE_STATUS_REMOTE_REUSED
-                and candidate.get("remote_job_id") is not None
-            ):
-                reuse_items.append(
-                    {"candidate_id": candidate_id, "job_id": int(candidate["remote_job_id"])}
-                )
+            if candidate.get("remote_job_id") is not None:
+                item = {
+                    "candidate_id": candidate_id,
+                    "job_id": int(candidate["remote_job_id"]),
+                    "cache_status": status,
+                }
+                if status == CACHE_STATUS_REMOTE_REUSED:
+                    reuse_items.append(item)
+                confirm_items.append(item)
 
     # ---- Phase 2: route PENDING_PREWARM misses into mall groups ----
     groups: dict[str, list[dict[str, Any]]] = {}
@@ -674,12 +765,43 @@ def _run_leased_pass(
             phase_errors.append(f"mall {mall_key}: {type(exc).__name__}: {exc}")
             continue
 
-    # ---- Phase 4: reuse-boost for confirmed non-terminal remote jobs ----
+    # ---- Phase 4: priority proof (PRIORITY_PENDING jobs) + reuse-boost ----
     counters["jobs_reused"] = len(reused_job_ids_this_pass)
+    # 4a: prove weight_type == -1 for jobs still exactly PRIORITY_PENDING with
+    # a remote identity (prioritize-only; never create/submit).
+    confirm_targets: dict[int, list[tuple[int, str]]] = {}
+    for item in confirm_items:
+        confirm_targets.setdefault(int(item["job_id"]), []).append(
+            (int(item["candidate_id"]), str(item["cache_status"]))
+        )
+    confirm_attempted_job_ids: set[int] = set()
+    for job_id, targets in confirm_targets.items():
+        if monotonic_value() >= deadline:
+            phase_errors.append(
+                f"budget deadline reached; priority confirm of job {job_id} deferred"
+            )
+            break
+        if _confirm_pending_priority_job(
+            prewarm_store=prewarm_store,
+            store=store,
+            token=token,
+            get_adapter=get_adapter,
+            business_date=summary["business_date"],
+            note_targets=targets,
+            job_id=job_id,
+            deadline=deadline,
+            monotonic_value=monotonic_value,
+            summary=summary,
+        ) is not None:
+            confirm_attempted_job_ids.add(job_id)
+    # 4b: reuse-boost — idempotent evidence replay for SUBMITTED/RUNNING/
+    # EXPORTED reused jobs.  Jobs the confirm pass owned this pass (attempted,
+    # confirmed, or budget-deferred) are skipped so one pass never calls
+    # prioritize twice on the same job.
     seen_job_ids: set[int] = set()
     for item in reuse_items:
         job_id = int(item["job_id"])
-        if job_id in seen_job_ids:
+        if job_id in seen_job_ids or job_id in confirm_attempted_job_ids:
             continue
         if monotonic_value() >= deadline:
             phase_errors.append(f"budget deadline reached; boost of job {job_id} deferred")
@@ -938,15 +1060,14 @@ def _dispatch_mall_group(
             counters["submit_unknown"] += 1
         else:
             remote_identity = f"{mall_key}|{task_id}|{task_number}"
-            state = (
-                "SUBMITTED"
-                if getattr(outcome, "priority_evidence", None) in _PRIORITY_EVIDENCE_STATES
-                else "PRIORITY_PENDING"
-            )
+            # weight_type=-1 is PROVEN, never assumed: submit-time
+            # priority_evidence is ignored for state and the job holds at
+            # PRIORITY_PENDING until the same-pass prioritize confirm proves it
+            # (or the next pass retries via the Phase 4 confirm list).
             store.reconcile_remote_job(
-                token, int(job_row["id"]), remote_identity=remote_identity, state=state
+                token, int(job_row["id"]), remote_identity=remote_identity, state="PRIORITY_PENDING"
             )
-            store.advance_crawl_work_for_job(token, int(job_row["id"]), state)
+            store.advance_crawl_work_for_job(token, int(job_row["id"]), "PRIORITY_PENDING")
             for entry in batch_entries:
                 _record(
                     prewarm_store,
@@ -955,6 +1076,22 @@ def _dispatch_mall_group(
                     remote_job_id=int(job_row["id"]),
                     phase_errors=phase_errors,
                 )
+            _confirm_pending_priority_job(
+                prewarm_store=prewarm_store,
+                store=store,
+                token=token,
+                get_adapter=get_adapter,
+                business_date=summary["business_date"],
+                note_targets=[
+                    (int(entry["candidate"]["id"]), CACHE_STATUS_REMOTE_DISPATCHED)
+                    for entry in batch_entries
+                ],
+                job_id=int(job_row["id"]),
+                deadline=deadline,
+                monotonic_value=monotonic_value,
+                summary=summary,
+                prepared=job,
+            )
     else:  # defensive: unknown submit status is treated fail-closed
         store.mark_submit_unknown(
             token, int(job_row["id"]), f"prewarm dispatch submit unknown status: {status}"
@@ -970,6 +1107,114 @@ def _dispatch_mall_group(
             )
         counters["submit_unknown"] += 1
     return 1
+
+
+def _confirm_pending_priority_job(
+    *,
+    prewarm_store: CustomerPrewarmStore,
+    store: DailyAuditStore,
+    token: LeaseToken,
+    get_adapter: Callable[[], Any],
+    business_date: str,
+    note_targets: Sequence[tuple[int, str]],
+    job_id: int,
+    deadline: float,
+    monotonic_value: Callable[[], float],
+    summary: dict[str, Any],
+    prepared: Any | None = None,
+) -> bool | None:
+    """One prioritize-only confirm for a job still exactly ``PRIORITY_PENDING``
+    with a remote identity (fail-closed; never creates or submits).
+
+    Returns ``True`` when ``weight_type == -1`` was PROVEN (status
+    ``UPDATED``/``ALREADY_HIGHEST`` AND weight_type -1): the job reconciles to
+    ``SUBMITTED``.  Returns ``False`` when the confirm attempt ran (or was
+    budget-deferred) without proof: the job stays ``PRIORITY_PENDING`` and the
+    next pass retries.  Returns ``None`` when the job is not a confirm
+    candidate (missing / identity-less / already moved on) so the reuse-boost
+    path may own it.  ``prepared`` may carry the in-memory job of a fresh
+    create; otherwise it is reconstructed from durable payload evidence.
+    """
+    phase_errors = summary["phase_errors"]
+    try:
+        job_row = store.get_remote_job(job_id)
+        if job_row is None:
+            return None
+        identity = str(job_row.get("remote_identity") or "").strip()
+        if not identity or str(job_row.get("state") or "") != "PRIORITY_PENDING":
+            return None  # already proven or lifecycle-owned: no second attempt
+        if prepared is None:
+            prepared = _reconstruct_prepared_job(get_adapter(), business_date, job_row)
+        parts = identity.split("|")
+        if (
+            len(parts) != 3
+            or parts[0] != prepared.mall_key
+            or not parts[1]
+            or not parts[2]
+        ):
+            raise ValueError("legacy remote task identity is invalid")
+        remaining = deadline - monotonic_value()
+        if remaining < SUBMIT_MIN_SECONDS:
+            phase_errors.append(
+                f"priority confirm of job {job_id} deferred: budget floor reached; "
+                "job stays PRIORITY_PENDING"
+            )
+            return False
+        store.renew_lease(token, LEASE_TTL_SECONDS)
+        priority = get_adapter().prioritize(
+            prepared,
+            task_id=parts[1],
+            task_number=parts[2],
+            timeout_seconds=max(0.001, deadline - monotonic_value()),
+        )
+        if _priority_proven(priority):
+            store.reconcile_remote_job(token, job_id, remote_identity=identity, state="SUBMITTED")
+            store.advance_crawl_work_for_job(token, job_id, "SUBMITTED")
+            summary["priority_confirmed"] += 1
+            return True
+        summary["priority_unconfirmed"] += 1
+        diagnostic = str(
+            getattr(priority, "diagnostic", "") or "highest priority was not confirmed"
+        )
+        phase_errors.append(f"priority confirm job {job_id}: not proven ({diagnostic})")
+        _record_priority_pending_note(
+            prewarm_store, note_targets, job_id, diagnostic, phase_errors
+        )
+        return False
+    except Exception as exc:  # noqa: BLE001 - confirm failure never fails the pass
+        summary["priority_unconfirmed"] += 1
+        phase_errors.append(f"priority confirm job {job_id}: {type(exc).__name__}: {exc}")
+        _record_priority_pending_note(
+            prewarm_store,
+            note_targets,
+            job_id,
+            f"{type(exc).__name__}: {exc}",
+            phase_errors,
+        )
+        return False
+
+
+def _record_priority_pending_note(
+    prewarm_store: CustomerPrewarmStore,
+    note_targets: Sequence[tuple[int, str]],
+    job_id: int,
+    diagnostic: str,
+    phase_errors: list[str],
+) -> None:
+    """Keep each bound candidate at its REMOTE_* status with the pending note.
+
+    Same-status records never erase prior evidence (the store only refreshes
+    ``last_error`` when a non-NULL note is supplied).
+    """
+    for candidate_id, cache_status in note_targets:
+        _record(
+            prewarm_store,
+            candidate_id,
+            cache_status=cache_status,
+            remote_job_id=job_id,
+            error=f"{_PRIORITY_PENDING_NOTE}: {diagnostic}",
+            phase_errors=phase_errors,
+        )
 
 
 def _boost_reused_job(

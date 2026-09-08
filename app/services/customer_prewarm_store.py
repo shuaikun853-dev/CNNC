@@ -163,14 +163,36 @@ def _detail_retry_backoff_seconds(consecutive_failures: int) -> int:
     return min(60 * 2 ** (consecutive_failures - 1), _DETAIL_RETRY_BACKOFF_CAP_SECONDS)
 
 
-class CustomerPrewarmStore:
-    """Standalone SQLite store for customer prewarm discovery state."""
+_READ_ONLY_GUARD_MESSAGE = "customer prewarm store opened read-only"
 
-    def __init__(self, path: str | Path) -> None:
+
+class CustomerPrewarmStore:
+    """Standalone SQLite store for customer prewarm discovery state.
+
+    ``read_only=True`` (or :meth:`open_read_only`) opens an EXISTING store for
+    diagnostics / plan-only reports: no directory creation, no schema
+    initialization, no WAL pragma — a missing store file raises
+    :class:`FileNotFoundError` instead of being silently created, and every
+    write API raises :class:`RuntimeError`.
+    """
+
+    def __init__(self, path: str | Path, *, read_only: bool = False) -> None:
         self.path = Path(path)
+        self._read_only = bool(read_only)
+        if self._read_only:
+            if self.path != Path(":memory:") and not self.path.is_file():
+                raise FileNotFoundError(
+                    f"prewarm store not found (read-only): {self.path}"
+                )
+            return
         if self.path != Path(":memory:"):
             self.path.parent.mkdir(parents=True, exist_ok=True)
         self._initialize()
+
+    @classmethod
+    def open_read_only(cls, path: str | Path) -> "CustomerPrewarmStore":
+        """Open an existing store read-only; never create or migrate anything."""
+        return cls(path, read_only=True)
 
     # Connections are intentionally never cached (same rationale as
     # SharedCrawlCache): ticks may be interrupted or cross threads.
@@ -184,6 +206,21 @@ class CustomerPrewarmStore:
         except sqlite3.DatabaseError:
             pass
         return connection
+
+    def _connect_ro(self) -> sqlite3.Connection:
+        # Mirrors customer_prewarm_discovery._open_state_db_readonly: the
+        # mode=ro URI never creates files; no journal_mode pragma on ro
+        # connections (busy_timeout alone is safe).
+        connection = sqlite3.connect(
+            self.path.resolve().as_uri() + "?mode=ro", uri=True
+        )
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA busy_timeout = 5000")
+        return connection
+
+    def _assert_writable(self) -> None:
+        if self._read_only:
+            raise RuntimeError(_READ_ONLY_GUARD_MESSAGE)
 
     @contextmanager
     def _transaction(self, immediate: bool = False) -> Iterator[sqlite3.Connection]:
@@ -200,7 +237,7 @@ class CustomerPrewarmStore:
 
     @contextmanager
     def _reader(self) -> Iterator[sqlite3.Connection]:
-        connection = self._connect()
+        connection = self._connect_ro() if self._read_only else self._connect()
         try:
             yield connection
         finally:
@@ -273,6 +310,7 @@ class CustomerPrewarmStore:
         source: str = "event",
     ) -> dict[str, Any]:
         """Idempotent document upsert; category change resets the detail state."""
+        self._assert_writable()
         business_date_value = self._require_text(business_date, "business_date")
         document_value = self._require_text(document_id, "document_id")
         category_value = self._optional_text(four_category_id) or ""
@@ -345,6 +383,7 @@ class CustomerPrewarmStore:
 
     def record_document_detail_success(self, document_id: str) -> None:
         """Mark the detail as DONE regardless of the attempt counter."""
+        self._assert_writable()
         document_value = self._require_text(document_id, "document_id")
         with self._transaction(immediate=True) as connection:
             connection.execute(
@@ -367,6 +406,7 @@ class CustomerPrewarmStore:
         ``next_retry_at = now + min(60 * 2**(consecutive_failures - 1), 3600)``
         seconds.  ``now`` is injectable for tests.
         """
+        self._assert_writable()
         document_value = self._require_text(document_id, "document_id")
         retry_base = (now if now is not None else datetime.now(UTC)).astimezone(UTC)
         now_text = self._utcnow()
@@ -411,6 +451,7 @@ class CustomerPrewarmStore:
         ``lookup_url`` defaults to ``original_url``; ``routing_url=None`` means
         no rewrite is known.
         """
+        self._assert_writable()
         document_value = self._require_text(document_id, "document_id")
         original_value = self._require_text(original_url, "original_url")
         mall_value = self._optional_text(mall) or ""
@@ -516,8 +557,12 @@ class CustomerPrewarmStore:
         ``remote_job_id`` is only accepted for the remote statuses
         (``REMOTE_DISPATCHED`` / ``REMOTE_REUSED``) and keeps the remote-task
         provenance on the candidate row; when omitted the stored value is left
-        untouched so later re-calls never erase prior evidence.
+        untouched so later re-calls never erase prior evidence.  The same holds
+        for ``error`` on the same-status idempotent path: a non-NULL error
+        refreshes ``last_error`` (diagnostic notes such as "priority pending
+        confirmation" stay visible), a NULL error never erases prior evidence.
         """
+        self._assert_writable()
         if cache_status not in _ALLOWED_CACHE_STATUS:
             raise ValueError(
                 f"cache_status must be one of {sorted(_ALLOWED_CACHE_STATUS)}, got {cache_status!r}"
@@ -539,17 +584,20 @@ class CustomerPrewarmStore:
                 raise ValueError(f"candidate {candidate_id} does not exist")
             current = row["cache_status"]
             if current == cache_status:
-                # 同状态幂等:仅刷新 last_checked_at(以及新提供的 remote_job_id),
-                # 其余字段不动。
+                # 同状态幂等:仅刷新 last_checked_at(以及新提供的 remote_job_id /
+                # 非空 error 诊断),其余字段不动。
                 if remote_job_value is not None:
                     connection.execute(
-                        "UPDATE prewarm_candidates SET remote_job_id=?, last_checked_at=? WHERE id=?",
-                        (remote_job_value, now, int(candidate_id)),
+                        """UPDATE prewarm_candidates
+                           SET remote_job_id=?, last_error=COALESCE(?, last_error),
+                               last_checked_at=? WHERE id=?""",
+                        (remote_job_value, error_value, now, int(candidate_id)),
                     )
                 else:
                     connection.execute(
-                        "UPDATE prewarm_candidates SET last_checked_at=? WHERE id=?",
-                        (now, int(candidate_id)),
+                        """UPDATE prewarm_candidates
+                           SET last_error=COALESCE(?, last_error), last_checked_at=? WHERE id=?""",
+                        (error_value, now, int(candidate_id)),
                     )
             elif current == CACHE_STATUS_CACHE_HIT:
                 raise ValueError(
@@ -652,6 +700,7 @@ class CustomerPrewarmStore:
 
     def ledger_claim(self, source: str, source_event_key: str) -> dict[str, Any]:
         """Insert-if-absent idempotent claim (cache_result_id stays NULL)."""
+        self._assert_writable()
         source_value = self._require_text(source, "source")
         key_value = self._require_text(source_event_key, "source_event_key")
         with self._transaction(immediate=True) as connection:
@@ -681,6 +730,7 @@ class CustomerPrewarmStore:
         error: str | None = None,
     ) -> dict[str, Any]:
         """Finalize an existing claim; raise KeyError when it was never claimed."""
+        self._assert_writable()
         source_value = self._require_text(source, "source")
         key_value = self._require_text(source_event_key, "source_event_key")
         error_value = self._optional_text(error)
@@ -729,6 +779,7 @@ class CustomerPrewarmStore:
 
     def ledger_drop_claim(self, source: str, source_event_key: str) -> None:
         """Drop an un-finalized claim so crash recovery may re-record it."""
+        self._assert_writable()
         source_value = self._require_text(source, "source")
         key_value = self._require_text(source_event_key, "source_event_key")
         with self._transaction(immediate=True) as connection:
@@ -753,6 +804,7 @@ class CustomerPrewarmStore:
 
     def record_recovery_run(self, business_date: str, documents_seen: int) -> None:
         """Append one scanner recovery run row (throttle bookkeeping, Issue #9)."""
+        self._assert_writable()
         business_date_value = self._require_text(business_date, "business_date")
         with self._transaction(immediate=True) as connection:
             connection.execute(

@@ -1,7 +1,7 @@
 """CLI for the Issue #10 customer prewarm dispatch.
 
 Default mode runs ONE bounded dispatch pass (route → reuse/create → submit →
-priority boost → cache absorb) that reuses the existing STEP1 zhaoshang
+priority proof → cache absorb) that reuses the existing STEP1 zhaoshang
 lifecycle; it never invents a second remote-task store.  Overlap is prevented
 twice over: the dispatcher's own instance lock prints
 ``SKIPPED_ALREADY_RUNNING``, and STEP1's per-day process lock / durable lease
@@ -10,13 +10,32 @@ next scheduled pass).
 
 ``--plan-only`` builds the §26 read-only report: zero writes anywhere (no
 candidate status changes, no lock files, no adapter construction, state DB
-accessed ``mode=ro`` only).
+accessed ``mode=ro`` only).  The prewarm store and shared cache are opened
+through their read-only modes, so a missing store file is reported as
+``PREWARM_STORE_MISSING`` / ``SHARED_CACHE_MISSING`` (exit 0, diagnosis JSON)
+instead of being silently created.
 
-``--backfill-zhaoshang-history N`` runs ONLY the zhaoshang-history backfill:
-past N calendar days (ending at ``--business-date`` inclusive) per-day state
-DBs are mirrored into the shared cache with
-``backfill_daily_history(source="zhaoshang-history")``; the dispatch pass does
-not run.  Idempotent: re-runs report the rows as ``already_synced``.
+The three data sources are independently overridable and default to today's
+layout: ``--state-runtime-root`` locates the STEP1 ``<date>/state.sqlite3``
+plus per-day lock / zhaoshang job dirs (defaults to ``--runtime-root``),
+``--prewarm-store-path`` and ``--shared-cache-path`` locate the two shared
+stores (default ``<runtime-root>/customer_prewarm.sqlite3`` and
+``<runtime-root>/shared_crawl_cache.sqlite3``).
+
+``--backfill-zhaoshang-history N`` runs ONLY the evidence-based zhaoshang
+history backfill: past N calendar days (ending at ``--business-date``
+inclusive) per-day state DBs are scanned for durably EXPORTED/COMPLETED remote
+jobs whose export workbook passes the full ``harvest_existing`` provenance
+gate AND whose validated ``(sku, url)`` identity is bound to a SUCCESS crawl
+row of the same job with ``page_price_status == OK``; only those rows are
+mirrored into the shared cache as ``zhaoshang-history`` evidence
+(:func:`app.services.zhaoshang_history_backfill.backfill_zhaoshang_history`);
+the dispatch pass does not run.  Unbound SUCCESS crawl rows are never
+recorded (no cross-proof).  Idempotent: re-runs report the same producer
+events as ``already_ingested_cross_source`` (deduped across ingest sources).
+A job whose evidence cannot be revalidated is isolated into ``jobs_partial``
+and reported as ``HISTORICAL_BACKFILL_PARTIAL`` (exit 0 — a documented
+outcome; exit 2 is reserved for unexpected failures).
 """
 
 from __future__ import annotations
@@ -37,18 +56,20 @@ from app.services.customer_prewarm_dispatch import (
     DEFAULT_MAX_JOBS_PER_PASS,
     run_prewarm_dispatch_pass,
 )
-from app.services.customer_prewarm_discovery import backfill_daily_history
 from app.services.customer_prewarm_store import CustomerPrewarmStore
 from app.services.incremental_audit_runtime import (
     DEFAULT_RUNTIME_ROOT,
     business_date_in_shanghai,
 )
 from app.services.shared_crawl_cache import SharedCrawlCache
+from app.services.zhaoshang_history_backfill import (
+    BACKFILL_SOURCE,
+    backfill_zhaoshang_history,
+)
 from scripts.zhaoshang_mall_mapping import load_zhaoshang_mall_mappings
 
 PREWARM_STORE_NAME = "customer_prewarm.sqlite3"
 SHARED_CACHE_NAME = "shared_crawl_cache.sqlite3"
-BACKFILL_SOURCE = "zhaoshang-history"
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -68,6 +89,28 @@ def build_parser() -> argparse.ArgumentParser:
         f"cache); default: {DEFAULT_RUNTIME_ROOT}",
     )
     parser.add_argument(
+        "--state-runtime-root",
+        type=Path,
+        default=None,
+        help="optional override for the STEP1 per-day data source "
+        "(<date>/state.sqlite3, per-day lock, zhaoshang job dirs); "
+        "defaults to --runtime-root",
+    )
+    parser.add_argument(
+        "--prewarm-store-path",
+        type=Path,
+        default=None,
+        help=f"optional override for the prewarm store; default: "
+        f"<runtime-root>/{PREWARM_STORE_NAME}",
+    )
+    parser.add_argument(
+        "--shared-cache-path",
+        type=Path,
+        default=None,
+        help=f"optional override for the shared crawl cache; default: "
+        f"<runtime-root>/{SHARED_CACHE_NAME}",
+    )
+    parser.add_argument(
         "--mapping-path",
         type=Path,
         default=None,
@@ -84,10 +127,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         metavar="N",
-        help="backfill-only mode: mirror historical zhaoshang successes from "
-        "the past N per-day state DBs (calendar days ending at "
-        "--business-date inclusive, 1..90) into the shared cache as "
-        "zhaoshang-history rows; the dispatch pass does not run",
+        help="backfill-only mode: re-validate the past N per-day state DBs' "
+        "EXPORTED/COMPLETED remote jobs through the harvest_existing "
+        "provenance gate (calendar days ending at --business-date inclusive, "
+        "1..90) and record only rows cross-proven by a bound SUCCESS crawl "
+        "row into the shared cache as zhaoshang-history evidence; the "
+        "dispatch pass does not run",
     )
     parser.add_argument(
         "--budget-seconds",
@@ -129,15 +174,30 @@ def _write_json_output(path: Path, summary: dict) -> None:
 
 
 def _run_backfill(args: argparse.Namespace, business_date: str, runtime_root: Path) -> int:
-    """--backfill-zhaoshang-history mode: only mirror past state DBs."""
+    """--backfill-zhaoshang-history mode: evidence-based mirror of past exports.
+
+    Read-write stores (the backfill writes the sync ledger + cache rows); the
+    same ``--prewarm-store-path``/``--shared-cache-path`` overrides as the
+    dispatch mode apply.  ``partial`` (some jobs failed evidence validation)
+    is a documented outcome: prominent marker, exit 0.
+    """
     dates = _backfill_dates(business_date, args.backfill_zhaoshang_history)
+    prewarm_store_path = (
+        Path(args.prewarm_store_path).resolve()
+        if args.prewarm_store_path is not None
+        else runtime_root / PREWARM_STORE_NAME
+    )
+    shared_cache_path = (
+        Path(args.shared_cache_path).resolve()
+        if args.shared_cache_path is not None
+        else runtime_root / SHARED_CACHE_NAME
+    )
     try:
-        summary = backfill_daily_history(
-            CustomerPrewarmStore(runtime_root / PREWARM_STORE_NAME),
-            SharedCrawlCache(runtime_root / SHARED_CACHE_NAME),
+        summary = backfill_zhaoshang_history(
+            CustomerPrewarmStore(prewarm_store_path),
+            SharedCrawlCache(shared_cache_path),
             runtime_root=runtime_root,
             business_dates=dates,
-            source=BACKFILL_SOURCE,
         )
     except Exception as exc:  # noqa: BLE001 - scheduler-facing failure
         print(
@@ -164,25 +224,95 @@ def _run_backfill(args: argparse.Namespace, business_date: str, runtime_root: Pa
     print(
         f"dates_scanned={summary['dates_scanned']} "
         f"dates_missing={len(summary['dates_missing'])} "
-        f"ok_synced={summary['ok_synced']} "
-        f"already_synced={summary['already_synced']} "
+        f"jobs_examined={summary['jobs_examined']} "
+        f"jobs_validated={summary['jobs_validated']} "
+        f"rows_examined={summary['rows_examined']} "
+        f"rows_recorded={summary['rows_recorded']} "
+        f"already_ingested_cross_source={summary['already_ingested_cross_source']} "
+        f"skipped_no_workbook_match={summary['skipped_no_workbook_match']} "
+        f"skipped_price_not_ok={summary['skipped_price_not_ok']} "
         f"transient_failures={summary['transient_failures']} "
         f"deterministic_failures={summary['deterministic_failures']} "
         f"errors={len(summary['errors'])}"
     )
+    if summary["partial"]:
+        print(
+            f"HISTORICAL_BACKFILL_PARTIAL jobs_partial={len(summary['jobs_partial'])} "
+            f"(documented outcome: re-run after fixing the listed jobs)"
+        )
+        for item in summary["jobs_partial"]:
+            print(
+                f"  partial job {item['job_id']} ({item['task_name'] or 'unnamed'}): "
+                f"{item['reason']}"
+            )
     if args.json_output is not None:
         _write_json_output(args.json_output, summary)
     return 0
 
 
+def _print_missing_store_diagnosis(
+    business_date: str,
+    outcome: str,
+    missing_path: Path,
+    args: argparse.Namespace,
+) -> int:
+    """Plan-only diagnosis for a missing store: exit 0, NO file is created."""
+    diagnosis = {
+        "business_date": business_date,
+        "plan_only": True,
+        "outcome": outcome,
+        "missing_path": str(missing_path),
+    }
+    print(json.dumps(diagnosis, ensure_ascii=False, sort_keys=True))
+    if args.json_output is not None:
+        _write_json_output(args.json_output, diagnosis)
+    return 0
+
+
 def _run_dispatch(args: argparse.Namespace, business_date: str, runtime_root: Path) -> int:
     mappings = load_zhaoshang_mall_mappings(args.mapping_path)
+    state_runtime_root = (
+        Path(args.state_runtime_root).resolve()
+        if args.state_runtime_root is not None
+        else None
+    )
+    prewarm_store_path = (
+        Path(args.prewarm_store_path).resolve()
+        if args.prewarm_store_path is not None
+        else runtime_root / PREWARM_STORE_NAME
+    )
+    shared_cache_path = (
+        Path(args.shared_cache_path).resolve()
+        if args.shared_cache_path is not None
+        else runtime_root / SHARED_CACHE_NAME
+    )
+    if args.plan_only:
+        # Provably zero construction: read-only store handles never mkdir,
+        # never initialize a schema, never touch a missing file — a missing
+        # store is a diagnosis (prewarm store reported first), never a fresh
+        # empty store.
+        try:
+            prewarm_store = CustomerPrewarmStore.open_read_only(prewarm_store_path)
+        except FileNotFoundError:
+            return _print_missing_store_diagnosis(
+                business_date, "PREWARM_STORE_MISSING", prewarm_store_path, args
+            )
+        try:
+            shared_cache = SharedCrawlCache.open_read_only(shared_cache_path)
+        except FileNotFoundError:
+            return _print_missing_store_diagnosis(
+                business_date, "SHARED_CACHE_MISSING", shared_cache_path, args
+            )
+    else:
+        prewarm_store = CustomerPrewarmStore(prewarm_store_path)
+        shared_cache = SharedCrawlCache(shared_cache_path)
     try:
         summary = run_prewarm_dispatch_pass(
-            CustomerPrewarmStore(runtime_root / PREWARM_STORE_NAME),
-            SharedCrawlCache(runtime_root / SHARED_CACHE_NAME),
+            prewarm_store,
+            shared_cache,
             business_date=business_date,
             runtime_root=runtime_root,
+            state_runtime_root=state_runtime_root,
             mappings=mappings,
             budget_seconds=args.budget_seconds,
             max_jobs_per_pass=args.max_jobs_per_pass,
@@ -218,6 +348,7 @@ def _run_dispatch(args: argparse.Namespace, business_date: str, runtime_root: Pa
         f"jobs_created={summary.get('jobs_created', 0)} "
         f"submit_unknown={summary.get('submit_unknown', 0)} "
         f"submit_not_attempted={summary.get('submit_not_attempted', 0)} "
+        f"priority_confirmed={summary.get('priority_confirmed', 0)} "
         f"priority_boosted={summary.get('priority_boosted', 0)} "
         f"priority_unconfirmed={summary.get('priority_unconfirmed', 0)} "
         f"phase_errors={len(summary.get('phase_errors', []))}"

@@ -459,7 +459,11 @@ def test_case6_new_task_created_submitted_once(tmp_path):
     assert summary["new_remote_urls"] == 1
     assert summary["batch_sizes"] == [1]
     assert summary["by_mall"] == {"comix": {"reused": 0, "created_urls": 1}}
+    # Finding 3:SUBMITTED 成功后先 PRIORITY_PENDING,同一 pass 内 prioritize
+    # 证明 weight_type == -1 才 reconcile 回 SUBMITTED。
+    assert summary["priority_confirmed"] == 1
     assert adapter.submit_calls == 1
+    assert adapter.prioritize_calls == 1
 
     candidate = candidate_by_id(prewarm, candidate_id)
     assert candidate["cache_status"] == CACHE_STATUS_REMOTE_DISPATCHED
@@ -929,3 +933,175 @@ def test_budget_floor_before_claim_keeps_intent_and_resumes_next_pass(tmp_path):
     assert candidate["cache_status"] == CACHE_STATUS_REMOTE_DISPATCHED
     assert int(candidate["remote_job_id"]) == int(jobs[0]["id"])
     assert len(_crawl_rows(paths.state_path)) == 1  # 幂等意图:crawl 行不重复
+
+
+# ---- Finding 3(Round 2):新任务的 weight_type=-1 必须被证明 --------------------------
+
+SUBMITTED_NO_PRIORITY = LegacySubmitOutcome(
+    SubmitStatus.SUBMITTED, task_id="remote-np", task_number="number-np"
+)
+
+
+def test_new_job_priority_confirmed_in_same_pass(tmp_path):
+    """submit 无优先级证据 → 状态先落 PRIORITY_PENDING;同一 pass 内 prioritize
+    证明 weight_type == -1 后才 reconcile 为 SUBMITTED(语义而非仅事件)。"""
+    runtime_root = tmp_path / "runtime"
+    paths = make_state_db(runtime_root, BUSINESS_DATE)
+    prewarm = CustomerPrewarmStore(runtime_root / "customer_prewarm.sqlite3")
+    cache = SharedCrawlCache(runtime_root / "shared_crawl_cache.sqlite3")
+    candidate_id = make_candidate(prewarm, "https://qx.com/product-pf.html")
+    adapter = _CountingAdapter(submit_outcome=SUBMITTED_NO_PRIORITY)
+
+    summary = run_pass(runtime_root, prewarm, cache, adapter=adapter)
+
+    assert summary["outcome"] == "OK"
+    assert summary["jobs_created"] == 1
+    assert summary["priority_confirmed"] == 1
+    assert summary["priority_unconfirmed"] == 0
+    assert adapter.submit_calls == 1 and adapter.prioritize_calls == 1
+    job = _state_rows(paths.state_path, "SELECT state, remote_identity FROM remote_jobs")[0]
+    assert job["state"] == "SUBMITTED"  # 被证明后才允许 SUBMITTED
+    assert job["remote_identity"] == "comix|remote-np|number-np"
+    crawl = _crawl_rows(paths.state_path)[0]
+    assert crawl["state"] == "SUBMITTED"
+    candidate = candidate_by_id(prewarm, candidate_id)
+    assert candidate["cache_status"] == CACHE_STATUS_REMOTE_DISPATCHED
+    assert candidate["remote_job_id"] is not None
+
+
+def test_new_job_priority_transient_failure_retries_without_recreate(tmp_path):
+    runtime_root = tmp_path / "runtime"
+    paths = make_state_db(runtime_root, BUSINESS_DATE)
+    prewarm = CustomerPrewarmStore(runtime_root / "customer_prewarm.sqlite3")
+    cache = SharedCrawlCache(runtime_root / "shared_crawl_cache.sqlite3")
+    candidate_id = make_candidate(prewarm, "https://qx.com/product-pt.html")
+    adapter = _CountingAdapter(
+        submit_outcome=SUBMITTED_NO_PRIORITY,
+        priority_outcomes=[
+            LegacyPriorityOutcome(
+                PriorityStatus.UNCONFIRMED, diagnostic="tool died", retryable=True
+            )
+        ],
+    )
+
+    first = run_pass(runtime_root, prewarm, cache, adapter=adapter)
+    assert first["priority_unconfirmed"] == 1
+    assert first["priority_confirmed"] == 0
+    assert adapter.submit_calls == 1 and adapter.prioritize_calls == 1
+    job = _state_rows(paths.state_path, "SELECT state FROM remote_jobs")[0]
+    assert job["state"] == "PRIORITY_PENDING"  # 闭合失败:绝不伪造成 SUBMITTED
+    candidate = candidate_by_id(prewarm, candidate_id)
+    assert candidate["cache_status"] == CACHE_STATUS_REMOTE_DISPATCHED
+    assert "priority pending confirmation" in (candidate["last_error"] or "")
+
+    # 第二轮:绝不重建/重提交,仅重试 prioritize;证明后 reconcile SUBMITTED。
+    second = run_pass(runtime_root, prewarm, cache, adapter=adapter)
+    assert second["outcome"] == "OK"
+    assert second["jobs_created"] == 0
+    assert second["priority_confirmed"] == 1
+    assert adapter.submit_calls == 1  # 跨两轮仅一次 POST
+    # prepare 第 1 次 = 创建链,第 2 次 = 第 2 轮从持久 payload 重建(非新建,
+    # 与 Case 7 的重建语义相同);crawl 行不重复才是"绝不重建"的硬证据。
+    assert adapter.prepare_calls == 2
+    assert adapter.prioritize_calls == 2
+    job = _state_rows(paths.state_path, "SELECT state FROM remote_jobs")[0]
+    assert job["state"] == "SUBMITTED"
+    assert len(_crawl_rows(paths.state_path)) == 1
+
+
+def test_new_job_priority_already_highest_confirmed_idempotent(tmp_path):
+    runtime_root = tmp_path / "runtime"
+    paths = make_state_db(runtime_root, BUSINESS_DATE)
+    prewarm = CustomerPrewarmStore(runtime_root / "customer_prewarm.sqlite3")
+    cache = SharedCrawlCache(runtime_root / "shared_crawl_cache.sqlite3")
+    make_candidate(prewarm, "https://qx.com/product-pah.html")
+    adapter = _CountingAdapter(
+        submit_outcome=SUBMITTED_NO_PRIORITY,
+        priority_outcomes=[LegacyPriorityOutcome(PriorityStatus.ALREADY_HIGHEST, weight_type=-1)],
+    )
+
+    first = run_pass(runtime_root, prewarm, cache, adapter=adapter)
+    assert first["priority_confirmed"] == 1
+    assert first["phase_errors"] == []
+    job = _state_rows(paths.state_path, "SELECT state FROM remote_jobs")[0]
+    assert job["state"] == "SUBMITTED"
+
+    # 第二轮:任务已 SUBMITTED 且 -1 已证明 → 确认幂等,不重复 prioritize。
+    second = run_pass(runtime_root, prewarm, cache, adapter=adapter)
+    assert second["priority_confirmed"] == 0
+    assert second["phase_errors"] == []
+    assert adapter.prioritize_calls == 1 and adapter.submit_calls == 1
+    job = _state_rows(paths.state_path, "SELECT state FROM remote_jobs")[0]
+    assert job["state"] == "SUBMITTED"
+
+
+def test_new_job_priority_readback_not_negative_never_confirmed(tmp_path):
+    runtime_root = tmp_path / "runtime"
+    paths = make_state_db(runtime_root, BUSINESS_DATE)
+    prewarm = CustomerPrewarmStore(runtime_root / "customer_prewarm.sqlite3")
+    cache = SharedCrawlCache(runtime_root / "shared_crawl_cache.sqlite3")
+    candidate_id = make_candidate(prewarm, "https://qx.com/product-pr.html")
+    adapter = _CountingAdapter(
+        submit_outcome=SUBMITTED_NO_PRIORITY,
+        priority_outcomes=[
+            LegacyPriorityOutcome(
+                PriorityStatus.UPDATED, weight_type=0, diagnostic="readback weight_type=0"
+            )
+        ],
+    )
+
+    first = run_pass(runtime_root, prewarm, cache, adapter=adapter)
+    # status=UPDATED 但 weight_type != -1:不算证明,任务必须留在 PRIORITY_PENDING。
+    assert first["priority_confirmed"] == 0
+    assert first["priority_unconfirmed"] == 1
+    job = _state_rows(paths.state_path, "SELECT state FROM remote_jobs")[0]
+    assert job["state"] == "PRIORITY_PENDING"
+    candidate = candidate_by_id(prewarm, candidate_id)
+    assert candidate["cache_status"] == CACHE_STATUS_REMOTE_DISPATCHED
+    assert "priority pending confirmation" in (candidate["last_error"] or "")
+
+    # 下一轮行为不变:同一确认路径重试,证明后 SUBMITTED,绝不重建。
+    second = run_pass(runtime_root, prewarm, cache, adapter=adapter)
+    assert second["priority_confirmed"] == 1
+    assert adapter.submit_calls == 1
+    job = _state_rows(paths.state_path, "SELECT state FROM remote_jobs")[0]
+    assert job["state"] == "SUBMITTED"
+
+
+def test_remote_dispatched_priority_pending_job_confirmed_without_resubmit(tmp_path):
+    """REMOTE_DISPATCHED + PRIORITY_PENDING(带身份)每轮重进 prioritize-only
+    确认列表:绝不重建、绝不重复提交(prepare 仅为持久 payload 重建)。"""
+    runtime_root = tmp_path / "runtime"
+    paths = make_state_db(runtime_root, BUSINESS_DATE)
+    prewarm = CustomerPrewarmStore(runtime_root / "customer_prewarm.sqlite3")
+    cache = SharedCrawlCache(runtime_root / "shared_crawl_cache.sqlite3")
+    url = "https://qx.com/product-rd.html"
+    _seed_paths, job_id = seed_remote_work(
+        runtime_root,
+        BUSINESS_DATE,
+        _CountingAdapter(),
+        mapping=COMIX,
+        url=url,
+        job_state="PRIORITY_PENDING",
+        remote_identity="comix|remote-rd|number-rd",
+    )
+    candidate_id = make_candidate(prewarm, url)
+    prewarm.record_candidate_result(
+        candidate_id, cache_status=CACHE_STATUS_REMOTE_DISPATCHED, remote_job_id=job_id
+    )
+    adapter = _CountingAdapter()
+
+    summary = run_pass(runtime_root, prewarm, cache, adapter=adapter)
+
+    assert summary["outcome"] == "OK"
+    assert adapter.submit_calls == 0
+    assert adapter.prepare_calls == 1  # 仅 payload 重建,不是新任务
+    assert adapter.prioritize_calls == 1
+    assert summary["priority_confirmed"] == 1
+    job = _state_rows(
+        paths.state_path, "SELECT state, remote_identity FROM remote_jobs WHERE id=?", (job_id,)
+    )[0]
+    assert job["state"] == "SUBMITTED"
+    assert job["remote_identity"] == "comix|remote-rd|number-rd"
+    crawl = _crawl_rows(paths.state_path)[0]
+    assert crawl["state"] == "SUBMITTED"
