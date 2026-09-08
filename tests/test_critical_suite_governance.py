@@ -139,6 +139,71 @@ def test_capability_sentinels_are_marked():
     assert not missing, f"关键能力缺少 gated regression 文件: {missing}"
 
 
+def test_workflow_bootstraps_governance_guard_before_critical_suite():
+    workflow_path = REPO_ROOT / ".github" / "workflows" / "critical-safety-tests.yml"
+    text = workflow_path.read_text(encoding="utf-8")
+    # 每个步骤块以步骤名开头,直到下一个 "- name:" 行。
+    blocks = re.split(r"(?m)^\s*- name: ", text)
+    steps = [(block.splitlines()[0], block) for block in blocks[1:]]
+
+    bootstrap_blocks = [
+        block for name, block in steps if name.startswith("Run governance bootstrap")
+    ]
+    assert bootstrap_blocks, (
+        "契约:workflow 必须先经 'Run governance bootstrap' 步骤直接执行本守卫文件"
+        "——本守卫寄生在 membership 机制内部(自身带 marker),被整删时"
+        "审计者与被审计者一起消失、收集数基线仍过,必须有外部引用兜底"
+    )
+    assert "python -m pytest tests/test_critical_suite_governance.py" in bootstrap_blocks[0], (
+        "契约:bootstrap 步骤必须直接文件选择执行守卫"
+        "(python -m pytest tests/test_critical_suite_governance.py)"
+    )
+    assert "-m critical_safety" not in bootstrap_blocks[0], (
+        "契约:bootstrap 不得经 -m critical_safety 过滤——守卫文件被整删时"
+        "marker 选择器收集到空集,bootstrap 会被掏空失去 self-guard 作用"
+    )
+
+    suite_blocks = [
+        block for name, block in steps if name.startswith("Run critical safety tests")
+    ]
+    assert suite_blocks, "契约:workflow 必须保留 'Run critical safety tests' 主测试步骤"
+    assert "python -m pytest tests -m critical_safety" in suite_blocks[0], (
+        "契约:主测试步骤必须保持单一 marker selector"
+        "(python -m pytest tests -m critical_safety),membership 权威不得漂移回 workflow"
+    )
+
+    names = [name for name, _block in steps]
+    bootstrap_index = next(
+        i for i, name in enumerate(names) if name.startswith("Run governance bootstrap")
+    )
+    suite_index = next(
+        i for i, name in enumerate(names) if name.startswith("Run critical safety tests")
+    )
+    assert bootstrap_index < suite_index, (
+        "契约:治理 bootstrap 必须先于 critical suite 执行"
+        "(守卫自身红了就不必再跑二十多分钟的主套件)"
+    )
+
+
+def test_priority_boost_module_does_not_skip_integration_mirror():
+    boost_source = (TESTS_DIR / "test_zhaoshang_priority_boost.py").read_text(
+        encoding="utf-8"
+    )
+    assert "allow_module_level" not in boost_source, (
+        "契约:priority boost 禁止模块级 skip——外部工具缺失只允许跳过 production 参数,"
+        "repo 内 integration 镜像(纯 stdlib、hermetic)必须在 CI 真跑"
+    )
+    assert re.search(
+        r"params\s*=\s*\[\s*INTEGRATION_HELPER,\s*EXTERNAL_HELPER,\s*\]", boost_source
+    ), "契约:fixture 必须保持 integration/production 双参数形态"
+    assert re.search(
+        r"path\s*==\s*EXTERNAL_HELPER\s+and\s+not\s+path\.is_file\(\)", boost_source
+    ), "契约:production 参数必须且只能在参数级 skip(仅当外部文件缺失时)"
+    assert "test_zhaoshang_priority_boost.py" in _marked_files(), (
+        "契约:priority boost 文件必须带 critical_safety membership 行(pytestmark)"
+    )
+
+
 def test_marker_selector_collects_at_least_floor():
     argv = [
         sys.executable, "-m", "pytest", "tests",
