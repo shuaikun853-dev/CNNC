@@ -74,9 +74,9 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "junction python not executable" }
           Write-Host "PREPARE_OK"
       # 清单来源：2026-09-04 审计确认的 CI_SAFE 纯逻辑安全测试（50 个文件）+
-      # 2026-09-07 Issue #10 新增 5 个文件（55 个）；本地干净 worktree 实测 1376
-      # 收集 / 1375 通过 / 1 失败（唯一失败即下方 --deselect 的那个，因生产机
-      # gitignored data/ 的 curl 文件在 CI 不存在）。
+      # 2026-09-07 Issue #10 新增 5 个文件、Review Round 2 +1（56 个）；本地干净
+      # worktree 实测 1376 收集 / 1375 通过 / 1 失败（唯一失败即下方 --deselect 的
+      # 那个，因生产机 gitignored data/ 的 curl 文件在 CI 不存在）。
       - name: Run critical safety tests
         env:
           PYTHONIOENCODING: utf-8
@@ -137,6 +137,7 @@ jobs:
           tests/test_legacy_adapter_progress_stop.py
           tests/test_zhaoshang_mall_mapping_aliases.py
           tests/test_zhaoshang_reference_reuse_dedupe.py
+          tests/test_zhaoshang_history_backfill.py
           tests/test_cnnc_saas_snapshot_adapter.py
           --deselect "tests/test_remote_running_recovery.py::test_default_dependencies_wire_probe_and_write_gated_restart"
           -q -l --timeout=600 --timeout-method=thread
