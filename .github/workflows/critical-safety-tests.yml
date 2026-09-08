@@ -4,7 +4,9 @@
 #    （marker 在 pytest.ini 注册，--strict-markers 全局生效）；GitHub 与本地
 #    使用同一 selector：python -m pytest tests -m critical_safety。
 # 2. 守卫 = tests/test_critical_suite_governance.py：闭合世界审计（未分类新文件、
-#    marker/排除重叠、陈旧排除条目）、关键能力哨兵、收集数单调性基线。
+#    marker/排除重叠、陈旧排除条目）、关键能力哨兵、收集数单调性基线；守卫自身
+#    的存在性/可执行性由 "Run governance bootstrap" 步骤直接执行该文件保证
+#    （self-guard：守卫被整删时该步骤必红，不依赖 marker 选择器）。
 # 3. 原 --deselect（default-dependencies wiring 测试读生产机 gitignored data/
 #    curl）已因测试 hermetic 化（stub CnncSaasSnapshotAdapter/load_curl_command）移除。
 # 4. 本 workflow 只读只测：无 Secret、无部署、无生产写。
@@ -83,6 +85,18 @@ jobs:
           & "E:\Python314\python.exe" --version
           if ($LASTEXITCODE -ne 0) { throw "junction python not executable" }
           Write-Host "PREPARE_OK"
+      # Self-guard = membership 机制外部的最小存在性/可执行性保证：守卫自身带
+      # critical_safety marker、与被审计对象共用同一 selector，被整删时审计一起
+      # 消失且收集数基线仍过。本步骤直接文件选择执行守卫（不用 -m 过滤，防守卫
+      # 被删后 selector 收集空集静默通过）；只引用 guard 本身，不是第二份
+      # membership 清单。
+      - name: Run governance bootstrap
+        env:
+          PYTHONIOENCODING: utf-8
+          PYTHONUTF8: "1"
+        run: >
+          python -m pytest tests/test_critical_suite_governance.py
+          -q --timeout=600 --timeout-method=thread
       # Membership 唯一权威 = 测试文件内 pytestmark（pytest.ini 注册 + 全局
       # --strict-markers）；本地与 CI 同 selector，本文件不再维护测试清单。
       # 治理守卫 = tests/test_critical_suite_governance.py（闭合世界/能力哨兵/
@@ -95,4 +109,4 @@ jobs:
           PYTHONUTF8: "1"  # JS harness 输出 UTF-8，避免 cp1252 Runner 上 subprocess 文本解码崩溃
         run: >
           python -m pytest tests -m critical_safety
-          -q -l --durations=25 --timeout=600 --timeout-method=thread
+          -q -l --durations=25 --timeout=600 --timeout-method=thread -ra

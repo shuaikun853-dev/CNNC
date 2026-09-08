@@ -5,6 +5,18 @@ Membership 唯一权威 = 测试文件内的文件级 ``pytestmark = pytest.mark
 ``python -m pytest tests -m critical_safety``)。本文件不复制 membership 清单,
 只做闭合世界审计:未分类新文件、marker/排除重叠、陈旧排除条目、关键能力哨兵缺失、
 收集数跌破单调性基线,任何一条都会让 Critical Gate 变红。
+
+两个不可互相替代的职责:
+- FLOOR_CRITICAL_COLLECTED = suite 缩水检测器(单调性基线;合法缩小 gate 需显式
+  调低该值并在 commit 中说明理由);
+- workflow 的 "Run governance bootstrap" 步骤 = 治理文件自身存在性/可执行性的
+  外部保证(self-guard):本守卫寄生在 membership 机制内部(自身带 marker),被
+  整删时审计者与被审计者一起消失、基线仍过,必须由 workflow 中的直接文件选择
+  引用兜底。二者不可互相替代——FLOOR 检测"套件缩水",bootstrap 检测"审计者消失"。
+
+test_zhaoshang_priority_boost.py 已晋升 gated:integration 镜像(repo 内,纯
+stdlib,hermetic)参数在 CI 必测;production 参数在外部工具存在时真跑,缺失时
+仅参数级 skip(不整模块 skip)。
 """
 from __future__ import annotations
 
@@ -21,10 +33,12 @@ pytestmark = pytest.mark.critical_safety
 REPO_ROOT = Path(__file__).resolve().parents[1]
 TESTS_DIR = REPO_ROOT / "tests"
 
-# 2026-09-07 迁移时实测 -m critical_safety 收集数(旧 50 文件命令为 1387 收集
-# /1386 通过/1 deselect;修复 deselect 根因后该测试回归,再新增 8 个 gate 文件)。
+# 2026-09-08 返修后实测 -m critical_safety 收集数(构成:2026-09-07 迁移基线
+# 1512 = 旧 50 文件命令 1387 收集修复 deselect 根因后回归 + 新增 8 个 gate 文件;
+# 本轮 +2 = 本文件新增 2 个特征化测试,+48 = test_zhaoshang_priority_boost.py
+# 晋升 gated 的 24 用例×integration/production 双参数)。
 # 合法缩小 gate 必须显式调低本值并在 commit 中说明理由。
-FLOOR_CRITICAL_COLLECTED = 1512  # 由迁移实测回填
+FLOOR_CRITICAL_COLLECTED = 1568  # 2026-09-08 实测回填(实测 1568/2458 collected)
 
 MARKER_PATTERN = re.compile(
     r"^pytestmark\s*=\s*\[?\s*pytest\.mark\.critical_safety\b", re.MULTILINE
@@ -60,10 +74,16 @@ EXCLUSIONS: dict[str, str] = {
     "test_zhaoshang_task_phases.py": "HERMETIC_UNGATED",
     # PRODUCTION_MACHINE_ONLY: 依赖生产机真实外部工具或公司机夹具;
     # CI 桩下执行等于 FAKE_GREEN(禁止),历史夹具类在 CI 恒 skip 无信号价值。
+    # 剩余 zhaoshang 排除的真实理由:test_zhaoshang_priority_core.py = 经
+    # CnncLegacyZhaoshangAdapter._load_module 加载真实外部工件,被测对象就是
+    # 生产加载面本身;test_zhaoshang_resume_modes.py = 真实外部工具 + wrapper
+    # exec 模块且要求 run_auto_task 属性;repo 侧适配器行为已由 gated 的
+    # test_legacy_zhaoshang_adapter.py 覆盖,晋升只增加 FAKE_GREEN 面。
+    # (test_zhaoshang_priority_boost.py 已晋升 gated:integration 镜像必测,
+    # production 参数有则测、无则参数级 skip。)
     "test_incremental_history_benchmark.py": "PRODUCTION_MACHINE_ONLY",
     "test_incremental_price_audit_history.py": "PRODUCTION_MACHINE_ONLY",
     "test_store_migration_upgrade.py": "PRODUCTION_MACHINE_ONLY",
-    "test_zhaoshang_priority_boost.py": "PRODUCTION_MACHINE_ONLY",
     "test_zhaoshang_priority_core.py": "PRODUCTION_MACHINE_ONLY",
     "test_zhaoshang_resume_modes.py": "PRODUCTION_MACHINE_ONLY",
     "test_zhaoshang_single_mall_templates.py": "PRODUCTION_MACHINE_ONLY",
@@ -84,6 +104,7 @@ CAPABILITY_SENTINELS: dict[str, str] = {
     "Zhaoshang Legacy Adapter": "test_legacy_zhaoshang_adapter.py",
     "Zhaoshang Progress Probe": "test_zhaoshang_progress_probe.py",
     "Zhaoshang Batch Adapter": "test_batch_zhaoshang_adapter.py",
+    "Zhaoshang Priority Writer": "test_zhaoshang_priority_boost.py",
     "Manual Re-export": "test_manual_reexport.py",
     "Manual Rebuild": "test_manual_rebuild.py",
     "Production Identity": "test_production_identity.py",

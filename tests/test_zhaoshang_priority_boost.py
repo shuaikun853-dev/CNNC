@@ -5,6 +5,8 @@ from pathlib import Path
 
 import pytest
 
+# membership 唯一权威行;external 缺失时仅 production 参数自 skip。
+pytestmark = pytest.mark.critical_safety
 
 ROOT = Path(__file__).resolve().parents[1]
 INTEGRATION_HELPER = (
@@ -13,12 +15,6 @@ INTEGRATION_HELPER = (
 EXTERNAL_HELPER = Path(
     r"E:\.A2026\招商局自动建任务\external_tools\crawl_task_tool\zhaoshang_priority_boost.py"
 )
-
-if not EXTERNAL_HELPER.is_file():
-    pytest.skip(
-        "zhaoshang external priority helper unavailable (PRODUCTION_MACHINE_ONLY)",
-        allow_module_level=True,
-    )
 
 
 def _load_module(path, name):
@@ -30,9 +26,17 @@ def _load_module(path, name):
     return module
 
 
-@pytest.fixture(params=[INTEGRATION_HELPER, EXTERNAL_HELPER], ids=["integration", "production"])
+@pytest.fixture(
+    params=[
+        INTEGRATION_HELPER,
+        EXTERNAL_HELPER,
+    ],
+    ids=["integration", "production"],
+)
 def priority_module(request):
     path = request.param
+    if path == EXTERNAL_HELPER and not path.is_file():
+        pytest.skip("zhaoshang external priority helper unavailable (production parameter only)")
     assert path.is_file()
     return _load_module(path, f"priority_{request.node.name}_{request.param.stem}")
 
