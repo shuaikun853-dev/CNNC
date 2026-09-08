@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import os
+import shutil
+import sys
 from collections import Counter
-from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from urllib.request import Request
 
-from openpyxl import Workbook
+from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Font, PatternFill
 from openpyxl.utils import get_column_letter
 
@@ -25,6 +28,20 @@ except ModuleNotFoundError:  # Direct invocation from scripts/.
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from app.services.incremental_audit_runtime import business_date_in_shanghai
+from app.services.workday_context import (
+    WorkdayContextError,
+    ensure_workday_layout,
+    now_in_shanghai,
+    read_manifest,
+    update_stage,
+    workday_root,
+)
+
 CNNC_KEYS = [
     "documentId",
     "commodityName",
@@ -63,6 +80,13 @@ MONITOR_HEADERS = [
     "问题说明",
     "SaaS监控状态",
 ]
+PUSHABLE_COL = 17
+STEP2_DIR_NAME = "03_step2"
+STEP2_OUTPUT_NAMES = {
+    "monitor": "STEP2_监控结果.xlsx",
+    "pushable": "STEP2_可直接推送.xlsx",
+    "non_pushable": "STEP2_不可直接推送.xlsx",
+}
 
 
 def _is_valid_new_price(value: object) -> bool:
@@ -150,6 +174,23 @@ def _build_monitor_values(row: dict) -> list[object]:
     ]
 
 
+def _format_sheet(sheet) -> None:
+    for cell in sheet[1]:
+        cell.font = Font(bold=True, color="FFFFFF")
+        cell.fill = PatternFill("solid", fgColor="1F4E78")
+    sheet.freeze_panes = "A2"
+    sheet.auto_filter.ref = sheet.dimensions
+    for col in range(1, sheet.max_column + 1):
+        width = max(
+            len(str(sheet.cell(row, col).value or ""))
+            for row in range(1, sheet.max_row + 1)
+        )
+        sheet.column_dimensions[get_column_letter(col)].width = min(
+            max(10, width + 2),
+            50,
+        )
+
+
 def _write_workbook(
     records: list[list[object]],
     output: Path,
@@ -188,20 +229,7 @@ def _write_workbook(
         sheet = workbook.create_sheet(name)
         for values in data:
             sheet.append(values)
-        for cell in sheet[1]:
-            cell.font = Font(bold=True, color="FFFFFF")
-            cell.fill = PatternFill("solid", fgColor="1F4E78")
-        sheet.freeze_panes = "A2"
-        sheet.auto_filter.ref = sheet.dimensions
-        for col in range(1, sheet.max_column + 1):
-            width = max(
-                len(str(sheet.cell(row, col).value or ""))
-                for row in range(1, sheet.max_row + 1)
-            )
-            sheet.column_dimensions[get_column_letter(col)].width = min(
-                max(10, width + 2),
-                50,
-            )
+        _format_sheet(sheet)
     workbook.save(output)
     return {
         "cnnc_total": len(records),
@@ -213,22 +241,13 @@ def _write_workbook(
     }
 
 
-def build_parser() -> argparse.ArgumentParser:
-    return argparse.ArgumentParser(
-        description="查询截至当前的中核 SaaS 监控状态并生成五 Sheet Excel。"
-    )
-
-
-def main(argv: list[str] | None = None) -> None:
-    build_parser().parse_args(argv)
-    apply_internal_no_proxy_env()
-    cnnc = load_curl_command(ROOT / "data/latest_cnnc_query.curl")
-    saas = load_curl_command(ROOT / "data/saas_zhuangtai.curl")
-    cnnc_body, saas_body = json.loads(cnnc["data"]), json.loads(saas["data"])
-    if cnnc_body.get("sassCheckStatuss") != ["0"] or (str(saas_body.get("tenantId")), str(saas_body.get("commodityPoolId"))) != ("188605", "222"):
-        raise RuntimeError("租户、商品池或中核待处理筛选不符合第二步范围")
-    auth_manager = AuthManager()
-    saas = auth_manager.prepare_curl("saas", saas, refresh=True)
+def _collect_records(
+    cnnc: dict,
+    cnnc_body: dict,
+    saas: dict,
+    saas_body: dict,
+    auth_manager: AuthManager,
+) -> list[list[object]]:
     cnnc_rows: list[dict] = []
     page, total = 1, None
     while True:
@@ -279,17 +298,179 @@ def main(argv: list[str] | None = None) -> None:
         records.append(
             [row.get(key, "") for key in CNNC_KEYS] + monitor_values
         )
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_dir = ROOT / "runtime" / "saas状态查询" / timestamp
-    output_dir.mkdir(parents=True)
-    output = output_dir / f"中核待处理_SaaS监控状态_{timestamp}.xlsx"
-    summary = _write_workbook(records, output)
-    print(
-        json.dumps(
-            {"output": str(output), **summary},
-            ensure_ascii=False,
-        )
+    return records
+
+
+def _write_projection_workbook(records, output: Path, sheet_name: str) -> None:
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = sheet_name
+    sheet.append(MONITOR_HEADERS)
+    for row in records:
+        sheet.append(row)
+    _format_sheet(sheet)
+    workbook.save(output)
+
+
+def _read_sheet_rows(path: Path, sheet_name: str) -> list[list[object]]:
+    workbook = load_workbook(path, read_only=True, data_only=True)
+    try:
+        return [list(row) for row in workbook[sheet_name].iter_rows(values_only=True)]
+    finally:
+        workbook.close()
+
+
+def _as_xlsx_value(value: object) -> object:
+    # openpyxl 把空字符串写盘后读回为 None；校验按同一规则归一，其余类型逐相等。
+    return None if value == "" else value
+
+
+def _validate_split_projection(records, monitor_path: Path, pushable_path: Path, non_pushable_path: Path) -> None:
+    normalized = [[_as_xlsx_value(value) for value in row] for row in records]
+    expected_monitor = [MONITOR_HEADERS, *normalized]
+    expected_pushable = [MONITOR_HEADERS, *[row for row in normalized if row[PUSHABLE_COL] == "是"]]
+    expected_non_pushable = [MONITOR_HEADERS, *[row for row in normalized if row[PUSHABLE_COL] == "否"]]
+    monitor_rows = _read_sheet_rows(monitor_path, "全量监控结果")
+    if monitor_rows != expected_monitor:
+        raise RuntimeError(f"monitor workbook rows do not match authoritative records: {monitor_path}")
+    pushable_rows = _read_sheet_rows(pushable_path, "可直接推送")
+    if pushable_rows != expected_pushable:
+        raise RuntimeError(f"pushable projection mismatch: {pushable_path}")
+    non_pushable_rows = _read_sheet_rows(non_pushable_path, "不可直接推送")
+    if non_pushable_rows != expected_non_pushable:
+        raise RuntimeError(f"non-pushable projection mismatch: {non_pushable_path}")
+    pushable_ids = {row[0] for row in pushable_rows[1:]}
+    non_pushable_ids = {row[0] for row in non_pushable_rows[1:]}
+    monitor_ids = {row[0] for row in monitor_rows[1:]}
+    if pushable_ids & non_pushable_ids:
+        raise RuntimeError("pushable and non-pushable documentIds intersect")
+    if pushable_ids | non_pushable_ids != monitor_ids:
+        raise RuntimeError("pushable + non-pushable do not cover monitor documentIds")
+
+
+def _begin_step2_run(business_date: str, base=None) -> dict:
+    ensure_workday_layout(business_date, base)
+    manifest = read_manifest(business_date, base)
+    previous = manifest["stages"].get("step2") or {}
+    now = now_in_shanghai()
+    run_info = {
+        "run_id": now.strftime("%Y%m%dT%H%M%S") + f"-{now.microsecond:06d}",
+        "generation": int(previous.get("generation") or 0) + 1,
+        "started_at": now.isoformat(timespec="seconds"),
+    }
+    update_stage(
+        business_date,
+        "step2",
+        {"status": "RUNNING", **run_info},
+        base,
     )
+    return run_info
+
+
+def _fail_step2_run(business_date: str, error: BaseException, base=None) -> None:
+    try:
+        update_stage(
+            business_date,
+            "step2",
+            {
+                "status": "FAILED",
+                "error_type": type(error).__name__,
+                "error_summary": str(error)[:500],
+            },
+            base,
+        )
+    except Exception:
+        pass  # 失败记录失败不得掩盖原始业务错误
+
+
+def _file_record(relative: str, path: Path) -> dict:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return {"path": relative, "sha256": digest.hexdigest(), "size": path.stat().st_size}
+
+
+def _complete_step2_publication(records, business_date: str, run_info: dict, base=None) -> dict:
+    step2_dir = workday_root(business_date, base) / STEP2_DIR_NAME
+    staging_dir = step2_dir / ".staging" / run_info["run_id"]
+    staging_dir.mkdir(parents=True, exist_ok=False)
+    pushable_rows = [row for row in records if row[PUSHABLE_COL] == "是"]
+    non_pushable_rows = [row for row in records if row[PUSHABLE_COL] == "否"]
+    staged = {key: staging_dir / name for key, name in STEP2_OUTPUT_NAMES.items()}
+    try:
+        summary = _write_workbook(records, staged["monitor"])
+        _write_projection_workbook(pushable_rows, staged["pushable"], "可直接推送")
+        _write_projection_workbook(non_pushable_rows, staged["non_pushable"], "不可直接推送")
+        _validate_split_projection(records, staged["monitor"], staged["pushable"], staged["non_pushable"])
+        for name in STEP2_OUTPUT_NAMES.values():
+            os.replace(staging_dir / name, step2_dir / name)
+    except BaseException:
+        shutil.rmtree(staging_dir, ignore_errors=True)
+        raise
+    files = {
+        key: _file_record(f"{STEP2_DIR_NAME}/{name}", step2_dir / name)
+        for key, name in STEP2_OUTPUT_NAMES.items()
+    }
+    counts = {
+        "monitor_total": len(records),
+        "pushable": len(pushable_rows),
+        "non_pushable": len(non_pushable_rows),
+    }
+    update_stage(
+        business_date,
+        "step2",
+        {
+            "status": "COMPLETED",
+            "completed_at": now_in_shanghai().isoformat(timespec="seconds"),
+            "outputs": {key: f"{STEP2_DIR_NAME}/{name}" for key, name in STEP2_OUTPUT_NAMES.items()},
+            "files": files,
+            "counts": counts,
+        },
+        base,
+    )
+    shutil.rmtree(staging_dir, ignore_errors=True)
+    return {
+        "business_date": business_date,
+        "run_id": run_info["run_id"],
+        "generation": run_info["generation"],
+        "outputs": {key: str(step2_dir / name) for key, name in STEP2_OUTPUT_NAMES.items()},
+        "counts": counts,
+        "summary": summary,
+    }
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="查询截至当前的中核 SaaS 监控状态并生成五 Sheet Excel。"
+    )
+    parser.add_argument(
+        "--business-date",
+        default=None,
+        help="业务日期 YYYY-MM-DD；缺省使用上海时区当前业务日",
+    )
+    return parser
+
+
+def main(argv: list[str] | None = None) -> None:
+    args = build_parser().parse_args(argv)
+    business_date = args.business_date or business_date_in_shanghai()
+    run_info = _begin_step2_run(business_date, ROOT)
+    try:
+        apply_internal_no_proxy_env()
+        cnnc = load_curl_command(ROOT / "data/latest_cnnc_query.curl")
+        saas = load_curl_command(ROOT / "data/saas_zhuangtai.curl")
+        cnnc_body, saas_body = json.loads(cnnc["data"]), json.loads(saas["data"])
+        if cnnc_body.get("sassCheckStatuss") != ["0"] or (str(saas_body.get("tenantId")), str(saas_body.get("commodityPoolId"))) != ("188605", "222"):
+            raise RuntimeError("租户、商品池或中核待处理筛选不符合第二步范围")
+        auth_manager = AuthManager()
+        saas = auth_manager.prepare_curl("saas", saas, refresh=True)
+        records = _collect_records(cnnc, cnnc_body, saas, saas_body, auth_manager)
+        publication = _complete_step2_publication(records, business_date, run_info, ROOT)
+    except BaseException as error:
+        _fail_step2_run(business_date, error, ROOT)
+        raise
+    print(json.dumps(publication, ensure_ascii=False))
 
 
 if __name__ == "__main__":
