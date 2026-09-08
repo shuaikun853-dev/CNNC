@@ -103,3 +103,68 @@ marker 选择器在 Runner 上与本地分毫不差(1514+4=1518),但暴露两类
    commit 1b9eec6)。
 3. **运行时长**:1518 用例在冷 Runner 实测 24:05,30 分钟上限余量不足;
    timeout 30→40(有实测证据)+ `--durations=25` 观测(commit 1b9eec6)。
+
+## Reviewer 返修(2026-09-08)
+
+Review 发现两个治理缺口,按 TDD 返修(先特征化 RED,再修复 GREEN;两个特征化
+测试先落 commit 907dd06 确认红,修复 commit 01e9eaa 转绿)。
+
+### Finding A:治理守卫自身缺守卫(self-guard 缺失)
+
+根因:守卫完全寄生在 membership 机制内部——自身带 `critical_safety` marker、
+由同一 selector 收集。若 `tests/test_critical_suite_governance.py` 被整删:
+6 个治理测试消失、闭合世界 glob 也看不到它、`1512 >= 1512` 收集数基线仍过,
+而 workflow 对该文件零显式引用 → CI 仍绿(审计者与被审计者一起消失)。
+
+修复:workflow 在 production-shape prep 与主套件之间插入 "Run governance
+bootstrap" 步骤,直接文件选择执行守卫(`python -m pytest
+tests/test_critical_suite_governance.py`,不经 `-m critical_safety` 过滤)。
+契约三 Case:
+
+| Case | 结果 |
+|---|---|
+| 守卫文件存在且通过 | bootstrap PASS |
+| 守卫文件被整删 | bootstrap 步骤 pytest 非零退出(实测 exit 4,file not found)→ job 必红 |
+| 守卫文件存在但守卫自身失败 | bootstrap 必红(先于约 24 分钟的主套件,快速失败) |
+
+新增普通 critical 测试仍只需给文件加一行 marker,无需改 workflow——bootstrap
+只引用守卫自身,不是第二份 membership 清单(不引用任何测试清单)。
+特征化契约由 `test_workflow_bootstraps_governance_guard_before_critical_suite`
+钉住(bootstrap 存在、直接文件选择、无 `-m critical_safety`、先于主套件、
+主套件 selector 不变)。
+
+### Finding B:整模块 skip 杀死集成覆盖
+
+根因:`tests/test_zhaoshang_priority_boost.py` 用 `allow_module_level=True` 把
+"production 参数缺外部文件(E:\.A2026,公司机存在/GitHub Runner 不存在)"上升成
+整模块 skip——Runner 上 repo 内 integration 镜像(`zhaoshang_priority_boost_
+integration/`,git 跟踪、纯 stdlib、hermetic)一起被跳过,gate 对该能力零覆盖。
+
+修复语义:删除模块级 skip;文件加 `pytestmark = pytest.mark.critical_safety`
+晋升 gated;fixture 保持 integration/production 双参数——integration 镜像
+缺失仍 assert 硬失败(repo 内文件必在),production 参数仅在外部文件缺失时
+参数级 `pytest.skip`(主套件 `-ra` 在 Runner 上直接列出 skip 原因)。
+新增能力哨兵 `"Zhaoshang Priority Writer" → test_zhaoshang_priority_boost.py`。
+特征化契约由 `test_priority_boost_module_does_not_skip_integration_mirror`
+钉住(无 `allow_module_level`、双参数形态、参数级 skip 形态、membership 行)。
+
+### core / resume_modes 维持排除的真实理由
+
+- `test_zhaoshang_priority_core.py`:经 `CnncLegacyZhaoshangAdapter._load_module`
+  加载真实外部工件,被测对象就是生产加载面本身——CI 存在性桩下执行 = FAKE_GREEN。
+- `test_zhaoshang_resume_modes.py`:真实外部工具 + wrapper exec 模块且要求
+  `run_auto_task` 属性,同样只有生产机有真实工件。
+- repo 侧适配器行为已由 gated 的 `test_legacy_zhaoshang_adapter.py` 覆盖;
+  两者晋升不增加 CI 信号,只会制造 FAKE_GREEN 面 → 保留排除,不晋升。
+
+### floor 与 bootstrap 职责区分
+
+| 机制 | 位置 | 检测什么 | 自身失效方式 | 兜底 |
+|---|---|---|---|---|
+| FLOOR_CRITICAL_COLLECTED | 守卫测试内 | 套件规模缩水(单调性基线) | 守卫文件被删时随守卫一起消失 | workflow bootstrap |
+| governance bootstrap | workflow 步骤 | 守卫文件自身存在性/可执行性 | workflow 文件被删 = 触发契约丢失 | 触发契约(指向 prod 的 PR 必现 Check)+ review |
+
+二者不可互相替代:FLOOR 检测"套件缩水",bootstrap 检测"审计者消失"。
+FLOOR 随本轮晋升更新:1512 → **1568**(实测 `1568/2458 collected, 890
+deselected`;构成 = 1518 既有 + 2 个特征化测试 + 48 个 boost 用例)。
+主套件本地实测:1568 passed / 0 failed @ 402.78s。
