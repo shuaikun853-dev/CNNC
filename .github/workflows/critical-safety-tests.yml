@@ -73,8 +73,9 @@ jobs:
           & "E:\Python314\python.exe" --version
           if ($LASTEXITCODE -ne 0) { throw "junction python not executable" }
           Write-Host "PREPARE_OK"
-      # 清单来源：2026-09-04 审计确认的 CI_SAFE 纯逻辑安全测试（50 个文件）；
-      # 本地干净 worktree 实测 1376 收集 / 1375 通过 / 1 失败（唯一失败即下方
+      # 清单来源：2026-09-04 审计确认的 CI_SAFE 纯逻辑安全测试（54 个文件，
+      # 2026-09-08 增补 STEP2 三表/显式闸门/workday manifest 4 个文件）；
+      # 本地干净 worktree 实测 1453 收集 / 1452 通过 / 1 失败（唯一失败即下方
       # --deselect 的那个，因生产机 gitignored data/ 的 curl 文件在 CI 不存在）。
       - name: Run critical safety tests
         env:
@@ -82,6 +83,10 @@ jobs:
           PYTHONUTF8: "1"  # JS harness 输出 UTF-8，避免 cp1252 Runner 上 subprocess 文本解码崩溃
         run: >
           python -m pytest
+          tests/test_export_current_monitor_status.py
+          tests/test_step2_outputs.py
+          tests/test_step2_explicit_gate.py
+          tests/test_workday_context.py
           tests/test_customer_price_semantics.py
           tests/test_customer_price_projection.py
           tests/test_detail_business_retry.py
