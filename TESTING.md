@@ -40,8 +40,8 @@ python -m pytest tests\test_reject_saas_audit_excel.py tests\test_approve_saas_a
 # SaaS 文档 ID 受控价格补推（仅测试替身，不调真实写接口）
 python -m pytest tests\test_push_saas_commodity_price.py -q --basetemp=.pytest_tmp_push_controlled
 
-# 第二步状态判定和 Excel
-python -m pytest tests\test_export_current_monitor_status.py -q
+# 第二步状态判定、三表投影、显式闸门与 workday manifest
+python -m pytest tests\test_export_current_monitor_status.py tests\test_step2_outputs.py tests\test_step2_explicit_gate.py tests\test_workday_context.py -q
 
 # 第三步授权开关、分阶段并行、恢复模式、回填和任务结果映射
 python -m pytest tests\test_monitor_stb_fallback.py tests\test_process_monitor_zs_result_mapping.py tests\test_zhaoshang_task_phases.py tests\test_zhaoshang_resume_modes.py -q
@@ -86,7 +86,8 @@ python -m py_compile `
   scripts\approve_saas_audit_excel.py `
   scripts\push_saas_commodity_price.py `
   scripts\auth_manager.py `
-  scripts\curl_utils.py
+  scripts\curl_utils.py `
+  app\services\workday_context.py
 ```
 
 只有修改外部招商局项目时才编译其脚本；不要为了查看帮助而创建真实任务。
@@ -169,24 +170,23 @@ python -m pytest tests\test_zhaoshang_priority_boost.py -q
 
 ```powershell
 python scripts\export_current_monitor_status.py --help
-python -m pytest tests\test_export_current_monitor_status.py -q
 ```
 
-生产运行只有用户要求第二步时才执行：
+生产运行只有用户要求第二步时才执行（`--business-date` 缺省取上海时区当前业务日）：
 
 ```powershell
-python scripts\export_current_monitor_status.py
+python scripts\export_current_monitor_status.py --business-date <YYYY-MM-DD>
 ```
 
 验收：
 
 1. 中核实际行数等于接口 `count`；SaaS 每批最多 200 个编码且每批成功。
-2. `saas_matched + saas_missing = cnnc_total`。
-3. `pushable + needs_processing + saas_missing = cnnc_total`。
-4. 五个固定 Sheet 存在，全量表保留原始 `newPrice`。
-5. 可推送条件严格为 `isSync=1`、`isSyncStandard=1`、`syncPriceStatus!=5`、`newPrice` 为有限正数。
-6. `syncPriceStatus=5` 优先归为价格检测校验失败；其他状态继续校验 `newPrice`。
-7. SaaS 只读分批明确返回 401 时只刷新并重试一次；第二次失败或任一分批异常时没有生成“全量”输出。
+2. `saas_matched + saas_missing = cnnc_total`；`pushable + needs_processing + saas_missing = cnnc_total`。
+3. 五个固定 Sheet 存在，全量表保留原始 `newPrice`。
+4. 可推送条件严格为 `isSync=1`、`isSyncStandard=1`、`syncPriceStatus!=5`、`newPrice` 为有限正数；`syncPriceStatus=5` 优先归为价格检测校验失败，其他状态继续校验 `newPrice`。
+5. SaaS 只读分批明确返回 401 时只刷新并重试一次；第二次失败或任一分批异常时没有生成“全量”输出。
+6. `STEP2_可直接推送.xlsx` 与 `STEP2_不可直接推送.xlsx` 是权威全量按 `是否可推送` 的纯投影：`monitor_total = pushable + non_pushable`，documentId 交集为空、并集等于全量。
+7. 运行后核对 manifest `stages.step2=COMPLETED` 且 `files.*.sha256` 与磁盘一致；同日重跑 generation+1 并原子整代替换三表，失败记 `FAILED` 且不产出“看似完整”的新一代。
 
 ## 6. 第三步验收
 

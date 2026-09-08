@@ -7,7 +7,7 @@
 | 步骤 | 业务目标 | 固定入口 | 输出 |
 |---|---|---|---|
 | 第一步 | 当前待审批数据的客户价、标题同款、商城价和最终决策 | `scripts/audit_saas_excel_file.py` | `runtime/price_audit_<时间戳>/saas_audit_final_<时间戳>.xlsx` |
-| 第二步 | 当前中核待处理数据的 SaaS 采集/同款/价格状态 | `scripts/export_current_monitor_status.py` | `runtime/saas状态查询/<时间戳>/中核待处理_SaaS监控状态_<时间戳>.xlsx` |
+| 第二步 | 当前中核待处理数据的 SaaS 采集/同款/价格状态 | `scripts/export_current_monitor_status.py` | `workdays/<YYYY-MM-DD>/03_step2/` 三份 `STEP2_*.xlsx` + `workdays/<YYYY-MM-DD>/manifest.json` |
 | 第三步 | 处理指定监控表中 `是否可推送=否` 的数据 | `scripts/process_monitor_no_push_zhaoshang.py` | `runtime/模板以及推送失败数据/<时间戳>/` 下三文件和缺价清单 |
 
 三步是业务分类，不是串行执行队列：三个步骤可以并行，同一步骤也可以同时运行多个独立批次。
