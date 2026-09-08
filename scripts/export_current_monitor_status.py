@@ -34,7 +34,6 @@ if str(ROOT) not in sys.path:
 
 from app.services.incremental_audit_runtime import business_date_in_shanghai
 from app.services.workday_context import (
-    WorkdayContextError,
     ensure_workday_layout,
     now_in_shanghai,
     read_manifest,
