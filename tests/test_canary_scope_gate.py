@@ -39,6 +39,7 @@ from app.services.customer_prewarm_dispatch import (
     CanaryLiveBudget,
     CanaryScope,
     CanaryScopeViolation,
+    _CACHE_SYNC_PENDING_NOTE,
     _boost_reused_job,
     _confirm_pending_priority_job,
     _dispatch_mall_group,
@@ -1542,3 +1543,235 @@ def test_r2_case_c_cli_live_drift_after_preflight_fails_closed(tmp_path, monkeyp
     retry_lock = ProcessLock(runtime_root / "customer_prewarm_dispatch.lock")
     retry_lock.acquire()
     retry_lock.release()
+
+
+# ---- Round-3:preflight target set 与 live 可行动交互集合口径精确对齐 ----------------
+# 统一"可行动交互"定义（两侧同源 _job_is_priority_actionable）：
+#   可行动 = ①miss 循环 unfinished_bound(reuse)/create（terminal 不算）；
+#           ②REMOTE_* 候选：job 有 remote_identity 且（state==PRIORITY_PENDING
+#             或（state∈_BOOSTABLE_JOB_STATES 且 cache_status==REMOTE_REUSED））。
+
+
+def test_r3_priority_actionable_predicate_truth_table():
+    f = dispatch_service._job_is_priority_actionable
+    # PENDING confirm：两种候选状态都可行动（confirm_items 两者都收）。
+    assert f("PRIORITY_PENDING", True, CACHE_STATUS_REMOTE_DISPATCHED) is True
+    assert f("PRIORITY_PENDING", True, CACHE_STATUS_REMOTE_REUSED) is True
+    # boost：仅 REMOTE_REUSED 候选 + _BOOSTABLE_JOB_STATES。
+    assert f("SUBMITTED", True, CACHE_STATUS_REMOTE_REUSED) is True
+    assert f("RUNNING", True, CACHE_STATUS_REMOTE_REUSED) is True
+    assert f("EXPORTED", True, CACHE_STATUS_REMOTE_REUSED) is True
+    # 不可行动：无 identity / 非 boostable state / REMOTE_DISPATCHED 的非 PENDING。
+    assert f("SUBMITTED", False, CACHE_STATUS_REMOTE_REUSED) is False
+    assert f("PENDING", True, CACHE_STATUS_REMOTE_REUSED) is False
+    assert f("SUBMIT_UNKNOWN", True, CACHE_STATUS_REMOTE_REUSED) is False
+    assert f("SUBMITTED", True, CACHE_STATUS_REMOTE_DISPATCHED) is False
+    assert f("SUCCESS", True, CACHE_STATUS_REMOTE_REUSED) is False
+
+
+def test_r3_t1_terminal_covered_url_preflight_passes_and_live_records_without_drift(
+    tmp_path, monkeypatch, capsys
+):
+    """T1 terminal 角落：in-scope 候选被生产 state terminal_success 覆盖时，
+    preflight 目标集合为空仍 PASS；live（空预算）只写 REMOTE_DISPATCHED+note，
+    零远端调用、零 drift，CLI 不 exit 2（修复前 Pass A 对 terminal 条目也做
+    budget.check → preflight PASS 后 live 必 CANARY_LIVE_SCOPE_DRIFT）。"""
+    runtime_root, state_root, store_path, cache_path = _tmp_layout(tmp_path)
+    url_t = "https://www.xhgj.com/item-t1.html"
+    seed_terminal_crawl(state_root, BUSINESS_DATE, XHGJ, url_t, result="seeded")
+    prewarm = CustomerPrewarmStore(store_path)
+    SharedCrawlCache(cache_path)
+    candidate_id = make_candidate(prewarm, url_t, mall="xhgj", document="D-T1")
+    workbook = _write_xhgj_mapping_workbook(tmp_path / "mapping.xlsx")
+    created_adapters: list[_CountingAdapter] = []
+
+    class _TrackedAdapter(_CountingAdapter):
+        def __init__(self, *, mappings=None, **kwargs):
+            super().__init__(**kwargs)
+            created_adapters.append(self)
+
+    monkeypatch.setattr(dispatch_service, "CnncLegacyZhaoshangAdapter", _TrackedAdapter)
+
+    plan_json = tmp_path / "t1-plan.json"
+    plan_code = _run_canary_cli(
+        runtime_root,
+        state_root,
+        store_path,
+        cache_path,
+        workbook,
+        "--canary-max-urls",
+        "1",
+        "--plan-only",
+        json_output=plan_json,
+    )
+    assert plan_code == 0
+    plan_summary = json.loads(plan_json.read_text(encoding="utf-8"))
+    assert plan_summary["canary_preflight"] == "PASS"
+    assert plan_summary["canary_target_urls"] == []
+    assert plan_summary["remote_interaction_urls"] == 0
+
+    live_json = tmp_path / "t1-live.json"
+    live_code = _run_canary_cli(
+        runtime_root,
+        state_root,
+        store_path,
+        cache_path,
+        workbook,
+        "--canary-max-urls",
+        "1",
+        json_output=live_json,
+    )
+    assert live_code == 0  # 修复前：drift 硬失败 exit 2
+    stdout = capsys.readouterr().out
+    assert "CANARY_LIVE_SCOPE_DRIFT" not in stdout
+    live_summary = json.loads(live_json.read_text(encoding="utf-8"))
+    assert live_summary["outcome"] == "OK"
+    assert not any(
+        "CANARY_LIVE_SCOPE_DRIFT" in error or "CanaryScopeViolation" in error
+        for error in live_summary["phase_errors"]
+    )
+    # terminal record 正常写（候选写允许、零远端调用）。
+    assert created_adapters == []  # 连 adapter 都无需构造
+    row = _store_row(store_path, candidate_id)
+    assert row["cache_status"] == CACHE_STATUS_REMOTE_DISPATCHED
+    assert row["last_error"] == _CACHE_SYNC_PENDING_NOTE
+
+
+def test_r3_t2_boostable_reused_candidate_enters_preflight_target_set(tmp_path):
+    """T2 boostable 入集合：REMOTE_REUSED 候选 + SUBMITTED 有 identity job 会
+    被 live Phase 4b boost → preflight 目标集合必须含其 URL；live 全程
+    budget.check 通过且 prioritize 恰好 1 次（修复前集合漏收 → PASS 后必断）。"""
+    runtime_root = tmp_path / "runtime"
+    url_b = "https://www.xhgj.com/item-t2b.html"
+    _paths, job_b = _seed_remote_work_task(
+        runtime_root,
+        _CountingAdapter(),
+        mapping=XHGJ,
+        url=url_b,
+        task_name="cnnc_current_opt_t2_boost",
+        job_state="SUBMITTED",
+        remote_identity="xhgj|tid-t2b|tnum-t2b",
+    )
+    prewarm = CustomerPrewarmStore(runtime_root / "customer_prewarm.sqlite3")
+    candidate_id = make_candidate(prewarm, url_b, mall="xhgj", document="D-T2B")
+    prewarm.record_candidate_result(
+        candidate_id, cache_status=CACHE_STATUS_REMOTE_REUSED, remote_job_id=job_b
+    )
+    cache = SharedCrawlCache(runtime_root / "shared_crawl_cache.sqlite3")
+
+    plan = _plan_only_scope(prewarm, cache, runtime_root)
+
+    assert plan["canary_target_urls"] == [["xhgj", url_b]]
+    assert plan["remote_interaction_urls"] == 1
+    assert plan["canary_preflight"] == "PASS"
+
+    budget = CanaryLiveBudget.from_plan(plan, _canary_scope())
+    adapter = _CountingAdapter()
+    summary = _run_canary_live(runtime_root, prewarm, cache, adapter=adapter, canary_budget=budget)
+
+    assert summary["outcome"] == "OK"
+    assert not any(
+        "CANARY_LIVE_SCOPE_DRIFT" in error or "CanaryScopeViolation" in error
+        for error in summary["phase_errors"]
+    )
+    assert adapter.prioritize_calls == 1
+    assert summary["priority_boosted"] == 1
+
+
+def test_r3_t3_non_actionable_entry_never_trips_phase4_guard(tmp_path):
+    """T3 不可行动不误伤：REMOTE_DISPATCHED 候选 + SUBMITTED job（4a 不动、4b
+    不拥有 → live 零 prioritize）与 1 个合法 PENDING confirm 并存时，Phase 4
+    前置守卫只对可行动者校验，合法 confirm 正常执行、整体不 blocked。"""
+    runtime_root = tmp_path / "runtime"
+    url_np = "https://www.xhgj.com/item-t3n.html"
+    _paths_np, job_np = _seed_remote_work_task(
+        runtime_root,
+        _CountingAdapter(),
+        mapping=XHGJ,
+        url=url_np,
+        task_name="cnnc_current_opt_t3_np",
+        job_state="SUBMITTED",
+        remote_identity="xhgj|tid-t3n|tnum-t3n",
+    )
+    url_ok = "https://www.xhgj.com/item-t3o.html"
+    _paths_ok, job_ok = _seed_remote_work_task(
+        runtime_root,
+        _CountingAdapter(),
+        mapping=XHGJ,
+        url=url_ok,
+        task_name="cnnc_current_opt_t3_ok",
+        job_state="PRIORITY_PENDING",
+        remote_identity="xhgj|tid-t3o|tnum-t3o",
+    )
+    prewarm = CustomerPrewarmStore(runtime_root / "customer_prewarm.sqlite3")
+    id_np = make_candidate(prewarm, url_np, mall="xhgj", document="D-T3N")
+    prewarm.record_candidate_result(
+        id_np, cache_status=CACHE_STATUS_REMOTE_DISPATCHED, remote_job_id=job_np
+    )
+    id_ok = make_candidate(prewarm, url_ok, mall="xhgj", document="D-T3O")
+    prewarm.record_candidate_result(
+        id_ok, cache_status=CACHE_STATUS_REMOTE_DISPATCHED, remote_job_id=job_ok
+    )
+    cache = SharedCrawlCache(runtime_root / "shared_crawl_cache.sqlite3")
+    adapter = _CountingAdapter()
+    budget = CanaryLiveBudget("xhgj", 1, [("xhgj", url_ok)])  # 不可行动者不在预算
+
+    summary = _run_canary_live(runtime_root, prewarm, cache, adapter=adapter, canary_budget=budget)
+
+    assert summary["outcome"] == "OK"
+    assert not any("phase 4 pre-priority budget guard" in error for error in summary["phase_errors"])
+    assert not any(
+        "CANARY_LIVE_SCOPE_DRIFT" in error or "CanaryScopeViolation" in error
+        for error in summary["phase_errors"]
+    )
+    # 只有合法 confirm 被执行（修复前：不可行动条目的 payload 对误触发 drift，
+    # 整个 Phase 4 被阻断 → prioritize=0）。
+    assert adapter.prioritize_calls == 1
+    assert summary["priority_confirmed"] == 1
+
+
+def test_r3_t4_boost_drift_after_preflight_blocks_whole_phase4(tmp_path):
+    """T4 boost 漂移整体失败：preflight 只含 A（PENDING confirm），live 前新增
+    REMOTE_REUSED+boostable B → Phase 4 前置守卫必须拦下（整体失败语义：
+    prioritize=0，A 也不许先动）——修复 C 不得弱化该 guard。"""
+    runtime_root = tmp_path / "runtime"
+    url_a = "https://www.xhgj.com/item-t4a.html"
+    _paths_a, job_a = _seed_remote_work_task(
+        runtime_root,
+        _CountingAdapter(),
+        mapping=XHGJ,
+        url=url_a,
+        task_name="cnnc_current_opt_t4_a",
+        job_state="PRIORITY_PENDING",
+        remote_identity="xhgj|tid-t4a|tnum-t4a",
+    )
+    url_b = "https://www.xhgj.com/item-t4b.html"
+    _paths_b, job_b = _seed_remote_work_task(
+        runtime_root,
+        _CountingAdapter(),
+        mapping=XHGJ,
+        url=url_b,
+        task_name="cnnc_current_opt_t4_b",
+        job_state="SUBMITTED",
+        remote_identity="xhgj|tid-t4b|tnum-t4b",
+    )
+    prewarm = CustomerPrewarmStore(runtime_root / "customer_prewarm.sqlite3")
+    id_a = make_candidate(prewarm, url_a, mall="xhgj", document="D-T4A")
+    prewarm.record_candidate_result(
+        id_a, cache_status=CACHE_STATUS_REMOTE_DISPATCHED, remote_job_id=job_a
+    )
+    id_b = make_candidate(prewarm, url_b, mall="xhgj", document="D-T4B")
+    prewarm.record_candidate_result(
+        id_b, cache_status=CACHE_STATUS_REMOTE_REUSED, remote_job_id=job_b
+    )
+    rows_before = [_store_row(prewarm.path, id_a), _store_row(prewarm.path, id_b)]
+    cache = SharedCrawlCache(runtime_root / "shared_crawl_cache.sqlite3")
+    adapter = _CountingAdapter()
+    budget = CanaryLiveBudget("xhgj", 2, [("xhgj", url_a)])  # preflight 只批准 A
+
+    summary = _run_canary_live(runtime_root, prewarm, cache, adapter=adapter, canary_budget=budget)
+
+    assert adapter.prioritize_calls == 0
+    assert any("phase 4 pre-priority budget guard" in error for error in summary["phase_errors"])
+    assert any("CANARY_LIVE_SCOPE_DRIFT" in error for error in summary["phase_errors"])
+    assert [_store_row(prewarm.path, id_a), _store_row(prewarm.path, id_b)] == rows_before

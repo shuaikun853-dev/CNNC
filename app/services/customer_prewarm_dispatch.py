@@ -562,9 +562,12 @@ def _plan_only_report(
         else:
             summary["routing_blocked"] += 1
 
-    # Third bucket: REMOTE_* candidates whose bound job is still exactly
-    # PRIORITY_PENDING with a remote identity — each needs a prioritize-only
-    # confirm pass before its -1 is proven.
+    # Third bucket: REMOTE_* candidates whose bound job still needs exactly one
+    # prioritize call — a PRIORITY_PENDING confirm (Phase 4a, both statuses) or
+    # a REMOTE_REUSED boost of a job in _BOOSTABLE_JOB_STATES (Phase 4b).  Every
+    # actionable (mall, url) pair joins the canary target set so the live Phase
+    # 4 budget guard matches the plan; pending_priority_planned keeps counting
+    # only the PENDING confirms.
     pending_priority_planned = 0
     for status in (CACHE_STATUS_REMOTE_DISPATCHED, CACHE_STATUS_REMOTE_REUSED):
         for candidate in prewarm_store.candidates(status):
@@ -579,15 +582,16 @@ def _plan_only_report(
             job = _read_remote_job_readonly(state_db_path, int(job_id))
             if job is None:
                 continue
-            if (
-                str(job.get("state") or "") == "PRIORITY_PENDING"
-                and str(job.get("remote_identity") or "").strip()
-            ):
+            job_state = str(job.get("state") or "")
+            has_identity = bool(str(job.get("remote_identity") or "").strip())
+            if not _job_is_priority_actionable(job_state, has_identity, status):
+                continue
+            target_pairs.add(
+                (_candidate_mall(candidate, mappings), str(candidate.get("lookup_url") or ""))
+            )
+            if job_state == "PRIORITY_PENDING":
                 seen_priority_job_ids.add(int(job_id))
                 pending_priority_planned += 1
-                target_pairs.add(
-                    (_candidate_mall(candidate, mappings), str(candidate.get("lookup_url") or ""))
-                )
 
     planned_jobs = min(len(create_groups), max_jobs_per_pass)
     summary["existing_remote_reused_planned"] = reused_planned
@@ -664,6 +668,26 @@ def _job_interaction_pairs(job_row: Mapping[str, Any]) -> list[tuple[Any, Any]]:
     payload = job_row.get("payload_json") or "{}"
     data = json.loads(payload) if isinstance(payload, str) else dict(payload)
     return [(row.get("mall_key"), row.get("url")) for row in data.get("requests", [])]
+
+
+def _job_is_priority_actionable(
+    job_state: str, has_identity: bool, cache_status: str | None
+) -> bool:
+    """统一"可行动交互"判定：live 对一个 REMOTE_* 候选的 bound job 调
+    prioritize 当且仅当本 predicate 为真——job 有 remote_identity，且
+    state == ``PRIORITY_PENDING``（Phase 4a confirm，两种候选状态都进 confirm
+    列表），或候选是 ``REMOTE_REUSED``（只有它进 reuse_items）且
+    state ∈ :data:`_BOOSTABLE_JOB_STATES`（Phase 4b boost）。  preflight 第三
+    桶与 live Phase 4 前置守卫必须共用同一 predicate，否则预算集合与 live
+    交互集合两侧口径漂移。  ``cache_status=None`` 按 REMOTE_REUSED 处理
+    （Phase 3 reuse 条目天然是 REMOTE_REUSED 记录）。"""
+    if not has_identity:
+        return False
+    if job_state == "PRIORITY_PENDING":
+        return True
+    return (cache_status or CACHE_STATUS_REMOTE_REUSED) == CACHE_STATUS_REMOTE_REUSED and (
+        job_state in _BOOSTABLE_JOB_STATES
+    )
 
 
 def run_prewarm_dispatch_pass(
@@ -984,10 +1008,23 @@ def _run_leased_pass(
     # entirely (whole-set failure semantics: no target is prioritized first).
     phase4_budget_blocked = False
     if canary_scope is not None and canary_budget is not None:
+        # Only entries live would actually prioritize (the same actionable
+        # predicate as the preflight target set: PENDING confirms + REMOTE_REUSED
+        # boosts with identity) join the whole-set guard — a REMOTE_DISPATCHED
+        # candidate over a SUBMITTED job (4a skips, 4b does not own it) makes
+        # zero prioritize calls and must never block Phase 4 by itself.
         pending_pairs: set[tuple[str, str]] = set()
         for item in [*confirm_items, *reuse_items]:
             job_row = store.get_remote_job(int(item["job_id"]))
-            for mall_value, url_value in _job_interaction_pairs(job_row or {}):
+            if job_row is None:
+                continue
+            if not _job_is_priority_actionable(
+                str(job_row.get("state") or ""),
+                bool(str(job_row.get("remote_identity") or "").strip()),
+                item.get("cache_status"),
+            ):
+                continue
+            for mall_value, url_value in _job_interaction_pairs(job_row):
                 pending_pairs.add((str(mall_value), str(url_value)))
         try:
             for pair in sorted(pending_pairs):
@@ -1106,12 +1143,16 @@ def _dispatch_mall_group(
             lookup_url = str(entry["routing"].lookup_url)
             probe = find_remote_work_for_url(paths.state_path, mall_key, lookup_url)
             precomputed_probes[lookup_url] = probe
-            if canary_budget is not None:
-                canary_budget.check(mall_key, lookup_url)  # drift -> raise, zero-write
             unfinished = (probe or {}).get("unfinished_bound") is not None
             terminal = bool(
                 (probe or {}).get("terminal_success") or (probe or {}).get("terminal_failed")
             )
+            if canary_budget is not None and (unfinished or not terminal):
+                # Preflight target set holds only actionable URLs (reuse +
+                # create); a terminal-classified entry makes zero remote calls
+                # (cache-sync record only), so budget-checking it here would
+                # raise a false CANARY_LIVE_SCOPE_DRIFT after an honest PASS.
+                canary_budget.check(mall_key, lookup_url)  # drift -> raise, zero-write
             if unfinished or not terminal:
                 live_interactions += 1
         if live_interactions > canary_scope.max_urls:
