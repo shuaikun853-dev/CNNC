@@ -69,6 +69,7 @@ if str(ROOT) not in sys.path:
 from app.services.customer_prewarm_dispatch import (
     DEFAULT_BUDGET_SECONDS,
     DEFAULT_MAX_JOBS_PER_PASS,
+    CanaryLiveBudget,
     CanaryScope,
     run_prewarm_dispatch_pass,
 )
@@ -456,7 +457,9 @@ def _run_dispatch(args: argparse.Namespace, business_date: str, runtime_root: Pa
                 if args.json_output is not None:
                     _write_json_output(args.json_output, preflight)
                 return 2
-            # preflight PASS -> RW live.
+            # preflight PASS -> RW live, carrying the preflight target set as a
+            # hard budget: any live interaction outside it fails closed.
+            canary_budget = CanaryLiveBudget.from_plan(preflight, canary_scope)
             rw_prewarm = CustomerPrewarmStore(prewarm_store_path)
             rw_cache = SharedCrawlCache(shared_cache_path)
             summary = run_prewarm_dispatch_pass(
@@ -470,6 +473,7 @@ def _run_dispatch(args: argparse.Namespace, business_date: str, runtime_root: Pa
                 max_jobs_per_pass=args.max_jobs_per_pass,
                 plan_only=False,
                 canary_scope=canary_scope,
+                canary_budget=canary_budget,
             )
             for key in (
                 "existing_remote_reused_planned",
@@ -477,6 +481,7 @@ def _run_dispatch(args: argparse.Namespace, business_date: str, runtime_root: Pa
                 "new_remote_jobs_planned",
                 "priority_updates_planned",
                 "remote_interaction_urls",
+                "canary_target_urls",
                 "candidates_seen_total",
                 "candidates_in_scope",
                 "skipped_by_canary_filter",
@@ -485,6 +490,19 @@ def _run_dispatch(args: argparse.Namespace, business_date: str, runtime_root: Pa
             summary["sandbox_schema_migrated"] = (
                 not had_remote_job_column and _store_has_remote_job_column(prewarm_store_path)
             )
+            if any(
+                "CanaryScopeViolation" in error or "CANARY_LIVE_SCOPE_DRIFT" in error
+                for error in summary.get("phase_errors", [])
+            ):
+                # Drift hard-fail: the live pass met a state outside the
+                # read-only preflight target set — scheduler must see exit 2.
+                print(
+                    "customer_prewarm_dispatch canary live SCOPE_DRIFT "
+                    "CANARY_LIVE_SCOPE_DRIFT; fail closed"
+                )
+                if args.json_output is not None:
+                    _write_json_output(args.json_output, summary)
+                return 2
         else:
             prewarm_store = CustomerPrewarmStore(prewarm_store_path)
             shared_cache = SharedCrawlCache(shared_cache_path)

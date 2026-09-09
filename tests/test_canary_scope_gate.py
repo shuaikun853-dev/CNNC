@@ -326,6 +326,12 @@ def test_case17a_normal_plan_only_summary_has_no_canary_keys(tmp_path):
 def _run_canary_live(runtime_root, prewarm, cache, *, adapter=None, **kwargs):
     # canary 模式服务层约定与 CLI 守卫一致：max_jobs_per_pass 必须 == cap(1)。
     kwargs.setdefault("max_jobs_per_pass", 1)
+    scope = kwargs.pop("canary_scope", None) or _canary_scope()
+    # Round-2 契约：live+scope 必须携带 preflight budget——由同一 store/cache
+    # 句柄的 plan-only 预演构造（零写）；显式传入的 canary_budget 优先（Case D）。
+    canary_budget = kwargs.pop("canary_budget", None) or _live_budget(
+        runtime_root, prewarm, cache, scope=scope
+    )
     return run_prewarm_dispatch_pass(
         prewarm,
         cache,
@@ -333,7 +339,8 @@ def _run_canary_live(runtime_root, prewarm, cache, *, adapter=None, **kwargs):
         runtime_root=runtime_root,
         mappings=[COMIX, XHGJ],
         adapter=adapter,
-        canary_scope=_canary_scope(),
+        canary_scope=scope,
+        canary_budget=canary_budget,
         **kwargs,
     )
 
@@ -645,6 +652,8 @@ def test_case16_canary_rw_live_migrates_only_sandbox_store(tmp_path):
     adapter = _CountingAdapter()
     migrated = CustomerPrewarmStore(store_path)  # RW 构造器执行幂等迁移
 
+    # Round-2 契约：live canary 由同句柄 plan-only 构造预算后传入。
+    budget = _live_budget(runtime_root, migrated, cache)
     summary = run_prewarm_dispatch_pass(
         migrated,
         cache,
@@ -654,6 +663,7 @@ def test_case16_canary_rw_live_migrates_only_sandbox_store(tmp_path):
         adapter=adapter,
         max_jobs_per_pass=1,
         canary_scope=_canary_scope(),
+        canary_budget=budget,
     )
 
     assert summary["jobs_created"] == 1
@@ -1467,3 +1477,68 @@ def test_r2_confirm_and_boost_per_call_budget_second_layer(tmp_path):
             audit_store.release_lease(token)
     finally:
         lock.release()
+
+
+# ---- Round-2 Task 3:Case C——preflight/live 漂移（CLI 端到端，TOCTOU）---------------
+
+
+def test_r2_case_c_cli_live_drift_after_preflight_fails_closed(tmp_path, monkeypatch, capsys):
+    runtime_root, state_root, store_path, cache_path = _tmp_layout(tmp_path)
+    prewarm = CustomerPrewarmStore(store_path)
+    SharedCrawlCache(cache_path)
+    make_candidate(prewarm, "https://www.xhgj.com/item-c1.html", mall="xhgj", document="D-C1")
+    _seed_daily_run(state_root / BUSINESS_DATE / "state.sqlite3", BUSINESS_DATE)
+    workbook = _write_xhgj_mapping_workbook(tmp_path / "mapping.xlsx")
+
+    # 漂移注入：第二个同 mall 候选只在 RW 阶段（preflight 之后）出现。
+    real_init = CustomerPrewarmStore.__init__
+    drift_url = "https://www.xhgj.com/item-c-drift.html"
+
+    def _drift_init(self, path, *args, **kwargs):
+        real_init(self, path, *args, **kwargs)
+        if not kwargs.get("read_only", False):
+            make_candidate(self, drift_url, mall="xhgj", document="D-C-DRIFT")
+
+    monkeypatch.setattr(CustomerPrewarmStore, "__init__", _drift_init)
+
+    created_adapters: list[_CountingAdapter] = []
+
+    class _DriftTrackedAdapter(_CountingAdapter):
+        def __init__(self, *, mappings=None, **kwargs):
+            super().__init__(**kwargs)
+            created_adapters.append(self)
+
+    monkeypatch.setattr(dispatch_service, "CnncLegacyZhaoshangAdapter", _DriftTrackedAdapter)
+
+    json_output = tmp_path / "case-c.json"
+    exit_code = _run_canary_cli(
+        runtime_root,
+        state_root,
+        store_path,
+        cache_path,
+        workbook,
+        "--canary-max-urls",
+        "1",
+        json_output=json_output,
+    )
+
+    assert exit_code == 2
+    stdout = capsys.readouterr().out
+    assert "CANARY_LIVE_SCOPE_DRIFT" in stdout  # 漂移硬失败 marker
+    # fake adapter 零远端调用（submit 与 prioritize 都不许发生）。
+    assert len(created_adapters) <= 1
+    for tracked in created_adapters:
+        assert tracked.submit_calls == 0 and tracked.prioritize_calls == 0
+    # 业务零变更：两个候选行都仍是 PENDING_PREWARM。
+    ro = CustomerPrewarmStore.open_read_only(store_path)
+    rows = ro.candidates()
+    assert len(rows) == 2
+    assert all(row["cache_status"] == CACHE_STATUS_PENDING_PREWARM for row in rows)
+    # 沙箱零任务工件：无任务目录、无 input.xlsx；dispatch.lock 文件本体在
+    # Windows 实现中 release 后残留（任何 live pass 都如此），因此断言锁可
+    # 立即重新获取（无陈旧占用）。
+    assert not (state_root / BUSINESS_DATE / "zhaoshang").exists()
+    assert not [p for p in tmp_path.rglob("input.xlsx")]
+    retry_lock = ProcessLock(runtime_root / "customer_prewarm_dispatch.lock")
+    retry_lock.acquire()
+    retry_lock.release()
