@@ -74,15 +74,19 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "junction python not executable" }
           Write-Host "PREPARE_OK"
       # 清单来源：2026-09-04 审计确认的 CI_SAFE 纯逻辑安全测试（50 个文件）+
-      # 2026-09-07 Issue #10 新增 5 个文件、Review Round 2 +1（56 个）；本地干净
-      # worktree 实测 1376 收集 / 1375 通过 / 1 失败（唯一失败即下方 --deselect 的
-      # 那个，因生产机 gitignored data/ 的 curl 文件在 CI 不存在）。
+      # 2026-09-07 Issue #10 新增 5 个文件、Review Round 2 +1（56 个）+
+      # 2026-09-09 Issue #10 canary 安全门禁 +1（57 个；--only-mall 硬 scope：
+      # other-mall 零写 / URL 超限零写 / 错 mall submit+priority tripwire /
+      # 显式路径与路径策略 / 老 schema 无迁移）；本地干净 worktree 实测
+      # 1376 收集 / 1375 通过 / 1 失败（唯一失败即下方 --deselect 的那个，
+      # 因生产机 gitignored data/ 的 curl 文件在 CI 不存在）。
       - name: Run critical safety tests
         env:
           PYTHONIOENCODING: utf-8
           PYTHONUTF8: "1"  # JS harness 输出 UTF-8，避免 cp1252 Runner 上 subprocess 文本解码崩溃
         run: >
           python -m pytest
+          tests/test_canary_scope_gate.py
           tests/test_customer_price_semantics.py
           tests/test_customer_price_projection.py
           tests/test_customer_reference_routing.py
