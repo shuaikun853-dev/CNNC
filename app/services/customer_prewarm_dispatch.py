@@ -659,6 +659,13 @@ def _reconstruct_prepared_job(
     return rebuilt
 
 
+def _job_interaction_pairs(job_row: Mapping[str, Any]) -> list[tuple[Any, Any]]:
+    """job payload_json 里的 (mall_key, url) 对（canary 预算身份，durable 证据）。"""
+    payload = job_row.get("payload_json") or "{}"
+    data = json.loads(payload) if isinstance(payload, str) else dict(payload)
+    return [(row.get("mall_key"), row.get("url")) for row in data.get("requests", [])]
+
+
 def run_prewarm_dispatch_pass(
     prewarm_store: CustomerPrewarmStore,
     shared_cache: Any,
@@ -788,6 +795,7 @@ def run_prewarm_dispatch_pass(
                     max_jobs_per_pass=max_jobs_per_pass,
                     summary=summary,
                     canary_scope=canary_scope,
+                    canary_budget=canary_budget,
                 )
             finally:
                 try:
@@ -815,6 +823,7 @@ def _run_leased_pass(
     max_jobs_per_pass: int,
     summary: dict[str, Any],
     canary_scope: CanaryScope | None = None,
+    canary_budget: CanaryLiveBudget | None = None,
 ) -> None:
     """Absorb → route → reuse/create → priority proof → boost.  Caller owns lease and locks."""
     phase_errors = summary["phase_errors"]
@@ -948,10 +957,11 @@ def _run_leased_pass(
                 max_jobs_per_pass=max_jobs_per_pass,
                 created_jobs=created_jobs,
                 reuse_items=reuse_items,
-                reused_job_ids_this_pass=reused_job_ids_this_pass,
-                summary=summary,
-                canary_scope=canary_scope,
-            )
+                    reused_job_ids_this_pass=reused_job_ids_this_pass,
+                    summary=summary,
+                    canary_scope=canary_scope,
+                    canary_budget=canary_budget,
+                )
         except Exception as exc:  # noqa: BLE001 - per-group isolation
             phase_errors.append(f"mall {mall_key}: {type(exc).__name__}: {exc}")
             continue
@@ -968,60 +978,80 @@ def _run_leased_pass(
 
     # ---- Phase 4: priority proof (PRIORITY_PENDING jobs) + reuse-boost ----
     counters["jobs_reused"] = len(reused_job_ids_this_pass)
-    # 4a: prove weight_type == -1 for jobs still exactly PRIORITY_PENDING with
-    # a remote identity (prioritize-only; never create/submit).
-    confirm_targets: dict[int, list[tuple[int, str]]] = {}
-    for item in confirm_items:
-        confirm_targets.setdefault(int(item["job_id"]), []).append(
-            (int(item["candidate_id"]), str(item["cache_status"]))
-        )
-    confirm_attempted_job_ids: set[int] = set()
-    for job_id, targets in confirm_targets.items():
-        if monotonic_value() >= deadline:
-            phase_errors.append(
-                f"budget deadline reached; priority confirm of job {job_id} deferred"
+    # Whole-set pre-priority budget guard: before ANY prioritize call of this
+    # phase, every (mall, url) payload pair of the confirm+boost job set must
+    # still be inside the preflight budget.  One drifted pair blocks 4a AND 4b
+    # entirely (whole-set failure semantics: no target is prioritized first).
+    phase4_budget_blocked = False
+    if canary_scope is not None and canary_budget is not None:
+        pending_pairs: set[tuple[str, str]] = set()
+        for item in [*confirm_items, *reuse_items]:
+            job_row = store.get_remote_job(int(item["job_id"]))
+            for mall_value, url_value in _job_interaction_pairs(job_row or {}):
+                pending_pairs.add((str(mall_value), str(url_value)))
+        try:
+            for pair in sorted(pending_pairs):
+                canary_budget.check(*pair)
+        except CanaryScopeViolation as violation:
+            phase4_budget_blocked = True
+            phase_errors.append(f"phase 4 pre-priority budget guard: {violation}")
+    if not phase4_budget_blocked:
+        # 4a: prove weight_type == -1 for jobs still exactly PRIORITY_PENDING
+        # with a remote identity (prioritize-only; never create/submit).
+        confirm_targets: dict[int, list[tuple[int, str]]] = {}
+        for item in confirm_items:
+            confirm_targets.setdefault(int(item["job_id"]), []).append(
+                (int(item["candidate_id"]), str(item["cache_status"]))
             )
-            break
-        if _confirm_pending_priority_job(
-            prewarm_store=prewarm_store,
-            store=store,
-            token=token,
-            get_adapter=get_adapter,
-            business_date=summary["business_date"],
-            note_targets=targets,
-            job_id=job_id,
-            deadline=deadline,
-            monotonic_value=monotonic_value,
-            summary=summary,
-            canary_scope=canary_scope,
-        ) is not None:
-            confirm_attempted_job_ids.add(job_id)
-    # 4b: reuse-boost — idempotent evidence replay for SUBMITTED/RUNNING/
-    # EXPORTED reused jobs.  Jobs the confirm pass owned this pass (attempted,
-    # confirmed, or budget-deferred) are skipped so one pass never calls
-    # prioritize twice on the same job.
-    seen_job_ids: set[int] = set()
-    for item in reuse_items:
-        job_id = int(item["job_id"])
-        if job_id in seen_job_ids or job_id in confirm_attempted_job_ids:
-            continue
-        if monotonic_value() >= deadline:
-            phase_errors.append(f"budget deadline reached; boost of job {job_id} deferred")
-            break
-        seen_job_ids.add(job_id)
-        _boost_reused_job(
-            prewarm_store=prewarm_store,
-            store=store,
-            token=token,
-            get_adapter=get_adapter,
-            business_date=summary["business_date"],
-            candidate_id=int(item["candidate_id"]),
-            job_id=job_id,
-            deadline=deadline,
-            monotonic_value=monotonic_value,
-            summary=summary,
-            canary_scope=canary_scope,
-        )
+        confirm_attempted_job_ids: set[int] = set()
+        for job_id, targets in confirm_targets.items():
+            if monotonic_value() >= deadline:
+                phase_errors.append(
+                    f"budget deadline reached; priority confirm of job {job_id} deferred"
+                )
+                break
+            if _confirm_pending_priority_job(
+                prewarm_store=prewarm_store,
+                store=store,
+                token=token,
+                get_adapter=get_adapter,
+                business_date=summary["business_date"],
+                note_targets=targets,
+                job_id=job_id,
+                deadline=deadline,
+                monotonic_value=monotonic_value,
+                summary=summary,
+                canary_scope=canary_scope,
+                canary_budget=canary_budget,
+            ) is not None:
+                confirm_attempted_job_ids.add(job_id)
+        # 4b: reuse-boost — idempotent evidence replay for SUBMITTED/RUNNING/
+        # EXPORTED reused jobs.  Jobs the confirm pass owned this pass (attempted,
+        # confirmed, or budget-deferred) are skipped so one pass never calls
+        # prioritize twice on the same job.
+        seen_job_ids: set[int] = set()
+        for item in reuse_items:
+            job_id = int(item["job_id"])
+            if job_id in seen_job_ids or job_id in confirm_attempted_job_ids:
+                continue
+            if monotonic_value() >= deadline:
+                phase_errors.append(f"budget deadline reached; boost of job {job_id} deferred")
+                break
+            seen_job_ids.add(job_id)
+            _boost_reused_job(
+                prewarm_store=prewarm_store,
+                store=store,
+                token=token,
+                get_adapter=get_adapter,
+                business_date=summary["business_date"],
+                candidate_id=int(item["candidate_id"]),
+                job_id=job_id,
+                deadline=deadline,
+                monotonic_value=monotonic_value,
+                summary=summary,
+                canary_scope=canary_scope,
+                canary_budget=canary_budget,
+            )
     if canary_scope is not None:
         # §3 口径：本 pass 真实发生的远端交互 = 复用 wire + 新建 URL + Phase 4
         # 的 confirm/boost 调用；同 pass 内对新建任务的 confirm 不另计（该 URL
@@ -1051,6 +1081,7 @@ def _dispatch_mall_group(
     reused_job_ids_this_pass: set[int],
     summary: dict[str, Any],
     canary_scope: CanaryScope | None = None,
+    canary_budget: CanaryLiveBudget | None = None,
 ) -> int:
     """Reuse-or-create + submit for one mall's candidate group (error-isolated
     by the caller).  Returns the number of remote jobs this group wired."""
@@ -1064,6 +1095,31 @@ def _dispatch_mall_group(
     mall_key = mapping.mall_key
     bucket = summary["by_mall"].setdefault(mall_key, {"reused": 0, "created_urls": 0})
 
+    # Canary Pass A (zero-write): probe + budget drift check + classify/count
+    # EVERY entry before the write loop below.  This closes the Round-1 gaps —
+    # the group cap assertion used to sit AFTER the per-entry reuse records and
+    # was skipped entirely by reuse-only groups (empty batch_entries).
+    precomputed_probes: dict[str, Any] = {}
+    if canary_scope is not None:
+        live_interactions = 0
+        for entry in entries:
+            lookup_url = str(entry["routing"].lookup_url)
+            probe = find_remote_work_for_url(paths.state_path, mall_key, lookup_url)
+            precomputed_probes[lookup_url] = probe
+            if canary_budget is not None:
+                canary_budget.check(mall_key, lookup_url)  # drift -> raise, zero-write
+            unfinished = (probe or {}).get("unfinished_bound") is not None
+            terminal = bool(
+                (probe or {}).get("terminal_success") or (probe or {}).get("terminal_failed")
+            )
+            if unfinished or not terminal:
+                live_interactions += 1
+        if live_interactions > canary_scope.max_urls:
+            raise CanaryScopeViolation(
+                f"mall {mall_key}: live remote interactions {live_interactions} exceed "
+                f"canary max urls {canary_scope.max_urls} (CANARY_LIVE_URL_LIMIT_EXCEEDED)"
+            )
+
     crawl_ids: list[int] = []
     batch_entries: list[Mapping[str, Any]] = []
     reused_here = 0
@@ -1071,7 +1127,11 @@ def _dispatch_mall_group(
         candidate = entry["candidate"]
         candidate_id = int(candidate["id"])
         lookup_url = str(entry["routing"].lookup_url)
-        probe = find_remote_work_for_url(paths.state_path, mall_key, lookup_url)
+        probe = (
+            precomputed_probes.get(lookup_url)
+            if canary_scope is not None
+            else find_remote_work_for_url(paths.state_path, mall_key, lookup_url)
+        )
         unfinished = (probe or {}).get("unfinished_bound")
         if unfinished is not None:
             job_id = int(unfinished["job"]["id"])
@@ -1320,6 +1380,7 @@ def _dispatch_mall_group(
                 summary=summary,
                 prepared=job,
                 canary_scope=canary_scope,
+                canary_budget=canary_budget,
             )
     else:  # defensive: unknown submit status is treated fail-closed
         store.mark_submit_unknown(
@@ -1352,6 +1413,7 @@ def _confirm_pending_priority_job(
     summary: dict[str, Any],
     prepared: Any | None = None,
     canary_scope: CanaryScope | None = None,
+    canary_budget: CanaryLiveBudget | None = None,
 ) -> bool | None:
     """One prioritize-only confirm for a job still exactly ``PRIORITY_PENDING``
     with a remote identity (fail-closed; never creates or submits).
@@ -1396,6 +1458,12 @@ def _confirm_pending_priority_job(
                 f"(job mall evidence does not prove {canary_scope.only_mall!r})"
             )
             return False
+        if canary_budget is not None:
+            # Second canary layer (per call): the job's durable payload
+            # (mall, url) pairs must all sit inside the preflight budget
+            # before any prioritize call is made.
+            for mall_value, url_value in _job_interaction_pairs(job_row):
+                canary_budget.check(mall_value, url_value)
         remaining = deadline - monotonic_value()
         if remaining < SUBMIT_MIN_SECONDS:
             phase_errors.append(
@@ -1475,6 +1543,7 @@ def _boost_reused_job(
     monotonic_value: Callable[[], float],
     summary: dict[str, Any],
     canary_scope: CanaryScope | None = None,
+    canary_budget: CanaryLiveBudget | None = None,
 ) -> None:
     """One idempotent priority boost for a reused job (fail-closed)."""
     phase_errors = summary["phase_errors"]
@@ -1507,6 +1576,12 @@ def _boost_reused_job(
                 f"(job mall evidence does not prove {canary_scope.only_mall!r})"
             )
             return
+        if canary_budget is not None:
+            # Second canary layer (per call): the job's durable payload
+            # (mall, url) pairs must all sit inside the preflight budget
+            # before any prioritize call is made.
+            for mall_value, url_value in _job_interaction_pairs(job_row):
+                canary_budget.check(mall_value, url_value)
         store.renew_lease(token, LEASE_TTL_SECONDS)
         priority = adapter.prioritize(
             prepared,

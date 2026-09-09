@@ -40,6 +40,7 @@ from app.services.customer_prewarm_dispatch import (
     CanaryScope,
     CanaryScopeViolation,
     _boost_reused_job,
+    _confirm_pending_priority_job,
     _dispatch_mall_group,
     prewarm_placeholder_sku,
     run_prewarm_dispatch_pass,
@@ -1181,3 +1182,288 @@ def test_r2_live_canary_without_preflight_budget_fails_closed(tmp_path):
         )
     # plan-only 忽略 budget 契约：无 budget 也能跑。
     assert _plan_only_scope(prewarm, cache, runtime_root)["outcome"] == "OK"
+
+
+# ---- Round-2 Task 2:Blocker 1 two-pass + Phase 4 整体预算前置 ---------------------
+# Blocker 1 根因：组级上限断言位于 per-entry 循环之后（循环内已对 reuse 候选
+# _record），且 reuse-only 组 ``if not batch_entries: return 0`` 完全跳过断言。
+
+
+def _state_count(state_path: Path, table: str) -> int:
+    connection = sqlite3.connect(str(state_path))
+    try:
+        return int(connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+    finally:
+        connection.close()
+
+
+def _make_group_summary() -> dict:
+    return {
+        "business_date": BUSINESS_DATE,
+        "phase_errors": [],
+        "by_mall": {},
+        "batch_sizes": [],
+        "existing_remote_reused": 0,
+        "new_remote_urls": 0,
+        "jobs_created": 0,
+        "submit_unknown": 0,
+        "submit_not_attempted": 0,
+    }
+
+
+def _dispatch_group_directly(paths, prewarm, audit_store, entries, adapter, summary, *, scope, budget=None):
+    lock = ProcessLock(paths.lock_path)
+    lock.acquire()
+    try:
+        token = audit_store.acquire_lease(BUSINESS_DATE, "case-ab", 120.0)
+        try:
+            return _dispatch_mall_group(
+                prewarm_store=prewarm,
+                store=audit_store,
+                token=token,
+                paths=paths,
+                mapping=XHGJ,
+                entries=entries,
+                get_adapter=lambda: adapter,
+                deadline=time.monotonic() + 50.0,
+                monotonic_value=time.monotonic,
+                max_jobs_per_pass=1,
+                created_jobs=0,
+                reuse_items=[],
+                reused_job_ids_this_pass=set(),
+                summary=summary,
+                canary_scope=scope,
+                canary_budget=budget,
+            )
+        finally:
+            audit_store.release_lease(token)
+    finally:
+        lock.release()
+
+
+def test_r2_case_a_reuse_only_group_over_limit_raises_zero_write(tmp_path):
+    runtime_root = tmp_path / "runtime"
+    url_a = "https://www.xhgj.com/item-ca.html"
+    url_b = "https://www.xhgj.com/item-cb.html"
+    _seed_remote_work_task(
+        runtime_root, _CountingAdapter(), mapping=XHGJ, url=url_a,
+        task_name="cnnc_current_opt_casea_1", job_state="SUBMITTED",
+        remote_identity="xhgj|tid-ca|tnum-ca",
+    )
+    _seed_remote_work_task(
+        runtime_root, _CountingAdapter(), mapping=XHGJ, url=url_b,
+        task_name="cnnc_current_opt_casea_2", job_state="SUBMITTED",
+        remote_identity="xhgj|tid-cb|tnum-cb",
+    )
+    prewarm = CustomerPrewarmStore(runtime_root / "customer_prewarm.sqlite3")
+    id_a = make_candidate(prewarm, url_a, mall="xhgj", document="D-CA")
+    id_b = make_candidate(prewarm, url_b, mall="xhgj", document="D-CB")
+    rows_before = [_store_row(prewarm.path, id_a), _store_row(prewarm.path, id_b)]
+    paths = make_state_db(runtime_root, BUSINESS_DATE)
+    audit_store = DailyAuditStore(paths.state_path)
+    adapter = _CountingAdapter()
+    entries = [
+        {"candidate": {"id": id_a}, "routing": SimpleNamespace(lookup_url=url_a)},
+        {"candidate": {"id": id_b}, "routing": SimpleNamespace(lookup_url=url_b)},
+    ]
+
+    # reuse-only 组：两个候选都是 reuse（batch_entries 最终为空）——上限检查
+    # 绝不能被空批逃生口跳过，且 raise 必须发生在任何 _record 之前。
+    with pytest.raises(CanaryScopeViolation, match="CANARY_LIVE_URL_LIMIT_EXCEEDED"):
+        _dispatch_group_directly(
+            paths, prewarm, audit_store, entries, adapter, _make_group_summary(),
+            scope=_canary_scope(),
+        )
+
+    assert [_store_row(prewarm.path, id_a), _store_row(prewarm.path, id_b)] == rows_before
+    assert adapter.submit_calls == 0 and adapter.prioritize_calls == 0
+
+
+def test_r2_case_b_mixed_group_over_limit_raises_before_any_record(tmp_path):
+    runtime_root = tmp_path / "runtime"
+    url_a = "https://www.xhgj.com/item-da.html"
+    url_b = "https://www.xhgj.com/item-db.html"
+    _seed_remote_work_task(
+        runtime_root, _CountingAdapter(), mapping=XHGJ, url=url_a,
+        task_name="cnnc_current_opt_caseb_1", job_state="SUBMITTED",
+        remote_identity="xhgj|tid-da|tnum-da",
+    )
+    prewarm = CustomerPrewarmStore(runtime_root / "customer_prewarm.sqlite3")
+    id_a = make_candidate(prewarm, url_a, mall="xhgj", document="D-DBA")
+    id_b = make_candidate(prewarm, url_b, mall="xhgj", document="D-DBB")  # URL B 全新
+    rows_before = [_store_row(prewarm.path, id_a), _store_row(prewarm.path, id_b)]
+    paths = make_state_db(runtime_root, BUSINESS_DATE)
+    crawls_before = _crawl_count(paths.state_path)
+    jobs_before = _state_count(paths.state_path, "remote_jobs")
+    audit_store = DailyAuditStore(paths.state_path)
+    adapter = _CountingAdapter()
+    entries = [
+        {"candidate": {"id": id_a}, "routing": SimpleNamespace(lookup_url=url_a)},
+        {"candidate": {"id": id_b}, "routing": SimpleNamespace(lookup_url=url_b)},
+    ]
+
+    with pytest.raises(CanaryScopeViolation, match="CANARY_LIVE_URL_LIMIT_EXCEEDED"):
+        _dispatch_group_directly(
+            paths, prewarm, audit_store, entries, adapter, _make_group_summary(),
+            scope=_canary_scope(),
+        )
+
+    # raise 发生在任何写之前：候选行不变、state db 无新 crawl/remote 行。
+    assert [_store_row(prewarm.path, id_a), _store_row(prewarm.path, id_b)] == rows_before
+    assert _crawl_count(paths.state_path) == crawls_before
+    assert _state_count(paths.state_path, "remote_jobs") == jobs_before
+    assert adapter.prepare_calls == 0
+    assert adapter.submit_calls == 0 and adapter.prioritize_calls == 0
+
+
+def _live_budget(runtime_root, prewarm, cache, *, scope=None, **kw):
+    """由同一 store/cache 句柄的 plan-only 构造 live 预算（迁移用 helper）。"""
+    plan = run_prewarm_dispatch_pass(
+        prewarm,
+        cache,
+        business_date=BUSINESS_DATE,
+        runtime_root=runtime_root,
+        mappings=[COMIX, XHGJ],
+        plan_only=True,
+        canary_scope=scope or _canary_scope(),
+        **kw,
+    )
+    return CanaryLiveBudget.from_plan(plan, scope or _canary_scope())
+
+
+def test_r2_case_d_two_pending_priority_whole_set_blocked(tmp_path):
+    runtime_root = tmp_path / "runtime"
+    url_a = "https://www.xhgj.com/item-ea.html"
+    url_b = "https://www.xhgj.com/item-eb.html"
+    _seed_paths_a, job_a = _seed_remote_work_task(
+        runtime_root, _CountingAdapter(), mapping=XHGJ, url=url_a,
+        task_name="cnnc_current_opt_cased_1", job_state="PRIORITY_PENDING",
+        remote_identity="xhgj|tid-ea|tnum-ea",
+    )
+    _seed_paths_b, job_b = _seed_remote_work_task(
+        runtime_root, _CountingAdapter(), mapping=XHGJ, url=url_b,
+        task_name="cnnc_current_opt_cased_2", job_state="PRIORITY_PENDING",
+        remote_identity="xhgj|tid-eb|tnum-eb",
+    )
+    prewarm = CustomerPrewarmStore(runtime_root / "customer_prewarm.sqlite3")
+    id_a = make_candidate(prewarm, url_a, mall="xhgj", document="D-DEA")
+    id_b = make_candidate(prewarm, url_b, mall="xhgj", document="D-DEB")
+    prewarm.record_candidate_result(id_a, cache_status=CACHE_STATUS_REMOTE_DISPATCHED, remote_job_id=job_a)
+    prewarm.record_candidate_result(id_b, cache_status=CACHE_STATUS_REMOTE_DISPATCHED, remote_job_id=job_b)
+    rows_before = [_store_row(prewarm.path, id_a), _store_row(prewarm.path, id_b)]
+    cache = SharedCrawlCache(runtime_root / "shared_crawl_cache.sqlite3")
+    adapter = _CountingAdapter()
+    budget = CanaryLiveBudget("xhgj", 1, [("xhgj", url_a)])  # preflight 只批准 A
+
+    summary = _run_canary_live(runtime_root, prewarm, cache, adapter=adapter, canary_budget=budget)
+
+    assert summary["outcome"] == "OK"
+    # 整体失败语义：B 越界 → 连 A 也不许先 prioritize。
+    assert adapter.prioritize_calls == 0
+    assert adapter.submit_calls == 0
+    assert any("phase 4 pre-priority budget guard" in e for e in summary["phase_errors"])
+    assert any("CANARY_LIVE_SCOPE_DRIFT" in e for e in summary["phase_errors"])
+    assert [_store_row(prewarm.path, id_a), _store_row(prewarm.path, id_b)] == rows_before
+
+
+def test_r2_case_e_fresh_create_same_pass_confirm_counts_one_url(tmp_path):
+    runtime_root = tmp_path / "runtime"
+    make_state_db(runtime_root, BUSINESS_DATE)
+    prewarm = CustomerPrewarmStore(runtime_root / "customer_prewarm.sqlite3")
+    cache = SharedCrawlCache(runtime_root / "shared_crawl_cache.sqlite3")
+    candidate_id = make_candidate(
+        prewarm, "https://www.xhgj.com/item-ec.html", mall="xhgj", document="D-EC"
+    )
+    adapter = _CountingAdapter()  # prioritize → UPDATED + weight_type=-1
+
+    budget = _live_budget(runtime_root, prewarm, cache)
+    summary = _run_canary_live(runtime_root, prewarm, cache, adapter=adapter, canary_budget=budget)
+
+    # 不许修过头：fresh create + 同轮 confirm 仍合法，且 URL 身份只计 1。
+    assert summary["outcome"] == "OK"
+    assert summary["jobs_created"] <= 1
+    assert summary["remote_interaction_urls"] == 1
+    assert summary["priority_confirmed"] >= 1
+    assert not any(
+        "CanaryScopeViolation" in e or "CANARY_LIVE_SCOPE_DRIFT" in e
+        for e in summary["phase_errors"]
+    )
+    assert adapter.submit_calls == 1 and adapter.prioritize_calls == 1
+    assert candidate_by_id(prewarm, candidate_id)["cache_status"] == CACHE_STATUS_REMOTE_DISPATCHED
+
+
+def _direct_priority_summary() -> dict:
+    return {
+        "business_date": BUSINESS_DATE,
+        "phase_errors": [],
+        "by_mall": {},
+        "batch_sizes": [],
+        "priority_confirmed": 0,
+        "priority_unconfirmed": 0,
+        "priority_updates_performed": 0,
+    }
+
+
+def test_r2_confirm_and_boost_per_call_budget_second_layer(tmp_path):
+    runtime_root = tmp_path / "runtime"
+    url_c = "https://www.xhgj.com/item-ed.html"
+    _paths, job_c = _seed_remote_work_task(
+        runtime_root, _CountingAdapter(), mapping=XHGJ, url=url_c,
+        task_name="cnnc_current_opt_casef_1", job_state="PRIORITY_PENDING",
+        remote_identity="xhgj|tid-ed|tnum-ed",
+    )
+    prewarm = CustomerPrewarmStore(runtime_root / "customer_prewarm.sqlite3")
+    candidate_id = make_candidate(prewarm, url_c, mall="xhgj", document="D-ED")
+    prewarm.record_candidate_result(
+        candidate_id, cache_status=CACHE_STATUS_REMOTE_DISPATCHED, remote_job_id=job_c
+    )
+    paths = make_state_db(runtime_root, BUSINESS_DATE)
+    audit_store = DailyAuditStore(paths.state_path)
+    adapter = _CountingAdapter()
+    budget = CanaryLiveBudget("xhgj", 1, [])  # 空 → 任何 payload pair 都是 drift
+
+    lock = ProcessLock(paths.lock_path)
+    lock.acquire()
+    try:
+        token = audit_store.acquire_lease(BUSINESS_DATE, "case-second-layer", 120.0)
+        try:
+            confirm_summary = _direct_priority_summary()
+            confirmed = _confirm_pending_priority_job(
+                prewarm_store=prewarm,
+                store=audit_store,
+                token=token,
+                get_adapter=lambda: adapter,
+                business_date=BUSINESS_DATE,
+                note_targets=[(candidate_id, CACHE_STATUS_REMOTE_DISPATCHED)],
+                job_id=job_c,
+                deadline=time.monotonic() + 50.0,
+                monotonic_value=time.monotonic,
+                summary=confirm_summary,
+                canary_scope=_canary_scope(),
+                canary_budget=budget,
+            )
+            assert confirmed is False
+            assert adapter.prioritize_calls == 0
+            assert any("CANARY_LIVE_SCOPE_DRIFT" in e for e in confirm_summary["phase_errors"])
+
+            boost_summary = _direct_priority_summary()
+            _boost_reused_job(
+                prewarm_store=prewarm,
+                store=audit_store,
+                token=token,
+                get_adapter=lambda: adapter,
+                business_date=BUSINESS_DATE,
+                candidate_id=candidate_id,
+                job_id=job_c,
+                deadline=time.monotonic() + 50.0,
+                monotonic_value=time.monotonic,
+                summary=boost_summary,
+                canary_scope=_canary_scope(),
+                canary_budget=budget,
+            )
+            assert adapter.prioritize_calls == 0
+            assert any("CANARY_LIVE_SCOPE_DRIFT" in e for e in boost_summary["phase_errors"])
+        finally:
+            audit_store.release_lease(token)
+    finally:
+        lock.release()
