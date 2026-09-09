@@ -738,6 +738,7 @@ def run_prewarm_dispatch_pass(
                     monotonic_value=monotonic_value,
                     max_jobs_per_pass=max_jobs_per_pass,
                     summary=summary,
+                    canary_scope=canary_scope,
                 )
             finally:
                 try:
@@ -764,6 +765,7 @@ def _run_leased_pass(
     monotonic_value: Callable[[], float],
     max_jobs_per_pass: int,
     summary: dict[str, Any],
+    canary_scope: CanaryScope | None = None,
 ) -> None:
     """Absorb → route → reuse/create → priority proof → boost.  Caller owns lease and locks."""
     phase_errors = summary["phase_errors"]
@@ -785,6 +787,12 @@ def _run_leased_pass(
         for candidate in _status_of(prewarm_store, status):
             candidate_id = int(candidate["id"])
             mall = _candidate_mall(candidate, mappings)
+            if canary_scope is not None:
+                counters["candidates_seen_total"] += 1
+                if not canary_scope.mall_in_scope(mall):
+                    counters["skipped_by_canary_filter"] += 1
+                    continue  # NO cache lookup, NO record, NO reuse/confirm lists
+                counters["candidates_in_scope"] += 1
             if not mall:
                 continue
             try:
@@ -818,6 +826,8 @@ def _run_leased_pass(
     for candidate in prewarm_store.list_unique_cache_misses():
         candidate_id = int(candidate["id"])
         routing = classify_reference_url(str(candidate["lookup_url"] or ""), mappings)
+        if not _scope_gate(summary, routing, canary_scope):
+            continue  # BEFORE cache recheck / any record — zero-write skip
         if routing.outcome == OUTCOME_ZHAOSHANG:
             try:
                 hit = shared_cache.lookup_current(routing.mall_key, routing.lookup_url)
@@ -876,7 +886,7 @@ def _run_leased_pass(
             phase_errors.append(f"mall {mall_key}: no ZhaoshangMallMapping loaded; deferred")
             continue
         try:
-            created_jobs += _dispatch_mall_group(
+            wired = _dispatch_mall_group(
                 prewarm_store=prewarm_store,
                 store=store,
                 token=token,
@@ -891,10 +901,21 @@ def _run_leased_pass(
                 reuse_items=reuse_items,
                 reused_job_ids_this_pass=reused_job_ids_this_pass,
                 summary=summary,
+                canary_scope=canary_scope,
             )
         except Exception as exc:  # noqa: BLE001 - per-group isolation
             phase_errors.append(f"mall {mall_key}: {type(exc).__name__}: {exc}")
             continue
+        if canary_scope is not None and mall_key != canary_scope.only_mall:
+            # Tripwire: the first-line group assertion must have raised long
+            # before; a nonzero value means the defensive layer fired.
+            counters["other_remote_tasks_created"] += wired
+        created_jobs += wired
+    # Same-pass confirms of fresh creates happened inside Phase 3; the §3
+    # interaction count below must not double-count them (the URL was already
+    # counted at create).
+    if canary_scope is not None:
+        priority_updates_before_phase4 = summary["priority_updates_performed"]
 
     # ---- Phase 4: priority proof (PRIORITY_PENDING jobs) + reuse-boost ----
     counters["jobs_reused"] = len(reused_job_ids_this_pass)
@@ -923,6 +944,7 @@ def _run_leased_pass(
             deadline=deadline,
             monotonic_value=monotonic_value,
             summary=summary,
+            canary_scope=canary_scope,
         ) is not None:
             confirm_attempted_job_ids.add(job_id)
     # 4b: reuse-boost — idempotent evidence replay for SUBMITTED/RUNNING/
@@ -949,6 +971,17 @@ def _run_leased_pass(
             deadline=deadline,
             monotonic_value=monotonic_value,
             summary=summary,
+            canary_scope=canary_scope,
+        )
+    if canary_scope is not None:
+        # §3 口径：本 pass 真实发生的远端交互 = 复用 wire + 新建 URL + Phase 4
+        # 的 confirm/boost 调用；同 pass 内对新建任务的 confirm 不另计（该 URL
+        # 已在 create 处计入）。
+        summary["remote_interaction_urls"] = (
+            counters["existing_remote_reused"]
+            + counters["new_remote_urls"]
+            + summary["priority_updates_performed"]
+            - priority_updates_before_phase4
         )
 
 
@@ -968,9 +1001,15 @@ def _dispatch_mall_group(
     reuse_items: list[dict[str, int]],
     reused_job_ids_this_pass: set[int],
     summary: dict[str, Any],
+    canary_scope: CanaryScope | None = None,
 ) -> int:
     """Reuse-or-create + submit for one mall's candidate group (error-isolated
     by the caller).  Returns the number of remote jobs this group wired."""
+    if canary_scope is not None and mapping.mall_key != canary_scope.only_mall:
+        # Second defensive layer: an out-of-scope group must never even probe.
+        raise CanaryScopeViolation(
+            f"canary scope {canary_scope.only_mall!r} violated by mall group {mapping.mall_key!r}"
+        )
     phase_errors = summary["phase_errors"]
     counters = summary
     mall_key = mapping.mall_key
@@ -978,6 +1017,7 @@ def _dispatch_mall_group(
 
     crawl_ids: list[int] = []
     batch_entries: list[Mapping[str, Any]] = []
+    reused_here = 0
     for entry in entries:
         candidate = entry["candidate"]
         candidate_id = int(candidate["id"])
@@ -994,6 +1034,7 @@ def _dispatch_mall_group(
                 phase_errors=phase_errors,
             ):
                 counters["existing_remote_reused"] += 1
+                reused_here += 1
                 bucket["reused"] += 1
                 reuse_items.append({"candidate_id": candidate_id, "job_id": job_id})
                 reused_job_ids_this_pass.add(job_id)
@@ -1035,6 +1076,13 @@ def _dispatch_mall_group(
 
     if not batch_entries:
         return 0
+    if canary_scope is not None and reused_here + len(batch_entries) > canary_scope.max_urls:
+        # Second defensive layer: the whole group's remote side effects must
+        # stay within the canary URL cap — raise BEFORE anything is submitted.
+        raise CanaryScopeViolation(
+            f"mall {mall_key}: group remote side effects {reused_here + len(batch_entries)} "
+            f"exceed canary max urls {canary_scope.max_urls}"
+        )
     if created_jobs >= max_jobs_per_pass:
         phase_errors.append(
             f"mall {mall_key}: max jobs per pass ({max_jobs_per_pass}) reached; "
@@ -1222,6 +1270,7 @@ def _dispatch_mall_group(
                 monotonic_value=monotonic_value,
                 summary=summary,
                 prepared=job,
+                canary_scope=canary_scope,
             )
     else:  # defensive: unknown submit status is treated fail-closed
         store.mark_submit_unknown(
@@ -1253,6 +1302,7 @@ def _confirm_pending_priority_job(
     monotonic_value: Callable[[], float],
     summary: dict[str, Any],
     prepared: Any | None = None,
+    canary_scope: CanaryScope | None = None,
 ) -> bool | None:
     """One prioritize-only confirm for a job still exactly ``PRIORITY_PENDING``
     with a remote identity (fail-closed; never creates or submits).
@@ -1284,6 +1334,19 @@ def _confirm_pending_priority_job(
             or not parts[2]
         ):
             raise ValueError("legacy remote task identity is invalid")
+        if canary_scope is not None and not (
+            str(job_row.get("mall_key") or "") == canary_scope.only_mall
+            and parts[0] == canary_scope.only_mall
+            and prepared.mall_key == canary_scope.only_mall
+        ):
+            # Second defensive layer: all THREE mall evidences (remote_jobs
+            # mall_key column, identity first segment, prepared.mall_key) must
+            # prove the canary target before any prioritize call is made.
+            summary["phase_errors"].append(
+                f"priority confirm job {job_id}: {CANARY_PRIORITY_SCOPE_VIOLATION} "
+                f"(job mall evidence does not prove {canary_scope.only_mall!r})"
+            )
+            return False
         remaining = deadline - monotonic_value()
         if remaining < SUBMIT_MIN_SECONDS:
             phase_errors.append(
@@ -1298,6 +1361,8 @@ def _confirm_pending_priority_job(
             task_number=parts[2],
             timeout_seconds=max(0.001, deadline - monotonic_value()),
         )
+        if canary_scope is not None:
+            summary["priority_updates_performed"] += 1
         if _priority_proven(priority):
             store.reconcile_remote_job(token, job_id, remote_identity=identity, state="SUBMITTED")
             store.advance_crawl_work_for_job(token, job_id, "SUBMITTED")
@@ -1360,6 +1425,7 @@ def _boost_reused_job(
     deadline: float,
     monotonic_value: Callable[[], float],
     summary: dict[str, Any],
+    canary_scope: CanaryScope | None = None,
 ) -> None:
     """One idempotent priority boost for a reused job (fail-closed)."""
     phase_errors = summary["phase_errors"]
@@ -1380,6 +1446,18 @@ def _boost_reused_job(
             or not parts[2]
         ):
             raise ValueError("legacy remote task identity is invalid")
+        if canary_scope is not None and not (
+            str(job_row.get("mall_key") or "") == canary_scope.only_mall
+            and parts[0] == canary_scope.only_mall
+            and prepared.mall_key == canary_scope.only_mall
+        ):
+            # Second defensive layer: all THREE mall evidences must prove the
+            # canary target before any prioritize call is made.
+            phase_errors.append(
+                f"boost job {job_id}: {CANARY_PRIORITY_SCOPE_VIOLATION} "
+                f"(job mall evidence does not prove {canary_scope.only_mall!r})"
+            )
+            return
         store.renew_lease(token, LEASE_TTL_SECONDS)
         priority = adapter.prioritize(
             prepared,
@@ -1387,6 +1465,8 @@ def _boost_reused_job(
             task_number=parts[2],
             timeout_seconds=max(0.001, deadline - monotonic_value()),
         )
+        if canary_scope is not None:
+            summary["priority_updates_performed"] += 1
         status = _status_value(priority.status)
         if status in (PriorityStatus.UPDATED.value, PriorityStatus.ALREADY_HIGHEST.value):
             summary["priority_boosted"] += 1
