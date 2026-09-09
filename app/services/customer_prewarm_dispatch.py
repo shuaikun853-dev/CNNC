@@ -63,6 +63,7 @@ import hashlib
 import json
 import os
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
@@ -105,6 +106,38 @@ BACKEND_VERSION = "legacy-v1"
 DISPATCH_LOCK_NAME = "customer_prewarm_dispatch.lock"
 DEFAULT_BUDGET_SECONDS = 50.0
 DEFAULT_MAX_JOBS_PER_PASS = 8
+
+# ---- Issue #10 canary hard scope gate ---------------------------------------
+# 只读 preflight 的 fail-closed 结果码（值 = 同名字符串，scheduler 直接匹配）。
+CANARY_MALL_NOT_MAPPED = "CANARY_MALL_NOT_MAPPED"
+CANARY_TARGET_EMPTY = "CANARY_TARGET_EMPTY"
+CANARY_URL_LIMIT_EXCEEDED = "CANARY_URL_LIMIT_EXCEEDED"
+CANARY_JOB_LIMIT_EXCEEDED = "CANARY_JOB_LIMIT_EXCEEDED"
+CANARY_PREFLIGHT_FAILED = "CANARY_PREFLIGHT_FAILED"
+# live 第二层防御：Phase 4 三证不一致时的 phase_error 记号。
+CANARY_PRIORITY_SCOPE_VIOLATION = "CANARY_PRIORITY_SCOPE_VIOLATION"
+
+
+class CanaryScopeViolation(RuntimeError):
+    """A live canary pass attempted remote work outside ``--only-mall``."""
+
+
+@dataclass(frozen=True)
+class CanaryScope:
+    """唯一 canary 策略对象：贯穿 CLI 与 service 全部四阶段的 scope 判定。
+
+    ``mall_in_scope`` 在 strip 后严格相等（空 mall 恒 False），绝不做前缀或
+    包含匹配。  ``max_urls``/``max_jobs`` 是 preflight 与 Phase 3 断言共用的
+    硬上限（默认各 1，与 CLI 默认值一致）。
+    """
+
+    only_mall: str
+    max_urls: int = 1
+    max_jobs: int = 1
+
+    def mall_in_scope(self, mall: Any) -> bool:
+        value = str(mall or "").strip()
+        return bool(value) and value == self.only_mall
 
 LEASE_OWNER = "customer_prewarm_dispatch"
 LEASE_TTL_SECONDS = 120.0
@@ -245,8 +278,12 @@ def find_remote_work_for_url(
     }
 
 
-def _empty_summary(business_date: str, plan_only: bool) -> dict[str, Any]:
-    return {
+def _empty_summary(
+    business_date: str,
+    plan_only: bool,
+    canary_scope: CanaryScope | None = None,
+) -> dict[str, Any]:
+    summary = {
         "outcome": "OK",
         "business_date": business_date,
         "plan_only": bool(plan_only),
@@ -274,6 +311,25 @@ def _empty_summary(business_date: str, plan_only: bool) -> dict[str, Any]:
         "by_mall": {},
         "batch_sizes": [],
     }
+    if canary_scope is not None:
+        # §11 canary 键集合：scope 存在时才追加（普通模式键集合逐字节不变）。
+        summary.update(
+            {
+                "canary_mode": True,
+                "only_mall": canary_scope.only_mall,
+                "canary_max_urls": canary_scope.max_urls,
+                "candidates_seen_total": 0,
+                "candidates_in_scope": 0,
+                "skipped_by_canary_filter": 0,
+                "remote_interaction_urls": 0,
+                # Tripwire counters: Phase 1-4 scope enforcement must keep both
+                # at 0; a nonzero value means a defensive layer fired.
+                "other_remote_tasks_created": 0,
+                "other_priority_changed": 0,
+                "priority_updates_performed": 0,
+            }
+        )
+    return summary
 
 
 def _status_of(store: CustomerPrewarmStore, status: str) -> list[dict[str, Any]]:
@@ -341,6 +397,52 @@ def _record(
         return False
 
 
+def validate_canary_preflight(
+    plan: Mapping[str, Any],
+    canary_scope: CanaryScope,
+    mappings: Sequence[ZhaoshangMallMapping],
+) -> str | None:
+    """Fail-closed gate over one scoped plan-only report (PASS → ``None``).
+
+    顺序即优先级：mall 未映射 > 目标为空 > URL 超限 > 任务超限 > 规划自身
+    phase error。  只读 preflight（plan-only 路径先于任何锁/写返回）复用同
+    一个 scope predicate，因此同参 plan-only 就是有效预演。
+    """
+    if not any(m.mall_key == canary_scope.only_mall for m in mappings):
+        return CANARY_MALL_NOT_MAPPED
+    if int(plan.get("candidates_in_scope", 0) or 0) < 1:
+        return CANARY_TARGET_EMPTY
+    if int(plan.get("remote_interaction_urls", 0) or 0) > canary_scope.max_urls:
+        return CANARY_URL_LIMIT_EXCEEDED
+    if int(plan.get("new_remote_jobs_planned", 0) or 0) > canary_scope.max_jobs:
+        return CANARY_JOB_LIMIT_EXCEEDED
+    if plan.get("phase_errors"):
+        return CANARY_PREFLIGHT_FAILED
+    return None
+
+
+def _scope_gate(
+    summary: dict[str, Any],
+    routing: Any,
+    canary_scope: CanaryScope | None,
+) -> bool:
+    """§12 共享 scope predicate：plan-only 与 live Phase 2 调用同一函数。
+
+    返回该候选是否 in-scope；越界候选（staples/tmall/unmapped/非目标商城）
+    在任何 cache 探测或写之前被计数并跳过。
+    """
+    if canary_scope is None:
+        return True
+    summary["candidates_seen_total"] += 1
+    if routing.outcome != OUTCOME_ZHAOSHANG or not canary_scope.mall_in_scope(
+        routing.mall_key
+    ):
+        summary["skipped_by_canary_filter"] += 1
+        return False
+    summary["candidates_in_scope"] += 1
+    return True
+
+
 def _plan_only_report(
     prewarm_store: CustomerPrewarmStore,
     shared_cache: Any,
@@ -349,9 +451,10 @@ def _plan_only_report(
     state_db_path: Path,
     mappings: Sequence[ZhaoshangMallMapping],
     max_jobs_per_pass: int,
+    canary_scope: CanaryScope | None = None,
 ) -> dict[str, Any]:
     """Build the §26 report with ZERO writes (no locks, no adapter, ro probes)."""
-    summary = _empty_summary(business_date, plan_only=True)
+    summary = _empty_summary(business_date, plan_only=True, canary_scope=canary_scope)
     phase_errors = summary["phase_errors"]
     by_mall: dict[str, dict[str, int]] = {}
 
@@ -373,6 +476,8 @@ def _plan_only_report(
     for candidate in misses:
         candidate_id = int(candidate["id"])
         routing = classify_reference_url(str(candidate["lookup_url"] or ""), mappings)
+        if not _scope_gate(summary, routing, canary_scope):
+            continue  # BEFORE cache recheck — mirrors live zero-write skip
         if routing.outcome == OUTCOME_ZHAOSHANG:
             try:
                 hit = shared_cache.lookup_current(routing.mall_key, routing.lookup_url)
@@ -423,6 +528,11 @@ def _plan_only_report(
     pending_priority_planned = 0
     for status in (CACHE_STATUS_REMOTE_DISPATCHED, CACHE_STATUS_REMOTE_REUSED):
         for candidate in prewarm_store.candidates(status):
+            if canary_scope is not None:
+                summary["candidates_seen_total"] += 1
+                if not canary_scope.mall_in_scope(_candidate_mall(candidate, mappings)):
+                    continue  # no job read, no priority planning
+                summary["candidates_in_scope"] += 1
             job_id = candidate.get("remote_job_id")
             if job_id is None or int(job_id) in seen_priority_job_ids:
                 continue
@@ -452,6 +562,16 @@ def _plan_only_report(
     ]
     summary["existing_remote_reused"] = reused_planned
     summary["new_remote_urls"] = summary["new_remote_urls_planned"]
+    if canary_scope is not None:
+        # §3 口径 = 复用 + 新建 + 待确认优先级（planning 视角，零远端调用）。
+        summary["remote_interaction_urls"] = (
+            summary["existing_remote_reused_planned"]
+            + summary["new_remote_urls_planned"]
+            + pending_priority_planned
+        )
+        summary["canary_preflight"] = (
+            validate_canary_preflight(summary, canary_scope, mappings) or "PASS"
+        )
     return summary
 
 
@@ -512,6 +632,7 @@ def run_prewarm_dispatch_pass(
     monotonic: Callable[[], float] | None = None,
     plan_only: bool = False,
     now: Any = None,
+    canary_scope: CanaryScope | None = None,
 ) -> dict[str, Any]:
     """Run one bounded dispatch pass and return its intake-style summary.
 
@@ -526,7 +647,16 @@ def run_prewarm_dispatch_pass(
     ``<date>/state.sqlite3``, per-day lock and zhaoshang job dirs) from
     ``runtime_root`` (prewarm-store / shared-cache base and the dispatcher's
     own instance lock); ``None`` keeps both on ``runtime_root``.
+
+    ``canary_scope`` (``--only-mall``) hard-scopes the ENTIRE pass to one mall:
+    the plan-only branch becomes a scoped read-only preflight (same predicate
+    as live), and the live branch enforces all four phases through the same
+    :class:`CanaryScope` policy object with layered defensive assertions.
     """
+    if canary_scope is not None and not plan_only and max_jobs_per_pass > canary_scope.max_jobs:
+        raise CanaryScopeViolation(
+            f"--max-jobs-per-pass {max_jobs_per_pass} exceeds canary cap {canary_scope.max_jobs}"
+        )
     monotonic_value = monotonic or time.monotonic
     deadline = monotonic_value() + max(0.0, float(budget_seconds))
     paths = runtime_paths(
@@ -542,9 +672,10 @@ def run_prewarm_dispatch_pass(
             state_db_path=paths.state_path,
             mappings=mappings,
             max_jobs_per_pass=max_jobs_per_pass,
+            canary_scope=canary_scope,
         )
 
-    summary = _empty_summary(business_date, plan_only=False)
+    summary = _empty_summary(business_date, plan_only=False, canary_scope=canary_scope)
     phase_errors = summary["phase_errors"]
     counters = summary
 
