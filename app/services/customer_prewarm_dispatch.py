@@ -171,6 +171,22 @@ class CanaryLiveBudget:
             )
         return key
 
+    def revalidate(self, current_urls) -> int:
+        """Live 零写 revalidation：current ⊆ allowed（shrink 合法，增长即漂移）。
+
+        返回 current 集合大小；任一 live actionable 目标不在 preflight 集合内
+        时 raise CanaryScopeViolation（CANARY_LIVE_SCOPE_DRIFT），调用方必须
+        在任何业务写之前 fail closed。
+        """
+        current = {(str(m).strip(), str(u).strip()) for m, u in current_urls}
+        drift = current - self._allowed
+        if drift:
+            raise CanaryScopeViolation(
+                f"CANARY_LIVE_SCOPE_DRIFT: live actionable targets not in the "
+                f"preflight set: {sorted(drift)!r}"
+            )
+        return len(current)
+
 
 LEASE_OWNER = "customer_prewarm_dispatch"
 LEASE_TTL_SECONDS = 120.0
@@ -852,6 +868,32 @@ def _run_leased_pass(
     """Absorb → route → reuse/create → priority proof → boost.  Caller owns lease and locks."""
     phase_errors = summary["phase_errors"]
     counters = summary
+
+    # ---- Phase 0 (canary): zero-write live revalidation barrier ----
+    # Re-derive the CURRENT actionable target set through the SAME read-only
+    # plan logic (_plan_only_report has no write path) and require it to be a
+    # subset of the preflight-approved budget.  Anything that grew between
+    # preflight and live is drift and must fail closed BEFORE Phase 1 absorbs
+    # or mutates any candidate (target shrink is safe and allowed).
+    if canary_scope is not None and canary_budget is not None:
+        revalidation = _plan_only_report(
+            prewarm_store,
+            shared_cache,
+            business_date=summary["business_date"],
+            state_db_path=paths.state_path,
+            mappings=mappings,
+            max_jobs_per_pass=max_jobs_per_pass,
+            canary_scope=canary_scope,
+        )
+        try:
+            summary["canary_revalidated_targets"] = canary_budget.revalidate(
+                revalidation.get("canary_target_urls") or []
+            )
+        except CanaryScopeViolation as violation:
+            phase_errors.append(f"live revalidation barrier: {violation}")
+            summary["outcome"] = "CANARY_LIVE_SCOPE_DRIFT"
+            return
+
     reuse_items: list[dict[str, Any]] = []
     # confirm_items: REMOTE_* candidates bound to a job that may still be
     # PRIORITY_PENDING — they re-enter the prioritize-only confirm pass (Phase

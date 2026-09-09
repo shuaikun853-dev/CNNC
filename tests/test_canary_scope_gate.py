@@ -1368,11 +1368,13 @@ def test_r2_case_d_two_pending_priority_whole_set_blocked(tmp_path):
 
     summary = _run_canary_live(runtime_root, prewarm, cache, adapter=adapter, canary_budget=budget)
 
-    assert summary["outcome"] == "OK"
-    # 整体失败语义：B 越界 → 连 A 也不许先 prioritize。
+    # Round-3 barrier：live 前零写重算即发现 B 增长（增长=漂移）→ 整个 pass
+    # fail closed。Phase 4 前置整体守卫保留为纵深防御（同一违例不再到达
+    # Phase 4；其非阻断面由 T3 钉住、per-call 第二层由直调 confirm/boost 钉住）。
+    assert summary["outcome"] == "CANARY_LIVE_SCOPE_DRIFT"
     assert adapter.prioritize_calls == 0
     assert adapter.submit_calls == 0
-    assert any("phase 4 pre-priority budget guard" in e for e in summary["phase_errors"])
+    assert any("live revalidation barrier" in e for e in summary["phase_errors"])
     assert any("CANARY_LIVE_SCOPE_DRIFT" in e for e in summary["phase_errors"])
     assert [_store_row(prewarm.path, id_a), _store_row(prewarm.path, id_b)] == rows_before
 
@@ -1732,8 +1734,9 @@ def test_r3_t3_non_actionable_entry_never_trips_phase4_guard(tmp_path):
 
 def test_r3_t4_boost_drift_after_preflight_blocks_whole_phase4(tmp_path):
     """T4 boost 漂移整体失败：preflight 只含 A（PENDING confirm），live 前新增
-    REMOTE_REUSED+boostable B → Phase 4 前置守卫必须拦下（整体失败语义：
-    prioritize=0，A 也不许先动）——修复 C 不得弱化该 guard。"""
+    REMOTE_REUSED+boostable B → Round-3 起由 Phase 0 零写 revalidation barrier
+    先拦（pass 在 Phase 1 前 fail closed，prioritize=0，A 也不许先动）；Phase 4
+    前置整体守卫保留为纵深防御（修复 C 不得弱化该 guard）。"""
     runtime_root = tmp_path / "runtime"
     url_a = "https://www.xhgj.com/item-t4a.html"
     _paths_a, job_a = _seed_remote_work_task(
@@ -1771,8 +1774,10 @@ def test_r3_t4_boost_drift_after_preflight_blocks_whole_phase4(tmp_path):
 
     summary = _run_canary_live(runtime_root, prewarm, cache, adapter=adapter, canary_budget=budget)
 
+    assert summary["outcome"] == "CANARY_LIVE_SCOPE_DRIFT"
     assert adapter.prioritize_calls == 0
-    assert any("phase 4 pre-priority budget guard" in error for error in summary["phase_errors"])
+    assert adapter.submit_calls == 0
+    assert any("live revalidation barrier" in error for error in summary["phase_errors"])
     assert any("CANARY_LIVE_SCOPE_DRIFT" in error for error in summary["phase_errors"])
     assert [_store_row(prewarm.path, id_a), _store_row(prewarm.path, id_b)] == rows_before
 
@@ -1827,3 +1832,72 @@ def test_r3g_fix1_phase3_scope_violation_terminates_whole_pass(tmp_path, monkeyp
     assert adapter.submit_calls == 0
     assert adapter.prepare_calls == 0
     assert [_store_row(prewarm.path, id_a), _store_row(prewarm.path, id_b)] == rows_before
+
+
+# ---- Round-3 Gate Review Fix 2:live 零写 revalidation barrier（Case G/H）----------
+
+
+def test_r3g_case_g_barrier_fails_before_phase1_absorb_and_any_write(tmp_path):
+    """Case G：budget={A}（create 目标）；budget 构造后、live 前 A 落入 shared
+    cache current hit 且注入新候选 B → barrier 必须在 Phase 1 absorb / Phase 2
+    recheck 的任何 _record 之前失败：A 不被写成 CACHE_HIT、全部候选 business
+    rows before==after、零 adapter 调用。"""
+    runtime_root = tmp_path / "runtime"
+    make_state_db(runtime_root, BUSINESS_DATE)
+    prewarm = CustomerPrewarmStore(runtime_root / "customer_prewarm.sqlite3")
+    cache = SharedCrawlCache(runtime_root / "shared_crawl_cache.sqlite3")
+    url_a = "https://www.xhgj.com/item-r3g-ga.html"
+    id_a = make_candidate(prewarm, url_a, mall="xhgj", document="D-R3GAX")
+    budget = _live_budget(runtime_root, prewarm, cache)  # preflight 只批准 A
+    # budget 构造后、live 前：A 被缓存覆盖 + 注入同 mall 新候选 B（漂移）。
+    cache.record_success(mall="xhgj", submitted_url=url_a, source="daily-internet", price="3.3")
+    url_b = "https://www.xhgj.com/item-r3g-gb.html"
+    id_b = make_candidate(prewarm, url_b, mall="xhgj", document="D-R3GBX")
+    rows_before = [_store_row(prewarm.path, id_a), _store_row(prewarm.path, id_b)]
+    adapter = _CountingAdapter()
+
+    summary = _run_canary_live(runtime_root, prewarm, cache, adapter=adapter, canary_budget=budget)
+
+    assert summary["outcome"] == "CANARY_LIVE_SCOPE_DRIFT"
+    assert any(
+        "live revalidation barrier" in error and "CANARY_LIVE_SCOPE_DRIFT" in error
+        for error in summary["phase_errors"]
+    )
+    # barrier 先于 Phase 1 absorb 与 Phase 2 recheck：A 仍是 PENDING_PREWARM
+    # （未被写成 CACHE_HIT），B 不变。
+    assert _store_row(prewarm.path, id_a) == rows_before[0]
+    assert _store_row(prewarm.path, id_b) == rows_before[1]
+    assert adapter.prepare_calls == 0
+    assert adapter.submit_calls == 0
+    assert adapter.prioritize_calls == 0
+
+
+def test_r3g_case_h_target_shrink_is_safe_and_terminal_branch_records(tmp_path):
+    """Case H：目标减少=安全（current ⊆ allowed）。budget={A}；live 前 A 被
+    terminal_success 覆盖 → barrier 重算 current={} ⊆ {A} 通过、零误报；Phase 3
+    terminal 分支正常记录（候选写允许）、零 submit/prioritize/prepare。"""
+    runtime_root = tmp_path / "runtime"
+    make_state_db(runtime_root, BUSINESS_DATE)
+    prewarm = CustomerPrewarmStore(runtime_root / "customer_prewarm.sqlite3")
+    cache = SharedCrawlCache(runtime_root / "shared_crawl_cache.sqlite3")
+    url_a = "https://www.xhgj.com/item-r3g-ha.html"
+    id_a = make_candidate(prewarm, url_a, mall="xhgj", document="D-R3HAX")
+    budget = _live_budget(runtime_root, prewarm, cache)  # preflight 批准 {A}
+    # budget 构造后 A 才被 terminal 覆盖：current 收缩为 {}（收缩合法）。
+    seed_terminal_crawl(runtime_root, BUSINESS_DATE, XHGJ, url_a, result="seeded")
+    adapter = _CountingAdapter()
+
+    summary = _run_canary_live(runtime_root, prewarm, cache, adapter=adapter, canary_budget=budget)
+
+    assert summary["outcome"] == "OK"
+    assert summary["canary_revalidated_targets"] == 0
+    assert not any(
+        "CANARY_LIVE_SCOPE_DRIFT" in error or "CanaryScopeViolation" in error
+        for error in summary["phase_errors"]
+    )
+    assert adapter.prepare_calls == 0
+    assert adapter.submit_calls == 0
+    assert adapter.prioritize_calls == 0
+    row = candidate_by_id(prewarm, id_a)
+    assert row["cache_status"] == CACHE_STATUS_REMOTE_DISPATCHED
+    assert row["last_error"] == _CACHE_SYNC_PENDING_NOTE
