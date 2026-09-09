@@ -36,6 +36,20 @@ events as ``already_ingested_cross_source`` (deduped across ingest sources).
 A job whose evidence cannot be revalidated is isolated into ``jobs_partial``
 and reported as ``HISTORICAL_BACKFILL_PARTIAL`` (exit 0 — a documented
 outcome; exit 2 is reserved for unexpected failures).
+
+``--only-mall MALL`` (canary mode) hard-scopes the ENTIRE pass — all four
+phases — to one mall through the service-level :class:`CanaryScope` policy
+object.  Canary mode requires all three explicit data-source paths
+(``CANARY_EXPLICIT_PATHS_REQUIRED`` otherwise), ``--max-jobs-per-pass 1`` and
+refuses store/cache paths inside ``--state-runtime-root`` (or named
+``state.sqlite3``: ``CANARY_PATH_POLICY_VIOLATION``).  A live canary pass runs
+a READ-ONLY preflight (the same-parameter scoped plan-only report over
+``mode=ro`` store handles) BEFORE any RW store constructor, ProcessLock,
+schema migration or job artifact; a blocked preflight
+(``CANARY_MALL_NOT_MAPPED`` / ``CANARY_TARGET_EMPTY`` / ``CANARY_URL_LIMIT_EXCEEDED``
+/ ``CANARY_JOB_LIMIT_EXCEEDED`` / ``CANARY_PREFLIGHT_FAILED``) exits 2 with
+zero writes.  On PASS the RW live run carries the preflight plan fields plus
+``sandbox_schema_migrated``.
 """
 
 from __future__ import annotations
@@ -43,6 +57,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sqlite3
 import sys
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -54,6 +69,7 @@ if str(ROOT) not in sys.path:
 from app.services.customer_prewarm_dispatch import (
     DEFAULT_BUDGET_SECONDS,
     DEFAULT_MAX_JOBS_PER_PASS,
+    CanaryScope,
     run_prewarm_dispatch_pass,
 )
 from app.services.customer_prewarm_store import CustomerPrewarmStore
@@ -147,6 +163,22 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_MAX_JOBS_PER_PASS,
         help="upper bound of remote jobs CREATED this pass; "
         f"default {DEFAULT_MAX_JOBS_PER_PASS}",
+    )
+    parser.add_argument(
+        "--only-mall",
+        default=None,
+        metavar="MALL",
+        help="canary mode: hard-scope the ENTIRE pass (all four phases) to one "
+        "mall; requires explicit --prewarm-store-path/--shared-cache-path/"
+        "--state-runtime-root and --max-jobs-per-pass 1",
+    )
+    parser.add_argument(
+        "--canary-max-urls",
+        type=int,
+        default=1,
+        metavar="N",
+        help="canary: max remote-interaction URLs (reuse + create + priority "
+        "confirm) allowed by preflight; default 1",
     )
     parser.add_argument(
         "--json-output",
@@ -269,6 +301,43 @@ def _print_missing_store_diagnosis(
     return 0
 
 
+def _print_canary_missing_store(
+    business_date: str,
+    outcome: str,
+    missing_path: Path,
+    args: argparse.Namespace,
+) -> int:
+    """Canary live diagnosis for a missing store: fail-closed exit 2 (the
+    plan-only exit-0 semantics never applies to a live canary run)."""
+    diagnosis = {
+        "business_date": business_date,
+        "canary_only_mall": args.only_mall,
+        "outcome": outcome,
+        "missing_path": str(missing_path),
+    }
+    print(json.dumps(diagnosis, ensure_ascii=False, sort_keys=True))
+    if args.json_output is not None:
+        _write_json_output(args.json_output, diagnosis)
+    return 2
+
+
+def _store_has_remote_job_column(path: Path) -> bool:
+    """``mode=ro`` probe: does the prewarm store already carry the
+    ``remote_job_id`` column?  A missing file never creates one (False)."""
+    path = Path(path)
+    if not path.is_file():
+        return False
+    connection = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
+    try:
+        columns = {
+            row[1]
+            for row in connection.execute("PRAGMA table_info(prewarm_candidates)").fetchall()
+        }
+        return "remote_job_id" in columns
+    finally:
+        connection.close()
+
+
 def _run_dispatch(args: argparse.Namespace, business_date: str, runtime_root: Path) -> int:
     mappings = load_zhaoshang_mall_mappings(args.mapping_path)
     state_runtime_root = (
@@ -286,38 +355,150 @@ def _run_dispatch(args: argparse.Namespace, business_date: str, runtime_root: Pa
         if args.shared_cache_path is not None
         else runtime_root / SHARED_CACHE_NAME
     )
-    if args.plan_only:
-        # Provably zero construction: read-only store handles never mkdir,
-        # never initialize a schema, never touch a missing file — a missing
-        # store is a diagnosis (prewarm store reported first), never a fresh
-        # empty store.
-        try:
-            prewarm_store = CustomerPrewarmStore.open_read_only(prewarm_store_path)
-        except FileNotFoundError:
-            return _print_missing_store_diagnosis(
-                business_date, "PREWARM_STORE_MISSING", prewarm_store_path, args
-            )
-        try:
-            shared_cache = SharedCrawlCache.open_read_only(shared_cache_path)
-        except FileNotFoundError:
-            return _print_missing_store_diagnosis(
-                business_date, "SHARED_CACHE_MISSING", shared_cache_path, args
-            )
-    else:
-        prewarm_store = CustomerPrewarmStore(prewarm_store_path)
-        shared_cache = SharedCrawlCache(shared_cache_path)
-    try:
-        summary = run_prewarm_dispatch_pass(
-            prewarm_store,
-            shared_cache,
-            business_date=business_date,
-            runtime_root=runtime_root,
-            state_runtime_root=state_runtime_root,
-            mappings=mappings,
-            budget_seconds=args.budget_seconds,
-            max_jobs_per_pass=args.max_jobs_per_pass,
-            plan_only=bool(args.plan_only),
+    canary_scope = (
+        CanaryScope(only_mall=str(args.only_mall).strip(), max_urls=args.canary_max_urls)
+        if args.only_mall
+        else None
+    )
+    if canary_scope is not None:
+        # Path policy: canary stores must never alias the STEP1 state runtime
+        # (that layout belongs to the production dispatcher, never a canary).
+        state_root = (
+            Path(args.state_runtime_root).resolve()
+            if args.state_runtime_root is not None
+            else runtime_root
         )
+        for label, p in (("prewarm-store", prewarm_store_path), ("shared-cache", shared_cache_path)):
+            if p == state_root or state_root in p.parents or p.name == "state.sqlite3":
+                print(
+                    json.dumps(
+                        {
+                            "outcome": "CANARY_PATH_POLICY_VIOLATION",
+                            "path": str(p),
+                            "state_runtime_root": str(state_root),
+                            "role": label,
+                        },
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    )
+                )
+                return 2
+    try:
+        if args.plan_only:
+            # Provably zero construction: read-only store handles never mkdir,
+            # never initialize a schema, never touch a missing file — a missing
+            # store is a diagnosis (prewarm store reported first), never a fresh
+            # empty store.
+            try:
+                prewarm_store = CustomerPrewarmStore.open_read_only(prewarm_store_path)
+            except FileNotFoundError:
+                return _print_missing_store_diagnosis(
+                    business_date, "PREWARM_STORE_MISSING", prewarm_store_path, args
+                )
+            try:
+                shared_cache = SharedCrawlCache.open_read_only(shared_cache_path)
+            except FileNotFoundError:
+                return _print_missing_store_diagnosis(
+                    business_date, "SHARED_CACHE_MISSING", shared_cache_path, args
+                )
+            summary = run_prewarm_dispatch_pass(
+                prewarm_store,
+                shared_cache,
+                business_date=business_date,
+                runtime_root=runtime_root,
+                state_runtime_root=state_runtime_root,
+                mappings=mappings,
+                budget_seconds=args.budget_seconds,
+                max_jobs_per_pass=args.max_jobs_per_pass,
+                plan_only=True,
+                canary_scope=canary_scope,
+            )
+            if canary_scope is not None and summary.get("canary_preflight", "PASS") != "PASS":
+                print(f"canary preflight FAILED outcome={summary['canary_preflight']}")
+                if args.json_output is not None:
+                    _write_json_output(args.json_output, summary)
+                return 2
+        elif canary_scope is not None:
+            # READ-ONLY preflight BEFORE any RW store constructor, ProcessLock,
+            # schema migration or job artifact: the same-parameter scoped
+            # plan-only pass over mode=ro handles, so a blocked canary leaves
+            # every store byte-identical.
+            try:
+                ro_prewarm = CustomerPrewarmStore.open_read_only(prewarm_store_path)
+            except FileNotFoundError:
+                return _print_canary_missing_store(
+                    business_date, "PREWARM_STORE_MISSING", prewarm_store_path, args
+                )
+            try:
+                ro_cache = SharedCrawlCache.open_read_only(shared_cache_path)
+            except FileNotFoundError:
+                return _print_canary_missing_store(
+                    business_date, "SHARED_CACHE_MISSING", shared_cache_path, args
+                )
+            had_remote_job_column = _store_has_remote_job_column(prewarm_store_path)
+            preflight = run_prewarm_dispatch_pass(
+                ro_prewarm,
+                ro_cache,
+                business_date=business_date,
+                runtime_root=runtime_root,
+                state_runtime_root=state_runtime_root,
+                mappings=mappings,
+                budget_seconds=args.budget_seconds,
+                max_jobs_per_pass=args.max_jobs_per_pass,
+                plan_only=True,
+                canary_scope=canary_scope,
+            )
+            if preflight.get("canary_preflight", "PASS") != "PASS":
+                print(
+                    "customer_prewarm_dispatch canary preflight BLOCKED "
+                    f"outcome={preflight['canary_preflight']}"
+                )
+                if args.json_output is not None:
+                    _write_json_output(args.json_output, preflight)
+                return 2
+            # preflight PASS -> RW live.
+            rw_prewarm = CustomerPrewarmStore(prewarm_store_path)
+            rw_cache = SharedCrawlCache(shared_cache_path)
+            summary = run_prewarm_dispatch_pass(
+                rw_prewarm,
+                rw_cache,
+                business_date=business_date,
+                runtime_root=runtime_root,
+                state_runtime_root=state_runtime_root,
+                mappings=mappings,
+                budget_seconds=args.budget_seconds,
+                max_jobs_per_pass=args.max_jobs_per_pass,
+                plan_only=False,
+                canary_scope=canary_scope,
+            )
+            for key in (
+                "existing_remote_reused_planned",
+                "new_remote_urls_planned",
+                "new_remote_jobs_planned",
+                "priority_updates_planned",
+                "remote_interaction_urls",
+                "candidates_seen_total",
+                "candidates_in_scope",
+                "skipped_by_canary_filter",
+            ):
+                summary[key] = preflight.get(key, summary.get(key, 0))
+            summary["sandbox_schema_migrated"] = (
+                not had_remote_job_column and _store_has_remote_job_column(prewarm_store_path)
+            )
+        else:
+            prewarm_store = CustomerPrewarmStore(prewarm_store_path)
+            shared_cache = SharedCrawlCache(shared_cache_path)
+            summary = run_prewarm_dispatch_pass(
+                prewarm_store,
+                shared_cache,
+                business_date=business_date,
+                runtime_root=runtime_root,
+                state_runtime_root=state_runtime_root,
+                mappings=mappings,
+                budget_seconds=args.budget_seconds,
+                max_jobs_per_pass=args.max_jobs_per_pass,
+                plan_only=False,
+            )
     except Exception as exc:  # noqa: BLE001 - scheduler-facing failure
         print(
             json.dumps(
@@ -353,6 +534,16 @@ def _run_dispatch(args: argparse.Namespace, business_date: str, runtime_root: Pa
         f"priority_unconfirmed={summary.get('priority_unconfirmed', 0)} "
         f"phase_errors={len(summary.get('phase_errors', []))}"
     )
+    if canary_scope is not None:
+        print(
+            f"canary only_mall={summary.get('only_mall', canary_scope.only_mall)} "
+            f"candidates_in_scope={summary.get('candidates_in_scope', 0)} "
+            f"skipped_by_canary_filter={summary.get('skipped_by_canary_filter', 0)} "
+            f"remote_interaction_urls={summary.get('remote_interaction_urls', 0)} "
+            f"other_remote_tasks_created={summary.get('other_remote_tasks_created', 0)} "
+            f"other_priority_changed={summary.get('other_priority_changed', 0)} "
+            f"sandbox_schema_migrated={summary.get('sandbox_schema_migrated', False)}"
+        )
     if args.json_output is not None:
         _write_json_output(args.json_output, summary)
     return 0
@@ -383,6 +574,27 @@ def main(argv: list[str] | None = None) -> int:
     if args.backfill_zhaoshang_history is not None and args.plan_only:
         print("ERROR --backfill-zhaoshang-history is mutually exclusive with --plan-only")
         return 2
+    if args.only_mall:
+        if args.canary_max_urls < 1:
+            print("ERROR --canary-max-urls must be at least 1")
+            return 2
+        if args.max_jobs_per_pass > 1:
+            print("ERROR --max-jobs-per-pass must be 1 with --only-mall")
+            return 2
+        if args.backfill_zhaoshang_history is not None:
+            print("ERROR --only-mall is mutually exclusive with --backfill-zhaoshang-history")
+            return 2
+        if (
+            args.prewarm_store_path is None
+            or args.shared_cache_path is None
+            or args.state_runtime_root is None
+        ):
+            print(
+                "ERROR canary mode requires explicit --prewarm-store-path, "
+                "--shared-cache-path and --state-runtime-root "
+                "(CANARY_EXPLICIT_PATHS_REQUIRED)"
+            )
+            return 2
 
     runtime_root = Path(args.runtime_root).resolve()
     if args.backfill_zhaoshang_history is not None:

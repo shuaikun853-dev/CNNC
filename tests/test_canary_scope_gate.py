@@ -17,6 +17,7 @@ fixture 复用 tests/test_customer_prewarm_dispatch 的 fake store/cache/adapter
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 import time
@@ -24,7 +25,9 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from openpyxl import Workbook
 
+from app.services import customer_prewarm_dispatch as dispatch_service
 from app.services.customer_prewarm_dispatch import (
     CANARY_JOB_LIMIT_EXCEEDED,
     CANARY_MALL_NOT_MAPPED,
@@ -48,6 +51,7 @@ from app.services.customer_prewarm_store import (
 )
 from app.services.daily_audit_store import DailyAuditStore, ProcessLock
 from app.services.shared_crawl_cache import SharedCrawlCache
+from scripts import customer_prewarm_dispatch as cli
 from scripts.zhaoshang_mall_mapping import ZhaoshangMallMapping
 from tests.test_customer_prewarm_dispatch import (
     BUSINESS_DATE,
@@ -58,6 +62,7 @@ from tests.test_customer_prewarm_dispatch import (
     make_state_db,
     seed_remote_work,
 )
+from tests.test_customer_prewarm_dispatch_cli import _seed_daily_run
 
 XHGJ = ZhaoshangMallMapping(
     mall_name="新华光谷商城",
@@ -626,3 +631,320 @@ def test_case17b_normal_live_summary_has_no_canary_keys(tmp_path):
         assert key not in summary, f"normal mode must not carry canary key {key}"
     # 普通模式行为不变：两个商城组都正常创建。
     assert summary["jobs_created"] == 2
+
+
+# ---- CLI canary 门禁（Task 3）fixtures and helpers -------------------------------
+
+
+def _sha256(path) -> str:
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def _write_xhgj_mapping_workbook(path: Path) -> Path:
+    """comix(EXTRA_DOMAIN_ALIASES qx.com) + xhgj(显式 商城URL 域名)。"""
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.append(["商城名称", "sourceId", "商城标识 identification", "商城URL"])
+    sheet.append(["齐心商城", "SRC-COMIX", "comix", ""])
+    sheet.append(["新华光谷商城", "SRC-XHGJ", "xhgj", "https://www.xhgj.com"])
+    workbook.save(path)
+    return path
+
+
+def _run_canary_cli(
+    runtime_root,
+    state_root,
+    prewarm_store_path,
+    cache_path,
+    workbook,
+    *extra,
+    only_mall="xhgj",
+    json_output=None,
+):
+    argv = [
+        "--business-date",
+        BUSINESS_DATE,
+        "--runtime-root",
+        str(runtime_root),
+        "--mapping-path",
+        str(workbook),
+        "--state-runtime-root",
+        str(state_root),
+        "--prewarm-store-path",
+        str(prewarm_store_path),
+        "--shared-cache-path",
+        str(cache_path),
+        "--only-mall",
+        only_mall,
+        "--max-jobs-per-pass",
+        "1",  # canary CLI 守卫要求；真实调用形态
+        *extra,
+    ]
+    if json_output is not None:
+        argv += ["--json-output", str(json_output)]
+    return cli.main(argv)
+
+
+def _guard_rw_constructors(monkeypatch) -> None:
+    """RW 构造器/ProcessLock 桩：canary 被阻断时任何 RW 访问都是 AssertionError。"""
+    real_prewarm_init = CustomerPrewarmStore.__init__
+    real_cache_init = SharedCrawlCache.__init__
+
+    def _prewarm_init(self, path, *args, **kwargs):
+        if not kwargs.get("read_only", False):
+            raise AssertionError("RW CustomerPrewarmStore must not run before preflight PASS")
+        real_prewarm_init(self, path, *args, **kwargs)
+
+    def _cache_init(self, path, *args, **kwargs):
+        if not kwargs.get("read_only", False):
+            raise AssertionError("RW SharedCrawlCache must not run before preflight PASS")
+        real_cache_init(self, path, *args, **kwargs)
+
+    class _NoLock:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("ProcessLock must not be taken before preflight PASS")
+
+    monkeypatch.setattr(CustomerPrewarmStore, "__init__", _prewarm_init)
+    monkeypatch.setattr(SharedCrawlCache, "__init__", _cache_init)
+    monkeypatch.setattr(dispatch_service, "ProcessLock", _NoLock)
+
+
+def _tmp_layout(tmp_path):
+    runtime_root = tmp_path / "runtime"
+    state_root = tmp_path / "state"
+    runtime_root.mkdir()
+    state_root.mkdir()
+    return (
+        runtime_root,
+        state_root,
+        runtime_root / "customer_prewarm.sqlite3",
+        runtime_root / "shared_crawl_cache.sqlite3",
+    )
+
+
+# ---- Case 7/15:URL 超限阻断在任何 RW/锁/迁移之前（store 字节不变、仍无列）-----------
+
+
+def test_case7_and_15_url_limit_blocks_before_any_rw_write_or_migration(tmp_path, monkeypatch, capsys):
+    runtime_root, state_root, store_path, cache_path = _tmp_layout(tmp_path)
+    prewarm = CustomerPrewarmStore(store_path)
+    SharedCrawlCache(cache_path)
+    make_candidate(prewarm, "https://www.xhgj.com/item-7a.html", mall="xhgj", document="D-X7A")
+    make_candidate(prewarm, "https://www.xhgj.com/item-7b.html", mall="xhgj", document="D-X7B")
+    # 老 schema：预先降级掉 remote_job_id 列（Case 15）。
+    connection = sqlite3.connect(str(store_path))
+    try:
+        connection.execute("ALTER TABLE prewarm_candidates DROP COLUMN remote_job_id")
+        connection.commit()
+    finally:
+        connection.close()
+    sha_before = _sha256(store_path)
+    _guard_rw_constructors(monkeypatch)
+
+    json_output = tmp_path / "case7.json"
+    exit_code = _run_canary_cli(
+        runtime_root,
+        state_root,
+        store_path,
+        cache_path,
+        _write_xhgj_mapping_workbook(tmp_path / "mapping.xlsx"),
+        "--canary-max-urls",
+        "1",
+        json_output=json_output,
+    )
+
+    assert exit_code == 2
+    summary = json.loads(json_output.read_text(encoding="utf-8"))
+    assert summary["canary_preflight"] == CANARY_URL_LIMIT_EXCEEDED
+    assert summary["candidates_in_scope"] == 2
+    assert summary["new_remote_urls_planned"] == 2
+    stdout = capsys.readouterr().out
+    assert "BLOCKED" in stdout
+    # Case 7：store 文件字节不变；Case 15：仍无 remote_job_id 列。
+    assert _sha256(store_path) == sha_before
+    assert "remote_job_id" not in _sqlite_columns(store_path, "prewarm_candidates")
+
+
+# ---- Case 8:目标 mall 未映射 → 零 RW 阻断 ------------------------------------------
+
+
+def test_case8_canary_mall_not_mapped_blocks_with_zero_rw(tmp_path, monkeypatch, capsys):
+    runtime_root, state_root, store_path, cache_path = _tmp_layout(tmp_path)
+    prewarm = CustomerPrewarmStore(store_path)
+    SharedCrawlCache(cache_path)
+    make_candidate(prewarm, "https://www.xhgj.com/item-8.html", mall="xhgj", document="D-X8")
+    sha_before = _sha256(store_path)
+    _guard_rw_constructors(monkeypatch)
+
+    exit_code = _run_canary_cli(
+        runtime_root,
+        state_root,
+        store_path,
+        cache_path,
+        _write_xhgj_mapping_workbook(tmp_path / "mapping.xlsx"),
+        only_mall="not-exist",
+    )
+
+    assert exit_code == 2
+    assert "CANARY_MALL_NOT_MAPPED" in capsys.readouterr().out
+    assert _sha256(store_path) == sha_before
+
+
+# ---- Case 14:缺任一显式路径 → exit 2 CANARY_EXPLICIT_PATHS_REQUIRED -----------------
+
+
+def test_case14_canary_requires_all_explicit_paths(tmp_path, monkeypatch, capsys):
+    runtime_root = tmp_path / "runtime"
+    state_root = tmp_path / "state"
+    runtime_root.mkdir()
+    state_root.mkdir()
+    store_path = runtime_root / "customer_prewarm.sqlite3"
+    CustomerPrewarmStore(store_path)
+    _guard_rw_constructors(monkeypatch)
+
+    argv = [
+        "--business-date",
+        BUSINESS_DATE,
+        "--runtime-root",
+        str(runtime_root),
+        "--mapping-path",
+        str(_write_xhgj_mapping_workbook(tmp_path / "mapping.xlsx")),
+        "--state-runtime-root",
+        str(state_root),
+        "--prewarm-store-path",
+        str(store_path),
+        # 故意缺 --shared-cache-path
+        "--only-mall",
+        "xhgj",
+        "--max-jobs-per-pass",
+        "1",
+    ]
+    exit_code = cli.main(argv)
+
+    assert exit_code == 2
+    assert "CANARY_EXPLICIT_PATHS_REQUIRED" in capsys.readouterr().out
+    assert not (runtime_root / "shared_crawl_cache.sqlite3").exists()
+
+
+# ---- 参数冲突组 / 路径策略组 --------------------------------------------------------
+
+
+def test_canary_param_conflicts_fail_closed(tmp_path, capsys):
+    runtime_root = tmp_path / "runtime"
+    runtime_root.mkdir()
+    workbook = _write_xhgj_mapping_workbook(tmp_path / "mapping.xlsx")
+    base = [
+        "--business-date",
+        BUSINESS_DATE,
+        "--runtime-root",
+        str(runtime_root),
+        "--mapping-path",
+        str(workbook),
+    ]
+
+    assert cli.main(base + ["--only-mall", "xhgj", "--canary-max-urls", "0"]) == 2
+    assert "--canary-max-urls must be at least 1" in capsys.readouterr().out
+    assert cli.main(base + ["--only-mall", "xhgj", "--max-jobs-per-pass", "8"]) == 2
+    assert "--max-jobs-per-pass must be 1 with --only-mall" in capsys.readouterr().out
+    assert (
+        cli.main(
+            base + ["--only-mall", "xhgj", "--max-jobs-per-pass", "1", "--backfill-zhaoshang-history", "3"]
+        )
+        == 2
+    )
+    assert "mutually exclusive with --backfill-zhaoshang-history" in capsys.readouterr().out
+
+
+def test_canary_path_policy_blocks_store_inside_state_runtime_root(tmp_path, capsys):
+    runtime_root, state_root, _, cache_path = _tmp_layout(tmp_path)
+    workbook = _write_xhgj_mapping_workbook(tmp_path / "mapping.xlsx")
+
+    exit_code = _run_canary_cli(
+        runtime_root,
+        state_root,
+        state_root / "customer_prewarm.sqlite3",  # 落在 state-runtime-root 内
+        cache_path,
+        workbook,
+    )
+
+    assert exit_code == 2
+    stdout = capsys.readouterr().out
+    assert "CANARY_PATH_POLICY_VIOLATION" in stdout
+    assert not (state_root / "customer_prewarm.sqlite3").exists()
+
+
+# ---- Case 13:同参 plan-only 与 live（preflight 计划字段携带）一致 --------------------
+
+
+def test_case13_live_canary_summary_carries_preflight_plan_fields(tmp_path, monkeypatch):
+    runtime_root, state_root, store_path, cache_path = _tmp_layout(tmp_path)
+    prewarm = CustomerPrewarmStore(store_path)
+    SharedCrawlCache(cache_path)
+    make_candidate(prewarm, "https://www.xhgj.com/item-13.html", mall="xhgj", document="D-X13")
+    make_candidate(prewarm, "https://qx.com/product-c13.html", mall="comix", document="D-C13")
+    _seed_daily_run(state_root / BUSINESS_DATE / "state.sqlite3", BUSINESS_DATE)
+    workbook = _write_xhgj_mapping_workbook(tmp_path / "mapping.xlsx")
+
+    # 1) 同参 plan-only（有效预演，exit 0）。
+    plan_json = tmp_path / "case13-plan.json"
+    plan_code = _run_canary_cli(
+        runtime_root,
+        state_root,
+        store_path,
+        cache_path,
+        workbook,
+        "--canary-max-urls",
+        "1",
+        "--plan-only",
+        json_output=plan_json,
+    )
+    assert plan_code == 0
+    plan_summary = json.loads(plan_json.read_text(encoding="utf-8"))
+    assert plan_summary["outcome"] == "OK"
+    assert plan_summary["plan_only"] is True
+    assert plan_summary["canary_preflight"] == "PASS"
+    for key in CANARY_SUMMARY_KEYS:
+        assert key in plan_summary
+    assert plan_summary["candidates_in_scope"] == 1
+    assert plan_summary["skipped_by_canary_filter"] == 1
+    assert plan_summary["priority_updates_performed"] == 0
+
+    # 2) live canary（fake adapter）。
+    created_adapters: list[_CountingAdapter] = []
+
+    class _TrackedAdapter(_CountingAdapter):
+        def __init__(self, *, mappings=None, **kwargs):
+            super().__init__(**kwargs)
+            created_adapters.append(self)
+
+    monkeypatch.setattr(dispatch_service, "CnncLegacyZhaoshangAdapter", _TrackedAdapter)
+
+    live_json = tmp_path / "case13-live.json"
+    live_code = _run_canary_cli(
+        runtime_root,
+        state_root,
+        store_path,
+        cache_path,
+        workbook,
+        "--canary-max-urls",
+        "1",
+        json_output=live_json,
+    )
+    assert live_code == 0
+    live_summary = json.loads(live_json.read_text(encoding="utf-8"))
+    assert live_summary["outcome"] == "OK"
+    assert live_summary["jobs_created"] == 1
+    assert live_summary["sandbox_schema_migrated"] is False  # 新 schema store 无迁移
+    assert len(created_adapters) == 1
+    assert created_adapters[0].submit_calls == 1
+    # live 的计划字段来自 preflight 携带 → 与 plan-only 数值完全一致。
+    for key in (
+        "candidates_seen_total",
+        "candidates_in_scope",
+        "skipped_by_canary_filter",
+        "remote_interaction_urls",
+        "new_remote_urls_planned",
+    ):
+        assert live_summary[key] == plan_summary[key], key
+    # in-scope 候选派发、越界候选原状。
+    assert live_summary["only_mall"] == "xhgj"
