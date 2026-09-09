@@ -957,11 +957,11 @@ def _run_leased_pass(
                 max_jobs_per_pass=max_jobs_per_pass,
                 created_jobs=created_jobs,
                 reuse_items=reuse_items,
-                    reused_job_ids_this_pass=reused_job_ids_this_pass,
-                    summary=summary,
-                    canary_scope=canary_scope,
-                    canary_budget=canary_budget,
-                )
+                reused_job_ids_this_pass=reused_job_ids_this_pass,
+                summary=summary,
+                canary_scope=canary_scope,
+                canary_budget=canary_budget,
+            )
         except Exception as exc:  # noqa: BLE001 - per-group isolation
             phase_errors.append(f"mall {mall_key}: {type(exc).__name__}: {exc}")
             continue
