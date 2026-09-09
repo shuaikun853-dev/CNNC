@@ -1775,3 +1775,55 @@ def test_r3_t4_boost_drift_after_preflight_blocks_whole_phase4(tmp_path):
     assert any("phase 4 pre-priority budget guard" in error for error in summary["phase_errors"])
     assert any("CANARY_LIVE_SCOPE_DRIFT" in error for error in summary["phase_errors"])
     assert [_store_row(prewarm.path, id_a), _store_row(prewarm.path, id_b)] == rows_before
+
+
+# ---- Round-3 Gate Review Fix 1:组级 CanaryScopeViolation 终止整个 pass ----------------
+
+
+def test_r3g_fix1_phase3_scope_violation_terminates_whole_pass(tmp_path, monkeypatch):
+    """P0：Phase 3 任意组的 CanaryScopeViolation 必须终止整个 leased pass——
+    合法 pending A（REMOTE_DISPATCHED + PRIORITY_PENDING job）绝不能在 Phase 4
+    被真实 prioritize（修复前组级 except 按 per-group isolation continue，
+    Phase 4 照跑）。预算由真实 plan 构造，barrier（Task 2）天然通过——本测试
+    钉的是 Phase 3→Phase 4 的终止语义。"""
+    runtime_root = tmp_path / "runtime"
+    url_a = "https://www.xhgj.com/item-r3g-a.html"
+    _paths_a, job_a = _seed_remote_work_task(
+        runtime_root,
+        _CountingAdapter(),
+        mapping=XHGJ,
+        url=url_a,
+        task_name="cnnc_current_opt_r3g_a",
+        job_state="PRIORITY_PENDING",
+        remote_identity="xhgj|tid-r3g|tnum-r3g",
+    )
+    prewarm = CustomerPrewarmStore(runtime_root / "customer_prewarm.sqlite3")
+    id_a = make_candidate(prewarm, url_a, mall="xhgj", document="D-R3GA")
+    prewarm.record_candidate_result(
+        id_a, cache_status=CACHE_STATUS_REMOTE_DISPATCHED, remote_job_id=job_a
+    )
+    url_b = "https://www.xhgj.com/item-r3g-b.html"
+    id_b = make_candidate(prewarm, url_b, mall="xhgj", document="D-R3GB")
+    rows_before = [_store_row(prewarm.path, id_a), _store_row(prewarm.path, id_b)]
+    cache = SharedCrawlCache(runtime_root / "shared_crawl_cache.sqlite3")
+
+    def _boom(**_kwargs):
+        raise CanaryScopeViolation("phase-3 group drift")
+
+    monkeypatch.setattr(dispatch_service, "_dispatch_mall_group", _boom)
+    adapter = _CountingAdapter()
+
+    summary = _run_canary_live(
+        runtime_root,
+        prewarm,
+        cache,
+        adapter=adapter,
+        canary_scope=_canary_scope(max_urls=2),
+    )
+
+    assert any("mall xhgj: CanaryScopeViolation" in error for error in summary["phase_errors"])
+    # P0：违例后零远端动作——A 不被 prioritize、B 不被 create/submit。
+    assert adapter.prioritize_calls == 0
+    assert adapter.submit_calls == 0
+    assert adapter.prepare_calls == 0
+    assert [_store_row(prewarm.path, id_a), _store_row(prewarm.path, id_b)] == rows_before

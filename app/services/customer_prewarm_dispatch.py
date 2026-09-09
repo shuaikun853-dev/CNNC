@@ -986,6 +986,12 @@ def _run_leased_pass(
                 canary_scope=canary_scope,
                 canary_budget=canary_budget,
             )
+        except CanaryScopeViolation as exc:
+            # A canary scope breach in ANY group terminates the WHOLE pass:
+            # no further groups and Phase 4 must never run afterwards
+            # (canary fail-closed: drift → zero further remote interactions).
+            phase_errors.append(f"mall {mall_key}: CanaryScopeViolation: {exc}")
+            return
         except Exception as exc:  # noqa: BLE001 - per-group isolation
             phase_errors.append(f"mall {mall_key}: {type(exc).__name__}: {exc}")
             continue
