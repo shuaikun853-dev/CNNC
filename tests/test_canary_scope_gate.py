@@ -29,16 +29,19 @@ from openpyxl import Workbook
 
 from app.services import customer_prewarm_dispatch as dispatch_service
 from app.services.customer_prewarm_dispatch import (
+    BACKEND_VERSION,
     CANARY_JOB_LIMIT_EXCEEDED,
     CANARY_MALL_NOT_MAPPED,
     CANARY_PREFLIGHT_FAILED,
     CANARY_PRIORITY_SCOPE_VIOLATION,
     CANARY_TARGET_EMPTY,
     CANARY_URL_LIMIT_EXCEEDED,
+    CanaryLiveBudget,
     CanaryScope,
     CanaryScopeViolation,
     _boost_reused_job,
     _dispatch_mall_group,
+    prewarm_placeholder_sku,
     run_prewarm_dispatch_pass,
     validate_canary_preflight,
 )
@@ -50,6 +53,7 @@ from app.services.customer_prewarm_store import (
     CustomerPrewarmStore,
 )
 from app.services.daily_audit_store import DailyAuditStore, ProcessLock
+from app.services.legacy_zhaoshang_adapter import CrawlRequest
 from app.services.shared_crawl_cache import SharedCrawlCache
 from scripts import customer_prewarm_dispatch as cli
 from scripts.zhaoshang_mall_mapping import ZhaoshangMallMapping
@@ -61,6 +65,7 @@ from tests.test_customer_prewarm_dispatch import (
     make_candidate,
     make_state_db,
     seed_remote_work,
+    seed_terminal_crawl,
 )
 from tests.test_customer_prewarm_dispatch_cli import _seed_daily_run
 
@@ -89,6 +94,77 @@ CANARY_SUMMARY_KEYS = (
 
 def _canary_scope(only_mall: str = "xhgj", max_urls: int = 1) -> CanaryScope:
     return CanaryScope(only_mall=only_mall, max_urls=max_urls)
+
+
+def _seed_remote_work_task(
+    runtime_root: Path,
+    adapter,
+    *,
+    mapping,
+    url,
+    task_name,
+    business_date=BUSINESS_DATE,
+    job_state="SUBMITTED",
+    remote_identity=None,
+):
+    """seed_remote_work 的本地变体：task_name 可指定。
+
+    共享 helper 的固定后缀 ``00000000000001`` 在同一 state db 播第二个 job 时
+    撞 ``remote_jobs(run_id, task_name)`` 唯一约束；Round-2 的 Case D /
+    target-set 用例需要同 db 多 job。
+    """
+    paths = make_state_db(runtime_root, business_date)
+    store = DailyAuditStore(paths.state_path)
+    lock = ProcessLock(paths.lock_path)
+    lock.acquire()
+    try:
+        token = store.acquire_lease(business_date, "canary-seeder", 120.0)
+        try:
+            sku = prewarm_placeholder_sku(mapping.mall_key, url)
+            crawl = store.ensure_crawl_work(
+                token, mapping.mall_key, sku, url, BACKEND_VERSION, "seed-fp",
+                source_id=mapping.source_id,
+            )
+            batch_state = paths.run_dir / "BATCH_STATE.md"
+            if not batch_state.is_file():
+                batch_state.touch()
+            requests = [
+                CrawlRequest(mapping.mall_key, mapping.source_id, mapping.mall_name, sku, url, BACKEND_VERSION)
+            ]
+            seed_dir = paths.run_dir / "zhaoshang" / mapping.mall_key / (
+                "seed-" + hashlib.sha1(task_name.encode("utf-8")).hexdigest()[:8]
+            )
+            prepared = adapter.prepare_job(
+                business_date,
+                requests,
+                seed_dir / "input.xlsx",
+                seed_dir / "result.xlsx",
+                task_name,
+                batch_state_path=batch_state,
+            )
+            job_row = store.prepare_remote_intent(
+                token,
+                prepared.logical_job_key,
+                prepared.task_name,
+                prepared.payload_sha256,
+                mall_key=mapping.mall_key,
+                input_path=str(prepared.template_path),
+                result_path=str(prepared.result_path),
+                payload_json=prepared.payload_json(),
+            )
+            store.link_crawl_work_to_remote_job(token, int(crawl["id"]), int(job_row["id"]))
+            if remote_identity:
+                claim = store.claim_remote_submission(token, int(job_row["id"]))
+                assert claim is not None
+                store.reconcile_remote_job(
+                    token, int(job_row["id"]), remote_identity=remote_identity, state=job_state
+                )
+                store.advance_crawl_work_for_job(token, int(job_row["id"]), job_state)
+            return paths, int(job_row["id"])
+        finally:
+            store.release_lease(token)
+    finally:
+        lock.release()
 
 
 def _seed_multi_mall_store(runtime_root: Path) -> CustomerPrewarmStore:
@@ -948,3 +1024,160 @@ def test_case13_live_canary_summary_carries_preflight_plan_fields(tmp_path, monk
         assert live_summary[key] == plan_summary[key], key
     # in-scope 候选派发、越界候选原状。
     assert live_summary["only_mall"] == "xhgj"
+
+
+# ---- Round-2 Task 1:preflight target set + CanaryLiveBudget ----------------------
+
+
+def _plan_only_scope(prewarm, cache, runtime_root, *, scope=None, **kwargs):
+    return run_prewarm_dispatch_pass(
+        prewarm,
+        cache,
+        business_date=BUSINESS_DATE,
+        runtime_root=runtime_root,
+        mappings=[COMIX, XHGJ],
+        plan_only=True,
+        canary_scope=scope or _canary_scope(),
+        **kwargs,
+    )
+
+
+def test_r2_preflight_target_set_single_create_url(tmp_path):
+    runtime_root = tmp_path / "runtime"
+    make_state_db(runtime_root, BUSINESS_DATE)
+    prewarm = _seed_multi_mall_store(runtime_root)
+    cache = SharedCrawlCache(runtime_root / "shared_crawl_cache.sqlite3")
+
+    summary = _plan_only_scope(prewarm, cache, runtime_root)
+
+    assert summary["canary_target_urls"] == [["xhgj", "https://www.xhgj.com/item-1.html"]]
+    # remote_interaction_urls = URL 身份集合口径（不再是计数加法）。
+    assert summary["remote_interaction_urls"] == len(summary["canary_target_urls"]) == 1
+    assert summary["canary_preflight"] == "PASS"
+    # 非 canary 键集合不受影响（canary_target_urls 只在 scope 分支出现）。
+    assert "canary_target_urls" not in run_prewarm_dispatch_pass(
+        prewarm,
+        cache,
+        business_date=BUSINESS_DATE,
+        runtime_root=runtime_root,
+        mappings=[COMIX, XHGJ],
+        plan_only=True,
+    )
+
+
+def test_r2_preflight_target_set_covers_reuse_and_pending_priority(tmp_path):
+    runtime_root = tmp_path / "runtime"
+    url_r = "https://www.xhgj.com/item-r2.html"
+    _seed_remote_work_task(
+        runtime_root,
+        _CountingAdapter(),
+        mapping=XHGJ,
+        url=url_r,
+        task_name="cnnc_current_opt_r2_reuse_1",
+        job_state="SUBMITTED",
+        remote_identity="xhgj|tid-r2|tnum-r2",
+    )
+    prewarm = CustomerPrewarmStore(runtime_root / "customer_prewarm.sqlite3")
+    make_candidate(prewarm, url_r, mall="xhgj", document="D-R2")
+    # 第三桶：REMOTE_DISPATCHED 候选绑定 PRIORITY_PENDING job（URL 与 miss 不同）。
+    url_p = "https://www.xhgj.com/item-p2.html"
+    _seed_paths, job_p = _seed_remote_work_task(
+        runtime_root,
+        _CountingAdapter(),
+        mapping=XHGJ,
+        url=url_p,
+        task_name="cnnc_current_opt_r2_pending_2",
+        job_state="PRIORITY_PENDING",
+        remote_identity="xhgj|tid-p2|tnum-p2",
+    )
+    pending_id = make_candidate(prewarm, url_p, mall="xhgj", document="D-P2")
+    prewarm.record_candidate_result(
+        pending_id, cache_status=CACHE_STATUS_REMOTE_DISPATCHED, remote_job_id=job_p
+    )
+    cache = SharedCrawlCache(runtime_root / "shared_crawl_cache.sqlite3")
+
+    summary = _plan_only_scope(prewarm, cache, runtime_root, scope=_canary_scope(max_urls=2))
+
+    assert summary["canary_target_urls"] == sorted(
+        [["xhgj", url_r], ["xhgj", url_p]]
+    )
+    assert summary["remote_interaction_urls"] == 2
+    assert summary["existing_remote_reused_planned"] == 1
+    assert summary["priority_updates_planned"] >= 2  # boost + pending priority confirm
+
+
+def test_r2_preflight_target_set_excludes_terminal_urls(tmp_path):
+    runtime_root = tmp_path / "runtime"
+    url_t = "https://www.xhgj.com/item-t2.html"
+    seed_terminal_crawl(runtime_root, BUSINESS_DATE, XHGJ, url_t, result="seeded")
+    prewarm = CustomerPrewarmStore(runtime_root / "customer_prewarm.sqlite3")
+    make_candidate(prewarm, url_t, mall="xhgj", document="D-T2")
+    cache = SharedCrawlCache(runtime_root / "shared_crawl_cache.sqlite3")
+
+    summary = _plan_only_scope(prewarm, cache, runtime_root)
+
+    # terminal 分支不产生 live interaction：不进目标集合（fail-closed 角落由
+    # live Pass A 的 per-entry budget.check 兜底）。
+    assert summary["new_remote_urls_planned"] == 0
+    assert summary["existing_remote_reused_planned"] == 0
+    assert summary["canary_target_urls"] == []
+    assert summary["remote_interaction_urls"] == 0
+    assert summary["candidates_in_scope"] == 1
+    assert summary["canary_preflight"] == "PASS"
+
+
+def test_r2_canary_live_budget_member_check_and_drift():
+    budget = CanaryLiveBudget(
+        "xhgj",
+        2,
+        [("xhgj", "https://www.xhgj.com/a.html"), ("xhgj", " https://www.xhgj.com/b.html ")],
+    )
+    assert budget.check("xhgj", "https://www.xhgj.com/a.html") == (
+        "xhgj",
+        "https://www.xhgj.com/a.html",
+    )
+    # strip 后相等即成员。
+    assert budget.check(" xhgj ", " https://www.xhgj.com/b.html ") == (
+        "xhgj",
+        "https://www.xhgj.com/b.html",
+    )
+    with pytest.raises(CanaryScopeViolation, match="CANARY_LIVE_SCOPE_DRIFT"):
+        budget.check("xhgj", "https://www.xhgj.com/c.html")
+    # 构造时集合超限 → fail closed。
+    with pytest.raises(CanaryScopeViolation, match="exceeds max"):
+        CanaryLiveBudget("xhgj", 1, [("xhgj", "u1"), ("xhgj", "u2")])
+
+
+def test_r2_canary_live_budget_from_plan_roundtrip(tmp_path):
+    runtime_root = tmp_path / "runtime"
+    make_state_db(runtime_root, BUSINESS_DATE)
+    prewarm = _seed_multi_mall_store(runtime_root)
+    cache = SharedCrawlCache(runtime_root / "shared_crawl_cache.sqlite3")
+
+    plan = _plan_only_scope(prewarm, cache, runtime_root)
+    budget = CanaryLiveBudget.from_plan(plan, _canary_scope())
+    budget.check("xhgj", "https://www.xhgj.com/item-1.html")  # 成员通过
+    with pytest.raises(CanaryScopeViolation, match="CANARY_LIVE_SCOPE_DRIFT"):
+        budget.check("xhgj", "https://www.xhgj.com/item-2.html")  # 非成员漂移
+
+
+def test_r2_live_canary_without_preflight_budget_fails_closed(tmp_path):
+    runtime_root = tmp_path / "runtime"
+    make_state_db(runtime_root, BUSINESS_DATE)
+    prewarm = CustomerPrewarmStore(runtime_root / "customer_prewarm.sqlite3")
+    cache = SharedCrawlCache(runtime_root / "shared_crawl_cache.sqlite3")
+    make_candidate(prewarm, "https://www.xhgj.com/item-r2b.html", mall="xhgj", document="D-R2B")
+
+    with pytest.raises(CanaryScopeViolation, match="live canary requires a preflight budget"):
+        run_prewarm_dispatch_pass(
+            prewarm,
+            cache,
+            business_date=BUSINESS_DATE,
+            runtime_root=runtime_root,
+            mappings=[COMIX, XHGJ],
+            max_jobs_per_pass=1,
+            plan_only=False,
+            canary_scope=_canary_scope(),
+        )
+    # plan-only 忽略 budget 契约：无 budget 也能跑。
+    assert _plan_only_scope(prewarm, cache, runtime_root)["outcome"] == "OK"

@@ -139,6 +139,39 @@ class CanaryScope:
         value = str(mall or "").strip()
         return bool(value) and value == self.only_mall
 
+
+class CanaryLiveBudget:
+    """Live canary 硬预算：preflight 批准的 (mall, exact_url) 目标集合。
+
+    成员检查即容量检查——集合在构造时已验证 |set| <= max_urls，live 中任何
+    不在集合内的 interaction 都是 CANARY_LIVE_SCOPE_DRIFT，fail closed。
+    """
+
+    def __init__(self, only_mall: str, max_urls: int, allowed_urls) -> None:
+        pairs = {(str(m).strip(), str(u).strip()) for m, u in allowed_urls}
+        if len(pairs) > int(max_urls):
+            raise CanaryScopeViolation(
+                f"canary target set has {len(pairs)} urls, exceeds max {max_urls}"
+            )
+        self.only_mall = only_mall
+        self.max_urls = int(max_urls)
+        self._allowed = frozenset(pairs)
+
+    @classmethod
+    def from_plan(cls, plan: Mapping[str, Any], canary_scope: CanaryScope) -> "CanaryLiveBudget":
+        pairs = [tuple(item) for item in plan.get("canary_target_urls") or []]
+        return cls(canary_scope.only_mall, canary_scope.max_urls, pairs)
+
+    def check(self, mall: Any, exact_url: Any) -> tuple[str, str]:
+        key = (str(mall or "").strip(), str(exact_url or "").strip())
+        if key not in self._allowed:
+            raise CanaryScopeViolation(
+                f"CANARY_LIVE_SCOPE_DRIFT: live interaction {key!r} is not in "
+                "the read-only preflight target set"
+            )
+        return key
+
+
 LEASE_OWNER = "customer_prewarm_dispatch"
 LEASE_TTL_SECONDS = 120.0
 
@@ -473,6 +506,11 @@ def _plan_only_report(
     # Job ids already covered by a planned reuse-boost; the PRIORITY_PENDING
     # bucket below must not count the same job twice.
     seen_priority_job_ids: set[int] = set()
+    # Canary target identity set: every (mall, exact_url) pair a live pass may
+    # interact with remotely (reuse + create + pending-priority confirm).  The
+    # live branch carries this stable set as a CanaryLiveBudget, so anything
+    # added between preflight and live is CANARY_LIVE_SCOPE_DRIFT.
+    target_pairs: set[tuple[str, str]] = set()
     for candidate in misses:
         candidate_id = int(candidate["id"])
         routing = classify_reference_url(str(candidate["lookup_url"] or ""), mappings)
@@ -498,6 +536,7 @@ def _plan_only_report(
             if unfinished is not None:
                 reused_planned += 1
                 bucket["reused"] += 1
+                target_pairs.add((routing.mall_key, routing.lookup_url))
                 job = unfinished.get("job") or {}
                 job_id = int(job.get("id") or 0)
                 if job_id:
@@ -511,6 +550,7 @@ def _plan_only_report(
             else:
                 create_groups.setdefault(routing.mall_key, []).append(routing.lookup_url)
                 bucket["created_urls"] += 1
+                target_pairs.add((routing.mall_key, routing.lookup_url))
         elif routing.outcome == OUTCOME_STAPLES:
             summary["staples_skipped"] += 1
             if routing.host.endswith("stbchina.cn"):
@@ -545,6 +585,9 @@ def _plan_only_report(
             ):
                 seen_priority_job_ids.add(int(job_id))
                 pending_priority_planned += 1
+                target_pairs.add(
+                    (_candidate_mall(candidate, mappings), str(candidate.get("lookup_url") or ""))
+                )
 
     planned_jobs = min(len(create_groups), max_jobs_per_pass)
     summary["existing_remote_reused_planned"] = reused_planned
@@ -563,12 +606,10 @@ def _plan_only_report(
     summary["existing_remote_reused"] = reused_planned
     summary["new_remote_urls"] = summary["new_remote_urls_planned"]
     if canary_scope is not None:
-        # §3 口径 = 复用 + 新建 + 待确认优先级（planning 视角，零远端调用）。
-        summary["remote_interaction_urls"] = (
-            summary["existing_remote_reused_planned"]
-            + summary["new_remote_urls_planned"]
-            + pending_priority_planned
-        )
+        # §3 口径 = URL 身份集合（durable 且 adapter 无关）：复用 + 新建 + 待
+        # 确认优先级的 (mall, exact_url) 对，去重后一个 URL 只计一次。
+        summary["canary_target_urls"] = [list(pair) for pair in sorted(target_pairs)]
+        summary["remote_interaction_urls"] = len(target_pairs)
         summary["canary_preflight"] = (
             validate_canary_preflight(summary, canary_scope, mappings) or "PASS"
         )
@@ -633,6 +674,7 @@ def run_prewarm_dispatch_pass(
     plan_only: bool = False,
     now: Any = None,
     canary_scope: CanaryScope | None = None,
+    canary_budget: CanaryLiveBudget | None = None,
 ) -> dict[str, Any]:
     """Run one bounded dispatch pass and return its intake-style summary.
 
@@ -652,11 +694,18 @@ def run_prewarm_dispatch_pass(
     the plan-only branch becomes a scoped read-only preflight (same predicate
     as live), and the live branch enforces all four phases through the same
     :class:`CanaryScope` policy object with layered defensive assertions.
+    ``canary_budget`` is the live-only hard budget (:class:`CanaryLiveBudget`)
+    built from the read-only preflight's ``canary_target_urls``; a live canary
+    pass without it fails closed (plan-only ignores the parameter).
     """
     if canary_scope is not None and not plan_only and max_jobs_per_pass > canary_scope.max_jobs:
         raise CanaryScopeViolation(
             f"--max-jobs-per-pass {max_jobs_per_pass} exceeds canary cap {canary_scope.max_jobs}"
         )
+    if canary_scope is not None and not plan_only and canary_budget is None:
+        # TOCTOU guard: a live canary without the preflight target set could
+        # interact with URLs approved by nobody — fail closed before any write.
+        raise CanaryScopeViolation("live canary requires a preflight budget")
     monotonic_value = monotonic or time.monotonic
     deadline = monotonic_value() + max(0.0, float(budget_seconds))
     paths = runtime_paths(
