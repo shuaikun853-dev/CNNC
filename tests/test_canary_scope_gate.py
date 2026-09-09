@@ -1901,3 +1901,127 @@ def test_r3g_case_h_target_shrink_is_safe_and_terminal_branch_records(tmp_path):
     row = candidate_by_id(prewarm, id_a)
     assert row["cache_status"] == CACHE_STATUS_REMOTE_DISPATCHED
     assert row["last_error"] == _CACHE_SYNC_PENDING_NOTE
+
+
+# ---- Round-3 Gate Review Case F（CLI 端到端）/ Case I（回归）------------------------
+
+
+def test_r3g_case_f_cli_live_drift_barrier_blocks_before_submit_and_prioritize(
+    tmp_path, monkeypatch, capsys
+):
+    """Case F（CLI 级，复用 Case C 的 RW 构造器注入模式）：preflight 时只有
+    A=REMOTE_DISPATCHED xhgj（state db 绑 PRIORITY_PENDING 有 identity job）
+    → target={A}；RW 构造器注入 B=新 PENDING_PREWARM xhgj → barrier 在
+    Phase 3/4 之前挡住：exit 2、CANARY_LIVE_SCOPE_DRIFT、submit=0、
+    prioritize=0（A 的 PENDING priority 未被触碰）、A/B 行不变。"""
+    runtime_root, state_root, store_path, cache_path = _tmp_layout(tmp_path)
+    url_a = "https://www.xhgj.com/item-r3g-fa.html"
+    _seed_paths, job_a = _seed_remote_work_task(
+        state_root,
+        _CountingAdapter(),
+        mapping=XHGJ,
+        url=url_a,
+        task_name="cnnc_current_opt_r3g_f",
+        job_state="PRIORITY_PENDING",
+        remote_identity="xhgj|tid-r3gf|tnum-r3gf",
+    )
+    prewarm = CustomerPrewarmStore(store_path)
+    SharedCrawlCache(cache_path)
+    id_a = make_candidate(prewarm, url_a, mall="xhgj", document="D-R3FA")
+    prewarm.record_candidate_result(
+        id_a, cache_status=CACHE_STATUS_REMOTE_DISPATCHED, remote_job_id=job_a
+    )
+    row_a_before = _store_row(store_path, id_a)
+    workbook = _write_xhgj_mapping_workbook(tmp_path / "mapping.xlsx")
+
+    # 漂移注入：第二个同 mall 候选只在 RW 阶段（preflight 之后）出现。
+    real_init = CustomerPrewarmStore.__init__
+    drift_url = "https://www.xhgj.com/item-r3g-f-drift.html"
+
+    def _drift_init(self, path, *args, **kwargs):
+        real_init(self, path, *args, **kwargs)
+        if not kwargs.get("read_only", False):
+            make_candidate(self, drift_url, mall="xhgj", document="D-R3F-DRIFT")
+
+    monkeypatch.setattr(CustomerPrewarmStore, "__init__", _drift_init)
+
+    created_adapters: list[_CountingAdapter] = []
+
+    class _DriftTrackedAdapter(_CountingAdapter):
+        def __init__(self, *, mappings=None, **kwargs):
+            super().__init__(**kwargs)
+            created_adapters.append(self)
+
+    monkeypatch.setattr(dispatch_service, "CnncLegacyZhaoshangAdapter", _DriftTrackedAdapter)
+
+    json_output = tmp_path / "case-f.json"
+    exit_code = _run_canary_cli(
+        runtime_root,
+        state_root,
+        store_path,
+        cache_path,
+        workbook,
+        "--canary-max-urls",
+        "1",
+        json_output=json_output,
+    )
+
+    assert exit_code == 2
+    stdout = capsys.readouterr().out
+    assert "CANARY_LIVE_SCOPE_DRIFT" in stdout
+    summary = json.loads(json_output.read_text(encoding="utf-8"))
+    assert summary["outcome"] == "CANARY_LIVE_SCOPE_DRIFT"
+    assert any(
+        "live revalidation barrier" in error and "CANARY_LIVE_SCOPE_DRIFT" in error
+        for error in summary["phase_errors"]
+    )
+    # barrier 在 Phase 3/4 之前：零远端调用——A 的 PENDING priority 未被触碰。
+    for tracked in created_adapters:
+        assert tracked.submit_calls == 0
+        assert tracked.prioritize_calls == 0
+        assert tracked.prepare_calls == 0
+    # A 行不变（仍 REMOTE_DISPATCHED + 原 job），B 仍 PENDING_PREWARM。
+    assert _store_row(store_path, id_a) == row_a_before
+    ro = CustomerPrewarmStore.open_read_only(store_path)
+    drift_rows = [row for row in ro.candidates() if row["lookup_url"] == drift_url]
+    assert len(drift_rows) == 1
+    assert drift_rows[0]["cache_status"] == CACHE_STATUS_PENDING_PREWARM
+    # state db：A 的 job 仍 PRIORITY_PENDING（零 prioritize 证明）。
+    connection = sqlite3.connect(str(state_root / BUSINESS_DATE / "state.sqlite3"))
+    try:
+        job_state = connection.execute(
+            "SELECT state FROM remote_jobs WHERE id=?", (job_a,)
+        ).fetchone()[0]
+    finally:
+        connection.close()
+    assert job_state == "PRIORITY_PENDING"
+
+
+def test_r3g_case_i_single_url_create_same_pass_confirm_with_barrier(tmp_path):
+    """Case I（回归）：单 URL create→同轮 confirm 场景带 barrier 完整 live——
+    barrier 重算与 preflight 天然同集（1 目标），remote_interaction_urls==1、
+    jobs_created<=1、prioritize 仅该任务、canary_revalidated_targets==1、
+    outcome=OK（barrier 不得误伤合法 canary 主路径）。"""
+    runtime_root = tmp_path / "runtime"
+    make_state_db(runtime_root, BUSINESS_DATE)
+    prewarm = CustomerPrewarmStore(runtime_root / "customer_prewarm.sqlite3")
+    cache = SharedCrawlCache(runtime_root / "shared_crawl_cache.sqlite3")
+    candidate_id = make_candidate(
+        prewarm, "https://www.xhgj.com/item-r3g-i.html", mall="xhgj", document="D-R3GI"
+    )
+    adapter = _CountingAdapter()  # prioritize → UPDATED + weight_type=-1
+
+    summary = _run_canary_live(runtime_root, prewarm, cache, adapter=adapter)
+
+    assert summary["outcome"] == "OK"
+    assert summary["canary_revalidated_targets"] == 1
+    assert summary["remote_interaction_urls"] == 1
+    assert summary["jobs_created"] <= 1
+    assert summary["priority_confirmed"] == 1
+    assert adapter.submit_calls == 1
+    assert adapter.prioritize_calls == 1
+    assert not any(
+        "CanaryScopeViolation" in error or "CANARY_LIVE_SCOPE_DRIFT" in error
+        for error in summary["phase_errors"]
+    )
+    assert candidate_by_id(prewarm, candidate_id)["cache_status"] == CACHE_STATUS_REMOTE_DISPATCHED
