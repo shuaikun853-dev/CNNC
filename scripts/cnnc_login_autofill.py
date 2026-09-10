@@ -308,8 +308,14 @@ class LoginAutofiller:
             for frame in frames:
                 if self._filled["username"] and self._filled["password"]:
                     return
-                # Origin 门禁先于任何字段读取（deny-by-default）
-                if not self._origin_allowed(getattr(frame, "url", "")):
+                # Origin 门禁先于任何字段读取（deny-by-default）。
+                # 已销毁/已分离 frame 连 .url getter 都可能抛错——读 url
+                # 也包进容错，抛错按不可信 frame 跳过（tick 绝不向外抛异常）
+                try:
+                    frame_url = frame.url
+                except Exception:
+                    continue
+                if not self._origin_allowed(frame_url):
                     continue
                 try:
                     fields = frame.evaluate(_COLLECT_INPUTS_JS)

@@ -131,6 +131,19 @@ class _BoomFrame:
         raise RuntimeError("Execution context was destroyed")
 
 
+class _BoomUrlFrame:
+    """模拟已销毁 frame：.url 属性 getter 本身抛错（Playwright teardown
+    阶段访问已分离 frame 的 .url 可能抛错，tick 绝不能因此向调用方抛异常）。
+    """
+
+    @property
+    def url(self):
+        raise RuntimeError("Frame was detached")
+
+    def evaluate(self, *_args, **_kwargs):
+        raise AssertionError("url 不可信的 frame 绝不应进入字段读取")
+
+
 class _FakePage:
     def __init__(self, frames):
         self.frames = frames
@@ -520,6 +533,25 @@ def test_tick_swallows_frame_evaluate_errors():
     ])
 
     _make_autofiller().tick(ctx)  # 绝不能抛异常（cmd_login 轮询循环不死）
+
+    assert good.calls == [("loginName", FAKE_USERNAME),
+                          ("password", FAKE_PASSWORD)]
+
+
+def test_tick_tolerates_frame_url_getter_error_and_keeps_processing(capsys):
+    """已销毁 frame 的 .url getter 抛错：按不可信 frame 跳过，tick 绝不
+    向调用方抛异常，同页/后页其他 frame 仍正常填充。"""
+    broken = _BoomUrlFrame()
+    good = _FakeFrame([
+        _field(id="loginName"),
+        _field(type="password", name="password"),
+    ])
+    ctx = _FakeCtx([
+        _FakePage([broken, _FakeFrame([_field(name="captcha")])]),
+        _FakePage([good]),
+    ])
+
+    _make_autofiller().tick(ctx)  # 绝不能抛异常
 
     assert good.calls == [("loginName", FAKE_USERNAME),
                           ("password", FAKE_PASSWORD)]
