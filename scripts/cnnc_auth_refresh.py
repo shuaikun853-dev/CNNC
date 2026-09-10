@@ -53,6 +53,13 @@ except ImportError:  # Direct invocation from scripts/（含命名空间 scripts
     import cnnc_auth_core as core
     from curl_utils import load_curl_command
 
+# 运行时临时目录治理（单一事实源 scripts/cnnc_runtime.py）：selftest 临时
+# 目录与子进程 TEMP 统一落 E: <repo>/runtime/temp，不再落 C: %TEMP%
+try:
+    from scripts.cnnc_runtime import force_process_tree_e_temp, temp_root
+except ImportError:  # Direct invocation from scripts/（含命名空间 scripts 冲突）.
+    from cnnc_runtime import force_process_tree_e_temp, temp_root
+
 
 ROOT = Path(__file__).resolve().parents[1]
 # 手动恢复结果工件（--login-and-recover 各 outcome 都写；status 路由只读合并）
@@ -579,7 +586,7 @@ def run_selftest() -> int:
         text = path.read_text(encoding="utf-8")
         return [json.loads(line) for line in text.splitlines() if line.strip()]
 
-    with TemporaryDirectory(prefix="cnnc_auth_selftest_") as tmp:
+    with TemporaryDirectory(prefix="cnnc_auth_selftest_", dir=str(temp_root())) as tmp:
         tmp_path = Path(tmp)
 
         # ---- 场景 1：refresh 成功路径（force 不受冷却影响 + state/ledger 断言）
@@ -672,6 +679,10 @@ def run_selftest() -> int:
 
 def main(argv: list[str] | None = None) -> int:
     _force_utf8_stdio()
+    # browser login 等子进程继承本进程 TEMP/TMP/TMPDIR：入口处统一重定向到
+    # E: <repo>/runtime/temp（scripts/cnnc_runtime.py），子进程临时写入
+    # 不再落 C: %TEMP%。只改当前进程环境，不触碰注册表/系统全局。
+    force_process_tree_e_temp()
     parser = argparse.ArgumentParser(
         prog="cnnc_auth_refresh.py",
         description=(

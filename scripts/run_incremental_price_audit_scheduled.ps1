@@ -146,6 +146,16 @@ if ($phases.Count -eq 0) {
     exit 0
 }
 
+# Project-controlled temp writes stay on E: (<repo>\runtime\temp, the shared
+# runtime root from scripts/cnnc_runtime.py).  Child Python/Chrome/cURL
+# processes inherit TEMP/TMP/TMPDIR; only this process environment changes,
+# never the registry or machine-wide settings.
+$cnncRuntimeTemp = Join-Path $repo "runtime\temp"
+New-Item -ItemType Directory -Path $cnncRuntimeTemp -Force | Out-Null
+$env:TEMP = $cnncRuntimeTemp
+$env:TMP = $cnncRuntimeTemp
+$env:TMPDIR = $cnncRuntimeTemp
+
 $pythonPath = (Get-Command $PythonExe -ErrorAction Stop).Source
 $processHostPath = Join-Path $PSScriptRoot "scheduled_process_host.cs"
 if (-not (Test-Path -LiteralPath $processHostPath -PathType Leaf)) {

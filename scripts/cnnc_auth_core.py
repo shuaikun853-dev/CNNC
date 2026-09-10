@@ -46,6 +46,13 @@ except ModuleNotFoundError:  # Direct invocation from scripts/.
     from auth_manager import _payload_is_auth_failure
     from curl_utils import apply_curl_headers, internal_direct_opener, load_curl_command
 
+# 运行时临时目录治理（单一事实源 scripts/cnnc_runtime.py，零 cnnc 内部依赖
+# 以杜绝循环 import）：selftest 临时目录统一落 E: <repo>/runtime/temp
+try:
+    from scripts.cnnc_runtime import temp_root
+except ModuleNotFoundError:  # Direct invocation from scripts/.
+    from cnnc_runtime import temp_root
+
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_STATE_PATH = ROOT / "data" / "cnnc_auth_state.json"
@@ -1125,7 +1132,9 @@ def run_selftest() -> int:
             if line.strip() and json.loads(line).get("event") == "CNNC_AUTH_REFRESHED"
         ]
 
-    with tempfile.TemporaryDirectory(prefix="cnnc_auth_core_selftest_") as tmp:
+    with tempfile.TemporaryDirectory(
+        prefix="cnnc_auth_core_selftest_", dir=str(temp_root())
+    ) as tmp:
         tmp_path = Path(tmp)
 
         # ---- 场景 1：refresh 成功发布，last_failure_at 清空

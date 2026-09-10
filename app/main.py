@@ -27,8 +27,15 @@ from app.workflows.router import route_workflow
 from app.workflows.base import WORKFLOW_REGISTRY
 from app.workflows.human_approval_guard import enforce_recommendation_only
 from app.services.workflow_knowledge_adapter import get_workflow_knowledge_files
+from scripts.cnnc_runtime import force_process_tree_e_temp
 
 logger = logging.getLogger(__name__)
+
+# 进程树 TEMP 重定向（必须先于 FastAPI app 创建）：Dashboard 进程及其
+# 全部子进程（refresh-curl / browser login 等 DETACHED 子进程）继承
+# E: <repo>/runtime/temp，临时写入不再落 C: %TEMP%。
+# 只改当前进程环境，不触碰注册表/系统全局（详见 scripts/cnnc_runtime.py）。
+force_process_tree_e_temp()
 
 _HIGH_RISK_WRITE_INTENT_RE = re.compile(
     r"修改价格指数|价格指数修改|修改指导价|手工修改价格|"

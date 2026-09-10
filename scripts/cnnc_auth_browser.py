@@ -86,6 +86,13 @@ try:  # 兼容两种入口：作为 scripts.* 包导入（pytest）与直接脚�
 except ImportError:  # 直接 python scripts/cnnc_auth_browser.py 时的 sys.path[0]=scripts
     from cnnc_login_autofill import create_login_autofiller
 
+# 运行时临时目录治理（单一事实源 scripts/cnnc_runtime.py）：一次性 Chrome
+# Profile 统一落 E: <repo>/runtime/temp，不再落 C: %TEMP%
+try:  # 兼容两种入口：作为 scripts.* 包导入（pytest）与直接脚本执行
+    from scripts.cnnc_runtime import force_process_tree_e_temp, temp_root
+except ImportError:  # 直接 python scripts/cnnc_auth_browser.py 时的 sys.path[0]=scripts
+    from cnnc_runtime import force_process_tree_e_temp, temp_root
+
 # ROOT = 本脚本所在目录（scripts/）的上一级，即 cnnc-ops-agent/
 ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = ROOT / "data"
@@ -346,7 +353,7 @@ def cmd_login(args):
     # 优雅关闭），启动 ~2 秒即误判"登录成功"秒关窗，用户永远没机会输密码
     # （2026-09-03 实锤 bug）。改空 Profile 后，TGC 出现只可能来自本次真人
     # 登录新签发，窗口保持打开直到用户真正完成登录。
-    login_dir = Path(tempfile.mkdtemp(prefix="cnnc_login_"))
+    login_dir = Path(tempfile.mkdtemp(prefix="cnnc_login_", dir=str(temp_root())))
     proc = browser = pw = None
     try:
         # URL 作为启动参数直接打开，不用 page.goto
@@ -437,7 +444,7 @@ def cmd_harvest(args):
         return 4
 
     # 一次性临时 Profile（系统 TEMP，仓库外），用后即删
-    harvest_dir = Path(tempfile.mkdtemp(prefix="cnnc_harvest_"))
+    harvest_dir = Path(tempfile.mkdtemp(prefix="cnnc_harvest_", dir=str(temp_root())))
     print("harvest 临时 Profile：%s" % harvest_dir)
     proc = browser = pw = None
     try:
@@ -673,7 +680,7 @@ def cmd_smoke(args):
 
     同 harvest 模式：一次性临时 Profile（mkdtemp + rmtree），不污染持久 Profile。
     """
-    smoke_dir = Path(tempfile.mkdtemp(prefix="cnnc_harvest_"))
+    smoke_dir = Path(tempfile.mkdtemp(prefix="cnnc_harvest_", dir=str(temp_root())))
     proc = browser = pw = None
     try:
         proc, browser, pw = _launch_chrome_cdp(url=None, headless=True,
@@ -692,6 +699,10 @@ def cmd_smoke(args):
 
 def main():
     _force_utf8_stdio()
+    # Chrome / Playwright driver 等子进程继承本进程 TEMP/TMP/TMPDIR：
+    # 入口处统一重定向到 E: <repo>/runtime/temp（scripts/cnnc_runtime.py），
+    # 子进程的临时写入不再落 C: %TEMP%。
+    force_process_tree_e_temp()
     parser = argparse.ArgumentParser(
         prog="cnnc_auth_browser.py",
         description="CNNC SSO 浏览器登录 / OC 收割工具"
