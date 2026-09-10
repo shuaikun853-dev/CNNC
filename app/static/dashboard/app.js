@@ -1333,19 +1333,56 @@
   function cnncStatusText(p) {
     return CNNC_STATUS_LABELS[p.status] || ("异常：" + p.status);
   }
+  // 纯函数 seam(离线单测,不触碰 DOM):登录区视图模型。
+  // manualRecoveryText 由 last_manual_recovery 工件(后端 /api/cnnc-auth/status
+  // 原样透传)生成非敏感文案:只含时间(HH:mm 上海)、outcome、cURL 计数与
+  // 失败文件名——绝不含 at_redacted/路径/任何凭证形态;无该字段返回 ""。
+  function cnncAuthView(p) {
+    const r = p && p.last_manual_recovery;
+    let manualRecoveryText = "";
+    if (r && typeof r === "object") {
+      const bits = ["上次手动刷新"];
+      const t = fmtShanghaiDateTime(r.completed_at);
+      if (t !== "—") bits.push(t.slice(11, 16));
+      bits.push(String(r.outcome || "UNKNOWN"));
+      const expected = Number(r.curl_expected);
+      const synced = Number(r.curl_synced);
+      if (Number.isFinite(expected) && Number.isFinite(synced)) {
+        bits.push("cURL " + synced + "/" + expected);
+      }
+      const failed = Array.isArray(r.curl_failed_files)
+        ? r.curl_failed_files.filter((f) => f) : [];
+      if (failed.length) bits.push("失败: " + failed.join(","));
+      manualRecoveryText = bits.join(" · ");
+    }
+    return {
+      statusText: cnncStatusText(p || {}),
+      autoExpand: Boolean(p && p.login_required),
+      manualRecoveryText,
+    };
+  }
   function renderCnncAuth(p) {
     const chips = $("#cnnc-auth-chips");
     if (!chips) return;
-    const parts = ["状态 " + cnncStatusText(p)];
+    const view = cnncAuthView(p);
+    const parts = ["状态 " + view.statusText];
     const refreshedAt = new Date(p.last_refresh_at || "").getTime();
     if (!Number.isNaN(refreshedAt) && p.last_refresh_at) {
       parts.push("最后刷新 " + fmtAgoAt(p.last_refresh_at, Date.now()));
     }
     chips.textContent = parts.join(" · ");
     const meta = $("#cnnc-auth-meta");
-    if (meta) meta.textContent = p.last_error ? "最近错误：" + p.last_error : "";
-    const btn = $("#cnnc-auth-login");
-    if (btn) btn.style.display = p.login_required ? "" : "none";
+    if (meta) {
+      const metaBits = [];
+      if (view.manualRecoveryText) metaBits.push(view.manualRecoveryText);
+      if (p.last_error) metaBits.push("最近错误：" + p.last_error);
+      meta.textContent = metaBits.join(" ｜ ");
+    }
+    // 重新登录入口常驻(2026-09-10):login_required 只决定警告与自动展开,
+    // 不决定按钮存在性——认证正常也可主动点。details 只开不关:正常状态
+    // 绝不强制展开/收起,不重置用户操作。
+    const d = $("#cnnc-auth");
+    if (d && view.autoExpand && !d.open) d.open = true;
   }
   // Bug2B:fetch 必须有超时——永久 pending 的响应曾让 inFlight 永真、轮询链死亡。
   // fetcher 做成可注入 factory(tests/js 用 fake clock 驱动超时行为),失败文案逐字保留。
@@ -1561,7 +1598,7 @@
   const api = { start, stop: () => { ctl.stop(); sfPoller.stop(); cnncPoller.stop(); prodIdentityPoller.stop(); closeoutActionsPoller.stop(); },
     createPollController, createSaasFlowPoller, safeProgressText, sfPartialNotice,
     sfTreeHtml, sfGrowthText, jobProgressCell, progressDetail, outputDisplayName,
-    createActionClient, actionOutcomeText, cnncStatusText, renderCnncAuth,
+    createActionClient, actionOutcomeText, cnncStatusText, renderCnncAuth, cnncAuthView,
     fmtShanghaiDateTime, createCnncAuthFetcher,
     piStatusText, piStatusWord, piWorkingTreeText, renderProductionIdentity,
     createProductionIdentityFetcher,

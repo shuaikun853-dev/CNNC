@@ -96,7 +96,7 @@
   </details>
 </section>
 
-<!-- CNNC 认证状态(只读轮询;SSO 失效时提供受控重新登录入口) -->
+<!-- CNNC 认证状态(只读轮询;重新登录入口常驻,认证正常也可主动点) -->
 <section class="card">
   <details class="saasflow" id="cnnc-auth">
     <summary style="cursor:pointer">
@@ -106,7 +106,8 @@
     </summary>
     <div class="sf-body">
       <div class="sf-notice" id="cnnc-auth-notice"></div>
-      <div class="sf-actions"><button class="btn" id="cnnc-auth-login" style="display:none">重新登录</button>
+      <div class="sf-actions"><button class="btn" id="cnnc-auth-login">重新登录</button>
+        <span class="sf-meta">可随时重新登录并刷新认证及 cURL</span>
         <span class="sf-meta" id="cnnc-auth-meta"></span></div>
     </div>
   </details>
