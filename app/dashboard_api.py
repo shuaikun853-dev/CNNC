@@ -6,6 +6,7 @@ _guard_operator_action(Host/Origin/X-Dashboard-Action-Token),绝无轮询触写�
 """
 from __future__ import annotations
 
+import json
 import os
 import re
 import secrets
@@ -425,6 +426,19 @@ def dashboard_job_refresh_progress(
 _CNNC_LOGIN_THROTTLE_SECONDS = 60.0
 # 进程内单例节流:60 秒内只允许启动一次登录浏览器(monotonic 时间戳)。
 _cnnc_login_launched_at: float | None = None
+# 手动恢复结果工件(scripts/cnnc_auth_refresh.py --login-and-recover 写入);
+# status 路由只读合并进 payload.last_manual_recovery,模块常量供测试注入。
+_CNNC_RECOVERY_RESULT_PATH = _ROOT_DIR / "data" / "cnnc_login_recovery_result.json"
+
+
+def _load_manual_recovery_result() -> dict | None:
+    """只读加载手动恢复结果工件;缺文件/坏 JSON/顶层非对象一律返回 None。"""
+    try:
+        data = json.loads(
+            Path(_CNNC_RECOVERY_RESULT_PATH).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
 
 
 @router.get("/api/cnnc-auth/status")
@@ -438,6 +452,9 @@ def dashboard_cnnc_auth_status() -> JSONResponse:
             "error_code": "CNNC_AUTH_STATUS_READ_FAILED",
             "message": "CNNC 认证状态读取失败,请稍后重试",
             "type": type(exc).__name__}) from exc
+    recovery = _load_manual_recovery_result()
+    if recovery is not None:
+        payload["last_manual_recovery"] = recovery
     return JSONResponse(payload, headers=_NO_STORE)
 
 

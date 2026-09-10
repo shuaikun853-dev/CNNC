@@ -25,22 +25,34 @@
     1     其他 CnncAuthError（stderr 打印状态码）
     2     SSO 会话失效（SSO_LOGIN_REQUIRED，需先
           python scripts/cnnc_auth_browser.py login）；无参数用法错误同为 2
+    4     认证刷新成功但期望 cURL 同步不完整
+          （AUTH_REFRESH_OK_CURL_SYNC_FAILED；仅 --login-and-recover，
+          stdout/结果工件只报文件名，绝不冒充登录失败 rc=1）
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from uuid import uuid4
 
 try:
     from scripts import cnnc_auth_core as core
+    from scripts.curl_utils import load_curl_command
 except ImportError:  # Direct invocation from scripts/（含命名空间 scripts 冲突）.
     import cnnc_auth_core as core
+    from curl_utils import load_curl_command
+
+
+ROOT = Path(__file__).resolve().parents[1]
+# 手动恢复结果工件（--login-and-recover 各 outcome 都写；status 路由只读合并）
+LOGIN_RECOVERY_RESULT_PATH = ROOT / "data" / "cnnc_login_recovery_result.json"
 
 
 def _force_utf8_stdio():
@@ -151,26 +163,94 @@ def _login_failed_mutator(rc: int):
     return mutator
 
 
-def run_login_and_recover(login_runner=None, provider=None) -> int:
-    """登录后自动恢复（review Finding 3）：login 成功 → force 刷新 → 发布。
+def _verify_curl_sync(at: str, curl_files) -> tuple[list[str], list[str]]:
+    """手动恢复严格后置条件：逐个核验期望 cURL 文件（2026-09-10）。
 
-    login_runner/provider 可注入（测试 seam）；默认 login_runner 阻塞等待
-    人工完成滑块/短信。返回码：
-        0  login 成功且 refresh(force=True) 发布成功（stdout 打 RECOVERY_OK，
-           AT 已脱敏）
+    对每个期望文件检查：存在、load_curl_command 可解析、内容含新 AT（与
+    cnnc_auth_core.sync_curl_files 的注入/自检同语义：AT 明文出现）。任何
+    一项不满足即该文件未同步。只读核验，绝不改写文件、绝不动 refresh 内部
+    的宽松语义。
+
+    返回 (synced_names, failed_names)；名字只含文件名，绝不含路径或 AT。
+    """
+    synced: list[str] = []
+    failed: list[str] = []
+    for path in curl_files or ():
+        name = Path(path).name
+        try:
+            target = Path(path)
+            text = target.read_text(encoding="utf-8", errors="replace")
+            load_curl_command(target)
+            if not at or at not in text:
+                raise ValueError("new AT not injected")
+        except Exception:  # noqa: BLE001 — 读取/解析/缺失一律按未同步
+            failed.append(name)
+        else:
+            synced.append(name)
+    return synced, failed
+
+
+def _write_recovery_result(path, outcome, *, at="", curl_expected=0,
+                           curl_synced=0, curl_failed_files=()) -> None:
+    """写手动恢复结果工件（观测用，绝不含完整凭证）。
+
+    tmp + os.replace 原子替换；OSError 尽力而为（含残留 tmp 清理），绝不
+    影响退出码语义。
+    """
+    payload = {
+        "completed_at": datetime.now(timezone.utc).isoformat(),
+        "outcome": outcome,
+        "curl_expected": int(curl_expected),
+        "curl_synced": int(curl_synced),
+        "curl_failed_files": list(curl_failed_files),
+        "at_redacted": core.redact_secret(at),
+    }
+    tmp = None
+    try:
+        target = Path(path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        tmp = target.with_name(f"{target.name}.{uuid4().hex}.tmp")
+        tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp, target)
+    except OSError:
+        if tmp is not None:
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+def run_login_and_recover(login_runner=None, provider=None, result_path=None) -> int:
+    """登录后自动恢复（review Finding 3）：login 成功 → force 刷新 → 发布
+    → 期望 cURL 同步严格后置核验（2026-09-10）。
+
+    login_runner/provider/result_path 可注入（测试 seam）；默认 login_runner
+    阻塞等待人工完成滑块/短信，默认工件路径 data/cnnc_login_recovery_result.json。
+    返回码：
+        0  login 成功、refresh(force=True) 发布成功且期望 cURL 全部同步
+           （stdout 打 RECOVERY_OK，AT 已脱敏）
         1  login 失败（状态落 LOGIN_RECOVERY_FAILED）或其他刷新失败
         2  refresh 抛 SSO_LOGIN_REQUIRED（失败状态已由 provider 落盘）
+        4  认证刷新成功但期望 cURL 同步不完整（stdout 只报文件名；绝不把
+           cURL 失败冒充登录失败 rc=1）
 
-    全程不打印完整凭证。
+    refresh 内部保持宽松语义（cURL 同步失败只记 CURL_SYNC_FAILED 台账不
+    阻断自动续签）；核验只发生在手动恢复入口并如实上报。四种 outcome 都写
+    结果工件（RECOVERY_OK / AUTH_REFRESH_OK_CURL_SYNC_FAILED /
+    LOGIN_RECOVERY_FAILED / REFRESH_FAILED，尽力而为不影响返回码）。全程
+    不打印完整凭证。
     """
     provider = provider if provider is not None else _default_provider()
     login_runner = login_runner if login_runner is not None else _default_login_runner
+    result_path = (Path(result_path) if result_path is not None
+                   else LOGIN_RECOVERY_RESULT_PATH)
     rc = int(login_runner())
     if rc != 0:
         try:
             provider.mutate_state(_login_failed_mutator(rc))
         except OSError:
             pass  # 状态落盘尽力而为，不改变返回码语义
+        _write_recovery_result(result_path, "LOGIN_RECOVERY_FAILED")
         print(
             "LOGIN_RECOVERY_FAILED：登录未完成/失败（exit=%d），请重试或手工运行 "
             "python scripts/cnnc_auth_browser.py login" % rc,
@@ -181,9 +261,25 @@ def run_login_and_recover(login_runner=None, provider=None) -> int:
         at = provider.refresh(force=True)  # force：人工登录显式重试，绕过 SSO 冷却
     except core.CnncAuthError as exc:
         # 失败状态/审计已由 provider 落盘，这里只提示并按状态码定退出码
+        _write_recovery_result(result_path, "REFRESH_FAILED")
         print("REFRESH_FAILED %s: %s" % (exc.status, exc), file=sys.stderr)
         return 2 if exc.status == core.CnncAuthStatus.SSO_LOGIN_REQUIRED else 1
-    print("RECOVERY_OK at=%s" % core.redact_secret(at))
+    # 严格后置核验（2026-09-10）：真 provider 有 curl_files 属性；无该属性的
+    # duck-type provider 期望清单为空 = 全同步（既有调用方语义不破）。
+    curl_files = getattr(provider, "curl_files", ()) or ()
+    synced, failed = _verify_curl_sync(at, curl_files)
+    expected = len(synced) + len(failed)
+    outcome = "AUTH_REFRESH_OK_CURL_SYNC_FAILED" if failed else "RECOVERY_OK"
+    _write_recovery_result(result_path, outcome, at=at, curl_expected=expected,
+                           curl_synced=len(synced), curl_failed_files=failed)
+    if failed:
+        print(
+            "AUTH_REFRESH_OK_CURL_SYNC_FAILED curl_synced=%d/%d failed=%s"
+            % (len(synced), expected, ",".join(failed))
+        )
+        return 4
+    print("RECOVERY_OK at=%s curl_synced=%d"
+          % (core.redact_secret(at), len(synced)))
     return 0
 
 

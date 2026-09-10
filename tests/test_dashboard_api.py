@@ -1,4 +1,5 @@
 from pathlib import Path
+import json
 
 import pytest
 from fastapi.testclient import TestClient
@@ -584,3 +585,91 @@ def test_production_writer_lock_blocks_second_process(tmp_path):
     # 释放后可重新获取
     second = ProcessLock(lock_path).acquire(owner={"pid": 333})
     second.release()
+
+
+# ======================================================================
+# CNNC 认证路由(2026-09-10):健康态不拒绝重新登录 + 手动恢复工件透传
+# ======================================================================
+
+def _fake_status_provider(monkeypatch):
+    """status 路由在调用时才 import CnncAuthProvider;替换类对象即可隔离
+    真实 data/ 读取,让 status 恒为 CNNC_AUTH_OK(健康)。"""
+    from scripts import cnnc_auth_core as core
+
+    class _FakeStatusProvider:
+        def get_status(self):
+            return {"status": "CNNC_AUTH_OK", "login_required": False}
+
+    monkeypatch.setattr(core, "CnncAuthProvider", _FakeStatusProvider)
+
+
+def test_cnnc_auth_login_healthy_state_starts_detached_recovery(client, monkeypatch):
+    """认证健康(CNNC_AUTH_OK)时 POST /api/cnnc-auth/login 必须 202 started 且
+    拉起恢复子进程(mock 掉):锁定"健康态不拒绝重新登录"。login 路由无健康门,
+    只有 operator guard / 60s 节流 / detached 拉起——这是有意契约。"""
+    from app import dashboard_api
+    launched = []
+
+    def fake_popen(args, **kwargs):
+        launched.append(list(args))
+
+    monkeypatch.setattr(dashboard_api.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(dashboard_api, "_cnnc_login_launched_at", None)  # 隔离节流单例
+    r = client.post("/dashboard/api/cnnc-auth/login", headers={
+        "X-Dashboard-Action-Token": dashboard_api._ACTION_TOKEN})
+    assert r.status_code == 202
+    assert r.json()["started"] is True
+    assert len(launched) == 1  # 子进程确实被拉起(mock 断言)
+    assert "--login-and-recover" in launched[0]
+
+
+def test_cnnc_auth_login_requires_operator_token(client, monkeypatch):
+    """回归:重登入口仍受 operator guard 保护(无令牌 403),健康态不绕过门禁。"""
+    from app import dashboard_api
+    monkeypatch.setattr(dashboard_api, "_cnnc_login_launched_at", None)
+    r = client.post("/dashboard/api/cnnc-auth/login")
+    assert r.status_code == 403
+
+
+def test_cnnc_auth_status_merges_manual_recovery_artifact(client, monkeypatch, tmp_path):
+    """status 路由合并结果工件:last_manual_recovery 原样透传工件内容;
+    缺文件/坏 JSON 容错不加字段(只读、绝不影响主 payload)。"""
+    from app import dashboard_api
+    _fake_status_provider(monkeypatch)
+    artifact = tmp_path / "cnnc_login_recovery_result.json"
+    artifact.write_text(json.dumps({
+        "completed_at": "2026-09-10T06:30:00+00:00",
+        "outcome": "RECOVERY_OK",
+        "curl_expected": 3,
+        "curl_synced": 3,
+        "curl_failed_files": [],
+        "at_redacted": "AT-2026***",
+    }, ensure_ascii=False), encoding="utf-8")
+    monkeypatch.setattr(dashboard_api, "_CNNC_RECOVERY_RESULT_PATH", artifact)
+
+    r = client.get("/dashboard/api/cnnc-auth/status")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["status"] == "CNNC_AUTH_OK"
+    assert body["last_manual_recovery"]["outcome"] == "RECOVERY_OK"
+    assert body["last_manual_recovery"]["curl_synced"] == 3
+    assert body["last_manual_recovery"]["curl_failed_files"] == []
+
+    # 工件缺失:响应正常且无该字段
+    monkeypatch.setattr(
+        dashboard_api, "_CNNC_RECOVERY_RESULT_PATH", tmp_path / "missing.json")
+    r2 = client.get("/dashboard/api/cnnc-auth/status")
+    assert r2.status_code == 200
+    assert "last_manual_recovery" not in r2.json()
+
+
+def test_cnnc_auth_status_bad_json_artifact_is_ignored(client, monkeypatch, tmp_path):
+    from app import dashboard_api
+    _fake_status_provider(monkeypatch)
+    artifact = tmp_path / "bad.json"
+    artifact.write_text("{not json", encoding="utf-8")
+    monkeypatch.setattr(dashboard_api, "_CNNC_RECOVERY_RESULT_PATH", artifact)
+
+    r = client.get("/dashboard/api/cnnc-auth/status")
+    assert r.status_code == 200
+    assert "last_manual_recovery" not in r.json()
