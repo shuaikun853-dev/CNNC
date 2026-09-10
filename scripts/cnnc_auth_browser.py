@@ -27,7 +27,12 @@
              还原导致启动即误判登录成功、窗口秒关（TGC 出现只可能来自
              本次真人登录新签发）；检测到 SSO 根凭证 TGC 后只把 5 个
              SSO 会话白名单 cookie 导出到 data/cnnc_auth_storage_state.json
-             （登录成功的会话仍经 storage_state 持久化）
+             （登录成功的会话仍经 storage_state 持久化）。支持 SSO 登录
+             表单账号密码自动填充：凭证文件 data/
+             cnnc_login_credentials.json（已被 .gitignore 忽略）存在且
+             auto_fill_enabled 非 false 时，自动把账号/密码填入登录表单
+             （含 iframe 场景，只填空字段、不点击不提交），人只做滑块/
+             短信验证与提交；文件缺失则保持纯手动输入
     harvest  用已保存会话只注入 5 个 SSO 会话 cookie（全量注入含陈旧 K5 等
              WAF cookie 会让门户首页卡在 412 挑战循环；WAF 空状态挑战自算
              反而秒过），从门户首页 https://sso.cnncecp.com/ 进入，自动跟随
@@ -323,6 +328,226 @@ def _close_cdp(proc, browser, pw):
             pass
 
 
+# --------------------------------------------------------------------------
+# login 的 SSO 登录表单自动填充（账号/密码）。
+# 边界：凭证只来自 data/cnnc_login_credentials.json（.gitignore 已忽略）；
+# 只填"当前为空"的字段、绝不覆盖人已输入内容；绝不点击/提交表单；
+# 日志只打字段名与 filled，绝不含凭证值；填充全部在 cmd_login 主线程
+# 轮询循环内联执行（Playwright sync API 禁止跨线程），单次尝试异常一律
+# 吞掉，绝不打断 TGC 轮询主流程。
+# --------------------------------------------------------------------------
+
+# 凭证文件：{"username": "...", "password": "...", "auto_fill_enabled": true}
+CREDENTIALS_FILE = DATA_DIR / "cnnc_login_credentials.json"
+# 填充尝试限速：登录页 302 链 + WAF 挑战 + 表单渲染需要数秒，每 3.5 秒
+# 试一轮足够；两个字段各成功填过一次后即停止再试
+AUTOFILL_INTERVAL_SEC = 3.5
+# 单字段 fill 超时：失败快速返回，避免拖慢 2 秒粒度的 TGC 轮询
+AUTOFILL_FILL_TIMEOUT_MS = 2000
+# 填充异常最多 WARN 次数（之后静默，避免刷屏）
+AUTOFILL_MAX_WARNS = 3
+
+# 用户名框启发式提示词（不区分大小写子串匹配 name/id/placeholder/class）
+USERNAME_HINTS = (
+    "username", "user", "account", "loginname", "login_name", "login",
+    "账号", "用户名", "工号", "empno", "emp_code",
+)
+# 验证码/短信码类字段绝不能当用户名框。注意含 "code"：emp_code 类字段会被
+# 一并排除——真实 SSO 登录框用 username/loginName 类命名，可接受
+CAPTCHA_HINTS = ("captcha", "sms", "code", "verify", "验证码", "短信", "校验")
+# 非文本类 input：既不参与用户名启发式，也不进 fallback
+NON_TEXT_INPUT_TYPES = frozenset((
+    "checkbox", "radio", "hidden", "submit", "button", "image",
+    "file", "reset", "range", "color", "date", "time",
+))
+
+
+def load_login_credentials(path=CREDENTIALS_FILE):
+    """读取登录自动填充凭证；任何异常/缺失/禁用一律返回 None，绝不抛出。
+
+    规则：文件缺失、坏 JSON、顶层非对象、缺 username/password、值为空白、
+    auto_fill_enabled 为 false（缺省视为 true）→ 返回 None；否则返回
+    {"username": ..., "password": ...}。纯函数，可离线单测。
+    """
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    if not data.get("auto_fill_enabled", True):
+        return None
+    username = data.get("username")
+    password = data.get("password")
+    for value in (username, password):
+        if not isinstance(value, str) or not value.strip():
+            return None
+    return {"username": username, "password": password}
+
+
+def _attrs_text(attrs):
+    """拼接 name/id/placeholder/class 供子串匹配（统一小写）。纯函数。"""
+    return " ".join(
+        str(attrs.get(key) or "")
+        for key in ("name", "id", "placeholder", "class")
+    ).lower()
+
+
+def _is_password_field(attrs):
+    """密码框判定：type 含 password（不区分大小写）。纯函数。"""
+    return "password" in str(attrs.get("type") or "").strip().lower()
+
+
+def _looks_like_captcha(attrs):
+    """验证码/短信码类字段判定（name/id/placeholder/class 含 captcha/sms/code 等）。"""
+    text = _attrs_text(attrs)
+    return any(hint in text for hint in CAPTCHA_HINTS)
+
+
+def _score_username_field(attrs):
+    """用户名框启发式打分。纯函数，可离线单测。
+
+    返回：-1 = 密码框（绝不当用户名）；0 = 未命中或排除（checkbox/hidden
+    等非文本类型、验证码类字段）；>0 = 命中 USERNAME_HINTS（中英文均支持）。
+    """
+    if _is_password_field(attrs):
+        return -1
+    if str(attrs.get("type") or "").strip().lower() in NON_TEXT_INPUT_TYPES:
+        return 0
+    if _looks_like_captcha(attrs):
+        return 0
+    text = _attrs_text(attrs)
+    return 1 if any(hint in text for hint in USERNAME_HINTS) else 0
+
+
+def _is_blank(value):
+    """只填空字段：当前值去空白后为空才允许填充，不覆盖人已输入内容。"""
+    return not str(value or "").strip()
+
+
+def _field_signature(attrs):
+    """字段签名 (type, name, id)：填充前二次确认 DOM 目标未漂移。"""
+    return (str(attrs.get("type") or "").strip().lower(),
+            str(attrs.get("name") or ""),
+            str(attrs.get("id") or ""))
+
+
+def _eligible_field(field):
+    """字段可填性：可见、未禁用、非只读。"""
+    return (field.get("visible") and not field.get("disabled")
+            and not field.get("readonly"))
+
+
+def _pick_frame_fill_targets(fields):
+    """纯决策：从单个 frame 的输入框描述列表（document 顺序）选出
+    (username_idx, password_idx)，找不到的返回 None。可离线单测。
+
+    - 密码框 = 第一个可见/启用/非只读的 password 输入框
+    - 用户名框 = 启发式最高分者；无命中时 fallback 到"密码框之前第一个
+      可见的非 password/非排除类型/非验证码类 输入框"
+    - 只返回当前值为空的索引（只填空字段，不覆盖人已输入）
+    """
+    usable = [i for i, f in enumerate(fields) if _eligible_field(f)]
+    pwd_idx = next(
+        (i for i in usable if _is_password_field(fields[i])), None)
+    user_idx, best = None, 0
+    for i in usable:
+        score = _score_username_field(fields[i])
+        if score > best:
+            user_idx, best = i, score
+    if user_idx is None and pwd_idx is not None:
+        for i in usable:
+            if i >= pwd_idx:
+                break
+            field = fields[i]
+            if (_is_password_field(field) or _looks_like_captcha(field)
+                    or str(field.get("type") or "").strip().lower()
+                    in NON_TEXT_INPUT_TYPES):
+                continue
+            user_idx = i
+            break
+    if user_idx is not None and not _is_blank(fields[user_idx].get("value")):
+        user_idx = None
+    if pwd_idx is not None and not _is_blank(fields[pwd_idx].get("value")):
+        pwd_idx = None
+    return user_idx, pwd_idx
+
+
+# 在 frame 内收集全部 input 描述（document 顺序，与 frame.locator("input")
+# 的 nth() 顺序一致）；visible = 几何尺寸 + display/visibility 综合判断。
+_COLLECT_INPUTS_JS = """() => Array.from(document.querySelectorAll('input')).map((el) => {
+    const rect = el.getBoundingClientRect();
+    const style = window.getComputedStyle(el);
+    return {
+        type: String(el.type || '').toLowerCase(),
+        name: el.getAttribute('name') || '',
+        id: el.getAttribute('id') || '',
+        placeholder: el.getAttribute('placeholder') || '',
+        className: String(el.className || ''),
+        value: String(el.value || ''),
+        disabled: !!el.disabled,
+        readonly: !!el.readOnly,
+        visible: style.display !== 'none' && style.visibility !== 'hidden'
+            && rect.width > 0 && rect.height > 0
+    };
+})"""
+
+
+def _fill_frame_fields(frame, fields, creds, state):
+    """在单个 frame 内执行已决策的填充；填充前二次确认目标未漂移。
+
+    用 locator.fill（Playwright 自带 input 事件派发，SPA 框架可感知），
+    不点击、不提交。DOM 与采样时签名不一致则本轮放弃（下一轮重新评估）。
+    异常向上抛给 _autofill_once 统一限次 WARN。
+    """
+    user_idx, pwd_idx = _pick_frame_fill_targets(fields)
+    for kind, idx in (("username", user_idx), ("password", pwd_idx)):
+        if idx is None or state.get(kind):
+            continue
+        expected = _field_signature(fields[idx])
+        locator = frame.locator("input").nth(idx)
+        actual = locator.evaluate(
+            "el => ({type: String(el.type || '').toLowerCase(),"
+            " name: el.getAttribute('name') || '',"
+            " id: el.getAttribute('id') || ''})")
+        if _field_signature(actual) != expected:
+            return
+        locator.fill(creds[kind], timeout=AUTOFILL_FILL_TIMEOUT_MS)
+        state[kind] = True
+        # 日志只打字段名与 filled，绝不含凭证值
+        print("AUTO_FILL：%s filled" % kind, flush=True)
+
+
+def _autofill_once(ctx, creds, state):
+    """单轮自动填充尝试：遍历 ctx.pages 与各 page.frames（含 iframe 表单）。
+
+    所有异常（frame 导航中/已销毁/fill 超时等）捕获后静默，仅前
+    AUTOFILL_MAX_WARNS 次打 WARN；绝不打断登录轮询主流程。两个字段都
+    成功填过后由调用方（cmd_login）不再调度本轮。
+    """
+    for page in list(getattr(ctx, "pages", None) or []):
+        try:
+            frames = list(page.frames)
+        except Exception:
+            continue
+        for frame in frames:
+            if state.get("username") and state.get("password"):
+                return
+            try:
+                fields = frame.evaluate(_COLLECT_INPUTS_JS)
+            except Exception:
+                continue  # 导航中/已关闭：静默跳过该 frame
+            if not isinstance(fields, list):
+                continue
+            try:
+                _fill_frame_fields(frame, fields, creds, state)
+            except Exception:
+                state["warns"] = state.get("warns", 0) + 1
+                if state["warns"] <= AUTOFILL_MAX_WARNS:
+                    print("WARN：自动填充尝试失败（第 %d 次，继续轮询）"
+                          % state["warns"], file=sys.stderr)
+
+
 def cmd_login(args):
     """人工一次性登录：纯净 Chrome 以一次性临时 Profile（空 cookie）打开
     真窗口完成登录，检测到本次登录新签发的 SSO 根凭证 TGC 后只导出 SSO
@@ -347,6 +572,14 @@ def cmd_login(args):
             return 1
         deadline = time.time() + LOGIN_TIMEOUT_SEC
         cookie_err_count = 0
+        # 自动填充（主线程内联，零线程）：循环外加载凭证一次；缺失则打一行
+        # 提示并保持原有纯手动行为。TGC 检测到后自然退出循环即停止填充。
+        creds = load_login_credentials(CREDENTIALS_FILE)
+        if creds is None:
+            print("AUTO_FILL_OFF：未配置 %s，需手动输入账号密码"
+                  % CREDENTIALS_FILE, flush=True)
+        fill_state = {"username": False, "password": False, "warns": 0}
+        next_fill_at = time.time()
         while time.time() < deadline:
             try:
                 # 注意：CDP 接管的浏览器上，带 URL 过滤的 ctx.cookies(url)
@@ -383,6 +616,13 @@ def cmd_login(args):
                     "%s(len=%d)" % (c["name"], len(c.get("value") or ""))
                     for c in cnn))
                 return 0
+            # 登录表单自动填充：限速尝试（不点击不提交；单次异常已在内
+            # 部吞掉，绝不影响下面的 TGC 轮询节奏）
+            if (creds is not None
+                    and not (fill_state["username"] and fill_state["password"])
+                    and time.time() >= next_fill_at):
+                next_fill_at = time.time() + AUTOFILL_INTERVAL_SEC
+                _autofill_once(ctx, creds, fill_state)
             time.sleep(2)
         print("LOGIN_TIMEOUT：请人工完成登录后重试", file=sys.stderr)
         return 3
