@@ -948,20 +948,37 @@ def run_staples_prewarm(
                 STAPLES_CACHE_MALL_KEY, str(evidence_raw["original_url"])
             )
         except Exception as exc:  # noqa: BLE001
+            # §15:SUCCESS 只认真实命中;lookup 瞬断 → 保持待同步,下一 pass 重试。
+            summary["cache_sync_pending"] += 1
             summary["errors"].append(f"cache-sync lookup job {job_id}: {exc}")
-            hit = None
-        if hit is not None:
-            candidate = prewarm_store.candidate_by_id(candidate_id)
-            if candidate is not None:
-                summary["errors"].extend(
-                    _flip_candidate_to_cache_hit(prewarm_store, shared_cache, candidate, hit)
+            continue
+        if hit is None:
+            # 写后 lookup 不到:绝不谎报 SUCCESS;保持待同步(success_payload 经
+            # COALESCE 原样保留)并留下诊断,下一 pass 重新补同步。
+            try:
+                staples_store.complete_job(
+                    job_id,
+                    None,
+                    state=STAPLES_JOB_STATE_LOCAL_SUCCESS_CACHE_PENDING,
+                    reason="cache lookup missed after write",
+                    now=now_value,
                 )
+            except Exception as exc:  # noqa: BLE001
+                summary["errors"].append(f"cache-sync keep-pending job {job_id}: {exc}")
+                continue
+            summary["cache_sync_pending"] += 1
+            continue
+        candidate = prewarm_store.candidate_by_id(candidate_id)
+        if candidate is not None:
+            summary["errors"].extend(
+                _flip_candidate_to_cache_hit(prewarm_store, shared_cache, candidate, hit)
+            )
         try:
             staples_store.complete_job(
                 job_id,
                 None,
                 state=STAPLES_JOB_STATE_SUCCESS,
-                cache_result_id=int(hit["entry"]["id"]) if hit is not None else None,
+                cache_result_id=int(hit["entry"]["id"]),
                 now=now_value,
             )
         except Exception as exc:  # noqa: BLE001

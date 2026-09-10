@@ -831,6 +831,119 @@ def test_case13_cache_write_transient_defers_to_local_cache_pending(stack, monke
     assert hit is not None and job["cache_result_id"] == hit["entry"]["id"]
 
 
+def _make_pending_job_via_failed_cache_write(stack, crawler, monkeypatch):
+    """Pass1:crawl 成功但缓存写瞬断 → 作业进入 LOCAL_SUCCESS_CACHE_PENDING。"""
+    original_record = stack.shared.record_success
+    write_calls = {"n": 0}
+
+    def flaky_record_success(mall, submitted_url, **kwargs):
+        write_calls["n"] += 1
+        if write_calls["n"] == 1:
+            raise sqlite3.OperationalError("database is locked")
+        return original_record(mall, submitted_url, **kwargs)
+
+    monkeypatch.setattr(stack.shared, "record_success", flaky_record_success)
+    summary = _run(stack, crawler, now=T0)
+    assert summary["crawl_success"] == 1 and summary["cache_hit_after_crawl"] == 0
+    return original_record
+
+
+def test_cache_sync_lookup_error_keeps_pending(stack, monkeypatch):
+    """Blocker B1:补同步写成功但 lookup_current 抛异常 → 保持待同步,绝不假 SUCCESS。"""
+    cid = _seed_candidate(stack.prewarm)
+    crawler = FakeCrawler(outcomes={URL: _success_outcome(URL)})
+    _make_pending_job_via_failed_cache_write(stack, crawler, monkeypatch)
+    assert stack.staples.job_for_candidate(cid)[
+        "state"
+    ] == STAPLES_JOB_STATE_LOCAL_SUCCESS_CACHE_PENDING
+    # Pass2:写成功,但 lookup_current 瞬断(arm 开关保证只影响第二个 pass)
+    original_lookup = stack.shared.lookup_current
+    state = {"armed": False}
+
+    def flaky_lookup(mall, url):
+        if state["armed"]:
+            raise sqlite3.OperationalError("cache lookup blew up")
+        return original_lookup(mall, url)
+
+    monkeypatch.setattr(stack.shared, "lookup_current", flaky_lookup)
+    state["armed"] = True
+    summary2 = _run(stack, crawler, now=_t(600))
+    # 不重新爬取,不假报 SUCCESS
+    assert crawler.calls == 1
+    assert summary2["cache_sync_succeeded"] == 0
+    assert summary2["cache_sync_pending"] == 1
+    job = stack.staples.job_for_candidate(cid)
+    assert job["state"] == STAPLES_JOB_STATE_LOCAL_SUCCESS_CACHE_PENDING
+    assert stack.prewarm.candidate_by_id(cid)["cache_status"] == CACHE_STATUS_STAPLES_PENDING
+
+
+def test_cache_sync_lookup_miss_keeps_pending(stack, monkeypatch):
+    """Blocker B2:补同步写成功但 lookup MISS → 保持待同步并留下诊断,绝不假 SUCCESS。"""
+    cid = _seed_candidate(stack.prewarm)
+    crawler = FakeCrawler(outcomes={URL: _success_outcome(URL)})
+    _make_pending_job_via_failed_cache_write(stack, crawler, monkeypatch)
+    # Pass2:写成功,但 lookup 返回 None(arm 开关只影响第二个 pass)
+    original_lookup = stack.shared.lookup_current
+    state = {"armed": False}
+
+    def miss_lookup(mall, url):
+        if state["armed"]:
+            return None
+        return original_lookup(mall, url)
+
+    monkeypatch.setattr(stack.shared, "lookup_current", miss_lookup)
+    state["armed"] = True
+    summary2 = _run(stack, crawler, now=_t(600))
+    assert crawler.calls == 1
+    assert summary2["cache_sync_succeeded"] == 0
+    assert summary2["cache_sync_pending"] == 1
+    job = stack.staples.job_for_candidate(cid)
+    assert job["state"] == STAPLES_JOB_STATE_LOCAL_SUCCESS_CACHE_PENDING
+    assert "cache lookup missed after write" in job["last_error"]
+    assert stack.prewarm.candidate_by_id(cid)["cache_status"] == CACHE_STATUS_STAPLES_PENDING
+
+
+def test_cache_sync_pending_recovers_on_third_pass(stack, monkeypatch):
+    """Blocker B3 三 Pass 恢复链:写瞬断→lookup 异常→真实 hit,全程只爬一次。"""
+    cid = _seed_candidate(stack.prewarm)
+    crawler = FakeCrawler(outcomes={URL: _success_outcome(URL)})
+    # Pass1:crawl 成功但 record_success 抛 OperationalError → 待同步
+    _make_pending_job_via_failed_cache_write(stack, crawler, monkeypatch)
+    assert crawler.calls == 1
+    assert stack.staples.job_for_candidate(cid)[
+        "state"
+    ] == STAPLES_JOB_STATE_LOCAL_SUCCESS_CACHE_PENDING
+    # Pass2:写成功但 lookup 抛异常 → 仍待同步,crawler 不再被调用
+    original_lookup = stack.shared.lookup_current
+    state = {"armed": False}
+
+    def flaky_lookup(mall, url):
+        if state["armed"]:
+            raise sqlite3.OperationalError("cache lookup blew up")
+        return original_lookup(mall, url)
+
+    monkeypatch.setattr(stack.shared, "lookup_current", flaky_lookup)
+    state["armed"] = True
+    summary2 = _run(stack, crawler, now=_t(600))
+    assert crawler.calls == 1
+    assert summary2["cache_sync_succeeded"] == 0 and summary2["cache_sync_pending"] == 1
+    assert stack.staples.job_for_candidate(cid)[
+        "state"
+    ] == STAPLES_JOB_STATE_LOCAL_SUCCESS_CACHE_PENDING
+    # Pass3:lookup 真实 hit → 候选 CACHE_HIT、作业 SUCCESS、cache_result_id 非空
+    monkeypatch.setattr(stack.shared, "lookup_current", original_lookup)
+    summary3 = _run(stack, crawler, now=_t(1200))
+    assert crawler.calls == 1  # 全程只爬一次
+    candidate = stack.prewarm.candidate_by_id(cid)
+    assert candidate["cache_status"] == CACHE_STATUS_CACHE_HIT
+    job = stack.staples.job_for_candidate(cid)
+    assert job["state"] == STAPLES_JOB_STATE_SUCCESS
+    hit = stack.shared.lookup_current(STAPLES_CACHE_MALL_KEY, URL)
+    assert hit is not None
+    assert job["cache_result_id"] == int(hit["entry"]["id"])
+    assert summary3["recheck_hits"] + summary3["cache_sync_succeeded"] == 1
+
+
 def test_case14_confirmed_sku_stored_verbatim(stack):
     _seed_candidate(stack.prewarm)
     outcome = _success_outcome(
