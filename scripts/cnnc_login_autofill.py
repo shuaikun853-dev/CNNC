@@ -12,7 +12,9 @@
       返回 None，调用方保持原有纯手动输入行为
 
 安全边界（与抽取前一致并加固）：
-    - 只填"当前为空"的字段，绝不覆盖人已输入内容
+    - 只填"当前为空"的字段，绝不覆盖人已输入内容；且 fill 前一刻重新
+      读取实时状态二次确认（采样快照与 fill 之间的时间窗口内 origin /
+      签名 / 实时值 / 可编辑性任一漂移即本轮 skip）
     - 绝不点击、绝不提交表单（人负责滑块/短信验证与提交）
     - 日志只打字段名与 filled/skip origin，绝不含凭证值
     - 单次尝试异常一律吞掉（WARN 限次），绝不打断 TGC 轮询主流程
@@ -214,6 +216,24 @@ _COLLECT_INPUTS_JS = """() => Array.from(document.querySelectorAll('input')).map
     };
 })"""
 
+# fill 前对单个 locator 目标一次性读取实时状态（与 _COLLECT_INPUTS_JS 的
+# visible 判定同构：几何尺寸 + display/visibility 综合判断）。这是采样
+# 快照之后的第二道读取，专用于收窄"采样 → fill"之间的时间窗口。
+_REVALIDATE_INPUT_JS = """(el) => {
+    const rect = el.getBoundingClientRect();
+    const style = window.getComputedStyle(el);
+    return {
+        type: String(el.type || '').toLowerCase(),
+        name: el.getAttribute('name') || '',
+        id: el.getAttribute('id') || '',
+        value: String(el.value || ''),
+        disabled: !!el.disabled,
+        readOnly: !!el.readOnly,
+        visible: style.display !== 'none' && style.visibility !== 'hidden'
+            && rect.width > 0 && rect.height > 0
+    };
+}"""
+
 
 # --------------------------------------------------------------------------
 # 精确可信 Origin 门禁（deny-by-default）
@@ -343,11 +363,52 @@ class LoginAutofiller:
             print("AUTO_FILL_SKIP origin=%s" % origin, flush=True)
         return False
 
+    def _revalidate_target_before_fill(self, frame, locator,
+                                       expected_signature) -> bool:
+        """fill 前最后一道实时复核，收窄"采样 → fill"之间的时间窗口。
+
+        采样快照（fields）到 locator.fill 之间用户/页面可能已改变状态：
+        手输值、origin 导航漂移、字段禁用/只读/隐藏、DOM 漂移。本方法在
+        fill 之前一次性重新确认，任一不满足即返回 False（调用方本轮只
+        skip 当前字段，不抛异常、不打断登录轮询，下一轮重新评估）：
+
+            A. 重新读 frame.url 重走精确 Origin 门禁——采样时通过不代表
+               fill 时仍可信。复用 _origin_allowed（不另设静默变体）：
+               origin 漂移属于值得暴露的异常事件，其 AUTO_FILL_SKIP 打印
+               有界（_MAX_SKIP_ORIGIN_LINES）且按 origin 去重，可接受。
+            B. locator.evaluate 一次性读取实时
+               {type,name,id,value,disabled,readOnly,visible}（visible
+               判定与 _COLLECT_INPUTS_JS 同构）。
+            C. (type,name,id) 实时签名与采样签名一致（DOM 未漂移）。
+            D. 实时 DOM value 去空白后为空——绝不覆盖人已输入内容
+               （判定只看实时值，不信任旧快照）。
+            E. 实时 visible 且 !disabled 且 !readOnly。
+
+        幂等/异常吞边界不变：frame.url / locator.evaluate 的任何异常都
+        按"本轮不可填"返回 False（tick 绝不向调用方抛异常）。
+        """
+        try:
+            frame_url = frame.url
+            if not self._origin_allowed(frame_url):
+                return False
+            live = locator.evaluate(_REVALIDATE_INPUT_JS)
+        except Exception:
+            return False  # 导航中/已销毁/已分离：本轮放弃该字段
+        if not isinstance(live, dict):
+            return False
+        if _field_signature(live) != expected_signature:
+            return False
+        if not _is_blank(live.get("value")):
+            return False
+        return bool(live.get("visible") and not live.get("disabled")
+                    and not live.get("readOnly"))
+
     def _fill_frame_fields(self, frame, fields):
-        """在单个 frame 内执行已决策的填充；填充前二次确认目标未漂移。
+        """在单个 frame 内执行已决策的填充；fill 前做实时状态复核。
 
         用 locator.fill（Playwright 自带 input 事件派发，SPA 框架可感知），
-        不点击、不提交。DOM 与采样时签名不一致则本轮放弃（下一轮重新评估）。
+        不点击、不提交。实时复核不过（签名漂移 / 实时值非空 / 不可编辑 /
+        origin 漂移）则本轮只 skip 当前字段，下一轮重新评估，绝不盲填。
         异常向上抛给 _autofill_once 统一限次 WARN。
         """
         user_idx, pwd_idx = _pick_frame_fill_targets(fields)
@@ -356,12 +417,9 @@ class LoginAutofiller:
                 continue
             expected = _field_signature(fields[idx])
             locator = frame.locator("input").nth(idx)
-            actual = locator.evaluate(
-                "el => ({type: String(el.type || '').toLowerCase(),"
-                " name: el.getAttribute('name') || '',"
-                " id: el.getAttribute('id') || ''})")
-            if _field_signature(actual) != expected:
-                return  # DOM 漂移：本轮放弃，下一轮重新评估，绝不盲填
+            if not self._revalidate_target_before_fill(frame, locator,
+                                                       expected):
+                continue
             locator.fill(self._creds[kind], timeout=AUTOFILL_FILL_TIMEOUT_MS)
             self._filled[kind] = True
             # 日志只打字段名与 filled，绝不含凭证值

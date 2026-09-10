@@ -59,16 +59,31 @@ def _field(**overrides):
 
 
 class _FakeLocator:
-    """fake frame.locator('input').nth(i)：绑定到 fake 元素并记录 fill。"""
+    """fake frame.locator('input').nth(i)：绑定到 fake 元素并记录 fill。
+
+    evaluate 可编排：元素带 evaluate_queue（fill 前实时状态读取的结果队列）
+    时按序弹出返回，模拟"采样之后、fill 之前"的时间窗口内状态被改变；
+    缺省返回元素当前实时状态，键与 _COLLECT_INPUTS_JS / fill 前实时读取
+    同构（{type,name,id,value,disabled,readOnly,visible}）。
+    """
 
     def __init__(self, element, calls):
         self._element = element
         self._calls = calls
 
     def evaluate(self, _js):
-        return {"type": self._element["type"],
-                "name": self._element["name"],
-                "id": self._element["id"]}
+        queue = self._element.get("evaluate_queue")
+        if queue:
+            return queue.pop(0)
+        return {
+            "type": self._element["type"],
+            "name": self._element["name"],
+            "id": self._element["id"],
+            "value": str(self._element.get("value") or ""),
+            "disabled": bool(self._element.get("disabled")),
+            "readOnly": bool(self._element.get("readonly")),
+            "visible": bool(self._element.get("visible", True)),
+        }
 
     def fill(self, value, timeout=None):
         key = (self._element["name"] or self._element["id"]
@@ -120,6 +135,26 @@ class _FailFillFrame(_FakeFrame):
     """locator.fill 必抛（模拟超时）：验证 WARN 限次。"""
 
     locator_cls = _FailFillLocator
+
+
+class _OriginDriftFrame(_FakeFrame):
+    """fill 前 frame.url 发生漂移的 frame：第一次读 url（采样时门禁）返回
+    可信 SSO，之后每次读取返回漂移后的 URL。"""
+
+    def __init__(self, elements, drifted_url):
+        self.elements = elements
+        self.calls = []
+        self.evaluate_calls = 0
+        self.drift_shift = 0
+        self._drifted_url = drifted_url
+        self._url_reads = 0
+
+    @property
+    def url(self):
+        self._url_reads += 1
+        if self._url_reads <= 1:
+            return TRUSTED_URL
+        return self._drifted_url
 
 
 class _BoomFrame:
@@ -481,6 +516,80 @@ def test_tick_skips_on_dom_drift_then_refills_next_round():
     now[0] += 10.0  # 推进注入时钟越过限速窗口
     filler.tick(_FakeCtx([_FakePage([frame])]))
     assert _calls_names(frame) == ["username", "password"]
+
+
+# ---------------------------------------- fill 前实时状态复核（采样→fill 时间窗口）
+
+
+def test_tick_skips_username_typed_between_snapshot_and_fill():
+    """采样时 value=""，fill 前实时读取 value 已被人手输 → 绝不覆盖。"""
+    frame = _FakeFrame([
+        _field(name="username", evaluate_queue=[{
+            "type": "text", "name": "username", "id": "",
+            "value": "human-typed-after-snapshot",
+            "disabled": False, "readOnly": False, "visible": True}]),
+        _field(type="password", name="password"),
+    ])
+
+    _make_autofiller().tick(_FakeCtx([_FakePage([frame])]))
+
+    assert frame.calls == [("password", FAKE_PASSWORD)]
+    assert frame.elements[0]["value"] == ""
+
+
+def test_tick_skips_password_typed_between_snapshot_and_fill():
+    """密码框同理：fill 前实时读取已非空 → skip，绝不覆盖。"""
+    frame = _FakeFrame([
+        _field(name="username"),
+        _field(type="password", name="password", evaluate_queue=[{
+            "type": "password", "name": "password", "id": "",
+            "value": "human-typed-after-snapshot",
+            "disabled": False, "readOnly": False, "visible": True}]),
+    ])
+
+    _make_autofiller().tick(_FakeCtx([_FakePage([frame])]))
+
+    assert frame.calls == [("username", FAKE_USERNAME)]
+    assert frame.elements[1]["value"] == ""
+
+
+def test_tick_skips_all_fields_when_origin_drifts_before_fill(capsys):
+    """采样时 frame.url 是可信 SSO，fill 前 frame 漂移到其他 origin →
+    本轮一个字段都不填（门禁不能因采样时通过就默认后续可信）。"""
+    frame = _OriginDriftFrame([
+        _field(name="username"),
+        _field(type="password", name="password"),
+    ], drifted_url="https://one.cnncecp.com/portal")
+
+    _make_autofiller().tick(_FakeCtx([_FakePage([frame])]))
+
+    assert frame.calls == []
+    out = capsys.readouterr().out
+    assert "AUTO_FILL：username filled" not in out
+    assert "AUTO_FILL_SKIP origin=https://one.cnncecp.com" in out
+
+
+@pytest.mark.parametrize("live_override", [
+    {"disabled": True},
+    {"readOnly": True},
+    {"visible": False},
+], ids=["disabled", "readonly", "invisible"])
+def test_tick_skips_target_turning_disabled_readonly_or_invisible(
+    live_override
+):
+    """采样 editable → fill 前实时状态变为 disabled/readonly/invisible →
+    本轮 skip 该字段（其余字段不受影响）。"""
+    live = {"type": "text", "name": "username", "id": "", "value": "",
+            "disabled": False, "readOnly": False, "visible": True}
+    live.update(live_override)
+    frame = _FakeFrame([
+        _field(name="username", evaluate_queue=[live]),
+        _field(type="password", name="password"),
+    ])
+
+    _make_autofiller().tick(_FakeCtx([_FakePage([frame])]))
+
+    assert frame.calls == [("password", FAKE_PASSWORD)]
 
 
 def test_tick_idempotent_after_both_filled():
