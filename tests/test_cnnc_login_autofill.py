@@ -462,6 +462,67 @@ def test_tick_never_fills_captcha_or_otp_fields(captcha_field):
     assert frame.calls == []
 
 
+@pytest.mark.parametrize("otp_name", [
+    "otp",
+    "otpCode",
+    "oneTimeCode",
+    "verificationCode",
+])
+def test_tick_otp_variations_with_password_never_fill_otp(otp_name):
+    """otp/one-time/verification 全形态都绝不当用户名框（启发式与
+    fallback 双路径都不得选中），密码框照常填充。"""
+    frame = _FakeFrame([
+        _field(name=otp_name),
+        _field(type="password", name="password"),
+    ])
+
+    _make_autofiller().tick(_FakeCtx([_FakePage([frame])]))
+
+    assert frame.calls == [("password", FAKE_PASSWORD)]
+
+
+def test_tick_fallback_skips_search_input():
+    """type=search 是站内搜索框：启发式与 fallback 双路径都不得当
+    用户名框，密码框照常填充。"""
+    frame = _FakeFrame([
+        _field(type="search", name="search"),
+        _field(type="password", name="password"),
+    ])
+
+    _make_autofiller().tick(_FakeCtx([_FakePage([frame])]))
+
+    assert frame.calls == [("password", FAKE_PASSWORD)]
+
+
+@pytest.mark.parametrize("captcha_name", ["captcha", "sms"])
+def test_tick_regression_captcha_and_sms_with_password_stay_unfilled(
+    captcha_name
+):
+    """回归锁：captcha/sms + password 组合只填密码，验证码类永不填。"""
+    frame = _FakeFrame([
+        _field(name=captcha_name),
+        _field(type="password", name="password"),
+    ])
+
+    _make_autofiller().tick(_FakeCtx([_FakePage([frame])]))
+
+    assert frame.calls == [("password", FAKE_PASSWORD)]
+
+
+def test_tick_username_not_excluded_by_otp_and_search_hints():
+    """反例：新排除词不得误伤正常用户名字段——username 仍被启发式
+    命中并填充。"""
+    frame = _FakeFrame([
+        _field(name="username"),
+        _field(type="password", name="password"),
+    ])
+
+    _make_autofiller().tick(_FakeCtx([_FakePage([frame])]))
+
+    assert frame.calls == [("username", FAKE_USERNAME),
+                           ("password", FAKE_PASSWORD)]
+
+
 def test_tick_never_overwrites_human_username():
     frame = _FakeFrame([
         _field(name="username", value="human-typed"),

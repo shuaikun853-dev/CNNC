@@ -15,6 +15,8 @@
     - 只填"当前为空"的字段，绝不覆盖人已输入内容；且 fill 前一刻重新
       读取实时状态二次确认（采样快照与 fill 之间的时间窗口内 origin /
       签名 / 实时值 / 可编辑性任一漂移即本轮 skip）
+    - 验证码/短信码/动态码/OTP（otp/one-time/verification 全形态）与
+      非文本类型（含 search 搜索框）绝不参与用户名启发式与 fallback
     - 绝不点击、绝不提交表单（人负责滑块/短信验证与提交）
     - 日志只打字段名与 filled/skip origin，绝不含凭证值
     - 单次尝试异常一律吞掉（WARN 限次），绝不打断 TGC 轮询主流程
@@ -95,13 +97,20 @@ USERNAME_HINTS = (
     "username", "user", "account", "loginname", "login_name", "login",
     "账号", "用户名", "工号", "empno", "emp_code",
 )
-# 验证码/短信码类字段绝不能当用户名框。注意含 "code"：emp_code 类字段会被
-# 一并排除——真实 SSO 登录框用 username/loginName 类命名，可接受
-CAPTCHA_HINTS = ("captcha", "sms", "code", "verify", "验证码", "短信", "校验")
-# 非文本类 input：既不参与用户名启发式，也不进 fallback
+# 验证码/短信码/动态码/OTP 类字段绝不能当用户名框。注意含 "code"：emp_code
+# 类字段会被一并排除——真实 SSO 登录框用 username/loginName 类命名，可接受。
+# "verify" 已含 "verification" 前缀，但显式列出使意图自明；otp 系列词条
+# 覆盖 one-time/one_time/one time/onetime 全形态（均小写子串匹配）
+CAPTCHA_HINTS = (
+    "captcha", "sms", "code", "verify", "验证码", "短信", "校验",
+    "otp", "one-time", "one_time", "one time", "onetime", "verification",
+    "动态码", "一次性",
+)
+# 非文本类 input：既不参与用户名启发式，也不进 fallback。search 是站内
+# 搜索框，绝不能当用户名 fallback 目标
 NON_TEXT_INPUT_TYPES = frozenset((
     "checkbox", "radio", "hidden", "submit", "button", "image",
-    "file", "reset", "range", "color", "date", "time",
+    "file", "reset", "range", "color", "date", "time", "search",
 ))
 
 
