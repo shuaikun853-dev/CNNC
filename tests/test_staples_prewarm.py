@@ -590,6 +590,123 @@ def test_case01_non_staples_candidates_never_routed(stack):
     )
 
 
+def test_route_limit_consumed_only_by_eligible_staples_candidates(stack):
+    """Blocker D1(饿死):route_limit 只能被 eligible Staples 候选消耗。
+
+    两个非 Staples 候选(jd/comix)按 id 序排在 Staples 候选之前且永远保持
+    PENDING_PREWARM;route_limit=1 时它们绝不能吃掉路由预算,否则 Staples
+    候选在本 pass 以及之后每个 pass 都排不进预算,永久饿死(Issue #11)。
+    """
+    jd_cid = _seed_candidate(
+        stack.prewarm, "https://www.jd.com/product/1.html", "DJ1", mall="jd"
+    )
+    comix_cid = _seed_candidate(
+        stack.prewarm, "https://www.comix.cn/p/2.html", "DC1", mall="comix"
+    )
+    staples_cid = _seed_candidate(stack.prewarm)
+    crawler = FakeCrawler()
+    summary = _run(stack, crawler, route_limit=1)
+    # Staples 候选被路由(翻出 PENDING_PREWARM 并建立 sidecar 作业)
+    assert summary["routed"] == 1
+    assert stack.prewarm.candidate_by_id(staples_cid)[
+        "cache_status"
+    ] == CACHE_STATUS_STAPLES_PENDING
+    assert stack.staples.job_for_candidate(staples_cid) is not None
+    # 路由的候选确实进入本 pass 本地爬取
+    assert crawler.calls == 1
+    assert crawler.seen_requests == [[{"candidate_id": staples_cid, "original_url": URL}]]
+    assert summary["errors"] == []
+    # 非 Staples 候选行为不变:零写入、无作业
+    for cid in (jd_cid, comix_cid):
+        assert stack.prewarm.candidate_by_id(cid)[
+            "cache_status"
+        ] == CACHE_STATUS_PENDING_PREWARM
+        assert stack.staples.job_for_candidate(cid) is None
+
+
+def test_route_limit_one_routes_first_staples_only(stack):
+    """防修过头:route_limit=1 时本 pass 只路由第一个 Staples 候选。
+
+    候选 id 序 = 非Staples A / Staples A / 非Staples B / Staples B:
+    预算只被 Staples A 消耗;Staples B 等下一 pass;非 Staples 行逐字段
+    不变(过滤发生在任何写之前,含 last_checked_at)。
+    """
+    jd_cid = _seed_candidate(
+        stack.prewarm, "https://www.jd.com/product/1.html", "DJ1", mall="jd"
+    )
+    url_a = "https://www.stbchina.cn/item.html?itemId=201"
+    url_b = "https://www.stbchina.cn/item.html?itemId=202"
+    staples_a_cid = _seed_candidate(stack.prewarm, url_a, "DA")
+    comix_cid = _seed_candidate(
+        stack.prewarm, "https://www.comix.cn/p/2.html", "DC1", mall="comix"
+    )
+    staples_b_cid = _seed_candidate(stack.prewarm, url_b, "DB")
+    non_staples_before = {
+        cid: stack.prewarm.candidate_by_id(cid) for cid in (jd_cid, comix_cid)
+    }
+    crawler = FakeCrawler(
+        outcomes={
+            url_a: _success_outcome(url_a, real_sku_id="201", crawler_uid_raw="201"),
+            url_b: _success_outcome(url_b, real_sku_id="202", crawler_uid_raw="202"),
+        }
+    )
+    summary = _run(stack, crawler, route_limit=1)
+    assert summary["routed"] == 1
+    # Staples A:已路由并本地爬取成功
+    assert stack.prewarm.candidate_by_id(staples_a_cid)[
+        "cache_status"
+    ] == CACHE_STATUS_CACHE_HIT
+    assert stack.staples.job_for_candidate(staples_a_cid)[
+        "state"
+    ] == STAPLES_JOB_STATE_SUCCESS
+    # Staples B:仍 PENDING_PREWARM、无作业(等下一 pass)
+    assert stack.prewarm.candidate_by_id(staples_b_cid)[
+        "cache_status"
+    ] == CACHE_STATUS_PENDING_PREWARM
+    assert stack.staples.job_for_candidate(staples_b_cid) is None
+    # 非 Staples 行逐字段不变
+    for cid in (jd_cid, comix_cid):
+        assert stack.prewarm.candidate_by_id(cid) == non_staples_before[cid]
+    # 只爬了 Staples A
+    assert crawler.calls == 1
+    assert crawler.seen_requests == [
+        [{"candidate_id": staples_a_cid, "original_url": url_a}]
+    ]
+
+
+def test_second_pass_routes_remaining_staples_after_limit(stack):
+    """前向进展:route_limit 是吞吐界不是饿死界——Pass1 路由 A,Pass2 路由 B。"""
+    _seed_candidate(stack.prewarm, "https://www.jd.com/product/1.html", "DJ1", mall="jd")
+    url_a = "https://www.stbchina.cn/item.html?itemId=201"
+    url_b = "https://www.stbchina.cn/item.html?itemId=202"
+    staples_a_cid = _seed_candidate(stack.prewarm, url_a, "DA")
+    _seed_candidate(stack.prewarm, "https://www.comix.cn/p/2.html", "DC1", mall="comix")
+    staples_b_cid = _seed_candidate(stack.prewarm, url_b, "DB")
+    crawler = FakeCrawler(
+        outcomes={
+            url_a: _success_outcome(url_a, real_sku_id="201", crawler_uid_raw="201"),
+            url_b: _success_outcome(url_b, real_sku_id="202", crawler_uid_raw="202"),
+        }
+    )
+    summary1 = _run(stack, crawler, route_limit=1)
+    assert summary1["routed"] == 1
+    assert stack.prewarm.candidate_by_id(staples_b_cid)[
+        "cache_status"
+    ] == CACHE_STATUS_PENDING_PREWARM
+    # 第二个 pass(now 递增):Staples B 也被路由并爬取成功
+    summary2 = _run(stack, crawler, now=_t(60), route_limit=1)
+    assert summary2["routed"] == 1
+    assert stack.prewarm.candidate_by_id(staples_b_cid)[
+        "cache_status"
+    ] == CACHE_STATUS_CACHE_HIT
+    assert stack.staples.job_for_candidate(staples_b_cid)[
+        "state"
+    ] == STAPLES_JOB_STATE_SUCCESS
+    assert crawler.calls == 2
+    assert [req["original_url"] for req in crawler.seen_requests[0]] == [url_a]
+    assert [req["original_url"] for req in crawler.seen_requests[1]] == [url_b]
+
+
 def test_case02_preseeded_cache_hit_absorbs_without_crawl(stack):
     cid = _seed_candidate(stack.prewarm)
     stack.shared.record_success(STAPLES_CACHE_MALL_KEY, URL, source="seed", price=3.5)

@@ -872,14 +872,15 @@ def run_staples_prewarm(
             summary["final_failures"] += 1
 
     # ---- Phase 1: route PENDING_PREWARM staples candidates to the local path.
-    examined = 0
+    # route_limit 只统计 eligible Staples 候选:非 Staples 候选绝不消耗本 pass
+    # 的路由预算,否则按 id 序排在前面的非 Staples 候选(永远保持
+    # PENDING_PREWARM)会让后面的 Staples 候选永久饿死(Issue #11)。
     for candidate in prewarm_store.candidates(CACHE_STATUS_PENDING_PREWARM, limit=None):
-        if examined >= int(route_limit):
-            break
-        examined += 1
         url = str(candidate.get("original_url") or "").strip()
         if not is_staples_url(url):
             continue
+        if summary["routed"] >= int(route_limit):
+            break
         try:
             prewarm_store.record_candidate_result(
                 int(candidate["id"]), cache_status=CACHE_STATUS_STAPLES_PENDING
