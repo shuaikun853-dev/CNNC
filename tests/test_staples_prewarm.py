@@ -166,6 +166,24 @@ class FakeCrawler:
         }
 
 
+def _transient_outcome(url, diagnostic="页面超时", **overrides):
+    fields: dict[str, Any] = dict(
+        status=STAPLES_OUTCOME_TRANSIENT_FAILURE,
+        original_url=url,
+        submitted_url=url,
+        returned_url=None,
+        canonical_url=None,
+        title=None,
+        price=None,
+        comment_count=None,
+        real_sku_id=None,
+        sku_status=SKU_STATUS_UNRESOLVED,
+        diagnostic=diagnostic,
+    )
+    fields.update(overrides)
+    return StaplesCrawlOutcome(**fields)
+
+
 def _success_outcome(url, *, price=12.5, title="史泰博商品", real_sku_id=UID,
                      sku_status=SKU_STATUS_URL_PARSED_UNVERIFIED, comment_count=123,
                      crawler_uid_raw=UID, **overrides):
@@ -300,6 +318,46 @@ def test_staples_retry_backoff_bounded():
     assert staples_retry_backoff_seconds(2) == 120
     assert staples_retry_backoff_seconds(3) == 300
     assert staples_retry_backoff_seconds(10) == 300
+
+
+def test_next_transient_failure_state_policy_boundaries(monkeypatch):
+    """Blocker A2:全部 transient 路径共用的纯函数策略;N-1/N 边界。"""
+    import app.services.staples_prewarm as staples_module
+
+    monkeypatch.setattr(staples_module, "STAPLES_MAX_CONSECUTIVE_TRANSIENT_FAILURES", 4)
+    # 预算内:RETRY_WAIT + 有界退避(按本次失败后的次数 1/2/3 → 60/120/300)
+    within = staples_module.next_transient_failure_state(0, "页面超时", T0)
+    assert within["state"] == STAPLES_JOB_STATE_RETRY_WAIT
+    assert within["reason"] == "页面超时"
+    assert within["next_retry_at"] == _t(60)
+    assert staples_module.next_transient_failure_state(1, "页面超时", _t(60))["next_retry_at"] == _t(180)
+    assert staples_module.next_transient_failure_state(2, "页面超时", _t(180))["next_retry_at"] == _t(480)
+    # 第 N 次:FAILED,reason 同时含 "retry exhausted" 与原 diagnostic
+    exhausted = staples_module.next_transient_failure_state(3, "页面超时", _t(480))
+    assert exhausted["state"] == STAPLES_JOB_STATE_FAILED
+    assert exhausted["next_retry_at"] is None
+    assert exhausted["reason"] == "staples retry exhausted after 4 attempts: 页面超时"
+    assert "retry exhausted" in exhausted["reason"] and "页面超时" in exhausted["reason"]
+
+
+def test_crawler_crash_path_uses_same_policy(stack, monkeypatch):
+    """Blocker A2:crawler.crawl 崩溃路径与 outcome 路径走同一 policy(monkeypatch 预算=2)。"""
+    import app.services.staples_prewarm as staples_module
+
+    monkeypatch.setattr(staples_module, "STAPLES_MAX_CONSECUTIVE_TRANSIENT_FAILURES", 2)
+    cid = _seed_candidate(stack.prewarm)
+    crawler = FakeCrawler(error=RuntimeError("kaboom"))
+    _run(stack, crawler, now=T0)
+    job = stack.staples.job_for_candidate(cid)
+    assert job["state"] == STAPLES_JOB_STATE_RETRY_WAIT  # 预算内
+    _run(stack, crawler, now=_t(60))
+    job = stack.staples.job_for_candidate(cid)
+    assert job["state"] == STAPLES_JOB_STATE_FAILED  # 第 2 次:耗尽
+    assert "retry exhausted" in job["last_error"]
+    assert "kaboom" in job["last_error"]
+    # 终态:不再认领、不再爬
+    _run(stack, crawler, now=_t(360))
+    assert crawler.calls == 2
 
 
 # ---- store:路由态迁移与 candidate_by_id ----------------------------------------
@@ -452,8 +510,30 @@ def test_request_staples_retry_only_failed_local(stack):
     assert retried["next_retry_at"] is None
     assert retried["manual_retry_requested_at"] == _iso(_t(10))
     assert retried["attempt_count"] == 1  # 计数器/历史保留
-    assert retried["consecutive_failures"] == 1
+    assert retried["consecutive_failures"] == 0  # 手动重试清零连续失败预算
     assert retried["last_error"] == "商品不存在"
+
+
+def test_manual_retry_resets_consecutive_failure_budget(stack):
+    """Blocker A3:耗尽 FAILED 后手动重试清零 consecutive_failures,保留 attempt_count。"""
+    cid = _seed_candidate(stack.prewarm)
+    crawler = FakeCrawler(outcomes={URL: _transient_outcome(URL, "页面超时")})
+    for now in (T0, _t(60), _t(180), _t(480)):  # 耗尽至 FAILED
+        _run(stack, crawler, now=now)
+    job = stack.staples.job_for_candidate(cid)
+    assert job["state"] == STAPLES_JOB_STATE_FAILED
+    assert job["attempt_count"] == 4
+    assert job["consecutive_failures"] == 3
+    # 手动重试:PENDING + 预算清零 + attempt 累计保留
+    retried = stack.staples.request_staples_retry(cid, now=_t(600))
+    assert retried["state"] == STAPLES_JOB_STATE_PENDING
+    assert retried["consecutive_failures"] == 0
+    assert retried["attempt_count"] == 4
+    # 再次瞬时失败:RETRY_WAIT 而非立刻 FAILED(预算已重置)
+    _run(stack, crawler, now=_t(660))
+    job = stack.staples.job_for_candidate(cid)
+    assert job["state"] == STAPLES_JOB_STATE_RETRY_WAIT
+    assert job["consecutive_failures"] == 1
 
 
 # ---- 编排:Case 1-19 -------------------------------------------------------------
@@ -586,27 +666,63 @@ def test_case06_transient_failure_backoff_gates_next_claim(stack):
     assert stack.staples.job_for_candidate(cid)["consecutive_failures"] == 2
 
 
-def test_case07_five_transient_failures_stay_retry_wait(stack):
+def test_case07_transient_failures_bounded_then_failed(stack):
     cid = _seed_candidate(stack.prewarm)
     executor = FakeExecutor(error=RuntimeError("页面超时"))
     crawler = _default_adapter(stack, executor, FakeFailureReader())
-    nows = [T0, _t(60), _t(180), _t(480), _t(780)]
+    nows = [T0, _t(60), _t(180), _t(480)]
     next_retries = []
+    states = []
     for now in nows:
         _run(stack, crawler, now=now)
         job = stack.staples.job_for_candidate(cid)
-        assert job["state"] == STAPLES_JOB_STATE_RETRY_WAIT
-        assert job["state"] != STAPLES_JOB_STATE_FAILED
-        next_retries.append(datetime.fromisoformat(job["next_retry_at"]))
+        states.append(job["state"])
+        if job["state"] == STAPLES_JOB_STATE_RETRY_WAIT:
+            next_retries.append(datetime.fromisoformat(job["next_retry_at"]))
+    # 前 3 次 RETRY_WAIT(1m/2m/5m),第 4 次达到预算转 FAILED
+    assert states == [
+        STAPLES_JOB_STATE_RETRY_WAIT,
+        STAPLES_JOB_STATE_RETRY_WAIT,
+        STAPLES_JOB_STATE_RETRY_WAIT,
+        STAPLES_JOB_STATE_FAILED,
+    ]
     deltas = [
         int((later - earlier).total_seconds())
         for earlier, later in zip(next_retries, next_retries[1:])
     ]
-    assert deltas == [120, 300, 300, 300]
+    assert deltas == [120, 300]
     assert (next_retries[0] - T0).total_seconds() == 60
     job = stack.staples.job_for_candidate(cid)
-    assert job["consecutive_failures"] == 5
-    assert len(executor.calls) == 5
+    assert job["consecutive_failures"] == 3  # FAILED 保持 consecutive
+    assert "retry exhausted" in job["last_error"]
+    assert "页面超时" in job["last_error"]
+    # 终态作业永不重爬
+    _run(stack, crawler, now=_t(780))
+    assert len(executor.calls) == 4
+
+
+def test_transient_failures_exhaust_to_failed_after_max_attempts(stack):
+    """Blocker A:瞬时失败必须有 attempt 预算,第 N 次转 FAILED,不再无限 RETRY_WAIT。"""
+    cid = _seed_candidate(stack.prewarm)
+    crawler = FakeCrawler(outcomes={URL: _transient_outcome(URL, "页面超时")})
+    # 前 3 次:RETRY_WAIT(有界退避)
+    for now in (T0, _t(60), _t(180)):
+        summary = _run(stack, crawler, now=now)
+        assert summary["transient_failures"] == 1
+        job = stack.staples.job_for_candidate(cid)
+        assert job["state"] == STAPLES_JOB_STATE_RETRY_WAIT
+    # 第 4 次:FAILED,reason 同时含 retry exhausted 与原 diagnostic
+    summary4 = _run(stack, crawler, now=_t(480))
+    assert crawler.calls == 4
+    assert summary4["final_failures"] == 1
+    job = stack.staples.job_for_candidate(cid)
+    assert job["state"] == STAPLES_JOB_STATE_FAILED
+    assert "retry exhausted" in job["last_error"]
+    assert "页面超时" in job["last_error"]
+    # 第 5 个 pass:FAILED 不再认领、不再爬
+    summary5 = _run(stack, crawler, now=_t(780))
+    assert summary5["jobs_claimed"] == 0
+    assert crawler.calls == 4
 
 
 def test_case08_final_failure_is_terminal(stack):

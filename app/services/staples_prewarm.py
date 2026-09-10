@@ -145,6 +145,36 @@ def staples_retry_backoff_seconds(consecutive_failures: int) -> int:
     return 300
 
 
+# 瞬时失败的连续次数预算:60/120/300/300 节奏下 4 次≈8 分钟窗口即稳定 FAILED,
+# 绝不允许 transient→RETRY_WAIT 无限循环(Playwright 成本考量,Issue #11 Blocker A)。
+STAPLES_MAX_CONSECUTIVE_TRANSIENT_FAILURES = 4
+
+
+def next_transient_failure_state(
+    consecutive_failures: int, diagnostic: str, now: datetime
+) -> dict[str, Any]:
+    """一次瞬时失败后的下一个状态判定(全部 transient 路径的唯一决策点,纯函数)。
+
+    返回 dict:RETRY_WAIT(带 next_retry_at,store 自增 consecutive_failures)或
+    FAILED(reason 形如 ``staples retry exhausted after N attempts: <diagnostic>``,
+    同时含 "retry exhausted" 与原 diagnostic;store 保持 consecutive_failures)。
+    """
+    diagnostic_text = str(diagnostic or "").strip()
+    budget = int(STAPLES_MAX_CONSECUTIVE_TRANSIENT_FAILURES)
+    if int(consecutive_failures) + 1 >= budget:
+        return {
+            "state": STAPLES_JOB_STATE_FAILED,
+            "reason": f"staples retry exhausted after {budget} attempts: {diagnostic_text}",
+            "next_retry_at": None,
+        }
+    return {
+        "state": STAPLES_JOB_STATE_RETRY_WAIT,
+        "reason": diagnostic_text,
+        "next_retry_at": now
+        + timedelta(seconds=staples_retry_backoff_seconds(int(consecutive_failures) + 1)),
+    }
+
+
 @dataclass(frozen=True)
 class StaplesCrawlOutcome:
     """One crawled URL's outcome, with the URL chain preserved independently.
@@ -652,7 +682,12 @@ class StaplesPrewarmStore:
             return dict(refreshed)
 
     def request_staples_retry(self, candidate_id: int, *, now: datetime | None = None) -> dict[str, Any]:
-        """手动重试:仅 FAILED 作业可回到 PENDING(§19,只走史泰博本地路径)。"""
+        """手动重试:仅 FAILED 作业可回到 PENDING(§19,只走史泰博本地路径)。
+
+        清零 ``consecutive_failures``(重新给满瞬时失败预算),保留
+        ``attempt_count`` 累计历史;否则耗尽后的 FAILED 将在第一次瞬时失败
+        时立刻再次 FAILED(Blocker A3)。
+        """
         now_text = self._timestamp(now) or self._utcnow()
         with self._transaction(immediate=True) as connection:
             row = connection.execute(
@@ -668,7 +703,7 @@ class StaplesPrewarmStore:
                 )
             connection.execute(
                 """UPDATE staples_prewarm_jobs
-                   SET state='PENDING', next_retry_at=NULL,
+                   SET state='PENDING', next_retry_at=NULL, consecutive_failures=0,
                        manual_retry_requested_at=?, claim_token=NULL,
                        lease_expires_at=NULL, updated_at=?
                    WHERE id=?""",
@@ -806,6 +841,25 @@ def run_staples_prewarm(
         "final_failures": 0,
         "errors": [],
     }
+
+    def _record_transient(job: Mapping[str, Any], diagnostic: str) -> None:
+        """瞬时失败的唯一完成路径:预算内 RETRY_WAIT,第 N 次 FAILED(终态)。"""
+        decision = next_transient_failure_state(
+            int(job["consecutive_failures"]), diagnostic, now_value
+        )
+        staples_store.complete_job(
+            int(job["id"]),
+            job["claim_token"],
+            state=decision["state"],
+            reason=decision["reason"],
+            next_retry_at=decision["next_retry_at"],
+            attempt_outcome="TRANSIENT_FAILURE",
+            now=now_value,
+        )
+        if decision["state"] == STAPLES_JOB_STATE_RETRY_WAIT:
+            summary["transient_failures"] += 1
+        else:
+            summary["final_failures"] += 1
 
     # ---- Phase 1: route PENDING_PREWARM staples candidates to the local path.
     examined = 0
@@ -959,21 +1013,7 @@ def run_staples_prewarm(
         crawler_error = f"crawler crashed: {exc}"
         for job, url in prepared:
             try:
-                staples_store.complete_job(
-                    int(job["id"]),
-                    job["claim_token"],
-                    state=STAPLES_JOB_STATE_RETRY_WAIT,
-                    reason=crawler_error,
-                    next_retry_at=now_value
-                    + timedelta(
-                        seconds=staples_retry_backoff_seconds(
-                            int(job["consecutive_failures"]) + 1
-                        )
-                    ),
-                    attempt_outcome="TRANSIENT_FAILURE",
-                    now=now_value,
-                )
-                summary["transient_failures"] += 1
+                _record_transient(job, crawler_error)
             except Exception as inner:  # noqa: BLE001
                 summary["errors"].append(f"crawler-crash job {job['id']}: {inner}")
         return summary
@@ -984,21 +1024,7 @@ def run_staples_prewarm(
         outcome = outcomes.get(url)
         try:
             if outcome is None:
-                staples_store.complete_job(
-                    job_id,
-                    job["claim_token"],
-                    state=STAPLES_JOB_STATE_RETRY_WAIT,
-                    reason="outcome missing",
-                    next_retry_at=now_value
-                    + timedelta(
-                        seconds=staples_retry_backoff_seconds(
-                            int(job["consecutive_failures"]) + 1
-                        )
-                    ),
-                    attempt_outcome="TRANSIENT_FAILURE",
-                    now=now_value,
-                )
-                summary["transient_failures"] += 1
+                _record_transient(job, "outcome missing")
             elif outcome.status == STAPLES_OUTCOME_SUCCESS:
                 evidence = _staples_success_payload(
                     outcome,
@@ -1070,21 +1096,7 @@ def run_staples_prewarm(
                 summary["crawl_success"] += 1
                 summary["cache_hit_after_crawl"] += 1
             elif outcome.status == STAPLES_OUTCOME_TRANSIENT_FAILURE:
-                staples_store.complete_job(
-                    job_id,
-                    job["claim_token"],
-                    state=STAPLES_JOB_STATE_RETRY_WAIT,
-                    reason=outcome.diagnostic,
-                    next_retry_at=now_value
-                    + timedelta(
-                        seconds=staples_retry_backoff_seconds(
-                            int(job["consecutive_failures"]) + 1
-                        )
-                    ),
-                    attempt_outcome="TRANSIENT_FAILURE",
-                    now=now_value,
-                )
-                summary["transient_failures"] += 1
+                _record_transient(job, outcome.diagnostic)
             else:
                 staples_store.complete_job(
                     job_id,
