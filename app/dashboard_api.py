@@ -467,6 +467,19 @@ def dashboard_cnnc_auth_login(request: Request) -> JSONResponse:
     review Finding 3 修复),本端点只负责 detached 拉起并立即返回。
     """
     _guard_operator_action(request, "cnnc-auth-login")
+    # 跨进程 single-flight（2026-09-10 Blocker 3）：真实 --login-and-recover
+    # 进程仍持 OS 锁时直接 409（检查优先于 60 秒节流——节流会随服务重启/时间
+    # 流逝失效，OS 锁不会），绝不叠加拉起第二个恢复进程。inspect 只探活不改
+    # 变运行状态；stale 残留（锁文件在、锁未被持有）不影响启动。锁路径经
+    # scripts.cnnc_auth_refresh 模块属性解析，测试可注入 tmp。
+    from app.services.daily_audit_store import ProcessLock
+    from scripts.cnnc_auth_refresh import LOGIN_RECOVERY_LOCK_PATH
+    if ProcessLock.inspect(LOGIN_RECOVERY_LOCK_PATH)["active"]:
+        return JSONResponse(
+            {"error": "重新登录流程已经在进行中，请完成当前登录窗口",
+             "error_code": "CNNC_LOGIN_ALREADY_RUNNING",
+             "status_name": "CNNC_LOGIN_ALREADY_RUNNING"},
+            status_code=409, headers=_NO_STORE)
     global _cnnc_login_launched_at
     now = time.monotonic()
     if _cnnc_login_launched_at is not None and \

@@ -28,6 +28,8 @@
     4     认证刷新成功但期望 cURL 同步不完整
           （AUTH_REFRESH_OK_CURL_SYNC_FAILED；仅 --login-and-recover，
           stdout/结果工件只报文件名，绝不冒充登录失败 rc=1）
+    5     已有重新登录恢复流程在运行（LOGIN_RECOVERY_ALREADY_RUNNING；
+          仅 --login-and-recover，跨进程锁被持有时零副作用退出）
 """
 
 from __future__ import annotations
@@ -53,6 +55,17 @@ except ImportError:  # Direct invocation from scripts/（含命名空间 scripts
 ROOT = Path(__file__).resolve().parents[1]
 # 手动恢复结果工件（--login-and-recover 各 outcome 都写；status 路由只读合并）
 LOGIN_RECOVERY_RESULT_PATH = ROOT / "data" / "cnnc_login_recovery_result.json"
+# 跨进程 single-flight 锁路径（GPT Review Round 2 Blocker 3，2026-09-10）：
+# --login-and-recover 全程持有，禁止并发第二个恢复进程。复用
+# daily_audit_store.ProcessLock（msvcrt/fcntl 单字节 OS 锁：进程退出自动
+# 释放、inspect 探活区分"文件存在"vs"锁被持有"），不自造文件锁。
+LOGIN_RECOVERY_LOCK_PATH = ROOT / "data" / ".cnnc_login_recovery.lock"
+try:
+    from app.services.daily_audit_store import LeaseUnavailable, ProcessLock
+except ImportError:  # 直接运行时 sys.path[0]=scripts，补 ROOT 后重导
+    if str(ROOT) not in sys.path:
+        sys.path.insert(0, str(ROOT))
+    from app.services.daily_audit_store import LeaseUnavailable, ProcessLock
 
 
 def _force_utf8_stdio():
@@ -220,12 +233,22 @@ def _write_recovery_result(path, outcome, *, at="", curl_expected=0,
                 pass
 
 
-def run_login_and_recover(login_runner=None, provider=None, result_path=None) -> int:
+def run_login_and_recover(login_runner=None, provider=None, result_path=None,
+                          lock_path=None) -> int:
     """登录后自动恢复（review Finding 3）：login 成功 → force 刷新 → 发布
     → 期望 cURL 同步严格后置核验（2026-09-10）。
 
-    login_runner/provider/result_path 可注入（测试 seam）；默认 login_runner
-    阻塞等待人工完成滑块/短信，默认工件路径 data/cnnc_login_recovery_result.json。
+    函数最外层先获取跨进程 single-flight OS 锁（GPT Review Round 2
+    Blocker 3，2026-09-10）：复用 daily_audit_store.ProcessLock，锁被他人
+    持有（LeaseUnavailable）→ stderr 打 LOGIN_RECOVERY_ALREADY_RUNNING 并
+    返回 5，绝不调用 login_runner/不写状态/不写工件；成功获取后
+    try/finally 保证 login 失败/SSO 失效/cURL 部分失败/任何异常路径最终
+    lock.release()（进程退出亦由 OS 自动释放）。
+
+    login_runner/provider/result_path/lock_path 可注入（测试 seam，锁路径
+    全部 tmp 注入）；默认 login_runner 阻塞等待人工完成滑块/短信，默认工件
+    路径 data/cnnc_login_recovery_result.json，默认锁路径
+    data/.cnnc_login_recovery.lock。
     返回码：
         0  login 成功、refresh(force=True) 发布成功且期望 cURL 全部同步
            （stdout 打 RECOVERY_OK，AT 已脱敏）
@@ -233,54 +256,75 @@ def run_login_and_recover(login_runner=None, provider=None, result_path=None) ->
         2  refresh 抛 SSO_LOGIN_REQUIRED（失败状态已由 provider 落盘）
         4  认证刷新成功但期望 cURL 同步不完整（stdout 只报文件名；绝不把
            cURL 失败冒充登录失败 rc=1）
+        5  已有恢复流程在运行（LOGIN_RECOVERY_ALREADY_RUNNING，零副作用）
 
     refresh 内部保持宽松语义（cURL 同步失败只记 CURL_SYNC_FAILED 台账不
-    阻断自动续签）；核验只发生在手动恢复入口并如实上报。四种 outcome 都写
+    阻断自动续签）；核验只发生在手动恢复入口并如实上报。五种 outcome 都写
     结果工件（RECOVERY_OK / AUTH_REFRESH_OK_CURL_SYNC_FAILED /
-    LOGIN_RECOVERY_FAILED / REFRESH_FAILED，尽力而为不影响返回码）。全程
-    不打印完整凭证。
+    LOGIN_RECOVERY_FAILED / REFRESH_FAILED，尽力而为不影响返回码；rc=5 不
+    写）。全程不打印完整凭证。
     """
-    provider = provider if provider is not None else _default_provider()
-    login_runner = login_runner if login_runner is not None else _default_login_runner
-    result_path = (Path(result_path) if result_path is not None
-                   else LOGIN_RECOVERY_RESULT_PATH)
-    rc = int(login_runner())
-    if rc != 0:
-        try:
-            provider.mutate_state(_login_failed_mutator(rc))
-        except OSError:
-            pass  # 状态落盘尽力而为，不改变返回码语义
-        _write_recovery_result(result_path, "LOGIN_RECOVERY_FAILED")
+    lock = ProcessLock(lock_path or LOGIN_RECOVERY_LOCK_PATH)
+    try:
+        lock.acquire(owner={
+            "pid": os.getpid(),
+            "command": "login-and-recover",
+            "started_at": datetime.now(timezone.utc).isoformat(),
+        })
+    except LeaseUnavailable:
         print(
-            "LOGIN_RECOVERY_FAILED：登录未完成/失败（exit=%d），请重试或手工运行 "
-            "python scripts/cnnc_auth_browser.py login" % rc,
+            "LOGIN_RECOVERY_ALREADY_RUNNING：上一个重新登录恢复流程仍在进行，"
+            "请完成当前登录窗口",
             file=sys.stderr,
         )
-        return 1
+        return 5
     try:
-        at = provider.refresh(force=True)  # force：人工登录显式重试，绕过 SSO 冷却
-    except core.CnncAuthError as exc:
-        # 失败状态/审计已由 provider 落盘，这里只提示并按状态码定退出码
-        _write_recovery_result(result_path, "REFRESH_FAILED")
-        print("REFRESH_FAILED %s: %s" % (exc.status, exc), file=sys.stderr)
-        return 2 if exc.status == core.CnncAuthStatus.SSO_LOGIN_REQUIRED else 1
-    # 严格后置核验（2026-09-10）：真 provider 有 curl_files 属性；无该属性的
-    # duck-type provider 期望清单为空 = 全同步（既有调用方语义不破）。
-    curl_files = getattr(provider, "curl_files", ()) or ()
-    synced, failed = _verify_curl_sync(at, curl_files)
-    expected = len(synced) + len(failed)
-    outcome = "AUTH_REFRESH_OK_CURL_SYNC_FAILED" if failed else "RECOVERY_OK"
-    _write_recovery_result(result_path, outcome, at=at, curl_expected=expected,
-                           curl_synced=len(synced), curl_failed_files=failed)
-    if failed:
-        print(
-            "AUTH_REFRESH_OK_CURL_SYNC_FAILED curl_synced=%d/%d failed=%s"
-            % (len(synced), expected, ",".join(failed))
-        )
-        return 4
-    print("RECOVERY_OK at=%s curl_synced=%d"
-          % (core.redact_secret(at), len(synced)))
-    return 0
+        provider = provider if provider is not None else _default_provider()
+        login_runner = (login_runner if login_runner is not None
+                        else _default_login_runner)
+        result_path = (Path(result_path) if result_path is not None
+                       else LOGIN_RECOVERY_RESULT_PATH)
+        rc = int(login_runner())
+        if rc != 0:
+            try:
+                provider.mutate_state(_login_failed_mutator(rc))
+            except OSError:
+                pass  # 状态落盘尽力而为，不改变返回码语义
+            _write_recovery_result(result_path, "LOGIN_RECOVERY_FAILED")
+            print(
+                "LOGIN_RECOVERY_FAILED：登录未完成/失败（exit=%d），请重试或手工运行 "
+                "python scripts/cnnc_auth_browser.py login" % rc,
+                file=sys.stderr,
+            )
+            return 1
+        try:
+            at = provider.refresh(force=True)  # force：人工登录显式重试，绕过 SSO 冷却
+        except core.CnncAuthError as exc:
+            # 失败状态/审计已由 provider 落盘，这里只提示并按状态码定退出码
+            _write_recovery_result(result_path, "REFRESH_FAILED")
+            print("REFRESH_FAILED %s: %s" % (exc.status, exc), file=sys.stderr)
+            return 2 if exc.status == core.CnncAuthStatus.SSO_LOGIN_REQUIRED else 1
+        # 严格后置核验（2026-09-10）：真 provider 有 curl_files 属性；无该属性的
+        # duck-type provider 期望清单为空 = 全同步（既有调用方语义不破）。
+        curl_files = getattr(provider, "curl_files", ()) or ()
+        synced, failed = _verify_curl_sync(at, curl_files)
+        expected = len(synced) + len(failed)
+        outcome = ("AUTH_REFRESH_OK_CURL_SYNC_FAILED" if failed
+                   else "RECOVERY_OK")
+        _write_recovery_result(result_path, outcome, at=at,
+                               curl_expected=expected, curl_synced=len(synced),
+                               curl_failed_files=failed)
+        if failed:
+            print(
+                "AUTH_REFRESH_OK_CURL_SYNC_FAILED curl_synced=%d/%d failed=%s"
+                % (len(synced), expected, ",".join(failed))
+            )
+            return 4
+        print("RECOVERY_OK at=%s curl_synced=%d"
+              % (core.redact_secret(at), len(synced)))
+        return 0
+    finally:
+        lock.release()
 
 
 def run_selftest() -> int:

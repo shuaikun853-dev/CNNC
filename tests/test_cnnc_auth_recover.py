@@ -112,7 +112,8 @@ def test_case13_login_and_recover_success_publishes_refreshed_token(
     result_path = tmp_path / "recovery_result.json"
 
     rc = cnnc_auth_refresh.run_login_and_recover(
-        login_runner=lambda: 0, provider=provider, result_path=result_path
+        login_runner=lambda: 0, provider=provider, result_path=result_path,
+        lock_path=tmp_path / "login_recovery.lock",  # 绝不触碰真实 data/
     )
 
     assert rc == 0
@@ -135,7 +136,8 @@ def test_case13_login_failure_records_login_recovery_failed(tmp_path, capsys):
     result_path = tmp_path / "recovery_result.json"
 
     rc = cnnc_auth_refresh.run_login_and_recover(
-        login_runner=lambda: 1, provider=provider, result_path=result_path
+        login_runner=lambda: 1, provider=provider, result_path=result_path,
+        lock_path=tmp_path / "login_recovery.lock",  # 绝不触碰真实 data/
     )
 
     assert rc == 1
@@ -163,7 +165,8 @@ def test_case13_refresh_sso_failure_maps_to_exit_2(tmp_path, capsys):
     result_path = tmp_path / "recovery_result.json"
 
     rc = cnnc_auth_refresh.run_login_and_recover(
-        login_runner=lambda: 0, provider=provider, result_path=result_path
+        login_runner=lambda: 0, provider=provider, result_path=result_path,
+        lock_path=tmp_path / "login_recovery.lock",  # 绝不触碰真实 data/
     )
 
     assert rc == 2  # SSO 失效专用退出码：提示先运行 browser login
@@ -191,7 +194,8 @@ def test_recovery_all_curl_synced_reports_recovery_ok(tmp_path, capsys):
     result_path = tmp_path / "recovery_result.json"
 
     rc = cnnc_auth_refresh.run_login_and_recover(
-        login_runner=lambda: 0, provider=provider, result_path=result_path
+        login_runner=lambda: 0, provider=provider, result_path=result_path,
+        lock_path=tmp_path / "login_recovery.lock",  # 绝不触碰真实 data/
     )
 
     assert rc == 0
@@ -221,7 +225,8 @@ def test_recovery_partial_curl_sync_failure_reports_file_names_only(
     result_path = tmp_path / "recovery_result.json"
 
     rc = cnnc_auth_refresh.run_login_and_recover(
-        login_runner=lambda: 0, provider=provider, result_path=result_path
+        login_runner=lambda: 0, provider=provider, result_path=result_path,
+        lock_path=tmp_path / "login_recovery.lock",  # 绝不触碰真实 data/
     )
 
     assert rc == 4  # 认证成功但 cURL 同步不完整（绝不冒充登录失败 rc=1）
@@ -247,7 +252,8 @@ def test_recovery_missing_curl_file_counts_as_failed(tmp_path, capsys):
     result_path = tmp_path / "recovery_result.json"
 
     rc = cnnc_auth_refresh.run_login_and_recover(
-        login_runner=lambda: 0, provider=provider, result_path=result_path
+        login_runner=lambda: 0, provider=provider, result_path=result_path,
+        lock_path=tmp_path / "login_recovery.lock",  # 绝不触碰真实 data/
     )
 
     assert rc == 4
@@ -267,7 +273,8 @@ def test_recovery_unparsable_curl_file_counts_as_failed(tmp_path, capsys):
 
     rc = cnnc_auth_refresh.run_login_and_recover(
         login_runner=lambda: 0, provider=provider,
-        result_path=tmp_path / "recovery_result.json"
+        result_path=tmp_path / "recovery_result.json",
+        lock_path=tmp_path / "login_recovery.lock",  # 绝不触碰真实 data/
     )
 
     assert rc == 4
@@ -282,7 +289,8 @@ def test_recovery_without_curl_files_attr_means_no_expectations(tmp_path, capsys
     result_path = tmp_path / "recovery_result.json"
 
     rc = cnnc_auth_refresh.run_login_and_recover(
-        login_runner=lambda: 0, provider=provider, result_path=result_path
+        login_runner=lambda: 0, provider=provider, result_path=result_path,
+        lock_path=tmp_path / "login_recovery.lock",  # 绝不触碰真实 data/
     )
 
     assert rc == 0
@@ -299,9 +307,97 @@ def test_artifact_write_failure_does_not_change_rc(tmp_path):
     rc = cnnc_auth_refresh.run_login_and_recover(
         login_runner=lambda: 0, provider=provider,
         result_path=tmp_path,  # 目录路径 → 写入必然 OSError
+        lock_path=tmp_path / "login_recovery.lock",  # 绝不触碰真实 data/
     )
 
     assert rc == 0
+
+
+# --------------------------------------- 跨进程 single-flight 锁（Blocker 3）
+# 2026-09-10：run_login_and_recover 全程持有 OS 级 ProcessLock（复用
+# daily_audit_store，msvcrt/fcntl 字节锁，进程退出自动释放）。锁被他人持有
+# → rc=5 零副作用；锁路径全部 tmp 注入，绝不触碰真实 data/。
+
+
+def test_login_lock_held_by_other_returns_5_without_side_effects(tmp_path, capsys):
+    """锁已被他人持有 → rc=5、login_runner 零调用、不写状态/工件、stderr 提示。"""
+    from app.services.daily_audit_store import ProcessLock
+
+    lock_path = tmp_path / "login_recovery.lock"
+    holder = ProcessLock(lock_path).acquire(owner={"pid": 12345})
+    try:
+        runner_calls = []
+
+        def runner():
+            runner_calls.append(1)
+            return 0
+
+        provider = _FakeRecoveryProvider(refresh_result=NEW_AT)
+        result_path = tmp_path / "recovery_result.json"
+
+        rc = cnnc_auth_refresh.run_login_and_recover(
+            login_runner=runner, provider=provider,
+            result_path=result_path, lock_path=lock_path)
+
+        assert rc == 5
+        assert runner_calls == []  # 绝不调用 login_runner
+        assert provider.refresh_calls == []  # 绝不触发刷新
+        assert not result_path.exists()  # 绝不写结果工件
+    finally:
+        holder.release()
+    assert "LOGIN_RECOVERY_ALREADY_RUNNING" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("expected_rc", [0, 1, 2, 4])
+def test_login_lock_active_during_run_and_released_after(tmp_path, expected_rc):
+    """login 运行全程锁被持有（inspect active=True）；结束后 rc=0/1/2/4 各
+    路径锁都已释放（try/finally 语义，无泄漏）。"""
+    from app.services.daily_audit_store import ProcessLock
+
+    lock_path = tmp_path / "login_recovery.lock"
+    observed = {}
+
+    def runner():
+        observed["active_during"] = ProcessLock.inspect(lock_path)["active"]
+        return 1 if expected_rc == 1 else 0
+
+    if expected_rc == 2:
+        provider = _FakeRecoveryProvider(refresh_error=core.CnncAuthError(
+            core.CnncAuthStatus.SSO_LOGIN_REQUIRED, "SSO 失效（锁测试）"))
+    elif expected_rc == 4:
+        good = _write_curl_file(tmp_path, "latest_cnnc_query.curl", NEW_AT)
+        bad = tmp_path / "detail_request.curl"
+        bad.write_text("not a curl command", encoding="utf-8")
+        provider = _FakeCurlSyncProvider(
+            curl_files=(good, bad), refresh_result=NEW_AT)
+    else:
+        provider = _FakeCurlSyncProvider(refresh_result=NEW_AT)
+
+    rc = cnnc_auth_refresh.run_login_and_recover(
+        login_runner=runner, provider=provider,
+        result_path=tmp_path / "recovery_result.json", lock_path=lock_path)
+
+    assert rc == expected_rc
+    assert observed["active_during"] is True
+    assert ProcessLock.inspect(lock_path)["active"] is False
+
+
+def test_login_lock_released_when_runner_raises(tmp_path):
+    """login_runner 抛异常上抛后锁必须已释放（finally 兜底，不等进程退出）。"""
+    from app.services.daily_audit_store import ProcessLock
+
+    lock_path = tmp_path / "login_recovery.lock"
+
+    def runner():
+        raise RuntimeError("boom")
+
+    with pytest.raises(RuntimeError):
+        cnnc_auth_refresh.run_login_and_recover(
+            login_runner=runner, provider=_FakeRecoveryProvider(),
+            result_path=tmp_path / "recovery_result.json",
+            lock_path=lock_path)
+
+    assert ProcessLock.inspect(lock_path)["active"] is False
 
 
 # ----------------------------------------------------------------- Case 15/16

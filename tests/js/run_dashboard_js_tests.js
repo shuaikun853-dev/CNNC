@@ -70,6 +70,7 @@ global.document = {
 const { createPollController, createSaasFlowPoller, safeProgressText, sfPartialNotice,
         sfTreeHtml, sfGrowthText, jobProgressCell, progressDetail, outputDisplayName,
         createActionClient, actionOutcomeText, renderCnncAuth, cnncAuthView, cnncStatusText,
+        cnncLoginNoticeText,
         fmtShanghaiDateTime, createCnncAuthFetcher, computeCloseoutBackendRunning,
         applyCloseoutRunningOverlay, isCloseoutWriter, resolveCloseoutActionsDate,
         updateCloseoutUI, pollDelay, inCloseoutWatchWindow, _setCloseoutStateForTest,
@@ -339,6 +340,27 @@ function test_sf_partial_notice_three_states() {
   check("R3 不得出现空列表拼接文案",
         !sfPartialNotice([], []).includes("::") &&
         !sfPartialNotice(["x"], []).includes(":;"));
+}
+
+function test_cnnc_login_notice_text_three_states() {
+  // Blocker 3(2026-09-10):重登 notice 三态纯函数——409 跨进程恢复锁被持有 /
+  // 429 60 秒节流 / 其他失败(code 优先兜底 HTTP status)。
+  const already409 = cnncLoginNoticeText({ status: 409, code: "HTTP_409" });
+  check("409(即使 code 只是 HTTP_409)文案提示完成当前登录窗口",
+        already409 === "重新登录流程已经在进行中，请完成当前登录窗口", already409);
+  const alreadyCode = cnncLoginNoticeText(
+    { status: 409, code: "CNNC_LOGIN_ALREADY_RUNNING" });
+  check("409 + CNNC_LOGIN_ALREADY_RUNNING code 命中同一文案",
+        alreadyCode === "重新登录流程已经在进行中，请完成当前登录窗口", alreadyCode);
+  const throttle429 = cnncLoginNoticeText({ status: 429, code: "HTTP_429" });
+  check("429 节流文案保留",
+        throttle429 === "登录浏览器已在启动中（60 秒内），请稍候。", throttle429);
+  const other = cnncLoginNoticeText({ status: 500, code: "CNNC_LOGIN_LAUNCH_FAILED" });
+  check("其他错误走 code 通用失败文案",
+        other === "登录请求失败：CNNC_LOGIN_LAUNCH_FAILED", other);
+  const fallback = cnncLoginNoticeText({ status: 503, code: null });
+  check("code 缺失兜底 HTTP status",
+        fallback === "登录请求失败：HTTP 503", fallback);
 }
 
 // ---- UI/Contract Hotfix 2026-08-28:P1 路由证据不足可见 / P2-1 AFTER_CUTOFF 文案 ----
@@ -1436,6 +1458,7 @@ function test_production_identity_seams() {
   test_cnnc_auth_view_manual_recovery_text();
   test_cnnc_auth_auto_expand_only_opens();
   test_cnnc_auth_meta_renders_manual_recovery_and_error();
+  test_cnnc_login_notice_text_three_states();
   test_fmt_shanghai_datetime();
   await test_cnnc_fetcher_ok();
   await test_cnnc_fetcher_failure_keeps_chain();

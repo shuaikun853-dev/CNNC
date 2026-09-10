@@ -1424,6 +1424,20 @@
     intervalMs: CNNC_POLL_INTERVAL_MS,
   });
 
+  // 重登 notice 三态文案（纯函数,Blocker 3 2026-09-10）:409 跨进程恢复锁被
+  // 持有(后端 body 平铺 error_code 经 createActionClient 后 code 退化为
+  // HTTP_409,故 status/code 双判)/429 60 秒节流/其他失败(code 优先,兜底
+  // HTTP status,与既有通用文案同形)。
+  function cnncLoginNoticeText(error) {
+    if (error && (error.status === 409 || error.code === "CNNC_LOGIN_ALREADY_RUNNING")) {
+      return "重新登录流程已经在进行中，请完成当前登录窗口";
+    }
+    if (error && error.status === 429) {
+      return "登录浏览器已在启动中（60 秒内），请稍候。";
+    }
+    return "登录请求失败：" + ((error && error.code) || ("HTTP " + (error && error.status)));
+  }
+
   async function cnncAuthLogin() {
     const btn = $("#cnnc-auth-login");
     const notice = $("#cnnc-auth-notice");
@@ -1435,9 +1449,7 @@
     try {
       const res = await client.refresh("/dashboard/api/cnnc-auth/login", {});
       if (res.error) {
-        if (notice) notice.textContent = res.error.status === 429
-          ? "登录浏览器已在启动中（60 秒内），请稍候。"
-          : "登录请求失败：" + (res.error.code || "HTTP " + res.error.status);
+        if (notice) notice.textContent = cnncLoginNoticeText(res.error);
         return;
       }
       if (notice) notice.textContent = (res && res.note) || "登录浏览器已启动，完成滑块/短信后系统自动恢复。";
@@ -1599,6 +1611,7 @@
     createPollController, createSaasFlowPoller, safeProgressText, sfPartialNotice,
     sfTreeHtml, sfGrowthText, jobProgressCell, progressDetail, outputDisplayName,
     createActionClient, actionOutcomeText, cnncStatusText, renderCnncAuth, cnncAuthView,
+    cnncLoginNoticeText,
     fmtShanghaiDateTime, createCnncAuthFetcher,
     piStatusText, piStatusWord, piWorkingTreeText, renderProductionIdentity,
     createProductionIdentityFetcher,

@@ -673,3 +673,151 @@ def test_cnnc_auth_status_bad_json_artifact_is_ignored(client, monkeypatch, tmp_
     r = client.get("/dashboard/api/cnnc-auth/status")
     assert r.status_code == 200
     assert "last_manual_recovery" not in r.json()
+
+
+# ======================================================================
+# 跨进程 single-flight 锁 409（2026-09-10 Blocker 3）：真实 --login-and-recover
+# 进程仍持 OS 锁时，登录端点必须 409 拒绝（优先于 60 秒节流），绝不叠加拉起
+# 第二个恢复进程。端点在调用时才 import LOGIN_RECOVERY_LOCK_PATH，测试
+# monkeypatch scripts.cnnc_auth_refresh 的模块属性即可注入 tmp 锁路径，
+# 绝不触碰真实 data/。
+# ======================================================================
+
+def _inject_login_lock_path(monkeypatch, lock_path):
+    from scripts import cnnc_auth_refresh
+    monkeypatch.setattr(
+        cnnc_auth_refresh, "LOGIN_RECOVERY_LOCK_PATH", lock_path)
+
+
+def _fake_login_popen(monkeypatch):
+    from app import dashboard_api
+    launched = []
+
+    def fake_popen(args, **kwargs):
+        launched.append(list(args))
+
+    monkeypatch.setattr(dashboard_api.subprocess, "Popen", fake_popen)
+    return launched
+
+
+def test_cnnc_auth_login_lock_held_returns_409_before_throttle(
+        client, monkeypatch, tmp_path):
+    """Case A：外部持有锁 + 节流时间戳设为 61 秒前（绕过节流）→ 409
+    CNNC_LOGIN_ALREADY_RUNNING、零 Popen；证明锁检查优先于节流。"""
+    import time
+
+    from app import dashboard_api
+    from app.services.daily_audit_store import ProcessLock
+
+    lock_path = tmp_path / "login_recovery.lock"
+    _inject_login_lock_path(monkeypatch, lock_path)
+    holder = ProcessLock(lock_path).acquire(
+        owner={"pid": 12345, "command": "login-and-recover"})
+    try:
+        monkeypatch.setattr(dashboard_api, "_cnnc_login_launched_at",
+                            time.monotonic() - 61.0)  # 节流已过期
+        launched = _fake_login_popen(monkeypatch)
+        r = client.post("/dashboard/api/cnnc-auth/login", headers={
+            "X-Dashboard-Action-Token": dashboard_api._ACTION_TOKEN})
+    finally:
+        holder.release()
+    assert r.status_code == 409
+    body = r.json()
+    assert body["error_code"] == "CNNC_LOGIN_ALREADY_RUNNING"
+    assert body["status_name"] == "CNNC_LOGIN_ALREADY_RUNNING"
+    assert "重新登录流程已经在进行中" in body["error"]
+    assert launched == []  # 绝不拉起第二个恢复进程
+
+
+def test_cnnc_auth_login_lock_free_starts_detached_recovery(
+        client, monkeypatch, tmp_path):
+    """Case B：锁未被持有 → 202 started、Popen 恰好一次（既有契约不破）。"""
+    from app import dashboard_api
+
+    _inject_login_lock_path(monkeypatch, tmp_path / "login_recovery.lock")
+    monkeypatch.setattr(dashboard_api, "_cnnc_login_launched_at", None)
+    launched = _fake_login_popen(monkeypatch)
+    r = client.post("/dashboard/api/cnnc-auth/login", headers={
+        "X-Dashboard-Action-Token": dashboard_api._ACTION_TOKEN})
+    assert r.status_code == 202
+    assert r.json()["started"] is True
+    assert len(launched) == 1
+    assert "--login-and-recover" in launched[0]
+
+
+def test_cnnc_auth_login_cross_process_lock_holder_blocks(
+        client, monkeypatch, tmp_path):
+    """Case C（真跨进程关键例）：独立子进程持有 OS 锁（msvcrt/fcntl 按句柄
+    排他，非同进程重入）→ 409、零 Popen；结束安全终止子进程（进程退出锁
+    自动释放，不留残留）。"""
+    import subprocess
+    import sys
+    import time
+
+    from app import dashboard_api
+    from app.services.daily_audit_store import ProcessLock
+
+    lock_path = tmp_path / "login_recovery.lock"
+    _inject_login_lock_path(monkeypatch, lock_path)
+    root = Path(__file__).resolve().parents[1]
+    holder_src = tmp_path / "lock_holder.py"
+    holder_src.write_text(
+        "import sys, time\n"
+        "sys.path.insert(0, sys.argv[2])\n"
+        "from app.services.daily_audit_store import ProcessLock\n"
+        "lock = ProcessLock(sys.argv[1]).acquire("
+        "owner={'pid': 'child-holder', 'command': 'test'})\n"
+        "print('HELD', flush=True)\n"
+        "time.sleep(60)\n",
+        encoding="utf-8")
+    child = subprocess.Popen(
+        [sys.executable, str(holder_src), str(lock_path), str(root)],
+        cwd=str(root), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    try:
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline:
+            if ProcessLock.inspect(lock_path)["active"]:
+                break
+            if child.poll() is not None:
+                raise AssertionError(
+                    "lock holder 提前退出: "
+                    + child.stderr.read().decode("utf-8", "replace"))
+            time.sleep(0.05)
+        assert ProcessLock.inspect(lock_path)["active"] is True, (
+            "子进程未成功持有锁")
+        monkeypatch.setattr(dashboard_api, "_cnnc_login_launched_at", None)
+        launched = _fake_login_popen(monkeypatch)
+        r = client.post("/dashboard/api/cnnc-auth/login", headers={
+            "X-Dashboard-Action-Token": dashboard_api._ACTION_TOKEN})
+        assert r.status_code == 409
+        assert r.json()["error_code"] == "CNNC_LOGIN_ALREADY_RUNNING"
+        assert launched == []
+    finally:
+        child.terminate()
+        try:
+            child.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            child.kill()
+            child.wait(timeout=10)
+    # 子进程退出后 OS 锁自动释放（探活即可验证，无需子进程显式清理）
+    assert ProcessLock.inspect(lock_path)["active"] is False
+
+
+def test_cnnc_auth_login_stale_lock_files_still_start(client, monkeypatch, tmp_path):
+    """Case D：锁文件与 owner.json 都存在但无人持有（stale 残留）→
+    inspect active=False（区分“文件存在”vs“锁被持有”）→ 202 started。"""
+    from app import dashboard_api
+
+    lock_path = tmp_path / "login_recovery.lock"
+    _inject_login_lock_path(monkeypatch, lock_path)
+    lock_path.write_bytes(b"0")
+    lock_path.with_name(lock_path.name + ".owner.json").write_text(
+        json.dumps({"pid": 999999, "command": "login-and-recover",
+                    "started_at": "2026-09-09T00:00:00+00:00"}),
+        encoding="utf-8")
+    monkeypatch.setattr(dashboard_api, "_cnnc_login_launched_at", None)
+    launched = _fake_login_popen(monkeypatch)
+    r = client.post("/dashboard/api/cnnc-auth/login", headers={
+        "X-Dashboard-Action-Token": dashboard_api._ACTION_TOKEN})
+    assert r.status_code == 202
+    assert len(launched) == 1
