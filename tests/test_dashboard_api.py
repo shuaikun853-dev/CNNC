@@ -821,3 +821,193 @@ def test_cnnc_auth_login_stale_lock_files_still_start(client, monkeypatch, tmp_p
         "X-Dashboard-Action-Token": dashboard_api._ACTION_TOKEN})
     assert r.status_code == 202
     assert len(launched) == 1
+
+
+# ======================================================================
+# 手动 cURL 刷新端点（2026-09-10）:POST /api/cnnc-auth/refresh-curl
+# operator 守卫 → 认证维护锁互斥（与 login 双向）→ 60 秒独立节流 →
+# detached 拉起 scripts/cnnc_auth_refresh.py --refresh-curl;结构性无
+# closeout/finalized 门（手工刷新不受收口限制）。status 路由只读合并
+# last_curl_refresh 工件。锁/工件路径经 dashboard_api 模块常量注入 tmp,
+# 绝不触碰真实 data/。
+# ======================================================================
+
+def _inject_maintenance_paths(monkeypatch, tmp_path):
+    """refresh-curl 端点与 status 合并用到的锁/工件路径全部注入 tmp。"""
+    from app import dashboard_api
+    monkeypatch.setattr(dashboard_api, "_AUTH_MAINTENANCE_LOCK_PATH",
+                        tmp_path / "auth_maintenance.lock")
+    monkeypatch.setattr(dashboard_api, "_CURL_REFRESH_RESULT_PATH",
+                        tmp_path / "cnnc_curl_refresh_result.json")
+
+
+def test_cnnc_curl_refresh_starts_detached_refresh(client, monkeypatch, tmp_path):
+    """健康路径：维护锁空闲 → 202 started、Popen 恰一次且 argv 含
+    --refresh-curl（detached 后台载荷,零 closeout/finalized 门）。"""
+    from app import dashboard_api
+
+    _inject_maintenance_paths(monkeypatch, tmp_path)
+    monkeypatch.setattr(dashboard_api, "_cnnc_curl_refresh_launched_at", None)
+    launched = _fake_login_popen(monkeypatch)
+    r = client.post("/dashboard/api/cnnc-auth/refresh-curl", headers={
+        "X-Dashboard-Action-Token": dashboard_api._ACTION_TOKEN})
+    assert r.status_code == 202
+    body = r.json()
+    assert body["started"] is True
+    assert r.headers["cache-control"] == "no-store"
+    assert len(launched) == 1
+    assert "--refresh-curl" in launched[0]
+
+
+def test_cnnc_curl_refresh_lock_held_returns_409_zero_popen(
+        client, monkeypatch, tmp_path):
+    """认证维护锁被 login-and-recover 持有 → 409 AUTH_MAINTENANCE_BUSY、
+    零 Popen（双向互斥之 refresh-curl 侧;锁先检优先于节流,零副作用）。"""
+    from app import dashboard_api
+    from app.services.daily_audit_store import ProcessLock
+
+    _inject_maintenance_paths(monkeypatch, tmp_path)
+    monkeypatch.setattr(dashboard_api, "_cnnc_curl_refresh_launched_at", None)
+    lock_path = tmp_path / "auth_maintenance.lock"
+    holder = ProcessLock(lock_path).acquire(
+        owner={"pid": 12345, "command": "login-and-recover"})
+    launched = _fake_login_popen(monkeypatch)
+    try:
+        r = client.post("/dashboard/api/cnnc-auth/refresh-curl", headers={
+            "X-Dashboard-Action-Token": dashboard_api._ACTION_TOKEN})
+    finally:
+        holder.release()
+    assert r.status_code == 409
+    body = r.json()
+    assert body["error_code"] == "AUTH_MAINTENANCE_BUSY"
+    assert body["status_name"] == "AUTH_MAINTENANCE_BUSY"
+    assert "CNNC 认证维护正在进行" in body["error"]
+    assert launched == []
+
+
+def test_cnnc_curl_refresh_throttle_60s_second_call_429(
+        client, monkeypatch, tmp_path):
+    """60 秒进程内节流（独立计时,与 login 节流互不影响）：首次 202,
+    60 秒内二次点击 429 且 Popen 仍恰一次。"""
+    from app import dashboard_api
+
+    _inject_maintenance_paths(monkeypatch, tmp_path)
+    monkeypatch.setattr(dashboard_api, "_cnnc_curl_refresh_launched_at", None)
+    # login 节流时间戳即使新鲜也不影响 refresh-curl（独立计时变量）
+    monkeypatch.setattr(dashboard_api, "_cnnc_login_launched_at", None)
+    launched = _fake_login_popen(monkeypatch)
+    headers = {"X-Dashboard-Action-Token": dashboard_api._ACTION_TOKEN}
+    r1 = client.post("/dashboard/api/cnnc-auth/refresh-curl", headers=headers)
+    r2 = client.post("/dashboard/api/cnnc-auth/refresh-curl", headers=headers)
+    assert r1.status_code == 202
+    assert r2.status_code == 429
+    assert "60 秒" in r2.json()["error"]
+    assert len(launched) == 1
+
+
+def test_cnnc_login_409_message_names_curl_refresh_holder(
+        client, monkeypatch, tmp_path):
+    """login 被 curl-refresh 持有时 409 文案区分持有者（含「cURL 刷新」）,
+    error_code 兼容保持 CNNC_LOGIN_ALREADY_RUNNING;零 Popen。"""
+    from app import dashboard_api
+    from app.services.daily_audit_store import ProcessLock
+
+    lock_path = tmp_path / "auth_maintenance.lock"
+    _inject_login_lock_path(monkeypatch, lock_path)
+    _inject_maintenance_paths(monkeypatch, tmp_path)
+    monkeypatch.setattr(dashboard_api, "_cnnc_login_launched_at", None)
+    holder = ProcessLock(lock_path).acquire(
+        owner={"pid": 12345, "command": "curl-refresh"})
+    launched = _fake_login_popen(monkeypatch)
+    try:
+        r = client.post("/dashboard/api/cnnc-auth/login", headers={
+            "X-Dashboard-Action-Token": dashboard_api._ACTION_TOKEN})
+    finally:
+        holder.release()
+    assert r.status_code == 409
+    body = r.json()
+    assert body["error_code"] == "CNNC_LOGIN_ALREADY_RUNNING"
+    assert "cURL 刷新" in body["error"]
+    assert launched == []
+
+
+def test_cnnc_curl_refresh_requires_operator_token(client, monkeypatch, tmp_path):
+    """回归：手动 cURL 刷新入口仍受 operator guard 保护(无令牌 403)。"""
+    from app import dashboard_api
+
+    _inject_maintenance_paths(monkeypatch, tmp_path)
+    monkeypatch.setattr(dashboard_api, "_cnnc_curl_refresh_launched_at", None)
+    r = client.post("/dashboard/api/cnnc-auth/refresh-curl")
+    assert r.status_code == 403
+
+
+def test_cnnc_curl_refresh_ignores_closeout_machinery(
+        client, monkeypatch, tmp_path):
+    """结构性无 closeout/finalized 门：即便 action runner/closeout 机器被
+    整体毒化(一访问即 AssertionError),refresh-curl 仍 202 启动——手工刷新
+    不受收口状态限制,与 login 端点同契约。"""
+    from app import dashboard_api
+
+    _inject_maintenance_paths(monkeypatch, tmp_path)
+    monkeypatch.setattr(dashboard_api, "_cnnc_curl_refresh_launched_at", None)
+
+    def _poison():  # 任何 closeout/action 机器访问立即失败
+        raise AssertionError("refresh-curl must not touch closeout machinery")
+
+    monkeypatch.setattr(dashboard_api, "get_action_runner", _poison)
+    launched = _fake_login_popen(monkeypatch)
+    r = client.post("/dashboard/api/cnnc-auth/refresh-curl", headers={
+        "X-Dashboard-Action-Token": dashboard_api._ACTION_TOKEN})
+    assert r.status_code == 202
+    assert r.json()["started"] is True
+    assert len(launched) == 1
+
+
+def test_cnnc_auth_status_merges_curl_refresh_artifact(
+        client, monkeypatch, tmp_path):
+    """status 路由合并 cURL 刷新工件:last_curl_refresh 原样透传;
+    缺文件容错不加字段（只读,绝不影响主 payload 与 last_manual_recovery）。"""
+    from app import dashboard_api
+
+    _fake_status_provider(monkeypatch)
+    _inject_maintenance_paths(monkeypatch, tmp_path)
+    artifact = tmp_path / "cnnc_curl_refresh_result.json"
+    artifact.write_text(json.dumps({
+        "completed_at": "2026-09-10T08:00:00+00:00",
+        "business_date": "2026-09-10",
+        "trigger": "manual",
+        "outcome": "CURL_REFRESH_OK",
+        "curl_expected": 3,
+        "curl_synced": 3,
+        "curl_failed_files": [],
+        "at_redacted": "AT-2026***",
+    }, ensure_ascii=False), encoding="utf-8")
+
+    r = client.get("/dashboard/api/cnnc-auth/status")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["status"] == "CNNC_AUTH_OK"
+    assert body["last_curl_refresh"]["outcome"] == "CURL_REFRESH_OK"
+    assert body["last_curl_refresh"]["curl_synced"] == 3
+    assert body["last_curl_refresh"]["trigger"] == "manual"
+
+    # 工件缺失:响应正常且无该字段
+    monkeypatch.setattr(
+        dashboard_api, "_CURL_REFRESH_RESULT_PATH", tmp_path / "missing.json")
+    r2 = client.get("/dashboard/api/cnnc-auth/status")
+    assert r2.status_code == 200
+    assert "last_curl_refresh" not in r2.json()
+
+
+def test_cnnc_auth_status_bad_json_curl_refresh_artifact_ignored(
+        client, monkeypatch, tmp_path):
+    from app import dashboard_api
+
+    _fake_status_provider(monkeypatch)
+    _inject_maintenance_paths(monkeypatch, tmp_path)
+    artifact = tmp_path / "cnnc_curl_refresh_result.json"
+    artifact.write_text("{not json", encoding="utf-8")
+
+    r = client.get("/dashboard/api/cnnc-auth/status")
+    assert r.status_code == 200
+    assert "last_curl_refresh" not in r.json()
