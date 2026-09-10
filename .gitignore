@@ -51,3 +51,6 @@ tools/_*.py
 _cmp_*.py
 _snapshots_cmp.txt
 爬取模板/
+
+# auth maintenance lock files (R4: prevent accidental commit)
+data/.cnnc_*.lock
