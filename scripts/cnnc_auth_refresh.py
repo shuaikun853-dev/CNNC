@@ -457,6 +457,81 @@ def run_curl_refresh(provider=None, result_path=None, lock_path=None,
         lock.release()
 
 
+# ensure_daily_curl_fresh 的 runner 返回码 → guard 状态映射（与 run_curl_refresh
+# 退出码同一套操作语义；未知返回码按通用认证刷新失败上报）。
+_DAILY_CURL_GUARD_RC_MAP = {
+    0: "DAILY_CURL_REFRESH_OK",
+    1: "AUTH_REFRESH_FAILED",
+    2: "SSO_LOGIN_REQUIRED",
+    4: "CURL_SYNC_PARTIAL",
+    5: "AUTH_MAINTENANCE_BUSY",
+}
+
+
+def _artifact_is_daily_curl_fresh(path, business_date: str) -> bool:
+    """只凭持久工件判定"今日 cURL 已全量同步"（幂等、与进程内存无关）。
+
+    新鲜当且仅当：工件 business_date==参数 AND outcome==CURL_REFRESH_OK
+    AND curl_synced==curl_expected AND curl_expected>0。工件缺失/坏 JSON/
+    字段缺失一律视为不新鲜（容错，绝不抛）。curl_expected>0 防 0/0 空期望
+    误判；部分失败 outcome 天然不满足。
+    """
+    try:
+        artifact = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    return (
+        artifact.get("business_date") == business_date
+        and artifact.get("outcome") == "CURL_REFRESH_OK"
+        and artifact.get("curl_synced") == artifact.get("curl_expected")
+        and int(artifact.get("curl_expected") or 0) > 0
+    )
+
+
+def ensure_daily_curl_fresh(business_date: str, provider=None, result_path=None,
+                            lock_path=None, runner=None, now=None) -> str:
+    """每日 cURL freshness guard（tick/finalize 前预检；2026-09-10）。
+
+    只读结果工件判定当日 cURL 是否已全量同步（business_date 相等 +
+    CURL_REFRESH_OK + 全同步 + 期望>0），不新鲜才调 runner 刷新一次。
+    fresh/失败/busy 都只返回状态字符串，绝不向调用方（incremental tick）
+    上抛异常——tick 的既有 lazy refresh 401 兜底语义保持不变。
+
+    判定是持久幂等的（只认工件，与进程内存无关），进程重启后第一次调用
+    与常驻进程行为一致。``now`` 参数为预留 seam：当前新鲜判定是纯"工件
+    business_date == 参数"相等比较，不消费墙上时钟。
+
+    部分失败语义：runner rc=4（AUTH_REFRESH_OK_CURL_SYNC_FAILED）落盘的
+    工件不满足新鲜判定 → 不算新鲜，下一次 tick 再调 guard 会再次尝试
+    刷新，直到一次全量同步成功为止。
+
+    business_date/provider/result_path/lock_path/runner 可注入（测试 seam，
+    工件与锁路径全部 tmp 注入，绝不触碰真实 data/）；runner 缺省
+    run_curl_refresh（provider/result_path/lock_path 原样透传）。
+    返回状态：
+        DAILY_CURL_ALREADY_FRESH  工件已证明当日全量同步（runner 零调用）
+        DAILY_CURL_REFRESH_OK     本次刷新成功且全量同步（rc=0）
+        SSO_LOGIN_REQUIRED        SSO 会话失效（rc=2；只上报，不自动弹登录）
+        AUTH_REFRESH_FAILED       其他认证刷新失败（rc=1，含未知返回码）
+        CURL_SYNC_PARTIAL         刷新成功但 cURL 部分失败（rc=4；不算新鲜）
+        AUTH_MAINTENANCE_BUSY     认证维护锁被持（rc=5；零副作用放行）
+        DAILY_CURL_REFRESH_ERROR  runner 抛异常（被本函数捕获，绝不上抛）
+    """
+    runner = runner if runner is not None else run_curl_refresh
+    result_path = (Path(result_path) if result_path is not None
+                   else CURL_REFRESH_RESULT_PATH)
+    lock_path = lock_path if lock_path is not None else AUTH_MAINTENANCE_LOCK_PATH
+    if _artifact_is_daily_curl_fresh(result_path, business_date):
+        return "DAILY_CURL_ALREADY_FRESH"
+    try:
+        rc = int(runner(trigger="daily-preflight", business_date=business_date,
+                        provider=provider, result_path=result_path,
+                        lock_path=lock_path))
+    except Exception:  # noqa: BLE001 — guard 绝不向 tick 上抛
+        return "DAILY_CURL_REFRESH_ERROR"
+    return _DAILY_CURL_GUARD_RC_MAP.get(rc, "AUTH_REFRESH_FAILED")
+
+
 def run_selftest() -> int:
     """离线自测（不走网络/浏览器）：tmp 目录 + 注入 fake 依赖验证刷新链。
 

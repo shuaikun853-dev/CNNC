@@ -314,6 +314,59 @@ def test_finalize_reuses_tick_core_and_then_calls_materializer(tmp_path):
     assert calls and calls[0][0] == "2026-08-11"
 
 
+def test_tick_runs_daily_curl_guard_exactly_once_for_the_business_date(
+    tmp_path, monkeypatch
+):
+    """tick（真正抓 CNNC customer 侧快照的命令）前先跑每日 cURL guard。"""
+    calls = []
+
+    def guard(*_args, **kwargs):
+        calls.append(kwargs.get("business_date"))
+        return "DAILY_CURL_ALREADY_FRESH"
+
+    monkeypatch.setattr(
+        runtime_module.cnnc_auth_refresh, "ensure_daily_curl_fresh", guard
+    )
+    events: list[str] = []
+
+    run_runtime_command(
+        "tick", business_date="2026-08-11", runtime_root=tmp_path / "runtime",
+        dependencies=_dependencies(events)
+    )
+
+    assert calls == ["2026-08-11"]  # 恰好 1 次且 business_date==tick 日
+
+
+def test_harvest_only_never_runs_daily_curl_guard(tmp_path, monkeypatch):
+    """harvest-only 只收既有远端任务，不抓快照 → guard 零调用。"""
+    calls = []
+
+    def guard(*_args, **kwargs):
+        calls.append(kwargs.get("business_date"))
+        return "DAILY_CURL_ALREADY_FRESH"
+
+    monkeypatch.setattr(
+        runtime_module.cnnc_auth_refresh, "ensure_daily_curl_fresh", guard
+    )
+    monkeypatch.setattr(
+        runtime_module,
+        "run_harvest_only",
+        lambda *_args, **_kwargs: TickSummary("HARVESTED", (), {}, {}, None),
+    )
+    root = tmp_path / "runtime"
+    paths = runtime_paths("2026-08-11", root)
+    paths.run_dir.mkdir(parents=True)
+    DailyAuditStore(paths.state_path).ensure_run("2026-08-11")
+
+    result = run_runtime_command(
+        "harvest-only", business_date="2026-08-11", runtime_root=root,
+        dependencies=_dependencies([]), runtime_budget_seconds=300,
+    )
+
+    assert result.tick.outcome == "HARVESTED"
+    assert calls == []  # harvest-only 分支零改动、零 guard 调用
+
+
 def test_customer_count_mismatch_freezes_but_pending_readiness_does_not_materialize(tmp_path):
     events: list[str] = []
     deps = _dependencies(events)

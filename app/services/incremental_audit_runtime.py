@@ -109,6 +109,7 @@ from app.workflows.incremental_price_audit_finalize import (
     materialize_frozen_review,
     materialize_forced_frozen_daily_run,
 )
+from scripts import cnnc_auth_refresh
 from scripts.audit_saas_excel_file import call_detail_api
 from scripts.auth_manager import AuthManager, _payload_is_auth_failure
 from scripts.cnnc_auth_core import AT_COOKIE_RE, CnncAuthProvider
@@ -2164,6 +2165,21 @@ def _run_runtime_command_locked(
     elif command == "harvest-only":
         summary = run_harvest_only(store, process_lock, config, deps)
     else:
+        # 每日 cURL freshness guard（2026-09-10）：仅 tick/finalize（真正抓
+        # CNNC customer 侧快照的两类命令）在跑引擎前确认为当日 cURL 已同步。
+        # 判定只读 results 工件、与 closeout/finalize 状态解耦；任何状态都
+        # 只打一行日志并放行 tick——busy/SSO/部分失败交给既有 lazy refresh
+        # 401 兜底语义，guard 绝不 raise、绝不自动弹登录。经模块属性引用
+        # （而非 from-import 函数名），测试可 monkeypatch 注入。
+        if command in {"tick", "finalize"}:
+            try:
+                guard_status = cnnc_auth_refresh.ensure_daily_curl_fresh(
+                    business_date=day,
+                    provider=getattr(deps, "cnnc_provider", None),
+                )
+            except Exception:  # noqa: BLE001 — guard 绝不影响 tick 执行
+                guard_status = "DAILY_CURL_GUARD_ERROR"
+            print("daily-curl-guard: %s" % guard_status)
         summary = run_incremental_tick(
             store,
             process_lock,
