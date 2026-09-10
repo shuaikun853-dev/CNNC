@@ -272,8 +272,10 @@ class StaplesLocalCrawler:
             return self._failure_reader
         return read_stbchina_failure_reasons
 
-    def _result_xlsx(self) -> Path:
-        return self.work_dir / "stbchina_missing_result.xlsx"
+    def _result_xlsx(self, attempt_dir: Path | None = None) -> Path:
+        """结果档路径:crawl 内一律传本次 attempt 目录(读新鲜结果,不读 base 旧档);
+        缺省回退 base work_dir,仅为向后兼容直接调用。"""
+        return (attempt_dir or self.work_dir) / "stbchina_missing_result.xlsx"
 
     def crawl(self, requests: Sequence[Mapping[str, Any]]) -> dict[str, StaplesCrawlOutcome]:
         """Crawl one batch, keyed by ``original_url``.  Never raises."""
@@ -288,8 +290,13 @@ class StaplesLocalCrawler:
         if not urls:
             return {}
         executor = self._default_executor()
+        # 每次批量爬取使用独立 attempt 目录:legacy wrapper 以"结果档已存在且
+        # 覆盖全部请求 URL"为短路条件(monitor_stb_fallback.run_stbchina_fallback),
+        # 共享 base 目录会让旧档吞掉新请求(Issue #11 Blocker C)。不清理,留取证。
+        attempt_dir = self.work_dir / "attempts" / uuid.uuid4().hex
+        attempt_dir.mkdir(parents=True, exist_ok=True)
         try:
-            records = executor(urls, self.work_dir) or {}
+            records = executor(urls, attempt_dir) or {}
         except Exception as exc:  # noqa: BLE001 - whole batch transient (Case 10)
             # 爬虫不可用/脚本失败都是瞬时:绝不因异常类名判 FINAL。
             diagnostic = str(exc).strip() or type(exc).__name__
@@ -309,7 +316,10 @@ class StaplesLocalCrawler:
             reasons: dict[str, str] = {}
             try:
                 # 注入的 reader 也可能不依赖结果文件;默认实现自身处理缺文件。
-                reasons = self._default_failure_reader()(self._result_xlsx()) or {}
+                # 读本次 attempt 目录:base 目录旧档绝不参与本次判定(Blocker C2)。
+                reasons = (
+                    self._default_failure_reader()(self._result_xlsx(attempt_dir)) or {}
+                )
             except Exception:  # noqa: BLE001 - unreadable reasons -> transient
                 reasons = {}
             for url in missing:

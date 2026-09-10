@@ -145,6 +145,39 @@ class FakeFailureReader:
         return dict(self.reasons)
 
 
+class LegacyLikeExecutor:
+    """复刻 run_stbchina_fallback 的旧档短路契约(monitor_stb_fallback.py:189-192):
+
+    若收到的 work_dir 下已存在 stbchina_missing_result.xlsx 且覆盖全部请求
+    URL,则直接返回旧记录、不启动爬取;否则"爬取"并在该目录写下结果档。
+    """
+
+    def __init__(self, stale_records=None, fresh_records=None):
+        self.calls: list[tuple[list[str], Path]] = []
+        self.crawled: list[bool] = []
+        self.stale_records = dict(stale_records or {})
+        self.fresh_records = dict(fresh_records or {})
+
+    def __call__(self, urls, work_dir):
+        urls = list(urls)
+        work_dir = Path(work_dir)
+        self.calls.append((urls, work_dir))
+        result_path = work_dir / "stbchina_missing_result.xlsx"
+        if result_path.is_file():
+            known = set(self.stale_records) | set(self.fresh_records)
+            if all(url in known for url in urls):
+                self.crawled.append(False)  # 旧档短路:未爬取
+                return {url: self.stale_records[url] for url in urls if url in self.stale_records}
+        self.crawled.append(True)
+        rows = [
+            ["t", "", url, str(self.fresh_records[url]["price"]), "", "成功", "", "", ""]
+            for url in urls
+            if url in self.fresh_records
+        ]
+        _write_result_xlsx(result_path, rows=rows)
+        return {url: self.fresh_records[url] for url in urls if url in self.fresh_records}
+
+
 class FakeCrawler:
     """脚本化假爬虫:记录 crawl 次数,按 original_url 返回预置 outcome。"""
 
@@ -1051,6 +1084,82 @@ def test_zhaoshang_tripwire_zero_after_full_pass(stack):
 # ---- 适配器细节 ------------------------------------------------------------------
 
 
+def test_crawl_uses_fresh_attempt_directory(stack):
+    """Blocker C1:crawl 每次把独立 attempt 目录传给 executor,绝不传 base work_dir。"""
+    base = stack.work_dir
+    base.mkdir(parents=True, exist_ok=True)
+    executor = FakeExecutor(
+        records={URL: {"price": 12.5, "title": "t", "uid": UID, "comment": "1"}}
+    )
+    crawler = StaplesLocalCrawler(
+        executor=executor, failure_reader=FakeFailureReader(), work_dir=base
+    )
+    outcomes = crawler.crawl([{"original_url": URL}])
+    assert len(executor.calls) == 1
+    attempt_dir = executor.calls[0][1]
+    assert attempt_dir != base  # RED:当前传入 base work_dir
+    assert attempt_dir.parent == base / "attempts"
+    assert attempt_dir.parent.parent == base
+    assert outcomes[URL].status == STAPLES_OUTCOME_SUCCESS
+
+
+def test_crawl_failure_reader_reads_fresh_attempt_dir_not_base(tmp_path):
+    """Blocker C2:base 目录旧档(含 requested URL 的终局失败原因)不得泄漏进本次判定。"""
+    base = tmp_path / "work"
+    base.mkdir()
+    _write_result_xlsx(base / "stbchina_missing_result.xlsx", rows=[
+        ["", "", URL, "3.0", "", "失败", "商品已下架", "", ""],  # 旧档:终局失败
+    ])
+    executor = FakeExecutor(records={})  # 本次 executor 未返回该 URL 记录
+    crawler = StaplesLocalCrawler(executor=executor, work_dir=base)  # 默认 failure reader
+    outcomes = crawler.crawl([{"original_url": URL}])
+    assert len(executor.calls) == 1
+    # 只能按"本次 attempt 无结果"判 TRANSIENT,绝不继承旧档的 商品已下架
+    assert outcomes[URL].status == STAPLES_OUTCOME_TRANSIENT_FAILURE
+    assert outcomes[URL].diagnostic == "采集失败，无原因记录"
+
+
+def test_crawl_stale_base_result_xlsx_cannot_short_circuit(stack):
+    """Blocker C2:base 目录旧结果档不能让本次爬取被短路;结果必须来自 executor。"""
+    stale_record = {"price": 3.0, "title": "旧标题", "uid": UID, "comment": "1"}
+    fresh_record = {"price": 99.0, "title": "新标题", "uid": UID, "comment": "2"}
+    base = stack.work_dir
+    base.mkdir(parents=True, exist_ok=True)
+    _write_result_xlsx(base / "stbchina_missing_result.xlsx", rows=[
+        ["旧标题", UID, URL, "3.0", "1", "成功", "", "", ""],  # 覆盖 requested URL 的旧档
+    ])
+    legacy = LegacyLikeExecutor(stale_records={URL: stale_record}, fresh_records={URL: fresh_record})
+    crawler = StaplesLocalCrawler(executor=legacy, failure_reader=FakeFailureReader(), work_dir=base)
+    outcomes = crawler.crawl([{"original_url": URL}])
+    assert len(legacy.calls) == 1
+    assert legacy.crawled == [True]  # executor MUST actually crawl:旧档不得短路
+    assert outcomes[URL].status == STAPLES_OUTCOME_SUCCESS
+    assert outcomes[URL].price == 99.0  # 结果来自 executor 返回值,而非旧档的 3.0
+
+
+def test_crawl_consecutive_attempts_isolated(stack):
+    """Blocker C3:连续两次 crawl 目录互不可见;A 留下的结果档不短路 B。"""
+    base = stack.work_dir
+    base.mkdir(parents=True, exist_ok=True)
+    legacy = LegacyLikeExecutor(
+        stale_records={URL: {"price": 3.0, "title": "旧", "uid": UID, "comment": "1"}},
+        fresh_records={URL: {"price": 66.0, "title": "新B", "uid": UID, "comment": "9"}},
+    )
+    crawler = StaplesLocalCrawler(
+        executor=legacy, failure_reader=FakeFailureReader(), work_dir=base
+    )
+    first = crawler.crawl([{"original_url": URL}])
+    dir_a = legacy.calls[0][1]
+    assert legacy.crawled == [True]
+    assert (dir_a / "stbchina_missing_result.xlsx").is_file()  # A 在自己目录留下结果档
+    second = crawler.crawl([{"original_url": URL}])
+    dir_b = legacy.calls[1][1]
+    assert legacy.crawled == [True, True]  # B 未被 A 的结果档短路
+    assert dir_a != dir_b  # RED 语义:旧实现两次都是同一个 base work_dir
+    assert dir_a.parent == dir_b.parent == base / "attempts"
+    assert first[URL].price == 66.0 and second[URL].price == 66.0
+
+
 def test_adapter_price_zero_or_missing_is_transient(stack):
     crawler = _default_adapter(
         stack, FakeExecutor(records={URL: {"price": 0.0, "title": "t", "uid": UID, "comment": "1"}})
@@ -1095,22 +1204,41 @@ def test_read_stbchina_failure_reasons_parses_xlsx(tmp_path):
     assert read_stbchina_failure_reasons(tmp_path / "missing.xlsx") == {}
 
 
+class WritingExecutor:
+    """按 legacy 契约把结果 xlsx 写进收到的 work_dir 的假执行器。"""
+
+    def __init__(self, records=None, rows=None):
+        self.records = dict(records or {})
+        self.rows = list(rows or [])
+        self.calls: list[tuple[list[str], Path]] = []
+
+    def __call__(self, urls, work_dir):
+        self.calls.append((list(urls), Path(work_dir)))
+        _write_result_xlsx(Path(work_dir) / "stbchina_missing_result.xlsx", rows=self.rows)
+        return {url: self.records[url] for url in urls if url in self.records}
+
+
 def test_default_adapter_reads_result_xlsx_and_classifies(tmp_path):
     work = tmp_path / "work"
     work.mkdir()
     url_ok = "https://www.stbchina.cn/item.html?itemId=1"
     url_final = "https://www.stbchina.cn/item.html?itemId=2"
     url_transient = "https://www.stbchina.cn/item.html?itemId=3"
-    _write_result_xlsx(work / "stbchina_missing_result.xlsx", rows=[
-        ["t", "1", url_ok, "9.9", "10", "成功", "", "2026-09-08", "1"],
-        ["", "", url_final, "", "", "失败", "商品不存在", "", ""],
-        ["", "", url_transient, "", "", "失败", "页面超时", "", ""],
-    ])
-    crawler = StaplesLocalCrawler(
-        executor=FakeExecutor(records={url_ok: {"price": 9.9, "title": "t", "uid": "1", "comment": "10"}}),
-        work_dir=work,
+    # executor 把结果档写进它收到的 attempt 目录(legacy 契约),默认 reader
+    # 从同一 attempt 目录读回:失败原因判定基于本次新鲜结果。
+    executor = WritingExecutor(
+        records={url_ok: {"price": 9.9, "title": "t", "uid": "1", "comment": "10"}},
+        rows=[
+            ["t", "1", url_ok, "9.9", "10", "成功", "", "2026-09-08", "1"],
+            ["", "", url_final, "", "", "失败", "商品不存在", "", ""],
+            ["", "", url_transient, "", "", "失败", "页面超时", "", ""],
+        ],
     )
+    crawler = StaplesLocalCrawler(executor=executor, work_dir=work)
     outcomes = crawler.crawl([{"original_url": url} for url in (url_ok, url_final, url_transient)])
+    assert len(executor.calls) == 1
+    assert executor.calls[0][1] != work  # 独立 attempt 目录(Blocker C1)
+    assert (executor.calls[0][1] / "stbchina_missing_result.xlsx").is_file()
     assert outcomes[url_ok].status == STAPLES_OUTCOME_SUCCESS
     assert outcomes[url_final].status == STAPLES_OUTCOME_FINAL_FAILURE
     assert outcomes[url_final].diagnostic == "商品不存在"
