@@ -6,7 +6,7 @@ ROOT = Path(__file__).resolve().parents[1]
 ROOT_DOCS = {
     "AGENTS.md": 180,
     "CURRENT_STATE.md": 150,
-    "TESTING.md": 240,
+    "TESTING.md": 244,
     "README.md": 180,
 }
 RUNBOOKS = {

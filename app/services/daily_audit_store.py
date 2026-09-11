@@ -20,6 +20,7 @@ from time import time_ns
 from typing import Any, Iterator, Mapping, Sequence
 
 from app.services.customer_price_semantics import CUSTOMER_PRICE_RETRYABLE_DETAIL_STATUSES
+from app.services.crawl_url_identity import is_placeholder_code
 
 
 DEFAULT_TENANT_ID = 188605
@@ -2294,6 +2295,58 @@ class DailyAuditStore:
                         ),
                     ).fetchone()
                     if source is None:
+                        # Issue #10: URL-only placeholder-sibling tiers.  A prewarm
+                        # placeholder crawl (``zhpq-`` sku, semantic guard
+                        # ``is_placeholder_code``) proves the same (mall, url, backend)
+                        # work already exists, so a new source document follows the very
+                        # same remote job / result instead of duplicating it.  Matched
+                        # WITHOUT sku (five-tuple semantics of the tiers above stay
+                        # untouched), and a failed placeholder never terminal-fails a
+                        # real STEP1 row (no TERMINAL_FAILED propagation).
+                        placeholder = connection.execute(
+                            """SELECT * FROM crawl_work WHERE run_id=? AND mall_key=? AND exact_url=?
+                               AND backend_version=? AND remote_job_id IS NOT NULL AND id<>?
+                               AND state IN ('PENDING', 'PRIORITY_PENDING', 'SUBMITTED', 'RUNNING', 'EXPORTED', 'RETRYABLE_FAILED', 'SUBMIT_UNKNOWN')
+                               ORDER BY id""",
+                            (token.run_id, target["mall_key"], target["exact_url"], target["backend_version"], crawl_work_id),
+                        ).fetchall()
+                        source = next((row for row in placeholder if is_placeholder_code(row["sku_id"])), None)
+                        if source is not None:
+                            connection.execute(
+                                """UPDATE crawl_work SET state=?, remote_job_id=?, error_text=NULL, updated_at=?
+                                   WHERE id=? AND remote_job_id IS NULL""",
+                                (
+                                    source["state"],
+                                    source["remote_job_id"],
+                                    self._utcnow(),
+                                    crawl_work_id,
+                                ),
+                            )
+                            return self._row(
+                                connection.execute("SELECT * FROM crawl_work WHERE id=?", (crawl_work_id,)).fetchone()
+                            )
+                        placeholder = connection.execute(
+                            """SELECT * FROM crawl_work WHERE run_id=? AND mall_key=? AND exact_url=?
+                               AND backend_version=? AND state IN ('SUCCESS', 'NO_RESULT')
+                               AND result_json IS NOT NULL AND id<>?
+                               ORDER BY CASE state WHEN 'SUCCESS' THEN 0 ELSE 1 END, id""",
+                            (token.run_id, target["mall_key"], target["exact_url"], target["backend_version"], crawl_work_id),
+                        ).fetchall()
+                        source = next((row for row in placeholder if is_placeholder_code(row["sku_id"])), None)
+                        if source is not None:
+                            connection.execute(
+                                """UPDATE crawl_work SET state=?, result_json=?, error_text=?, updated_at=? WHERE id=?""",
+                                (
+                                    source["state"],
+                                    source["result_json"],
+                                    source["error_text"] if source["state"] == "NO_RESULT" else None,
+                                    self._utcnow(),
+                                    crawl_work_id,
+                                ),
+                            )
+                            return self._row(
+                                connection.execute("SELECT * FROM crawl_work WHERE id=?", (crawl_work_id,)).fetchone()
+                            )
                         return None
                     connection.execute(
                         """UPDATE crawl_work SET state='TERMINAL_FAILED', result_json=?, error_text=?, updated_at=?

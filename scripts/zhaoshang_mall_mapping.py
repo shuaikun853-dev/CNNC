@@ -15,6 +15,8 @@ EXTRA_DOMAIN_ALIASES = {
     "zjmi": ("zjmi.com",),
     "nbdeli": ("nbdeli.cn", "delib2b.com"),
     "epec": ("emall.epec.com", "lt95.com"),
+    "comix": ("qx.com",),
+    "ofs": ("officemate.cn",),
 }
 
 SUPPORTED_ZHAOSHANG_MALL_KEYS = {

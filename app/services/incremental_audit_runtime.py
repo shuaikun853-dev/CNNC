@@ -17,7 +17,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, time
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Mapping, Sequence
 from zoneinfo import ZoneInfo
 
 from app.services.cnnc_saas_snapshot_adapter import CnncSaasSnapshotAdapter
@@ -27,6 +27,8 @@ from app.services.customer_price_semantics import (
     DetailRequestError,
     is_retryable_detail_http_status,
 )
+from app.services.customer_prewarm_discovery import intake_documents
+from app.services.customer_prewarm_store import CustomerPrewarmStore
 from app.services.batch_zhaoshang_adapter import (
     BatchProgressStatus,
     BatchReconcileStatus,
@@ -995,6 +997,22 @@ def snapshot_discoverer(
                 pass  # preflight 失败不阻塞发现；lazy 刷新路径兜底
         snapshot = adapter.fetch(source_label="incremental-runtime", max_elapsed_seconds=timeout_seconds)
         customer = _customer_index(snapshot.customer_rows)
+        # Issue #9 sidecar-only channel: every observed customer document,
+        # including customer-only docs with no SaaS pending row.  A row lacking
+        # fourCategoryId keeps "" (WAITING_CATEGORY semantics: the prewarm
+        # store parks it out of detail scanning until a later sighting supplies
+        # one).  NEVER consumed by STEP1 stages; only the prewarm intake hook
+        # reads it.
+        prewarm_rows = [
+            {
+                "documentId": document_id,
+                "fourCategoryId": str(row.get("fourCategoryId") or ""),
+                "fourCategoryName": str(row.get("fourCategoryName") or ""),
+                "commodityName": str(row.get("commodityName") or ""),
+                "referenceLink": str(row.get("referenceLink") or ""),
+            }
+            for document_id, row in sorted(customer.items())
+        ]
         saas_rows = [normalize_saas_pending_row(dict(row)) for row in snapshot.saas_rows]
         joined = join_saas_with_customer(saas_rows, customer)
         # Eligibility is part of the authoritative daily snapshot. An URL on
@@ -1023,9 +1041,30 @@ def snapshot_discoverer(
                 "customer_count": snapshot.customer_count,
                 "pages": [evidence.__dict__ for evidence in snapshot.page_evidence],
             },
+            prewarm_rows=prewarm_rows,
         )
 
     return discover
+
+
+def _prewarm_intake_worker(store_path: Path) -> Callable[[str, Sequence[Mapping[str, Any]]], None]:
+    """Issue #9 sidecar intake (lazy, fail-open): the prewarm store is only
+    constructed on the first intake call, inside the tick hook's try/except.
+
+    A corrupt/locked/unwritable prewarm DB therefore can never break STEP1
+    dependency composition; it only counts ``prewarm_intake_failures``.
+    Exceptions propagate to the tick hook, which counts them and continues;
+    this worker itself performs no network or remote action.
+    """
+    store: CustomerPrewarmStore | None = None
+
+    def intake(business_date: str, rows: Sequence[Mapping[str, Any]]) -> None:
+        nonlocal store
+        if store is None:
+            store = CustomerPrewarmStore(store_path)
+        intake_documents(store, business_date, rows, source="event")
+
+    return intake
 
 
 def _detail_worker(
@@ -1926,6 +1965,12 @@ def build_default_dependencies(
         # Read-only wait/export and exact unknown-submit reconciliation remain
         # available on ordinary ticks. Only planner+submit are write-capable.
         dependencies.harvest = harvester
+        # Issue #9 sidecar: best-effort enqueue of discovered documents into
+        # the prewarm inbox. The tick hook catches every exception and only
+        # counts it; drain-only dependencies stay without it on purpose.
+        dependencies.prewarm_intake = _prewarm_intake_worker(
+            paths.run_dir.parent / "customer_prewarm.sqlite3"
+        )
     if enable_zhaoshang:
         if paths is None or business_date is None:
             raise RuntimeConfigurationError("Zhaoshang runtime paths and business date are required")
