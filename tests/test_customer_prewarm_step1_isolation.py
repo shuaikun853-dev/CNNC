@@ -14,7 +14,10 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 
 import app.services.incremental_audit_runtime as runtime_module
-from app.services.customer_prewarm_discovery import intake_documents
+from app.services.customer_prewarm_discovery import (
+    intake_documents,
+    prewarm_rows_from_customer_rows,
+)
 from app.services.customer_prewarm_store import CustomerPrewarmStore
 from app.services.daily_audit_store import DailyAuditStore, ProcessLock
 from app.services.incremental_audit_runtime import (
@@ -86,6 +89,9 @@ def _deps(rows, clock, *, prewarm_intake=None):
                 for row_value in rows
             ],
             evidence={"saas_count": len(rows), "customer_count": len(rows)},
+            # 显式声明 customer-only prewarm 通道(生产 discoverer 语义):
+            # prewarm_rows=None 表示"无通道",intake 必须整跳跳过。
+            prewarm_rows=prewarm_rows_from_customer_rows(rows),
         )
 
     def model(_row, _timeout):

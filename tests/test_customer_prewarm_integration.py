@@ -35,6 +35,7 @@ from app.services.crawl_url_identity import (
     SKU_STATUS_URL_PARSED_UNVERIFIED,
 )
 from app.services.customer_prewarm_dispatch import run_prewarm_dispatch_pass
+from app.services.customer_prewarm_discovery import prewarm_rows_from_customer_rows
 from app.services.customer_prewarm_store import (
     CACHE_STATUS_CACHE_HIT,
     CACHE_STATUS_PENDING_PREWARM,
@@ -783,6 +784,9 @@ def _closeout_observation(rows) -> DiscoveredState:
         source_fingerprints=[f"source-{row['vCommodityId']}" for row in rows],
         customer_fingerprints=[f"customer-{row['vCommodityId']}" for row in rows],
         evidence={"saas_count": len(rows), "customer_count": len(rows)},
+        # 显式声明 customer-only prewarm 通道(生产 discoverer 语义):
+        # prewarm_rows=None 表示"无通道",intake 必须整跳跳过。
+        prewarm_rows=prewarm_rows_from_customer_rows(rows),
     )
 
 

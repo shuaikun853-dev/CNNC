@@ -11,7 +11,10 @@
   STEP1 整体 fail-closed,既有失败行保持原失败态/blocking;
 - Case K:prewarm 集成在场时,finalize 投影仍 1:1 对齐——absent 行
   NO_ACTION/needs_human_approval=False/execution_allowed=False/executed=False,
-  普通行保留原 verdict,record_results 与冻结行逐行对位。
+  普通行保留原 verdict,record_results 与冻结行逐行对位;
+- Case L:DiscoveredState.prewarm_rows=None(该 discoverer 无 prewarm 通道)
+  时 intake 整跳跳过(fail-open),绝不把 SaaS-joined rows 回退灌进
+  prewarm 通道(customer-only 语义不能被 SaaS 行污染)。
 
 全部 hermetic:tmp SQLite / fake adapter / fake intake,零真实远端、零真实爬取。
 构造法照抄生产测试:test_customer_prewarm_step1_isolation(tick seam)、
@@ -35,7 +38,10 @@ from app.services.cnnc_saas_snapshot_adapter import (
     SnapshotConsistencyDrift,
     SnapshotFetchExhausted,
 )
-from app.services.customer_prewarm_discovery import intake_documents
+from app.services.customer_prewarm_discovery import (
+    intake_documents,
+    prewarm_rows_from_customer_rows,
+)
 from app.services.customer_prewarm_store import (
     CACHE_STATUS_PENDING_PREWARM,
     CACHE_STATUS_REMOTE_DISPATCHED,
@@ -286,21 +292,25 @@ def test_case_i_prewarm_intake_failure_does_not_break_absence_closeout(tmp_path)
 
 
 def _manual_discovery(v: str, sku: str) -> DiscoveredState:
+    rows = [
+        {
+            "vCommodityId": v,
+            "documentId": v,
+            "skuId": sku,
+            "extLink": "",
+            "fourCategoryId": "cat-1",
+        }
+    ]
     return DiscoveredState(
         observed_at=datetime(2026, 8, 11, 10, 1, tzinfo=UTC),
         headers=["vCommodityId"],
-        rows=[
-            {
-                "vCommodityId": v,
-                "documentId": v,
-                "skuId": sku,
-                "extLink": "",
-                "fourCategoryId": "cat-1",
-            }
-        ],
+        rows=rows,
         source_fingerprints=[f"source-{v}-{sku}"],
         customer_fingerprints=["customer-cat-1-10"],
         evidence={"saas_count": 1, "customer_count": 1},
+        # 显式声明 customer-only prewarm 通道(生产 discoverer 语义):
+        # prewarm_rows=None 表示"无通道",intake 必须整跳跳过。
+        prewarm_rows=prewarm_rows_from_customer_rows(rows),
     )
 
 
@@ -393,6 +403,82 @@ def test_case_j_technical_customer_failure_never_becomes_absent_skip(tmp_path):
     after = store.list_stage_work_for_business_date(BUSINESS_DATE, stage="DETAIL")
     assert [row["state"] for row in after] == ["RETRYABLE_FAILED"]
     assert len(received) == 1  # 第二个 tick 未到 intake(失败在发现阶段)
+
+
+# ---- Case L:prewarm_rows=None 即无通道——intake 跳过,绝不回退 SaaS rows -------------
+
+
+def test_case_l_prewarm_rows_none_skips_intake_no_saas_fallback(tmp_path):
+    """DiscoveredState.prewarm_rows=None(该 discoverer 没有 prewarm 通道)时,
+    intake seam 必须整跳跳过(fail-open):零调用、零计数,并且绝不允许把
+    SaaS-joined rows 回退灌进 prewarm 通道——生产通道是 customer-only 语义,
+    SaaS 行混入即语义分叉。tick 本身照常完成,STEP1 权威快照不受影响。"""
+    clock = _Clock()
+    received: list[tuple[str, list[dict[str, Any]]]] = []
+    prewarm_db = tmp_path / "prewarm-root" / "customer_prewarm.sqlite3"
+    real_intake = runtime_module._prewarm_intake_worker(prewarm_db)
+
+    def recording_intake(business_date: str, rows) -> None:
+        received.append((business_date, [dict(row) for row in rows]))
+        real_intake(business_date, rows)
+
+    saas_rows = [
+        {
+            "vCommodityId": "v-saas-a",
+            "documentId": "doc-saas-a",
+            "skuId": "sku-a",
+            "extLink": "",
+            "fourCategoryId": "cat-1",
+        },
+        {
+            "vCommodityId": "v-saas-b",
+            "documentId": "doc-saas-b",
+            "skuId": "sku-b",
+            "extLink": "",
+            "fourCategoryId": "cat-2",
+        },
+    ]
+    store = DailyAuditStore(tmp_path / "case-l.sqlite3")
+    summary = run_incremental_tick(
+        store,
+        ProcessLock(tmp_path / "case-l.lock"),
+        _tick_config(clock),
+        TickDependencies(
+            discover=lambda _timeout: DiscoveredState(
+                observed_at=datetime(2026, 8, 11, 10, 1, tzinfo=UTC),
+                headers=["vCommodityId"],
+                rows=saas_rows,
+                source_fingerprints=["source-v-saas-a", "source-v-saas-b"],
+                customer_fingerprints=["customer-cat-1-10", "customer-cat-2-10"],
+                evidence={"saas_count": 2, "customer_count": 2},
+                prewarm_rows=None,
+            ),
+            detail=lambda _row, _timeout: {
+                "customerPrice": "10",
+                "customerPriceStatus": "FOUND",
+                "customerPriceSource": "DETAIL_REFERENCE_INFOS",
+                "customerPriceWarning": "",
+                "customerPriceEvidence": "reference price 1 = 10",
+            },
+            model=lambda _row, _timeout: {"match_result": "SAME"},
+            prewarm_intake=recording_intake,
+            monotonic=clock.monotonic,
+            wall_clock=lambda: datetime(2026, 8, 11, 10, 2, tzinfo=UTC),
+        ),
+    )
+
+    # tick 照常完成:prewarm 通道缺席绝不影响 STEP1 主线
+    assert summary.outcome == "COMPLETED"
+    # intake 零调用、零计数:prewarm_rows=None = 无通道,fail-open 跳过
+    assert received == []
+    assert "prewarm_intake_ok" not in summary.counters
+    assert "prewarm_intake_failures" not in summary.counters
+    # SaaS 行未进入任何 prewarm 通道:intake 零调用 ⇒ sidecar 库从未被懒构造
+    assert not prewarm_db.exists()
+    # STEP1 权威快照照常落库:两条 SaaS 行不因通道缺席而丢失
+    details = store.list_stage_work_for_business_date(BUSINESS_DATE, stage="DETAIL")
+    assert len(details) == 2
+    assert summary.backlog["customer_absent_skipped"] == 0
 
 
 # ---- Case K:prewarm 集成在场时 finalize 投影仍 1:1 对齐 ---------------------------

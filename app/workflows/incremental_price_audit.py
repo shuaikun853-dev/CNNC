@@ -1573,15 +1573,13 @@ def run_incremental_tick(
             counters["today_discovered"] = int(ingested["member_count"])
             counters["delta_new"] = int(ingested["status_counts"].get("NEW", 0))
             counters["delta_changed"] = int(ingested["status_counts"].get("CHANGED", 0))
-            if deps.prewarm_intake is not None:
+            if deps.prewarm_intake is not None and discovered.prewarm_rows is not None:
                 # Issue #9 sidecar gate: enqueue only; failure is a counter.
-                # The default fallback keeps injectable fakes that predate the
-                # dedicated prewarm_rows channel working unchanged.
+                # ``prewarm_rows`` ``None`` = this discoverer has no prewarm
+                # channel: skip intake (fail-open) and NEVER fall back to the
+                # SaaS-joined ``rows`` — the sidecar channel is customer-only.
                 try:
-                    deps.prewarm_intake(
-                        config.business_date,
-                        discovered.prewarm_rows if discovered.prewarm_rows is not None else discovered.rows,
-                    )
+                    deps.prewarm_intake(config.business_date, discovered.prewarm_rows)
                     counters["prewarm_intake_ok"] = counters.get("prewarm_intake_ok", 0) + 1
                 except Exception:  # noqa: BLE001 - never fail the tick
                     counters["prewarm_intake_failures"] = counters.get("prewarm_intake_failures", 0) + 1
