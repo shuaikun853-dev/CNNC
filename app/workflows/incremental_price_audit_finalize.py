@@ -16,7 +16,13 @@ from typing import Any, Mapping
 from openpyxl import load_workbook
 from openpyxl.styles import PatternFill
 
+from app.schemas.workflow import (
+    SaasSameProductApprovalAuditResponse,
+    SaasSameProductApprovalAuditResult,
+    WorkflowAction,
+)
 from app.services.customer_price_semantics import (
+    CUSTOMER_ABSENT_SKIPPED,
     CustomerPriceBusinessState,
     customer_price_business_state,
     decode_business_error,
@@ -286,8 +292,98 @@ def _accumulate_customer_price_state(counts: dict[str, int], state: CustomerPric
         counts["customer_price_failed"] += 1
     elif state.key == "INVALID":
         counts["customer_price_invalid"] += 1
-    elif state.key == "CUSTOMER_ABSENT_SKIPPED":
+    elif state.key == CUSTOMER_ABSENT_SKIPPED:
         counts["customer_absent_skipped"] += 1
+
+
+# Final reason for a projected customer-absent row: the round's authoritative
+# customer snapshot query succeeded and the documentId is not in the customer
+# export, so there is nothing to process this round.  No rejection/withdrawal
+# meaning is implied — the durable evidence keeps the real business facts.
+CUSTOMER_ABSENT_SKIP_REASON = "客户侧权威快照当前无此单据，本轮无需处理"
+
+
+def _project_customer_absent_results(
+    audit_response: SaasSameProductApprovalAuditResponse,
+    price_states: list[CustomerPriceBusinessState],
+    enriched: list[dict[str, Any]],
+) -> SaasSameProductApprovalAuditResponse:
+    """Final projection of customer-absent rows onto the frozen audit response.
+
+    work_01's generic rules only see ``customerPrice=None`` and therefore report
+    CUSTOMER_PRICE_MISSING / MANUAL_CHECK for CUSTOMER_ABSENT_SKIPPED rows, and
+    ``enforce_saas_audit_recommendation_only`` force-flags every row
+    ``needs_human_approval=True``.  Running here — after that enforce — makes
+    this the final word on the finalize artifact: rows whose durable evidence
+    classifies as CUSTOMER_ABSENT_SKIPPED (authoritative snapshot query
+    succeeded, documentId absent; legacy LOOKUP_FAILED evidence classifies
+    identically) are rewritten to an explicit non-blocking NO_ACTION record
+    with their real persisted customer evidence appended, and the affected
+    summary counters are recomputed from the projected results.  Every other
+    row, summary key, and the frozen evidence in state storage stay untouched.
+
+    Fail-closed: ``record_results`` / ``price_states`` / ``enriched`` must align
+    1:1 (record_results order is the frozen row order by construction) — any
+    misalignment raises instead of guessing which row is absent.
+    """
+    record_results = audit_response.record_results
+    if not (len(record_results) == len(price_states) == len(enriched)):
+        raise ValueError(
+            "customer-absent projection requires 1:1 alignment: "
+            f"record_results={len(record_results)} "
+            f"price_states={len(price_states)} enriched={len(enriched)}"
+        )
+    projected: list[SaasSameProductApprovalAuditResult] = []
+    touched_groups: set[str] = set()
+    for result, price_state, info in zip(record_results, price_states, enriched):
+        if price_state.key != CUSTOMER_ABSENT_SKIPPED:
+            projected.append(result)
+            continue
+        touched_groups.add(result.vCommodityId)
+        evidence = list(result.evidence)
+        for key in ("customerPriceStatus", "customerPriceWarning", "customerPriceEvidence"):
+            value = normalize_cell_str(info.get(key))
+            if value:
+                evidence.append(f"{key}={value}")
+        projected.append(result.model_copy(update={
+            "price_vs_customer_check": CUSTOMER_ABSENT_SKIPPED,
+            "primary_action": WorkflowAction.NO_ACTION,
+            "suggested_actions": [WorkflowAction.NO_ACTION],
+            "needs_human_approval": False,
+            "execution_allowed": False,
+            "executed": False,
+            "reason": CUSTOMER_ABSENT_SKIP_REASON,
+            "evidence": evidence,
+        }))
+
+    summary = dict(audit_response.summary)
+    summary["manual_check_count"] = sum(
+        1 for result in projected if result.primary_action == WorkflowAction.MANUAL_CHECK
+    )
+    summary["customer_price_missing_count"] = sum(
+        1 for result in projected if result.price_vs_customer_check == "CUSTOMER_PRICE_MISSING"
+    )
+    summary["customer_absent_skipped_count"] = sum(
+        1 for result in projected if result.price_vs_customer_check == CUSTOMER_ABSENT_SKIPPED
+    )
+    if touched_groups:
+        grouped: dict[str, list[SaasSameProductApprovalAuditResult]] = {}
+        for result in projected:
+            grouped.setdefault(result.vCommodityId, []).append(result)
+        for v_commodity_id in touched_groups:
+            group_results = grouped.get(v_commodity_id, [])
+            summary[f"group.{v_commodity_id}.manual_check_count"] = sum(
+                1 for result in group_results
+                if result.primary_action == WorkflowAction.MANUAL_CHECK
+            )
+            summary[f"group.{v_commodity_id}.customer_absent_skipped_count"] = sum(
+                1 for result in group_results
+                if result.price_vs_customer_check == CUSTOMER_ABSENT_SKIPPED
+            )
+    return audit_response.model_copy(update={
+        "record_results": projected,
+        "summary": summary,
+    })
 
 
 def _crawl_key(row: Mapping[str, Any]) -> tuple[str, str, str]:
@@ -510,6 +606,10 @@ def build_frozen_audit_artifact(
     relevant_remote_job_ids: set[int] = set()
     rows: list[dict[str, Any]] = []
     enriched: list[dict[str, Any]] = []
+    # Frozen-row order classification of each row's customer-price evidence;
+    # kept index-aligned with rows/enriched so the final audit-response
+    # projection can rewrite exactly the customer-absent rows.
+    price_states: list[CustomerPriceBusinessState] = []
     model_results: dict[tuple[str, str, str, str], TitleMatchModelResult] = {}
 
     for item in items:
@@ -540,6 +640,7 @@ def build_frozen_audit_artifact(
             price_state = customer_price_business_state(detail["state"], None, "")
         _accumulate_customer_price_state(counts, price_state)
         enriched.append(info)
+        price_states.append(price_state)
 
         model = models.get(item_id)
         if model is None or model["state"] in {"PENDING", "CLAIMED", "RETRYABLE_FAILED"}:
@@ -734,12 +835,19 @@ def build_frozen_audit_artifact(
         )
 
     records = build_records(rows, enriched)
-    audit_response = audit_saas_approval_records(
-        records,
-        use_model=True,
-        use_link_audit=True,
-        use_crawl_result=False,
-        precomputed_title_model_results=model_results,
+    # enforce_saas_audit_recommendation_only already ran inside
+    # audit_saas_approval_records; the projection below is applied afterwards
+    # and is therefore the final word on the artifact's audit response.
+    audit_response = _project_customer_absent_results(
+        audit_saas_approval_records(
+            records,
+            use_model=True,
+            use_link_audit=True,
+            use_crawl_result=False,
+            precomputed_title_model_results=model_results,
+        ),
+        price_states,
+        enriched,
     )
     artifact = FrozenAuditArtifact(
         business_date=token.business_date,

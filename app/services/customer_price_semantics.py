@@ -308,7 +308,14 @@ def customer_price_required(row: Mapping[str, Any] | None) -> bool:
     customer price as the price-review baseline, so the predicate is
     unconditionally True; keep callers on this function (never inline the
     assumption) so a future exemption stays a one-line change here.
-    取不到 ≠ 不需要：确定性缺席（MISSING_PROVEN）同样阻塞正式出表，
-    除非未来找到明确业务豁免。
+
+    Semantics (2026-09-11 ruling): a normally-processable row requires a valid
+    customer price — 取不到 ≠ 不需要，确定性缺席（MISSING_PROVEN，身份缺失 /
+    未提供）同样阻塞正式出表.  The single explicit business exception is
+    CUSTOMER_ABSENT_SKIPPED: the round's authoritative customer snapshot query
+    succeeded and the documentId is provably not in the customer export, i.e.
+    the customer has no such document this round and there is nothing to
+    process (explicitly authorized non-blocking skip, never a silent
+    customerPrice=None pass-through).
     """
     return True
