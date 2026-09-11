@@ -4,14 +4,15 @@
 # 2. --deselect 排除的 tests/test_remote_running_recovery.py::test_default_dependencies_wire_probe_and_write_gated_restart
 #    依赖生产机上 gitignored data/ 目录下的 curl 文件（环境差异，非代码 bug）。
 # 3. 本 workflow 只读只测：无 Secret、无部署、无生产写。
-# 4. 触发契约：开发分支(feat/fix/hotfix/refactor)重要文件 push 自动测试；
+# 4. 触发契约：开发分支(feat/fix/hotfix/refactor/integration)重要文件 push 自动测试；
 #    任何 → prod 的 PR 必定产生 Check；workflow_dispatch 已移除
 #    （默认分支 main 无本文件，入口不可用）。
 name: CNNC Critical Safety Tests
 
 on:
   # 契约 1：GLM 开发分支重要代码 push -> 自动 CI（paths 过滤节省 Actions 分钟；
-  # 只改文档/README 等不触发）。分支模式 = 仓库实际开发命名（feat/fix/hotfix/refactor），
+  # 只改文档/README 等不触发）。分支模式 = 仓库实际开发命名（feat/fix/hotfix/refactor，
+  # 2026-09-11 起 integration/* 集成分支同为开发线），
   # tmp/*、wip/* 等临时/旁支目录有意不触发。
   push:
     branches:
@@ -19,6 +20,7 @@ on:
       - fix/**
       - hotfix/**
       - refactor/**
+      - integration/**
       - prod/closeout-20260818
     paths:
       - app/**
