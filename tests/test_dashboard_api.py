@@ -528,7 +528,8 @@ def test_customer_price_empty_200_when_no_state_file(client, monkeypatch, tmp_pa
     assert body == {
         "business_date": "2026-08-11", "filter": "all", "total_required": 0,
         "counts": {"ready": 0, "pending": 0, "retrying": 0, "missing": 0,
-                   "failed": 0, "invalid": 0, "absent_proven": 0},
+                   "failed": 0, "invalid": 0, "absent_proven": 0,
+                   "absent_skipped": 0},
         "rows": [], "truncated": 0, "limit": 0, "max_attempts": 3}
 
 
@@ -539,7 +540,8 @@ def test_customer_price_projects_readonly_payload(client, monkeypatch, tmp_path)
     payload = {
         "business_date": "2026-08-11", "filter": "unacquired", "total_required": 2,
         "counts": {"ready": 0, "pending": 1, "retrying": 1, "missing": 0,
-                   "failed": 0, "invalid": 0, "absent_proven": 0},
+                   "failed": 0, "invalid": 0, "absent_proven": 0,
+                   "absent_skipped": 0},
         "rows": [{"document_id": "v1", "state": "RETRYING", "attempts": 1,
                   "max_attempts": 3, "error_text": "customerPriceStatus=NOT_FOUND"}],
         "truncated": 0, "limit": 500, "max_attempts": 3}

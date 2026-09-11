@@ -1105,7 +1105,7 @@ def _backlog(
     customer_price_missing = 0
     customer_price_failed = 0
     customer_price_invalid = 0
-    customer_price_absent_proven = 0
+    customer_absent_skipped = 0
     customer_price_success_blockers = 0
     for work in stages:
         if work["stage"] != "DETAIL" or not _in_current_detail_scope(work):
@@ -1113,14 +1113,19 @@ def _backlog(
         state = customer_price_semantics.customer_price_business_state(
             work.get("state"), _decoded_result_dict(work), work.get("error_text")
         )
-        if state.key == customer_price_semantics.MISSING:
+        if state.key in {customer_price_semantics.MISSING, customer_price_semantics.MISSING_PROVEN}:
+            # MISSING_PROVEN (no detail identity / price not provided) still
+            # blocks and is folded into the missing family gate.
             customer_price_missing += 1
         elif state.key == customer_price_semantics.FAILED:
             customer_price_failed += 1
         elif state.key == customer_price_semantics.INVALID:
             customer_price_invalid += 1
-        elif state.key == customer_price_semantics.MISSING_PROVEN:
-            customer_price_absent_proven += 1
+        elif state.key == customer_price_semantics.CUSTOMER_ABSENT_SKIPPED:
+            # 2026-09-11 business authorization: authoritative customer query
+            # succeeded and the documentId is absent — a non-blocking skip,
+            # tracked for observability only.
+            customer_absent_skipped += 1
         if (
             work["state"] == "SUCCESS"
             and state.key in {
@@ -1133,7 +1138,8 @@ def _backlog(
             # Cross-view anti-double-count: a TERMINAL-stage blocker is already
             # carried by detail_terminal, so only SUCCESS-stage business
             # blockers are additive here (MISSING cannot occur on SUCCESS but
-            # is kept in the set defensively).
+            # is kept in the set defensively).  CUSTOMER_ABSENT_SKIPPED is
+            # deliberately excluded: it never blocks.
             customer_price_success_blockers += 1
     return {
         "stage_pending": missing_stages + detail_pending + model_pending,
@@ -1150,7 +1156,7 @@ def _backlog(
         "customer_price_missing": customer_price_missing,
         "customer_price_failed": customer_price_failed,
         "customer_price_invalid": customer_price_invalid,
-        "customer_price_absent_proven": customer_price_absent_proven,
+        "customer_absent_skipped": customer_absent_skipped,
         "customer_price_success_blockers": customer_price_success_blockers,
         "crawl_pending": sum(work["state"] in {"PENDING", "RUNNING", "RETRYABLE_FAILED", "SUBMITTED", "EXPORTED", "SUBMIT_UNKNOWN"} for work in crawls),
         "remote_pending": sum(job["state"] in {"PRIORITY_PENDING", "SUBMITTED", "RUNNING", "EXPORTED"} for job in jobs),
@@ -1706,13 +1712,15 @@ def run_incremental_tick(
         # blocking customer-price business state (SUCCESS-stage
         # INVALID/MISSING_PROVEN included) blocks the same way — finalize
         # would refuse these rows, so the tick must not report COMPLETED.
-        # RETRYING/PENDING stay out: they are already carried by
-        # stage_pending and surface as PENDING_RETRY, not manual review.
+        # CUSTOMER_ABSENT_SKIPPED stays out (2026-09-11 business authorization:
+        # authoritative customer query succeeded, documentId absent = nothing
+        # to process this round).  RETRYING/PENDING stay out: they are already
+        # carried by stage_pending and surface as PENDING_RETRY, not manual
+        # review.
         customer_price_manual_blockers = (
             backlog["customer_price_missing"]
             + backlog["customer_price_failed"]
             + backlog["customer_price_invalid"]
-            + backlog["customer_price_absent_proven"]
         )
         if (
             backlog["model_terminal"]
@@ -1736,11 +1744,12 @@ def run_incremental_tick(
         counters["crawl_running"] = backlog["crawl_pending"]
         # final_pending mirrors status.computed_pending: the coarse technical
         # work sum, plus detail_terminal, plus the SUCCESS-stage customer-price
-        # business blockers.  The four customer_price_* buckets are cross-cut
-        # views of the same detail rows and stay out of the sum (TERMINAL-stage
-        # blockers are already carried by detail_terminal; SUCCESS-stage ones
-        # are added back exactly once via customer_price_success_blockers), so
-        # nothing is double-counted.
+        # business blockers.  The customer_price_* / customer_absent_skipped
+        # buckets are cross-cut views of the same detail rows and stay out of
+        # the sum (TERMINAL-stage blockers are already carried by
+        # detail_terminal; SUCCESS-stage blocking ones are added back exactly
+        # once via customer_price_success_blockers), so nothing is
+        # double-counted.
         final_pending = (
             sum(
                 value for key, value in backlog.items()
@@ -1749,7 +1758,7 @@ def run_incremental_tick(
                     "customer_price_missing",
                     "customer_price_failed",
                     "customer_price_invalid",
-                    "customer_price_absent_proven",
+                    "customer_absent_skipped",
                     "customer_price_success_blockers",
                 }
             )

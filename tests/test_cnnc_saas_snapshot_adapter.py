@@ -359,6 +359,20 @@ def test_count_changes_and_early_empty_pages_fail(events, error_text):
         adapter.fetch()
 
 
+def test_nonzero_rspcode_fails_the_fetch_without_rows():
+    """Fail-closed for the 2026-09-11 skip rule: a business-level non-0000
+    rspCode is a technical failure — the fetch raises, no snapshot/rows are
+    returned, so it can never be misread as "documentId absent"."""
+    adapter, opener = _adapter(
+        [{"rspCode": "8888", "rspDesc": "boom", "count": 0, "rows": []}]
+    )
+
+    with pytest.raises(RuntimeError, match="rspCode is not 0000"):
+        adapter.fetch()
+
+    assert opener.requests  # the request really went out and failed closed
+
+
 def test_serialization_contract_preserves_order_and_duplicates():
     adapter, _opener = _adapter(
         [

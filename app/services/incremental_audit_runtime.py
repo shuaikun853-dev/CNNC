@@ -1051,12 +1051,16 @@ def _detail_worker(
                 "customerPriceEvidence": "existing input reference price",
             }
         if normalize_cell_str(row.get("customer_lookup_status")) == "NOT_FOUND":
+            # 2026-09-11 rule change: the authoritative customer snapshot round
+            # completed (fetch guards count drift/exhaustion) and this
+            # documentId is absent — "nothing to process this round", a
+            # non-blocking skip, never a technical failure.
             return {
                 "customerPrice": None,
-                "customerPriceStatus": "LOOKUP_FAILED",
+                "customerPriceStatus": "CUSTOMER_NOT_FOUND",
                 "customerPriceSource": "",
                 "customerPriceWarning": "customer export did not contain this documentId",
-                "customerPriceEvidence": "",
+                "customerPriceEvidence": "authoritative customer snapshot round complete; documentId absent",
             }
         document_id = normalize_cell_str(row.get("vCommodityId") or row.get("documentId"))
         category_id = normalize_cell_str(row.get("fourCategoryId"))
@@ -1159,7 +1163,7 @@ def _detail_worker(
         # successful completion.  NOT_FOUND / REQUEST_FAILED / PARSE_FAILED are
         # non-deterministic outcomes: raise so the durable stage records a
         # retryable failure with the structured (sanitized, decodable) error
-        # prefix.  Deterministic skips (EXISTS / LOOKUP_FAILED /
+        # prefix.  Deterministic skips (EXISTS / CUSTOMER_NOT_FOUND /
         # DETAIL_REQUEST_SKIPPED) still return normally — re-running them
         # cannot change the answer.
         if str(result.get("customerPriceStatus") or "") in CUSTOMER_PRICE_RETRYABLE_DETAIL_STATUSES:

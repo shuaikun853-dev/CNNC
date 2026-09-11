@@ -586,15 +586,43 @@ def test_force_finalize_never_tolerates_unresolved_customer_price(
     assert store.get_run(DATE)["state"] != "FINALIZED"
 
 
-@pytest.mark.parametrize("status", ["LOOKUP_FAILED", "DETAIL_REQUEST_SKIPPED", "NOT_PROVIDED"])
-def test_force_finalize_never_tolerates_proven_absent_customer_price(tmp_path, status):
-    """Round-2 fail-closed ruling (flipped from round-1 tolerance): a required
-    row without a valid customer price blocks force-finalize too, even when
-    the absence is deterministic and evidence-complete."""
+@pytest.mark.parametrize("status", ["CUSTOMER_NOT_FOUND", "LOOKUP_FAILED"])
+def test_force_finalize_tolerates_customer_absent_skip(tmp_path, status):
+    """2026-09-11 business authorization (rewritten from the round-2
+    never-tolerate ruling): the round's authoritative customer query succeeded
+    and the documentId is absent — a non-blocking skip, so an otherwise clean
+    day with only customer-absent rows force-finalizes (and would ordinary-
+    finalize too).  LOOKUP_FAILED is the legacy spelling of the same outcome."""
     store, snapshot, crawls = _seed_force(tmp_path)
     _link_inflight_job(store, tmp_path, crawls)
     for item in store.ordered_snapshot_items(snapshot["id"]):
         _rework_detail(store, item["id"], result=_proven_absent_result(status))
+    output = tmp_path / "formal.xlsx"
+
+    publication = materialize_forced_frozen_daily_run(
+        store, ProcessLock(tmp_path / "finalize.lock"), DATE, output, max_incomplete=10,
+    )
+
+    assert publication.readiness.customer_absent_skipped == 2
+    assert publication.readiness.customer_price_missing == 0
+    assert publication.forced is True
+    assert output.exists()
+    assert store.get_run(DATE)["state"] == "FINALIZED"
+
+
+def test_force_finalize_still_rejects_contradictory_price_evidence(tmp_path):
+    """Companion guard: customer-absent rows never unlock other blockers —
+    a contradictory INVALID price still blocks force-finalize."""
+    store, snapshot, crawls = _seed_force(tmp_path)
+    _link_inflight_job(store, tmp_path, crawls)
+    for item in store.ordered_snapshot_items(snapshot["id"]):
+        _rework_detail(store, item["id"], result={
+            "customerPrice": "0",
+            "customerPriceStatus": "FOUND",
+            "customerPriceSource": "DETAIL_REFERENCE_INFOS",
+            "customerPriceWarning": "",
+            "customerPriceEvidence": "参考价1=0",
+        })
     output = tmp_path / "formal.xlsx"
 
     with pytest.raises(ForceFinalizeRejected) as excinfo:
@@ -603,7 +631,71 @@ def test_force_finalize_never_tolerates_proven_absent_customer_price(tmp_path, s
         )
 
     assert excinfo.value.error_type == "FORCE_FINALIZE_BLOCKED"
-    assert excinfo.value.readiness.customer_price_absent_proven == 2
+    assert excinfo.value.readiness.customer_price_invalid == 2
+    assert excinfo.value.readiness.customer_absent_skipped == 0
+    assert not output.exists()
+    assert store.get_run(DATE)["state"] != "FINALIZED"
+
+
+def test_force_finalize_mixed_ready_and_customer_absent_day_publishes(tmp_path):
+    """Mixed day (slice T10): 100 READY rows + 3 customer-absent skip rows.
+    The absent rows are a non-blocking skip, so the day force-finalizes
+    (with the ordinary remote long tail tolerated) and the skip rows never
+    appear as blockers."""
+    rows = [_row(f"v-{i}", f"sku-{i}", f"https://shop.example/{i}") for i in range(100)]
+    rows += [
+        _row(f"v-absent-{i}", f"sku-absent-{i}", f"https://shop.example/absent-{i}")
+        for i in range(3)
+    ]
+    store, snapshot, crawls = _seed_force(tmp_path, rows=rows)
+    _link_inflight_job(store, tmp_path, crawls)
+    for item in store.ordered_snapshot_items(snapshot["id"]):
+        if str(item["row"]["vCommodityId"]).startswith("v-absent-"):
+            _rework_detail(store, item["id"], result=_proven_absent_result("CUSTOMER_NOT_FOUND"))
+    output = tmp_path / "formal.xlsx"
+
+    publication = materialize_forced_frozen_daily_run(
+        store, ProcessLock(tmp_path / "finalize.lock"), DATE, output, max_incomplete=103,
+    )
+
+    assert publication.readiness.customer_absent_skipped == 3
+    assert publication.readiness.customer_price_missing == 0
+    assert publication.readiness.customer_price_failed == 0
+    assert publication.readiness.customer_price_invalid == 0
+    assert output.exists()
+    assert store.get_run(DATE)["state"] == "FINALIZED"
+
+
+def test_force_finalize_mixed_day_with_detail_request_failure_stays_blocked(tmp_path):
+    """Mixed day (slice T11): customer-absent skips never unlock technical
+    failures — one DETAIL_REQUEST_FAILED row keeps the day
+    FORCE_FINALIZE_BLOCKED."""
+    rows = [_row(f"v-{i}", f"sku-{i}", f"https://shop.example/{i}") for i in range(100)]
+    rows += [
+        _row(f"v-absent-{i}", f"sku-absent-{i}", f"https://shop.example/absent-{i}")
+        for i in range(3)
+    ]
+    store, snapshot, crawls = _seed_force(tmp_path, rows=rows)
+    _link_inflight_job(store, tmp_path, crawls)
+    items = store.ordered_snapshot_items(snapshot["id"])
+    for item in items:
+        if str(item["row"]["vCommodityId"]).startswith("v-absent-"):
+            _rework_detail(store, item["id"], result=_proven_absent_result("CUSTOMER_NOT_FOUND"))
+    _rework_detail(
+        store,
+        items[0]["id"],
+        error="customerPriceStatus=DETAIL_REQUEST_FAILED；rspCode=500",
+    )
+    output = tmp_path / "formal.xlsx"
+
+    with pytest.raises(ForceFinalizeRejected) as excinfo:
+        materialize_forced_frozen_daily_run(
+            store, ProcessLock(tmp_path / "finalize.lock"), DATE, output, max_incomplete=103,
+        )
+
+    assert excinfo.value.error_type == "FORCE_FINALIZE_BLOCKED"
+    assert excinfo.value.readiness.customer_price_failed == 1
+    assert excinfo.value.readiness.customer_absent_skipped == 3
     assert not output.exists()
     assert store.get_run(DATE)["state"] != "FINALIZED"
 

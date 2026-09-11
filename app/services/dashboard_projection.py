@@ -56,17 +56,18 @@ def _attention_items(s: Mapping, recovery_exhausted_invalid: int = 0) -> list[di
         items.append({"level": "red", "tag": "需人工", "title": "模型校验终态失败",
             "problem": "模型重试预算耗尽后仍失败。", "impact": "对应商品缺模型结论。",
             "system_action": "不再自动重试。", "suggestion": "可按手册 requeue-model-transient/recover-model 处理。"})
-    # 客户价门禁(2026-09-03,R2-B 同步 fail-closed):detail 业务计数取代旧
-    # "Detail 有终态失败"黄条。RETRYING=自动重试中(黄,无需人工);
+    # 客户价门禁(2026-09-03,R2-B 同步 fail-closed;2026-09-11 单据缺席改跳过态):
+    # detail 业务计数取代旧"Detail 有终态失败"黄条。RETRYING=自动重试中(黄,无需人工);
     # MISSING/FAILED/INVALID=重试预算耗尽(红,阻塞自动审批与最终出表);
-    # MISSING_PROVEN=确定性缺席(R2-B 起同为红条阻塞,与"客户价获取失败"
-    # 并列——一个 retryable exhausted、一个 proven missing)。旧"不阻塞出表"
-    # 黄条与 finalize 门禁矛盾,已删除。
+    # MISSING_PROVEN=缺详情身份/未提供价(R2-B 起红条阻塞,与"客户价获取失败"并列);
+    # CUSTOMER_ABSENT_SKIPPED(含 legacy LOOKUP_FAILED)=客户侧权威查询成功且单据
+    # 缺席=本轮无需处理(黄"关注",不阻塞出表,无需人工)。
     cp_retrying = _cp(d, "customer_price_retrying")
     cp_missing = _cp(d, "customer_price_missing")
     cp_failed = _cp(d, "customer_price_failed")
     cp_invalid = _cp(d, "customer_price_invalid")
     cp_absent = _cp(d, "customer_price_absent_proven")
+    cp_skipped = _cp(d, "customer_absent_skipped")
     if cp_retrying:
         items.append({"level": "yellow", "tag": "自动重试", "title": "客户价获取正在自动重试",
             "problem": f"{cp_retrying} 条商品客户价获取进入业务失败,已进入 durable 自动重试。",
@@ -88,10 +89,16 @@ def _attention_items(s: Mapping, recovery_exhausted_invalid: int = 0) -> list[di
             "suggestion": "在客户价明细中查看失败行;处理上游问题后可人工 requeue 重试。"})
     if cp_absent:
         items.append({"level": "red", "tag": "需人工", "title": "客户价确定性缺失",
-            "problem": "客户导出中无该单据/无详情身份,客户价确定性缺席,自动重试无意义。",
+            "problem": "缺少详情身份或未提供客户价,客户价确定性缺席,自动重试无意义。",
             "impact": "该数据缺少价格审核基准;当前阻塞最终出表。",
             "system_action": "不再自动重试;证据已保留在客户价明细。",
-            "suggestion": "核对上游客户导出;当前无业务豁免路径,如需放行需业务显式决策。"})
+            "suggestion": "核对行内身份字段与输入价格;如需放行需业务显式决策。"})
+    if cp_skipped:
+        items.append({"level": "yellow", "tag": "关注", "title": "客户侧已无数据跳过(不阻塞)",
+            "problem": f"{cp_skipped} 条商品经客户侧权威查询确认本轮无此单据,按规则记为无需处理。",
+            "impact": "确定性单据缺席,属跳过态,不阻塞最终出表。",
+            "system_action": "已跳过,不重试;证据已保留在客户价明细。",
+            "suggestion": "无需操作;如怀疑上游客户导出遗漏,可人工核对(可选)。"})
     if r["unknown"] or c["unknown"]:
         items.append({"level": "yellow", "tag": "关注", "title": "任务提交结果待确认",
             "problem": "提交后结果未知,系统正按精确身份自动对账。",
@@ -141,9 +148,10 @@ def _stages(s: Mapping, finalized: bool, recovery_exhausted_invalid: int = 0) ->
     zs_yellow = bool(r["unknown"] or c["unknown"] or h.get("stall_detected"))
     uniq = s["counts"]["unique_items"]
     stages = []
-    # 客户价门禁(2026-09-03,R2-B 同步 fail-closed):missing/failed/invalid =
-    # 重试预算耗尽的人工阻塞;absent_proven = 确定性缺席,同样阻塞正式出表
-    # (round-2 裁定)。prep 卡必须与 hero word 同源显示异常,不得停在"进行中/完成"。
+    # 客户价门禁(2026-09-03,R2-B 同步 fail-closed;2026-09-11 单据缺席改跳过态):
+    # missing/failed/invalid = 重试预算耗尽的人工阻塞;absent_proven(缺详情身份/
+    # 未提供价,MISSING_PROVEN)同样阻塞正式出表(round-2 裁定)。
+    # customer_absent_skipped(权威查询成功且单据缺席)是非阻塞跳过态,不进入本判定。
     cp_blocking = _cp(d, "customer_price_missing") + _cp(d, "customer_price_failed") \
         + _cp(d, "customer_price_invalid") + _cp(d, "customer_price_absent_proven") > 0
     prep_bad = m["terminal"] or cp_blocking
@@ -217,7 +225,7 @@ def _final_text(s: Mapping, closeout_running: bool = False) -> tuple[str, str]:
                ("remote_unknown", "个任务提交结果待确认"), ("remote_manual", "项招商局任务需人工"),
                ("model_pending", "条模型处理未完成"), ("model_terminal", "条模型终态失败"),
                ("detail_terminal", "条客户价获取失败(重试耗尽)"),
-               ("customer_price_absent_proven", "条客户价确定性缺失(上游无此单据)"),
+               ("customer_price_absent_proven", "条客户价确定性缺失(无详情身份/未提供价)"),
                ("customer_price_invalid", "条客户价证据无效(价格与状态矛盾)"),
                ("detail_pending", "条 Detail 未完成"), ("crawl_pending", "条采集未完成"),
                ("crawl_unplanned", "条必爬行未规划"), ("crawl_planning_pending", "条必爬行待规划"),
@@ -243,13 +251,14 @@ def compute_overall_status(status: Mapping, *, recovering: int = 0,
     d, m, r, c, f = status["detail"], status["model"], status["remote"], status["crawl"], status["final"]
     prep_pending = d["pending"] + d["running"] + m["pending"] + m["running"]
     # P1-1:合法 RECOVERY_EXHAUSTED 不再计入 manual;proof 不合法的才按真实阻塞升级红。
-    # 客户价门禁(2026-09-03,R2-B 同步 fail-closed):detail terminal = 客户价
-    # 重试预算耗尽(MISSING/FAILED/INVALID),是真实人工阻塞——attention 已红
-    # "需人工",hero word 必须同源一致。missing/failed/invalid 直接入判
-    # (SUCCESS+price<=0 的 INVALID 阶段态是 SUCCESS、terminal=0,但 finalize
-    # ready 门与 NON_TOLERABLE 同样阻塞);absent_proven=确定性缺席,R2-B 起
-    # 同为阻塞。d["terminal"] 保留为防御(旧/不可解码 error_text 的 TERMINAL
-    # 行按 FAILED 覆盖)。
+    # 客户价门禁(2026-09-03,R2-B 同步 fail-closed;2026-09-11 单据缺席改跳过态):
+    # detail terminal = 客户价重试预算耗尽(MISSING/FAILED/INVALID),是真实人工阻塞
+    # ——attention 已红"需人工",hero word 必须同源一致。missing/failed/invalid
+    # 直接入判(SUCCESS+price<=0 的 INVALID 阶段态是 SUCCESS、terminal=0,但
+    # finalize ready 门与 NON_TOLERABLE 同样阻塞);absent_proven(缺详情身份/
+    # 未提供价,MISSING_PROVEN)R2-B 起同为阻塞。customer_absent_skipped(权威查询
+    # 成功且单据缺席)是非阻塞跳过态,不入判。d["terminal"] 保留为防御(旧/不可
+    # 解码 error_text 的 TERMINAL 行按 FAILED 覆盖)。
     manual_needed = any((r["manual"], c["manual"], c["unplanned"], m["terminal"], d["terminal"])) \
         or any(_cp(d, k) for k in ("customer_price_missing", "customer_price_failed",
                                    "customer_price_invalid", "customer_price_absent_proven")) \
@@ -448,16 +457,21 @@ from app.services.customer_price_semantics import (
 )
 
 # 行级分类键 → 过滤语义。R2-B 起 unacquired=尚未取得可用客户价,确定性缺席
-# (MISSING_PROVEN)同属未获取(finalize 同样被其阻塞);terminal=重试预算耗尽、
+# (MISSING_PROVEN)同属未获取;2026-09-11 起 CUSTOMER_ABSENT_SKIPPED(权威查询
+# 成功且单据缺席)是非阻塞跳过态,同样只排除 READY。terminal=重试预算耗尽、
 # 需要人工的终态。
 _CP_UNFINISHED_KEYS = ("PENDING", "RETRYING", "MISSING", "FAILED", "INVALID")
 _CP_TERMINAL_KEYS = frozenset({"MISSING", "FAILED", "INVALID"})
 _CUSTOMER_PRICE_FILTERS = ("all", "unacquired", "retrying", "terminal")
 # semantics 业务键 → 汇总桶(单一来源:customer_price_business_state)。
+# "CUSTOMER_NOT_FOUND"/"LOOKUP_FAILED" 是防御性别名:分类器对这两个 status 恒返
+# 回 key=CUSTOMER_ABSENT_SKIPPED,这两个字符串不会作为 key 出现(legacy 证据兼容)。
 _STATE_BUCKET = {
     "READY": "ready", "PENDING": "pending", "RETRYING": "retrying",
     "MISSING": "missing", "MISSING_PROVEN": "absent_proven",
     "FAILED": "failed", "INVALID": "invalid",
+    "CUSTOMER_ABSENT_SKIPPED": "absent_skipped",
+    "CUSTOMER_NOT_FOUND": "absent_skipped", "LOOKUP_FAILED": "absent_skipped",
 }
 
 
@@ -468,7 +482,7 @@ def empty_customer_price_projection(business_date: str, filter: str = "all") -> 
         "filter": filter,
         "total_required": 0,
         "counts": {"ready": 0, "pending": 0, "retrying": 0, "missing": 0,
-                   "failed": 0, "invalid": 0, "absent_proven": 0},
+                   "failed": 0, "invalid": 0, "absent_proven": 0, "absent_skipped": 0},
         "rows": [],
         "truncated": 0,
         "limit": 0,
@@ -515,7 +529,7 @@ def project_customer_price(
             snapshot_id = int(latest["id"])
         rows: list[dict] = []
         counts = {"ready": 0, "pending": 0, "retrying": 0, "missing": 0,
-                  "failed": 0, "invalid": 0, "absent_proven": 0}
+                  "failed": 0, "invalid": 0, "absent_proven": 0, "absent_skipped": 0}
         for row in con.execute(
             """SELECT m.row_ordinal, i.row_json, i.v_commodity_id, i.sku_id,
                       w.state AS detail_state, w.attempts, w.retryable,
@@ -570,7 +584,8 @@ def project_customer_price(
     finally:
         con.close()
     if filter == "unacquired":
-        # R2-B:确定性缺席(MISSING_PROVEN)同属未获取——只排除 READY。
+        # R2-B:确定性缺席(MISSING_PROVEN)同属未获取;2026-09-11:单据缺席跳过态
+        # (CUSTOMER_ABSENT_SKIPPED)同样只被"all/unacquired"看到——只排除 READY。
         selected = [r for r in rows if r["state"] != "READY"]
     elif filter == "retrying":
         selected = [r for r in rows if r["state"] == "RETRYING"]
@@ -578,9 +593,12 @@ def project_customer_price(
         selected = [r for r in rows if r["state"] in _CP_TERMINAL_KEYS]
     else:
         selected = rows
-    # 未完成在前(获取中→待重试→缺失→失败→无效),证据缺席次之,已获取最后。
+    # 未完成在前(获取中→待重试→缺失→失败→无效),证据缺席次之,单据缺席跳过
+    # 再次,已获取最后。
     order = {**{key: i for i, key in enumerate(_CP_UNFINISHED_KEYS)},
-             "MISSING_PROVEN": len(_CP_UNFINISHED_KEYS), "READY": len(_CP_UNFINISHED_KEYS) + 1}
+             "MISSING_PROVEN": len(_CP_UNFINISHED_KEYS),
+             "CUSTOMER_ABSENT_SKIPPED": len(_CP_UNFINISHED_KEYS) + 1,
+             "READY": len(_CP_UNFINISHED_KEYS) + 2}
     selected.sort(key=lambda r: order.get(r["state"], len(order)))
     truncated = max(0, len(selected) - limit) if limit else 0
     return {
@@ -604,6 +622,7 @@ _CP_SUMMARY_KEYS = (
     ("customer_price_failed", "failed"),
     ("customer_price_invalid", "invalid"),
     ("customer_price_absent_proven", "absent_proven"),
+    ("customer_absent_skipped", "absent_skipped"),
 )
 
 

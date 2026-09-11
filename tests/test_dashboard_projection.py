@@ -536,7 +536,8 @@ def _detail_terminal_day():
                    "customer_price_required": 151, "customer_price_ready": 150,
                    "customer_price_pending": 0, "customer_price_retrying": 0,
                    "customer_price_missing": 1, "customer_price_failed": 0,
-                   "customer_price_invalid": 0, "customer_price_absent_proven": 0}
+                   "customer_price_invalid": 0, "customer_price_absent_proven": 0,
+                   "customer_absent_skipped": 0}
     return s
 
 
@@ -596,9 +597,8 @@ def test_invalid_only_zero_price_success_still_turns_day_red():
 
 
 def test_absent_proven_only_turns_day_red_and_blocks():
-    """R2-B 翻转(Round-1 为黄条不阻塞):MISSING_PROVEN(证据齐全的确定性缺席)
-    与 retry 耗尽同为阻塞——hero word 推红、prep 卡显示异常、attention 独立
-    红色"客户价确定性缺失"。"""
+    """MISSING_PROVEN(缺详情身份/未提供价,非单据缺席)保持 R2-B 阻塞语义:
+    hero word 推红、prep 卡显示异常、attention 独立红色"客户价确定性缺失"。"""
     s = _cleared()
     s["detail"] = _cp_detail(customer_price_ready=148, customer_price_absent_proven=3)
     out = compute_overall_status(s)
@@ -608,6 +608,24 @@ def test_absent_proven_only_turns_day_red_and_blocks():
                and a["title"] == "客户价确定性缺失" for a in out["attention"])
     # 旧黄条(证据齐全缺席/不阻塞出表)必须彻底消失。
     assert not any(a["title"] == "部分商品客户价缺失(证据齐全)" for a in out["attention"])
+
+
+def test_customer_absent_skipped_only_is_yellow_nonblocking_and_day_not_red():
+    """2026-09-11 规则变更:customer_absent_skipped(客户侧权威查询成功且单据
+    缺席)是跳过态——仅黄色"关注"条目,不推红 hero word、不判 prep 异常、
+    computed_pending 为零时日状态保持"等待最终收口"。"""
+    s = _cleared()
+    s["detail"] = _cp_detail(customer_price_ready=148, customer_absent_skipped=3)
+    out = compute_overall_status(s)
+    assert out["word"] != "需要人工处理" and out["color"] != "red"
+    assert out["stages"][0]["state"] != "bad"
+    item = next(a for a in out["attention"] if a["title"] == "客户侧已无数据跳过(不阻塞)")
+    assert item["level"] == "yellow" and item["tag"] == "关注"
+    assert "3 条商品" in item["problem"] and "无需处理" in item["problem"]
+    assert "不阻塞最终出表" in item["impact"]
+    assert "不重试" in item["system_action"]
+    assert "无需操作" in item["suggestion"]
+    assert not any(a["level"] == "red" for a in out["attention"])
 
 
 def test_rf2_finalized_day_stays_green_with_customer_price_failure_history():
@@ -687,7 +705,7 @@ def _cp_detail(**over):
          "customer_price_pending": 0, "customer_price_retrying": 0,
          "customer_price_missing": 0, "customer_price_failed": 0,
          "customer_price_invalid": 0, "customer_price_absent_proven": 0,
-         "customer_price_ratio": 1.0}
+         "customer_absent_skipped": 0, "customer_price_ratio": 1.0}
     d.update(over)
     return d
 
@@ -737,8 +755,8 @@ def test_attention_customer_price_exhausted_failure_is_red_manual():
 
 
 def test_attention_absent_proven_is_red_blocking_and_distinct_from_exhausted():
-    """R2-B 翻转:确定性缺席是独立红条(tag 需人工),与"客户价获取失败"
-    (retry 耗尽)并列——一个 proven missing、一个 retryable exhausted。"""
+    """MISSING_PROVEN(缺详情身份/未提供价)是独立红条(tag 需人工),与"客户价
+    获取失败"(retry 耗尽)并列;单据缺席(customer_absent_skipped)则不再入此条。"""
     s = _cleared()
     s["detail"] = _cp_detail(customer_price_ready=148, customer_price_absent_proven=3)
     out = compute_overall_status(s)
@@ -747,7 +765,6 @@ def test_attention_absent_proven_is_red_blocking_and_distinct_from_exhausted():
     assert "确定性缺席" in item["problem"] and "自动重试无意义" in item["problem"]
     assert "缺少价格审核基准" in item["impact"] and "阻塞最终出表" in item["impact"]
     assert "不再自动重试" in item["system_action"] and "客户价明细" in item["system_action"]
-    assert "无业务豁免路径" in item["suggestion"] and "业务显式决策" in item["suggestion"]
     # 仅 absent_proven 时不得出现"客户价获取失败"(那是 retry 耗尽条目)。
     assert not any(a["title"] == "客户价获取失败" for a in out["attention"])
 
@@ -759,6 +776,18 @@ def test_absent_proven_and_exhausted_failures_are_two_parallel_red_items():
     out = compute_overall_status(s)
     titles = [a["title"] for a in out["attention"] if a["level"] == "red"]
     assert "客户价获取失败" in titles and "客户价确定性缺失" in titles
+
+
+def test_customer_absent_skipped_is_a_separate_nonblocking_attention_item():
+    """customer_absent_skipped 与红色阻塞条目并列展示,但保持黄色非阻塞。"""
+    s = _cleared()
+    s["detail"] = _cp_detail(customer_price_ready=147, customer_price_failed=1,
+                             customer_absent_skipped=3)
+    out = compute_overall_status(s)
+    skipped = next(a for a in out["attention"] if a["title"] == "客户侧已无数据跳过(不阻塞)")
+    assert skipped["level"] == "yellow" and skipped["tag"] == "关注"
+    assert any(a["level"] == "red" and a["title"] == "客户价获取失败"
+               for a in out["attention"])
 
 
 def test_absent_proven_lowers_customer_price_ratio_and_blocks_prep():
@@ -779,7 +808,18 @@ def test_final_text_surfaces_absent_proven_blocker():
     s["final"] = {**_cleared()["final"],
                   "blocker_summary": {"customer_price_absent_proven": 5}}
     out = compute_overall_status(s)
-    assert "5 条客户价确定性缺失(上游无此单据)" in out["final_text"]
+    assert "5 条客户价确定性缺失(无详情身份/未提供价)" in out["final_text"]
+
+
+def test_final_text_never_surfaces_customer_absent_skipped_as_blocker():
+    """customer_absent_skipped 是非阻塞跳过态,绝不进入"还不能生成最终 Excel"
+    的阻塞清单。"""
+    s = _cleared()
+    s["final"] = {**_cleared()["final"],
+                  "blocker_summary": {"customer_absent_skipped": 5}}
+    out = compute_overall_status(s)
+    assert "5 条" not in out["final_text"] or "跳过" not in out["final_text"]
+    assert "全部阻塞已清零" in out["final_text"]
 
 
 def test_final_text_surfaces_customer_price_exhausted_blocker():
@@ -821,7 +861,7 @@ def test_build_summary_customer_price_block_and_fingerprint_reacts(tmp_path, mon
     cp = out["customer_price"]
     assert cp == {"required": 151, "ready": 151, "pending": 0, "retrying": 0,
                   "missing": 0, "failed": 0, "invalid": 0, "absent_proven": 0,
-                  "ratio": 1.0}
+                  "absent_skipped": 0, "ratio": 1.0}
     assert out["overall"]["stages"][0]["sub"][-1] == ("客户价", "151/151")
     fingerprint_before = out["fingerprint"]
     state["detail"]["customer_price_failed"] = 3   # 重试耗尽的行进入业务失败

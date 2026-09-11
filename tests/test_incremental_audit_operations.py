@@ -403,6 +403,7 @@ def test_status_final_blocker_summary_decomposes_computed_pending(tmp_path):
         "customer_price_failed": 0,
         "customer_price_invalid": 0,
         "customer_price_absent_proven": 0,
+        "customer_absent_skipped": 0,
     }
     # customer_price_* keys are a deliberate business cross-cut over the same
     # detail rows, so only the technical keys must decompose the computed sum.
@@ -509,6 +510,7 @@ def test_customer_price_projection_ready_row_and_ratio(tmp_path):
     assert detail["customer_price_failed"] == 0
     assert detail["customer_price_invalid"] == 0
     assert detail["customer_price_absent_proven"] == 0
+    assert detail["customer_absent_skipped"] == 0
     assert detail["customer_price_ratio"] == 1.0
     assert status["final"]["computed_pending"] == 0
     assert status["final"]["blocker_summary"]["customer_price_missing"] == 0
@@ -597,13 +599,46 @@ def test_customer_price_projection_flags_legacy_invalid_success_as_failed(tmp_pa
     assert status["final"]["blocker_summary"]["customer_price_failed"] == 1
 
 
-def test_customer_price_projection_absent_proven_row(tmp_path):
+def test_customer_price_projection_customer_absent_skip_row(tmp_path):
+    """2026-09-11 rule change: a SUCCESS LOOKUP_FAILED row is a non-blocking
+    customer-absent skip — counted in customer_absent_skipped only, invisible
+    to every blocker view."""
     root = tmp_path / "runtime"
     _tick(root, detail=lambda _row, _timeout: {
         "customerPrice": None,
         "customerPriceStatus": "LOOKUP_FAILED",
         "customerPriceSource": "",
         "customerPriceWarning": "customer export did not contain this documentId",
+        "customerPriceEvidence": "authoritative customer snapshot round complete; documentId absent",
+    })
+
+    status = collect_runtime_status(business_date=BUSINESS_DATE, runtime_root=root)
+    detail_status = status["detail"]
+
+    assert detail_status["completed"] == 1
+    assert detail_status["customer_absent_skipped"] == 1
+    assert detail_status["customer_price_absent_proven"] == 0
+    assert detail_status["customer_price_missing"] == 0
+    assert detail_status["customer_price_ratio"] == 0
+    assert status["final"]["blocker_summary"]["customer_price_missing"] == 0
+    assert status["final"]["blocker_summary"]["customer_price_absent_proven"] == 0
+    assert status["final"]["blocker_summary"]["customer_absent_skipped"] == 1
+    assert status["final"]["computed_pending"] == 0
+    # Nothing blocks, so next_actions must not demand manual evidence review.
+    assert status["next_actions"] == [
+        "run the next finite shadow tick; run finalize at or after the 18:00 cutoff"
+    ]
+
+
+def test_customer_price_projection_proven_absent_row_still_blocks(tmp_path):
+    """MISSING_PROVEN (no detail identity) is not document absence: it stays in
+    absent_proven, computed_pending and the manual-inspection next action."""
+    root = tmp_path / "runtime"
+    _tick(root, detail=lambda _row, _timeout: {
+        "customerPrice": None,
+        "customerPriceStatus": "DETAIL_REQUEST_SKIPPED",
+        "customerPriceSource": "",
+        "customerPriceWarning": "missing documentId or fourCategoryId",
         "customerPriceEvidence": "",
     })
 
@@ -612,12 +647,14 @@ def test_customer_price_projection_absent_proven_row(tmp_path):
 
     assert detail_status["completed"] == 1
     assert detail_status["customer_price_absent_proven"] == 1
+    assert detail_status["customer_absent_skipped"] == 0
     assert detail_status["customer_price_missing"] == 0
     assert detail_status["customer_price_ratio"] == 0
     assert status["final"]["blocker_summary"]["customer_price_missing"] == 0
-    # Round-2: the absent-proven bucket is projected into the blocker summary
-    # (it blocks ordinary and force finalize via the finalize gates).
+    # The proven-absent bucket is projected into the blocker summary (it blocks
+    # ordinary and force finalize via the finalize gates).
     assert status["final"]["blocker_summary"]["customer_price_absent_proven"] == 1
+    assert status["final"]["computed_pending"] == 1
     # R2-B: the row is SUCCESS (detail.terminal==0) but provably price-less, so
     # next_actions must send the operator to the terminal/manual inspection
     # branch instead of suggesting more ticks.
@@ -675,6 +712,7 @@ def test_customer_price_pending_includes_members_without_stage_row(tmp_path):
     assert detail["customer_price_failed"] == 0
     assert detail["customer_price_invalid"] == 0
     assert detail["customer_price_absent_proven"] == 0
+    assert detail["customer_absent_skipped"] == 0
     bucket_sum = sum(
         detail[key]
         for key in (
@@ -685,6 +723,7 @@ def test_customer_price_pending_includes_members_without_stage_row(tmp_path):
             "customer_price_failed",
             "customer_price_invalid",
             "customer_price_absent_proven",
+            "customer_absent_skipped",
         )
     )
     assert bucket_sum == detail["customer_price_required"]

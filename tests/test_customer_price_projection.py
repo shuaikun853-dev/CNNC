@@ -84,7 +84,8 @@ def _seed(tmp_path: Path) -> Path:
         # 4 RETRYING: one retryable business failure, budget remains.
         _claim_and_fail(store, lease, int(work[3]["id"]),
                         encode_business_error("NOT_FOUND", "详情接口未返回有效参考价"), rounds=1)
-        # 5 MISSING_PROVEN: deterministic absence with complete evidence.
+        # 5 CUSTOMER_ABSENT_SKIPPED (legacy LOOKUP_FAILED spelling):
+        # deterministic documentId absence with complete evidence.
         _claim_and_complete(store, lease, int(work[4]["id"]), {
             "customerPrice": None, "customerPriceStatus": "LOOKUP_FAILED",
             "customerPriceSource": "",
@@ -116,11 +117,17 @@ def test_counts_buckets_sum_to_total_required(tmp_path):
     assert data["business_date"] == BUSINESS_DATE
     assert data["filter"] == "all"
     assert data["total_required"] == 8
+    # 2026-09-11: the v-absent LOOKUP_FAILED row projects into the non-blocking
+    # absent_skipped bucket instead of absent_proven.
     assert data["counts"] == {"ready": 1, "pending": 1, "retrying": 1, "missing": 1,
-                              "failed": 2, "invalid": 1, "absent_proven": 1}
+                              "failed": 2, "invalid": 1, "absent_proven": 0,
+                              "absent_skipped": 1}
     assert sum(data["counts"].values()) == data["total_required"]
     assert data["max_attempts"] == 3
     assert data["truncated"] == 0
+    absent = _by_id(data["rows"])["v-absent"]
+    assert absent["state"] == "CUSTOMER_ABSENT_SKIPPED"
+    assert absent["customer_price_status"] == "LOOKUP_FAILED"
 
 
 def test_row_fields_and_unfinished_first_ordering(tmp_path):
@@ -250,6 +257,6 @@ def test_missing_run_or_snapshot_returns_empty_structure(tmp_path):
     assert other_day["rows"] == [] and other_day["total_required"] == 0
     assert other_day["counts"] == {"ready": 0, "pending": 0, "retrying": 0,
                                    "missing": 0, "failed": 0, "invalid": 0,
-                                   "absent_proven": 0}
+                                   "absent_proven": 0, "absent_skipped": 0}
     empty = empty_customer_price_projection("2026-08-12", "terminal")
     assert empty["filter"] == "terminal" and empty["max_attempts"] == 3

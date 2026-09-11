@@ -554,7 +554,11 @@ def test_snapshot_discovery_resolves_policy_once_and_fingerprints_backend_change
     assert first.source_fingerprints != second.source_fingerprints
 
 
-def test_detail_worker_preserves_legacy_lookup_failed_branch(monkeypatch):
+def test_detail_worker_customer_absent_produces_customer_not_found(monkeypatch):
+    """2026-09-11 rule change: a row whose customer_lookup_status is NOT_FOUND
+    (the round's authoritative customer snapshot query succeeded and was
+    complete) is "nothing to process this round" — the worker returns
+    CUSTOMER_NOT_FOUND with skip evidence, and never issues a detail request."""
     calls = []
     monkeypatch.setattr(
         "app.services.incremental_audit_runtime.call_detail_api",
@@ -571,8 +575,40 @@ def test_detail_worker_preserves_legacy_lookup_failed_branch(monkeypatch):
         10,
     )
 
-    assert result["customerPriceStatus"] == "LOOKUP_FAILED"
+    assert result["customerPriceStatus"] == "CUSTOMER_NOT_FOUND"
+    assert result["customerPrice"] is None
+    assert result["customerPriceWarning"] == "customer export did not contain this documentId"
+    assert result["customerPriceEvidence"] == (
+        "authoritative customer snapshot round complete; documentId absent"
+    )
     assert calls == []
+
+
+def test_snapshot_fetch_failure_never_produces_customer_not_found_rows():
+    """Fail-closed guard for the 2026-09-11 skip rule: only a *complete*
+    authoritative customer snapshot round may declare a documentId absent.
+    A technical fetch failure (count drift -> whole round voided -> budget
+    exhaustion) propagates as a typed error, so the tick fails as a whole and
+    no joined row with customer_lookup_status=NOT_FOUND can ever be produced
+    by a broken fetch."""
+    from app.services.cnnc_saas_snapshot_adapter import (
+        SnapshotConsistencyDrift,
+        SnapshotFetchExhausted,
+    )
+
+    class DriftingAdapter:
+        cnnc_provider = None
+
+        def fetch(self, **_kwargs):
+            raise SnapshotFetchExhausted(
+                "saas", 1, 3, 5.0,
+                SnapshotConsistencyDrift("saas", "count changed during pagination"),
+            )
+
+    discover = snapshot_discoverer(DriftingAdapter())
+
+    with pytest.raises(SnapshotFetchExhausted):
+        discover(10)
 
 
 def test_finalize_publishes_frozen_scope_even_when_superseded_prefix_work_is_pending(tmp_path):

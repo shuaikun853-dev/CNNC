@@ -14,12 +14,20 @@ and the detail worker's deterministic skips):
   — the outcome is not deterministic, so the row enters durable retry and, once
   the attempt budget is exhausted, blocks finalization as MISSING (NOT_FOUND)
   or FAILED (request/parse).
-- PROVEN_ABSENT: ``LOOKUP_FAILED`` / ``DETAIL_REQUEST_SKIPPED`` /
-  ``NOT_PROVIDED`` — the row provably has no customer price today (it is not in
-  the authoritative customer export, or it has no detail identity).  Retrying
-  is meaningless; the enriched evidence still flows into review output, but the
-  row must block formal finalization (round-2 fail-closed ruling: no valid
-  price means the price-review baseline is unresolved) and never auto-APPROVE.
+- ABSENT_SKIPPED: ``CUSTOMER_NOT_FOUND`` (legacy rows: ``LOOKUP_FAILED``) — the
+  round's authoritative customer snapshot query succeeded and was complete, and
+  the documentId is provably not in the customer export.  There is nothing to
+  process this round: the row is a non-blocking skip
+  (CUSTOMER_ABSENT_SKIPPED).  Evidence is preserved, no retry happens, and the
+  row never blocks finalization (2026-09-11 business authorization).  All
+  technical failures (auth/network/HTTP/pagination/snapshot drift) keep the
+  whole tick failing and can never produce this state.
+- PROVEN_ABSENT: ``DETAIL_REQUEST_SKIPPED`` / ``NOT_PROVIDED`` — the row has no
+  detail identity or no price was provided, which is a different situation from
+  document absence.  Retrying is meaningless; the enriched evidence still flows
+  into review output, and the row still blocks formal finalization as
+  MISSING_PROVEN (round-2 fail-closed ruling: no valid price means the
+  price-review baseline is unresolved) and never auto-APPROVE.
 
 Fail-closed invariant: any SUCCESS evidence without a positive price AND a
 FOUND-family status is never READY — contradictory evidence (positive price
@@ -37,8 +45,18 @@ CUSTOMER_PRICE_FOUND_STATUSES = frozenset({"FOUND", "FOUND_SINGLE_REFERENCE", "E
 CUSTOMER_PRICE_RETRYABLE_DETAIL_STATUSES = frozenset(
     {"NOT_FOUND", "DETAIL_REQUEST_FAILED", "DETAIL_PARSE_FAILED"}
 )
+# CUSTOMER_NOT_FOUND is the "authoritative customer snapshot round complete and
+# the documentId is absent" status produced by the runtime detail worker.
+# LOOKUP_FAILED is kept for legacy durable evidence compatibility: the
+# 2026-09-11 audit proved its only producer was the same deterministic join
+# path, so historical LOOKUP_FAILED rows project into the same non-blocking
+# skip state without rewriting state databases.
+CUSTOMER_PRICE_ABSENT_SKIPPED_STATUSES = frozenset({"CUSTOMER_NOT_FOUND", "LOOKUP_FAILED"})
+# Identity missing / price not provided: a different situation from document
+# absence — the row still lacks its price-review baseline and blocks as
+# MISSING_PROVEN.
 CUSTOMER_PRICE_PROVEN_ABSENT_STATUSES = frozenset(
-    {"LOOKUP_FAILED", "DETAIL_REQUEST_SKIPPED", "NOT_PROVIDED"}
+    {"DETAIL_REQUEST_SKIPPED", "NOT_PROVIDED"}
 )
 
 # Matches TickConfig.detail_max_attempts; duplicated here only so pure
@@ -159,13 +177,15 @@ class CustomerPriceBusinessState:
     """Business classification of one row's customer-price evidence.
 
     ``key`` is one of READY / PENDING / RETRYING / MISSING / MISSING_PROVEN /
-    FAILED / INVALID.  ``blocking`` marks whether the state must block ordinary
-    finalize (only READY never blocks; round-2 ruling made MISSING_PROVEN
-    blocking because a required row without a valid price must not ship a
-    formal workbook).  ``wait_class`` tells a consumer how the row is expected
-    to move on its own: ``WAIT_WORK`` / ``WAIT_RETRY`` resolve automatically,
-    ``MANUAL_REVIEW`` rows (including proven-absent rows) need a human, and
-    ``NONE`` needs nothing.
+    FAILED / INVALID / CUSTOMER_ABSENT_SKIPPED.  ``blocking`` marks whether the
+    state must block ordinary finalize (only READY and CUSTOMER_ABSENT_SKIPPED
+    never block; round-2 ruling made MISSING_PROVEN blocking because a required
+    row whose price-review baseline is genuinely unresolved must not ship a
+    formal workbook, while a proven documentId absence is "nothing to process
+    this round" per the 2026-09-11 authorization).  ``wait_class`` tells a
+    consumer how the row is expected to move on its own: ``WAIT_WORK`` /
+    ``WAIT_RETRY`` resolve automatically, ``MANUAL_REVIEW`` rows need a human,
+    and ``NONE`` needs nothing.
     """
 
     key: str
@@ -182,6 +202,7 @@ MISSING = "MISSING"
 MISSING_PROVEN = "MISSING_PROVEN"
 FAILED = "FAILED"
 INVALID = "INVALID"
+CUSTOMER_ABSENT_SKIPPED = "CUSTOMER_ABSENT_SKIPPED"
 
 
 def _status_text(result: Mapping[str, Any] | None) -> str:
@@ -205,8 +226,11 @@ def _classify_success(result: Mapping[str, Any] | None) -> CustomerPriceBusiness
 
     A positive price alone is never success: READY requires BOTH a positive
     price AND a FOUND-family status.  Any positive price combined with a
-    failure/absence/unknown status is contradictory evidence -> INVALID.  A
-    proven-absent status with no valid price is MISSING_PROVEN (blocking, round
+    failure/absence/unknown status is contradictory evidence -> INVALID.  An
+    ABSENT_SKIPPED status with no valid price is CUSTOMER_ABSENT_SKIPPED (a
+    non-blocking skip: authoritative query succeeded, documentId absent —
+    2026-09-11 authorization).  A proven-absent status (no detail identity /
+    price not provided) with no valid price is MISSING_PROVEN (blocking, round
     2); a retryable business failure with no valid price is the legacy
     invalid-success -> FAILED.  Everything else is INVALID.
     """
@@ -218,6 +242,10 @@ def _classify_success(result: Mapping[str, Any] | None) -> CustomerPriceBusiness
         # Contradictory evidence (positive price + failed/absent/unknown
         # status) must never look like a usable price.
         return CustomerPriceBusinessState(INVALID, status, "SUCCESS", True, "MANUAL_REVIEW")
+    if status in CUSTOMER_PRICE_ABSENT_SKIPPED_STATUSES:
+        # Authoritative customer query succeeded and the documentId is absent:
+        # nothing to process this round — a non-blocking skip, not a failure.
+        return CustomerPriceBusinessState(CUSTOMER_ABSENT_SKIPPED, status, "SUCCESS", False, "NONE")
     if status in CUSTOMER_PRICE_PROVEN_ABSENT_STATUSES:
         # Deterministic absence: retrying is meaningless, but the row still
         # lacks its price-review baseline, so it blocks formal finalization
@@ -242,20 +270,21 @@ def customer_price_business_state(
     and ``error_text`` the persisted failure text.  The rule table (authoritative,
     mirrored by tests/test_customer_price_semantics.py):
 
-    ================ ============================== ============== ========
-    detail state     evidence                       key            blocking
-    ================ ============================== ============== ========
-    PENDING/CLAIMED  -                              PENDING        yes
-    RETRYABLE_FAILED -                              RETRYING       yes
-    TERMINAL_FAILED  error prefix NOT_FOUND         MISSING        yes
-    TERMINAL_FAILED  REQUEST/PARSE prefix or none   FAILED         yes
-    SUCCESS          price>0 AND FOUND-family       READY          no
-    SUCCESS          price>0 AND other status       INVALID        yes
-    SUCCESS          no price AND PROVEN_ABSENT     MISSING_PROVEN yes
-    SUCCESS          no price AND RETRYABLE (legacy) FAILED        yes
-    SUCCESS          price invalid / unknown status INVALID        yes
-    (no stage row)   -                              PENDING        yes
-    ================ ============================== ============== ========
+    ================ ============================== ======================= ========
+    detail state     evidence                       key                     blocking
+    ================ ============================== ======================= ========
+    PENDING/CLAIMED  -                              PENDING                 yes
+    RETRYABLE_FAILED -                              RETRYING                yes
+    TERMINAL_FAILED  error prefix NOT_FOUND         MISSING                 yes
+    TERMINAL_FAILED  REQUEST/PARSE prefix or none   FAILED                  yes
+    SUCCESS          price>0 AND FOUND-family       READY                   no
+    SUCCESS          price>0 AND other status       INVALID                 yes
+    SUCCESS          no price AND ABSENT_SKIPPED    CUSTOMER_ABSENT_SKIPPED no
+    SUCCESS          no price AND PROVEN_ABSENT     MISSING_PROVEN          yes
+    SUCCESS          no price AND RETRYABLE (legacy) FAILED                 yes
+    SUCCESS          price invalid / unknown status INVALID                 yes
+    (no stage row)   -                              PENDING                 yes
+    ================ ============================== ======================= ========
     """
     state = str(detail_state or "").strip().upper()
     if state == "SUCCESS":

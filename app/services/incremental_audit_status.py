@@ -49,7 +49,13 @@ def _empty_customer_price() -> dict[str, int]:
         "customer_price_missing": 0,
         "customer_price_failed": 0,
         "customer_price_invalid": 0,
+        # Dual-track absence view (2026-09-11): customer_absent_skipped counts
+        # CUSTOMER_ABSENT_SKIPPED rows (authoritative customer query succeeded,
+        # documentId absent — a non-blocking skip); customer_price_absent_proven
+        # counts only MISSING_PROVEN rows (no detail identity / price not
+        # provided, still blocking).
         "customer_price_absent_proven": 0,
+        "customer_absent_skipped": 0,
         "customer_price_success_blockers": 0,
         "customer_price_ratio": 0,
     }
@@ -101,7 +107,11 @@ def _empty_blocker_summary() -> dict[str, int]:
         "customer_price_missing": 0,
         "customer_price_failed": 0,
         "customer_price_invalid": 0,
+        # MISSING_PROVEN only (no detail identity / price not provided): still
+        # a blocker.  CUSTOMER_ABSENT_SKIPPED rows are a non-blocking skip and
+        # are reported through customer_absent_skipped instead.
         "customer_price_absent_proven": 0,
+        "customer_absent_skipped": 0,
     }
 
 
@@ -219,15 +229,18 @@ def _customer_price_summary(
     ``error_text``; the technical keys' numbers never come from here.
 
     Invariant: ready+pending+retrying+missing+failed+invalid+absent_proven
-    equals ``customer_price_required`` — a snapshot member with no DETAIL
-    stage row yet (snapshot landed, the tick has not claimed its detail work)
-    is pending exactly like ``_stage_status`` counts it, never invisible.
+    +absent_skipped equals ``customer_price_required`` — a snapshot member with
+    no DETAIL stage row yet (snapshot landed, the tick has not claimed its
+    detail work) is pending exactly like ``_stage_status`` counts it, never
+    invisible.
 
     ``customer_price_success_blockers`` counts business-blocking rows whose
     stage state is SUCCESS (INVALID / MISSING_PROVEN, plus legacy FAILED and
-    defensively MISSING).  Together with ``detail.terminal`` it is the exact
-    set finalize treats as actionable blockers, and the two sets are disjoint
-    by stage state, so adding both never double-counts.
+    defensively MISSING) — CUSTOMER_ABSENT_SKIPPED is deliberately excluded
+    (2026-09-11: a proven documentId absence is a non-blocking skip).  Together
+    with ``detail.terminal`` it is the exact set finalize treats as actionable
+    blockers, and the two sets are disjoint by stage state, so adding both
+    never double-counts.
     """
     summary = {
         "ready": 0,
@@ -237,6 +250,7 @@ def _customer_price_summary(
         "failed": 0,
         "invalid": 0,
         "absent_proven": 0,
+        "absent_skipped": 0,
         "success_blockers": 0,
     }
     rows = connection.execute(
@@ -266,6 +280,8 @@ def _customer_price_summary(
             summary["missing"] += 1
         elif state.key == "MISSING_PROVEN":
             summary["absent_proven"] += 1
+        elif state.key == "CUSTOMER_ABSENT_SKIPPED":
+            summary["absent_skipped"] += 1
         elif state.key == "FAILED":
             summary["failed"] += 1
         elif state.key == "INVALID":
@@ -289,6 +305,7 @@ def _customer_price_summary(
         "customer_price_failed": summary["failed"],
         "customer_price_invalid": summary["invalid"],
         "customer_price_absent_proven": summary["absent_proven"],
+        "customer_absent_skipped": summary["absent_skipped"],
         "customer_price_success_blockers": summary["success_blockers"],
         "customer_price_ratio": round(summary["ready"] / required, 2) if required else 0,
     }
@@ -306,8 +323,10 @@ def _next_actions(status: dict[str, Any]) -> list[str]:
         return ["run doctor, then let a later tick reconcile the exact remote identity; do not resubmit"]
     # detail terminal = 客户价重试预算耗尽(MISSING/FAILED/INVALID),与 model terminal
     # 同为"重试已耗尽、需先看失败证据"的人工检查条件;不得建议继续跑 tick 掩盖它。
-    # R2-B:absent_proven(确定性缺席)同样阻塞正式出表,这些行是 SUCCESS 态
-    # (detail.terminal==0),必须并入同一人工检查分支。
+    # R2-B:absent_proven(缺详情身份/未提供价,MISSING_PROVEN)同样阻塞正式出表,
+    # 这些行是 SUCCESS 态(detail.terminal==0),必须并入同一人工检查分支。
+    # 2026-09-11:customer_absent_skipped(权威查询成功且单据缺席)是非阻塞跳过态,
+    # 不进入本分支。
     if status["remote"]["manual"] or status["model"]["terminal"] \
             or status["crawl"]["manual"] or status["detail"]["terminal"] \
             or status["detail"].get("customer_price_absent_proven", 0):
@@ -598,6 +617,7 @@ def collect_runtime_status(
                 "customer_price_failed": detail.get("customer_price_failed", 0),
                 "customer_price_invalid": detail.get("customer_price_invalid", 0),
                 "customer_price_absent_proven": detail.get("customer_price_absent_proven", 0),
+                "customer_absent_skipped": detail.get("customer_absent_skipped", 0),
             },
         },
         "lease": {

@@ -5,6 +5,7 @@ from __future__ import annotations
 from decimal import Decimal
 
 from app.services.customer_price_semantics import (
+    CUSTOMER_PRICE_ABSENT_SKIPPED_STATUSES,
     CUSTOMER_PRICE_FOUND_STATUSES,
     CUSTOMER_PRICE_PROVEN_ABSENT_STATUSES,
     CUSTOMER_PRICE_RETRYABLE_DETAIL_STATUSES,
@@ -41,8 +42,12 @@ def test_status_families_match_the_detail_worker_vocabulary():
         "DETAIL_REQUEST_FAILED",
         "DETAIL_PARSE_FAILED",
     }
+    # 2026-09-11 rule change: documentId absence (authoritative customer query
+    # succeeded and complete) is a non-blocking skip; LOOKUP_FAILED stays in the
+    # family as legacy evidence compatibility (same deterministic join origin).
+    assert CUSTOMER_PRICE_ABSENT_SKIPPED_STATUSES == {"CUSTOMER_NOT_FOUND", "LOOKUP_FAILED"}
+    # Identity missing / price not provided keep their own proven-absent family.
     assert CUSTOMER_PRICE_PROVEN_ABSENT_STATUSES == {
-        "LOOKUP_FAILED",
         "DETAIL_REQUEST_SKIPPED",
         "NOT_PROVIDED",
     }
@@ -123,8 +128,14 @@ def test_success_with_positive_price_and_found_status_is_ready():
 
 
 def test_positive_price_with_failure_status_is_invalid_contradiction():
-    """Contradictory evidence (price=100 + failed status) is never READY."""
-    for status in sorted(CUSTOMER_PRICE_RETRYABLE_DETAIL_STATUSES | CUSTOMER_PRICE_PROVEN_ABSENT_STATUSES):
+    """Contradictory evidence (price=100 + failed status) is never READY.
+    Includes the ABSENT_SKIPPED statuses: a positive price alongside
+    "documentId absent" is contradictory, never a usable skip."""
+    for status in sorted(
+        CUSTOMER_PRICE_RETRYABLE_DETAIL_STATUSES
+        | CUSTOMER_PRICE_PROVEN_ABSENT_STATUSES
+        | CUSTOMER_PRICE_ABSENT_SKIPPED_STATUSES
+    ):
         classified = customer_price_business_state("SUCCESS", _success_result("100", status), "")
         assert classified.key == "INVALID", status
         assert classified.blocking is True
@@ -144,17 +155,41 @@ def test_success_accepts_decimal_and_numeric_string_prices():
     assert customer_price_business_state("SUCCESS", _success_result(10), "").key == "READY"
 
 
-def test_success_lookup_failed_is_missing_proven_and_blocks_finalization():
-    """Round-2 ruling: deterministic absence blocks formal finalization too."""
+def test_success_customer_not_found_without_price_is_absent_skipped_and_nonblocking():
+    """2026-09-11 business authorization: the round's authoritative customer
+    query succeeded and was complete, and the documentId is absent — nothing to
+    process this round.  The row is a non-blocking skip (never MANUAL_REVIEW,
+    never a finalize blocker)."""
+    classified = customer_price_business_state(
+        "SUCCESS",
+        _success_result(
+            None,
+            "CUSTOMER_NOT_FOUND",
+            customerPriceWarning="customer export did not contain this documentId",
+            customerPriceEvidence="authoritative customer snapshot round complete; documentId absent",
+        ),
+        "",
+    )
+    assert classified.key == "CUSTOMER_ABSENT_SKIPPED"
+    assert classified.status == "CUSTOMER_NOT_FOUND"
+    assert classified.detail_state == "SUCCESS"
+    assert classified.blocking is False
+    assert classified.wait_class == "NONE"
+
+
+def test_success_legacy_lookup_failed_without_price_is_absent_skipped_and_nonblocking():
+    """Legacy durable rows persisted LOOKUP_FAILED for the same deterministic
+    join outcome (the 2026-09-11 audit proved its only producer).  The shared
+    classifier must project them into the same non-blocking skip state."""
     classified = customer_price_business_state(
         "SUCCESS",
         _success_result(None, "LOOKUP_FAILED", customerPriceWarning="customer export did not contain this documentId"),
         "",
     )
-    assert classified.key == "MISSING_PROVEN"
+    assert classified.key == "CUSTOMER_ABSENT_SKIPPED"
     assert classified.status == "LOOKUP_FAILED"
-    assert classified.blocking is True
-    assert classified.wait_class == "MANUAL_REVIEW"
+    assert classified.blocking is False
+    assert classified.wait_class == "NONE"
 
 
 def test_success_request_skipped_and_not_provided_are_missing_proven_and_blocking():

@@ -67,18 +67,21 @@ class FinalizeReadiness:
     remote_submit_unknown: int = 0
     remote_priority_pending: int = 0
     # Additive customer-price business buckets (semantics module is the single
-    # source of truth).  missing/failed/invalid/absent_proven block ordinary
-    # finalize and are non-tolerable for force-finalize (round-2 fail-closed
-    # ruling: every required row needs a valid price; deterministic absence is
-    # evidence, not an exemption); pending duplicates detail_pending
-    # explicitly for observability.  Absent-proven rows (LOOKUP_FAILED /
-    # SKIPPED / NOT_PROVIDED with complete evidence) keep their enriched
-    # evidence for review output but never auto-APPROVE row-side.
+    # source of truth).  missing/failed/invalid block ordinary finalize and are
+    # non-tolerable for force-finalize (round-2 fail-closed ruling: every
+    # required row needs a valid price); pending duplicates detail_pending
+    # explicitly for observability.  MISSING_PROVEN rows (DETAIL_REQUEST_SKIPPED
+    # / NOT_PROVIDED: no detail identity / price not provided) still block and
+    # are counted with the missing family.  CUSTOMER_ABSENT_SKIPPED rows (the
+    # round's authoritative customer query succeeded and the documentId is
+    # absent — 2026-09-11 business authorization; legacy LOOKUP_FAILED evidence
+    # classifies identically) are a non-blocking skip: they are counted only for
+    # observability and never gate readiness.
     customer_price_pending: int = 0
     customer_price_missing: int = 0
     customer_price_failed: int = 0
     customer_price_invalid: int = 0
-    customer_price_absent_proven: int = 0
+    customer_absent_skipped: int = 0
 
     @property
     def ready(self) -> bool:
@@ -97,7 +100,6 @@ class FinalizeReadiness:
                 self.customer_price_missing,
                 self.customer_price_failed,
                 self.customer_price_invalid,
-                self.customer_price_absent_proven,
             )
         )
 
@@ -153,7 +155,6 @@ def is_recoverable_finalize_wait(readiness: FinalizeReadiness | None) -> bool:
         readiness.customer_price_missing,
         readiness.customer_price_failed,
         readiness.customer_price_invalid,
-        readiness.customer_price_absent_proven,
     ))
     return has_pending and not has_actionable_blocker
 
@@ -180,11 +181,13 @@ FORCE_FINALIZE_INCOMPLETE_TASKS_KEY = "force_finalize_incomplete_tasks"
 # Readiness buckets that force-finalize must never tolerate.  Detail/Model
 # evidence, unplanned or invalid crawl work, unknown submission outcomes,
 # manual/terminal states, and not-yet-submitted intent all stay blocking.
-# Customer-price MISSING/FAILED/INVALID/ABSENT_PROVEN block the same way
-# (round-2 fail-closed ruling): publishing a final workbook whose price-review
-# baseline is provably unresolved — including a deterministically absent price
-# — is never tolerated, and customer_price_pending is intentionally absent
-# because it is the same rows as detail_pending (already listed).
+# Customer-price MISSING/FAILED/INVALID block the same way (round-2 fail-closed
+# ruling): publishing a final workbook whose price-review baseline is provably
+# unresolved is never tolerated.  CUSTOMER_ABSENT_SKIPPED is deliberately not a
+# blocker (2026-09-11 business authorization: the authoritative customer query
+# succeeded and the documentId is absent = nothing to process this round), and
+# customer_price_pending is intentionally absent because it is the same rows as
+# detail_pending (already listed).
 NON_TOLERABLE_BLOCKERS = (
     "detail_pending",
     "detail_terminal",
@@ -205,7 +208,6 @@ NON_TOLERABLE_BLOCKERS = (
     "customer_price_missing",
     "customer_price_failed",
     "customer_price_invalid",
-    "customer_price_absent_proven",
 )
 
 
@@ -269,17 +271,23 @@ def _detail_failure(error_text: object) -> dict[str, Any]:
 
 
 def _accumulate_customer_price_state(counts: dict[str, int], state: CustomerPriceBusinessState) -> None:
-    """Fold one row's customer-price classification into readiness counters."""
+    """Fold one row's customer-price classification into readiness counters.
+
+    MISSING_PROVEN (no detail identity / price not provided) still blocks and
+    is folded into the missing family.  CUSTOMER_ABSENT_SKIPPED (authoritative
+    customer query succeeded, documentId absent) is a non-blocking skip kept
+    only for observability.
+    """
     if state.key in {"PENDING", "RETRYING"}:
         counts["customer_price_pending"] += 1
-    elif state.key == "MISSING":
+    elif state.key in {"MISSING", "MISSING_PROVEN"}:
         counts["customer_price_missing"] += 1
-    elif state.key == "MISSING_PROVEN":
-        counts["customer_price_absent_proven"] += 1
     elif state.key == "FAILED":
         counts["customer_price_failed"] += 1
     elif state.key == "INVALID":
         counts["customer_price_invalid"] += 1
+    elif state.key == "CUSTOMER_ABSENT_SKIPPED":
+        counts["customer_absent_skipped"] += 1
 
 
 def _crawl_key(row: Mapping[str, Any]) -> tuple[str, str, str]:
@@ -497,7 +505,7 @@ def build_frozen_audit_artifact(
         "customer_price_missing": 0,
         "customer_price_failed": 0,
         "customer_price_invalid": 0,
-        "customer_price_absent_proven": 0,
+        "customer_absent_skipped": 0,
     }
     relevant_remote_job_ids: set[int] = set()
     rows: list[dict[str, Any]] = []

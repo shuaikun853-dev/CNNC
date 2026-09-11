@@ -3054,7 +3054,7 @@ def test_empty_authoritative_snapshot_clears_dropped_detail_blockers(tmp_path):
     assert summary.backlog["customer_price_missing"] == 0
     assert summary.backlog["customer_price_failed"] == 0
     assert summary.backlog["customer_price_invalid"] == 0
-    assert summary.backlog["customer_price_absent_proven"] == 0
+    assert summary.backlog["customer_absent_skipped"] == 0
     assert summary.backlog["customer_price_success_blockers"] == 0
     assert summary.backlog["stage_pending"] == 0
     assert summary.outcome == "COMPLETED"
@@ -3070,12 +3070,12 @@ def test_empty_authoritative_snapshot_clears_dropped_detail_blockers(tmp_path):
     assert whole_run["customer_price_failed"] == 1
 
 
-ABSENT_PROVEN_PAYLOAD = {
+ABSENT_SKIP_PAYLOAD = {
     "customerPrice": None,
     "customerPriceStatus": "LOOKUP_FAILED",
     "customerPriceSource": "",
-    "customerPriceWarning": "上游查询失败",
-    "customerPriceEvidence": "",
+    "customerPriceWarning": "customer export did not contain this documentId",
+    "customerPriceEvidence": "authoritative customer snapshot round complete; documentId absent",
 }
 
 CONTRADICTORY_PRICE_PAYLOAD = {
@@ -3087,21 +3087,27 @@ CONTRADICTORY_PRICE_PAYLOAD = {
 }
 
 
-def test_success_absent_proven_detail_blocks_tick_as_manual_review(tmp_path):
-    """SUCCESS + proven-absent status: the row is not terminal and not
-    retrying, but finalize would refuse it — the tick must end in
-    MANUAL_REVIEW_REQUIRED, never COMPLETED."""
+@pytest.mark.parametrize("status", ["CUSTOMER_NOT_FOUND", "LOOKUP_FAILED"])
+def test_success_customer_absent_skip_is_nonblocking_tick_completes(tmp_path, status):
+    """2026-09-11 business authorization (rewritten from the R2-B manual-review
+    contract): the round's authoritative customer query succeeded and the
+    documentId is absent — a non-blocking skip.  The row is SUCCESS evidence
+    (not terminal, not retrying), the backlog shows customer_absent_skipped,
+    customer_price_success_blockers stays 0, and a day with only such rows
+    completes instead of demanding manual review.  LOOKUP_FAILED is the legacy
+    spelling of the same deterministic join outcome."""
     store = DailyAuditStore(tmp_path / "state.sqlite")
     clock = Clock()
     deps = _quiet_deps([_quiet_row("doc-1", "sku-1")])
-    deps.detail = lambda _row, _timeout: dict(ABSENT_PROVEN_PAYLOAD)
+    deps.detail = lambda _row, _timeout: {**ABSENT_SKIP_PAYLOAD, "customerPriceStatus": status}
 
     summary = run_incremental_tick(store, ProcessLock(tmp_path / "tick.lock"), _config(clock), deps)
 
-    assert summary.backlog["customer_price_absent_proven"] == 1
-    assert summary.backlog["customer_price_success_blockers"] == 1
+    assert summary.backlog["customer_absent_skipped"] == 1
+    assert summary.backlog["customer_price_success_blockers"] == 0
     assert summary.backlog["detail_terminal"] == 0
-    assert summary.outcome == "MANUAL_REVIEW_REQUIRED"
+    assert summary.outcome != "MANUAL_REVIEW_REQUIRED"
+    assert summary.outcome == "COMPLETED"
 
 
 def test_success_contradictory_price_detail_blocks_tick_as_manual_review(tmp_path):
@@ -3135,7 +3141,7 @@ def test_retryable_detail_failure_stays_pending_retry_not_manual(tmp_path):
     assert summary.backlog["customer_price_missing"] == 0
     assert summary.backlog["customer_price_failed"] == 0
     assert summary.backlog["customer_price_invalid"] == 0
-    assert summary.backlog["customer_price_absent_proven"] == 0
+    assert summary.backlog["customer_absent_skipped"] == 0
 
 
 def test_found_price_completes_without_customer_price_blockers(tmp_path):
@@ -3149,27 +3155,33 @@ def test_found_price_completes_without_customer_price_blockers(tmp_path):
     assert summary.backlog["customer_price_missing"] == 0
     assert summary.backlog["customer_price_failed"] == 0
     assert summary.backlog["customer_price_invalid"] == 0
-    assert summary.backlog["customer_price_absent_proven"] == 0
+    assert summary.backlog["customer_absent_skipped"] == 0
     assert summary.backlog["customer_price_success_blockers"] == 0
 
 
 def test_final_pending_metric_matches_status_computed_pending(tmp_path):
     """The persisted final_pending metric and the status projection must speak
-    the same language: one SUCCESS-stage absent-proven blocker is exactly one
-    unit of final pending in both views."""
+    the same language: one SUCCESS-stage blocking customer-price row (here the
+    contradictory INVALID evidence) is exactly one unit of final pending in
+    both views, while a customer-absent skip row counts as zero in both."""
     from app.services.incremental_audit_runtime import runtime_paths
     from app.services.incremental_audit_status import collect_runtime_status
 
     root = tmp_path / "runtime"
     store = DailyAuditStore(runtime_paths("2026-08-11", root).state_path)
     clock = Clock()
-    deps = _quiet_deps([_quiet_row("doc-1", "sku-1")])
-    deps.detail = lambda _row, _timeout: dict(ABSENT_PROVEN_PAYLOAD)
+    deps = _quiet_deps([_quiet_row("doc-1", "sku-1"), _quiet_row("doc-2", "sku-2")])
+    deps.detail = lambda row, _timeout: (
+        dict(CONTRADICTORY_PRICE_PAYLOAD)
+        if row.get("documentId") == "doc-1" else dict(ABSENT_SKIP_PAYLOAD)
+    )
 
     summary = run_incremental_tick(store, ProcessLock(tmp_path / "tick.lock"), _config(clock), deps)
 
     status = collect_runtime_status(business_date="2026-08-11", runtime_root=root)
     assert summary.outcome == "MANUAL_REVIEW_REQUIRED"
+    assert summary.backlog["customer_price_invalid"] == 1
+    assert summary.backlog["customer_absent_skipped"] == 1
     assert status["metrics"]["final_pending"] == 1
     assert status["final"]["computed_pending"] == 1
     assert status["final"]["computed_pending"] == status["metrics"]["final_pending"]

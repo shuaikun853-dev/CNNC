@@ -729,25 +729,51 @@ def test_valid_customer_price_keeps_finalize_ready(tmp_path):
     assert built.readiness.customer_price_missing == 0
     assert built.readiness.customer_price_failed == 0
     assert built.readiness.customer_price_invalid == 0
-    assert built.readiness.customer_price_absent_proven == 0
+    assert built.readiness.customer_absent_skipped == 0
     assert built.artifact is not None
     assert built.artifact.enriched_rows[0]["customerPrice"] is not None
     store.release_lease(token)
 
 
-@pytest.mark.parametrize("status", ["LOOKUP_FAILED", "DETAIL_REQUEST_SKIPPED", "NOT_PROVIDED"])
-def test_proven_absent_customer_price_blocks_finalize(tmp_path, status):
-    """Round-2 fail-closed ruling: a required row with no valid customer price
-    blocks formal finalization even when the absence is deterministic and
-    evidence-complete.  (Flipped from the round-1 'does not block' contract.)"""
+@pytest.mark.parametrize("status", ["CUSTOMER_NOT_FOUND", "LOOKUP_FAILED"])
+def test_customer_absent_skip_keeps_finalize_ready(tmp_path, status):
+    """2026-09-11 business authorization: the round's authoritative customer
+    query succeeded and the documentId is absent — a non-blocking skip.
+    (LOOKUP_FAILED is the legacy durable spelling of the same deterministic
+    join outcome.)  The evidence row no longer blocks ordinary finalize."""
     store, snapshot = _seed(tmp_path, rows=[_row(url="")])
-    token = store.acquire_lease("2026-08-11", "absent", 60)
+    token = store.acquire_lease("2026-08-11", "absent-skip", 60)
     item = store.ordered_snapshot_items(snapshot["id"])[0]
     _rework_detail(store, token, item["id"], result={
         "customerPrice": None,
         "customerPriceStatus": status,
         "customerPriceSource": "",
-        "customerPriceWarning": "authoritative customer export has no such document",
+        "customerPriceWarning": "customer export did not contain this documentId",
+        "customerPriceEvidence": "authoritative customer snapshot round complete; documentId absent",
+    })
+
+    built = build_frozen_audit_artifact(store, token, output_identity="daily-final-20260811")
+
+    assert built.readiness.ready is True
+    assert built.readiness.customer_absent_skipped == 1
+    assert built.readiness.customer_price_missing == 0
+    assert built.artifact is not None
+    store.release_lease(token)
+
+
+@pytest.mark.parametrize("status", ["DETAIL_REQUEST_SKIPPED", "NOT_PROVIDED"])
+def test_proven_absent_customer_price_still_blocks_finalize(tmp_path, status):
+    """Identity missing / price not provided is not document absence: the row
+    still lacks its price-review baseline and blocks formal finalization
+    (round-2 fail-closed ruling, unchanged)."""
+    store, snapshot = _seed(tmp_path, rows=[_row(url="")])
+    token = store.acquire_lease("2026-08-11", "absent-proven", 60)
+    item = store.ordered_snapshot_items(snapshot["id"])[0]
+    _rework_detail(store, token, item["id"], result={
+        "customerPrice": None,
+        "customerPriceStatus": status,
+        "customerPriceSource": "",
+        "customerPriceWarning": "missing documentId or fourCategoryId",
         "customerPriceEvidence": "",
     })
 
@@ -755,9 +781,17 @@ def test_proven_absent_customer_price_blocks_finalize(tmp_path, status):
 
     # The enriched evidence is preserved for review, but the formal final is blocked.
     assert built.readiness.ready is False
-    assert built.readiness.customer_price_absent_proven == 1
+    assert built.readiness.customer_price_missing == 1
+    assert built.readiness.customer_absent_skipped == 0
     assert built.artifact is None
     store.release_lease(token)
+
+
+def test_non_tolerable_blockers_do_not_contain_customer_absent_keys():
+    from app.workflows.incremental_price_audit_finalize import NON_TOLERABLE_BLOCKERS
+
+    assert "customer_price_absent_proven" not in NON_TOLERABLE_BLOCKERS
+    assert "customer_absent_skipped" not in NON_TOLERABLE_BLOCKERS
 
 
 def test_detail_failure_keeps_decoded_status_from_error_prefix():
@@ -792,7 +826,6 @@ def test_recoverable_finalize_wait_is_true_for_pure_pending_only():
         {"customer_price_missing": 1},
         {"customer_price_failed": 1},
         {"customer_price_invalid": 1},
-        {"customer_price_absent_proven": 1},
         {"model_terminal": 1},
         {"crawl_terminal": 1},
         {"remote_manual": 1},
@@ -802,18 +835,20 @@ def test_recoverable_finalize_wait_is_true_for_pure_pending_only():
     ],
 )
 def test_actionable_blockers_are_never_a_recoverable_wait(blocker):
-    """Any actionable blocker (including every customer_price_* bucket and
-    detail_terminal) must stop the closeout from idling as if it were only a
-    pending wait."""
+    """Any actionable blocker (including every blocking customer_price_* bucket
+    and detail_terminal) must stop the closeout from idling as if it were only
+    a pending wait."""
     from app.workflows.incremental_price_audit_finalize import FinalizeReadiness, is_recoverable_finalize_wait
 
     readiness = FinalizeReadiness(detail_pending=1, **blocker)
     assert is_recoverable_finalize_wait(readiness) is False
 
 
-def test_absent_proven_alone_is_an_actionable_blocker_not_a_wait():
-    """Even without pending work, absent_proven must read as not-recoverable:
-    the closeout must not idle-wait on a gate only a human can resolve."""
+def test_customer_absent_skip_is_never_an_actionable_blocker():
+    """2026-09-11 rule change: customer_absent_skipped is a non-blocking skip.
+    A day whose only customer-price evidence is skipped rows is finalizable,
+    and skipped rows never stop pending work from being a recoverable wait."""
     from app.workflows.incremental_price_audit_finalize import FinalizeReadiness, is_recoverable_finalize_wait
 
-    assert is_recoverable_finalize_wait(FinalizeReadiness(customer_price_absent_proven=1)) is False
+    assert FinalizeReadiness(customer_absent_skipped=3).ready is True
+    assert is_recoverable_finalize_wait(FinalizeReadiness(detail_pending=1, customer_absent_skipped=3)) is True

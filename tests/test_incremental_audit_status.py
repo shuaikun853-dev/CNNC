@@ -23,12 +23,12 @@ FOUND_PAYLOAD = {
     "customerPriceEvidence": "参考价1=10",
 }
 
-ABSENT_PROVEN_PAYLOAD = {
+ABSENT_SKIP_PAYLOAD = {
     "customerPrice": None,
     "customerPriceStatus": "LOOKUP_FAILED",
     "customerPriceSource": "",
-    "customerPriceWarning": "上游查询失败",
-    "customerPriceEvidence": "",
+    "customerPriceWarning": "customer export did not contain this documentId",
+    "customerPriceEvidence": "authoritative customer snapshot round complete; documentId absent",
 }
 
 CONTRADICTORY_PRICE_PAYLOAD = {
@@ -117,22 +117,47 @@ def _complete_model(store: DailyAuditStore, item_id: int) -> None:
         store.release_lease(token)
 
 
-def test_success_absent_proven_counts_into_computed_pending(tmp_path):
+def test_success_customer_absent_skip_counts_as_nonblocking_skip(tmp_path):
+    """2026-09-11 rule change: a SUCCESS LOOKUP_FAILED row (legacy spelling of
+    the deterministic documentId absence) projects into customer_absent_skipped
+    and never into the blocker views."""
     root = tmp_path / "runtime"
     store = _store(root)
     store.ensure_run(BUSINESS_DATE)
     snapshot = _seed_snapshot(store, [_row()], "2026-08-11T09:00:00+00:00")
     item = _item_id(store, snapshot["id"], "doc-1")
-    _complete_detail(store, item, ABSENT_PROVEN_PAYLOAD)
+    _complete_detail(store, item, ABSENT_SKIP_PAYLOAD)
+    _complete_model(store, item)
+
+    status = collect_runtime_status(business_date=BUSINESS_DATE, runtime_root=root)
+
+    assert status["detail"]["terminal"] == 0
+    assert status["detail"]["customer_absent_skipped"] == 1
+    assert status["detail"]["customer_price_absent_proven"] == 0
+    assert status["detail"]["customer_price_success_blockers"] == 0
+    assert status["final"]["blocker_summary"]["customer_absent_skipped"] == 1
+    assert status["final"]["blocker_summary"]["customer_price_absent_proven"] == 0
+    assert status["final"]["computed_pending"] == 0
+
+
+def test_success_proven_absent_counts_into_computed_pending(tmp_path):
+    """MISSING_PROVEN (no detail identity / price not provided) still blocks:
+    it stays in absent_proven, success_blockers and computed_pending."""
+    root = tmp_path / "runtime"
+    store = _store(root)
+    store.ensure_run(BUSINESS_DATE)
+    snapshot = _seed_snapshot(store, [_row()], "2026-08-11T09:00:00+00:00")
+    item = _item_id(store, snapshot["id"], "doc-1")
+    _complete_detail(store, item, {**ABSENT_SKIP_PAYLOAD, "customerPriceStatus": "DETAIL_REQUEST_SKIPPED"})
     _complete_model(store, item)
 
     status = collect_runtime_status(business_date=BUSINESS_DATE, runtime_root=root)
 
     assert status["detail"]["terminal"] == 0
     assert status["detail"]["customer_price_absent_proven"] == 1
+    assert status["detail"]["customer_absent_skipped"] == 0
     assert status["detail"]["customer_price_success_blockers"] == 1
     assert status["final"]["blocker_summary"]["customer_price_absent_proven"] == 1
-    # The SUCCESS-stage blocker must be visible: computed_pending is 1, not 0.
     assert status["final"]["computed_pending"] == 1
 
 
@@ -213,6 +238,7 @@ def test_empty_latest_snapshot_is_not_polluted_by_dropped_history(tmp_path):
         "customer_price_failed",
         "customer_price_invalid",
         "customer_price_absent_proven",
+        "customer_absent_skipped",
         "customer_price_success_blockers",
     ):
         assert status["detail"][key] == 0
