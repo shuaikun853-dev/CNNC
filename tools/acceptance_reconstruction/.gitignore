@@ -1,0 +1,6 @@
+__pycache__/
+.pytest_cache/
+v/
+CACHEDIR.TAG
+.tmp_xlsx/
+config.local.json

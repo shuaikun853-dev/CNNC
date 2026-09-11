@@ -1,0 +1,23 @@
+{
+  "_comment": "验收回溯重建管线配置示例。复制为 config.local.json 并填入本机真实路径。config.local.json 含本机路径与业务文件位置，禁止提交到 Git。",
+  "workdir": "D:\\path\\to\\_acceptance_reconstruction_YYYYMMDD",
+  "temp_dir": "D:\\path\\to\\_acceptance_reconstruction_YYYYMMDD\\temp",
+  "final_authority": "<最终验收交付表 xlsx 绝对路径（不可修改）>",
+  "final_authority_equiv": "<等价重存副本路径，仅校验>",
+  "final_authority_orig": "<原始交付字节副本路径，仅校验>",
+  "p25_pool": "<平台匹配候选池 xlsx（标准商品编码+匹配商城/SKU/标题/链接/价格）>",
+  "s3_flags": "<补采批同款=是 + 去极值/一物多码标志 xlsx>",
+  "s3_raw": "<同上未打标志版>",
+  "drop80": "<偏离超80剔除清单 xlsx>",
+  "drop_new": "<新增剔除明细 xlsx>",
+  "dify_recheck": "<同款再校验模型结果 xlsx>",
+  "recall_csv": "<召回明细全量 csv（duckdb 直读，勿复制）>",
+  "comment_index_parquet": "<评论索引 parquet>",
+  "delivery_coverage_parquet": "<交付行评论覆盖 parquet>",
+  "power_match_parquet": "<幂次子集评论匹配 parquet>",
+  "delivery_0825_parquet": "<FINAL 已归一化 parquet（交叉校验用）>",
+  "zs_result": "<最新爬取评论 xlsx>",
+  "algo_src": "<cnnc_price_algorithms_review_v1/src/cnnc_price_algorithms.py>",
+  "libs_dir": "<含 duckdb/polars/pyarrow wheel 的本地 libs 目录（无则置空字符串并自装）>",
+  "inventory_round1_csv": "<第一轮元数据盘点 csv>"
+}
