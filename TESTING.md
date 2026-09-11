@@ -70,6 +70,8 @@ python -m pytest tests\test_customer_reference_links.py tests\test_customer_prew
 python -m pytest tests\test_staples_prewarm.py -q
 # Issue #10×#11 集成契约:候选归属与 dispatcher 隔离/CACHE_HIT 终态/旧 schema additive 迁移保行/plan-only 双零写/同 DB 共存不互污染/STEP1 隔离
 python -m pytest tests\test_customer_prewarm_integration.py -q
+# Refresh v2 合并树交叉契约(Case H-K):客户缺席×prewarm intake 共存/intake 失败不破坏缺席收口/快照技术失败 fail-closed 不变缺席跳过/prewarm 在场时 finalize 投影 1:1 对齐
+python -m pytest tests\test_refresh_v2_cross_contract.py -q
 ```
 历史 fixture 缺失时，最后一项会 skip；不得用生产接口补齐它。
 ### Dashboard 测试（只读看板）
