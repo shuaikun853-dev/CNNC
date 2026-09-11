@@ -426,6 +426,42 @@ class CnncSaasSnapshotAdapter:
             source_label=source_label,
         )
 
+    def fetch_customer_documents(
+        self,
+        *,
+        max_elapsed_seconds: float | None = None,
+    ) -> AuthoritativeSnapshot:
+        """Customer-side-only read for the prewarm scanner recovery (Issue #9).
+
+        Same frozen scope validation and the same customer pagination/retry/drift
+        machinery as fetch(); only the SaaS side is skipped so the per-minute
+        sidecar never repeats the heavy SaaS query work.
+        """
+        if max_elapsed_seconds is not None:
+            try:
+                max_elapsed_seconds = float(max_elapsed_seconds)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("max_elapsed_seconds must be positive and finite") from exc
+            if not math.isfinite(max_elapsed_seconds) or max_elapsed_seconds <= 0:
+                raise ValueError("max_elapsed_seconds must be positive and finite")
+        _saas_body, customer_body = self._validate_scope()
+        started_at = self._monotonic()
+        deadline = started_at + min(
+            self.policy.max_elapsed_seconds,
+            max_elapsed_seconds or self.policy.max_elapsed_seconds,
+        )
+        customer_rows, customer_count, customer_pages = self._fetch_side(
+            "customer", self._customer_config, customer_body, deadline, started_at
+        )
+        return AuthoritativeSnapshot(
+            observed_at_utc=datetime.now(timezone.utc),
+            saas_rows=(),
+            customer_rows=customer_rows,
+            saas_count=0,
+            customer_count=customer_count,
+            page_evidence=customer_pages,
+        )
+
 
 def snapshot_to_json_payloads(snapshot: AuthoritativeSnapshot) -> tuple[dict[str, Any], dict[str, Any]]:
     """Return legacy-compatible JSON payloads without changing row order or multiplicity."""
