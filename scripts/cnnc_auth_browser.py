@@ -27,7 +27,12 @@
              还原导致启动即误判登录成功、窗口秒关（TGC 出现只可能来自
              本次真人登录新签发）；检测到 SSO 根凭证 TGC 后只把 5 个
              SSO 会话白名单 cookie 导出到 data/cnnc_auth_storage_state.json
-             （登录成功的会话仍经 storage_state 持久化）
+             （登录成功的会话仍经 storage_state 持久化）。支持 SSO 登录
+             表单账号密码自动填充：凭证文件 data/
+             cnnc_login_credentials.json（已被 .gitignore 忽略）存在且
+             auto_fill_enabled 非 false 时，自动把账号/密码填入登录表单
+             （含 iframe 场景，只填空字段、不点击不提交），人只做滑块/
+             短信验证与提交；文件缺失则保持纯手动输入
     harvest  用已保存会话只注入 5 个 SSO 会话 cookie（全量注入含陈旧 K5 等
              WAF cookie 会让门户首页卡在 412 挑战循环；WAF 空状态挑战自算
              反而秒过），从门户首页 https://sso.cnncecp.com/ 进入，自动跟随
@@ -74,6 +79,12 @@ import time
 import urllib.request
 import uuid
 from pathlib import Path
+
+# 登录表单自动填充深模块（限速/幂等/精确 Origin 门禁内聚在 autofiller.tick）
+try:  # 兼容两种入口：作为 scripts.* 包导入（pytest）与直接脚本执行
+    from scripts.cnnc_login_autofill import create_login_autofiller
+except ImportError:  # 直接 python scripts/cnnc_auth_browser.py 时的 sys.path[0]=scripts
+    from cnnc_login_autofill import create_login_autofiller
 
 # ROOT = 本脚本所在目录（scripts/）的上一级，即 cnnc-ops-agent/
 ROOT = Path(__file__).resolve().parent.parent
@@ -347,6 +358,11 @@ def cmd_login(args):
             return 1
         deadline = time.time() + LOGIN_TIMEOUT_SEC
         cookie_err_count = 0
+        # 登录表单自动填充（主线程内联，零线程）：循环外创建一次；凭证缺失
+        # 时 create_login_autofiller 打一行 AUTO_FILL_OFF 并返回 None，保持
+        # 原有纯手动行为。限速/幂等/精确 Origin 门禁/异常吞噬全部内聚在
+        # autofiller.tick 内。TGC 检测到后自然退出循环即停止填充。
+        autofiller = create_login_autofiller()
         while time.time() < deadline:
             try:
                 # 注意：CDP 接管的浏览器上，带 URL 过滤的 ctx.cookies(url)
@@ -383,6 +399,10 @@ def cmd_login(args):
                     "%s(len=%d)" % (c["name"], len(c.get("value") or ""))
                     for c in cnn))
                 return 0
+            # 登录表单自动填充：限速尝试（不点击不提交；异常已在内
+            # 部吞掉，绝不影响下面的 TGC 轮询节奏）
+            if autofiller is not None:
+                autofiller.tick(ctx)
             time.sleep(2)
         print("LOGIN_TIMEOUT：请人工完成登录后重试", file=sys.stderr)
         return 3

@@ -6,6 +6,7 @@ _guard_operator_action(Host/Origin/X-Dashboard-Action-Token),绝无轮询触写�
 """
 from __future__ import annotations
 
+import json
 import os
 import re
 import secrets
@@ -35,6 +36,12 @@ from app.services.dashboard_projection import (
 from app.services.incremental_audit_runtime import runtime_paths
 from app.services.production_identity import get_production_identity_service
 from app.services.saas_flow_diagnostic import get_saas_flow_diagnostic
+# 常量单源（2026-09-10）:认证维护锁/cURL 结果工件路径由 scripts.cnnc_auth_refresh
+# 定义,dashboard 只读引用并在下方绑定为模块常量(测试可 monkeypatch 注入 tmp)。
+from scripts.cnnc_auth_refresh import (
+    AUTH_MAINTENANCE_LOCK_PATH,
+    CURL_REFRESH_RESULT_PATH,
+)
 
 router = APIRouter(prefix="/dashboard", tags=["step1-dashboard"])
 _STATIC_DIR = Path(__file__).resolve().parent / "static" / "dashboard"
@@ -419,12 +426,40 @@ def dashboard_job_refresh_progress(
 
 
 # ======================================================================
-# CNNC 认证:只读状态 + 受控本地登录浏览器启动
+# CNNC 认证:只读状态 + 受控本地登录浏览器启动 + 手动 cURL 刷新
 # ======================================================================
 
 _CNNC_LOGIN_THROTTLE_SECONDS = 60.0
 # 进程内单例节流:60 秒内只允许启动一次登录浏览器(monotonic 时间戳)。
 _cnnc_login_launched_at: float | None = None
+# 手动 cURL 刷新的独立 60 秒节流计时(与 login 节流互不影响)。
+_cnnc_curl_refresh_launched_at: float | None = None
+# 手动恢复结果工件(scripts/cnnc_auth_refresh.py --login-and-recover 写入);
+# status 路由只读合并进 payload.last_manual_recovery,模块常量供测试注入。
+_CNNC_RECOVERY_RESULT_PATH = _ROOT_DIR / "data" / "cnnc_login_recovery_result.json"
+# cURL 刷新结果工件/认证维护锁路径:常量单源自 scripts.cnnc_auth_refresh,
+# 绑定为模块常量供测试 monkeypatch 注入 tmp(绝不触碰真实 data/)。
+_CURL_REFRESH_RESULT_PATH = CURL_REFRESH_RESULT_PATH
+_AUTH_MAINTENANCE_LOCK_PATH = AUTH_MAINTENANCE_LOCK_PATH
+
+
+def _load_result_artifact(path) -> dict | None:
+    """只读加载结果工件 JSON;缺文件/坏 JSON/顶层非对象一律返回 None。"""
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _load_manual_recovery_result() -> dict | None:
+    """只读加载手动恢复结果工件(scripts --login-and-recover 写入)。"""
+    return _load_result_artifact(_CNNC_RECOVERY_RESULT_PATH)
+
+
+def _load_curl_refresh_result() -> dict | None:
+    """只读加载 cURL 刷新结果工件(scripts --refresh-curl 写入)。"""
+    return _load_result_artifact(_CURL_REFRESH_RESULT_PATH)
 
 
 @router.get("/api/cnnc-auth/status")
@@ -438,6 +473,12 @@ def dashboard_cnnc_auth_status() -> JSONResponse:
             "error_code": "CNNC_AUTH_STATUS_READ_FAILED",
             "message": "CNNC 认证状态读取失败,请稍后重试",
             "type": type(exc).__name__}) from exc
+    recovery = _load_manual_recovery_result()
+    if recovery is not None:
+        payload["last_manual_recovery"] = recovery
+    curl_refresh = _load_curl_refresh_result()
+    if curl_refresh is not None:
+        payload["last_curl_refresh"] = curl_refresh
     return JSONResponse(payload, headers=_NO_STORE)
 
 
@@ -450,6 +491,27 @@ def dashboard_cnnc_auth_login(request: Request) -> JSONResponse:
     review Finding 3 修复),本端点只负责 detached 拉起并立即返回。
     """
     _guard_operator_action(request, "cnnc-auth-login")
+    # 跨进程 single-flight（2026-09-10 Blocker 3）：真实 --login-and-recover
+    # 进程仍持 OS 锁时直接 409（检查优先于 60 秒节流——节流会随服务重启/时间
+    # 流逝失效，OS 锁不会），绝不叠加拉起第二个恢复进程。inspect 只探活不改
+    # 变运行状态；stale 残留（锁文件在、锁未被持有）不影响启动。锁路径经
+    # scripts.cnnc_auth_refresh 模块属性解析，测试可注入 tmp。
+    from app.services.daily_audit_store import ProcessLock
+    from scripts.cnnc_auth_refresh import LOGIN_RECOVERY_LOCK_PATH
+    lock_info = ProcessLock.inspect(LOGIN_RECOVERY_LOCK_PATH)
+    if lock_info["active"]:
+        # 持有者语义区分文案（owner metadata command 可读回）:cURL 刷新持有
+        # → 维护提示;login-and-recover/其他 → 原登录窗口提示。error_code
+        # 保持 CNNC_LOGIN_ALREADY_RUNNING 兼容（既有前端/测试不破）。
+        if str(lock_info.get("command") or "") == "curl-refresh":
+            busy_text = "CNNC 认证维护正在进行（cURL 刷新），请先完成当前操作"
+        else:
+            busy_text = "重新登录流程已经在进行中，请完成当前登录窗口"
+        return JSONResponse(
+            {"error": busy_text,
+             "error_code": "CNNC_LOGIN_ALREADY_RUNNING",
+             "status_name": "CNNC_LOGIN_ALREADY_RUNNING"},
+            status_code=409, headers=_NO_STORE)
     global _cnnc_login_launched_at
     now = time.monotonic()
     if _cnnc_login_launched_at is not None and \
@@ -475,6 +537,54 @@ def dashboard_cnnc_auth_login(request: Request) -> JSONResponse:
     return JSONResponse(
         {"started": True,
          "note": "登录浏览器已启动；完成滑块/短信后系统将自动续签并恢复（无需其他操作）"},
+        status_code=202, headers=_NO_STORE)
+
+
+@router.post("/api/cnnc-auth/refresh-curl")
+def dashboard_cnnc_auth_refresh_curl(request: Request) -> JSONResponse:
+    """手动强制刷新认证并同步 cURL（detached 拉起 --refresh-curl）。
+
+    载荷为 scripts/cnnc_auth_refresh.py --refresh-curl:force 刷新 + 严格
+    cURL 后置核验 + 结果工件（status 路由透传 last_curl_refresh）。守卫
+    齐备 + 认证维护锁先检互斥（与 login 双向,零 Popen 拒绝,检查优先于
+    节流）+ 60 秒独立进程内节流;结构性无任何 closeout/finalized 状态
+    检查——手工刷新不受收口限制。本端点只负责 detached 拉起并立即返回。
+    """
+    _guard_operator_action(request, "cnnc-auth-refresh-curl")
+    # 跨进程 single-flight:认证维护锁被任何持有者（login-and-recover/
+    # curl-refresh）占用时直接 409,绝不叠加第二个认证维护进程。
+    from app.services.daily_audit_store import ProcessLock
+    if ProcessLock.inspect(_AUTH_MAINTENANCE_LOCK_PATH)["active"]:
+        return JSONResponse(
+            {"error": "CNNC 认证维护正在进行，请先完成当前操作",
+             "error_code": "AUTH_MAINTENANCE_BUSY",
+             "status_name": "AUTH_MAINTENANCE_BUSY"},
+            status_code=409, headers=_NO_STORE)
+    global _cnnc_curl_refresh_launched_at
+    now = time.monotonic()
+    if _cnnc_curl_refresh_launched_at is not None and \
+            now - _cnnc_curl_refresh_launched_at < _CNNC_LOGIN_THROTTLE_SECONDS:
+        return JSONResponse(
+            {"error": "cURL 刷新已在启动中（60 秒内），请稍候"}, status_code=429,
+            headers=_NO_STORE)
+    popen_kwargs: dict = {}
+    if os.name == "nt":  # Windows:脱离本服务进程,不随 dashboard 重启被杀
+        popen_kwargs["creationflags"] = (
+            subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP)
+    try:
+        subprocess.Popen(
+            [sys.executable, str(_ROOT_DIR / "scripts" / "cnnc_auth_refresh.py"),
+             "--refresh-curl"],
+            cwd=str(_ROOT_DIR), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            **popen_kwargs)
+    except OSError as exc:  # FileNotFoundError 等:简讯返回,不暴露堆栈
+        raise HTTPException(status_code=500, detail={
+            "error_code": "CNNC_CURL_REFRESH_LAUNCH_FAILED",
+            "message": "cURL 刷新启动失败,请稍后重试"}) from exc
+    _cnnc_curl_refresh_launched_at = now
+    return JSONResponse(
+        {"started": True,
+         "note": "正在强制刷新认证并同步 cURL，完成后此处显示结果"},
         status_code=202, headers=_NO_STORE)
 
 

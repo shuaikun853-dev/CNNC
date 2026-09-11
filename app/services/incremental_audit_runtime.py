@@ -109,6 +109,7 @@ from app.workflows.incremental_price_audit_finalize import (
     materialize_frozen_review,
     materialize_forced_frozen_daily_run,
 )
+from scripts import cnnc_auth_refresh
 from scripts.audit_saas_excel_file import call_detail_api
 from scripts.auth_manager import AuthManager, _payload_is_auth_failure
 from scripts.cnnc_auth_core import AT_COOKIE_RE, CnncAuthProvider
@@ -2039,6 +2040,25 @@ def run_runtime_command(
         production_lock.release()
 
 
+def _ensure_runtime_daily_curl_fresh(deps, day: str) -> None:
+    """每日 cURL freshness guard（2026-09-10）：tick/finalize/closeout（真正
+    抓 CNNC customer 侧快照的命令）在进入引擎前确认为当日 cURL 已同步。
+    判定只读 results 工件、与 closeout/finalize 状态解耦；任何状态都只打一
+    行日志并放行——busy/SSO/部分失败交给既有 lazy refresh 401 兜底语义，
+    guard 绝不 raise、绝不自动弹登录。经模块属性引用（而非 from-import 函
+    数名），测试可 monkeypatch 注入。closeout 与 tick/finalize 在命令分发前
+    统一执行一次，其内部多个 incremental pass 因此不重复触发。
+    """
+    try:
+        guard_status = cnnc_auth_refresh.ensure_daily_curl_fresh(
+            business_date=day,
+            provider=getattr(deps, "cnnc_provider", None),
+        )
+    except Exception:  # noqa: BLE001 — guard 绝不影响命令执行
+        guard_status = "DAILY_CURL_GUARD_ERROR"
+    print("daily-curl-guard: %s" % guard_status)
+
+
 def _run_runtime_command_locked(
     command: str,
     *,
@@ -2103,6 +2123,11 @@ def _run_runtime_command_locked(
             paths=paths,
             business_date=day,
         )
+    # 每日 cURL freshness guard：tick/finalize/closeout 统一在命令分发前执行
+    # 一次（deps 构建后紧邻处）；closeout 内部的多个 incremental pass 由此不
+    # 再重复触发。drain-only/harvest-only 只收既有远端任务，语义保持不触发。
+    if command in {"tick", "finalize", "closeout"}:
+        _ensure_runtime_daily_curl_fresh(deps, day)
     if deps.submit_crawl is not None and deps.submit_gate is None:
         # Durable remote-stall breaker: while recent SQLite evidence shows the
         # remote is not materializing subtasks, this tick must not create any

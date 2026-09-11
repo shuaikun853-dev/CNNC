@@ -1074,6 +1074,8 @@
 
     const cnncLoginBtn = $("#cnnc-auth-login");
     if (cnncLoginBtn) cnncLoginBtn.addEventListener("click", cnncAuthLogin);
+    const cnncRefreshCurlBtn = $("#cnnc-auth-refresh-curl");
+    if (cnncRefreshCurlBtn) cnncRefreshCurlBtn.addEventListener("click", cnncRefreshCurl);
   }
   function renderTech(status) {
     $("#tech pre").textContent = JSON.stringify(status, null, 2);
@@ -1333,19 +1335,81 @@
   function cnncStatusText(p) {
     return CNNC_STATUS_LABELS[p.status] || ("异常：" + p.status);
   }
+  // 纯函数 seam(离线单测,不触碰 DOM):登录区视图模型。
+  // manualRecoveryText 由 last_manual_recovery 工件(后端 /api/cnnc-auth/status
+  // 原样透传)生成非敏感文案:只含时间(HH:mm 上海)、outcome、cURL 计数与
+  // 失败文件名——绝不含 at_redacted/路径/任何凭证形态;无该字段返回 ""。
+  // curlRefreshText 同理,来自 last_curl_refresh 工件(--refresh-curl 写入);
+  // SSO_LOGIN_REQUIRED → 明确提示需重新登录;无该字段返回 ""。
+  function cnncAuthView(p) {
+    const r = p && p.last_manual_recovery;
+    let manualRecoveryText = "";
+    if (r && typeof r === "object") {
+      const bits = ["上次手动刷新"];
+      const t = fmtShanghaiDateTime(r.completed_at);
+      if (t !== "—") bits.push(t.slice(11, 16));
+      bits.push(String(r.outcome || "UNKNOWN"));
+      const expected = Number(r.curl_expected);
+      const synced = Number(r.curl_synced);
+      if (Number.isFinite(expected) && Number.isFinite(synced)) {
+        bits.push("cURL " + synced + "/" + expected);
+      }
+      const failed = Array.isArray(r.curl_failed_files)
+        ? r.curl_failed_files.filter((f) => f) : [];
+      if (failed.length) bits.push("失败: " + failed.join(","));
+      manualRecoveryText = bits.join(" · ");
+    }
+    const c = p && p.last_curl_refresh;
+    let curlRefreshText = "";
+    if (c && typeof c === "object") {
+      const bits = ["上次 cURL 刷新"];
+      const t = fmtShanghaiDateTime(c.completed_at);
+      if (t !== "—") bits.push(t.slice(11, 16));
+      if (String(c.outcome) === "SSO_LOGIN_REQUIRED") {
+        bits.push("cURL 刷新需要重新登录");
+      } else {
+        bits.push(String(c.outcome || "UNKNOWN"));
+        const expected = Number(c.curl_expected);
+        const synced = Number(c.curl_synced);
+        if (Number.isFinite(expected) && Number.isFinite(synced)) {
+          bits.push("cURL " + synced + "/" + expected);
+        }
+        const failed = Array.isArray(c.curl_failed_files)
+          ? c.curl_failed_files.filter((f) => f) : [];
+        if (failed.length) bits.push("失败: " + failed.join(","));
+      }
+      curlRefreshText = bits.join(" · ");
+    }
+    return {
+      statusText: cnncStatusText(p || {}),
+      autoExpand: Boolean(p && p.login_required),
+      manualRecoveryText,
+      curlRefreshText,
+    };
+  }
   function renderCnncAuth(p) {
     const chips = $("#cnnc-auth-chips");
     if (!chips) return;
-    const parts = ["状态 " + cnncStatusText(p)];
+    const view = cnncAuthView(p);
+    const parts = ["状态 " + view.statusText];
     const refreshedAt = new Date(p.last_refresh_at || "").getTime();
     if (!Number.isNaN(refreshedAt) && p.last_refresh_at) {
       parts.push("最后刷新 " + fmtAgoAt(p.last_refresh_at, Date.now()));
     }
     chips.textContent = parts.join(" · ");
     const meta = $("#cnnc-auth-meta");
-    if (meta) meta.textContent = p.last_error ? "最近错误：" + p.last_error : "";
-    const btn = $("#cnnc-auth-login");
-    if (btn) btn.style.display = p.login_required ? "" : "none";
+    if (meta) {
+      const metaBits = [];
+      if (view.manualRecoveryText) metaBits.push(view.manualRecoveryText);
+      if (view.curlRefreshText) metaBits.push(view.curlRefreshText);
+      if (p.last_error) metaBits.push("最近错误：" + p.last_error);
+      meta.textContent = metaBits.join(" ｜ ");
+    }
+    // 重新登录入口常驻(2026-09-10):login_required 只决定警告与自动展开,
+    // 不决定按钮存在性——认证正常也可主动点。details 只开不关:正常状态
+    // 绝不强制展开/收起,不重置用户操作。
+    const d = $("#cnnc-auth");
+    if (d && view.autoExpand && !d.open) d.open = true;
   }
   // Bug2B:fetch 必须有超时——永久 pending 的响应曾让 inFlight 永真、轮询链死亡。
   // fetcher 做成可注入 factory(tests/js 用 fake clock 驱动超时行为),失败文案逐字保留。
@@ -1387,6 +1451,20 @@
     intervalMs: CNNC_POLL_INTERVAL_MS,
   });
 
+  // 重登 notice 三态文案（纯函数,Blocker 3 2026-09-10）:409 跨进程恢复锁被
+  // 持有(后端 body 平铺 error_code 经 createActionClient 后 code 退化为
+  // HTTP_409,故 status/code 双判)/429 60 秒节流/其他失败(code 优先,兜底
+  // HTTP status,与既有通用文案同形)。
+  function cnncLoginNoticeText(error) {
+    if (error && (error.status === 409 || error.code === "CNNC_LOGIN_ALREADY_RUNNING")) {
+      return "重新登录流程已经在进行中，请完成当前登录窗口";
+    }
+    if (error && error.status === 429) {
+      return "登录浏览器已在启动中（60 秒内），请稍候。";
+    }
+    return "登录请求失败：" + ((error && error.code) || ("HTTP " + (error && error.status)));
+  }
+
   async function cnncAuthLogin() {
     const btn = $("#cnnc-auth-login");
     const notice = $("#cnnc-auth-notice");
@@ -1398,9 +1476,7 @@
     try {
       const res = await client.refresh("/dashboard/api/cnnc-auth/login", {});
       if (res.error) {
-        if (notice) notice.textContent = res.error.status === 429
-          ? "登录浏览器已在启动中（60 秒内），请稍候。"
-          : "登录请求失败：" + (res.error.code || "HTTP " + res.error.status);
+        if (notice) notice.textContent = cnncLoginNoticeText(res.error);
         return;
       }
       if (notice) notice.textContent = (res && res.note) || "登录浏览器已启动，完成滑块/短信后系统自动恢复。";
@@ -1408,6 +1484,44 @@
       if (notice) notice.textContent = "登录请求失败，请稍后重试。";
     } finally {
       setBtnLoading(btn, false, null, "重新登录");
+    }
+  }
+
+  // 手动 cURL 刷新 notice 三态文案（纯函数,2026-09-10）:409 认证维护锁
+  // 被持有(后端 body 平铺,code 经 createActionClient 退化为 HTTP_409,故
+  // status/code 双判)/429 60 秒独立节流/其他失败(code 优先,兜底 HTTP
+  // status,与 cnncLoginNoticeText 同形)。
+  function cnncCurlRefreshNoticeText(error) {
+    if (error && (error.status === 409 || error.code === "AUTH_MAINTENANCE_BUSY")) {
+      return "CNNC 认证维护正在进行，请先完成当前操作";
+    }
+    if (error && error.status === 429) {
+      return "cURL 刷新已在启动中（60 秒内），请稍候";
+    }
+    return "cURL 刷新请求失败：" + ((error && error.code) || ("HTTP " + (error && error.status)));
+  }
+
+  // 手动 cURL 刷新(2026-09-10):detached 拉起后端 --refresh-curl,立即返回;
+  // 结果经 status 轮询的 last_curl_refresh 工件透出。请求期间按钮 disabled。
+  async function cnncRefreshCurl() {
+    const btn = $("#cnnc-auth-refresh-curl");
+    const notice = $("#cnnc-auth-notice");
+    if (!btn || btn.disabled) return;
+    const client = getActionClient();
+    if (!client) { if (notice) notice.textContent = "操作台不可用，无法发起 cURL 刷新。"; return; }
+    setBtnLoading(btn, true, "正在启动 cURL 刷新…");
+    if (notice) notice.textContent = "";
+    try {
+      const res = await client.refresh("/dashboard/api/cnnc-auth/refresh-curl", {});
+      if (res.error) {
+        if (notice) notice.textContent = cnncCurlRefreshNoticeText(res.error);
+        return;
+      }
+      if (notice) notice.textContent = "已开始刷新 cURL，完成后状态区显示结果";
+    } catch (e) {
+      if (notice) notice.textContent = "cURL 刷新请求失败，请稍后重试。";
+    } finally {
+      setBtnLoading(btn, false, null, "刷新 cURL");
     }
   }
 
@@ -1561,7 +1675,8 @@
   const api = { start, stop: () => { ctl.stop(); sfPoller.stop(); cnncPoller.stop(); prodIdentityPoller.stop(); closeoutActionsPoller.stop(); },
     createPollController, createSaasFlowPoller, safeProgressText, sfPartialNotice,
     sfTreeHtml, sfGrowthText, jobProgressCell, progressDetail, outputDisplayName,
-    createActionClient, actionOutcomeText, cnncStatusText, renderCnncAuth,
+    createActionClient, actionOutcomeText, cnncStatusText, renderCnncAuth, cnncAuthView,
+    cnncLoginNoticeText, cnncCurlRefreshNoticeText,
     fmtShanghaiDateTime, createCnncAuthFetcher,
     piStatusText, piStatusWord, piWorkingTreeText, renderProductionIdentity,
     createProductionIdentityFetcher,
