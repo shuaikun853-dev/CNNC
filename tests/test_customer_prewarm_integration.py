@@ -572,7 +572,7 @@ def test_case_d_legacy_schema_additive_migration_preserves_rows(tmp_path):
     assert row["routing_url"] is None
     assert row["business_date"] == "2026-09-06"
     assert row["source"] == "detail"
-    assert row["cache_status"] == "PENDING_PREWARM"
+    assert row["cache_status"] == CACHE_STATUS_PENDING_PREWARM
     assert row["match_level"] is None
     assert row["resolved_identity_id"] is None
     assert row["last_error"] == "miss"

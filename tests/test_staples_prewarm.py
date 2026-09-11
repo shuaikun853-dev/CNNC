@@ -1704,6 +1704,42 @@ def test_case20d_plan_only_json_output_equals_db_rejected(tmp_path, monkeypatch,
     assert _sha256(db) == db_hash
 
 
+def test_cli_live_json_output_equals_db_rejected(tmp_path, monkeypatch, capsys):
+    """live 模式同款守卫:--json-output 等于任一 DB 路径必须 exit 2,且在任何写之前拒绝。"""
+    _patch_cli_monitor(tmp_path, monkeypatch)
+    runtime = tmp_path / "runtime"
+    db = runtime / "customer_prewarm.sqlite3"
+    prewarm = CustomerPrewarmStore(db)
+    StaplesPrewarmStore(db)  # sidecar 表与真实部署同文件
+    assert _seed_candidate(prewarm) >= 1
+    cache = runtime / "shared_crawl_cache.sqlite3"
+    SharedCrawlCache(cache).record_success(
+        "nbdeli", "https://b2b.nbdeli.com/goods/1.html", source="seed"
+    )
+    before_hash = {path: _sha256(path) for path in (db, cache)}
+    before_files = {entry.name for entry in runtime.iterdir()}
+
+    exit_code = cli.main(
+        [
+            "--business-date",
+            BUSINESS_DATE_CLI,
+            "--runtime-root",
+            str(runtime),
+            "--json-output",
+            str(db),
+        ]
+    )
+
+    assert exit_code == 2
+    out = capsys.readouterr().out
+    assert "ERROR" in out
+    assert "equals a database path" in out
+    # 拒绝发生在任何写之前(锁/DB/-wal/-shm 都未产生):两个 DB 字节恒等
+    for path in (db, cache):
+        assert _sha256(path) == before_hash[path]
+    assert {entry.name for entry in runtime.iterdir()} == before_files
+
+
 def test_case21_plan_only_db_absent_parent_dir_not_created(tmp_path, monkeypatch):
     _patch_cli_monitor(tmp_path, monkeypatch)
     missing_dir = tmp_path / "nope"

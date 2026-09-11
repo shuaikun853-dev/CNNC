@@ -113,7 +113,7 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=None,
         help="optional path to write the full summary/plan dict as JSON "
-        "(parents created); in plan-only this must not equal either database path",
+        "(parents created); this must not equal either database path",
     )
     return parser
 
@@ -249,18 +249,20 @@ def main(argv: list[str] | None = None) -> int:
         Path(args.work_dir) if args.work_dir is not None else runtime_root / DEFAULT_WORK_DIR_NAME
     )
 
+    # §28: the only allowed write is the optional --json-output report, and it
+    # must never be one of the database paths (fail closed before any IO —
+    # plan-only and live alike, i.e. before the process lock is even taken).
+    if args.json_output is not None and Path(args.json_output).resolve() in (
+        prewarm_path,
+        cache_path,
+    ):
+        print(
+            f"ERROR --json-output {args.json_output} equals a database path; "
+            "the report must never overwrite a database file"
+        )
+        return 2
+
     if args.plan_only:
-        # §28: the only allowed write is the optional --json-output report, and
-        # it must never be one of the database paths (fail closed before any IO).
-        if args.json_output is not None and Path(args.json_output).resolve() in (
-            prewarm_path,
-            cache_path,
-        ):
-            print(
-                f"ERROR --json-output {args.json_output} equals a database path; "
-                "plan-only must never write a database file"
-            )
-            return 2
         return _run_plan_only(args, business_date, prewarm_path, cache_path)
 
     lock = ProcessLock(runtime_root / STAPLES_LOCK_NAME)
