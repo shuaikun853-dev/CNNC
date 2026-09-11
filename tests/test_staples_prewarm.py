@@ -199,6 +199,40 @@ class FakeCrawler:
         }
 
 
+class _EnsureJobFailingStaplesStore:
+    """staples_store 代理:ensure_job 命中目标 candidate_id 即抛异常,其余全委托。"""
+
+    def __init__(self, inner, target_candidate_id, exc):
+        self._inner = inner
+        self._target = int(target_candidate_id)
+        self._exc = exc
+
+    def ensure_job(self, candidate_id, now=None):
+        if int(candidate_id) == self._target:
+            raise self._exc
+        return self._inner.ensure_job(candidate_id, now=now)
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+
+class _RecordResultFailingPrewarmStore:
+    """prewarm_store 代理:record_candidate_result 命中目标 candidate_id 即抛异常。"""
+
+    def __init__(self, inner, target_candidate_id, exc):
+        self._inner = inner
+        self._target = int(target_candidate_id)
+        self._exc = exc
+
+    def record_candidate_result(self, candidate_id, **kwargs):
+        if int(candidate_id) == self._target:
+            raise self._exc
+        return self._inner.record_candidate_result(candidate_id, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+
 def _transient_outcome(url, diagnostic="页面超时", **overrides):
     fields: dict[str, Any] = dict(
         status=STAPLES_OUTCOME_TRANSIENT_FAILURE,
@@ -705,6 +739,64 @@ def test_second_pass_routes_remaining_staples_after_limit(stack):
     assert crawler.calls == 2
     assert [req["original_url"] for req in crawler.seen_requests[0]] == [url_a]
     assert [req["original_url"] for req in crawler.seen_requests[1]] == [url_b]
+
+
+def test_route_budget_consumed_when_ensure_job_fails_after_status_flip(stack):
+    """Case D:ensure_job 在状态翻转后失败,预算已被 A 消耗,本 pass 绝不处理 B。"""
+    url_a = "https://www.stbchina.cn/item.html?itemId=301"
+    url_b = "https://www.stbchina.cn/item.html?itemId=302"
+    a_cid = _seed_candidate(stack.prewarm, url_a, "DA301")
+    b_cid = _seed_candidate(stack.prewarm, url_b, "DB302")
+    stack.staples = _EnsureJobFailingStaplesStore(
+        stack.staples, a_cid, RuntimeError("ensure_job boom")
+    )
+    crawler = FakeCrawler()
+    summary = _run(stack, crawler, route_limit=1)
+    # A:状态已翻转(record_candidate_result 已生效,业务变更已发生)但无作业
+    assert stack.prewarm.candidate_by_id(a_cid)[
+        "cache_status"
+    ] == CACHE_STATUS_STAPLES_PENDING
+    assert stack.staples.job_for_candidate(a_cid) is None
+    # B:完全未动——A 失败也消耗预算,route_limit=1 不允许越界路由 B
+    assert stack.prewarm.candidate_by_id(b_cid)[
+        "cache_status"
+    ] == CACHE_STATUS_PENDING_PREWARM
+    assert stack.staples.job_for_candidate(b_cid) is None
+    assert summary["routed"] == 0
+    assert any(
+        e.startswith("route candidate") and str(a_cid) in e
+        for e in summary["errors"]
+    )
+    assert crawler.calls == 0
+
+
+def test_route_budget_consumed_when_record_candidate_result_fails(stack):
+    """Case E:record_candidate_result 自身失败同样消耗预算,B 本 pass 不被处理。"""
+    url_a = "https://www.stbchina.cn/item.html?itemId=303"
+    url_b = "https://www.stbchina.cn/item.html?itemId=304"
+    a_cid = _seed_candidate(stack.prewarm, url_a, "DA303")
+    b_cid = _seed_candidate(stack.prewarm, url_b, "DB304")
+    stack.prewarm = _RecordResultFailingPrewarmStore(
+        stack.prewarm, a_cid, RuntimeError("record boom")
+    )
+    crawler = FakeCrawler()
+    summary = _run(stack, crawler, route_limit=1)
+    # A:record 失败,状态未翻转、无作业
+    assert stack.prewarm.candidate_by_id(a_cid)[
+        "cache_status"
+    ] == CACHE_STATUS_PENDING_PREWARM
+    assert stack.staples.job_for_candidate(a_cid) is None
+    # B:完全未动
+    assert stack.prewarm.candidate_by_id(b_cid)[
+        "cache_status"
+    ] == CACHE_STATUS_PENDING_PREWARM
+    assert stack.staples.job_for_candidate(b_cid) is None
+    assert summary["routed"] == 0
+    assert any(
+        e.startswith("route candidate") and str(a_cid) in e
+        for e in summary["errors"]
+    )
+    assert crawler.calls == 0
 
 
 def test_case02_preseeded_cache_hit_absorbs_without_crawl(stack):
