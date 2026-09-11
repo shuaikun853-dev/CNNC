@@ -143,5 +143,6 @@ jobs:
           tests/test_zhaoshang_reference_reuse_dedupe.py
           tests/test_zhaoshang_history_backfill.py
           tests/test_cnnc_saas_snapshot_adapter.py
+          tests/test_staples_prewarm.py
           --deselect "tests/test_remote_running_recovery.py::test_default_dependencies_wire_probe_and_write_gated_restart"
           -q -l --timeout=600 --timeout-method=thread

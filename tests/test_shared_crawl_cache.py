@@ -114,12 +114,13 @@ def test_ofs_product_identity_hostname_policy():
 
 def test_resolve_mall_product_identity_is_mall_scoped():
     assert resolve_mall_product_identity("ofs", "https://www.ofs.cn/product-1.html") == "1"
-    # jd has no registered parser in v1: conservative MISS even for an ofs URL.
+    # jd has no registered parser: conservative MISS even for an ofs URL.
     assert resolve_mall_product_identity("jd", "https://www.ofs.cn/product-1.html") is None
     assert resolve_mall_product_identity("", "https://www.ofs.cn/product-1.html") is None
     assert resolve_mall_product_identity("ofs", "") is None
     assert resolve_mall_product_identity("ofs", "   ") is None
-    assert set(MALL_IDENTITY_PARSERS) == {"ofs"}
+    # Issue #11: stbchina joins ofs as the second registered parser.
+    assert set(MALL_IDENTITY_PARSERS) == {"ofs", "stbchina"}
 
 
 def test_placeholder_and_status_constants():

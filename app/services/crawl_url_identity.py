@@ -7,8 +7,8 @@ MISS).  It never guesses, never fuzzy-matches, and never treats a SKU id as an
 identity key: only URLs whose path verifiably ends with a mall's product
 pattern may contribute an identity.
 
-Malls without a registered parser (everything except ``ofs`` in v1) always
-resolve to ``None`` so callers stay fail-closed.
+Malls without a registered parser (everything except ``ofs`` and
+``stbchina``) always resolve to ``None`` so callers stay fail-closed.
 
 SKU evidence states (``SKU_STATUSES``, Issue #7 closure 2026-09-07):
 
@@ -28,7 +28,7 @@ from __future__ import annotations
 
 import re
 from typing import Callable, Mapping, Sequence
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 SKU_STATUS_CONFIRMED = "CONFIRMED"
 SKU_STATUS_UPSTREAM_PROVIDED = "UPSTREAM_PROVIDED"
@@ -52,6 +52,14 @@ PLACEHOLDER_PREFIXES_DEFAULT = ("zhpq-",)
 # numeric paths are also rejected.  The hostname must pass the ofs.cn allow
 # policy (see ofs_product_identity).
 _OFS_PRODUCT_PATTERN = re.compile(r"/product-([0-9]+)\.html/?\Z", re.IGNORECASE)
+
+# Same policy as the ofs parser: only the parsed URL *path* may prove the
+# product shape (/item.html, case-insensitive, optional trailing slash); an
+# item tail inside a query string or fragment is a conservative MISS.  The
+# identity itself is the first ``itemId`` query value matching
+# ``^[A-Za-z0-9]+$`` (Issue #11).
+_STBCHINA_ITEM_PATTERN = re.compile(r"/item\.html/?\Z", re.IGNORECASE)
+_STBCHINA_ITEM_ID_PATTERN = re.compile(r"^[A-Za-z0-9]+$")
 
 
 def is_placeholder_code(
@@ -104,8 +112,52 @@ def ofs_product_identity(url: str) -> str | None:
     return match.group(1)
 
 
+def stbchina_product_identity(url: str) -> str | None:
+    """Return the ``itemId`` when the URL path ends with ``/item.html`` on a stbchina host.
+
+    Hostname allow policy: only ``stbchina.cn`` and any real subdomain
+    ``*.stbchina.cn`` count; lookalikes such as ``notstbchina.cn`` or
+    ``stbchina.cn.evil.com`` are a conservative MISS.  Only the parsed URL
+    *path* is matched - an ``/item.html`` tail inside a query string or
+    fragment never contributes an identity.  The identity is the first
+    ``itemId`` query value (stripped) matching ``^[A-Za-z0-9]+$``.
+
+    Examples:
+        ``https://www.stbchina.cn/item.html?itemId=1001358701037447``
+            -> ``"1001358701037447"``
+        ``https://stbchina.cn/item.html/?itemId=abc123`` -> ``"abc123"``
+        ``https://www.stbchina.cn/other?itemId=1`` -> ``None``
+        ``https://www.stbchina.cn/x?u=/item.html?itemId=1`` -> ``None``
+    """
+    if not isinstance(url, str):
+        return None
+    stripped = url.strip()
+    if not stripped:
+        return None
+    try:
+        parsed = urlparse(stripped)
+    except ValueError:  # pragma: no cover - malformed URL, conservative MISS
+        return None
+    # Hostname gate first (urlparse already returns the hostname lowercased).
+    host = (parsed.hostname or "").strip().lower()
+    if host != "stbchina.cn" and not host.endswith(".stbchina.cn"):
+        return None
+    if _STBCHINA_ITEM_PATTERN.search(parsed.path or "") is None:
+        return None
+    try:
+        values = parse_qs(parsed.query or "").get("itemId", [])
+    except ValueError:  # pragma: no cover - malformed query, conservative MISS
+        return None
+    for value in values:
+        candidate = value.strip()
+        if candidate and _STBCHINA_ITEM_ID_PATTERN.match(candidate):
+            return candidate
+    return None
+
+
 MALL_IDENTITY_PARSERS: Mapping[str, Callable[[str], str | None]] = {
     "ofs": ofs_product_identity,
+    "stbchina": stbchina_product_identity,
 }
 
 

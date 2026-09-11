@@ -120,6 +120,8 @@ _ALLOWED_CACHE_STATUS = {
 }
 
 # 命中是终态:历史 append-only,CACHE_HIT 永不回退或改道。
+# STAPLES_PENDING 是史泰博本地预爬路由态(Issue #11):PENDING_PREWARM 先进入
+# 该态等待本地缓存/本地爬取,终态仍是 CACHE_HIT,永不改道招商局。
 _ALLOWED_TRANSITIONS: dict[str, set[str]] = {
     CACHE_STATUS_PENDING_LOOKUP: {CACHE_STATUS_PENDING_PREWARM, CACHE_STATUS_CACHE_HIT},
     CACHE_STATUS_PENDING_PREWARM: {
@@ -644,6 +646,14 @@ class CustomerPrewarmStore:
                 "SELECT * FROM prewarm_candidates WHERE id=?", (int(candidate_id),)
             ).fetchone()
             return dict(refreshed)
+
+    def candidate_by_id(self, candidate_id: int) -> dict[str, Any] | None:
+        """One candidate row by primary key, or ``None`` when it does not exist."""
+        with self._reader() as connection:
+            row = connection.execute(
+                "SELECT * FROM prewarm_candidates WHERE id=?", (int(candidate_id),)
+            ).fetchone()
+        return dict(row) if row is not None else None
 
     def candidates(
         self, cache_status: str | None = None, *, limit: int | None = None
