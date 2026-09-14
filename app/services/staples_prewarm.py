@@ -65,7 +65,7 @@ from app.services.customer_prewarm_store import (
     CACHE_STATUS_PENDING_PREWARM,
     CACHE_STATUS_STAPLES_PENDING,
 )
-from app.services.shared_crawl_cache import AliasConflictError
+from app.services.shared_crawl_cache import PRODUCER_STAPLES_LOCAL, AliasConflictError
 
 # 既有权威 mall key(cnnc_same_product_import/config.py:186-187)。
 STAPLES_CACHE_MALL_KEY = "stbchina"
@@ -782,6 +782,7 @@ def _write_staples_success(
         comment_count=evidence.get("comment_count"),
         source=STAPLES_PREWARM_SOURCE,
         payload=dict(evidence),
+        producer=PRODUCER_STAPLES_LOCAL,
     )
 
 

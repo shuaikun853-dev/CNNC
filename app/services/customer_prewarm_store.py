@@ -97,6 +97,23 @@ CREATE TABLE IF NOT EXISTS prewarm_recovery_runs (
     ran_at TEXT NOT NULL,
     documents_seen INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS prewarm_daily_observations (
+    business_date TEXT NOT NULL,
+    candidate_id INTEGER NOT NULL,
+    document_id TEXT NOT NULL,
+    original_url TEXT NOT NULL,
+    first_seen_at TEXT NOT NULL,
+    last_seen_at TEXT NOT NULL,
+    PRIMARY KEY(business_date, candidate_id, document_id)
+);
+CREATE TABLE IF NOT EXISTS prewarm_remote_job_links (
+    business_date TEXT NOT NULL,
+    candidate_id INTEGER NOT NULL,
+    remote_job_id INTEGER NOT NULL,
+    producer TEXT NOT NULL,
+    recorded_at TEXT NOT NULL,
+    PRIMARY KEY(business_date, candidate_id, remote_job_id)
+);
 """
 
 CACHE_STATUS_PENDING_LOOKUP = "PENDING_LOOKUP"
@@ -272,6 +289,20 @@ class CustomerPrewarmStore:
                 connection.execute(
                     "ALTER TABLE prewarm_candidates ADD COLUMN remote_job_id INTEGER"
                 )
+            # Issue #13 Round 2 bootstrap: derive per-day observations from the
+            # existing document-day evidence (prewarm_links × documents'
+            # business_date).  INSERT OR IGNORE keeps this idempotent on every
+            # open — existing observation rows (their refreshed last_seen_at)
+            # are never overwritten.
+            connection.execute(
+                """INSERT OR IGNORE INTO prewarm_daily_observations
+                   (business_date, candidate_id, document_id, original_url,
+                    first_seen_at, last_seen_at)
+                   SELECT d.business_date, l.candidate_id, l.document_id,
+                          l.original_url, l.first_seen_at, l.last_seen_at
+                   FROM prewarm_links l
+                   JOIN prewarm_documents d ON d.document_id = l.document_id"""
+            )
 
     # ---- shared helpers ------------------------------------------------------
 
@@ -542,6 +573,21 @@ class CustomerPrewarmStore:
                 "SELECT * FROM prewarm_links WHERE document_id=? AND original_url=?",
                 (document_value, original_value),
             ).fetchone()
+            # Issue #13 Round 2: the same write transaction also records the
+            # document-day observation for this link.  The observation is
+            # derived bookkeeping — a failure here is swallowed so it can
+            # never break the link/candidate write itself.
+            try:
+                self._insert_daily_observation(
+                    connection,
+                    business_date=business_date_value,
+                    candidate_id=candidate_id,
+                    document_id=document_value,
+                    original_url=original_value,
+                    now_text=now,
+                )
+            except sqlite3.Error:
+                pass
             return {"link": dict(link), "candidate": dict(candidate)}
 
     def record_candidate_result(
@@ -695,6 +741,179 @@ class CustomerPrewarmStore:
                 (int(candidate_id),),
             ).fetchall()
         return [dict(row) for row in rows]
+
+    # ---- daily observations / remote job links (Issue #13 Round 2) -------------
+
+    @staticmethod
+    def _insert_daily_observation(
+        connection: sqlite3.Connection,
+        *,
+        business_date: str,
+        candidate_id: int,
+        document_id: str,
+        original_url: str,
+        now_text: str,
+    ) -> None:
+        """Upsert one document-day observation on an open connection.
+
+        PK hit refreshes ``last_seen_at`` only (first_seen_at is immutable
+        evidence).  Shared by :meth:`record_daily_observation` (own
+        transaction) and :meth:`upsert_link` (same transaction as the link
+        write, best-effort isolated there).
+        """
+        row = connection.execute(
+            """SELECT first_seen_at FROM prewarm_daily_observations
+               WHERE business_date=? AND candidate_id=? AND document_id=?""",
+            (business_date, int(candidate_id), document_id),
+        ).fetchone()
+        if row is None:
+            connection.execute(
+                """INSERT INTO prewarm_daily_observations
+                   (business_date, candidate_id, document_id, original_url,
+                    first_seen_at, last_seen_at)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (
+                    business_date,
+                    int(candidate_id),
+                    document_id,
+                    original_url,
+                    now_text,
+                    now_text,
+                ),
+            )
+        else:
+            connection.execute(
+                """UPDATE prewarm_daily_observations
+                   SET last_seen_at=?, original_url=?
+                   WHERE business_date=? AND candidate_id=? AND document_id=?""",
+                (
+                    now_text,
+                    original_url,
+                    business_date,
+                    int(candidate_id),
+                    document_id,
+                ),
+            )
+
+    def record_daily_observation(
+        self,
+        business_date: str,
+        candidate_id: int,
+        document_id: str,
+        original_url: str,
+        *,
+        now: datetime | None = None,
+    ) -> None:
+        """Upsert one (business_date, candidate, document) observation.
+
+        The PK hit path refreshes ``last_seen_at`` so a document/url seen
+        twice on the same business day stays one row.  ``now`` is injectable
+        for tests and normalized to the store's UTC microsecond ISO format.
+        """
+        self._assert_writable()
+        business_date_value = self._require_text(business_date, "business_date")
+        document_value = self._require_text(document_id, "document_id")
+        original_value = self._require_text(original_url, "original_url")
+        now_text = (
+            (now if now is not None else datetime.now(UTC))
+            .astimezone(UTC)
+            .isoformat(timespec="microseconds")
+        )
+        with self._transaction(immediate=True) as connection:
+            self._insert_daily_observation(
+                connection,
+                business_date=business_date_value,
+                candidate_id=int(candidate_id),
+                document_id=document_value,
+                original_url=original_value,
+                now_text=now_text,
+            )
+
+    def record_remote_job_link(
+        self,
+        business_date: str,
+        candidate_id: int,
+        remote_job_id: int,
+        producer: str,
+        *,
+        now: datetime | None = None,
+    ) -> None:
+        """Upsert one candidate↔remote-job linkage (PK hit refreshes
+        ``recorded_at``; the first producer attribution is kept)."""
+        self._assert_writable()
+        business_date_value = self._require_text(business_date, "business_date")
+        producer_value = self._require_text(producer, "producer")
+        now_text = (
+            (now if now is not None else datetime.now(UTC))
+            .astimezone(UTC)
+            .isoformat(timespec="microseconds")
+        )
+        with self._transaction(immediate=True) as connection:
+            row = connection.execute(
+                """SELECT recorded_at FROM prewarm_remote_job_links
+                   WHERE business_date=? AND candidate_id=? AND remote_job_id=?""",
+                (business_date_value, int(candidate_id), int(remote_job_id)),
+            ).fetchone()
+            if row is None:
+                connection.execute(
+                    """INSERT INTO prewarm_remote_job_links
+                       (business_date, candidate_id, remote_job_id, producer, recorded_at)
+                       VALUES (?, ?, ?, ?, ?)""",
+                    (
+                        business_date_value,
+                        int(candidate_id),
+                        int(remote_job_id),
+                        producer_value,
+                        now_text,
+                    ),
+                )
+            else:
+                connection.execute(
+                    """UPDATE prewarm_remote_job_links
+                       SET recorded_at=?
+                       WHERE business_date=? AND candidate_id=? AND remote_job_id=?""",
+                    (
+                        now_text,
+                        business_date_value,
+                        int(candidate_id),
+                        int(remote_job_id),
+                    ),
+                )
+
+    def candidate_ids_for_business_date(self, business_date: str) -> set[int]:
+        """Distinct observed candidate ids of one business day (missing table →
+        empty set; never a fallback to candidate first-seen)."""
+        business_date_value = self._require_text(business_date, "business_date")
+        with self._reader() as connection:
+            rows = connection.execute(
+                "SELECT DISTINCT candidate_id FROM prewarm_daily_observations WHERE business_date=?",
+                (business_date_value,),
+            ).fetchall()
+        return {int(row["candidate_id"]) for row in rows}
+
+    def remote_job_link_for_candidate(self, candidate_id: int) -> dict[str, Any] | None:
+        """Latest linkage of one candidate (max recorded_at, tie-break max rowid)."""
+        with self._reader() as connection:
+            row = connection.execute(
+                """SELECT * FROM prewarm_remote_job_links
+                   WHERE candidate_id=?
+                   ORDER BY recorded_at DESC, rowid DESC
+                   LIMIT 1""",
+                (int(candidate_id),),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def remote_job_producer(self, business_date: str, remote_job_id: int) -> str | None:
+        """Producer of any linkage row for (business_date, remote_job_id)."""
+        business_date_value = self._require_text(business_date, "business_date")
+        with self._reader() as connection:
+            row = connection.execute(
+                """SELECT producer FROM prewarm_remote_job_links
+                   WHERE business_date=? AND remote_job_id=?
+                   LIMIT 1""",
+                (business_date_value, int(remote_job_id)),
+            ).fetchone()
+        return str(row["producer"]) if row is not None else None
 
     # ---- sync ledger -------------------------------------------------------------
 

@@ -372,6 +372,18 @@
     if (outcome === null || outcome === undefined) return "";
     try { return JSON.stringify(outcome); } catch (e) { return String(outcome); }
   }
+  // 手动重爬动作状态 → 中文(诚实生命周期:只有 SUCCEEDED 携带缓存证明,
+  // WAITING_REMOTE 仅招商局路径;史泰博同步爬取直接 RUNNING→SUCCEEDED/FAILED)。
+  function recrawlStatusText(status) {
+    switch (String(status || "")) {
+      case "RUNNING": return "进行中…";
+      case "WAITING_REMOTE": return "已派发，等待招商局完成";
+      case "PRIORITY_PENDING": return "优先级待确认";
+      case "SUCCEEDED": return "重爬完成 ✓";
+      case "FAILED": return "重爬失败 ✗";
+      default: return "重爬结束(" + status + ")";
+    }
+  }
   async function startRecrawl() {
     if (recrawlBusy || !detail) return;
     const cand = detailCandidate(detail);
@@ -400,7 +412,7 @@
       }
       const started = r.json || {};
       const pollUrl = started.poll || ("/dashboard/api/prewarm/recrawl-actions/" + encodeURIComponent(started.action_id));
-      setRecrawlStatus("已受理(" + (started.status || "RUNNING") + "),正在轮询…", "");
+      setRecrawlStatus("已受理(" + recrawlStatusText(started.status) + "),正在轮询…", "");
       for (let i = 0; i < MAX_POLLS; i += 1) {
         await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_MS));
         let pr;
@@ -408,13 +420,16 @@
         catch (e) { pr = { status: 0, json: null }; }
         if (!pr.status || pr.status < 200 || pr.status >= 300) continue;   // 单次轮询失败不终止
         const data = pr.json || {};
-        if (data.status && data.status !== "RUNNING") {
-          if (data.status === "SUCCEEDED") setRecrawlStatus("重爬完成 ✓ " + outcomeSummary(data.outcome), "ok");
-          else if (data.status === "FAILED") setRecrawlStatus("重爬失败 ✗ " + outcomeSummary(data.outcome), "err");
-          else setRecrawlStatus("重爬结束(" + data.status + ") " + outcomeSummary(data.outcome), "");
-          return;
+        const st = String(data.status || "");
+        // 每次轮询驱动一次懒完成评估(服务端 get 只读重估 WAITING_REMOTE)
+        if (st === "SUCCEEDED") { setRecrawlStatus(recrawlStatusText(st) + " " + outcomeSummary(data.outcome), "ok"); return; }
+        if (st === "FAILED") { setRecrawlStatus(recrawlStatusText(st) + " " + outcomeSummary(data.outcome), "err"); return; }
+        if (st === "PRIORITY_PENDING") { setRecrawlStatus(recrawlStatusText(st) + " " + outcomeSummary(data.outcome), ""); return; }
+        if (st === "WAITING_REMOTE") {
+          setRecrawlStatus(recrawlStatusText(st) + "(已等待 " + ((i + 1) * POLL_INTERVAL_MS / 1000) + " 秒)", "");
+          continue;
         }
-        setRecrawlStatus("重爬执行中…(已等待 " + ((i + 1) * POLL_INTERVAL_MS / 1000) + " 秒)", "");
+        setRecrawlStatus(recrawlStatusText(st || "RUNNING") + "(已等待 " + ((i + 1) * POLL_INTERVAL_MS / 1000) + " 秒)", "");
       }
       setRecrawlStatus("轮询超时,请稍后刷新查看结果", "err");
     } finally {

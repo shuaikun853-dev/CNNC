@@ -11,9 +11,28 @@ that re-crawls EXACTLY ONE prewarm link URL:
   cache is untouched — the old current row stays valid.
 - zhaoshang route: :func:`~app.services.customer_prewarm_dispatch.dispatch_single_candidate_exact`
   (probe → reuse+boost | create exactly one single-URL job + submit + priority
-  proof).  Its outcome dict is passed through verbatim — ``CREATED``/``REUSED``
-  mean success, everything else (``SUBMIT_UNKNOWN``, ``LOCK_BUSY``, …) is an
-  honest failure.  Candidate ``cache_status`` is never written on either route.
+  proof).  Dispatch is NOT success — the outcome dict is passed through
+  verbatim into an honest lifecycle (Issue #13 Review Round 2, Blocker 4):
+
+  - ``CREATED`` with ``priority_confirmed`` / ``REUSED`` with
+    ``priority_proven`` → ``WAITING_REMOTE`` (priority -1 proven; the remote
+    crawl is legitimately still pending).
+  - ``CREATED`` unconfirmed / ``REUSED`` unproven → ``PRIORITY_PENDING``
+    (honest waiting — never displayed as success, never auto-flipped; the
+    operator may start a NEW action later whose probe/boost may prove -1).
+  - every other outcome (``SUBMIT_UNKNOWN``, ``LOCK_BUSY``, …) → ``FAILED``
+    with the dispatch dict verbatim; no second POST ever.
+
+  While ``WAITING_REMOTE``, every :meth:`ManualRecrawlRunner.get` lazily
+  re-evaluates completion: the shared crawl cache is opened READ-ONLY and
+  ``lookup_current`` is probed with the SAME mall/URL derivation as at start;
+  a current success with ``succeeded_at >= handle.started_at`` is the ONLY
+  proof of ``SUCCEEDED`` (``completion_proof="cache_current"`` plus a
+  ``new_result`` summary).  Nothing is ever written by the action itself —
+  the eventual remote-side sync owns the new row.  Poll-driven only (no
+  background thread); evaluation never raises.
+
+  Candidate ``cache_status`` is never written on either route.
 
 Guards run synchronously in :meth:`ManualRecrawlRunner.start` and fail closed
 with :class:`ManualRecrawlError`: missing prewarm DB → ``STATE_DB_MISSING``,
@@ -70,9 +89,17 @@ ROUTE_ZHAOSHANG = "zhaoshang"
 ACTIONS_DIR_NAME = "customer_prewarm"
 ACTIONS_LOG_NAME = "manual_recrawl_actions.jsonl"
 
-# Dispatch outcomes that mean the remote action actually happened or was
-# already alive; every other outcome is reported honestly as a failure.
-_DISPATCH_SUCCESS_OUTCOMES = frozenset({"CREATED", "REUSED"})
+# Honest dispatch→lifecycle mapping (Blocker 4): dispatch is never success by
+# itself.  ``CREATED``/``REUSED`` mean the remote side is legitimately pending
+# (WAITING_REMOTE when priority -1 is proven, PRIORITY_PENDING otherwise);
+# every other outcome is an honest failure with the dispatch dict passed
+# through verbatim.
+_DISPATCH_WAITING_OUTCOME = "CREATED"
+_DISPATCH_REUSED_OUTCOME = "REUSED"
+
+# Lazy-completion proof label: SUCCEEDED is only ever backed by a shared-cache
+# current row newer than the action started.
+COMPLETION_PROOF_CACHE_CURRENT = "cache_current"
 
 _STAPLES_LOCK_OWNER_COMMAND = "prewarm_manual_recrawl"
 
@@ -221,10 +248,21 @@ class ManualRecrawlRunner:
         return dict(handle)
 
     def get(self, action_id: str) -> dict[str, Any] | None:
-        """One action handle (with ``outcome``/``finished_at`` once done) or None."""
+        """One action handle (with ``outcome``/``finished_at`` once done) or None.
+
+        Poll-driven completion: while the status is ``WAITING_REMOTE`` every
+        call lazily re-evaluates the shared cache read-only for a new current
+        success (see :meth:`_evaluate_waiting_remote_locked`); the handle is
+        mutated under the runner lock.  ``PRIORITY_PENDING`` never auto-flips
+        and no dispatch is ever re-run here.
+        """
         with self._lock:
             handle = self._actions.get(str(action_id))
-            return dict(handle) if handle is not None else None
+            if handle is None:
+                return None
+            if handle.get("status") == "WAITING_REMOTE":
+                self._evaluate_waiting_remote_locked(handle)
+            return dict(handle)
 
     def _join_for_tests(self, action_id: str, timeout: float = 10.0) -> None:
         """Test seam: wait for one action's worker to finish."""
@@ -313,7 +351,10 @@ class ManualRecrawlRunner:
             )
 
         # Lazy import: only a successful crawl needs the RW cache.
-        from app.services.shared_crawl_cache import SharedCrawlCache
+        from app.services.shared_crawl_cache import (
+            PRODUCER_MANUAL_RECRAWL_STAPLES,
+            SharedCrawlCache,
+        )
 
         cache = SharedCrawlCache(Path(self.runtime_root) / SHARED_CACHE_NAME)
         evidence = self._staples_evidence(handle, outcome)
@@ -330,6 +371,7 @@ class ManualRecrawlRunner:
             price=outcome.price,
             comment_count=outcome.comment_count,
             source=MANUAL_RECRAWL_SOURCE_STAPLES,
+            producer=PRODUCER_MANUAL_RECRAWL_STAPLES,
             payload=evidence,
         )
         # §15 honesty: SUCCEEDED only for a proven current row after the write.
@@ -347,6 +389,7 @@ class ManualRecrawlRunner:
             "SUCCEEDED",
             {
                 "outcome": STAPLES_OUTCOME_SUCCESS,
+                "completion_proof": COMPLETION_PROOF_CACHE_CURRENT,
                 "result_id": int(row["id"]),
                 "identity_id": int(verify["identity_id"]),
                 "match_level": verify.get("match_level"),
@@ -389,7 +432,14 @@ class ManualRecrawlRunner:
         }
 
     def _run_zhaoshang_action(self, handle: dict[str, Any]) -> tuple[str, dict[str, Any]]:
-        """dispatch_single_candidate_exact with verbatim honest passthrough."""
+        """dispatch_single_candidate_exact → honest lifecycle (never success).
+
+        ``CREATED``/``REUSED`` map to WAITING_REMOTE (priority proven) or
+        PRIORITY_PENDING (unproven); everything else — including every
+        skip/error outcome — maps to FAILED with the dispatch dict passed
+        through verbatim.  SUCCEEDED is only reachable later, lazily via
+        :meth:`get`, with a shared-cache current-row proof.
+        """
         prewarm_db = Path(self.runtime_root) / PREWARM_STORE_NAME
         cache_db = Path(self.runtime_root) / SHARED_CACHE_NAME
         if not prewarm_db.is_file() or not cache_db.is_file():
@@ -411,9 +461,104 @@ class ManualRecrawlRunner:
             candidate_id=int(handle["candidate_id"]),
             mappings=list(self._mappings_loader()),
         )
-        if str(result.get("outcome")) in _DISPATCH_SUCCESS_OUTCOMES:
-            return "SUCCEEDED", {"dispatch": result}
-        return "FAILED", {"dispatch": result}
+        return self._classify_dispatch_result(result)
+
+    @staticmethod
+    def _classify_dispatch_result(result: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+        """Map one dispatch result dict to (status, outcome) honestly.
+
+        - CREATED & priority_confirmed / REUSED & priority_proven →
+          WAITING_REMOTE (remote crawl legitimately pending);
+        - CREATED unconfirmed / REUSED unproven (``False`` or ``None``) →
+          PRIORITY_PENDING (priority -1 NOT proven; never auto-flipped — a
+          NEW action's probe/boost may prove it later);
+        - anything else → FAILED with the dispatch dict verbatim.
+        """
+        summary: dict[str, Any] = {"dispatch": result}
+        outcome = str(result.get("outcome") or "")
+        if outcome == _DISPATCH_WAITING_OUTCOME:
+            if result.get("priority_confirmed") is True:
+                return "WAITING_REMOTE", summary
+            return "PRIORITY_PENDING", summary
+        if outcome == _DISPATCH_REUSED_OUTCOME:
+            if result.get("priority_proven") is True:
+                return "WAITING_REMOTE", summary
+            return "PRIORITY_PENDING", summary
+        return "FAILED", summary
+
+    # ---- lazy completion (poll-driven; WAITING_REMOTE only) ----------------------
+
+    def _completion_lookup_targets(self, handle: dict[str, Any]) -> tuple[str, list[str]]:
+        """Same mall/URL derivation as :meth:`start`: (mall, urls to probe).
+
+        Zhaoshang re-classifies the original URL with the same mappings loader
+        (lookup_url first, then the original); any re-derivation failure falls
+        back to the mall/URL stored on the handle.
+        """
+        original_url = str(handle["original_url"])
+        mall = str(handle["mall"] or "")
+        urls = [original_url]
+        try:
+            routing = classify_reference_url(original_url, list(self._mappings_loader()))
+            if handle.get("route") == ROUTE_ZHAOSHANG and routing.outcome == OUTCOME_ZHAOSHANG:
+                mall = routing.mall_key
+                lookup_url = str(routing.lookup_url or "")
+                if lookup_url and lookup_url != original_url:
+                    urls = [lookup_url, original_url]
+        except Exception:  # noqa: BLE001 - lookup target derivation is best-effort
+            pass
+        return mall, urls
+
+    def _evaluate_waiting_remote_locked(self, handle: dict[str, Any]) -> None:
+        """Poll-driven lazy completion for one WAITING_REMOTE handle.
+
+        Opens the shared crawl cache READ-ONLY (never writes), probes
+        ``lookup_current`` and flips the handle to SUCCEEDED only when the
+        current row's ``succeeded_at`` parses to a datetime >= the action's
+        ``started_at``.  Never raises: any evaluation error keeps
+        WAITING_REMOTE and notes ``outcome["last_check_error"]``.  Never
+        re-dispatches and never flips PRIORITY_PENDING.
+        """
+        try:
+            from app.services.shared_crawl_cache import SharedCrawlCache
+
+            mall, urls = self._completion_lookup_targets(handle)
+            started = datetime.fromisoformat(str(handle["started_at"]))
+            if started.tzinfo is None:
+                started = started.replace(tzinfo=UTC)
+            cache = SharedCrawlCache.open_read_only(
+                Path(self.runtime_root) / SHARED_CACHE_NAME
+            )
+            for url in urls:
+                hit = cache.lookup_current(mall, url)
+                if hit is None:
+                    continue
+                entry = hit.get("entry") or {}
+                succeeded_at = entry.get("succeeded_at")
+                try:
+                    succeeded = datetime.fromisoformat(str(succeeded_at))
+                except (TypeError, ValueError):
+                    continue  # unparseable → not yet
+                if succeeded.tzinfo is None:
+                    continue  # naive timestamp cannot be proven UTC-new
+                if succeeded < started:
+                    continue  # old current row, not produced by this action
+                outcome = dict(handle.get("outcome") or {})
+                outcome["completion_proof"] = COMPLETION_PROOF_CACHE_CURRENT
+                outcome["new_result"] = {
+                    "result_id": int(entry["id"]),
+                    "price": entry.get("price"),
+                    "title": entry.get("title"),
+                    "succeeded_at": succeeded_at,
+                    "producer": entry.get("producer"),
+                }
+                handle["outcome"] = outcome
+                handle["status"] = "SUCCEEDED"
+                return
+        except Exception as exc:  # noqa: BLE001 - evaluation must never raise
+            outcome = dict(handle.get("outcome") or {})
+            outcome["last_check_error"] = f"{type(exc).__name__}: {exc}"
+            handle["outcome"] = outcome
 
     # ---- durability log (best-effort) --------------------------------------------
 

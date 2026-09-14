@@ -73,7 +73,11 @@ from app.services.customer_prewarm_store import (
     CustomerPrewarmStore,
 )
 from app.services.customer_reference_links import extract_reference_links
-from app.services.shared_crawl_cache import AliasConflictError, SharedCrawlCache
+from app.services.shared_crawl_cache import (
+    PRODUCER_DAILY_INTERNET,
+    AliasConflictError,
+    SharedCrawlCache,
+)
 from scripts.zhaoshang_mall_mapping import ZhaoshangMallMapping
 
 DETAIL_BUDGET_RESERVE_SECONDS = 5.0
@@ -627,6 +631,15 @@ def sync_daily_internet_results(
             real_sku_id = None
             sku_status = SKU_STATUS_UNRESOLVED
         payload["request_sku_id"] = sku_value
+        # Issue #13 Round 2 provenance: a crawl row whose remote job is linked
+        # in the prewarm store was produced by the customer-prewarm dispatcher;
+        # everything else stays the plain daily-internet producer.
+        producer = (
+            prewarm_store.remote_job_producer(business_date, row["remote_job_id"])
+            if row["remote_job_id"] is not None
+            else None
+        )
+        effective_producer = producer or PRODUCER_DAILY_INTERNET
         try:
             row_out = shared_cache.record_success(
                 mall=mall_key,
@@ -638,6 +651,7 @@ def sync_daily_internet_results(
                 source=source,
                 succeeded_at=succeeded_at,
                 payload=payload,
+                producer=effective_producer,
             )
         except sqlite3.OperationalError:
             # 瞬时失败(库锁/繁忙):不记 ledger,下轮重试。

@@ -450,9 +450,12 @@ def test_recrawl_unknown_code_and_non_domain_error_500(client, monkeypatch):
 # ======================================================================
 
 def test_poll_200_passthrough(client, monkeypatch):
+    # Round 2 B4 诚实生命周期形状:派发只到 WAITING_REMOTE;SUCCEEDED 必须带
+    # 完成证明(懒完成由 runner.get() 评估,poll 端点纯透传)。
     handle = {"action_id": "act-1", "candidate_id": 42, "route": "zhaoshang",
               "mall": "comix", "original_url": "https://qx.com/a.html",
-              "status": "SUCCEEDED", "outcome": {"dispatch": {"outcome": "CREATED"}},
+              "status": "WAITING_REMOTE",
+              "outcome": {"dispatch": {"outcome": "CREATED", "priority_confirmed": True}},
               "started_at": "t", "finished_at": "t2"}
     runner = _FakeRunner(get_result=handle)
     _install_runner(monkeypatch, runner)
@@ -460,6 +463,22 @@ def test_poll_200_passthrough(client, monkeypatch):
     assert r.status_code == 200
     assert r.json() == handle
     assert r.headers["Cache-Control"] == "no-store"
+
+
+def test_poll_passthrough_succeeded_requires_completion_proof(client, monkeypatch):
+    handle = {"action_id": "act-2", "candidate_id": 42, "route": "staples-local",
+              "mall": "stbchina", "original_url": STAPLES_URL,
+              "status": "SUCCEEDED",
+              "outcome": {"outcome": "SUCCESS", "completion_proof": "cache_current",
+                          "result_id": 7},
+              "started_at": "t", "finished_at": "t2"}
+    runner = _FakeRunner(get_result=handle)
+    _install_runner(monkeypatch, runner)
+    r = client.get("/dashboard/api/prewarm/recrawl-actions/act-2")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["status"] == "SUCCEEDED"
+    assert body["outcome"]["completion_proof"] == "cache_current"
 
 
 def test_poll_unknown_404(client, monkeypatch):
@@ -519,7 +538,10 @@ def _build_tmp_runtime(runtime_root):
         "comix", "https://qx.com/item-a.html", source="daily-internet",
         succeeded_at=SUCCEEDED_AT, sku_status="CONFIRMED",
         real_sku_id="SKU-A", title="Title A", price="12.5")
-    upserted = prewarm.upsert_link("D1", "https://qx.com/item-a.html", mall="comix")
+    # business_date 显式对齐被查看日:Round-2 投影按当日 observation 集合取数,
+    # upsert 事务同步写入该文档日 observation(B2 范围语义)。
+    upserted = prewarm.upsert_link(
+        "D1", "https://qx.com/item-a.html", mall="comix", business_date=BUSINESS_DATE)
     candidate_id = int(upserted["candidate"]["id"])
     prewarm.record_candidate_result(
         candidate_id, cache_status=CACHE_STATUS_PENDING_PREWARM)

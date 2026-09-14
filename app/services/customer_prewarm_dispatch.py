@@ -100,6 +100,10 @@ from app.services.legacy_zhaoshang_adapter import (
     PriorityStatus,
     SubmitStatus,
 )
+from app.services.shared_crawl_cache import (
+    PRODUCER_CUSTOMER_PREWARM_ZHAOSHANG,
+    PRODUCER_MANUAL_RECRAWL_ZHAOSHANG,
+)
 from scripts.zhaoshang_mall_mapping import ZhaoshangMallMapping
 
 BACKEND_VERSION = "legacy-v1"
@@ -444,6 +448,30 @@ def _record(
     except Exception as exc:  # noqa: BLE001 - per-candidate isolation
         phase_errors.append(f"candidate {candidate_id}: {type(exc).__name__}: {exc}")
         return False
+
+
+def _record_remote_job_link(
+    prewarm_store: CustomerPrewarmStore,
+    business_date: str,
+    candidate_id: int,
+    job_id: int,
+    producer: str,
+    phase_errors: list[str],
+) -> None:
+    """Best-effort candidate↔remote-job linkage (Issue #13 Round 2).
+
+    Pure bookkeeping at every site where a candidate is bound to a remote job
+    id; a failure is collected into ``phase_errors`` and never breaks the
+    dispatch outcome (and never touches the candidate's cache_status).
+    """
+    try:
+        prewarm_store.record_remote_job_link(
+            business_date, int(candidate_id), int(job_id), producer
+        )
+    except Exception as exc:  # noqa: BLE001 - linkage is best-effort
+        phase_errors.append(
+            f"candidate {candidate_id} job link {job_id}: {type(exc).__name__}: {exc}"
+        )
 
 
 def validate_canary_preflight(
@@ -1224,6 +1252,14 @@ def _dispatch_mall_group(
         unfinished = (probe or {}).get("unfinished_bound")
         if unfinished is not None:
             job_id = int(unfinished["job"]["id"])
+            _record_remote_job_link(
+                prewarm_store,
+                summary["business_date"],
+                candidate_id,
+                job_id,
+                PRODUCER_CUSTOMER_PREWARM_ZHAOSHANG,
+                phase_errors,
+            )
             if _record(
                 prewarm_store,
                 candidate_id,
@@ -1238,6 +1274,18 @@ def _dispatch_mall_group(
                 reused_job_ids_this_pass.add(job_id)
             continue
         if (probe or {}).get("terminal_success"):
+            # Linkage uses the candidate's durable remote_job_id (the probe
+            # classifies terminal rows as booleans only); absent for jobs this
+            # dispatcher never bound — nothing is invented.
+            if candidate.get("remote_job_id") is not None:
+                _record_remote_job_link(
+                    prewarm_store,
+                    summary["business_date"],
+                    candidate_id,
+                    int(candidate["remote_job_id"]),
+                    PRODUCER_CUSTOMER_PREWARM_ZHAOSHANG,
+                    phase_errors,
+                )
             _record(
                 prewarm_store,
                 candidate_id,
@@ -1247,6 +1295,15 @@ def _dispatch_mall_group(
             )
             continue
         if (probe or {}).get("terminal_failed"):
+            if candidate.get("remote_job_id") is not None:
+                _record_remote_job_link(
+                    prewarm_store,
+                    summary["business_date"],
+                    candidate_id,
+                    int(candidate["remote_job_id"]),
+                    PRODUCER_CUSTOMER_PREWARM_ZHAOSHANG,
+                    phase_errors,
+                )
             _record(
                 prewarm_store,
                 candidate_id,
@@ -1374,6 +1431,14 @@ def _dispatch_mall_group(
     if claim is None:
         # Another writer dispatched this job: never double-POST.
         for entry in batch_entries:
+            _record_remote_job_link(
+                prewarm_store,
+                summary["business_date"],
+                int(entry["candidate"]["id"]),
+                int(job_row["id"]),
+                PRODUCER_CUSTOMER_PREWARM_ZHAOSHANG,
+                phase_errors,
+            )
             _record(
                 prewarm_store,
                 int(entry["candidate"]["id"]),
@@ -1392,6 +1457,14 @@ def _dispatch_mall_group(
             token, int(job_row["id"]), f"prewarm dispatch submit unknown: {diagnostic}"
         )
         for entry in batch_entries:
+            _record_remote_job_link(
+                prewarm_store,
+                summary["business_date"],
+                int(entry["candidate"]["id"]),
+                int(job_row["id"]),
+                PRODUCER_CUSTOMER_PREWARM_ZHAOSHANG,
+                phase_errors,
+            )
             _record(
                 prewarm_store,
                 int(entry["candidate"]["id"]),
@@ -1426,6 +1499,14 @@ def _dispatch_mall_group(
                 token, int(job_row["id"]), "prewarm dispatch submit returned incomplete identity"
             )
             for entry in batch_entries:
+                _record_remote_job_link(
+                    prewarm_store,
+                    summary["business_date"],
+                    int(entry["candidate"]["id"]),
+                    int(job_row["id"]),
+                    PRODUCER_CUSTOMER_PREWARM_ZHAOSHANG,
+                    phase_errors,
+                )
                 _record(
                     prewarm_store,
                     int(entry["candidate"]["id"]),
@@ -1446,6 +1527,14 @@ def _dispatch_mall_group(
             )
             store.advance_crawl_work_for_job(token, int(job_row["id"]), "PRIORITY_PENDING")
             for entry in batch_entries:
+                _record_remote_job_link(
+                    prewarm_store,
+                    summary["business_date"],
+                    int(entry["candidate"]["id"]),
+                    int(job_row["id"]),
+                    PRODUCER_CUSTOMER_PREWARM_ZHAOSHANG,
+                    phase_errors,
+                )
                 _record(
                     prewarm_store,
                     int(entry["candidate"]["id"]),
@@ -1476,6 +1565,14 @@ def _dispatch_mall_group(
             token, int(job_row["id"]), f"prewarm dispatch submit unknown status: {status}"
         )
         for entry in batch_entries:
+            _record_remote_job_link(
+                prewarm_store,
+                summary["business_date"],
+                int(entry["candidate"]["id"]),
+                int(job_row["id"]),
+                PRODUCER_CUSTOMER_PREWARM_ZHAOSHANG,
+                phase_errors,
+            )
             _record(
                 prewarm_store,
                 int(entry["candidate"]["id"]),
@@ -1633,16 +1730,23 @@ def _boost_reused_job(
     summary: dict[str, Any],
     canary_scope: CanaryScope | None = None,
     canary_budget: CanaryLiveBudget | None = None,
-) -> None:
-    """One idempotent priority boost for a reused job (fail-closed)."""
+) -> bool | None:
+    """One idempotent priority boost for a reused job (fail-closed).
+
+    Issue #13 Round 2 additive tri-state return (existing counters/callers
+    unchanged): ``True`` = proven (status UPDATED/ALREADY_HIGHEST);
+    ``False`` = attempted-but-unconfirmed, budget-deferred, canary-blocked,
+    or the failure path; ``None`` = not actionable (missing job, missing
+    identity, or a non-boostable state the existing lifecycle owns).
+    """
     phase_errors = summary["phase_errors"]
     try:
         job_row = store.get_remote_job(job_id)
         if job_row is None:
-            return
+            return None
         identity = str(job_row.get("remote_identity") or "").strip()
         if not identity or str(job_row.get("state") or "") not in _BOOSTABLE_JOB_STATES:
-            return  # the existing lifecycle owns identity-less / terminal jobs
+            return None  # the existing lifecycle owns identity-less / terminal jobs
         adapter = get_adapter()
         prepared = _reconstruct_prepared_job(adapter, business_date, job_row)
         parts = identity.split("|")
@@ -1664,7 +1768,7 @@ def _boost_reused_job(
                 f"boost job {job_id}: {CANARY_PRIORITY_SCOPE_VIOLATION} "
                 f"(job mall evidence does not prove {canary_scope.only_mall!r})"
             )
-            return
+            return False
         if canary_budget is not None:
             # Second canary layer (per call): the job's durable payload
             # (mall, url) pairs must all sit inside the preflight budget
@@ -1683,19 +1787,21 @@ def _boost_reused_job(
         status = _status_value(priority.status)
         if status in (PriorityStatus.UPDATED.value, PriorityStatus.ALREADY_HIGHEST.value):
             summary["priority_boosted"] += 1
-        else:
-            summary["priority_unconfirmed"] += 1
-            diagnostic = str(getattr(priority, "diagnostic", "") or "highest priority was not confirmed")
-            _record(
-                prewarm_store,
-                candidate_id,
-                cache_status=CACHE_STATUS_REMOTE_REUSED,
-                remote_job_id=job_id,
-                error=f"{_PRIORITY_UNCONFIRMED_PREFIX}: {diagnostic}",
-                phase_errors=phase_errors,
-            )
+            return True
+        summary["priority_unconfirmed"] += 1
+        diagnostic = str(getattr(priority, "diagnostic", "") or "highest priority was not confirmed")
+        _record(
+            prewarm_store,
+            candidate_id,
+            cache_status=CACHE_STATUS_REMOTE_REUSED,
+            remote_job_id=job_id,
+            error=f"{_PRIORITY_UNCONFIRMED_PREFIX}: {diagnostic}",
+            phase_errors=phase_errors,
+        )
+        return False
     except Exception as exc:  # noqa: BLE001 - boost failure never fails the pass
         phase_errors.append(f"boost job {job_id}: {type(exc).__name__}: {exc}")
+        return False
 
 
 # ---- Issue #13 Slice B: guarded single-URL manual recrawl ---------------------
@@ -1887,7 +1993,15 @@ def _dispatch_exact_leased(
     if unfinished is not None:
         job = unfinished.get("job") or {}
         job_id = int(job.get("id") or 0)
-        _boost_reused_job(
+        _record_remote_job_link(
+            prewarm_store,
+            business_date,
+            candidate_id,
+            job_id,
+            PRODUCER_MANUAL_RECRAWL_ZHAOSHANG,
+            phase_errors,
+        )
+        boost_proven = _boost_reused_job(
             prewarm_store=prewarm_store,
             store=store,
             token=token,
@@ -1902,6 +2016,9 @@ def _dispatch_exact_leased(
         summary["outcome"] = "REUSED"
         summary["remote_job_id"] = job_id
         summary["remote_identity"] = str(job.get("remote_identity") or "")
+        # Issue #13 Round 2: surface the honest boost proof (True=proven,
+        # False=unconfirmed/failed, None=not actionable) for the caller.
+        summary["priority_proven"] = boost_proven
         return summary
 
     mapping = next((m for m in mappings if m.mall_key == mall_key), None)
@@ -2026,6 +2143,15 @@ def _dispatch_exact_leased(
             note = "manual recrawl submit returned incomplete identity"
             diagnostic = diagnostic or "incomplete identity"
         store.mark_submit_unknown(token, job_id, note)
+        # The job exists (POST may have landed): record the linkage either way.
+        _record_remote_job_link(
+            prewarm_store,
+            business_date,
+            candidate_id,
+            job_id,
+            PRODUCER_MANUAL_RECRAWL_ZHAOSHANG,
+            phase_errors,
+        )
         summary["outcome"] = "SUBMIT_UNKNOWN"
         summary["diagnostic"] = diagnostic
         return summary
@@ -2051,6 +2177,14 @@ def _dispatch_exact_leased(
             token, job_id, remote_identity=remote_identity, state="PRIORITY_PENDING"
         )
         store.advance_crawl_work_for_job(token, job_id, "PRIORITY_PENDING")
+        _record_remote_job_link(
+            prewarm_store,
+            business_date,
+            candidate_id,
+            job_id,
+            PRODUCER_MANUAL_RECRAWL_ZHAOSHANG,
+            phase_errors,
+        )
         confirmed = _confirm_pending_priority_job(
             prewarm_store=prewarm_store,
             store=store,
