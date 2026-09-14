@@ -148,5 +148,12 @@ jobs:
           tests/test_staples_prewarm.py
           tests/test_customer_prewarm_integration.py
           tests/test_refresh_v2_cross_contract.py
+          # 2026-09-14 Issue #13 新增 5 个文件（预爬看板 projection/手动重爬/
+          # 精确派发/API+页面 smoke）
+          tests/test_prewarm_dashboard_projection.py
+          tests/test_prewarm_manual_recrawl.py
+          tests/test_customer_prewarm_dispatch_exact.py
+          tests/test_prewarm_dashboard_api.py
+          tests/test_prewarm_page_smoke.py
           --deselect "tests/test_remote_running_recovery.py::test_default_dependencies_wire_probe_and_write_gated_restart"
           -q -l --timeout=600 --timeout-method=thread

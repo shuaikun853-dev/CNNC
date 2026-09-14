@@ -33,6 +33,17 @@ from app.services.dashboard_projection import (
     empty_customer_price_projection,
     project_customer_price,
 )
+# Issue #13(2026-09-14):预爬看板只读投影 + 手动重爬 runner;模块级导入,
+# 测试通过 monkeypatch app.dashboard_api 属性注入替身(与 build_dashboard_summary 同约定)。
+from app.services.prewarm_dashboard_projection import (
+    build_prewarm_dashboard_summary,
+    get_prewarm_link_detail,
+    list_prewarm_links,
+)
+from app.services.prewarm_manual_recrawl import (
+    ManualRecrawlError,
+    get_manual_recrawl_runner,
+)
 from app.services.incremental_audit_runtime import runtime_paths
 from app.services.production_identity import get_production_identity_service
 from app.services.saas_flow_diagnostic import get_saas_flow_diagnostic
@@ -80,8 +91,10 @@ def _today() -> str:
 
 
 # 静态资源 cache busting:磁盘 index.html 不手写 ?v=(保持纯静态契约),
-# 由服务端注入 app.css/app.js 的 mtime_ns 版本——文件更新 → URL 变 → 浏览器必拉新。
-_DASHBOARD_ASSETS = ("app.css", "app.js")
+# 由服务端注入 shell.css/app.css/app.js 的 mtime_ns 版本——文件更新 → URL 变 →
+# 浏览器必拉新。shell.css 为 Issue #13 多页外壳抽取(Issue #13 前的 index.html
+# 不引用它,replace() 缺失时为 no-op,旧页面不受影响)。
+_DASHBOARD_ASSETS = ("shell.css", "app.css", "app.js")
 
 
 def _asset_version(path: Path) -> str:
@@ -654,3 +667,217 @@ def dashboard_action_status(action_id: str) -> JSONResponse:
         return JSONResponse(durable, headers=_NO_STORE)
     raise HTTPException(status_code=404, detail={
         "error_code": "ACTION_NOT_FOUND", "message": "未找到该操作记录"})
+
+
+# ======================================================================
+# Issue #13(2026-09-14):客户链接预爬页 + 只读投影 API + 受控手动重爬。
+# 薄适配层铁律:本文件无 SQL、无状态解释——只做参数白名单校验、委托
+# app.services.prewarm_dashboard_projection(只读投影)/
+# app.services.prewarm_manual_recrawl(受控单 URL 重爬)与错误码映射。
+# ======================================================================
+
+_PREWARM_PAGE_ASSETS = ("shell.css", "prewarm.css", "prewarm.js")
+# links 列表查询参数白名单:date + 分页 + 过滤;其余一律 400。
+_PREWARM_LINK_ALLOWED_PARAMS = frozenset({
+    "date", "page", "page_size", "mall", "status", "source",
+    "missing_title", "unverified_sku", "unresolved_sku", "failure", "cache_miss",
+})
+# 布尔型过滤参数只接受 "1"/"true"(大小写不敏感),其余 400 BAD_FILTER_PARAM。
+_PREWARM_BOOL_FILTER_PARAMS = frozenset({
+    "missing_title", "unverified_sku", "unresolved_sku", "failure", "cache_miss",
+})
+_PREWARM_PAGE_SIZE_MAX = 200
+
+
+class _PrewarmRecrawlBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    business_date: str | None = None
+    expected_original_url: str | None = None
+    expected_status: str | None = None
+
+
+def _prewarm_page_html() -> str:
+    """prewarm.html + 静态资源 mtime 版本注入(与 _dashboard_index_html 同法)。"""
+    html = (_STATIC_DIR / "prewarm.html").read_text(encoding="utf-8")
+    for name in _PREWARM_PAGE_ASSETS:
+        version = _asset_version(_STATIC_DIR / name)
+        html = html.replace(f"/dashboard/static/{name}", f"/dashboard/static/{name}?v={version}")
+    return html
+
+
+@router.get("/prewarm", include_in_schema=True)
+def prewarm_page() -> HTMLResponse:
+    return HTMLResponse(_prewarm_page_html(), headers={"Cache-Control": "no-cache"})
+
+
+@router.get("/api/prewarm/summary")
+def prewarm_summary(request: Request, date: str = Query(default=None)) -> Response:
+    """预爬 KPI 只读摘要:降级负载是投影层的正常 200 返回,只有意外异常才 503。"""
+    unknown = set(request.query_params.keys()) - {"date"}
+    if unknown:
+        raise HTTPException(status_code=400, detail={
+            "error_code": "UNKNOWN_QUERY_PARAM",
+            "message": "不支持的查询参数:" + ",".join(sorted(unknown))
+                       + ";本接口只接受 date(YYYY-MM-DD)"})
+    business_date = date or _today()
+    if not _valid_business_date(business_date):
+        raise HTTPException(status_code=400, detail={
+            "error_code": "BAD_BUSINESS_DATE", "message": "business_date 必须为合法的 YYYY-MM-DD 日历日期"})
+    try:
+        payload = build_prewarm_dashboard_summary(business_date)
+    except Exception as exc:  # 只读投影失败统一降级,不暴露堆栈
+        raise HTTPException(status_code=503, detail={
+            "error_code": "PREWARM_SUMMARY_READ_FAILED", "message": "预爬状态读取失败,请稍后重试",
+            "type": type(exc).__name__}) from exc
+    return JSONResponse(payload, headers=_NO_STORE)
+
+
+@router.get("/api/prewarm/links")
+def prewarm_links(
+    request: Request,
+    date: str = Query(default=None),
+    page: str = Query(default=None),
+    page_size: str = Query(default=None),
+    mall: str = Query(default=None),
+    status: str = Query(default=None),
+    source: str = Query(default=None),
+    missing_title: str = Query(default=None),
+    unverified_sku: str = Query(default=None),
+    unresolved_sku: str = Query(default=None),
+    failure: str = Query(default=None),
+    cache_miss: str = Query(default=None),
+) -> Response:
+    """预爬链接分页列表(服务端过滤);分页/过滤全部在投影层完成,此处只校验。"""
+    unknown = set(request.query_params.keys()) - _PREWARM_LINK_ALLOWED_PARAMS
+    if unknown:
+        raise HTTPException(status_code=400, detail={
+            "error_code": "UNKNOWN_QUERY_PARAM",
+            "message": "不支持的查询参数:" + ",".join(sorted(unknown))
+                       + ";本接口只接受 date/page/page_size 与过滤参数"})
+    business_date = date or _today()
+    if not _valid_business_date(business_date):
+        raise HTTPException(status_code=400, detail={
+            "error_code": "BAD_BUSINESS_DATE", "message": "business_date 必须为合法的 YYYY-MM-DD 日历日期"})
+    page_value = 1
+    if page is not None:
+        try:
+            page_value = int(page)
+        except ValueError:
+            raise HTTPException(status_code=400, detail={
+                "error_code": "BAD_PAGE_PARAM", "message": "page 必须为 ≥1 的整数"})
+        if page_value < 1:
+            raise HTTPException(status_code=400, detail={
+                "error_code": "BAD_PAGE_PARAM", "message": "page 必须为 ≥1 的整数"})
+    page_size_value = 50
+    if page_size is not None:
+        try:
+            page_size_value = int(page_size)
+        except ValueError:
+            raise HTTPException(status_code=400, detail={
+                "error_code": "BAD_PAGE_SIZE_PARAM", "message": "page_size 必须为 1..200 的整数"})
+        if not 1 <= page_size_value <= _PREWARM_PAGE_SIZE_MAX:
+            raise HTTPException(status_code=400, detail={
+                "error_code": "BAD_PAGE_SIZE_PARAM", "message": "page_size 必须为 1..200 的整数"})
+    filters: dict = {}
+    for key, value in (("mall", mall), ("status", status), ("source", source)):
+        if value is not None and value.strip():
+            filters[key] = value.strip()
+    for key, value in (("missing_title", missing_title),
+                       ("unverified_sku", unverified_sku),
+                       ("unresolved_sku", unresolved_sku),
+                       ("failure", failure), ("cache_miss", cache_miss)):
+        if value is None:
+            continue
+        lowered = value.strip().lower()
+        if lowered not in ("1", "true"):
+            raise HTTPException(status_code=400, detail={
+                "error_code": "BAD_FILTER_PARAM",
+                "message": key + " 仅接受 1 或 true"})
+        filters[key] = True
+    try:
+        payload = list_prewarm_links(
+            business_date, page=page_value, page_size=page_size_value, filters=filters)
+    except Exception as exc:  # 只读投影失败统一降级,不暴露堆栈
+        raise HTTPException(status_code=503, detail={
+            "error_code": "PREWARM_LINKS_READ_FAILED", "message": "预爬链接读取失败,请稍后重试",
+            "type": type(exc).__name__}) from exc
+    return JSONResponse(payload, headers=_NO_STORE)
+
+
+@router.get("/api/prewarm/links/{candidate_id}")
+def prewarm_link_detail(
+    request: Request, candidate_id: int, date: str = Query(default=None)
+) -> Response:
+    unknown = set(request.query_params.keys()) - {"date"}
+    if unknown:
+        raise HTTPException(status_code=400, detail={
+            "error_code": "UNKNOWN_QUERY_PARAM",
+            "message": "不支持的查询参数:" + ",".join(sorted(unknown))
+                       + ";本接口只接受 date(YYYY-MM-DD)"})
+    business_date = date or _today()
+    if not _valid_business_date(business_date):
+        raise HTTPException(status_code=400, detail={
+            "error_code": "BAD_BUSINESS_DATE", "message": "business_date 必须为合法的 YYYY-MM-DD 日历日期"})
+    try:
+        payload = get_prewarm_link_detail(business_date, int(candidate_id))
+    except Exception as exc:  # 只读投影失败统一降级,不暴露堆栈
+        raise HTTPException(status_code=503, detail={
+            "error_code": "PREWARM_LINK_READ_FAILED", "message": "预爬链接读取失败,请稍后重试",
+            "type": type(exc).__name__}) from exc
+    if payload is None:
+        raise HTTPException(status_code=404, detail={
+            "error_code": "PREWARM_LINK_NOT_FOUND",
+            "message": f"业务日期 {business_date} 下不存在候选 {candidate_id}"})
+    return JSONResponse(payload, headers=_NO_STORE)
+
+
+@router.post("/api/prewarm/links/{candidate_id}/recrawl")
+def prewarm_link_recrawl(
+    request: Request, candidate_id: int, body: _PrewarmRecrawlBody | None = None
+) -> JSONResponse:
+    _guard_operator_action(request, "prewarm-recrawl")
+    business_date = _resolve_action_body_date(body.business_date if body is not None else None)
+    if not _valid_business_date(business_date):
+        raise HTTPException(status_code=400, detail={
+            "error_code": "BAD_BUSINESS_DATE",
+            "message": "business_date 必须为合法的 YYYY-MM-DD 日历日期"})
+    try:
+        handle = get_manual_recrawl_runner().start(
+            business_date,
+            candidate_id=int(candidate_id),
+            expected_original_url=body.expected_original_url if body is not None else None,
+            expected_status=body.expected_status if body is not None else None,
+        )
+    except ManualRecrawlError as exc:
+        status_by_code = {
+            "CANDIDATE_NOT_FOUND": 404,
+            "STALE_PREWARM_LINK": 409,
+            "ACTION_IN_FLIGHT": 409,
+            "RECAL_NOT_SUPPORTED": 400,
+            "STATE_DB_MISSING": 409,
+        }
+        detail: dict = {"error_code": exc.code, "message": str(exc)}
+        if exc.code == "ACTION_IN_FLIGHT":
+            detail["existing_action_id"] = exc.existing_action_id
+        raise HTTPException(
+            status_code=status_by_code.get(exc.code, 500), detail=detail) from exc
+    return JSONResponse(
+        {"action_id": handle["action_id"], "status": handle["status"],
+         "route": handle["route"], "mall": handle["mall"],
+         "poll": f"/dashboard/api/prewarm/recrawl-actions/{handle['action_id']}"},
+        status_code=202, headers=_NO_STORE)
+
+
+@router.get("/api/prewarm/recrawl-actions/{action_id}")
+def prewarm_recrawl_action_status(request: Request, action_id: str) -> JSONResponse:
+    if request.query_params:
+        unknown = sorted(request.query_params.keys())
+        raise HTTPException(status_code=400, detail={
+            "error_code": "UNKNOWN_QUERY_PARAM",
+            "message": "不支持的查询参数:" + ",".join(unknown)
+                       + ";本接口不接受任何查询参数"})
+    handle = get_manual_recrawl_runner().get(action_id)
+    if handle is None:
+        raise HTTPException(status_code=404, detail={
+            "error_code": "ACTION_NOT_FOUND", "message": "未找到该操作记录"})
+    return JSONResponse(handle, headers=_NO_STORE)
