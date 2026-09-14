@@ -613,14 +613,16 @@ def test_get_routes_zero_write_against_real_projection(client, monkeypatch, tmp_
     assert r_detail.json()["candidate_id"] == 1
 
     after = _snapshot(runtime_root)
-    # 零写铁律:三个库文件字节级不变(无 checkpoint/无新行/无 schema 变化)。
+    # 零业务写契约(与投影模块 docstring 一致):三个主库字节级不变
+    # (无 checkpoint/无新行/无 schema 变化/无内容改写)。
     # snapshot key 用 Path 拼接,与 _snapshot 的 str(relative_to) 同一字符串化规则。
     for name in ("customer_prewarm.sqlite3", "shared_crawl_cache.sqlite3",
                  str(Path(BUSINESS_DATE) / "state.sqlite3")):
         assert after[name] == before[name], name
-    # mode=ro 读 WAL 库时 SQLite 会按读语义创建 -shm/-wal 读辅助文件
-    # (不是模块写入;生产 runtime 中 writer 常驻本就存在)。除这两个库的
-    # 读辅助文件外,零新建、零删除、其余文件字节级不变。
+    # WAL 平台事实(customer_prewarm_discovery 同款现象):mode=ro 打开 WAL 库
+    # 时 SQLite 读端可能物化瞬态 -shm/-wal 读辅助文件——平台读端产物,
+    # 非业务写、非内容变化。唯一允许的新文件就是这些读辅助文件;
+    # 此外零新建、零删除,主库哈希一律不变。
     allowed_new = {
         "customer_prewarm.sqlite3-shm", "customer_prewarm.sqlite3-wal",
         "shared_crawl_cache.sqlite3-shm", "shared_crawl_cache.sqlite3-wal",

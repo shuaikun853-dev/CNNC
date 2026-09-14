@@ -12,24 +12,46 @@ that re-crawls EXACTLY ONE prewarm link URL:
 - zhaoshang route: :func:`~app.services.customer_prewarm_dispatch.dispatch_single_candidate_exact`
   (probe → reuse+boost | create exactly one single-URL job + submit + priority
   proof).  Dispatch is NOT success — the outcome dict is passed through
-  verbatim into an honest lifecycle (Issue #13 Review Round 2, Blocker 4):
+  verbatim into an honest lifecycle (Issue #13 Review Round 2, Blocker 4;
+  Round 3 D12 classification):
 
-  - ``CREATED`` with ``priority_confirmed`` / ``REUSED`` with
-    ``priority_proven`` → ``WAITING_REMOTE`` (priority -1 proven; the remote
-    crawl is legitimately still pending).
-  - ``CREATED`` unconfirmed / ``REUSED`` unproven → ``PRIORITY_PENDING``
-    (honest waiting — never displayed as success, never auto-flipped; the
-    operator may start a NEW action later whose probe/boost may prove -1).
+  - ``CREATED`` with ``priority_confirmed`` → ``WAITING_REMOTE`` (priority -1
+    proven; the remote crawl is legitimately still pending); unconfirmed →
+    ``PRIORITY_PENDING``.
+  - ``REUSED`` with ``priority_proven`` ``True`` → ``WAITING_REMOTE``;
+    ``False`` → ``PRIORITY_PENDING``; ``None`` → ``WAITING_REMOTE`` only when
+    the re-probe found a terminal SUCCESS crawl row
+    (``job_terminal_success``, noted as ``priority_moot_terminal_success``),
+    otherwise honestly ``FAILED`` — a non-boostable reuse would otherwise
+    wait forever.
   - every other outcome (``SUBMIT_UNKNOWN``, ``LOCK_BUSY``, …) → ``FAILED``
     with the dispatch dict verbatim; no second POST ever.
 
-  While ``WAITING_REMOTE``, every :meth:`ManualRecrawlRunner.get` lazily
-  re-evaluates completion: the shared crawl cache is opened READ-ONLY and
-  ``lookup_current`` is probed with the SAME mall/URL derivation as at start;
-  a current success with ``succeeded_at >= handle.started_at`` is the ONLY
-  proof of ``SUCCEEDED`` (``completion_proof="cache_current"`` plus a
-  ``new_result`` summary).  Nothing is ever written by the action itself —
-  the eventual remote-side sync owns the new row.  Poll-driven only (no
+  While ``WAITING_REMOTE`` the (route, original_url) in-flight key stays
+  HELD (Round 3 D8): a second start for the same URL fails with
+  ``ACTION_IN_FLIGHT`` until the action turns terminal.  Every
+  :meth:`ManualRecrawlRunner.get` lazily re-evaluates, in order:
+
+  1. the dispatched remote job's owning state DB
+     (``runtime_root/<job_business_date>/state.sqlite3``, opened READ-ONLY
+     per the dispatch contract's ``remote_job_id`` + ``job_business_date``;
+     ``CREATED`` jobs are same-day and default to the action's own day):
+     a terminal ``FAILED`` job honestly fails the action
+     (``failed_by="remote_job_terminal_failed"``, Round 3 D9) instead of
+     waiting forever; a missing/unreadable DB only notes
+     ``last_check_error`` and keeps waiting (never raises).
+  2. the shared crawl cache, opened READ-ONLY, probed with the SAME
+     mall/URL derivation as at start: a current success with
+     ``succeeded_at >= handle.started_at`` AND ``producer ==
+     "manual-recrawl-zhaoshang"`` is the ONLY proof of ``SUCCEEDED``
+     (``completion_proof="cache_current"`` plus a ``new_result`` summary;
+     Round 3 D10).  A qualifying-time current row from ANY other producer is
+     NOT a completion: it only notes ``superseded_current_producer`` once
+     and the action keeps waiting (D9 resolves it if the manual job failed).
+
+  Every lazy terminal flip appends a durable ``completed`` JSONL event
+  (Round 3 D11).  Nothing is ever written by the action itself — the
+  eventual remote-side sync owns the new row.  Poll-driven only (no
   background thread); evaluation never raises.
 
   Candidate ``cache_status`` is never written on either route.
@@ -38,7 +60,8 @@ Guards run synchronously in :meth:`ManualRecrawlRunner.start` and fail closed
 with :class:`ManualRecrawlError`: missing prewarm DB → ``STATE_DB_MISSING``,
 unknown candidate → ``CANDIDATE_NOT_FOUND``, stale operator link/status →
 ``STALE_PREWARM_LINK``, staples/tmall/unmapped URL → ``RECRAWL_NOT_SUPPORTED``,
-same URL already being re-crawled → ``ACTION_IN_FLIGHT``.
+same URL already being re-crawled (non-terminal action, D8) →
+``ACTION_IN_FLIGHT``.
 
 Durability & isolation: every action appends a JSONL intent/finish record
 under ``<runtime_root>/customer_prewarm/manual_recrawl_actions.jsonl``
@@ -89,16 +112,25 @@ ROUTE_ZHAOSHANG = "zhaoshang"
 ACTIONS_DIR_NAME = "customer_prewarm"
 ACTIONS_LOG_NAME = "manual_recrawl_actions.jsonl"
 
-# Honest dispatch→lifecycle mapping (Blocker 4): dispatch is never success by
-# itself.  ``CREATED``/``REUSED`` mean the remote side is legitimately pending
-# (WAITING_REMOTE when priority -1 is proven, PRIORITY_PENDING otherwise);
-# every other outcome is an honest failure with the dispatch dict passed
-# through verbatim.
+# Honest dispatch→lifecycle mapping (Blocker 4 + Round 3 D12): dispatch is
+# never success by itself.  ``CREATED``/``REUSED`` (priority proven/confirmed)
+# mean the remote side is legitimately pending (WAITING_REMOTE) or honestly
+# awaiting an operator retry (PRIORITY_PENDING); ``REUSED`` unproven-``None``
+# is a FAILED unless the re-probe found a terminal SUCCESS row; every other
+# outcome is an honest failure with the dispatch dict passed through verbatim.
 _DISPATCH_WAITING_OUTCOME = "CREATED"
 _DISPATCH_REUSED_OUTCOME = "REUSED"
 
+# Terminal remote_jobs state that honestly fails a WAITING_REMOTE action
+# (Round 3 D9); terminal set per the projection: {COMPLETED, FAILED}.
+_REMOTE_JOB_FAILED_STATE = "FAILED"
+
+# ``outcome["failed_by"]`` label when the dispatched remote job itself ended
+# terminal FAILED (Round 3 D9).
+FAILED_BY_REMOTE_JOB_TERMINAL = "remote_job_terminal_failed"
+
 # Lazy-completion proof label: SUCCEEDED is only ever backed by a shared-cache
-# current row newer than the action started.
+# current row newer than the action started (and produced by this route).
 COMPLETION_PROOF_CACHE_CURRENT = "cache_current"
 
 _STAPLES_LOCK_OWNER_COMMAND = "prewarm_manual_recrawl"
@@ -251,10 +283,13 @@ class ManualRecrawlRunner:
         """One action handle (with ``outcome``/``finished_at`` once done) or None.
 
         Poll-driven completion: while the status is ``WAITING_REMOTE`` every
-        call lazily re-evaluates the shared cache read-only for a new current
-        success (see :meth:`_evaluate_waiting_remote_locked`); the handle is
-        mutated under the runner lock.  ``PRIORITY_PENDING`` never auto-flips
-        and no dispatch is ever re-run here.
+        call lazily re-evaluates, first the dispatched remote job's owning
+        state DB (terminal FAILED → FAILED, D9) then the shared cache
+        read-only for a new manual-producer current success (D10); terminal
+        flips release the in-flight key (D8) and append the ``completed``
+        JSONL event (D11).  The handle is mutated under the runner lock.
+        ``PRIORITY_PENDING`` never auto-flips and no dispatch is ever re-run
+        here.
         """
         with self._lock:
             handle = self._actions.get(str(action_id))
@@ -297,10 +332,25 @@ class ManualRecrawlRunner:
             handle["status"] = status
             handle["outcome"] = outcome_summary
             handle["finished_at"] = _utcnow_iso()
-            key = (handle["route"], handle["original_url"])
-            if self._inflight.get(key) == action_id:
-                del self._inflight[key]
+            # D8: WAITING_REMOTE keeps holding the in-flight key (the remote
+            # job is legitimately still pending); every worker-end state an
+            # operator can act on — SUCCEEDED, PRIORITY_PENDING, FAILED —
+            # releases it immediately.
+            if status != "WAITING_REMOTE":
+                self._release_inflight_locked(handle)
         self._append_log(self._log_record(handle, "finished"))
+
+    def _release_inflight_locked(self, handle: dict[str, Any]) -> None:
+        """Drop the (route, original_url) in-flight key for one action (D8).
+
+        MUST be called with ``self._lock`` held: the key is released in the
+        same critical section that makes the terminal flip visible, so a new
+        start for the same URL is possible exactly when no live action can
+        still produce a result for it.
+        """
+        key = (handle["route"], handle["original_url"])
+        if self._inflight.get(key) == handle["action_id"]:
+            del self._inflight[key]
 
     def _run_staples_action(self, handle: dict[str, Any]) -> tuple[str, dict[str, Any]]:
         """Local crawl of the exact URL; on success one cache write, else none.
@@ -467,11 +517,19 @@ class ManualRecrawlRunner:
     def _classify_dispatch_result(result: dict[str, Any]) -> tuple[str, dict[str, Any]]:
         """Map one dispatch result dict to (status, outcome) honestly.
 
-        - CREATED & priority_confirmed / REUSED & priority_proven →
-          WAITING_REMOTE (remote crawl legitimately pending);
-        - CREATED unconfirmed / REUSED unproven (``False`` or ``None``) →
-          PRIORITY_PENDING (priority -1 NOT proven; never auto-flipped — a
-          NEW action's probe/boost may prove it later);
+        - CREATED & ``priority_confirmed`` / REUSED & ``priority_proven``
+          (True) → WAITING_REMOTE (remote crawl legitimately pending);
+        - CREATED unconfirmed / REUSED ``False`` → PRIORITY_PENDING
+          (priority -1 NOT proven; never auto-flipped — a NEW action's
+          probe/boost may prove it later);
+        - REUSED with ``priority_proven None`` (Round 3 D12): the reuse was
+          NOT boostable (e.g. SUBMIT_UNKNOWN / retryable) OR the job already
+          reached terminal SUCCESS (the re-probe's ``job_terminal_success``).
+            - terminal SUCCESS → WAITING_REMOTE (noted
+              ``priority_moot_terminal_success``): priority is moot, the
+              cache proof decides completion lazily;
+            - otherwise → FAILED with the dispatch dict verbatim — an
+              unproven, non-terminal reuse would otherwise wait forever;
         - anything else → FAILED with the dispatch dict verbatim.
         """
         summary: dict[str, Any] = {"dispatch": result}
@@ -483,7 +541,12 @@ class ManualRecrawlRunner:
         if outcome == _DISPATCH_REUSED_OUTCOME:
             if result.get("priority_proven") is True:
                 return "WAITING_REMOTE", summary
-            return "PRIORITY_PENDING", summary
+            if result.get("priority_proven") is False:
+                return "PRIORITY_PENDING", summary
+            if result.get("job_terminal_success") is True:
+                summary["priority_moot_terminal_success"] = True
+                return "WAITING_REMOTE", summary
+            return "FAILED", summary
         return "FAILED", summary
 
     # ---- lazy completion (poll-driven; WAITING_REMOTE only) ----------------------
@@ -509,18 +572,99 @@ class ManualRecrawlRunner:
             pass
         return mall, urls
 
+    def _remote_job_terminal_state_locked(self, handle: dict[str, Any]) -> str | None:
+        """Read-only probe of the dispatched remote job's state (Round 3 D9).
+
+        Resolves the job through ``outcome["dispatch"]`` (the F2 contract:
+        ``remote_job_id`` + ``job_business_date`` — ``cross_day`` always
+        travels with a date), opens
+        ``runtime_root/<job_business_date>/state.sqlite3`` in ``mode=ro`` and
+        returns the ``remote_jobs.state`` string, or ``None`` when the action
+        has no resolvable remote reference or the row is missing.  ``CREATED``
+        summaries are same-day by construction and carry no
+        ``job_business_date`` — the handle's own ``business_date`` is then
+        used, so CREATED actions are covered by this probe too (Round 3 F4).
+        A missing or unreadable state DB notes ``last_check_error`` and
+        returns None — this probe NEVER raises and NEVER fails the action by
+        itself.
+
+        MUST be called with ``self._lock`` held (mutates ``handle["outcome"]``).
+        """
+        dispatch = (handle.get("outcome") or {}).get("dispatch")
+        if not isinstance(dispatch, dict):
+            return None
+        remote_job_id = dispatch.get("remote_job_id")
+        if remote_job_id is None:
+            return None  # no resolvable remote reference → cache-proof path only
+        job_business_date = str(
+            dispatch.get("job_business_date") or handle.get("business_date") or ""
+        )
+        if not job_business_date:
+            return None
+        state_db = Path(self.runtime_root) / job_business_date / "state.sqlite3"
+        try:
+            from app.services.customer_prewarm_discovery import _open_state_db_readonly
+
+            connection = _open_state_db_readonly(state_db)
+            if connection is None:
+                raise FileNotFoundError(f"state DB not found: {state_db}")
+            try:
+                row = connection.execute(
+                    "SELECT state FROM remote_jobs WHERE id=?",
+                    (int(remote_job_id),),
+                ).fetchone()
+            finally:
+                connection.close()
+        except Exception as exc:  # noqa: BLE001 - missing/unreadable DB keeps waiting
+            outcome = dict(handle.get("outcome") or {})
+            outcome["last_check_error"] = f"{type(exc).__name__}: {exc}"
+            handle["outcome"] = outcome
+            return None
+        if row is None:
+            return None  # job row vanished from the owning day — keep waiting
+        return str(row["state"] or "")
+
+    def _complete_terminal_locked(self, handle: dict[str, Any]) -> None:
+        """Shared terminal-flip tail for lazy evaluation (D8/D11).
+
+        MUST be called with ``self._lock`` held, AFTER ``handle["status"]``
+        was flipped: stamps ``finished_at``, releases the in-flight key in the
+        same critical section (D8) and appends the durable ``completed``
+        JSONL event (D11, best-effort).
+        """
+        handle["finished_at"] = _utcnow_iso()
+        self._release_inflight_locked(handle)
+        self._append_log(self._log_record(handle, "completed"))
+
     def _evaluate_waiting_remote_locked(self, handle: dict[str, Any]) -> None:
         """Poll-driven lazy completion for one WAITING_REMOTE handle.
 
-        Opens the shared crawl cache READ-ONLY (never writes), probes
-        ``lookup_current`` and flips the handle to SUCCEEDED only when the
-        current row's ``succeeded_at`` parses to a datetime >= the action's
-        ``started_at``.  Never raises: any evaluation error keeps
-        WAITING_REMOTE and notes ``outcome["last_check_error"]``.  Never
-        re-dispatches and never flips PRIORITY_PENDING.
+        Order (Round 3): first the dispatched remote job's terminal state
+        (D9 — a remote FAILED honestly fails the action), then the shared
+        crawl cache READ-ONLY: ``lookup_current`` is probed and flips the
+        handle to SUCCEEDED only when the current row's ``succeeded_at``
+        parses to a datetime >= the action's ``started_at`` AND its
+        ``producer`` is exactly ``PRODUCER_MANUAL_RECRAWL_ZHAOSHANG``
+        (D10 — another producer's new current row is only noted as
+        ``superseded_current_producer``, once, and the action keeps waiting).
+        Never raises: any evaluation error keeps WAITING_REMOTE and notes
+        ``outcome["last_check_error"]``.  Never re-dispatches and never flips
+        PRIORITY_PENDING.  Staples actions never enter here (they end
+        synchronously in the worker with their own completion proof).
         """
+        remote_state = self._remote_job_terminal_state_locked(handle)
+        if remote_state is not None and remote_state.upper() == _REMOTE_JOB_FAILED_STATE:
+            outcome = dict(handle.get("outcome") or {})
+            outcome["failed_by"] = FAILED_BY_REMOTE_JOB_TERMINAL
+            handle["outcome"] = outcome
+            handle["status"] = "FAILED"
+            self._complete_terminal_locked(handle)
+            return
         try:
-            from app.services.shared_crawl_cache import SharedCrawlCache
+            from app.services.shared_crawl_cache import (
+                PRODUCER_MANUAL_RECRAWL_ZHAOSHANG,
+                SharedCrawlCache,
+            )
 
             mall, urls = self._completion_lookup_targets(handle)
             started = datetime.fromisoformat(str(handle["started_at"]))
@@ -543,6 +687,17 @@ class ManualRecrawlRunner:
                     continue  # naive timestamp cannot be proven UTC-new
                 if succeeded < started:
                     continue  # old current row, not produced by this action
+                if entry.get("producer") != PRODUCER_MANUAL_RECRAWL_ZHAOSHANG:
+                    # D10: a qualifying-time row from ANY other producer is
+                    # not this action's completion — note it once and keep
+                    # waiting (D9 resolves the action if the manual job
+                    # itself failed).
+                    outcome = dict(handle.get("outcome") or {})
+                    outcome.setdefault(
+                        "superseded_current_producer", str(entry.get("producer") or "")
+                    )
+                    handle["outcome"] = outcome
+                    continue
                 outcome = dict(handle.get("outcome") or {})
                 outcome["completion_proof"] = COMPLETION_PROOF_CACHE_CURRENT
                 outcome["new_result"] = {
@@ -554,6 +709,7 @@ class ManualRecrawlRunner:
                 }
                 handle["outcome"] = outcome
                 handle["status"] = "SUCCEEDED"
+                self._complete_terminal_locked(handle)
                 return
         except Exception as exc:  # noqa: BLE001 - evaluation must never raise
             outcome = dict(handle.get("outcome") or {})
@@ -574,8 +730,8 @@ class ManualRecrawlRunner:
             "status": handle.get("status"),
             "recorded_at": _utcnow_iso(),
         }
-        if event == "finished" and "outcome" in handle:
-            record["outcome_summary"] = handle["outcome"]
+        if event in ("finished", "completed") and "outcome" in handle:
+            record["outcome_summary"] = dict(handle["outcome"])  # shallow copy
         return record
 
     def _append_log(self, record: dict[str, Any]) -> None:

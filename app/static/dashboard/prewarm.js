@@ -372,6 +372,22 @@
     if (outcome === null || outcome === undefined) return "";
     try { return JSON.stringify(outcome); } catch (e) { return String(outcome); }
   }
+  // D13 失败后缀:仅当服务端明确给出 failed_by=remote_job_terminal_failed
+  // (远端任务终态 FAILED,诚实失败路径)时追加;其余失败不添加任何修饰。
+  function recrawlFailureSuffix(outcome) {
+    if (outcome && outcome.failed_by === "remote_job_terminal_failed") {
+      return " 招商局任务终态失败";
+    }
+    return "";
+  }
+  // D13 等待注记:已有其他来源更新的当前结果(本动作的完成证明被顶掉,
+  // 仍等待本任务终态)——不是成功文案,只是诚实说明当前状态。
+  function recrawlWaitingNote(outcome) {
+    if (outcome && outcome.superseded_current_producer) {
+      return " ·已有其他来源更新的当前结果，等待本任务终态";
+    }
+    return "";
+  }
   // 手动重爬动作状态 → 中文(诚实生命周期:只有 SUCCEEDED 携带缓存证明,
   // WAITING_REMOTE 仅招商局路径;史泰博同步爬取直接 RUNNING→SUCCEEDED/FAILED)。
   function recrawlStatusText(status) {
@@ -421,18 +437,26 @@
         if (!pr.status || pr.status < 200 || pr.status >= 300) continue;   // 单次轮询失败不终止
         const data = pr.json || {};
         const st = String(data.status || "");
-        // 每次轮询驱动一次懒完成评估(服务端 get 只读重估 WAITING_REMOTE)
+        // 每次轮询驱动一次懒完成评估(服务端 get 只读重估 WAITING_REMOTE:
+        // 先查远端任务终态 FAILED,再查 manual-recrawl-zhaoshang 新 current 行)
         if (st === "SUCCEEDED") { setRecrawlStatus(recrawlStatusText(st) + " " + outcomeSummary(data.outcome), "ok"); return; }
-        if (st === "FAILED") { setRecrawlStatus(recrawlStatusText(st) + " " + outcomeSummary(data.outcome), "err"); return; }
+        if (st === "FAILED") {
+          setRecrawlStatus(recrawlStatusText(st) + recrawlFailureSuffix(data.outcome) +
+            " " + outcomeSummary(data.outcome), "err");
+          return;
+        }
         if (st === "PRIORITY_PENDING") { setRecrawlStatus(recrawlStatusText(st) + " " + outcomeSummary(data.outcome), ""); return; }
         if (st === "WAITING_REMOTE") {
-          setRecrawlStatus(recrawlStatusText(st) + "(已等待 " + ((i + 1) * POLL_INTERVAL_MS / 1000) + " 秒)", "");
+          setRecrawlStatus(recrawlStatusText(st) + recrawlWaitingNote(data.outcome) +
+            "(已等待 " + ((i + 1) * POLL_INTERVAL_MS / 1000) + " 秒)", "");
           continue;
         }
         setRecrawlStatus(recrawlStatusText(st || "RUNNING") + "(已等待 " + ((i + 1) * POLL_INTERVAL_MS / 1000) + " 秒)", "");
       }
       setRecrawlStatus("轮询超时,请稍后刷新查看结果", "err");
     } finally {
+      // D13 按钮规则:仅在动作 RUNNING / WAITING_REMOTE 期间禁用(整个轮询
+      // 会话持锁);终态与 PRIORITY_PENDING(操作员可重试路径)结束后立即恢复可点。
       setRecrawlBusy(false);
     }
   }

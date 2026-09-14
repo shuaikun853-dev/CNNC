@@ -1,11 +1,16 @@
 """Read-only projection for the customer prewarm dashboard (Issue #13).
 
 Deep read-model module: the dashboard API layer stays thin and this module
-owns every query, whitelist and KPI unit semantics.  Zero writes, zero
-network, zero FastAPI imports — all three databases (the customer prewarm
-store, the shared crawl cache and STEP1's per-day ``state.sqlite3``) are
-opened through sqlite ``mode=ro`` URIs, so a GET can never create or modify
-a file (a missing store is reported, never created).
+owns every query, whitelist and KPI unit semantics.  Zero BUSINESS writes,
+zero network, zero FastAPI imports — all three databases (the customer
+prewarm store, the shared crawl cache and STEP1's per-day ``state.sqlite3``)
+are opened through sqlite ``mode=ro`` URIs; their CONTENT is never modified
+and no business row/schema ever changes (a missing store is reported, never
+created).  One platform truth, identical to the phenomenon documented in
+``customer_prewarm_discovery``: on WAL-mode databases a read-only open may
+materialize transient SQLite ``-shm``/``-wal`` reader sidecar files next to
+the database files — a SQLite reader artifact, never a business write and
+never a content change (the main-DB bytes stay untouched).
 
 Degradation contract: a missing store file or a ``sqlite3.OperationalError``
 (locked / corrupt / unreadable) never raises.  The affected store's

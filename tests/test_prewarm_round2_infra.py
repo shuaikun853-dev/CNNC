@@ -23,12 +23,13 @@ import pytest
 from app.services.customer_prewarm_dispatch import (
     BACKEND_VERSION,
     _boost_reused_job,
+    _CACHE_SYNC_PENDING_NOTE,
     dispatch_single_candidate_exact,
     find_remote_work_for_url,
     prewarm_placeholder_sku,
     run_prewarm_dispatch_pass,
 )
-from app.services.customer_prewarm_discovery import sync_daily_internet_results
+from app.services.customer_prewarm_discovery import process_document, sync_daily_internet_results
 from app.services.customer_prewarm_store import (
     CACHE_STATUS_CACHE_HIT,
     CACHE_STATUS_PENDING_PREWARM,
@@ -176,6 +177,7 @@ def seed_remote_work(
     url,
     job_state="SUBMITTED",
     remote_identity=None,
+    task_name=None,
 ):
     paths = runtime_paths(business_date, runtime_root)
     paths.run_dir.mkdir(parents=True, exist_ok=True)
@@ -201,7 +203,7 @@ def seed_remote_work(
             requests,
             seed_dir / "input.xlsx",
             seed_dir / "result.xlsx",
-            f"cnnc_current_opt_{mapping.mall_name}_00000000000001",
+            task_name or f"cnnc_current_opt_{mapping.mall_name}_00000000000001",
             batch_state_path=batch_state,
         )
         job_row = store.prepare_remote_intent(
@@ -599,6 +601,130 @@ def test_record_daily_observation_upsert_refreshes_last_seen(tmp_path):
     # store 归一化为 UTC 微秒 ISO 格式
     assert datetime.fromisoformat(rows[0]["first_seen_at"]) == first
     assert datetime.fromisoformat(rows[0]["last_seen_at"]) == second
+
+
+# ---- Round 3 F1: observation 日期 = 扫描 pass 业务日(D1/D2 缺陷) -------------------
+#
+# D1:process_document 曾把文档首见日(document.business_date,不可变)传给
+#    upsert_link,observation 被钉死在首见日 → 逐日范围退化为首见日范围。
+# D2:DONE 文档次日仅走 intake(upsert_document),从不重跑 detail → 新一日
+#    没有任何 observation 行,重复引用在新一日的看板范围内不可见。
+
+
+def _detail_payload(urls):
+    return {"data": {"referenceInfos": [{"referenceLink": u} for u in urls]}}
+
+
+def test_upsert_document_records_observations_for_existing_links(tmp_path):
+    """D2:DONE 文档次日仅 intake 重见(D2 upsert_document,无 detail)→
+    其既有 links 必须派生出 (D2, cand, doc) observation——重复引用在
+    新一日的看板范围内可见(逐日 observation 的真实扫描路径证明)。"""
+    store_path = tmp_path / "prewarm.sqlite3"
+    store = CustomerPrewarmStore(store_path)
+    day1, day2 = BUSINESS_DATE, "2026-09-15"
+    url = "https://qx.com/repeat-obs.html"
+
+    # Day1 完整流:intake + detail(upsert_link)→ link 与 D1 observation 存在
+    store.upsert_document(day1, "DOC-R", "CAT-1")
+    upsert = store.upsert_link("DOC-R", url, mall="comix", business_date=day1)
+    candidate_id = int(upsert["candidate"]["id"])
+    assert [row["business_date"] for row in _observations(store_path)] == [day1]
+
+    # Day2 仅 intake(intake 路径,无 detail 重跑)→ 文档在 D2 被重见
+    store.upsert_document(day2, "DOC-R", "CAT-1")
+
+    rows = _observations(store_path)
+    assert [row["business_date"] for row in rows] == [day1, day2]
+    assert all(
+        row["candidate_id"] == candidate_id and row["document_id"] == "DOC-R"
+        for row in rows
+    )
+    assert rows[1]["original_url"] == url
+    assert store.candidate_ids_for_business_date(day2) == {candidate_id}
+
+
+def test_process_document_uses_pass_business_date_for_new_links(tmp_path):
+    """D1(新链接形态):老文档(首见 D1,类别变化重置 PENDING)在 pass 日
+    D2 的 detail 中发现新引用 → 候选 first-seen 与 observation 都必须落在
+    pass 日 D2,而不是文档首见日 D1(跨午夜形态:observation 用 pass 日,
+    即使 document.business_date 不同)。"""
+    store_path = tmp_path / "prewarm.sqlite3"
+    store = CustomerPrewarmStore(store_path)
+    shared_cache = SharedCrawlCache(tmp_path / "shared_cache.sqlite3")
+    day1, day2 = BUSINESS_DATE, "2026-09-15"
+
+    store.upsert_document(day1, "DOC-N", "CAT-1")
+    # 类别变化 → 重置 PENDING(次日重扫的真实形态);文档行的 business_date
+    # 保持 D1(首见日不可变)
+    store.upsert_document(day2, "DOC-N", "CAT-2")
+    document_row = store.pending_documents(10)[0]
+    assert document_row["business_date"] == day1
+
+    new_url = "https://qx.com/pass-day-link.html"
+
+    def detail_fetch(document_id, four_category_id):
+        return {"ok": True, "payload": _detail_payload([new_url]), "error": None}
+
+    result = process_document(
+        store,
+        shared_cache,
+        document_row,
+        mappings=[COMIX],
+        detail_fetch=detail_fetch,
+        business_date=day2,
+    )
+    assert result["detail_ok"] is True
+
+    candidates = store.candidates()
+    assert len(candidates) == 1
+    # 候选 first-seen = pass 日(本修复的既定语义修正)
+    assert candidates[0]["business_date"] == day2
+    # observation 日 = pass 日,绝无 D1 行
+    rows = _observations(store_path)
+    assert [row["business_date"] for row in rows] == [day2]
+    assert rows[0]["candidate_id"] == candidates[0]["id"]
+    assert rows[0]["document_id"] == "DOC-N"
+    assert rows[0]["original_url"] == new_url
+
+
+def test_observation_date_not_first_seen_for_reprocessed_document(tmp_path):
+    """D1(重复引用形态):Day1 upsert 的链接在 Day2 真实重扫序列
+    (intake 重见 → detail 重跑同链接)中再次被看到 → observation 必须落在
+    pass 日 D2;两天各一行,而不是只刷新 D1 行。"""
+    store_path = tmp_path / "prewarm.sqlite3"
+    store = CustomerPrewarmStore(store_path)
+    shared_cache = SharedCrawlCache(tmp_path / "shared_cache.sqlite3")
+    day1, day2 = BUSINESS_DATE, "2026-09-15"
+    url = "https://qx.com/reprocessed-link.html"
+
+    # Day1 完整流
+    store.upsert_document(day1, "DOC-P", "CAT-1")
+    upsert = store.upsert_link("DOC-P", url, mall="comix", business_date=day1)
+    candidate_id = int(upsert["candidate"]["id"])
+
+    # Day2 真实重扫序列:intake 重见(类别变化重置 PENDING)+ detail 重跑
+    store.upsert_document(day2, "DOC-P", "CAT-2")
+    document_row = store.pending_documents(10)[0]
+
+    def detail_fetch(document_id, four_category_id):
+        return {"ok": True, "payload": _detail_payload([url]), "error": None}
+
+    result = process_document(
+        store,
+        shared_cache,
+        document_row,
+        mappings=[COMIX],
+        detail_fetch=detail_fetch,
+        business_date=day2,
+    )
+    assert result["detail_ok"] is True
+    assert result["misses"] == 1  # 缓存未命中 → 候选保持 PENDING_PREWARM
+
+    rows = _observations(store_path)
+    assert [row["business_date"] for row in rows] == [day1, day2]
+    assert all(row["candidate_id"] == candidate_id for row in rows)
+    assert all(row["original_url"] == url for row in rows)
+    assert store.candidate_ids_for_business_date(day2) == {candidate_id}
 
 
 # ---- B2: remote job link 读写 + 查询辅助 -------------------------------------------
@@ -1054,6 +1180,137 @@ def test_dispatch_pass_cross_day_terminal_probe_keeps_day1_linkage(tmp_path):
     assert link["remote_job_id"] == job1
 
 
+def test_dispatch_pass_cross_day_reachable_variant_public_api_only(tmp_path):
+    """Finding 7(可达跨日变体,全程公开 API,绝无直改 prewarm 库 SQL):
+
+    Day1 文档 DOC-A → 候选 C1(URL U)→ 真实 Day1 派发 pass 绑定任务 J
+    (linkage D1)。Day2 新文档 DOC-B 引用同一 URL U —— store 不变量:候选
+    身份严格 (mall, original_url),同 mall 复见只会复见 C1;唯一可达的新
+    候选路径是映射变更换 mall → upsert_link 落新候选 C2。Day2 库中存在一个
+    同数字 id 的无关任务(终态 SUCCESS,覆盖 URL U)。
+
+    Day2 pass:phase-1 D5 守卫跳过跨日 C1(绝不用裸 id 去碰 Day2 的同号
+    任务);C2 按自身 probe 诚实处置 —— 终态 SUCCESS 分支记
+    REMOTE_DISPATCHED + cache-sync note,不绑 linkage、不建任务、不 POST。
+    """
+    day1, day2 = BUSINESS_DATE, "2026-09-15"
+    runtime_root = tmp_path / "runtime"
+    store_path = runtime_root / "customer_prewarm.sqlite3"
+    prewarm = CustomerPrewarmStore(store_path)
+    cache = SharedCrawlCache(runtime_root / "shared_crawl_cache.sqlite3")
+    url = "https://qx.com/product-crossday-reachable.html"
+
+    # ---- Day1:document A → C1 → 真实派发 pass 绑定 job J(linkage D1)----
+    make_state_db(runtime_root, day1)
+    prewarm.upsert_document(day1, "DOC-A")
+    upsert1 = prewarm.upsert_link("DOC-A", url, mall="comix", business_date=day1)
+    c1 = int(upsert1["candidate"]["id"])
+    prewarm.record_candidate_result(c1, cache_status=CACHE_STATUS_PENDING_PREWARM)
+    summary1 = run_prewarm_dispatch_pass(
+        prewarm, cache, business_date=day1, runtime_root=runtime_root,
+        mappings=[COMIX], adapter=_CountingAdapter(),
+    )
+    assert summary1["outcome"] == "OK" and summary1["jobs_created"] == 1
+    candidate1 = prewarm.candidate_by_id(c1)
+    job_j = int(candidate1["remote_job_id"])
+    link1 = prewarm.remote_job_link_for_candidate(c1)
+    assert link1["business_date"] == day1 and int(link1["remote_job_id"]) == job_j
+    paths1 = runtime_paths(day1, runtime_root)
+
+    # ---- Day2:新文档 DOC-B 引用同一 URL U ----
+    # 同 mall 复见只会复见 C1(身份不变量);映射变更换 mall → 新候选 C2,
+    # 这是公开 API 下唯一可达的新候选路径(store.upsert_link 文档明示)。
+    prewarm.upsert_document(day2, "DOC-B")
+    same = prewarm.upsert_link("DOC-B", url, mall="comix", business_date=day2)
+    assert int(same["candidate"]["id"]) == c1  # 无 C2:同 (mall, url) 复见
+    upsert2 = prewarm.upsert_link("DOC-B", url, mall="comix-v2", business_date=day2)
+    c2 = int(upsert2["candidate"]["id"])
+    assert c2 != c1
+    prewarm.record_candidate_result(c2, cache_status=CACHE_STATUS_PENDING_PREWARM)
+
+    # ---- Day2 状态库:同数字 id 的无关任务,终态 SUCCESS 覆盖 URL U ----
+    # (逐日自增 id 天然同号;行形状镜像 daily-sync 造库 make_sync_state_db)
+    paths2 = make_state_db(runtime_root, day2)
+    connection = sqlite3.connect(str(paths2.state_path), isolation_level=None)
+    try:
+        run_id = connection.execute(
+            "SELECT id FROM daily_runs ORDER BY id LIMIT 1"
+        ).fetchone()[0]
+        now = datetime.now(UTC).isoformat(timespec="seconds")
+        cursor = connection.execute(
+            """INSERT INTO remote_jobs (run_id, logical_key, task_name, payload_hash,
+                                        mall_key, state, created_at, updated_at)
+               VALUES (?, 'logical-poison', 'cnnc_current_opt_poison', 'payload-hash',
+                       'comix', 'SUCCEEDED', ?, ?)""",
+            (run_id, now, now),
+        )
+        poison_job = int(cursor.lastrowid)
+        assert poison_job == job_j  # 数字 id 跨日碰撞 —— 被测缺陷形态
+        connection.execute(
+            """INSERT INTO crawl_work (run_id, mall_key, source_id, sku_id,
+                                       exact_url, backend_version, fingerprint,
+                                       state, remote_job_id, result_json, updated_at)
+               VALUES (?, 'comix', 'SRC-COMIX', ?, ?, ?, 'fp-poison',
+                       'SUCCESS', ?, ?, ?)""",
+            (
+                run_id,
+                prewarm_placeholder_sku(COMIX.mall_key, url),
+                url,
+                BACKEND_VERSION,
+                poison_job,
+                json.dumps({"page_price_status": "OK", "page_price_value": "1.1"}),
+                now,
+            ),
+        )
+    finally:
+        connection.close()
+
+    # ---- Day2 派发 pass(终态分支绝不 POST)----
+    adapter = _CountingAdapter(submit_raises=True)
+    summary2 = run_prewarm_dispatch_pass(
+        prewarm, cache, business_date=day2, runtime_root=runtime_root,
+        mappings=[COMIX], adapter=adapter,
+    )
+
+    assert summary2["outcome"] == "OK"
+    assert summary2["jobs_created"] == 0
+    assert adapter.submit_calls == 0 and adapter.prepare_calls == 0
+    # D5:跨日 C1 被显式跳过(裸 id 绝不触 Day2 同号任务)
+    assert any(
+        f"candidate {c1}: cross-day job {job_j}@{day1} skipped" in message
+        for message in summary2["phase_errors"]
+    ), summary2["phase_errors"]
+
+    # C1 完整性:linkage 仍 (day1, C1, J),绝不重绑/改日到 D2
+    candidate1 = prewarm.candidate_by_id(c1)
+    assert candidate1["cache_status"] == CACHE_STATUS_REMOTE_DISPATCHED
+    assert int(candidate1["remote_job_id"]) == job_j
+    link1 = prewarm.remote_job_link_for_candidate(c1)
+    assert link1 is not None
+    assert link1["business_date"] == day1
+    assert int(link1["remote_job_id"]) == job_j
+    assert _store_rows(
+        store_path,
+        """SELECT * FROM prewarm_remote_job_links
+           WHERE business_date=? AND candidate_id=? AND remote_job_id=?""",
+        (day2, c1, job_j),
+    ) == []
+    # Day1 任务行原样未被触碰
+    day1_job = _state_rows(paths1.state_path, "SELECT state FROM remote_jobs")[0]
+    assert day1_job["state"] == "SUBMITTED"
+
+    # C2 按自身 probe 诚实处置:同号终态任务 → REMOTE_DISPATCHED 终态注记
+    # (cache sync pending),不绑 linkage、不带 remote_job_id
+    candidate2 = prewarm.candidate_by_id(c2)
+    assert candidate2["cache_status"] == CACHE_STATUS_REMOTE_DISPATCHED
+    assert candidate2["last_error"] == _CACHE_SYNC_PENDING_NOTE
+    assert candidate2["remote_job_id"] is None
+    assert prewarm.remote_job_link_for_candidate(c2) is None
+    # 同号 Day2 任务绝未被 confirm/boost(状态仍是终态 SUCCESS,且仅此一个)
+    jobs2 = _state_rows(paths2.state_path, "SELECT id, state FROM remote_jobs")
+    assert [(int(row["id"]), row["state"]) for row in jobs2] == [(poison_job, "SUCCEEDED")]
+
+
 # ---- E: exact 路径写 manual link + priority_proven 三态 -----------------------------
 
 
@@ -1189,3 +1446,190 @@ def test_dispatch_exact_reuse_not_actionable_proven_none(tmp_path):
     assert result["priority_proven"] is None
     assert adapter.prioritize_calls == 0
     assert prewarm.candidate_by_id(candidate_id) == before
+
+
+# ---- F2 Round 3: boost 证明口径(D3)+ Phase 1 跨日跳过(D5) ----------------------
+
+
+def test_boost_return_status_updated_without_minus_one_is_false(tmp_path):
+    """D3:status=UPDATED 但 weight_type != -1 → tri-state False(不再算
+    proven boost);priority_boosted 只计 PROVEN(状态接受 AND -1 证明)。"""
+    runtime_root = tmp_path / "runtime"
+    paths = make_state_db(runtime_root, BUSINESS_DATE)
+    prewarm = CustomerPrewarmStore(runtime_root / "customer_prewarm.sqlite3")
+    url = "https://qx.com/boost-updated-w0.html"
+    _paths, job_id = seed_remote_work(
+        runtime_root,
+        BUSINESS_DATE,
+        _CountingAdapter(),
+        mapping=COMIX,
+        url=url,
+        job_state="SUBMITTED",
+        remote_identity="comix|remote-bw|number-bw",
+    )
+    candidate_id = cache_hit_candidate(prewarm, url)
+    adapter = _CountingAdapter(
+        priority_outcomes=[
+            LegacyPriorityOutcome(
+                PriorityStatus.UPDATED, weight_type=0, diagnostic="readback weight_type=0"
+            )
+        ]
+    )
+    store = DailyAuditStore(paths.state_path)
+    lock = ProcessLock(paths.lock_path)
+    lock.acquire()
+    try:
+        token = store.acquire_lease(BUSINESS_DATE, "boost-test", 120.0)
+        summary = _boost_summary()
+        result = _boost_reused_job(
+            prewarm_store=prewarm,
+            store=store,
+            token=token,
+            get_adapter=lambda: adapter,
+            business_date=BUSINESS_DATE,
+            candidate_id=candidate_id,
+            job_id=job_id,
+            deadline=time.monotonic() + 50.0,
+            monotonic_value=time.monotonic,
+            summary=summary,
+        )
+        store.release_lease(token)
+    finally:
+        lock.release()
+    assert result is False
+    assert summary["priority_boosted"] == 0
+    assert summary["priority_unconfirmed"] == 1
+
+
+def test_pass_boost_weight_type_zero_is_unconfirmed_not_boosted(tmp_path):
+    """D3 pass 级计数:UPDATED 且 weight_type=0 的 boost 走 unconfirmed 路径
+    (priority_boosted=0 / priority_unconfirmed=1),候选保持 REMOTE_REUSED。"""
+    from app.services.customer_prewarm_store import CACHE_STATUS_REMOTE_REUSED
+
+    runtime_root = tmp_path / "runtime"
+    make_state_db(runtime_root, BUSINESS_DATE)
+    prewarm = CustomerPrewarmStore(runtime_root / "customer_prewarm.sqlite3")
+    cache = SharedCrawlCache(runtime_root / "shared_crawl_cache.sqlite3")
+    url = "https://qx.com/pass-boost-weight0.html"
+    seed_remote_work(
+        runtime_root,
+        BUSINESS_DATE,
+        _CountingAdapter(),
+        mapping=COMIX,
+        url=url,
+        job_state="SUBMITTED",
+        remote_identity="comix|remote-pw|number-pw",
+    )
+    upsert = prewarm.upsert_link("D1", url, mall="comix")
+    candidate_id = int(upsert["candidate"]["id"])
+    prewarm.record_candidate_result(candidate_id, cache_status=CACHE_STATUS_PENDING_PREWARM)
+    adapter = _CountingAdapter(
+        priority_outcomes=[
+            LegacyPriorityOutcome(
+                PriorityStatus.UPDATED, weight_type=0, diagnostic="readback weight_type=0"
+            )
+        ]
+    )
+
+    summary = run_pass(runtime_root, prewarm, cache, adapter=adapter)
+
+    assert summary["outcome"] == "OK"
+    assert summary["existing_remote_reused"] == 1
+    assert summary["priority_boosted"] == 0
+    assert summary["priority_unconfirmed"] == 1
+    assert adapter.prioritize_calls == 1
+    candidate = prewarm.candidate_by_id(candidate_id)
+    assert candidate["cache_status"] == CACHE_STATUS_REMOTE_REUSED
+
+
+def test_pass_phase1_skips_cross_day_linked_candidates(tmp_path):
+    """D5:Phase 1 以裸 remote_job_id 构建 confirm/reuse 列表时,先查 linkage
+    ——跨日 linkage(如昨日绑定)的候选本轮跳过并记 phase note;今日库中
+    相同数字 id 的无关任务绝不被 confirm/boost;同日候选照常确认。"""
+    day1 = "2026-09-13"
+    runtime_root = tmp_path / "runtime"
+    store_path = runtime_root / "customer_prewarm.sqlite3"
+    prewarm = CustomerPrewarmStore(store_path)
+    cache = SharedCrawlCache(runtime_root / "shared_crawl_cache.sqlite3")
+    url_x = "https://qx.com/pass-crossday-x.html"
+
+    # Day1: real dispatch shape — candidate bound to Day1 job + linkage row.
+    make_state_db(runtime_root, day1)
+    _paths1, job1 = seed_remote_work(
+        runtime_root,
+        day1,
+        _CountingAdapter(),
+        mapping=COMIX,
+        url=url_x,
+        job_state="SUBMITTED",
+        remote_identity="comix|remote-p1|number-p1",
+    )
+    upsert_x = prewarm.upsert_link("DOC-X", url_x, mall="comix", business_date=day1)
+    cand_x = int(upsert_x["candidate"]["id"])
+    prewarm.record_candidate_result(cand_x, cache_status=CACHE_STATUS_PENDING_PREWARM)
+    prewarm.record_candidate_result(
+        cand_x, cache_status=CACHE_STATUS_REMOTE_DISPATCHED, remote_job_id=job1
+    )
+    prewarm.record_remote_job_link(day1, cand_x, job1, "customer-prewarm-zhaoshang")
+
+    # Today: a job carrying the SAME numeric id (foreign URL) — the bare-id
+    # poison.  Plus a same-day linked candidate that must confirm normally.
+    paths_today = make_state_db(runtime_root, BUSINESS_DATE)
+    _p, poison_job = seed_remote_work(
+        runtime_root,
+        BUSINESS_DATE,
+        _CountingAdapter(),
+        mapping=COMIX,
+        url="https://qx.com/pass-poison.html",
+        job_state="PRIORITY_PENDING",
+        remote_identity="comix|remote-px|number-px",
+    )
+    assert poison_job == job1  # numeric-id collision is the defect under test
+    url_y = "https://qx.com/pass-sameday-y.html"
+    _p2, job_y = seed_remote_work(
+        runtime_root,
+        BUSINESS_DATE,
+        _CountingAdapter(),
+        mapping=COMIX,
+        url=url_y,
+        job_state="PRIORITY_PENDING",
+        remote_identity="comix|remote-py|number-py",
+        task_name=f"cnnc_current_opt_{COMIX.mall_name}_00000000000002",
+    )
+    upsert_y = prewarm.upsert_link("DOC-Y", url_y, mall="comix", business_date=BUSINESS_DATE)
+    cand_y = int(upsert_y["candidate"]["id"])
+    prewarm.record_candidate_result(cand_y, cache_status=CACHE_STATUS_PENDING_PREWARM)
+    prewarm.record_candidate_result(
+        cand_y, cache_status=CACHE_STATUS_REMOTE_DISPATCHED, remote_job_id=job_y
+    )
+    prewarm.record_remote_job_link(
+        BUSINESS_DATE, cand_y, job_y, "customer-prewarm-zhaoshang"
+    )
+
+    adapter = _CountingAdapter(
+        priority_outcomes=[LegacyPriorityOutcome(PriorityStatus.UPDATED, weight_type=-1)]
+    )
+    summary = run_pass(runtime_root, prewarm, cache, adapter=adapter)
+
+    assert summary["outcome"] == "OK"
+    # ONLY the same-day candidate was confirmed; the cross-day candidate never
+    # drove a prioritize against the same-numbered today job.
+    assert adapter.prioritize_calls == 1
+    assert summary["priority_confirmed"] == 1
+    jobs = {
+        int(row["id"]): row
+        for row in _state_rows(paths_today.state_path, "SELECT id, state FROM remote_jobs")
+    }
+    assert jobs[poison_job]["state"] == "PRIORITY_PENDING"  # wrong-job poison untouched
+    assert jobs[job_y]["state"] == "SUBMITTED"  # same-day confirm worked normally
+    # phase note names the skipped cross-day candidate/job/date
+    assert any(
+        f"candidate {cand_x}: cross-day job {job1}@{day1} skipped" in message
+        for message in summary["phase_errors"]
+    ), summary["phase_errors"]
+    # cross-day candidate row keeps its REMOTE_DISPATCHED binding evidence
+    assert prewarm.candidate_by_id(cand_x)["cache_status"] == CACHE_STATUS_REMOTE_DISPATCHED
+    assert int(prewarm.candidate_by_id(cand_x)["remote_job_id"]) == job1
+    # Day1 job row untouched
+    day1_job = _state_rows(_paths1.state_path, "SELECT state FROM remote_jobs")[0]
+    assert day1_job["state"] == "SUBMITTED"

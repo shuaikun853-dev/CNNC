@@ -1,20 +1,26 @@
-"""prewarm_manual_recrawl 行为测试(Issue #13 Slice B + Review Round 2 B4)。
+"""prewarm_manual_recrawl 行为测试(Issue #13 Slice B + Review Round 2 B4 + Round 3 F3)。
 
 守卫式单 URL 手动重爬 runner:守卫顺序(库缺失 → 404 → 竞态链接 → 不支持
 路由 → in-flight)、史泰博本地爬取(写缓存带 producer、绝不写候选)、招商局
 诚实生命周期(派发 ≠ 成功:CREATED 确认/REUSED 证实 → WAITING_REMOTE,未
-证实 → PRIORITY_PENDING 永不自动翻转,其余 → FAILED 诚实透传;SUCCEEDED
-只能由 get() 懒完成证明 —— 共享缓存出现 started_at 之后的新 current 行)、
-双击防抖与 §44 业务隔离(closeout/STEP2/STEP3/push 模块在手动重爬动作期间
-绝不 import)。
+证实 → PRIORITY_PENDING 永不自动翻转,其余 → FAILED 诚实透传;REUSED +
+priority_proven None → 终态成功(job_terminal_success)→ WAITING_REMOTE,
+否则 → FAILED 诚实透传;SUCCEEDED 只能由 get() 懒完成证明 —— 共享缓存出现
+started_at 之后、producer=manual-recrawl-zhaoshang 的新 current 行;远端任务
+终态 FAILED → 动作 FAILED(failed_by=remote_job_terminal_failed))。
+Round 3 F3:D8 in-flight key 全程持有(status 非终态期间同一 URL 二次发起
+409;懒终态翻转立即释放;PRIORITY_PENDING/派发失败允许操作员重试)、
+D11 每次懒终态翻转落 completed JSONL 事件、双击防抖与 §44 业务隔离
+(closeout/STEP2/STEP3/push 模块在手动重爬动作期间绝不 import)。
 
 全程零真实爬虫/网络/子进程:爬虫/派发用 fakes,完成证明用 tmp_path 下真实
-SharedCrawlCache。
+SharedCrawlCache,远端状态库用最小 remote_jobs 表(镜像投影测试造库方式)。
 """
 
 from __future__ import annotations
 
 import json
+import sqlite3
 import sys
 import threading
 import types
@@ -33,6 +39,7 @@ from app.services.customer_prewarm_store import (
 )
 from app.services.incremental_audit_runtime import DEFAULT_RUNTIME_ROOT
 from app.services.shared_crawl_cache import (
+    PRODUCER_DAILY_INTERNET,
     PRODUCER_MANUAL_RECRAWL_STAPLES,
     PRODUCER_MANUAL_RECRAWL_ZHAOSHANG,
     SharedCrawlCache,
@@ -128,14 +135,19 @@ class RecordingDispatch:
 class GateDispatch:
     """Blocks inside dispatch_exact until released (independent in-flight)."""
 
-    def __init__(self):
+    def __init__(self, result=None):
         self.calls = 0
         self.gate = threading.Event()
+        self.result = dict(result or {})
 
     def __call__(self, _prewarm_store, _shared_cache, **kwargs):
         self.calls += 1
         self.gate.wait(timeout=5)
-        return {"outcome": "CREATED", "remote_job_id": int(kwargs["candidate_id"])}
+        return dict(
+            {"outcome": "CREATED", "remote_job_id": int(kwargs["candidate_id"]),
+             "priority_confirmed": True},
+            **self.result,
+        )
 
 
 def _poison_crawler_factory():
@@ -214,6 +226,26 @@ def _seed_candidate(prewarm, url, document_id, *, mall, cache_status=CACHE_STATU
     if cache_status != CACHE_STATUS_PENDING_PREWARM:
         prewarm.record_candidate_result(candidate_id, cache_status=cache_status)
     return candidate_id
+
+
+def _write_state_db(runtime_root, jobs, *, business_date=BUSINESS_DATE):
+    """最小 STEP1 状态库(镜像 test_prewarm_dashboard_projection 的造库方式):
+    runtime_root/<business_date>/state.sqlite3,remote_jobs 只建 runner 读取的
+    最小列(id/state)。"""
+    day_dir = runtime_root / business_date
+    day_dir.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(str(day_dir / "state.sqlite3"))
+    try:
+        connection.execute(
+            "CREATE TABLE remote_jobs (id INTEGER PRIMARY KEY, state TEXT NOT NULL)"
+        )
+        for job_id, state in jobs:
+            connection.execute(
+                "INSERT INTO remote_jobs (id, state) VALUES (?, ?)", (job_id, state)
+            )
+        connection.commit()
+    finally:
+        connection.close()
 
 
 # ---- guard order ----------------------------------------------------------------
@@ -567,6 +599,12 @@ def test_created_unconfirmed_is_priority_pending_never_success(runtime):
     assert "completion_proof" not in still["outcome"]
     assert dispatch.calls == 1  # poll path never re-dispatches
 
+    # D8:PRIORITY_PENDING 是操作员可重试的终态 —— in-flight 已释放,
+    # 同一 URL 立即可发起新动作(其 probe/boost 可能重新证明优先级)。
+    retry = runner.start(BUSINESS_DATE, candidate_id=candidate_id)
+    assert retry["action_id"] != handle["action_id"]
+    runner._join_for_tests(retry["action_id"])
+
 
 def test_reused_unconfirmed_is_priority_pending(runtime):
     candidate_id = _seed_candidate(runtime.prewarm, COMIX_URL_1, "D1", mall="comix")
@@ -585,11 +623,24 @@ def test_reused_unconfirmed_is_priority_pending(runtime):
     assert finished["outcome"]["dispatch"]["priority_proven"] is False
 
 
-def test_reused_priority_proven_none_is_priority_pending(runtime):
-    """REUSED + priority_proven None(不可证实)同样是诚实的等待,不是成功。"""
+def test_reused_none_terminal_success_is_waiting(runtime):
+    """D12:REUSED + priority_proven None + job_terminal_success → WAITING_REMOTE。
+
+    不可证实优先级但再探测发现终态 SUCCESS 爬取行:URL 实际已完成 —— 诚实
+    等待(不是成功也不是失败),outcome 记 priority_moot_terminal_success。
+    """
     candidate_id = _seed_candidate(runtime.prewarm, COMIX_URL_1, "D1", mall="comix")
     dispatch = RecordingDispatch(
-        results={candidate_id: {"outcome": "REUSED", "remote_job_id": 3, "priority_proven": None}}
+        results={
+            candidate_id: {
+                "outcome": "REUSED",
+                "remote_job_id": 3,
+                "priority_proven": None,
+                "cross_day": False,
+                "job_business_date": BUSINESS_DATE,
+                "job_terminal_success": True,
+            }
+        }
     )
     runner = _make_runner(
         runtime, crawler_factory=_poison_crawler_factory, dispatch_exact=dispatch
@@ -597,7 +648,38 @@ def test_reused_priority_proven_none_is_priority_pending(runtime):
 
     handle = runner.start(BUSINESS_DATE, candidate_id=candidate_id)
     runner._join_for_tests(handle["action_id"])
-    assert runner.get(handle["action_id"])["status"] == "PRIORITY_PENDING"
+    waiting = runner.get(handle["action_id"])
+    assert waiting["status"] == "WAITING_REMOTE"
+    assert waiting["outcome"]["priority_moot_terminal_success"] is True
+    assert waiting["outcome"]["dispatch"]["outcome"] == "REUSED"
+    assert waiting["outcome"]["dispatch"]["priority_proven"] is None
+    assert "completion_proof" not in waiting["outcome"]  # 仍未带缓存证明
+
+
+def test_reused_none_other_is_failed(runtime):
+    """D12:REUSED + priority_proven None(不可证实且非终态成功)→ FAILED。
+
+    旧行为是 PRIORITY_PENDING(永远无人收尾);新语义:None 意味着该复用
+    任务不可提升(SUBMIT_UNKNOWN/可重试),诚实失败并原样透传 dispatch。
+    """
+    candidate_id = _seed_candidate(runtime.prewarm, COMIX_URL_1, "D1", mall="comix")
+    dispatch_dict = {
+        "outcome": "REUSED",
+        "remote_job_id": 3,
+        "priority_proven": None,
+        "cross_day": False,
+        "job_business_date": BUSINESS_DATE,
+    }
+    dispatch = RecordingDispatch(results={candidate_id: dict(dispatch_dict)})
+    runner = _make_runner(
+        runtime, crawler_factory=_poison_crawler_factory, dispatch_exact=dispatch
+    )
+
+    handle = runner.start(BUSINESS_DATE, candidate_id=candidate_id)
+    runner._join_for_tests(handle["action_id"])
+    finished = runner.get(handle["action_id"])
+    assert finished["status"] == "FAILED"
+    assert finished["outcome"]["dispatch"] == dispatch_dict  # verbatim
 
 
 def test_reused_proven_is_waiting_remote(runtime):
@@ -710,6 +792,300 @@ def test_waiting_remote_survives_evaluation_error(runtime, monkeypatch):
     assert runner.get(handle["action_id"])["status"] == "WAITING_REMOTE"
 
 
+def test_remote_job_terminal_failed_fails_action(runtime):
+    """D9:远端任务终态 FAILED → 动作 FAILED(failed_by),旧 current 不动。
+
+    派发 dict 带 remote_job_id + job_business_date:runner 以 mode=ro 打开
+    runtime_root/<job_business_date>/state.sqlite3 读该任务状态。COMPLETED/
+    在途不翻转(仍走缓存证明路径);FAILED 则诚实失败并原样保留 dispatch。
+    """
+    runtime.cache.record_success(
+        mall="comix", submitted_url=COMIX_URL_1, source="daily-internet", price="9.9"
+    )
+    old_current_id, old_history = _cache_snapshot(runtime.cache, "comix", COMIX_URL_1)
+    candidate_id = _seed_candidate(runtime.prewarm, COMIX_URL_1, "D1", mall="comix")
+    dispatch_dict = {
+        "outcome": "CREATED",
+        "remote_job_id": 7,
+        "priority_confirmed": True,
+        "job_business_date": BUSINESS_DATE,
+    }
+    dispatch = RecordingDispatch(results={candidate_id: dict(dispatch_dict)})
+    runner = _make_runner(
+        runtime, crawler_factory=_poison_crawler_factory, dispatch_exact=dispatch
+    )
+
+    handle = runner.start(BUSINESS_DATE, candidate_id=candidate_id)
+    runner._join_for_tests(handle["action_id"])
+    # 任务仍在途(状态库尚未有 FAILED 行)→ 保持 WAITING_REMOTE
+    assert runner.get(handle["action_id"])["status"] == "WAITING_REMOTE"
+
+    _write_state_db(runtime.runtime_root, [(7, "FAILED")])
+    finished = runner.get(handle["action_id"])
+    assert finished["status"] == "FAILED"
+    assert finished["outcome"]["failed_by"] == "remote_job_terminal_failed"
+    assert finished["outcome"]["dispatch"] == dispatch_dict  # dispatch 原样保留
+    assert finished["finished_at"] is not None
+
+    # 旧 current 完全未动(零缓存写入)
+    current_id, history = _cache_snapshot(runtime.cache, "comix", COMIX_URL_1)
+    assert current_id == old_current_id
+    assert history == old_history
+
+    # D8:FAILED 终态释放 in-flight —— 同一 URL 立即可重试
+    retry = runner.start(BUSINESS_DATE, candidate_id=candidate_id)
+    assert retry["action_id"] != handle["action_id"]
+
+
+def test_remote_job_terminal_failed_created_without_job_date_uses_action_day(runtime):
+    """F4(补 F3 残留):CREATED 派发 dict 无 ``job_business_date``(F2 契约:
+    CREATED 即当日构造)→ 动作日兜底。当日真实状态库中该任务终态 FAILED
+    → get() 诚实失败(failed_by=remote_job_terminal_failed),不再永远等待。"""
+    runtime.cache.record_success(
+        mall="comix", submitted_url=COMIX_URL_1, source="daily-internet", price="9.9"
+    )
+    candidate_id = _seed_candidate(runtime.prewarm, COMIX_URL_1, "D1", mall="comix")
+    # CREATED 形态:remote_job_id + priority_confirmed,无 job_business_date
+    dispatch = RecordingDispatch(
+        results={
+            candidate_id: {
+                "outcome": "CREATED",
+                "remote_job_id": 7,
+                "priority_confirmed": True,
+            }
+        }
+    )
+    runner = _make_runner(
+        runtime, crawler_factory=_poison_crawler_factory, dispatch_exact=dispatch
+    )
+    handle = runner.start(BUSINESS_DATE, candidate_id=candidate_id)
+    runner._join_for_tests(handle["action_id"])
+    assert runner.get(handle["action_id"])["status"] == "WAITING_REMOTE"
+
+    # 动作日(默认日)真实状态库:任务 7 终态 FAILED
+    _write_state_db(runtime.runtime_root, [(7, "FAILED")])
+    finished = runner.get(handle["action_id"])
+    assert finished["status"] == "FAILED"
+    assert finished["outcome"]["failed_by"] == "remote_job_terminal_failed"
+    assert finished["outcome"]["dispatch"]["outcome"] == "CREATED"
+    assert finished["finished_at"] is not None
+
+
+def test_remote_job_terminal_failed_missing_db_keeps_waiting(runtime):
+    """D9 兜底:状态库缺失/不可读 → 记 last_check_error,保持 WAITING_REMOTE,绝不抛。"""
+    candidate_id = _seed_candidate(runtime.prewarm, COMIX_URL_1, "D1", mall="comix")
+    dispatch = RecordingDispatch(
+        results={
+            candidate_id: {
+                "outcome": "CREATED",
+                "remote_job_id": 7,
+                "priority_confirmed": True,
+                "job_business_date": BUSINESS_DATE,
+            }
+        }
+    )
+    runner = _make_runner(
+        runtime, crawler_factory=_poison_crawler_factory, dispatch_exact=dispatch
+    )
+    handle = runner.start(BUSINESS_DATE, candidate_id=candidate_id)
+    runner._join_for_tests(handle["action_id"])
+
+    result = runner.get(handle["action_id"])
+    assert result["status"] == "WAITING_REMOTE"  # never raise, never fail-closed
+    assert "last_check_error" in result["outcome"]
+    # 后续轮询仍可继续(不卡死评估路径)
+    assert runner.get(handle["action_id"])["status"] == "WAITING_REMOTE"
+
+
+def test_completion_requires_manual_producer(runtime):
+    """D10:SUCCEEDED 只认 producer=manual-recrawl-zhaoshang 的新 current 行。
+
+    他源(daily-internet)在 qualifying 时间落地新 current → 不成功,仅记一次
+    superseded_current_producer 并保持 WAITING_REMOTE(D9 的失败路径最终
+    兜底);随后本任务同步的手动行落地 → SUCCEEDED 带完成证明,identity 的
+    current 变为手动行、历史按序保留(含被顶掉的他源行)。
+    """
+    runtime.cache.record_success(
+        mall="comix", submitted_url=COMIX_URL_1, source="daily-internet", price="9.9"
+    )
+    old_current_id, _ = _cache_snapshot(runtime.cache, "comix", COMIX_URL_1)
+    candidate_id = _seed_candidate(runtime.prewarm, COMIX_URL_1, "D1", mall="comix")
+    dispatch = RecordingDispatch(
+        results={candidate_id: {"outcome": "CREATED", "remote_job_id": 7, "priority_confirmed": True}}
+    )
+    runner = _make_runner(
+        runtime, crawler_factory=_poison_crawler_factory, dispatch_exact=dispatch
+    )
+
+    handle = runner.start(BUSINESS_DATE, candidate_id=candidate_id)
+    runner._join_for_tests(handle["action_id"])
+    assert runner.get(handle["action_id"])["status"] == "WAITING_REMOTE"
+
+    # 他源新 current 行(qualifying 时间)→ 不成功,记一次 superseded 来源
+    daily_row = runtime.cache.record_success(
+        mall="comix",
+        submitted_url=COMIX_URL_1,
+        source="daily-internet",
+        producer=PRODUCER_DAILY_INTERNET,
+        price="11.0",
+    )
+    waiting = runner.get(handle["action_id"])
+    assert waiting["status"] == "WAITING_REMOTE"
+    assert waiting["outcome"]["superseded_current_producer"] == PRODUCER_DAILY_INTERNET
+    assert "completion_proof" not in waiting["outcome"]
+    again = runner.get(handle["action_id"])
+    assert again["outcome"]["superseded_current_producer"] == PRODUCER_DAILY_INTERNET  # 只记一次
+
+    # 本任务同步的手动行 → SUCCEEDED
+    manual_row = runtime.cache.record_success(
+        mall="comix",
+        submitted_url=COMIX_URL_1,
+        source="daily-internet",
+        producer=PRODUCER_MANUAL_RECRAWL_ZHAOSHANG,
+        price="13.5",
+        title="新结果标题",
+    )
+    done = runner.get(handle["action_id"])
+    assert done["status"] == "SUCCEEDED"
+    assert done["outcome"]["completion_proof"] == "cache_current"
+    assert int(done["outcome"]["new_result"]["result_id"]) == int(manual_row["id"])
+    assert done["outcome"]["new_result"]["producer"] == PRODUCER_MANUAL_RECRAWL_ZHAOSHANG
+
+    # current = 手动行;daily 行不再 current;历史按序保留旧行
+    hit = runtime.cache.lookup_current("comix", COMIX_URL_1)
+    assert int(hit["entry"]["id"]) == int(manual_row["id"])
+    history_ids = [int(row["id"]) for row in runtime.cache.history("comix", COMIX_URL_1)]
+    assert history_ids == [int(old_current_id), int(daily_row["id"]), int(manual_row["id"])]
+
+
+def test_inflight_held_until_terminal(runtime):
+    """D8:WAITING_REMOTE 全程持有 in-flight key;懒终态翻转立即释放。
+
+    - CREATED+confirmed 派发后(WAITING_REMOTE),同一 URL 二次 start 报
+      ACTION_IN_FLIGHT(前端 409);
+    - 懒 SUCCEEDED(真实缓存写入 manual producer + get())后二次 start 成功;
+    - D9 的 FAILED 同样释放 key(下一次 start 允许)。
+    """
+    candidate_id = _seed_candidate(runtime.prewarm, COMIX_URL_1, "D1", mall="comix")
+    candidate_failed = _seed_candidate(runtime.prewarm, COMIX_URL_2, "D2", mall="comix")
+    dispatch = RecordingDispatch(
+        results={
+            candidate_id: {"outcome": "CREATED", "remote_job_id": 21, "priority_confirmed": True},
+            candidate_failed: {
+                "outcome": "CREATED",
+                "remote_job_id": 22,
+                "priority_confirmed": True,
+                "job_business_date": BUSINESS_DATE,
+            },
+        }
+    )
+    runner = _make_runner(
+        runtime, crawler_factory=_poison_crawler_factory, dispatch_exact=dispatch
+    )
+    from app.services.prewarm_manual_recrawl import ManualRecrawlError
+
+    handle = runner.start(BUSINESS_DATE, candidate_id=candidate_id)
+    runner._join_for_tests(handle["action_id"])
+    assert runner.get(handle["action_id"])["status"] == "WAITING_REMOTE"
+
+    # WAITING_REMOTE 期间同一 URL 二次发起 → ACTION_IN_FLIGHT(API 映射 409)
+    with pytest.raises(ManualRecrawlError) as excinfo:
+        runner.start(BUSINESS_DATE, candidate_id=candidate_id)
+    assert excinfo.value.code == "ACTION_IN_FLIGHT"
+    assert excinfo.value.existing_action_id == handle["action_id"]
+
+    # 懒 SUCCEEDED(manual producer 新 current 行)→ key 释放,可再发起
+    runtime.cache.record_success(
+        mall="comix",
+        submitted_url=COMIX_URL_1,
+        source="daily-internet",
+        producer=PRODUCER_MANUAL_RECRAWL_ZHAOSHANG,
+        price="14.0",
+    )
+    assert runner.get(handle["action_id"])["status"] == "SUCCEEDED"
+    again = runner.start(BUSINESS_DATE, candidate_id=candidate_id)
+    assert again["action_id"] != handle["action_id"]
+    runner._join_for_tests(again["action_id"])
+
+    # D9 的 FAILED 也释放 key
+    _write_state_db(runtime.runtime_root, [(22, "FAILED")])
+    failed_handle = runner.start(BUSINESS_DATE, candidate_id=candidate_failed)
+    runner._join_for_tests(failed_handle["action_id"])
+    assert runner.get(failed_handle["action_id"])["status"] == "FAILED"
+    retry = runner.start(BUSINESS_DATE, candidate_id=candidate_failed)
+    assert retry["action_id"] != failed_handle["action_id"]
+
+
+def test_completed_jsonl_event(runtime):
+    """D11:每次懒终态翻转(懒 SUCCEEDED / D9 FAILED)追加 completed JSONL 事件。
+
+    事件字段:action_id/event/status/route/mall/original_url/business_date/
+    outcome_summary(shallow)/recorded_at;worker 的 finished 事件保持不变。
+    """
+    c_ok = _seed_candidate(runtime.prewarm, COMIX_URL_1, "D1", mall="comix")
+    c_failed = _seed_candidate(runtime.prewarm, COMIX_URL_2, "D2", mall="comix")
+    dispatch = RecordingDispatch(
+        results={
+            c_ok: {"outcome": "CREATED", "remote_job_id": 31, "priority_confirmed": True},
+            c_failed: {
+                "outcome": "CREATED",
+                "remote_job_id": 32,
+                "priority_confirmed": True,
+                "job_business_date": BUSINESS_DATE,
+            },
+        }
+    )
+    runner = _make_runner(
+        runtime, crawler_factory=_poison_crawler_factory, dispatch_exact=dispatch
+    )
+
+    ok_handle = runner.start(BUSINESS_DATE, candidate_id=c_ok)
+    runner._join_for_tests(ok_handle["action_id"])
+    runtime.cache.record_success(
+        mall="comix",
+        submitted_url=COMIX_URL_1,
+        source="daily-internet",
+        producer=PRODUCER_MANUAL_RECRAWL_ZHAOSHANG,
+        price="16.0",
+    )
+    assert runner.get(ok_handle["action_id"])["status"] == "SUCCEEDED"
+
+    _write_state_db(runtime.runtime_root, [(32, "FAILED")])
+    failed_handle = runner.start(BUSINESS_DATE, candidate_id=c_failed)
+    runner._join_for_tests(failed_handle["action_id"])
+    assert runner.get(failed_handle["action_id"])["status"] == "FAILED"
+
+    log_path = runtime.runtime_root / "customer_prewarm" / ACTIONS_LOG_NAME
+    assert log_path.is_file()
+    events = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
+
+    ok_completed = [
+        e for e in events
+        if e["event"] == "completed" and e["action_id"] == ok_handle["action_id"]
+    ]
+    assert len(ok_completed) == 1
+    assert ok_completed[0]["status"] == "SUCCEEDED"
+    assert ok_completed[0]["route"] == "zhaoshang"
+    assert ok_completed[0]["mall"] == "comix"
+    assert ok_completed[0]["original_url"] == COMIX_URL_1
+    assert ok_completed[0]["business_date"] == BUSINESS_DATE
+    assert ok_completed[0]["outcome_summary"]["completion_proof"] == "cache_current"
+    assert ok_completed[0]["recorded_at"]
+
+    failed_completed = [
+        e for e in events
+        if e["event"] == "completed" and e["action_id"] == failed_handle["action_id"]
+    ]
+    assert len(failed_completed) == 1
+    assert failed_completed[0]["status"] == "FAILED"
+    assert failed_completed[0]["outcome_summary"]["failed_by"] == "remote_job_terminal_failed"
+
+    # worker 的 finished 事件仍按原样存在(每次动作 started/finished 各一条)
+    for handle in (ok_handle, failed_handle):
+        same = [e for e in events if e["action_id"] == handle["action_id"]]
+        assert [e["event"] for e in same] == ["started", "finished", "completed"]
+
+
 # ---- in-flight guard ----------------------------------------------------------------
 
 
@@ -722,6 +1098,7 @@ def test_double_click_same_url_is_in_flight_different_urls_independent(runtime):
     from app.services.prewarm_manual_recrawl import ManualRecrawlError
 
     gate_crawler = GateCrawler(outcomes={STAPLES_URL: _success_outcome(STAPLES_URL)})
+    # D12 语义:确认的 CREATED → WAITING_REMOTE(不再止于 PRIORITY_PENDING)
     gate_dispatch = GateDispatch()
     runner = _make_runner(
         runtime, crawler_factory=lambda: gate_crawler, dispatch_exact=gate_dispatch
@@ -746,14 +1123,18 @@ def test_double_click_same_url_is_in_flight_different_urls_independent(runtime):
     runner._join_for_tests(third["action_id"])
 
     assert runner.get(first["action_id"])["status"] == "SUCCEEDED"  # staples sync crawl
-    # zhaoshang: GateDispatch returns CREATED without priority proof → honest
-    # PRIORITY_PENDING (dispatch ended the worker; in-flight is cleared — the
-    # operator may start a NEW probe action for the same URL).
-    assert runner.get(second["action_id"])["status"] == "PRIORITY_PENDING"
-    assert runner.get(third["action_id"])["status"] == "PRIORITY_PENDING"
+    # D12:CREATED + priority_confirmed → WAITING_REMOTE(远端任务合法在途)
+    assert runner.get(second["action_id"])["status"] == "WAITING_REMOTE"
+    assert runner.get(third["action_id"])["status"] == "WAITING_REMOTE"
     assert gate_crawler.calls == 1  # the second click never re-crawled
 
-    # in-flight slot cleared: the same URL can start again after finishing
+    # D8:WAITING_REMOTE 期间同一 URL 的二次发起 → ACTION_IN_FLIGHT(API 409)
+    with pytest.raises(ManualRecrawlError) as excinfo:
+        runner.start(BUSINESS_DATE, candidate_id=candidate_z1)
+    assert excinfo.value.code == "ACTION_IN_FLIGHT"
+    assert excinfo.value.existing_action_id == second["action_id"]
+
+    # staples worker 端即达终态 → key 已释放:同一 URL 可再次发起
     fourth = runner.start(BUSINESS_DATE, candidate_id=candidate_staples)
     runner._join_for_tests(fourth["action_id"])
     assert runner.get(fourth["action_id"])["status"] == "SUCCEEDED"

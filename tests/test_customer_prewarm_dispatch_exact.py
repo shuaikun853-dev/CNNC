@@ -349,10 +349,11 @@ def test_case_a_reuse_boosts_existing_job_never_creates_or_submits(tmp_path):
 
 
 def test_case_a_unconfirmed_boost_blocks_candidate_write_and_stays_honest(tmp_path):
-    """复用 + boost 优先级未证明:_NoCandidateWriteStore 拦下 boost 未确认分支
-    对候选行的间接写入,_record 吞掉异常成为 phase_error;结果仍是诚实的
-    REUSED(含 priority_unconfirmed 计数),远端任务状态/爬虫行/候选行全部
-    原样,绝不新建、绝不 POST。"""
+    """复用 + boost 优先级未证明:_NoCandidateWriteStore 路径下 boost 未确认
+    分支的候选行 note 写入被直接跳过(D6,不再产生合成 RuntimeError
+    phase_error);结果仍是诚实的 REUSED(含 priority_unconfirmed 计数与
+    priority_proven False),远端任务状态/爬虫行/候选行全部原样,绝不新建、
+    绝不 POST。"""
     runtime_root = tmp_path / "runtime"
     paths = make_state_db(runtime_root, BUSINESS_DATE)
     prewarm = CustomerPrewarmStore(runtime_root / "customer_prewarm.sqlite3")
@@ -383,9 +384,11 @@ def test_case_a_unconfirmed_boost_blocks_candidate_write_and_stays_honest(tmp_pa
     # 不抛异常;复用本身仍诚实上报(未确认优先级不冒充完全成功)。
     assert result["outcome"] == "REUSED"
     assert result["remote_job_id"] == job_id
+    assert result["priority_proven"] is False
     assert result["priority_unconfirmed"] == 1
-    # 守卫店的拒绝以 guard 文案出现在 phase_errors(_record 的隔离上报)。
-    assert any(
+    # D6:守卫店的拒绝不再以合成 RuntimeError 进 phase_errors——note 写入被
+    # 直接跳过(guarded 路径绝不写候选行,note 只是 pass 内记账)。
+    assert not any(
         "manual recrawl never writes candidate cache_status" in message
         for message in result["phase_errors"]
     ), result["phase_errors"]
@@ -474,6 +477,250 @@ def test_case_c_submit_unknown_never_second_post(tmp_path):
 
 
 # ---- Case D: 优先级未证明 → 诚实 CREATED + priority_confirmed False ------------------
+
+
+def test_boost_requires_weight_type_minus_one_readback(tmp_path):
+    """D3:status=UPDATED 但 weight_type!= -1 的 readback 绝不算 proven boost。
+
+    复用路径的 priority_proven 必须与 _priority_proven 同一口径:缺 -1 证据 →
+    False + priority_unconfirmed 计数,优先级绝不冒充已证明。"""
+    runtime_root = tmp_path / "runtime"
+    prewarm = CustomerPrewarmStore(runtime_root / "customer_prewarm.sqlite3")
+    cache = SharedCrawlCache(runtime_root / "shared_crawl_cache.sqlite3")
+    url = "https://qx.com/exact-boost-w0.html"
+    paths = make_state_db(runtime_root, BUSINESS_DATE)
+    _paths, job_id = seed_remote_work(
+        runtime_root,
+        BUSINESS_DATE,
+        _CountingAdapter(),
+        mapping=COMIX,
+        url=url,
+        job_state="SUBMITTED",
+        remote_identity="comix|remote-w0|number-w0",
+    )
+    candidate_id = cache_hit_candidate(prewarm, url)
+    adapter = _CountingAdapter(
+        submit_raises=True,
+        priority_outcomes=[
+            LegacyPriorityOutcome(PriorityStatus.UPDATED, weight_type=0, diagnostic="readback weight_type=0")
+        ],
+    )
+
+    result = _dispatch(runtime_root, prewarm, cache, candidate_id, adapter=adapter)
+
+    assert result["outcome"] == "REUSED"
+    assert result["remote_job_id"] == job_id
+    # honest tri-state: status-accepted-but-weight-unproven is NOT proven
+    assert result["priority_proven"] is False
+    assert result["priority_boosted"] == 0
+    assert result["priority_unconfirmed"] == 1
+    assert adapter.prioritize_calls == 1
+    assert adapter.submit_calls == 0
+    # the job row stays untouched by the boost path
+    job = _state_rows(paths.state_path, "SELECT state FROM remote_jobs")[0]
+    assert job["state"] == "SUBMITTED"
+
+
+def test_boost_updated_with_minus_one_is_proven(tmp_path):
+    """D3:UPDATED AND weight_type == -1 → priority_proven True(boosted 计数)。"""
+    runtime_root = tmp_path / "runtime"
+    prewarm = CustomerPrewarmStore(runtime_root / "customer_prewarm.sqlite3")
+    cache = SharedCrawlCache(runtime_root / "shared_crawl_cache.sqlite3")
+    url = "https://qx.com/exact-boost-w-1.html"
+    make_state_db(runtime_root, BUSINESS_DATE)
+    _paths, job_id = seed_remote_work(
+        runtime_root,
+        BUSINESS_DATE,
+        _CountingAdapter(),
+        mapping=COMIX,
+        url=url,
+        job_state="SUBMITTED",
+        remote_identity="comix|remote-wm|number-wm",
+    )
+    candidate_id = cache_hit_candidate(prewarm, url)
+    adapter = _CountingAdapter(submit_raises=True)
+
+    result = _dispatch(runtime_root, prewarm, cache, candidate_id, adapter=adapter)
+
+    assert result["outcome"] == "REUSED"
+    assert result["remote_job_id"] == job_id
+    assert result["priority_proven"] is True
+    assert result["priority_boosted"] == 1
+    assert result["priority_unconfirmed"] == 0
+    assert adapter.prioritize_calls == 1
+
+
+def test_exact_cross_day_unfinished_job_reused_no_duplicate_create(tmp_path):
+    """D4:候选跨日 linkage 指向 Day1 未完成任务时,exact 在创建前只读探测
+    Day1 库并复用该任务——绝不新建 Day2 重复远端任务,也绝不写 (D2, cand,
+    job) 新 linkage(D1 linkage 保持权威)。"""
+    day1 = "2026-09-13"
+    runtime_root = tmp_path / "runtime"
+    prewarm = CustomerPrewarmStore(runtime_root / "customer_prewarm.sqlite3")
+    cache = SharedCrawlCache(runtime_root / "shared_crawl_cache.sqlite3")
+    url = "https://qx.com/exact-crossday-reuse.html"
+
+    # Day1 state DB: unfinished bound RUNNING job for the URL + linkage row.
+    paths1 = make_state_db(runtime_root, day1)
+    _paths1, job1 = seed_remote_work(
+        runtime_root,
+        day1,
+        _CountingAdapter(),
+        mapping=COMIX,
+        url=url,
+        job_state="RUNNING",
+        remote_identity="comix|remote-cd|number-cd",
+    )
+    candidate_id = cache_hit_candidate(prewarm, url)
+    prewarm.record_remote_job_link(
+        day1, candidate_id, job1, "customer-prewarm-zhaoshang"
+    )
+
+    # Day2 (action day) state DB exists WITHOUT any work for the URL.
+    paths2 = make_state_db(runtime_root, BUSINESS_DATE)
+    adapter = _CountingAdapter(submit_raises=True)
+
+    result = _dispatch(runtime_root, prewarm, cache, candidate_id, adapter=adapter)
+
+    assert result["outcome"] == "REUSED"
+    assert result["remote_job_id"] == job1
+    assert result["remote_identity"] == "comix|remote-cd|number-cd"
+    assert result["priority_proven"] is True
+    assert result["cross_day"] is True
+    assert result["job_business_date"] == day1
+    # create chain NEVER ran: zero prepares besides the boost reconstruct,
+    # zero submits, zero new rows in the Day2 state DB.
+    assert adapter.prepare_calls == 1
+    assert adapter.submit_calls == 0
+    assert _crawl_rows(paths2.state_path) == []
+    assert _state_rows(paths2.state_path, "SELECT * FROM remote_jobs") == []
+    # the Day1 job row is untouched (read-only boost)
+    job1_row = _state_rows(paths1.state_path, "SELECT state FROM remote_jobs")[0]
+    assert job1_row["state"] == "RUNNING"
+    # no NEW linkage row dated Day2 for that job id (Day1 linkage stays
+    # authoritative)
+    link_rows = _state_rows(
+        runtime_root / "customer_prewarm.sqlite3",
+        """SELECT * FROM prewarm_remote_job_links
+           WHERE business_date=? AND candidate_id=? AND remote_job_id=?""",
+        (BUSINESS_DATE, candidate_id, job1),
+    )
+    assert link_rows == []
+    link = prewarm.remote_job_link_for_candidate(candidate_id)
+    assert link is not None
+    assert link["business_date"] == day1
+    assert link["remote_job_id"] == job1
+
+
+def test_exact_cross_day_missing_state_db_falls_back_to_create(tmp_path):
+    """D4 回退:linkage 指向的业务日 state.sqlite3 文件缺失 → 诚实走正常
+    创建链(恰好一个单 URL 任务),绝不静默吞掉。"""
+    day1 = "2026-09-13"
+    runtime_root = tmp_path / "runtime"
+    prewarm = CustomerPrewarmStore(runtime_root / "customer_prewarm.sqlite3")
+    cache = SharedCrawlCache(runtime_root / "shared_crawl_cache.sqlite3")
+    url = "https://qx.com/exact-crossday-missing.html"
+
+    candidate_id = cache_hit_candidate(prewarm, url)
+    # linkage points at a day whose state DB file was never created
+    prewarm.record_remote_job_link(day1, candidate_id, 777, "customer-prewarm-zhaoshang")
+    assert not (runtime_root / day1 / "state.sqlite3").is_file()
+
+    paths2 = make_state_db(runtime_root, BUSINESS_DATE)
+    adapter = _CountingAdapter()
+
+    result = _dispatch(runtime_root, prewarm, cache, candidate_id, adapter=adapter)
+
+    assert result["outcome"] == "CREATED"
+    assert result["priority_confirmed"] is True
+    assert adapter.prepare_calls == 1
+    assert adapter.submit_calls == 1
+    assert len(_crawl_rows(paths2.state_path)) == 1
+
+
+def test_guarded_reused_unconfirmed_no_runtimeerror_noise(tmp_path):
+    """D6:守卫式 exact REUSED 未确认不再携带合成的 RuntimeError phase_error
+    ——guarded manual 路径绝不写候选行,note 只是 pass 内记账,直接跳过。"""
+    runtime_root = tmp_path / "runtime"
+    prewarm = CustomerPrewarmStore(runtime_root / "customer_prewarm.sqlite3")
+    cache = SharedCrawlCache(runtime_root / "shared_crawl_cache.sqlite3")
+    url = "https://qx.com/exact-boost-quiet.html"
+    make_state_db(runtime_root, BUSINESS_DATE)
+    _paths, job_id = seed_remote_work(
+        runtime_root,
+        BUSINESS_DATE,
+        _CountingAdapter(),
+        mapping=COMIX,
+        url=url,
+        job_state="SUBMITTED",
+        remote_identity="comix|remote-q|number-q",
+    )
+    candidate_id = cache_hit_candidate(prewarm, url)
+    before = prewarm.candidate_by_id(candidate_id)
+    adapter = _CountingAdapter(
+        submit_raises=True,
+        priority_outcomes=[
+            LegacyPriorityOutcome(PriorityStatus.UNCONFIRMED, diagnostic="tool died")
+        ],
+    )
+
+    result = _dispatch(runtime_root, prewarm, cache, candidate_id, adapter=adapter)
+
+    assert result["outcome"] == "REUSED"
+    assert result["priority_proven"] is False
+    assert result["priority_unconfirmed"] == 1
+    # NO synthetic guarded-write RuntimeError noise in phase_errors
+    assert not any(
+        "manual recrawl never writes candidate cache_status" in message
+        for message in result["phase_errors"]
+    ), result["phase_errors"]
+    assert result["phase_errors"] == []
+    # the candidate row was never written (the note write was skipped, not
+    # failed): byte-identical before/after
+    assert prewarm.candidate_by_id(candidate_id) == before
+    assert adapter.submit_calls == 0
+
+
+def test_exact_reused_none_with_terminal_success_flag(tmp_path):
+    """D7:同日复用 boost 返回 None(job 状态移出可 boost 集合)时重probe;
+    终态 SUCCESS → REUSED 携带 job_terminal_success=True + priority_proven
+    None(诚实:任务已完成,无需也无法再 boost)。"""
+    runtime_root = tmp_path / "runtime"
+    paths = make_state_db(runtime_root, BUSINESS_DATE)
+    prewarm = CustomerPrewarmStore(runtime_root / "customer_prewarm.sqlite3")
+    cache = SharedCrawlCache(runtime_root / "shared_crawl_cache.sqlite3")
+    url = "https://qx.com/exact-boost-none-terminal.html"
+    _paths, job_id = seed_remote_work(
+        runtime_root,
+        BUSINESS_DATE,
+        _CountingAdapter(),
+        mapping=COMIX,
+        url=url,
+        job_state="SUBMITTED",
+        remote_identity="comix|remote-nt|number-nt",
+    )
+    # simulate a state move between probe and boost: the bound crawl row went
+    # terminal SUCCESS while the job moved to a non-boostable in-flight state
+    connection = sqlite3.connect(str(paths.state_path), isolation_level=None)
+    try:
+        connection.execute("UPDATE remote_jobs SET state='SUBMIT_UNKNOWN'")
+        connection.execute("UPDATE crawl_work SET state='SUCCESS'")
+    finally:
+        connection.close()
+    candidate_id = cache_hit_candidate(prewarm, url)
+    adapter = _CountingAdapter(submit_raises=True)
+
+    result = _dispatch(runtime_root, prewarm, cache, candidate_id, adapter=adapter)
+
+    assert result["outcome"] == "REUSED"
+    assert result["remote_job_id"] == job_id
+    assert result["priority_proven"] is None
+    assert result["job_terminal_success"] is True
+    assert result["cross_day"] is False
+    assert result["job_business_date"] == BUSINESS_DATE
+    assert adapter.submit_calls == 0
+    assert adapter.prioritize_calls == 0
+    assert len(_crawl_rows(paths.state_path)) == 1
 
 
 def test_case_d_priority_unconfirmed_reported_honestly(tmp_path):

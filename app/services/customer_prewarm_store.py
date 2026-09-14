@@ -293,7 +293,10 @@ class CustomerPrewarmStore:
             # existing document-day evidence (prewarm_links × documents'
             # business_date).  INSERT OR IGNORE keeps this idempotent on every
             # open — existing observation rows (their refreshed last_seen_at)
-            # are never overwritten.
+            # are never overwritten.  New business days come ONLY from the two
+            # explicit write paths (upsert_link's inline observation and
+            # upsert_document's per-link derivation); this bootstrap covers
+            # legacy rows only.
             connection.execute(
                 """INSERT OR IGNORE INTO prewarm_daily_observations
                    (business_date, candidate_id, document_id, original_url,
@@ -387,6 +390,22 @@ class CustomerPrewarmStore:
                         "UPDATE prewarm_documents SET last_seen_at=?, source=? WHERE document_id=?",
                         (now, new_source, document_value),
                     )
+            # Issue #13 Round 3 (D2): 文档在业务日 D 被重见 ⇒ 其既有引用在
+            # D 也被观测。为该文档的全部既有 links 派生当日 observation
+            # (INSERT OR IGNORE,PK 幂等),覆盖 DONE 文档次日仅走 intake、
+            # 不再重跑 detail 的重复引用场景。派生记账:SQL 失败被吞掉,
+            # 绝不破坏文档写入本身(与 upsert_link 内联写同一隔离策略)。
+            try:
+                connection.execute(
+                    """INSERT OR IGNORE INTO prewarm_daily_observations
+                       (business_date, candidate_id, document_id, original_url,
+                        first_seen_at, last_seen_at)
+                       SELECT ?, l.candidate_id, l.document_id, l.original_url, ?, ?
+                       FROM prewarm_links l WHERE l.document_id=?""",
+                    (business_date_value, now, now, document_value),
+                )
+            except sqlite3.Error:
+                pass
             refreshed = connection.execute(
                 "SELECT * FROM prewarm_documents WHERE document_id=?", (document_value,)
             ).fetchone()
@@ -478,11 +497,13 @@ class CustomerPrewarmStore:
     ) -> dict[str, Any]:
         """Idempotent link upsert returning ``{"link": ..., "candidate": ...}``.
 
-        ``business_date`` is only used when a NEW candidate row is created;
-        it defaults to the current UTC date (candidates carry the first-seen
-        date, so callers usually pass the business date they are scanning).
-        ``lookup_url`` defaults to ``original_url``; ``routing_url=None`` means
-        no rewrite is known.
+        ``business_date`` has TWO uses (Issue #13 Round 3): it is stamped as
+        the first-seen date when a NEW candidate row is created, AND it dates
+        the daily observation recorded for this link — so callers pass the
+        business date they are scanning and a link re-observed on a later day
+        is observed under that later day.  It defaults to the current UTC
+        date.  ``lookup_url`` defaults to ``original_url``;
+        ``routing_url=None`` means no rewrite is known.
         """
         self._assert_writable()
         document_value = self._require_text(document_id, "document_id")

@@ -39,9 +39,16 @@ introduces a second remote-task store:
   ``UNCONFIRMED``, an exception, or a readback whose weight_type is not -1 —
   leaves the job ``PRIORITY_PENDING`` and retries next pass (candidates
   ``REMOTE_DISPATCHED``/``REMOTE_REUSED`` stay, never re-created).
-  ``priority_boosted`` keeps counting the idempotent evidence-replay boosts of
-  reused jobs.  ``PRIORITY_PENDING`` jobs with a remote identity re-enter the
-  confirm list from BOTH remote candidate statuses every pass.
+  ``priority_boosted`` counts only PROVEN boosts of reused jobs (status
+  ``UPDATED``/``ALREADY_HIGHEST`` AND readback ``weight_type == -1``; a
+  status-accepted-but-weight-unproven outcome takes the unconfirmed path with
+  counter ``priority_unconfirmed``).  ``PRIORITY_PENDING`` jobs with a remote
+  identity re-enter the confirm list from BOTH remote candidate statuses every
+  pass.  Round 3 cross-day protection: pass Phase 1 never resolves a
+  candidate's bound job by bare id against today's DB when a linkage row dates
+  that job on an earlier day (skipped with a phase note — the manual-recrawl
+  exact path owns cross-day work through a strictly read-only probe of that
+  day's state DB and a no-write boost).
 - plan-only: the whole report is built from read-only probes and returns
   BEFORE any lock, store write, or adapter construction — provably zero-write.
 
@@ -355,8 +362,10 @@ def _empty_summary(
         # priority_confirmed: distinct jobs PROVEN weight_type == -1 this pass
         # (same-pass confirms of fresh creates + PRIORITY_PENDING confirms of
         # REMOTE_* candidates; state reconciled to SUBMITTED).
-        # priority_boosted: idempotent evidence-replay boosts of reused jobs
-        # (status-level confirmation only; the legacy job state is untouched).
+        # priority_boosted: PROVEN boosts of reused jobs — status accepted
+        # (UPDATED/ALREADY_HIGHEST) AND readback weight_type == -1.  Round 3
+        # D3: a status-accepted-but-weight-unproven outcome counts into
+        # priority_unconfirmed instead (never claimed as proven).
         "priority_confirmed": 0,
         "priority_boosted": 0,
         "priority_unconfirmed": 0,
@@ -417,11 +426,66 @@ def _read_remote_job_readonly(state_db_path: str | Path, job_id: int) -> dict[st
     return dict(row) if row is not None else None
 
 
+def _read_remote_job_row_readonly(state_db_path: str | Path, job_id: int) -> dict[str, Any] | None:
+    """Full ``remote_jobs`` row probe (``mode=ro``) for the cross-day boost
+    (Round 3 D4): the row lives in ANOTHER day's state DB and is only ever
+    read from here — the owning day's lifecycle stays authoritative."""
+    connection = _open_state_db_readonly(state_db_path)
+    if connection is None:
+        return None
+    try:
+        row = connection.execute(
+            "SELECT * FROM remote_jobs WHERE id=?",
+            (int(job_id),),
+        ).fetchone()
+    finally:
+        connection.close()
+    return dict(row) if row is not None else None
+
+
 def _candidate_mall(candidate: Mapping[str, Any], mappings: Sequence[ZhaoshangMallMapping]) -> str:
     mall = str(candidate.get("mall") or "").strip()
     if mall:
         return mall
     return classify_reference_url(str(candidate.get("lookup_url") or ""), mappings).mall_key
+
+
+def _cross_day_link(
+    prewarm_store: Any,
+    candidate_id: int,
+    business_date: str,
+    phase_errors: list[str],
+) -> dict[str, Any] | None:
+    """Latest candidate linkage when it dates the bound job on ANOTHER day.
+
+    Round 3 D5 guard: a candidate whose latest linkage row names a different
+    ``business_date`` has its remote job owned by that day's state DB —
+    resolving the bare ``remote_job_id`` against today's DB can hit an
+    unrelated same-numbered job.  Returns ``None`` (keep current behavior)
+    when there is no linkage, when the linkage is same-day, or when the probe
+    itself fails (isolated into ``phase_errors``)."""
+    try:
+        link = prewarm_store.remote_job_link_for_candidate(int(candidate_id))
+    except Exception as exc:  # noqa: BLE001 - probe failure never breaks the pass
+        phase_errors.append(
+            f"candidate {candidate_id}: remote job link probe: {type(exc).__name__}: {exc}"
+        )
+        return None
+    if link is None:
+        return None
+    link_date = str(link.get("business_date") or "")
+    if not link_date or link_date == business_date:
+        return None
+    return link
+
+
+def _cross_day_skip_note(candidate_id: int, link: Mapping[str, Any]) -> str:
+    """Phase note for a candidate skipped because its job lives on another day."""
+    return (
+        f"candidate {int(candidate_id)}: cross-day job "
+        f"{link.get('remote_job_id')}@{link.get('business_date')} skipped "
+        "(manual recrawl path owns cross-day work)"
+    )
 
 
 def _record(
@@ -622,6 +686,13 @@ def _plan_only_report(
                 summary["candidates_in_scope"] += 1
             job_id = candidate.get("remote_job_id")
             if job_id is None or int(job_id) in seen_priority_job_ids:
+                continue
+            candidate_id = int(candidate["id"])
+            link = _cross_day_link(prewarm_store, candidate_id, business_date, phase_errors)
+            if link is not None:
+                # D5 (plan-only): never count a cross-day-linked candidate's
+                # bare job id against today's state DB.
+                phase_errors.append(_cross_day_skip_note(candidate_id, link))
                 continue
             job = _read_remote_job_readonly(state_db_path, int(job_id))
             if job is None:
@@ -964,6 +1035,17 @@ def _run_leased_pass(
                     counters["absorbed"] += 1
                 continue
             if candidate.get("remote_job_id") is not None:
+                link = _cross_day_link(
+                    prewarm_store, candidate_id, summary["business_date"], phase_errors
+                )
+                if link is not None:
+                    # D5: the candidate's bound job lives on an earlier day's
+                    # state DB.  Resolving the bare id against today's DB could
+                    # confirm/boost an unrelated same-numbered job — skip the
+                    # candidate from the confirm/reuse lists this pass; the
+                    # manual-recrawl exact path owns cross-day work.
+                    phase_errors.append(_cross_day_skip_note(candidate_id, link))
+                    continue
                 item = {
                     "candidate_id": candidate_id,
                     "job_id": int(candidate["remote_job_id"]),
@@ -1722,11 +1804,14 @@ def _boost_reused_job(
 ) -> bool | None:
     """One idempotent priority boost for a reused job (fail-closed).
 
-    Issue #13 Round 2 additive tri-state return (existing counters/callers
-    unchanged): ``True`` = proven (status UPDATED/ALREADY_HIGHEST);
-    ``False`` = attempted-but-unconfirmed, budget-deferred, canary-blocked,
-    or the failure path; ``None`` = not actionable (missing job, missing
-    identity, or a non-boostable state the existing lifecycle owns).
+    Issue #13 Round 3 D3: ``True`` means PROVEN — outcome status accepted
+    (``UPDATED``/``ALREADY_HIGHEST``) AND readback ``weight_type == -1``
+    (the same honest bar as :func:`_priority_proven` / the confirm path).
+    ``False`` = attempted-but-unconfirmed (including status accepted without
+    the -1 readback), budget-deferred, canary-blocked, or the failure path —
+    the counter ``priority_unconfirmed`` is honest bookkeeping, never a
+    proven boost.  ``None`` = not actionable (missing job, missing identity,
+    or a non-boostable state the existing lifecycle owns).
     """
     phase_errors = summary["phase_errors"]
     try:
@@ -1773,23 +1858,104 @@ def _boost_reused_job(
         )
         if canary_scope is not None:
             summary["priority_updates_performed"] += 1
-        status = _status_value(priority.status)
-        if status in (PriorityStatus.UPDATED.value, PriorityStatus.ALREADY_HIGHEST.value):
+        if _priority_proven(priority):
+            # D3: PROVEN means status accepted AND readback weight_type == -1
+            # — a status-accepted-but-weight-unproven outcome takes the
+            # unconfirmed path below instead of claiming a proven boost.
             summary["priority_boosted"] += 1
             return True
         summary["priority_unconfirmed"] += 1
         diagnostic = str(getattr(priority, "diagnostic", "") or "highest priority was not confirmed")
-        _record(
-            prewarm_store,
-            candidate_id,
-            cache_status=CACHE_STATUS_REMOTE_REUSED,
-            remote_job_id=job_id,
-            error=f"{_PRIORITY_UNCONFIRMED_PREFIX}: {diagnostic}",
-            phase_errors=phase_errors,
-        )
+        if not getattr(prewarm_store, "_no_candidate_writes", False):
+            # D6: the guarded manual path never writes candidate rows; the
+            # unconfirmed note is pass-only bookkeeping, so skip the doomed
+            # _record round-trip instead of synthesizing RuntimeError
+            # phase_errors on every guarded exact-REUSED-unconfirmed pass.
+            _record(
+                prewarm_store,
+                candidate_id,
+                cache_status=CACHE_STATUS_REMOTE_REUSED,
+                remote_job_id=job_id,
+                error=f"{_PRIORITY_UNCONFIRMED_PREFIX}: {diagnostic}",
+                phase_errors=phase_errors,
+            )
         return False
     except Exception as exc:  # noqa: BLE001 - boost failure never fails the pass
         phase_errors.append(f"boost job {job_id}: {type(exc).__name__}: {exc}")
+        return False
+
+
+def _boost_cross_day_job(
+    *,
+    prewarm_store: Any,
+    store: DailyAuditStore,
+    token: LeaseToken,
+    get_adapter: Callable[[], Any],
+    link_date: str,
+    job_row: Mapping[str, Any],
+    candidate_id: int,
+    deadline: float,
+    monotonic_value: Callable[[], float],
+    summary: dict[str, Any],
+) -> bool | None:
+    """Read-only priority boost of ANOTHER day's unfinished job (Round 3 D4).
+
+    Same prioritize logic as :func:`_boost_reused_job` with three hard
+    differences: the job row comes from the link date's state DB (opened
+    read-only — this function never writes that DB and never resolves the job
+    against today's DB), the prepared job is reconstructed under ``link_date``
+    (the payload's logical key dates from the original day), and no state
+    reconciles happen — the owning day's lifecycle stays authoritative and no
+    linkage row is written (the existing ``(link_date, candidate_id, job_id)``
+    row remains the authoritative binding).  Only TODAY's lease is renewed so
+    the long remote call cannot expire the currently held lease.  Tri-state
+    return mirrors :func:`_boost_reused_job` (proven ``True`` counts
+    ``priority_boosted``; everything else is honest and retried).
+    """
+    phase_errors = summary["phase_errors"]
+    job_id = int(job_row.get("id") or 0)
+    try:
+        identity = str(job_row.get("remote_identity") or "").strip()
+        if not identity or str(job_row.get("state") or "") not in _BOOSTABLE_JOB_STATES:
+            return None
+        adapter = get_adapter()
+        prepared = _reconstruct_prepared_job(adapter, link_date, job_row)
+        parts = identity.split("|")
+        if (
+            len(parts) != 3
+            or parts[0] != prepared.mall_key
+            or not parts[1]
+            or not parts[2]
+        ):
+            raise ValueError("legacy remote task identity is invalid")
+        store.renew_lease(token, LEASE_TTL_SECONDS)
+        priority = adapter.prioritize(
+            prepared,
+            task_id=parts[1],
+            task_number=parts[2],
+            timeout_seconds=max(0.001, deadline - monotonic_value()),
+        )
+        if _priority_proven(priority):
+            summary["priority_boosted"] += 1
+            return True
+        summary["priority_unconfirmed"] += 1
+        diagnostic = str(getattr(priority, "diagnostic", "") or "highest priority was not confirmed")
+        if not getattr(prewarm_store, "_no_candidate_writes", False):
+            # D6 guard, same rationale as the same-day boost's unconfirmed
+            # branch: the guarded manual path never writes candidate rows.
+            _record(
+                prewarm_store,
+                candidate_id,
+                cache_status=CACHE_STATUS_REMOTE_REUSED,
+                remote_job_id=job_id,
+                error=f"{_PRIORITY_UNCONFIRMED_PREFIX}: {diagnostic}",
+                phase_errors=phase_errors,
+            )
+        return False
+    except Exception as exc:  # noqa: BLE001 - cross-day boost failure never fails the dispatch
+        phase_errors.append(
+            f"cross-day boost job {job_id}@{link_date}: {type(exc).__name__}: {exc}"
+        )
         return False
 
 
@@ -1799,12 +1965,16 @@ def _boost_reused_job(
 class _NoCandidateWriteStore:
     """Read-candidate proxy over :class:`CustomerPrewarmStore`.
 
-    Manual recrawl NEVER changes a candidate's ``cache_status`` — including the
-    indirect path: :func:`_boost_reused_job`'s unconfirmed branch records a
-    candidate note through ``record_candidate_result``.  Wrapping the real store
-    fails that write closed (the store's own transition table would refuse
-    ``CACHE_HIT`` anyway) while every other attribute delegates untouched.
+    Manual recrawl NEVER changes a candidate's ``cache_status`` — including
+    the indirect path: a boost's unconfirmed branch records a candidate note
+    through ``record_candidate_result``.  The class flag ``_no_candidate_writes``
+    lets write-shaped helpers (:func:`_boost_reused_job` / Round 3 D6, and the
+    cross-day variant) skip that pass-only note bookkeeping up front instead
+    of failing here; any candidate write that still reaches this proxy fails
+    closed loudly while every other attribute delegates untouched.
     """
+
+    _no_candidate_writes = True
 
     def __init__(self, store: CustomerPrewarmStore) -> None:
         self._store = store
@@ -1867,10 +2037,10 @@ def dispatch_single_candidate_exact(
 
     monotonic_value = monotonic or time.monotonic
     deadline = monotonic_value() + max(0.0, float(budget_seconds))
-    paths = runtime_paths(
-        business_date,
-        state_runtime_root if state_runtime_root is not None else runtime_root,
+    effective_state_root = (
+        state_runtime_root if state_runtime_root is not None else runtime_root
     )
+    paths = runtime_paths(business_date, effective_state_root)
     summary: dict[str, Any] = {
         "outcome": "OK",
         "business_date": business_date,
@@ -1945,6 +2115,7 @@ def dispatch_single_candidate_exact(
                     deadline=deadline,
                     monotonic_value=monotonic_value,
                     summary=summary,
+                    state_runtime_root=effective_state_root,
                 )
             finally:
                 try:
@@ -1971,8 +2142,21 @@ def _dispatch_exact_leased(
     deadline: float,
     monotonic_value: Callable[[], float],
     summary: dict[str, Any],
+    state_runtime_root: str | Path,
 ) -> dict[str, Any]:
-    """Probe → reuse-boost or single-URL create+submit.  Caller owns the lease."""
+    """Probe → reuse-boost or single-URL create+submit.  Caller owns the lease.
+
+    Return contract (Round 3, consumed by the manual-recrawl runner): every
+    ``REUSED`` summary carries ``remote_job_id`` (int), ``remote_identity``
+    (str), ``priority_proven`` (True proven / False unconfirmed / None not
+    actionable), ``cross_day`` (bool) and ``job_business_date`` (str — the
+    business_date of the state DB owning the reused job; equals the action
+    day unless ``cross_day`` is True).  ``job_terminal_success: True`` is
+    added ONLY when ``priority_proven`` is None and the re-probe found a
+    terminal SUCCESS crawl row for the URL (D7).  ``CREATED`` summaries carry
+    ``remote_job_id``/``task_name``/``task_number``/``remote_identity``/
+    ``priority_confirmed`` and are same-day by construction.
+    """
     phase_errors = summary["phase_errors"]
     mall_key = routing.mall_key
     lookup_url = routing.lookup_url
@@ -2002,13 +2186,70 @@ def _dispatch_exact_leased(
             monotonic_value=monotonic_value,
             summary=summary,
         )
+        job_terminal_success = False
+        if boost_proven is None:
+            # D7: the job is no longer boostable (its state moved on between
+            # the probe and the boost).  Re-probe before reporting: a terminal
+            # SUCCESS crawl row means the URL is actually finished — report
+            # that honestly via ``job_terminal_success`` instead of a bare
+            # None.  terminal_failed / still-unfinished keeps the plain REUSED
+            # + None semantics.
+            reprobe = find_remote_work_for_url(paths.state_path, mall_key, lookup_url)
+            job_terminal_success = bool((reprobe or {}).get("terminal_success"))
         summary["outcome"] = "REUSED"
         summary["remote_job_id"] = job_id
         summary["remote_identity"] = str(job.get("remote_identity") or "")
-        # Issue #13 Round 2: surface the honest boost proof (True=proven,
+        # Issue #13 Round 2/3: surface the honest boost proof (True=proven,
         # False=unconfirmed/failed, None=not actionable) for the caller.
         summary["priority_proven"] = boost_proven
+        summary["cross_day"] = False
+        summary["job_business_date"] = business_date
+        if job_terminal_success:
+            summary["job_terminal_success"] = True
         return summary
+
+    # ---- Round 3 D4: cross-day linkage probe (strictly read-only) --------
+    # The candidate may be linked to an unfinished job living on an EARLIER
+    # day's state DB.  Today's probe cannot see it, so without this check the
+    # create chain below would fabricate a duplicate live remote task for the
+    # same URL.  The link date's DB is opened read-only; no linkage row is
+    # written here (the existing (link_date, candidate, job) row stays
+    # authoritative), and the boost is the no-write cross-day variant.
+    link = _cross_day_link(prewarm_store, candidate_id, business_date, phase_errors)
+    if link is not None:
+        link_date = str(link["business_date"])
+        link_db = runtime_paths(link_date, state_runtime_root).state_path
+        cross_unfinished = (find_remote_work_for_url(link_db, mall_key, lookup_url) or {}).get(
+            "unfinished_bound"
+        )
+        if link.get("remote_job_id") is not None and cross_unfinished is not None:
+            job_id = int(cross_unfinished["job"]["id"])
+            link_job_row = _read_remote_job_row_readonly(link_db, job_id)
+            if link_job_row is not None:
+                boost_proven = _boost_cross_day_job(
+                    prewarm_store=prewarm_store,
+                    store=store,
+                    token=token,
+                    get_adapter=get_adapter,
+                    link_date=link_date,
+                    job_row=link_job_row,
+                    candidate_id=candidate_id,
+                    deadline=deadline,
+                    monotonic_value=monotonic_value,
+                    summary=summary,
+                )
+                summary["outcome"] = "REUSED"
+                summary["remote_job_id"] = job_id
+                summary["remote_identity"] = str(link_job_row.get("remote_identity") or "")
+                summary["priority_proven"] = boost_proven
+                summary["cross_day"] = True
+                summary["job_business_date"] = link_date
+                return summary
+            # The linked job row vanished from the owning day's DB: the stale
+            # linkage is not actionable — fall through to the honest create.
+        # Missing link-date DB, no unfinished bound work there, or no job row:
+        # treat as no cross-day work and fall through to the normal same-day
+        # decision (create per the manual-recrawl intent).
 
     mapping = next((m for m in mappings if m.mall_key == mall_key), None)
     if mapping is None:
