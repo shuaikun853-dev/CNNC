@@ -1696,3 +1696,383 @@ def _boost_reused_job(
             )
     except Exception as exc:  # noqa: BLE001 - boost failure never fails the pass
         phase_errors.append(f"boost job {job_id}: {type(exc).__name__}: {exc}")
+
+
+# ---- Issue #13 Slice B: guarded single-URL manual recrawl ---------------------
+
+
+class _NoCandidateWriteStore:
+    """Read-candidate proxy over :class:`CustomerPrewarmStore`.
+
+    Manual recrawl NEVER changes a candidate's ``cache_status`` — including the
+    indirect path: :func:`_boost_reused_job`'s unconfirmed branch records a
+    candidate note through ``record_candidate_result``.  Wrapping the real store
+    fails that write closed (the store's own transition table would refuse
+    ``CACHE_HIT`` anyway) while every other attribute delegates untouched.
+    """
+
+    def __init__(self, store: CustomerPrewarmStore) -> None:
+        self._store = store
+
+    def record_candidate_result(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        raise RuntimeError("manual recrawl never writes candidate cache_status")
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._store, name)
+
+
+def dispatch_single_candidate_exact(
+    prewarm_store: CustomerPrewarmStore,
+    shared_cache: Any,
+    *,
+    business_date: str,
+    runtime_root: str | Path,
+    candidate_id: int,
+    mappings: Sequence[ZhaoshangMallMapping],
+    adapter: Any | None = None,
+    budget_seconds: float = 90.0,
+    state_runtime_root: str | Path | None = None,
+    monotonic: Callable[[], float] | None = None,
+) -> dict[str, Any]:
+    """Dispatch EXACTLY ONE candidate's URL through the existing lifecycle.
+
+    Issue #13 manual recrawl semantics (hard invariants):
+
+    - candidate rows are NEVER written — ``record_candidate_result`` is never
+      called, directly or indirectly (``CACHE_HIT`` stays terminal; the shared
+      cache and remote lifecycle carry all new evidence).
+    - probe first (:func:`find_remote_work_for_url`): an unfinished bound job
+      is reused with one idempotent :func:`_boost_reused_job` boost (result
+      ``REUSED``); terminal crawl rows mean the URL is finished — per the
+      manual-recrawl intent a fresh job is still created exactly once.
+    - create: the single-URL batch walks the exact STEP1 chain (placeholder
+      SKU, fingerprint, ``cnnc_current_opt_*`` task name, ``BATCH_STATE.md``),
+      then claim → submit → honest outcome handling: ``SUBMIT_UNKNOWN`` /
+      incomplete identity reconciles only; pre-send ``NOT_ATTEMPTED`` releases
+      the burned claim; ``SUBMITTED`` reconciles ``PRIORITY_PENDING`` and gets
+      one same-pass :func:`_confirm_pending_priority_job` confirm with
+      ``note_targets=[]`` (no candidate writes by construction).
+
+    Locks/lease mirror :func:`run_prewarm_dispatch_pass` byte for byte except
+    the instance-lock owner carries ``"invocation": "manual-recrawl"``.  All
+    skip outcomes are write-free by construction.  ``shared_cache`` is part of
+    the call contract for symmetry; the function itself performs no cache
+    writes (cache sync owns absorption, never the dispatcher).
+    """
+    candidate = prewarm_store.candidate_by_id(int(candidate_id))
+    if candidate is None:
+        return {"outcome": "CANDIDATE_NOT_FOUND", "phase_errors": []}
+    routing = classify_reference_url(str(candidate["original_url"] or ""), mappings)
+    if routing.outcome != OUTCOME_ZHAOSHANG:
+        return {
+            "outcome": "NOT_DISPATCHABLE",
+            "reason": routing.outcome,
+            "phase_errors": [],
+        }
+
+    monotonic_value = monotonic or time.monotonic
+    deadline = monotonic_value() + max(0.0, float(budget_seconds))
+    paths = runtime_paths(
+        business_date,
+        state_runtime_root if state_runtime_root is not None else runtime_root,
+    )
+    summary: dict[str, Any] = {
+        "outcome": "OK",
+        "business_date": business_date,
+        "candidate_id": int(candidate_id),
+        "mall_key": routing.mall_key,
+        "lookup_url": routing.lookup_url,
+        "phase_errors": [],
+        "priority_confirmed": 0,
+        "priority_boosted": 0,
+        "priority_unconfirmed": 0,
+    }
+    phase_errors = summary["phase_errors"]
+    guarded_store = _NoCandidateWriteStore(prewarm_store)
+    adapter_holder: list[Any] = []
+
+    def get_adapter() -> Any:
+        if not adapter_holder:
+            adapter_holder.append(
+                adapter if adapter is not None else CnncLegacyZhaoshangAdapter(mappings=mappings)
+            )
+        return adapter_holder[0]
+
+    lock_owner = {
+        "pid": os.getpid(),
+        "command": "customer_prewarm_dispatch",
+        "business_date": business_date,
+        "invocation": "manual-recrawl",
+    }
+    instance_lock = ProcessLock(Path(runtime_root) / DISPATCH_LOCK_NAME)
+    try:
+        instance_lock.acquire(owner=lock_owner)
+    except LeaseUnavailable:
+        summary["outcome"] = "SKIPPED_ALREADY_RUNNING"
+        return summary
+    try:
+        day_lock = ProcessLock(paths.lock_path)
+        try:
+            day_lock.acquire(owner=lock_owner)
+        except LeaseUnavailable:
+            summary["outcome"] = "LOCK_BUSY"
+            return summary
+        try:
+            if not paths.state_path.is_file():
+                summary["outcome"] = "STATE_DB_MISSING"
+                return summary
+            store = DailyAuditStore(paths.state_path)
+            if store.get_run(business_date) is None:
+                summary["outcome"] = "STATE_DB_MISSING"
+                return summary
+            try:
+                token = store.acquire_lease(
+                    business_date,
+                    LEASE_OWNER,
+                    LEASE_TTL_SECONDS,
+                    allow_unexpired_takeover=True,
+                    process_lock=day_lock,
+                )
+            except LeaseUnavailable:
+                summary["outcome"] = "LOCK_BUSY"
+                return summary
+            try:
+                return _dispatch_exact_leased(
+                    prewarm_store=guarded_store,
+                    store=store,
+                    token=token,
+                    paths=paths,
+                    routing=routing,
+                    candidate_id=int(candidate_id),
+                    mappings=mappings,
+                    get_adapter=get_adapter,
+                    business_date=business_date,
+                    deadline=deadline,
+                    monotonic_value=monotonic_value,
+                    summary=summary,
+                )
+            finally:
+                try:
+                    store.release_lease(token)
+                except Exception as exc:  # noqa: BLE001 - release never masks the result
+                    phase_errors.append(f"lease release: {type(exc).__name__}: {exc}")
+        finally:
+            day_lock.release()
+    finally:
+        instance_lock.release()
+
+
+def _dispatch_exact_leased(
+    *,
+    prewarm_store: Any,
+    store: DailyAuditStore,
+    token: LeaseToken,
+    paths: Any,
+    routing: Any,
+    candidate_id: int,
+    mappings: Sequence[ZhaoshangMallMapping],
+    get_adapter: Callable[[], Any],
+    business_date: str,
+    deadline: float,
+    monotonic_value: Callable[[], float],
+    summary: dict[str, Any],
+) -> dict[str, Any]:
+    """Probe → reuse-boost or single-URL create+submit.  Caller owns the lease."""
+    phase_errors = summary["phase_errors"]
+    mall_key = routing.mall_key
+    lookup_url = routing.lookup_url
+
+    probe = find_remote_work_for_url(paths.state_path, mall_key, lookup_url)
+    unfinished = (probe or {}).get("unfinished_bound")
+    if unfinished is not None:
+        job = unfinished.get("job") or {}
+        job_id = int(job.get("id") or 0)
+        _boost_reused_job(
+            prewarm_store=prewarm_store,
+            store=store,
+            token=token,
+            get_adapter=get_adapter,
+            business_date=business_date,
+            candidate_id=candidate_id,
+            job_id=job_id,
+            deadline=deadline,
+            monotonic_value=monotonic_value,
+            summary=summary,
+        )
+        summary["outcome"] = "REUSED"
+        summary["remote_job_id"] = job_id
+        summary["remote_identity"] = str(job.get("remote_identity") or "")
+        return summary
+
+    mapping = next((m for m in mappings if m.mall_key == mall_key), None)
+    if mapping is None:
+        summary["outcome"] = "MALL_NOT_MAPPED"
+        summary["reason"] = f"no ZhaoshangMallMapping loaded for mall {mall_key!r}"
+        return summary
+
+    # ---- create: exactly one single-URL job through the idempotent chain ----
+    sku_id = prewarm_placeholder_sku(mall_key, lookup_url)
+    fingerprint = prewarm_crawl_fingerprint(
+        mall_key, mapping.source_id, sku_id, lookup_url, business_date
+    )
+    work = store.ensure_crawl_work(
+        token,
+        mall_key,
+        sku_id,
+        lookup_url,
+        BACKEND_VERSION,
+        fingerprint,
+        source_id=mapping.source_id,
+    )
+    requests = [
+        CrawlRequest(
+            mall_key=mall_key,
+            mall_source_id=mapping.source_id,
+            mall_name=mapping.mall_name,
+            sku_id=sku_id,
+            url=lookup_url,
+            backend_version=BACKEND_VERSION,
+        )
+    ]
+    # Mirror legacy_zhaoshang_bridge.finalize byte for byte (same as the pass).
+    task_fingerprint = hashlib.sha256(
+        json.dumps(
+            {
+                "business_date": business_date,
+                "requests": [
+                    request.identity
+                    for request in sorted(requests, key=lambda value: value.identity)
+                ],
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    numeric_suffix = f"{int(task_fingerprint, 16) % (10 ** 14):014d}"
+    task_name = f"cnnc_current_opt_{requests[0].mall_name}_{numeric_suffix}"
+    job_dir = paths.run_dir / "zhaoshang" / mall_key / numeric_suffix
+    job_dir.mkdir(parents=True, exist_ok=True)
+    batch_state = _ensure_batch_state_file(paths.run_dir)
+
+    job = get_adapter().prepare_job(
+        business_date,
+        requests,
+        job_dir / "input.xlsx",
+        job_dir / "result.xlsx",
+        task_name,
+        batch_state_path=batch_state,
+    )
+    payload_json = {
+        "requests": [
+            {
+                "mall_key": request.mall_key,
+                "mall_source_id": request.mall_source_id,
+                "mall_name": request.mall_name,
+                "sku_id": request.sku_id,
+                "url": request.url,
+                "backend_version": request.backend_version,
+            }
+            for request in requests
+        ],
+        "batch_state": str(batch_state),
+    }
+    job_row = store.prepare_remote_intent(
+        token,
+        job.logical_job_key,
+        job.task_name,
+        job.payload_sha256,
+        mall_key=job.mall_key,
+        input_path=str(job.template_path),
+        result_path=str(job.result_path),
+        payload_json=payload_json,
+    )
+    job_id = int(job_row["id"])
+    summary["remote_job_id"] = job_id
+    summary["task_name"] = task_name
+    store.link_crawl_work_batch_to_remote_job(token, [int(work["id"])], job_id)
+    store.renew_lease(token, LEASE_TTL_SECONDS)
+
+    # Pre-send boundary: below the budget floor the intent stays unclaimed so
+    # a real adapter never burns into a fake SUBMIT_UNKNOWN (same as the pass).
+    remaining = deadline - monotonic_value()
+    if remaining < SUBMIT_MIN_SECONDS:
+        phase_errors.append(
+            f"manual recrawl: budget floor reached before claim; job {job_id} "
+            "stays SUBMIT_INTENT for resume"
+        )
+        summary["outcome"] = "SUBMIT_DEFERRED"
+        summary["note"] = "SUBMIT_INTENT for resume"
+        return summary
+
+    claim = store.claim_remote_submission(token, job_id)
+    if claim is None:
+        # Another writer dispatched this job: never double-POST.
+        summary["outcome"] = "CLAIM_LOST"
+        return summary
+
+    remaining = deadline - monotonic_value()
+    outcome = get_adapter().submit(job, timeout_seconds=max(0.001, remaining))
+    status = _status_value(outcome.status)
+    diagnostic = str(getattr(outcome, "diagnostic", "") or "")
+    task_id = getattr(outcome, "task_id", None)
+    task_number = getattr(outcome, "task_number", None)
+    if status == SubmitStatus.SUBMIT_UNKNOWN.value or (
+        status == SubmitStatus.SUBMITTED.value and (not task_id or not task_number)
+    ):
+        # Fail closed like the pass: reconcile-only, never a silent success.
+        if status == SubmitStatus.SUBMIT_UNKNOWN.value:
+            note = f"manual recrawl submit unknown: {diagnostic}"
+        else:
+            note = "manual recrawl submit returned incomplete identity"
+            diagnostic = diagnostic or "incomplete identity"
+        store.mark_submit_unknown(token, job_id, note)
+        summary["outcome"] = "SUBMIT_UNKNOWN"
+        summary["diagnostic"] = diagnostic
+        return summary
+    if status == SubmitStatus.NOT_ATTEMPTED.value:
+        # Pre-send failure: no dispatch happened; the unclaimed intent is
+        # re-planned by the next call through the idempotent create chain.
+        store.release_remote_submission_claim(
+            token, job_id, f"manual recrawl submit not attempted: {diagnostic}"
+        )
+        summary["outcome"] = "SUBMIT_NOT_ATTEMPTED"
+        summary["diagnostic"] = diagnostic
+        phase_errors.append(
+            f"manual recrawl: {_SUBMIT_NOT_ATTEMPTED_NOTE}"
+            + (f" ({diagnostic})" if diagnostic else "")
+        )
+        return summary
+    if status == SubmitStatus.SUBMITTED.value:
+        remote_identity = f"{mall_key}|{task_id}|{task_number}"
+        # weight_type=-1 is PROVEN, never assumed: hold at PRIORITY_PENDING
+        # until the same-pass confirm proves it (note_targets=[] -> zero
+        # candidate writes by construction).
+        store.reconcile_remote_job(
+            token, job_id, remote_identity=remote_identity, state="PRIORITY_PENDING"
+        )
+        store.advance_crawl_work_for_job(token, job_id, "PRIORITY_PENDING")
+        confirmed = _confirm_pending_priority_job(
+            prewarm_store=prewarm_store,
+            store=store,
+            token=token,
+            get_adapter=get_adapter,
+            business_date=business_date,
+            note_targets=[],
+            job_id=job_id,
+            deadline=deadline,
+            monotonic_value=monotonic_value,
+            summary=summary,
+            prepared=job,
+        )
+        summary["outcome"] = "CREATED"
+        summary["task_number"] = task_number
+        summary["remote_identity"] = remote_identity
+        summary["priority_confirmed"] = bool(confirmed)
+        return summary
+    # defensive: unknown submit status is treated fail-closed
+    store.mark_submit_unknown(
+        token, job_id, f"manual recrawl submit unknown status: {status}"
+    )
+    summary["outcome"] = "SUBMIT_UNKNOWN"
+    summary["diagnostic"] = f"unknown submit status: {status}"
+    return summary
