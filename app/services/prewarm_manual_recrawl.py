@@ -42,11 +42,19 @@ that re-crawls EXACTLY ONE prewarm link URL:
      ``last_check_error`` and keeps waiting (never raises).
   2. the shared crawl cache, opened READ-ONLY, probed with the SAME
      mall/URL derivation as at start: a current success with
-     ``succeeded_at >= handle.started_at`` AND ``producer ==
-     "manual-recrawl-zhaoshang"`` is the ONLY proof of ``SUCCEEDED``
-     (``completion_proof="cache_current"`` plus a ``new_result`` summary;
-     Round 3 D10).  A qualifying-time current row from ANY other producer is
-     NOT a completion: it only notes ``superseded_current_producer`` once
+     ``succeeded_at >= handle.started_at`` whose payload correlates EXACTLY
+     with THIS action's dispatched job — payload ``remote_job_id`` equal to
+     the dispatch's ``remote_job_id`` AND payload ``business_date`` equal to
+     the dispatch's ``job_business_date`` (``CREATED`` is same-day → the
+     action's own day) — is the ONLY proof of ``SUCCEEDED``
+     (``completion_proof="cache_current"`` plus a whitelisted ``new_result``
+     summary; Round 3 D10, Round 4 Slice G2 exact correlation).  Producer is
+     surfaced in ``new_result`` for diagnostics but is NEVER the gate: a
+     REUSED job originally created by the AUTO customer-prewarm pass still
+     carries ``producer="customer-prewarm-zhaoshang"`` in the cache (first
+     producer attribution is kept) and MUST complete when the
+     ``(business_date, remote_job_id)`` pair matches.  A qualifying-time row
+     that does not correlate only notes ``superseded_current_producer`` once
      and the action keeps waiting (D9 resolves it if the manual job failed).
 
   Every lazy terminal flip appends a durable ``completed`` JSONL event
@@ -130,7 +138,9 @@ _REMOTE_JOB_FAILED_STATE = "FAILED"
 FAILED_BY_REMOTE_JOB_TERMINAL = "remote_job_terminal_failed"
 
 # Lazy-completion proof label: SUCCEEDED is only ever backed by a shared-cache
-# current row newer than the action started (and produced by this route).
+# current row newer than the action started whose payload correlates exactly
+# with this action's dispatched job (business_date + remote_job_id, Round 4
+# Slice G2) — producer is surfaced for diagnostics only, never the gate.
 COMPLETION_PROOF_CACHE_CURRENT = "cache_current"
 
 _STAPLES_LOCK_OWNER_COMMAND = "prewarm_manual_recrawl"
@@ -642,14 +652,31 @@ class ManualRecrawlRunner:
         Order (Round 3): first the dispatched remote job's terminal state
         (D9 — a remote FAILED honestly fails the action), then the shared
         crawl cache READ-ONLY: ``lookup_current`` is probed and flips the
-        handle to SUCCEEDED only when the current row's ``succeeded_at``
-        parses to a datetime >= the action's ``started_at`` AND its
-        ``producer`` is exactly ``PRODUCER_MANUAL_RECRAWL_ZHAOSHANG``
-        (D10 — another producer's new current row is only noted as
-        ``superseded_current_producer``, once, and the action keeps waiting).
-        Never raises: any evaluation error keeps WAITING_REMOTE and notes
-        ``outcome["last_check_error"]``.  Never re-dispatches and never flips
-        PRIORITY_PENDING.  Staples actions never enter here (they end
+        handle to SUCCEEDED only when the current row EXACTLY correlates
+        with THIS action's dispatched job (Round 4 Slice G2, replacing the
+        Round 3 D10 producer gate):
+
+        1. ``succeeded_at`` parses to a tz-aware datetime >= the action's
+           ``started_at`` (a fresh row, not the pre-action current);
+        2. the row payload's ``remote_job_id`` equals the dispatch's
+           ``remote_job_id`` (``outcome["dispatch"]``, F2 contract);
+        3. the row payload's ``business_date`` equals the dispatch's
+           ``job_business_date`` (``CREATED`` is same-day → the handle's
+           ``business_date``).
+
+        Producer is surfaced in ``new_result`` for diagnostics but is NEVER
+        the gate: a REUSED job originally created by the AUTO
+        customer-prewarm pass still carries
+        ``producer="customer-prewarm-zhaoshang"`` (first attribution is kept)
+        and MUST complete when ``(business_date, remote_job_id)`` match.  A
+        qualifying-time row that does not correlate is only noted once as
+        ``superseded_current_producer`` (setdefault; carries the row's
+        producer) and the action keeps waiting — D9 resolves it if the manual
+        job itself failed.  The payload dict is proof-internal only and never
+        leaves this method: ``new_result`` stays the small whitelisted
+        summary.  Never raises: any evaluation error keeps WAITING_REMOTE and
+        notes ``outcome["last_check_error"]``.  Never re-dispatches and never
+        flips PRIORITY_PENDING.  Staples actions never enter here (they end
         synchronously in the worker with their own completion proof).
         """
         remote_state = self._remote_job_terminal_state_locked(handle)
@@ -660,11 +687,24 @@ class ManualRecrawlRunner:
             handle["status"] = "FAILED"
             self._complete_terminal_locked(handle)
             return
-        try:
-            from app.services.shared_crawl_cache import (
-                PRODUCER_MANUAL_RECRAWL_ZHAOSHANG,
-                SharedCrawlCache,
+        # Round 4 Slice G2: this action's expected (job_id, job_date) pair —
+        # the dispatch result is the live contract (REUSED carries
+        # ``job_business_date``; ``CREATED`` is same-day → the action's day).
+        dispatch = (handle.get("outcome") or {}).get("dispatch")
+        expected_job_id: int | None = None
+        expected_job_date = str(handle.get("business_date") or "")
+        if isinstance(dispatch, dict):
+            raw_job_id = dispatch.get("remote_job_id")
+            if raw_job_id is not None:
+                try:
+                    expected_job_id = int(raw_job_id)
+                except (TypeError, ValueError):
+                    expected_job_id = None
+            expected_job_date = str(
+                dispatch.get("job_business_date") or handle.get("business_date") or ""
             )
+        try:
+            from app.services.shared_crawl_cache import SharedCrawlCache
 
             mall, urls = self._completion_lookup_targets(handle)
             started = datetime.fromisoformat(str(handle["started_at"]))
@@ -686,12 +726,29 @@ class ManualRecrawlRunner:
                 if succeeded.tzinfo is None:
                     continue  # naive timestamp cannot be proven UTC-new
                 if succeeded < started:
-                    continue  # old current row, not produced by this action
-                if entry.get("producer") != PRODUCER_MANUAL_RECRAWL_ZHAOSHANG:
-                    # D10: a qualifying-time row from ANY other producer is
-                    # not this action's completion — note it once and keep
-                    # waiting (D9 resolves the action if the manual job
-                    # itself failed).
+                    continue  # old current row, predates this action
+                payload = entry.get("payload")
+                if not isinstance(payload, dict):
+                    payload = {}
+                row_job_id = payload.get("remote_job_id")
+                if row_job_id is not None:
+                    try:
+                        row_job_id = int(row_job_id)
+                    except (TypeError, ValueError):
+                        row_job_id = None
+                correlated = (
+                    expected_job_id is not None
+                    and row_job_id is not None
+                    and row_job_id == expected_job_id
+                    and str(payload.get("business_date")) == expected_job_date
+                )
+                if not correlated:
+                    # G2: a qualifying-time current row that does not carry
+                    # THIS action's (date, job_id) pair is not a completion —
+                    # whatever the producer (a wrong-job manual row included).
+                    # Note it once and keep waiting (D9 resolves the action if
+                    # the manual job itself failed); producer stays a
+                    # diagnostic, never the gate.
                     outcome = dict(handle.get("outcome") or {})
                     outcome.setdefault(
                         "superseded_current_producer", str(entry.get("producer") or "")

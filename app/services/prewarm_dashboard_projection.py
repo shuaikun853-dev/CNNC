@@ -32,12 +32,14 @@ the transparent unit as ``scope`` = ``{"business_date", ...,
 "candidate_count_in_scope"}``.
 
 Remote job resolution (B2): per candidate the linkage row
-(``prewarm_remote_job_links``, latest ``recorded_at``) pins the job to ITS
-business date, and the job row is read from that date's
-``runtime_root/<date>/state.sqlite3``; a legacy candidate without linkage
-falls back to the candidate's OWN first-seen date.  Job ids collide across
-dates, so jobs are keyed by ``(business_date, job_id)`` — the selected
-date's DB is NEVER queried by bare integer id.
+(``prewarm_remote_job_links``, latest ``recorded_at`` among the rows dated
+ON OR BEFORE the viewed business date — a linkage dated after the viewed
+day never projects) pins the job to ITS business date, and the job row is
+read from that date's ``runtime_root/<date>/state.sqlite3``; a legacy
+candidate without linkage falls back to the candidate's OWN first-seen
+date.  Job ids collide across dates, so jobs are keyed by
+``(business_date, job_id)`` — the selected date's DB is NEVER queried by
+bare integer id.
 
 Cache current-row resolution (Review Round 2, B1): identity is ``mall + URL``
 (parent #6).  ``resolved_identity_id`` → the ``crawl_results`` row with
@@ -53,8 +55,12 @@ never be attached.
 
 KPI units (single authority for the UI):
 
-- ``reference_link_count`` / ``unique_url_count``: ``prewarm_links`` rows of
-  the day scope / distinct ``original_url`` among them.
+- ``reference_link_count``: the VIEWED day's ``prewarm_daily_observations``
+  rows among the day-scope candidates (one observation per document the
+  candidate was seen under on this day; the per-candidate ``document_ids``
+  of summary / list / detail come from the same day-scoped map).
+  ``unique_url_count``: distinct ``original_url`` among the day-scope
+  candidates.
 - ``cache_hit_candidate_count``: day-scope candidates with
   ``cache_status='CACHE_HIT'``.
 - ``historical_cache_hit_count``: CACHE_HIT candidates whose CURRENT cache
@@ -419,10 +425,31 @@ def _load_candidates(connection: sqlite3.Connection) -> list[dict[str, Any]]:
     return [dict(row) for row in rows]
 
 
-def _load_document_ids(connection: sqlite3.Connection) -> dict[int, list[str]]:
-    rows = connection.execute(
-        "SELECT candidate_id, document_id FROM prewarm_links ORDER BY id"
-    ).fetchall()
+def _load_day_document_ids(
+    view: dict[str, Any], connection: sqlite3.Connection
+) -> dict[int, list[str]]:
+    """candidate_id → document ids observed on the VIEWED business day.
+
+    The daily observation table — NOT the global ``prewarm_links`` table —
+    is the authority for which documents/references were seen on the viewed
+    day: a candidate re-observed on a later day under a different document
+    must not show the later document when the earlier day is viewed.
+    ``rowid`` order keeps first-seen order.  Legacy store without the
+    observations table → empty map (data absence, not a degraded note); any
+    other read error degrades the prewarm store honestly.
+    """
+    try:
+        rows = connection.execute(
+            """SELECT candidate_id, document_id FROM prewarm_daily_observations
+               WHERE business_date=? ORDER BY rowid""",
+            (view["business_date"],),
+        ).fetchall()
+    except sqlite3.OperationalError as exc:
+        if "no such table" in str(exc).lower():
+            return {}
+        view["available"]["prewarm_store"] = False
+        view["reasons"].append(f"prewarm_store read failed: {exc}")
+        return {}
     documents: dict[int, list[str]] = {}
     for row in rows:
         documents.setdefault(int(row["candidate_id"]), []).append(str(row["document_id"]))
@@ -535,9 +562,12 @@ def _load_day_candidate_ids(view: dict[str, Any], connection: sqlite3.Connection
 def _load_remote_job_links(
     view: dict[str, Any], connection: sqlite3.Connection, candidate_ids: list[int]
 ) -> dict[int, dict[str, Any]]:
-    """candidate_id → latest linkage row (max ``recorded_at``, tie-break max
-    ``rowid`` — the same ordering the store's own
-    ``remote_job_link_for_candidate`` uses).
+    """candidate_id → latest linkage row dated ON OR BEFORE the viewed
+    business date (ISO ``YYYY-MM-DD`` compares lexicographically, so the
+    string ``<=`` is the date comparison); among the qualifying rows, max
+    ``recorded_at`` with tie-break max ``rowid`` — the same ordering the
+    store's own ``remote_job_link_for_candidate`` uses.  A linkage dated
+    AFTER the viewed day never projects (no future-date leakage).
 
     Missing linkage table (legacy store) → no linkage at all, without a
     degraded note — the per-candidate legacy fallback then applies.
@@ -549,9 +579,10 @@ def _load_remote_job_links(
         rows = connection.execute(
             f"""SELECT candidate_id, business_date, remote_job_id
                 FROM prewarm_remote_job_links
-                WHERE candidate_id IN ({placeholders})
+                WHERE candidate_id IN ({placeholders}) AND business_date <= ?
                 ORDER BY recorded_at, rowid""",
-            [int(candidate_id) for candidate_id in candidate_ids],
+            [int(candidate_id) for candidate_id in candidate_ids]
+            + [str(view["business_date"])],
         ).fetchall()
     except sqlite3.OperationalError as exc:
         if "no such table" in str(exc).lower():
@@ -664,8 +695,7 @@ def _candidate_view(paths: SimpleNamespace) -> dict[str, Any]:
     prewarm = connections.get("prewarm_store")
     if prewarm is not None:
         candidates = _scan(prewarm, "prewarm_store", available, reasons, _load_candidates)
-        documents = _scan(prewarm, "prewarm_store", available, reasons, _load_document_ids)
-        view["documents"] = documents or {}
+        view["documents"] = _load_day_document_ids(view, prewarm)
         view["staples_jobs"] = _load_staples_jobs_best_effort(prewarm, reasons)
         day_ids = _load_day_candidate_ids(view, prewarm)
         # Single scope cut: summary / list / detail all iterate these rows only.

@@ -603,6 +603,77 @@ def test_record_daily_observation_upsert_refreshes_last_seen(tmp_path):
     assert datetime.fromisoformat(rows[0]["last_seen_at"]) == second
 
 
+# ---- Round 4 Slice G2: observation 写入与 link/document 原子(无半成功) --------------
+#
+# observations 是看板的权威逐日索引:内联 observation 写与 link/document 写
+# 同处一个 BEGIN IMMEDIATE 事务,observation 失败必须让整个 upsert 回滚 ——
+# 绝不出现"链接已持久化而当日 observation 缺失"的半成功状态。
+
+
+def test_upsert_link_observation_failure_rolls_back_link(tmp_path):
+    """注入故障(observations 表缺失,模拟损坏):upsert_link 必须抛
+    sqlite3.OperationalError,且 link 行绝不落库(整体回滚,无半成功)。"""
+    store_path = tmp_path / "prewarm.sqlite3"
+    store = CustomerPrewarmStore(store_path)
+    store.upsert_document(BUSINESS_DATE, "DOC-ATOM", "CAT-1")
+    connection = sqlite3.connect(str(store_path), isolation_level=None)
+    try:
+        connection.execute("DROP TABLE prewarm_daily_observations")
+    finally:
+        connection.close()
+
+    with pytest.raises(sqlite3.OperationalError):
+        store.upsert_link(
+            "DOC-ATOM",
+            "https://qx.com/atomic-link.html",
+            mall="comix",
+            business_date=BUSINESS_DATE,
+        )
+
+    # fresh ro read:link(与本次事务内创建的候选)都不存在
+    ro = CustomerPrewarmStore.open_read_only(store_path)
+    assert ro.links_for_document("DOC-ATOM") == []
+    assert _store_rows(store_path, "SELECT * FROM prewarm_candidates") == []
+
+
+def test_upsert_document_observation_failure_rolls_back_document(tmp_path):
+    """注入故障(observations 表缺失):upsert_document 必须抛
+    sqlite3.OperationalError,文档 last_seen_at 保持不变证明 UPDATE 已回滚
+    (整体回滚,无半成功);既有 link 不受影响。"""
+    store_path = tmp_path / "prewarm.sqlite3"
+    store = CustomerPrewarmStore(store_path)
+    url = "https://qx.com/atomic-doc.html"
+    store.upsert_document(BUSINESS_DATE, "DOC-ATOM2", "CAT-1")
+    store.upsert_link("DOC-ATOM2", url, mall="comix", business_date=BUSINESS_DATE)
+    before = _store_rows(
+        store_path,
+        "SELECT last_seen_at FROM prewarm_documents WHERE document_id=?",
+        ("DOC-ATOM2",),
+    )
+    assert len(before) == 1
+
+    connection = sqlite3.connect(str(store_path), isolation_level=None)
+    try:
+        connection.execute("DROP TABLE prewarm_daily_observations")
+    finally:
+        connection.close()
+
+    with pytest.raises(sqlite3.OperationalError):
+        store.upsert_document(BUSINESS_DATE, "DOC-ATOM2", "CAT-1")
+
+    # last_seen_at 不变 ⇒ 本次 upsert(含 UPDATE)整体回滚
+    after = _store_rows(
+        store_path,
+        "SELECT last_seen_at FROM prewarm_documents WHERE document_id=?",
+        ("DOC-ATOM2",),
+    )
+    assert after == before
+    # 既有 link 原样存在(本次失败只影响自身事务)
+    assert _store_rows(
+        store_path, "SELECT * FROM prewarm_links WHERE document_id=?", ("DOC-ATOM2",)
+    ) != []
+
+
 # ---- Round 3 F1: observation 日期 = 扫描 pass 业务日(D1/D2 缺陷) -------------------
 #
 # D1:process_document 曾把文档首见日(document.business_date,不可变)传给

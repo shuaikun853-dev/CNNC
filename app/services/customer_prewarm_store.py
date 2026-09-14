@@ -393,19 +393,19 @@ class CustomerPrewarmStore:
             # Issue #13 Round 3 (D2): 文档在业务日 D 被重见 ⇒ 其既有引用在
             # D 也被观测。为该文档的全部既有 links 派生当日 observation
             # (INSERT OR IGNORE,PK 幂等),覆盖 DONE 文档次日仅走 intake、
-            # 不再重跑 detail 的重复引用场景。派生记账:SQL 失败被吞掉,
-            # 绝不破坏文档写入本身(与 upsert_link 内联写同一隔离策略)。
-            try:
-                connection.execute(
-                    """INSERT OR IGNORE INTO prewarm_daily_observations
-                       (business_date, candidate_id, document_id, original_url,
-                        first_seen_at, last_seen_at)
-                       SELECT ?, l.candidate_id, l.document_id, l.original_url, ?, ?
-                       FROM prewarm_links l WHERE l.document_id=?""",
-                    (business_date_value, now, now, document_value),
-                )
-            except sqlite3.Error:
-                pass
+            # 不再重跑 detail 的重复引用场景。
+            # Issue #13 Round 4 (Slice G2) 不变量:observations 是看板的权威
+            # 逐日索引 —— 派生写与文档写同处一个 BEGIN IMMEDIATE 事务且绝不
+            # 吞错:observation 失败让整个 upsert(含文档 UPDATE/INSERT)一起
+            # 回滚,绝不出现"文档已持久化而当日 observation 缺失"的半成功。
+            connection.execute(
+                """INSERT OR IGNORE INTO prewarm_daily_observations
+                   (business_date, candidate_id, document_id, original_url,
+                    first_seen_at, last_seen_at)
+                   SELECT ?, l.candidate_id, l.document_id, l.original_url, ?, ?
+                   FROM prewarm_links l WHERE l.document_id=?""",
+                (business_date_value, now, now, document_value),
+            )
             refreshed = connection.execute(
                 "SELECT * FROM prewarm_documents WHERE document_id=?", (document_value,)
             ).fetchone()
@@ -595,20 +595,21 @@ class CustomerPrewarmStore:
                 (document_value, original_value),
             ).fetchone()
             # Issue #13 Round 2: the same write transaction also records the
-            # document-day observation for this link.  The observation is
-            # derived bookkeeping — a failure here is swallowed so it can
-            # never break the link/candidate write itself.
-            try:
-                self._insert_daily_observation(
-                    connection,
-                    business_date=business_date_value,
-                    candidate_id=candidate_id,
-                    document_id=document_value,
-                    original_url=original_value,
-                    now_text=now,
-                )
-            except sqlite3.Error:
-                pass
+            # document-day observation for this link.
+            # Issue #13 Round 4 (Slice G2) invariant: observations are the
+            # dashboard's authoritative day index — this inline write is
+            # ATOMIC with the link/candidate write (same BEGIN IMMEDIATE
+            # transaction, never swallowed): an observation failure raises
+            # and rolls back the WHOLE upsert, so a persisted link can never
+            # exist without its day observation (no half-success).
+            self._insert_daily_observation(
+                connection,
+                business_date=business_date_value,
+                candidate_id=candidate_id,
+                document_id=document_value,
+                original_url=original_value,
+                now_text=now,
+            )
             return {"link": dict(link), "candidate": dict(candidate)}
 
     def record_candidate_result(
@@ -780,7 +781,7 @@ class CustomerPrewarmStore:
         PK hit refreshes ``last_seen_at`` only (first_seen_at is immutable
         evidence).  Shared by :meth:`record_daily_observation` (own
         transaction) and :meth:`upsert_link` (same transaction as the link
-        write, best-effort isolated there).
+        write — atomic with it since Round 4 Slice G2, never swallowed).
         """
         row = connection.execute(
             """SELECT first_seen_at FROM prewarm_daily_observations

@@ -6,8 +6,12 @@
 证实 → PRIORITY_PENDING 永不自动翻转,其余 → FAILED 诚实透传;REUSED +
 priority_proven None → 终态成功(job_terminal_success)→ WAITING_REMOTE,
 否则 → FAILED 诚实透传;SUCCEEDED 只能由 get() 懒完成证明 —— 共享缓存出现
-started_at 之后、producer=manual-recrawl-zhaoshang 的新 current 行;远端任务
-终态 FAILED → 动作 FAILED(failed_by=remote_job_terminal_failed))。
+started_at 之后、payload (business_date, remote_job_id) 与本动作派发任务
+完全一致的新 current 行(Round 4 Slice G2 精确关联;producer 仅诊断展示,
+绝不当门槛 —— REUSED 的 AUTO 客户预爬任务其同步行 producer 仍是
+customer-prewarm-zhaoshang,但 (date, job_id) 一致就必须完成;不相关的
+qualifying 行只记一次 superseded_current_producer 注记并继续等待);远端
+任务终态 FAILED → 动作 FAILED(failed_by=remote_job_terminal_failed))。
 Round 3 F3:D8 in-flight key 全程持有(status 非终态期间同一 URL 二次发起
 409;懒终态翻转立即释放;PRIORITY_PENDING/派发失败允许操作员重试)、
 D11 每次懒终态翻转落 completed JSONL 事件、双击防抖与 §44 业务隔离
@@ -39,6 +43,7 @@ from app.services.customer_prewarm_store import (
 )
 from app.services.incremental_audit_runtime import DEFAULT_RUNTIME_ROOT
 from app.services.shared_crawl_cache import (
+    PRODUCER_CUSTOMER_PREWARM_ZHAOSHANG,
     PRODUCER_DAILY_INTERNET,
     PRODUCER_MANUAL_RECRAWL_STAPLES,
     PRODUCER_MANUAL_RECRAWL_ZHAOSHANG,
@@ -246,6 +251,33 @@ def _write_state_db(runtime_root, jobs, *, business_date=BUSINESS_DATE):
         connection.commit()
     finally:
         connection.close()
+
+
+# ---- lazy-completion row helpers (Round 4 Slice G2 correlation) -------------------
+
+
+def _sync_payload(business_date=BUSINESS_DATE, remote_job_id=7):
+    """远端同步行的 payload 形状(镜像 sync_daily_internet_results)。"""
+    return {
+        "business_date": business_date,
+        "remote_job_id": remote_job_id,
+        "result": {"page_price_status": "OK", "page_price_value": "13.5"},
+    }
+
+
+def _write_sync_row(cache, url, payload, *, producer=PRODUCER_MANUAL_RECRAWL_ZHAOSHANG,
+                    price="13.5"):
+    """真实 SharedCrawlCache RW 写入一条远端同步成功行(succeeded_at=now →
+    qualifying 时间;payload 按 live daily-sync 契约携带 (date, job_id))。"""
+    return cache.record_success(
+        mall="comix",
+        submitted_url=url,
+        source="daily-internet",
+        producer=producer,
+        price=price,
+        title="新结果标题",
+        payload=payload,
+    )
 
 
 # ---- guard order ----------------------------------------------------------------
@@ -514,11 +546,13 @@ def test_dispatch_created_confirmed_is_waiting_not_success(runtime):
     assert hit["entry"]["succeeded_at"] < waiting["started_at"]
 
 
-def test_waiting_remote_completes_only_with_new_current(runtime):
-    """懒完成证明:WAITING_REMOTE 期间写入新 current 成功行 → get() → SUCCEEDED。
+def test_exact_job_id_new_current_succeeds(runtime):
+    """G2 相关性语义 6(既有 happy path 更新):手动 producer 行,payload
+    (business_date, remote_job_id) 与 CREATED 派发(无 job_business_date →
+    动作日兜底)完全一致 + qualifying 时间 → get() → SUCCEEDED。
 
-    完成证明 completion_proof=cache_current + new_result 摘要;旧行保留
-    (history_count 递增)。无新行时绝不翻转。
+    完成证明 completion_proof=cache_current + new_result 摘要(白名单,无
+    payload);旧行保留(history_count 递增)。无相关行时绝不翻转。
     """
     runtime.cache.record_success(
         mall="comix", submitted_url=COMIX_URL_1, source="daily-internet", price="9.9"
@@ -537,14 +571,7 @@ def test_waiting_remote_completes_only_with_new_current(runtime):
     assert runner.get(handle["action_id"])["status"] == "WAITING_REMOTE"
 
     # 远端同步落地:真实 SharedCrawlCache RW 写入新成功行(succeeded_at=now)
-    new_row = runtime.cache.record_success(
-        mall="comix",
-        submitted_url=COMIX_URL_1,
-        source="daily-internet",
-        producer=PRODUCER_MANUAL_RECRAWL_ZHAOSHANG,
-        price="13.5",
-        title="新结果标题",
-    )
+    new_row = _write_sync_row(runtime.cache, COMIX_URL_1, _sync_payload(remote_job_id=7))
 
     done = runner.get(handle["action_id"])
     assert done["status"] == "SUCCEEDED"
@@ -555,6 +582,7 @@ def test_waiting_remote_completes_only_with_new_current(runtime):
     assert new_result["title"] == "新结果标题"
     assert new_result["producer"] == PRODUCER_MANUAL_RECRAWL_ZHAOSHANG
     assert new_result["succeeded_at"]
+    assert "payload" not in new_result  # payload 只用于内部证明,绝不出白名单
     # 派发透传与完成证明共存
     assert done["outcome"]["dispatch"]["outcome"] == "CREATED"
 
@@ -566,6 +594,155 @@ def test_waiting_remote_completes_only_with_new_current(runtime):
     assert history_ids == {old_current_id, int(new_row["id"])}
 
     # 终态幂等:后续 get() 保持 SUCCEEDED
+    assert runner.get(handle["action_id"])["status"] == "SUCCEEDED"
+
+
+# ---- G2 correlation matrix (Round 4 Slice G2) --------------------------------------
+
+
+def test_wrong_remote_job_cannot_complete(runtime):
+    """G2 相关性矩阵 1:同 producer(手动)但 payload.remote_job_id 属于另一
+    任务(例如另一并发手动动作)→ 不是本动作的完成:保持 WAITING_REMOTE、
+    记一次 superseded 注记,绝不 SUCCEEDED。"""
+    candidate_id = _seed_candidate(runtime.prewarm, COMIX_URL_1, "D1", mall="comix")
+    dispatch = RecordingDispatch(
+        results={candidate_id: {"outcome": "CREATED", "remote_job_id": 7, "priority_confirmed": True}}
+    )
+    runner = _make_runner(
+        runtime, crawler_factory=_poison_crawler_factory, dispatch_exact=dispatch
+    )
+    handle = runner.start(BUSINESS_DATE, candidate_id=candidate_id)
+    runner._join_for_tests(handle["action_id"])
+    assert runner.get(handle["action_id"])["status"] == "WAITING_REMOTE"
+
+    _write_sync_row(runtime.cache, COMIX_URL_1, _sync_payload(remote_job_id=999))
+
+    waiting = runner.get(handle["action_id"])
+    assert waiting["status"] == "WAITING_REMOTE"
+    assert waiting["outcome"]["superseded_current_producer"] == PRODUCER_MANUAL_RECRAWL_ZHAOSHANG
+    assert "completion_proof" not in waiting["outcome"]
+    assert "new_result" not in waiting["outcome"]
+    # 重复轮询绝不翻转(setdefault 注记不刷屏)
+    again = runner.get(handle["action_id"])
+    assert again["status"] == "WAITING_REMOTE"
+    assert again["outcome"]["superseded_current_producer"] == PRODUCER_MANUAL_RECRAWL_ZHAOSHANG
+
+
+def test_missing_payload_remote_job_cannot_complete(runtime):
+    """G2 相关性矩阵 2:手动 producer 行 payload 缺 remote_job_id(手动/
+    staples record_success 自带 payload 的真实形态)→ 无法证明相关性,
+    保持 WAITING_REMOTE,绝不 SUCCEEDED。"""
+    candidate_id = _seed_candidate(runtime.prewarm, COMIX_URL_1, "D1", mall="comix")
+    dispatch = RecordingDispatch(
+        results={candidate_id: {"outcome": "CREATED", "remote_job_id": 7, "priority_confirmed": True}}
+    )
+    runner = _make_runner(
+        runtime, crawler_factory=_poison_crawler_factory, dispatch_exact=dispatch
+    )
+    handle = runner.start(BUSINESS_DATE, candidate_id=candidate_id)
+    runner._join_for_tests(handle["action_id"])
+
+    _write_sync_row(runtime.cache, COMIX_URL_1, {"business_date": BUSINESS_DATE})
+
+    waiting = runner.get(handle["action_id"])
+    assert waiting["status"] == "WAITING_REMOTE"
+    assert "completion_proof" not in waiting["outcome"]
+    assert "new_result" not in waiting["outcome"]
+
+
+def test_job_date_mismatch_cannot_complete(runtime):
+    """G2 相关性矩阵 3:同 remote_job_id 但 payload.business_date ≠ 派发任务日
+    (CREATED → 动作日兜底)→ 不同任务/不同日,保持 WAITING_REMOTE。"""
+    candidate_id = _seed_candidate(runtime.prewarm, COMIX_URL_1, "D1", mall="comix")
+    dispatch = RecordingDispatch(
+        results={candidate_id: {"outcome": "CREATED", "remote_job_id": 7, "priority_confirmed": True}}
+    )
+    runner = _make_runner(
+        runtime, crawler_factory=_poison_crawler_factory, dispatch_exact=dispatch
+    )
+    handle = runner.start(BUSINESS_DATE, candidate_id=candidate_id)
+    runner._join_for_tests(handle["action_id"])
+
+    _write_sync_row(
+        runtime.cache, COMIX_URL_1, _sync_payload(business_date="2026-09-13", remote_job_id=7)
+    )
+
+    waiting = runner.get(handle["action_id"])
+    assert waiting["status"] == "WAITING_REMOTE"
+    assert "completion_proof" not in waiting["outcome"]
+    assert "new_result" not in waiting["outcome"]
+
+
+def test_other_producer_different_job_cannot_complete(runtime):
+    """G2 相关性矩阵 4:daily-internet 行(另一任务的同步结果,qualifying
+    时间)→ 不是本动作的完成,仅记一次 superseded 来源注记并继续等待。"""
+    candidate_id = _seed_candidate(runtime.prewarm, COMIX_URL_1, "D1", mall="comix")
+    dispatch = RecordingDispatch(
+        results={candidate_id: {"outcome": "CREATED", "remote_job_id": 7, "priority_confirmed": True}}
+    )
+    runner = _make_runner(
+        runtime, crawler_factory=_poison_crawler_factory, dispatch_exact=dispatch
+    )
+    handle = runner.start(BUSINESS_DATE, candidate_id=candidate_id)
+    runner._join_for_tests(handle["action_id"])
+
+    _write_sync_row(
+        runtime.cache,
+        COMIX_URL_1,
+        _sync_payload(remote_job_id=5),
+        producer=PRODUCER_DAILY_INTERNET,
+    )
+
+    waiting = runner.get(handle["action_id"])
+    assert waiting["status"] == "WAITING_REMOTE"
+    assert waiting["outcome"]["superseded_current_producer"] == PRODUCER_DAILY_INTERNET
+    assert "completion_proof" not in waiting["outcome"]
+    assert "new_result" not in waiting["outcome"]
+
+
+def test_reused_customer_prewarm_job_completes_by_exact_job_id(runtime):
+    """G2 核心缺陷修复(REUSED 路径):复用任务是 AUTO 客户预爬先建的 →
+    linkage PK 首绑 producer=customer-prewarm-zhaoshang;远端同步行的
+    producer 因此不是手动,但 payload (business_date, remote_job_id) 与
+    REUSED 派发的 (job_business_date, remote_job_id) 完全一致 → 必须完成。
+    producer 永不当门槛,只在 new_result 里做诊断展示;payload 不外泄。"""
+    candidate_id = _seed_candidate(runtime.prewarm, COMIX_URL_1, "D1", mall="comix")
+    dispatch = RecordingDispatch(
+        results={
+            candidate_id: {
+                "outcome": "REUSED",
+                "remote_job_id": 3,
+                "priority_proven": True,
+                "cross_day": False,
+                "job_business_date": BUSINESS_DATE,
+            }
+        }
+    )
+    runner = _make_runner(
+        runtime, crawler_factory=_poison_crawler_factory, dispatch_exact=dispatch
+    )
+    handle = runner.start(BUSINESS_DATE, candidate_id=candidate_id)
+    runner._join_for_tests(handle["action_id"])
+    assert runner.get(handle["action_id"])["status"] == "WAITING_REMOTE"
+
+    # linkage 首绑保留 AUTO producer(真实形态),同步行 producer 随 linkage
+    row = _write_sync_row(
+        runtime.cache,
+        COMIX_URL_1,
+        _sync_payload(business_date=BUSINESS_DATE, remote_job_id=3),
+        producer=PRODUCER_CUSTOMER_PREWARM_ZHAOSHANG,
+    )
+
+    done = runner.get(handle["action_id"])
+    assert done["status"] == "SUCCEEDED"
+    assert done["outcome"]["completion_proof"] == "cache_current"
+    new_result = done["outcome"]["new_result"]
+    assert int(new_result["result_id"]) == int(row["id"])
+    assert new_result["producer"] == PRODUCER_CUSTOMER_PREWARM_ZHAOSHANG
+    assert "payload" not in new_result
+    assert done["outcome"]["dispatch"]["outcome"] == "REUSED"
+    assert "superseded_current_producer" not in done["outcome"]
+    # 终态幂等
     assert runner.get(handle["action_id"])["status"] == "SUCCEEDED"
 
 
@@ -897,13 +1074,12 @@ def test_remote_job_terminal_failed_missing_db_keeps_waiting(runtime):
     assert runner.get(handle["action_id"])["status"] == "WAITING_REMOTE"
 
 
-def test_completion_requires_manual_producer(runtime):
-    """D10:SUCCEEDED 只认 producer=manual-recrawl-zhaoshang 的新 current 行。
-
-    他源(daily-internet)在 qualifying 时间落地新 current → 不成功,仅记一次
+def test_uncorrelated_row_noted_once_then_exact_row_completes(runtime):
+    """G2 相关性语义(取代 D10 producer 门槛):qualifying 时间落地但不携带
+    本任务 (date, job_id) 的新 current 行 → 不是完成,仅记一次
     superseded_current_producer 并保持 WAITING_REMOTE(D9 的失败路径最终
-    兜底);随后本任务同步的手动行落地 → SUCCEEDED 带完成证明,identity 的
-    current 变为手动行、历史按序保留(含被顶掉的他源行)。
+    兜底);随后 (date, job_id) 精确一致的手动行落地 → SUCCEEDED 带完成
+    证明,identity 的 current 变为手动行、历史按序保留(含被顶掉的不相关行)。
     """
     runtime.cache.record_success(
         mall="comix", submitted_url=COMIX_URL_1, source="daily-internet", price="9.9"
@@ -921,7 +1097,8 @@ def test_completion_requires_manual_producer(runtime):
     runner._join_for_tests(handle["action_id"])
     assert runner.get(handle["action_id"])["status"] == "WAITING_REMOTE"
 
-    # 他源新 current 行(qualifying 时间)→ 不成功,记一次 superseded 来源
+    # 不相关新 current 行(qualifying 时间;旧式 daily 行,无 job payload)
+    # → 不成功,记一次 superseded 来源
     daily_row = runtime.cache.record_success(
         mall="comix",
         submitted_url=COMIX_URL_1,
@@ -936,15 +1113,8 @@ def test_completion_requires_manual_producer(runtime):
     again = runner.get(handle["action_id"])
     assert again["outcome"]["superseded_current_producer"] == PRODUCER_DAILY_INTERNET  # 只记一次
 
-    # 本任务同步的手动行 → SUCCEEDED
-    manual_row = runtime.cache.record_success(
-        mall="comix",
-        submitted_url=COMIX_URL_1,
-        source="daily-internet",
-        producer=PRODUCER_MANUAL_RECRAWL_ZHAOSHANG,
-        price="13.5",
-        title="新结果标题",
-    )
+    # (date, job_id) 精确一致的本任务手动行 → SUCCEEDED
+    manual_row = _write_sync_row(runtime.cache, COMIX_URL_1, _sync_payload(remote_job_id=7))
     done = runner.get(handle["action_id"])
     assert done["status"] == "SUCCEEDED"
     assert done["outcome"]["completion_proof"] == "cache_current"
@@ -994,13 +1164,9 @@ def test_inflight_held_until_terminal(runtime):
     assert excinfo.value.code == "ACTION_IN_FLIGHT"
     assert excinfo.value.existing_action_id == handle["action_id"]
 
-    # 懒 SUCCEEDED(manual producer 新 current 行)→ key 释放,可再发起
-    runtime.cache.record_success(
-        mall="comix",
-        submitted_url=COMIX_URL_1,
-        source="daily-internet",
-        producer=PRODUCER_MANUAL_RECRAWL_ZHAOSHANG,
-        price="14.0",
+    # 懒 SUCCEEDED(精确关联 (date, job 21) 的手动新 current 行)→ key 释放
+    _write_sync_row(
+        runtime.cache, COMIX_URL_1, _sync_payload(remote_job_id=21), price="14.0"
     )
     assert runner.get(handle["action_id"])["status"] == "SUCCEEDED"
     again = runner.start(BUSINESS_DATE, candidate_id=candidate_id)
@@ -1041,13 +1207,7 @@ def test_completed_jsonl_event(runtime):
 
     ok_handle = runner.start(BUSINESS_DATE, candidate_id=c_ok)
     runner._join_for_tests(ok_handle["action_id"])
-    runtime.cache.record_success(
-        mall="comix",
-        submitted_url=COMIX_URL_1,
-        source="daily-internet",
-        producer=PRODUCER_MANUAL_RECRAWL_ZHAOSHANG,
-        price="16.0",
-    )
+    _write_sync_row(runtime.cache, COMIX_URL_1, _sync_payload(remote_job_id=31), price="16.0")
     assert runner.get(ok_handle["action_id"])["status"] == "SUCCEEDED"
 
     _write_state_db(runtime.runtime_root, [(32, "FAILED")])

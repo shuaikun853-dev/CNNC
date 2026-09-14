@@ -24,6 +24,7 @@ Round-2 contracts under test here:
 from __future__ import annotations
 
 import sqlite3
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any
 
@@ -796,6 +797,146 @@ def test_repeat_reference_across_dates(tmp_path):
         links = projection.list_prewarm_links(day, runtime_root=runtime_root)
         assert links["pagination"]["total"] == 1, day
         assert links["links"][0]["document_ids"] == ["DOC-Y"], day
+
+
+def test_day_scoped_document_ids_two_docs_two_days(tmp_path):
+    """G1: the documents map is day-scoped.  Day 1 DOC-A and Day 2 DOC-B map
+    to the SAME candidate (identity is mall+url), yet each day's view shows
+    only ITS OWN observation rows — summary count, list row and detail
+    alike."""
+    runtime_root, prewarm, _shared = _small_env(tmp_path)
+    url = "https://qx.com/day-scope-docs.html"
+    upserted = prewarm.upsert_link("DOC-A", url, mall="comix", business_date=BUSINESS_DATE)
+    candidate_id = int(upserted["candidate"]["id"])
+    prewarm.upsert_link("DOC-B", url, mall="comix", business_date=DAY_2)
+
+    summary_d1 = projection.build_prewarm_dashboard_summary(
+        BUSINESS_DATE, runtime_root=runtime_root
+    )
+    assert summary_d1["kpi"]["reference_link_count"] == 1
+    links_d1 = projection.list_prewarm_links(BUSINESS_DATE, runtime_root=runtime_root)
+    assert links_d1["pagination"]["total"] == 1
+    assert links_d1["links"][0]["document_ids"] == ["DOC-A"]
+    assert links_d1["links"][0]["document_count"] == 1
+
+    summary_d2 = projection.build_prewarm_dashboard_summary(DAY_2, runtime_root=runtime_root)
+    assert summary_d2["kpi"]["reference_link_count"] == 1
+    links_d2 = projection.list_prewarm_links(DAY_2, runtime_root=runtime_root)
+    assert links_d2["pagination"]["total"] == 1
+    assert links_d2["links"][0]["document_ids"] == ["DOC-B"]
+    assert links_d2["links"][0]["document_count"] == 1
+
+    detail_d1 = projection.get_prewarm_link_detail(
+        BUSINESS_DATE, candidate_id, runtime_root=runtime_root
+    )
+    assert detail_d1["document_ids"] == ["DOC-A"]
+    detail_d2 = projection.get_prewarm_link_detail(
+        DAY_2, candidate_id, runtime_root=runtime_root
+    )
+    assert detail_d2["document_ids"] == ["DOC-B"]
+
+
+def test_day_scoped_reference_link_count_multi_doc(tmp_path):
+    """G1: reference_link_count counts the VIEWED day's observation rows
+    among the in-scope candidates; the candidate itself is counted once."""
+    runtime_root, prewarm, _shared = _small_env(tmp_path)
+    url = "https://qx.com/multi-doc.html"
+    prewarm.upsert_link("DOC-A", url, mall="comix", business_date=BUSINESS_DATE)
+    prewarm.upsert_link("DOC-B", url, mall="comix", business_date=BUSINESS_DATE)
+    prewarm.upsert_link("DOC-C", url, mall="comix", business_date=DAY_2)
+
+    summary_d1 = projection.build_prewarm_dashboard_summary(
+        BUSINESS_DATE, runtime_root=runtime_root
+    )
+    assert summary_d1["scope"] == {"business_date": BUSINESS_DATE, "candidate_count_in_scope": 1}
+    kpi_d1 = summary_d1["kpi"]
+    assert kpi_d1["candidate_count"] == 1  # summary scope counts the candidate once
+    assert kpi_d1["reference_link_count"] == 2  # DOC-A + DOC-B observed on Day 1
+    assert kpi_d1["unique_url_count"] == 1
+    row_d1 = projection.list_prewarm_links(BUSINESS_DATE, runtime_root=runtime_root)["links"][0]
+    assert sorted(row_d1["document_ids"]) == ["DOC-A", "DOC-B"]
+    assert row_d1["document_count"] == 2
+
+    summary_d2 = projection.build_prewarm_dashboard_summary(DAY_2, runtime_root=runtime_root)
+    assert summary_d2["scope"] == {"business_date": DAY_2, "candidate_count_in_scope": 1}
+    kpi_d2 = summary_d2["kpi"]
+    assert kpi_d2["candidate_count"] == 1
+    assert kpi_d2["reference_link_count"] == 1  # only DOC-C observed on Day 2
+    assert kpi_d2["unique_url_count"] == 1
+    row_d2 = projection.list_prewarm_links(DAY_2, runtime_root=runtime_root)["links"][0]
+    assert row_d2["document_ids"] == ["DOC-C"]
+    assert row_d2["document_count"] == 1
+
+
+def test_no_future_linkage_leak(tmp_path):
+    """G1: a linkage dated AFTER the viewed day never projects — View D1
+    resolves Day 1's job 17 even though a Day-2 linkage (job 31) exists, and
+    View D2 resolves job 31."""
+    runtime_root = tmp_path / "runtime"
+    runtime_root.mkdir()
+    prewarm = CustomerPrewarmStore(runtime_root / "customer_prewarm.sqlite3")
+    SharedCrawlCache(runtime_root / "shared_crawl_cache.sqlite3")  # every store exists
+    StaplesPrewarmStore(runtime_root / "customer_prewarm.sqlite3")
+    day1_task = "cnnc_current_opt_mallx_d1_17"
+    day2_task = "cnnc_current_opt_mallx_d2_31"
+    _make_state_db(runtime_root, jobs=[(17, "RUNNING")],
+                   business_date=BUSINESS_DATE, task_names={17: day1_task})
+    _make_state_db(runtime_root, jobs=[(31, "RUNNING")],
+                   business_date=DAY_2, task_names={31: day2_task})
+
+    url = "https://qx.com/future-leak.html"
+    upserted = prewarm.upsert_link("DOC-F", url, mall="comix", business_date=BUSINESS_DATE)
+    candidate_id = int(upserted["candidate"]["id"])
+    prewarm.record_candidate_result(candidate_id, cache_status=CACHE_STATUS_PENDING_PREWARM)
+    prewarm.record_candidate_result(
+        candidate_id, cache_status=CACHE_STATUS_REMOTE_DISPATCHED, remote_job_id=17
+    )
+    # Same candidate observed again on Day 2 (so both views are in scope).
+    prewarm.record_daily_observation(DAY_2, candidate_id, "DOC-F", url)
+
+    # Natural order: D1 linkage recorded first, D2 linkage later.
+    prewarm.record_remote_job_link(BUSINESS_DATE, candidate_id, 17, "customer-prewarm-zhaoshang")
+    prewarm.record_remote_job_link(DAY_2, candidate_id, 31, "customer-prewarm-zhaoshang")
+
+    summary_d1 = projection.build_prewarm_dashboard_summary(
+        BUSINESS_DATE, runtime_root=runtime_root
+    )
+    assert summary_d1["degraded"] is False
+    assert summary_d1["scope"]["candidate_count_in_scope"] == 1
+    kpi_d1 = summary_d1["kpi"]
+    # job 17 (Day 1) RUNNING — Day 2's job 31 must never leak into View D1.
+    assert kpi_d1["zhaoshang_running_candidate_count"] == 1
+    assert kpi_d1["remote_job_count"] == 1
+    detail_d1 = projection.get_prewarm_link_detail(
+        BUSINESS_DATE, candidate_id, runtime_root=runtime_root
+    )
+    assert detail_d1["remote_job"]["task_name"] == day1_task
+    assert detail_d1["remote_job"]["state"] == "RUNNING"
+
+    summary_d2 = projection.build_prewarm_dashboard_summary(DAY_2, runtime_root=runtime_root)
+    assert summary_d2["kpi"]["zhaoshang_running_candidate_count"] == 1
+    detail_d2 = projection.get_prewarm_link_detail(
+        DAY_2, candidate_id, runtime_root=runtime_root
+    )
+    assert detail_d2["remote_job"]["task_name"] == day2_task
+    assert detail_d2["remote_job"]["state"] == "RUNNING"
+
+    # Inversion: refresh the D2 linkage to an EARLIER recorded_at and the D1
+    # linkage to a LATER one — the business_date filter (not recorded_at
+    # ordering) must decide, so View D1 still picks job 17.
+    early = datetime(2026, 9, 10, 8, 0, tzinfo=UTC)
+    late = datetime(2026, 9, 10, 20, 0, tzinfo=UTC)
+    prewarm.record_remote_job_link(
+        DAY_2, candidate_id, 31, "customer-prewarm-zhaoshang", now=early
+    )
+    prewarm.record_remote_job_link(
+        BUSINESS_DATE, candidate_id, 17, "customer-prewarm-zhaoshang", now=late
+    )
+    detail_d1b = projection.get_prewarm_link_detail(
+        BUSINESS_DATE, candidate_id, runtime_root=runtime_root
+    )
+    assert detail_d1b["remote_job"]["task_name"] == day1_task
+    assert detail_d1b["remote_job"]["state"] == "RUNNING"
 
 
 def test_no_linkage_falls_back_to_candidate_day(tmp_path):
