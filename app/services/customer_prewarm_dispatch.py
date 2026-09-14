@@ -2282,6 +2282,10 @@ def _dispatch_exact_leased(
         )
     ]
     # Mirror legacy_zhaoshang_bridge.finalize byte for byte (same as the pass).
+    # DEFERRED REFACTOR (Issue #13 reviews): this create/submit chain is a
+    # consciously kept duplicate of _dispatch_mall_group's — extracting a
+    # shared primitive would rewrite the production-frozen pass path mid
+    # review round; first refactor target once the branch merges.
     task_fingerprint = hashlib.sha256(
         json.dumps(
             {

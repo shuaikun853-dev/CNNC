@@ -328,7 +328,11 @@ def _business_day_cutoff_utc(business_date: str) -> datetime | None:
 
 
 def _connect_ro(path: Path) -> sqlite3.Connection:
-    """mode=ro URI connection: never creates files, never writes (seam for tests)."""
+    """mode=ro URI connection: zero business writes (seam for tests).
+
+    On WAL-mode DBs the read may materialize transient -shm/-wal reader
+    sidecars — see the module docstring's documented contract.
+    """
     connection = sqlite3.connect(Path(path).resolve().as_uri() + "?mode=ro", uri=True)
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA busy_timeout = 5000")
@@ -682,7 +686,8 @@ def _candidate_view(paths: SimpleNamespace) -> dict[str, Any]:
 
 
 def _open_cache_ro(path: Path, reasons: list[str]) -> SharedCrawlCache | None:
-    """The B1 fallback's read-only facade (opened once; never creates files)."""
+    """The B1 fallback's read-only facade (opened once; zero business writes —
+    the WAL sidecar reader-artifact note in the module docstring applies)."""
     try:
         return SharedCrawlCache.open_read_only(path)
     except (OSError, sqlite3.Error) as exc:
