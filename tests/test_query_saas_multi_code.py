@@ -1,4 +1,4 @@
-from scripts.query_saas_multi_code import find_multi_code_malls, parse_document_ids
+from scripts.query_saas_multi_code import chunked, find_multi_code_malls, parse_document_ids
 
 
 def test_parse_document_ids_deduplicates_and_preserves_order():
@@ -6,6 +6,12 @@ def test_parse_document_ids_deduplicates_and_preserves_order():
         "700000000000000001",
         "700000000000000002",
     ]
+
+
+def test_chunked_limits_monitor_requests_to_one_hundred_document_ids():
+    batches = list(chunked(list(range(201)), 100))
+
+    assert [len(batch) for batch in batches] == [100, 100, 1]
 
 
 def test_find_multi_code_malls_uses_valid_distinct_sku_link_pairs():

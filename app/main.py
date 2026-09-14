@@ -2,6 +2,8 @@ import re
 import logging
 from pathlib import Path
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.concurrency import run_in_threadpool
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 from app.agent.planner import build_diagnosis
@@ -22,11 +24,13 @@ from app.schemas.workflow import (
     WorkflowRouteResponse,
 )
 from app.workflows.local_access_guard import check_local_access
+from app.workflows.local_access_guard import LOOPBACK_HOSTS
 from app.workflows.scope_guard import validate_request_scope, validate_records_scope
 from app.workflows.router import route_workflow
 from app.workflows.base import WORKFLOW_REGISTRY
 from app.workflows.human_approval_guard import enforce_recommendation_only
 from app.services.workflow_knowledge_adapter import get_workflow_knowledge_files
+from scripts.query_saas_multi_code import parse_document_ids, query_multi_code_document_ids
 
 logger = logging.getLogger(__name__)
 
@@ -44,10 +48,18 @@ _HIGH_RISK_WRITE_NOTICE = (
 
 app = FastAPI(title=APP_NAME, version=APP_VERSION)
 
+ZH_IMPORT_PAGE_PATH = Path(__file__).resolve().parents[2] / "zhImport.html"
+ZH_IMPORT_VALIDATION_PATH = Path(__file__).resolve().parents[2] / "zhImport-validation.js"
+MAX_ZH_IMPORT_QUERY_IDS = 1000
+
 
 class DiagnoseRequest(BaseModel):
     question: str
     params: dict | None = None
+
+
+class ZhImportMultiCodeQueryRequest(BaseModel):
+    document_ids: str = Field(min_length=1, max_length=50_000)
 
 
 class SqlParamSpec(BaseModel):
@@ -170,6 +182,50 @@ def _safe_path_check(p) -> bool:
         return True
     except Exception:
         return False
+
+
+def _check_zh_import_local_access(request: Request) -> None:
+    client_host = request.client.host if request.client else None
+    if client_host not in LOOPBACK_HOSTS:
+        raise HTTPException(
+            status_code=403,
+            detail={"error_code": "LOCAL_ACCESS_DENIED", "message": "一物多码查询仅允许本机访问"},
+        )
+
+
+@app.get("/tools/zh-import", include_in_schema=False)
+async def zh_import_page(request: Request):
+    _check_zh_import_local_access(request)
+    if not ZH_IMPORT_PAGE_PATH.is_file():
+        raise HTTPException(status_code=404, detail={"message": "导入页面文件不存在"})
+    return FileResponse(ZH_IMPORT_PAGE_PATH, media_type="text/html")
+
+
+@app.get("/tools/zhImport-validation.js", include_in_schema=False)
+async def zh_import_validation_script(request: Request):
+    _check_zh_import_local_access(request)
+    if not ZH_IMPORT_VALIDATION_PATH.is_file():
+        raise HTTPException(status_code=404, detail={"message": "导入校验脚本不存在"})
+    return FileResponse(ZH_IMPORT_VALIDATION_PATH, media_type="application/javascript")
+
+
+@app.post("/tools/zh-import/multi-code-query")
+async def zh_import_multi_code_query(req: ZhImportMultiCodeQueryRequest, request: Request):
+    _check_zh_import_local_access(request)
+    document_ids = parse_document_ids(req.document_ids)
+    if not document_ids:
+        raise HTTPException(status_code=422, detail={"message": "未识别到单据 ID"})
+    if len(document_ids) > MAX_ZH_IMPORT_QUERY_IDS:
+        raise HTTPException(
+            status_code=422,
+            detail={"message": f"单次最多查询 {MAX_ZH_IMPORT_QUERY_IDS} 条单据 ID"},
+        )
+
+    try:
+        return await run_in_threadpool(query_multi_code_document_ids, document_ids)
+    except Exception:
+        logger.exception("zh import multi-code query failed")
+        raise HTTPException(status_code=502, detail={"message": "SaaS 只读查询失败，请稍后重试"})
 
 
 @app.post("/diagnose", response_model=DiagnoseResponse)

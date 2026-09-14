@@ -43,6 +43,9 @@ python -m pytest tests\test_push_saas_commodity_price.py -q --basetemp=.pytest_t
 # 第二步状态判定和 Excel
 python -m pytest tests\test_export_current_monitor_status.py -q
 
+# 本地一物多码查询页与每批 100 条限制（测试替身，不调真实 SaaS）
+python -m pytest tests\test_query_saas_multi_code.py tests\test_zh_import_multi_code_api.py -q
+
 # 第三步授权开关、分阶段并行、恢复模式、回填和任务结果映射
 python -m pytest tests\test_monitor_stb_fallback.py tests\test_process_monitor_zs_result_mapping.py tests\test_zhaoshang_task_phases.py tests\test_zhaoshang_resume_modes.py -q
 
