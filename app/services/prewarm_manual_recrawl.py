@@ -18,7 +18,7 @@ that re-crawls EXACTLY ONE prewarm link URL:
 Guards run synchronously in :meth:`ManualRecrawlRunner.start` and fail closed
 with :class:`ManualRecrawlError`: missing prewarm DB → ``STATE_DB_MISSING``,
 unknown candidate → ``CANDIDATE_NOT_FOUND``, stale operator link/status →
-``STALE_PREWARM_LINK``, staples/tmall/unmapped URL → ``RECAL_NOT_SUPPORTED``,
+``STALE_PREWARM_LINK``, staples/tmall/unmapped URL → ``RECRAWL_NOT_SUPPORTED``,
 same URL already being re-crawled → ``ACTION_IN_FLIGHT``.
 
 Durability & isolation: every action appends a JSONL intent/finish record
@@ -80,7 +80,7 @@ _STAPLES_LOCK_OWNER_COMMAND = "prewarm_manual_recrawl"
 class ManualRecrawlError(RuntimeError):
     """Guard failure of a manual recrawl start (API maps ``code`` to HTTP).
 
-    ``code`` ∈ {CANDIDATE_NOT_FOUND, STALE_PREWARM_LINK, RECAL_NOT_SUPPORTED,
+    ``code`` ∈ {CANDIDATE_NOT_FOUND, STALE_PREWARM_LINK, RECRAWL_NOT_SUPPORTED,
     ACTION_IN_FLIGHT, STATE_DB_MISSING}; ``existing_action_id`` carries the
     in-flight action for ``ACTION_IN_FLIGHT``.
     """
@@ -182,7 +182,7 @@ class ManualRecrawlRunner:
             route, mall = ROUTE_ZHAOSHANG, routing.mall_key
         else:
             raise ManualRecrawlError(
-                "RECAL_NOT_SUPPORTED",
+                "RECRAWL_NOT_SUPPORTED",
                 f"manual recrawl is not supported for routing outcome "
                 f"{routing.outcome} (url {original_url!r})",
             )

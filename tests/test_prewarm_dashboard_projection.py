@@ -320,7 +320,7 @@ def test_p1_missing_stores_summary_degraded_zero_filled_without_file_creation(tm
     assert set(kpi) == KPI_INT_KEYS | {"status_distribution"}
     for key in KPI_INT_KEYS:
         assert kpi[key] == 0, key
-    assert kpi["status_distribution"] == {}
+    assert kpi["status_distribution"] == []
     # Read-only discipline: the empty runtime dir must stay empty.
     assert list(runtime_root.rglob("*")) == []
 
@@ -374,14 +374,16 @@ def test_p2_kpi_counts_mixed_fixture_exact_units(env):
     assert kpi["unresolved_sku_count"] == 1
     assert kpi["remote_job_count"] == 2  # distinct jobs bound to REMOTE_* candidates
     assert kpi["remote_url_count"] == 1  # candidate rows bound to non-terminal jobs (job 1 only)
-    assert kpi["status_distribution"] == {
-        "CACHE_HIT": 3,
-        "MANUAL_SKIP": 1,
-        "PENDING_PREWARM": 1,
-        "REMOTE_DISPATCHED": 2,
-        "ROUTING_BLOCKED": 1,
-        "STAPLES_PENDING": 2,
-    }
+    # List shape: {status, label, count} sorted by status; labels come from
+    # the module's _CACHE_STATUS_LABELS (unknown statuses degrade to raw).
+    assert kpi["status_distribution"] == [
+        {"status": "CACHE_HIT", "label": "缓存命中", "count": 3},
+        {"status": "MANUAL_SKIP", "label": "人工跳过", "count": 1},
+        {"status": "PENDING_PREWARM", "label": "待预爬", "count": 1},
+        {"status": "REMOTE_DISPATCHED", "label": "招商局已派发", "count": 2},
+        {"status": "ROUTING_BLOCKED", "label": "路由受阻", "count": 1},
+        {"status": "STAPLES_PENDING", "label": "史泰博预爬中", "count": 2},
+    ]
 
 
 # ---- P3: duplicate document references -----------------------------------------

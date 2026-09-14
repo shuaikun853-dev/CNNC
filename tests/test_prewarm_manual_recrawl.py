@@ -280,7 +280,7 @@ def test_unsupported_route_rejected(runtime):
     with pytest.raises(ManualRecrawlError) as excinfo:
         runner.start(BUSINESS_DATE, candidate_id=candidate_id)
 
-    assert excinfo.value.code == "RECAL_NOT_SUPPORTED"
+    assert excinfo.value.code == "RECRAWL_NOT_SUPPORTED"
     assert "MANUAL_SKIP" in str(excinfo.value)
 
 

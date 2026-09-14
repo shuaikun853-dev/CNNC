@@ -348,6 +348,58 @@ def test_case_a_reuse_boosts_existing_job_never_creates_or_submits(tmp_path):
     assert len(_crawl_rows(paths.state_path)) == 1  # no new crawl work
 
 
+def test_case_a_unconfirmed_boost_blocks_candidate_write_and_stays_honest(tmp_path):
+    """复用 + boost 优先级未证明:_NoCandidateWriteStore 拦下 boost 未确认分支
+    对候选行的间接写入,_record 吞掉异常成为 phase_error;结果仍是诚实的
+    REUSED(含 priority_unconfirmed 计数),远端任务状态/爬虫行/候选行全部
+    原样,绝不新建、绝不 POST。"""
+    runtime_root = tmp_path / "runtime"
+    paths = make_state_db(runtime_root, BUSINESS_DATE)
+    prewarm = CustomerPrewarmStore(runtime_root / "customer_prewarm.sqlite3")
+    cache = SharedCrawlCache(runtime_root / "shared_crawl_cache.sqlite3")
+    url = "https://qx.com/exact-reuse-unconfirmed.html"
+    _paths, job_id = seed_remote_work(
+        runtime_root,
+        BUSINESS_DATE,
+        _CountingAdapter(),
+        mapping=COMIX,
+        url=url,
+        job_state="SUBMITTED",
+        remote_identity="comix|remote-ea|number-ea",
+    )
+    candidate_id = cache_hit_candidate(prewarm, url)
+    before = prewarm.candidate_by_id(candidate_id)
+    # UNCONFIRMED boost(weight_type 不是 -1)+ submit 毒化:任何意外 POST 直接
+    # 让测试失败(与 test_case_a 同一防泄漏手法)。
+    adapter = _CountingAdapter(
+        submit_raises=True,
+        priority_outcomes=[
+            LegacyPriorityOutcome(PriorityStatus.UNCONFIRMED, diagnostic="tool died")
+        ],
+    )
+
+    result = _dispatch(runtime_root, prewarm, cache, candidate_id, adapter=adapter)
+
+    # 不抛异常;复用本身仍诚实上报(未确认优先级不冒充完全成功)。
+    assert result["outcome"] == "REUSED"
+    assert result["remote_job_id"] == job_id
+    assert result["priority_unconfirmed"] == 1
+    # 守卫店的拒绝以 guard 文案出现在 phase_errors(_record 的隔离上报)。
+    assert any(
+        "manual recrawl never writes candidate cache_status" in message
+        for message in result["phase_errors"]
+    ), result["phase_errors"]
+    # 候选行前后字节级一致(CACHE_HIT 终态,含间接路径也绝不写)。
+    assert prewarm.candidate_by_id(candidate_id) == before
+    # 远端任务状态原样;无新建爬虫行;submit/create 计数为零。
+    job = _state_rows(paths.state_path, "SELECT state FROM remote_jobs")[0]
+    assert job["state"] == "SUBMITTED"
+    assert len(_crawl_rows(paths.state_path)) == 1
+    assert adapter.submit_calls == 0
+    assert adapter.prepare_calls == 1  # 仅 boost 的 payload 重建
+    assert adapter.prioritize_calls == 1
+
+
 # ---- Case B: 恰好一个单 URL 新任务 + 提交 + 优先级证明 ------------------------------
 
 

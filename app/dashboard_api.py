@@ -36,6 +36,7 @@ from app.services.dashboard_projection import (
 # Issue #13(2026-09-14):预爬看板只读投影 + 手动重爬 runner;模块级导入,
 # 测试通过 monkeypatch app.dashboard_api 属性注入替身(与 build_dashboard_summary 同约定)。
 from app.services.prewarm_dashboard_projection import (
+    PAGE_SIZE_MAX,
     build_prewarm_dashboard_summary,
     get_prewarm_link_detail,
     list_prewarm_links,
@@ -686,7 +687,7 @@ _PREWARM_LINK_ALLOWED_PARAMS = frozenset({
 _PREWARM_BOOL_FILTER_PARAMS = frozenset({
     "missing_title", "unverified_sku", "unresolved_sku", "failure", "cache_miss",
 })
-_PREWARM_PAGE_SIZE_MAX = 200
+# page_size 上限单源:直接引用投影层的 PAGE_SIZE_MAX(不再本地复制 200)。
 
 
 class _PrewarmRecrawlBody(BaseModel):
@@ -775,7 +776,7 @@ def prewarm_links(
         except ValueError:
             raise HTTPException(status_code=400, detail={
                 "error_code": "BAD_PAGE_SIZE_PARAM", "message": "page_size 必须为 1..200 的整数"})
-        if not 1 <= page_size_value <= _PREWARM_PAGE_SIZE_MAX:
+        if not 1 <= page_size_value <= PAGE_SIZE_MAX:
             raise HTTPException(status_code=400, detail={
                 "error_code": "BAD_PAGE_SIZE_PARAM", "message": "page_size 必须为 1..200 的整数"})
     filters: dict = {}
@@ -853,7 +854,7 @@ def prewarm_link_recrawl(
             "CANDIDATE_NOT_FOUND": 404,
             "STALE_PREWARM_LINK": 409,
             "ACTION_IN_FLIGHT": 409,
-            "RECAL_NOT_SUPPORTED": 400,
+            "RECRAWL_NOT_SUPPORTED": 400,
             "STATE_DB_MISSING": 409,
         }
         detail: dict = {"error_code": exc.code, "message": str(exc)}

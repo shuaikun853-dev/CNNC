@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import sqlite3
+from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
@@ -404,7 +405,7 @@ def test_recrawl_error_mapping(client, monkeypatch):
         ("CANDIDATE_NOT_FOUND", 404, None),
         ("STALE_PREWARM_LINK", 409, None),
         ("ACTION_IN_FLIGHT", 409, "prev-action"),
-        ("RECAL_NOT_SUPPORTED", 400, None),
+        ("RECRAWL_NOT_SUPPORTED", 400, None),
         ("STATE_DB_MISSING", 409, None),
     ]
     for code, expected_status, existing in cases:
@@ -591,8 +592,9 @@ def test_get_routes_zero_write_against_real_projection(client, monkeypatch, tmp_
 
     after = _snapshot(runtime_root)
     # 零写铁律:三个库文件字节级不变(无 checkpoint/无新行/无 schema 变化)。
+    # snapshot key 用 Path 拼接,与 _snapshot 的 str(relative_to) 同一字符串化规则。
     for name in ("customer_prewarm.sqlite3", "shared_crawl_cache.sqlite3",
-                 f"{BUSINESS_DATE}\\state.sqlite3"):
+                 str(Path(BUSINESS_DATE) / "state.sqlite3")):
         assert after[name] == before[name], name
     # mode=ro 读 WAL 库时 SQLite 会按读语义创建 -shm/-wal 读辅助文件
     # (不是模块写入;生产 runtime 中 writer 常驻本就存在)。除这两个库的

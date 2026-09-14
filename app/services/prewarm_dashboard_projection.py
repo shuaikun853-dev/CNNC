@@ -38,6 +38,10 @@ KPI units (single authority for the UI):
 - ``failure_count``: bucket sum of ROUTING_BLOCKED + MANUAL_SKIP candidates
   + staples jobs FAILED + REMOTE_* candidates whose job state is FAILED
   (per the design formula; a candidate can contribute to two buckets).
+- ``url_parsed_unverified_count`` / ``unresolved_sku_count``: candidates whose
+  CURRENT cache row carries that ``sku_status`` — the same unit as the
+  ``unverified_sku`` / ``unresolved_sku`` filters (any candidate status with a
+  current cache row, not only CACHE_HIT ones).
 - ``remote_job_count``: distinct remote jobs bound to REMOTE_* candidates.
 - ``remote_url_count``: candidate rows bound to non-terminal remote jobs
   (terminal = {COMPLETED, FAILED}; unknown state never counts).
@@ -75,6 +79,11 @@ from app.services.customer_prewarm_store import (
     CACHE_STATUS_ROUTING_BLOCKED,
     CACHE_STATUS_STAPLES_PENDING,
 )
+from app.services.customer_reference_routing import (
+    OUTCOME_STAPLES,
+    OUTCOME_ZHAOSHANG,
+    classify_reference_url,
+)
 from app.services.incremental_audit_runtime import DEFAULT_RUNTIME_ROOT
 from app.services.staples_prewarm import (
     STAPLES_JOB_STATE_FAILED,
@@ -86,6 +95,9 @@ _SHANGHAI = ZoneInfo("Asia/Shanghai")
 
 _PAGE_SIZE_DEFAULT = 50
 _PAGE_SIZE_MAX = 200
+# Public alias: the API layer validates ``1..PAGE_SIZE_MAX`` against this SAME
+# constant (single source; the underscore name stays module-internal).
+PAGE_SIZE_MAX = _PAGE_SIZE_MAX
 
 # Cache statuses of candidates that own a remote (招商局) job.
 _REMOTE_CANDIDATE_STATUSES = frozenset(
@@ -293,7 +305,7 @@ def _scan(
 def _load_candidates(connection: sqlite3.Connection) -> list[dict[str, Any]]:
     rows = connection.execute(
         """SELECT id, mall, original_url, cache_status, match_level,
-                  resolved_identity_id, remote_job_id
+                  resolved_identity_id, remote_job_id, routing_url
            FROM prewarm_candidates ORDER BY id"""
     ).fetchall()
     return [dict(row) for row in rows]
@@ -469,7 +481,7 @@ def build_prewarm_dashboard_summary(
             "remote_job_count",
             "remote_url_count",
         )}
-        kpi["status_distribution"] = {}
+        kpi["status_distribution"] = []
 
         candidates: list[dict[str, Any]] = view["candidates"]
         kpi["reference_link_count"] = sum(
@@ -488,6 +500,16 @@ def build_prewarm_dashboard_summary(
             candidate_id = int(candidate["id"])
             current = _current_cache_row(candidate, view)
 
+            # SKU-review KPIs use the SAME unit as the unverified_sku /
+            # unresolved_sku filters: ANY candidate whose current cache row
+            # carries the sku_status counts (not only CACHE_HIT ones).
+            if current is not None:
+                sku_status = str(current["sku_status"] or "")
+                if sku_status == SKU_STATUS_URL_PARSED_UNVERIFIED:
+                    kpi["url_parsed_unverified_count"] += 1
+                elif sku_status == SKU_STATUS_UNRESOLVED:
+                    kpi["unresolved_sku_count"] += 1
+
             if status == CACHE_STATUS_CACHE_HIT:
                 kpi["cache_hit_candidate_count"] += 1
                 if current is not None:
@@ -498,11 +520,6 @@ def build_prewarm_dashboard_summary(
                         kpi["prewarm_new_success_count"] += 1
                     elif source_class == "manual-recrawl":
                         kpi["manual_recrawl_hit_count"] += 1
-                    sku_status = str(current["sku_status"] or "")
-                    if sku_status == SKU_STATUS_URL_PARSED_UNVERIFIED:
-                        kpi["url_parsed_unverified_count"] += 1
-                    elif sku_status == SKU_STATUS_UNRESOLVED:
-                        kpi["unresolved_sku_count"] += 1
                     if cutoff is not None:
                         succeeded_at = _parse_utc(current["succeeded_at"])
                         if succeeded_at is not None and succeeded_at < cutoff:
@@ -535,7 +552,12 @@ def build_prewarm_dashboard_summary(
                         # Non-terminal job: its candidate URLs are still in flight.
                         kpi["remote_url_count"] += 1
 
-        kpi["status_distribution"] = dict(sorted(status_counts.items()))
+        # List shape (single source of labels via cache_status_label; unknown
+        # statuses degrade to the raw string), sorted by status for stability.
+        kpi["status_distribution"] = [
+            {"status": status, "label": cache_status_label(status), "count": count}
+            for status, count in sorted(status_counts.items())
+        ]
         kpi["zhaoshang_running_job_count"] = len(running_job_ids)
         kpi["remote_job_count"] = len(bound_job_ids)
 
@@ -777,6 +799,26 @@ def get_prewarm_link_detail(
                 "succeeded_at": current["succeeded_at"],
             }
 
+        # Server-authoritative route hint for the drawer's recrawl panel: the
+        # SAME classifier the manual-recrawl runner guards with.  The mappings
+        # loader is imported lazily inside this function (missing-config
+        # robustness) and any failure degrades the route to None — the UI then
+        # falls back to its host heuristic.
+        route: str | None = None
+        try:
+            from scripts.zhaoshang_mall_mapping import load_zhaoshang_mall_mappings
+
+            routing = classify_reference_url(
+                str(candidate["original_url"] or ""),
+                list(load_zhaoshang_mall_mappings()),
+            )
+            if routing.outcome == OUTCOME_STAPLES:
+                route = "staples-local"
+            elif routing.outcome == OUTCOME_ZHAOSHANG:
+                route = "zhaoshang"
+        except Exception:  # noqa: BLE001 - routing evidence is best-effort only
+            route = None
+
         degraded, reasons = _degraded(view)
         return {
             "business_date": business_date,
@@ -784,6 +826,8 @@ def get_prewarm_link_detail(
             "candidate_id": wanted,
             "mall": str(candidate["mall"] or ""),
             "original_url": str(candidate["original_url"] or ""),
+            "routing_url": candidate.get("routing_url"),
+            "route": route,
             "cache_status": str(candidate["cache_status"]),
             "cache_status_label": cache_status_label(candidate["cache_status"]),
             "match_level": candidate["match_level"],

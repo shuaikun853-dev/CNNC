@@ -143,12 +143,13 @@
       kpiWrap.innerHTML = KPI_LABELS.map(([key, label]) =>
         '<div class="kpi-card"><div class="kpi-num">' + esc(kpi[key] ?? "—") +
         '</div><div class="kpi-label">' + esc(label) + "</div></div>").join("");
-      const dist = kpi.status_distribution || {};
+      // 状态分布:后端列表形状 [{status,label,count}](label 由后端单源提供)
+      const dist = Array.isArray(kpi.status_distribution) ? kpi.status_distribution : [];
       const distEl = $("#pw-status-dist");
-      const entries = Object.keys(dist).map((k) => [k, dist[k]]);
-      distEl.innerHTML = (entries.length
-        ? '<span class="pw-dist-label">状态分布:</span>' + entries.map(([k, n]) =>
-            '<span class="' + cacheBadgeClass(k) + '">' + esc(k) + " × " + esc(n) + "</span>").join("")
+      distEl.innerHTML = (dist.length
+        ? '<span class="pw-dist-label">状态分布:</span>' + dist.map((entry) =>
+            '<span class="' + cacheBadgeClass(entry.status) + '">' +
+            esc(entry.label || entry.status) + " × " + esc(entry.count) + "</span>").join("")
         : "");
       if (s.degraded) {
         const reasons = Array.isArray(s.degraded_reasons) ? s.degraded_reasons.join(";") : "";
@@ -284,6 +285,7 @@
     $("#pw-d-current").innerHTML =
       kvRow("标题", kvText(cur.title)) +
       kvRow("价格", kvText(cur.price)) +
+      kvRow("crawl_id", kvText(cur.crawl_id)) +
       kvRow("real_sku_id", kvText(cur.real_sku_id)) +
       kvRow("SKU状态", skuLabel ? '<span class="' + skuCls + '">' + esc(skuPrefix + skuLabel) + "</span>" : "—") +
       kvRow("评论数", kvText(cur.comment_count)) +
@@ -308,14 +310,17 @@
         (h.is_current ? '<span class="badge badge-ok">当前</span> ' : "") +
         esc(bits.join(" · ")) + "</li>";
     }).join("") || '<li class="current">暂无历史</li>';
-    // 人工操作:当前结果时间 + 确认面板 + 路由提示(仅提示文案;服务端为权威路由)
+    // 人工操作:当前结果时间 + 确认面板 + 路由提示(优先服务端 detail.route,
+    // 仅在路由缺失/为 null 时回退 stbchina.cn 主机启发;服务端始终为权威路由)
     $("#pw-recrawl-current").textContent =
       "当前缓存结果成功时间:" + fmtShanghaiDateTime(cur.succeeded_at);
     $("#pw-recrawl-facts").innerHTML =
       "商城:" + esc(cand.mall || "—") + " · URL:" + esc(cand.original_url || "—") +
       " · 当前结果时间:" + esc(fmtShanghaiDateTime(cur.succeeded_at));
-    $("#recrawl-route-hint").textContent = staplesRouteHint(cand.original_url)
-      ? "本地重新爬取(史泰博)" : "招商局重新爬取 · priority -1";
+    const routeHint = (d && d.route) === "staples-local" ? "本地重新爬取(史泰博)"
+      : (d && d.route) === "zhaoshang" ? "招商局重新爬取 · priority -1"
+      : (staplesRouteHint(cand.original_url) ? "本地重新爬取(史泰博)" : "招商局重新爬取 · priority -1");
+    $("#recrawl-route-hint").textContent = routeHint;
     $("#pw-recrawl-confirm").hidden = false;
     setRecrawlStatus("", "");
   }
