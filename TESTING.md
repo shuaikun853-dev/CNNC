@@ -81,7 +81,7 @@ python -m pytest tests\test_refresh_v2_cross_contract.py -q
 `tests\test_production_identity.py`（生产部署身份只读投影：fake runner + tmp git 迷你仓库，不碰生产 git/调度器/网络）：
 `E:\Python314\python.exe -m pytest tests\test_production_identity.py -q --basetemp=runtime\pytest-tmp\prodidentity`
 # Issue #13 客户链接预爬看板:projection/手动重爬/精确派发/API+页面 smoke
-python -m pytest tests\test_prewarm_dashboard_projection.py tests\test_prewarm_manual_recrawl.py tests\test_customer_prewarm_dispatch_exact.py tests\test_prewarm_dashboard_api.py tests\test_prewarm_page_smoke.py -q
+python -m pytest tests\test_prewarm_dashboard_projection.py tests\test_prewarm_manual_recrawl.py tests\test_customer_prewarm_dispatch_exact.py tests\test_prewarm_dashboard_api.py tests\test_prewarm_page_smoke.py tests\test_prewarm_round2_infra.py -q
 fixture 原则：只用 `tmp_path` 下的临时 SQLite/`daily_status.json` 或 monkeypatch 替身，不碰生产 `runtime\incremental_price_audit`；不注册真实计划任务，自启用例只读文本、从不执行 `-Apply`。
 ### 编译检查
 

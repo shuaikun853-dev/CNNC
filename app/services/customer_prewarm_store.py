@@ -884,11 +884,18 @@ class CustomerPrewarmStore:
         """Distinct observed candidate ids of one business day (missing table →
         empty set; never a fallback to candidate first-seen)."""
         business_date_value = self._require_text(business_date, "business_date")
-        with self._reader() as connection:
-            rows = connection.execute(
-                "SELECT DISTINCT candidate_id FROM prewarm_daily_observations WHERE business_date=?",
-                (business_date_value,),
-            ).fetchall()
+        try:
+            with self._reader() as connection:
+                rows = connection.execute(
+                    "SELECT DISTINCT candidate_id FROM prewarm_daily_observations WHERE business_date=?",
+                    (business_date_value,),
+                ).fetchall()
+        except sqlite3.OperationalError as exc:
+            if "no such table" not in str(exc).lower():
+                raise
+            # Issue #13 Round 2 前的旧库没有 observation 表:投影语义保持
+            # 一致,按"该日无观测"处理,其余 OperationalError 照常上抛。
+            return set()
         return {int(row["candidate_id"]) for row in rows}
 
     def remote_job_link_for_candidate(self, candidate_id: int) -> dict[str, Any] | None:

@@ -957,6 +957,103 @@ def test_dispatch_pass_writes_job_links_for_reused_job(tmp_path):
     assert link["producer"] == "customer-prewarm-zhaoshang"
 
 
+def test_dispatch_pass_cross_day_terminal_probe_keeps_day1_linkage(tmp_path):
+    """跨日边界:Day1 已绑定的候选(linkage (D1, cand, job1) 已存在),Day2
+    pass 在 Day2 库探测到该 URL 的终态 SUCCESS 行时,不得把 Day1 的 job1
+    再链到 Day2——首绑日 linkage 保持权威(REMOTE_DISPATCHED 照记)。"""
+    day1, day2 = BUSINESS_DATE, "2026-09-15"
+    runtime_root = tmp_path / "runtime"
+    store_path = runtime_root / "customer_prewarm.sqlite3"
+    prewarm = CustomerPrewarmStore(store_path)
+    cache = SharedCrawlCache(runtime_root / "shared_crawl_cache.sqlite3")
+    url = "https://qx.com/product-crossday.html"
+
+    # Day1:真实派发形态——candidate 绑定 job1 + linkage (D1, cand, job1)
+    make_state_db(runtime_root, day1)
+    _paths, job1 = seed_remote_work(
+        runtime_root,
+        day1,
+        _CountingAdapter(),
+        mapping=COMIX,
+        url=url,
+        job_state="SUBMITTED",
+        remote_identity="comix|remote-cd1|number-cd1",
+    )
+    upsert = prewarm.upsert_link("DOC-D1", url, mall="comix", business_date=day1)
+    candidate_id = int(upsert["candidate"]["id"])
+    prewarm.record_candidate_result(candidate_id, cache_status=CACHE_STATUS_PENDING_PREWARM)
+    prewarm.record_candidate_result(
+        candidate_id, cache_status=CACHE_STATUS_REMOTE_DISPATCHED, remote_job_id=job1
+    )
+    prewarm.record_remote_job_link(day1, candidate_id, job1, "customer-prewarm-zhaoshang")
+
+    # Day2 re-miss 形态:候选重新进入 PENDING_PREWARM(transition 表禁止
+    # REMOTE_DISPATCHED → PENDING_PREWARM,直接落库该跨日 re-plan 状态),
+    # 行上保留 Day1 绑定证据
+    connection = sqlite3.connect(str(store_path), isolation_level=None)
+    try:
+        connection.execute(
+            "UPDATE prewarm_candidates SET cache_status='PENDING_PREWARM' WHERE id=?",
+            (candidate_id,),
+        )
+    finally:
+        connection.close()
+
+    # Day2 库:该 URL 的终态 SUCCESS 行(daily-sync 无 task_name 的行形状,
+    # 未绑定 job)→ probe:unfinished_bound=None / terminal_success=True
+    paths2 = make_state_db(runtime_root, day2)
+    connection = sqlite3.connect(str(paths2.state_path), isolation_level=None)
+    try:
+        run_id = connection.execute(
+            "SELECT id FROM daily_runs ORDER BY id LIMIT 1"
+        ).fetchone()[0]
+        connection.execute(
+            """INSERT INTO crawl_work (run_id, mall_key, source_id, sku_id,
+                                       exact_url, backend_version, fingerprint,
+                                       state, remote_job_id, result_json, updated_at)
+               VALUES (?, 'comix', 'SRC-COMIX', ?, ?, ?, 'fp-crossday',
+                       'SUCCESS', NULL, ?, ?)""",
+            (
+                run_id,
+                prewarm_placeholder_sku(COMIX.mall_key, url),
+                url,
+                BACKEND_VERSION,
+                json.dumps({"page_price_status": "OK", "page_price_value": "1.1"}),
+                datetime.now(UTC).isoformat(timespec="seconds"),
+            ),
+        )
+    finally:
+        connection.close()
+
+    adapter = _CountingAdapter(submit_raises=True)  # 终态分支绝不 POST
+    summary = run_prewarm_dispatch_pass(
+        prewarm,
+        cache,
+        business_date=day2,
+        runtime_root=runtime_root,
+        mappings=[COMIX],
+        adapter=adapter,
+    )
+
+    assert summary["outcome"] == "OK"
+    assert adapter.submit_calls == 0  # 终态分支:只记 cache-sync,零远端调用
+    candidate = prewarm.candidate_by_id(candidate_id)
+    assert candidate["cache_status"] == CACHE_STATUS_REMOTE_DISPATCHED
+    assert candidate["remote_job_id"] == job1  # 绑定证据不被抹掉
+    # 跨日不变量:绝不产生 (D2, cand, job1) linkage;D1 linkage 仍权威
+    rows = _store_rows(
+        store_path,
+        """SELECT * FROM prewarm_remote_job_links
+           WHERE business_date=? AND candidate_id=? AND remote_job_id=?""",
+        (day2, candidate_id, job1),
+    )
+    assert rows == []
+    link = prewarm.remote_job_link_for_candidate(candidate_id)
+    assert link is not None
+    assert link["business_date"] == day1
+    assert link["remote_job_id"] == job1
+
+
 # ---- E: exact 路径写 manual link + priority_proven 三态 -----------------------------
 
 

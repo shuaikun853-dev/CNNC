@@ -82,10 +82,10 @@ jobs:
       # 显式路径与路径策略 / 老 schema 无迁移）；本地干净 worktree 实测
       # 1376 收集 / 1375 通过 / 1 失败（唯一失败即下方 --deselect 的那个，
       # 因生产机 gitignored data/ 的 curl 文件在 CI 不存在）。
-      # 2026-09-14 Issue #13 新增 5 个文件（预爬看板 projection/手动重爬/
-      # 精确派发/API+页面 smoke）。注意：本块是 run: > 折叠标量，注释必须
-      # 写在块外——块内 # 会被折叠进命令行，把后续清单和 --deselect 全部
-      # 注释掉（CI run 34813428733 实测踩坑）。
+      # 2026-09-14 Issue #13 新增 6 个文件（预爬看板 projection/手动重爬/
+      # 精确派发/API+页面 smoke/Round-2 基础设施）。注意：本块是 run: >
+      # 折叠标量，注释必须写在块外——块内 # 会被折叠进命令行，把后续清单
+      # 和 --deselect 全部注释掉（CI run 34813428733 实测踩坑）。
       - name: Run critical safety tests
         env:
           PYTHONIOENCODING: utf-8
@@ -157,5 +157,6 @@ jobs:
           tests/test_customer_prewarm_dispatch_exact.py
           tests/test_prewarm_dashboard_api.py
           tests/test_prewarm_page_smoke.py
+          tests/test_prewarm_round2_infra.py
           --deselect "tests/test_remote_running_recovery.py::test_default_dependencies_wire_probe_and_write_gated_restart"
           -q -l --timeout=600 --timeout-method=thread

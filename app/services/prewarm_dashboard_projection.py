@@ -79,7 +79,8 @@ KPI units (single authority for the UI):
 - ``remote_job_count``: distinct ``(business_date, job_id)`` refs bound to
   REMOTE_* candidates.
 - ``remote_url_count``: candidate rows bound to non-terminal remote jobs
-  (terminal = {COMPLETED, FAILED}; unknown state never counts).
+  (terminal = {COMPLETED, FAILED}; every other state — including an
+  unresolved job row — counts as in-flight).
 """
 
 from __future__ import annotations

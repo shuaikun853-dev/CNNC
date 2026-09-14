@@ -1274,18 +1274,13 @@ def _dispatch_mall_group(
                 reused_job_ids_this_pass.add(job_id)
             continue
         if (probe or {}).get("terminal_success"):
-            # Linkage uses the candidate's durable remote_job_id (the probe
-            # classifies terminal rows as booleans only); absent for jobs this
-            # dispatcher never bound — nothing is invented.
-            if candidate.get("remote_job_id") is not None:
-                _record_remote_job_link(
-                    prewarm_store,
-                    summary["business_date"],
-                    candidate_id,
-                    int(candidate["remote_job_id"]),
-                    PRODUCER_CUSTOMER_PREWARM_ZHAOSHANG,
-                    phase_errors,
-                )
+            # Cross-day rule (Round 2 review): only a FIRST-EVER binding may be
+            # linked under today's business_date.  A remote_job_id the candidate
+            # already carried before this pass was bound on an earlier day whose
+            # own linkage row stays authoritative — re-linking that job under
+            # today would fabricate a same-day dispatch that never happened.
+            # This branch binds nothing itself (the probe classifies terminal
+            # rows as booleans only), so it records no linkage at all.
             _record(
                 prewarm_store,
                 candidate_id,
@@ -1295,15 +1290,9 @@ def _dispatch_mall_group(
             )
             continue
         if (probe or {}).get("terminal_failed"):
-            if candidate.get("remote_job_id") is not None:
-                _record_remote_job_link(
-                    prewarm_store,
-                    summary["business_date"],
-                    candidate_id,
-                    int(candidate["remote_job_id"]),
-                    PRODUCER_CUSTOMER_PREWARM_ZHAOSHANG,
-                    phase_errors,
-                )
+            # Same cross-day rule as terminal_success: a pre-existing binding
+            # belongs to its earlier day (authoritative linkage there); this
+            # branch binds nothing, so it records no linkage either.
             _record(
                 prewarm_store,
                 candidate_id,
