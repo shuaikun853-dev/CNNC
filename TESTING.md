@@ -51,6 +51,7 @@ python -m pytest tests\test_zhaoshang_priority_boost.py tests\test_zhaoshang_res
 
 # 旧诊断和工作流安全边界
 python -m pytest tests\test_safety_guard.py tests\test_scope_guard.py tests\test_workflow_scope_guard.py -q
+python -m pytest tests\test_cnnc_auth_browser_harvest.py tests\test_cnnc_auth_browser_tmp_root.py -q  # CNNC 认证浏览器一次性临时 Profile 落 E 盘 runtime/browser_tmp + 启动清扫陈旧残留（2026-09-15 C 盘满事故回归）
 
 # 上下文文档体积、链接和必备规则
 python -m pytest tests\test_context_documents.py -q
@@ -91,8 +92,7 @@ python -m py_compile `
   scripts\reject_saas_audit_excel.py `
   scripts\approve_saas_audit_excel.py `
   scripts\push_saas_commodity_price.py `
-  scripts\auth_manager.py `
-  scripts\curl_utils.py
+  scripts\auth_manager.py scripts\curl_utils.py
 ```
 
 只有修改外部招商局项目时才编译其脚本；不要为了查看帮助而创建真实任务。

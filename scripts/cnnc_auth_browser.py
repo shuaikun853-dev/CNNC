@@ -48,10 +48,12 @@
              失败仅 WARN、回退外部裸 HTTP 交换（cnnc_auth_core 通道）。成功后
              把服务器轮换的 cookie 经白名单过滤回写
              storage_state（只存 5 个 SSO 会话 cookie，陈旧 K5/SF/UqZ 等
-             WAF cookie 不落盘）。浏览器每次使用一次性临时 Profile（系统
-             TEMP，用后即删），从根上隔离固定 Profile 累积的陈旧持久
-             K5/SF/UqZ cookie（曾导致 harvest 带陈旧 WAF 状态启动、卡进
-             挑战循环）
+             WAF cookie 不落盘）。浏览器每次使用一次性临时 Profile（仓库
+             E 盘 runtime/browser_tmp，用后即删；进程被硬杀时 finally 删除
+             走不到的泄漏残留留在 E 盘并在下次启动时清扫陈旧自愈，不再压满
+             C 盘 %TEMP%——2026-09-15 C 盘满致计划任务崩溃事故），从根上
+             隔离固定 Profile 累积的陈旧持久 K5/SF/UqZ cookie（曾导致
+             harvest 带陈旧 WAF 状态启动、卡进挑战循环）
     smoke    离线自检：headless 启动纯净 Chrome（一次性临时 Profile）并
              CDP 接管，打印版本验证链路
 
@@ -90,6 +92,17 @@ except ImportError:  # 直接 python scripts/cnnc_auth_browser.py 时的 sys.pat
 ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = ROOT / "data"
 STORAGE_STATE = DATA_DIR / "cnnc_auth_storage_state.json"
+
+# 浏览器一次性临时 Profile 统一落盘根：仓库 E 盘 runtime/browser_tmp（.gitignore
+# 已忽略 runtime/）。2026-09-15 生产事故：harvest 子进程被调用方 30 秒预算硬杀
+# （TerminateProcess）后 finally rmtree 走不到，mkdtemp 出的临时 Profile（每个
+# 约 78MB）滞留原地，在 C 盘 %TEMP% 累积 146 个约 5GB 压满 C 盘，计划任务
+# PowerShell 包装脚本 Add-Type 编译临时文件失败、整点审计 tick 静默崩溃。改落
+# E 盘后硬杀泄漏不再触碰 C 盘（函数内在调用时读取，测试可 monkeypatch）。
+BROWSER_TMP_ROOT = ROOT / "runtime" / "browser_tmp"
+# 陈旧残留清扫阈值：必须远超 login 15 分钟窗口与 harvest 60 秒窗口，6 小时
+# 覆盖过夜残留；正在使用的 Profile 绝不会被误删（只在创建新 Profile 前清扫）。
+STALE_BROWSER_TMP_MAX_AGE_SECONDS = 6 * 3600
 
 # AUTHORIZE_URL 仅作说明保留，不再作为 harvest 的 goto 目标：直接 goto 该
 # URL 会被 WAF 挑战页（412 中转页）卡死。harvest 改用 HARVEST_ENTRY（门户
@@ -334,6 +347,39 @@ def _close_cdp(proc, browser, pw):
             pass
 
 
+def _make_browser_profile_dir(prefix):
+    """创建浏览器一次性临时 Profile 目录（E 盘 runtime/browser_tmp + 陈旧清扫）。
+
+    login/harvest/smoke 三处统一入口，三步全为尽力而为、绝不打断认证链路：
+    1. mkdir BROWSER_TMP_ROOT；E 盘不可用（OSError）时打一行 WARN 回退系统
+       TEMP mkdtemp——认证失败比临时目录落错盘严重得多；
+    2. 顺带清扫根目录下超过 STALE_BROWSER_TMP_MAX_AGE_SECONDS 的
+       cnnc_login_/cnnc_harvest_ 陈旧残留：进程被硬杀时 finally rmtree 走不到，
+       残留只能靠下一次启动自愈回收；整个清扫吞一切异常、绝不影响返回；
+    3. 返回 Path(tempfile.mkdtemp(prefix, dir=BROWSER_TMP_ROOT))。
+    """
+    try:
+        BROWSER_TMP_ROOT.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        print("WARN：BROWSER_TMP_ROOT 不可用，本次回退系统 TEMP: %s"
+              % BROWSER_TMP_ROOT, file=sys.stderr)
+        return Path(tempfile.mkdtemp(prefix=prefix))
+    try:
+        cutoff = time.time() - STALE_BROWSER_TMP_MAX_AGE_SECONDS
+        for child in sorted(BROWSER_TMP_ROOT.iterdir()):
+            if not (child.name.startswith("cnnc_login_")
+                    or child.name.startswith("cnnc_harvest_")):
+                continue
+            try:
+                if child.stat().st_mtime < cutoff:
+                    shutil.rmtree(child, ignore_errors=True)
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return Path(tempfile.mkdtemp(prefix=prefix, dir=str(BROWSER_TMP_ROOT)))
+
+
 def cmd_login(args):
     """人工一次性登录：纯净 Chrome 以一次性临时 Profile（空 cookie）打开
     真窗口完成登录，检测到本次登录新签发的 SSO 根凭证 TGC 后只导出 SSO
@@ -341,12 +387,14 @@ def cmd_login(args):
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     print("正在启动纯净 Chrome…请在窗口中完成 CNNC 登录（账号+滑块+短信）",
           flush=True)
-    # 一次性临时 Profile（系统 TEMP，仓库外），空 cookie 启动：持久 Profile
-    # 里物理残留的陈旧 TGC 会被"崩溃恢复"还原（_close_cdp 硬杀 Chrome 从不
-    # 优雅关闭），启动 ~2 秒即误判"登录成功"秒关窗，用户永远没机会输密码
-    # （2026-09-03 实锤 bug）。改空 Profile 后，TGC 出现只可能来自本次真人
-    # 登录新签发，窗口保持打开直到用户真正完成登录。
-    login_dir = Path(tempfile.mkdtemp(prefix="cnnc_login_"))
+    # 一次性临时 Profile（E 盘 runtime/browser_tmp，用后即删），空 cookie 启动：
+    # 持久 Profile 里物理残留的陈旧 TGC 会被"崩溃恢复"还原（_close_cdp 硬杀
+    # Chrome 从不优雅关闭），启动 ~2 秒即误判"登录成功"秒关窗，用户永远没
+    # 机会输密码（2026-09-03 实锤 bug）。改空 Profile 后，TGC 出现只可能来自
+    # 本次真人登录新签发，窗口保持打开直到用户真正完成登录。落 E 盘而非系统
+    # %TEMP%：被硬杀时的泄漏残留留在 E 盘并顺带清扫，不再压满 C 盘
+    # （2026-09-15 C 盘满致计划任务崩溃事故）。
+    login_dir = _make_browser_profile_dir("cnnc_login_")
     proc = browser = pw = None
     try:
         # URL 作为启动参数直接打开，不用 page.goto
@@ -436,8 +484,11 @@ def cmd_harvest(args):
               file=sys.stderr)
         return 4
 
-    # 一次性临时 Profile（系统 TEMP，仓库外），用后即删
-    harvest_dir = Path(tempfile.mkdtemp(prefix="cnnc_harvest_"))
+    # 一次性临时 Profile（E 盘 runtime/browser_tmp，用后即删）。harvest 子进程
+    # 可能被调用方 30 秒预算硬杀（TerminateProcess），finally rmtree 走不到，
+    # 泄漏残留落 E 盘并由下次启动的陈旧清扫自愈回收——不再压满 C 盘 %TEMP%
+    # （2026-09-15 C 盘满致计划任务崩溃事故）
+    harvest_dir = _make_browser_profile_dir("cnnc_harvest_")
     print("harvest 临时 Profile：%s" % harvest_dir)
     proc = browser = pw = None
     try:
@@ -673,7 +724,7 @@ def cmd_smoke(args):
 
     同 harvest 模式：一次性临时 Profile（mkdtemp + rmtree），不污染持久 Profile。
     """
-    smoke_dir = Path(tempfile.mkdtemp(prefix="cnnc_harvest_"))
+    smoke_dir = _make_browser_profile_dir("cnnc_harvest_")
     proc = browser = pw = None
     try:
         proc, browser, pw = _launch_chrome_cdp(url=None, headless=True,
