@@ -667,6 +667,77 @@ def test_cross_day_same_integer_job_id_operates_d1_pair_only(tmp_path):
     assert [(row["id"], row["state"]) for row in d2_rows_after] == [(17, "COMPLETED")]
 
 
+# ---- 测试 4b:跨日预算耗尽释放 in-flight 键,再次点击重新武装 ----------------------
+
+
+def test_cross_day_budget_exhaustion_releases_inflight_and_reclick_rearms(tmp_path):
+    """跨日 worker 是该 URL 唯一 lifecycle owner:预算耗尽(仍 WAITING_REMOTE)
+    即释放 (route, url) in-flight 键——同 URL 同候选再次 start 必须成功
+    (不得 ACTION_IN_FLIGHT),dispatch 被第二次点击再次调用(重新探测,
+    fake 层无 adapter),有界循环重新武装(reexport 计数再 +2);旧动作
+    get() 只读共存,仍可读且仍 WAITING_REMOTE(懒翻转的 key==action_id
+    守卫保证不误删新动作的键)。"""
+    runtime_root = tmp_path / "runtime"
+    prewarm = CustomerPrewarmStore(runtime_root / PREWARM_STORE_NAME)
+    SharedCrawlCache(runtime_root / SHARED_CACHE_NAME)
+    candidate_id = _seed_candidate(prewarm, URL)
+    _write_min_state_db(runtime_root, DAY_1, [(17, "RUNNING")])
+    _make_run_db(runtime_root, BUSINESS_DATE)
+
+    dispatch = _FixedDispatch({
+        "outcome": "REUSED",
+        "remote_job_id": 17,
+        "remote_identity": "comix|t|n",
+        "priority_proven": True,
+        "cross_day": True,
+        "job_business_date": DAY_1,
+    })
+
+    reexport_calls: list[dict] = []
+
+    def fake_reexport(**kwargs):
+        reexport_calls.append(dict(kwargs))
+        return {
+            "outcome": "REEXPORT_REJECTED",
+            "error_code": "REMOTE_PROGRESS_UNKNOWN",
+            "create_calls": 0,
+        }
+
+    runner = _make_runner(
+        runtime_root,
+        dispatch_exact=dispatch,
+        reexport=fake_reexport,
+        adapter_factory=lambda: object(),
+        max_attempts=2,
+    )
+
+    # 第一次点击:预算 2 轮耗尽 → 诚实 WAITING_REMOTE,reexport 恰 2 次。
+    handle = runner.start(BUSINESS_DATE, candidate_id=candidate_id)
+    runner._join_for_tests(handle["action_id"])
+    first = runner.get(handle["action_id"])
+    assert first["status"] == "WAITING_REMOTE"
+    assert first["outcome"]["cross_day_harvest"]["attempts"] == 2
+    assert len(reexport_calls) == 2
+
+    # 预算耗尽即释放键:同 URL 同候选再次 start 成功(直接拿到新 action_id,
+    # 不抛 ACTION_IN_FLIGHT),dispatch 被第二次点击再次调用(重新探测)。
+    handle2 = runner.start(BUSINESS_DATE, candidate_id=candidate_id)
+    assert handle2["action_id"] != handle["action_id"]
+    runner._join_for_tests(handle2["action_id"])
+    second = runner.get(handle2["action_id"])
+    assert second["status"] == "WAITING_REMOTE"
+    assert second["outcome"]["cross_day_harvest"]["attempts"] == 2
+    # 有界循环重新武装:reexport 计数继续 +2(每个动作各自 2 轮)。
+    assert len(reexport_calls) == 4
+    # 两次点击各恰好一次 dispatch(重新探测;fake 层面无 adapter,
+    # 零 POST 语义由 test_prewarm_manual_recrawl 的毒化 adapter 覆盖)。
+    assert dispatch.calls == 2
+    # 旧动作 get() 只读共存:仍可读且仍 WAITING_REMOTE。
+    old = runner.get(handle["action_id"])
+    assert old is not None
+    assert old["status"] == "WAITING_REMOTE"
+
+
 # ---- 测试 5:延续只碰本动作的 (date, job) 对 ------------------------------------
 
 

@@ -149,9 +149,15 @@ CLI 等价命令(与页面按钮走同一实现,供脚本/应急):
   招商任务并提优 priority -1。返回 `202 + action_id`,以
   `GET /dashboard/api/prewarm/recrawl-actions/{action_id}` 轮询生命周期:
   `WAITING_REMOTE`(远端在途)/`PRIORITY_PENDING`(提优未证实,需人工重试)/
-  `SUCCEEDED`/`FAILED`。`SUCCEEDED` 仅当共享缓存出现本动作 producer
-  (`manual-recrawl-*`)的新 current 行;远端任务终态 FAILED → 诚实 `FAILED`;
-  派发本身绝不是成功。同一 URL 非终态期间二次发起 → 409(`ACTION_IN_FLIGHT`)。
+  `SUCCEEDED`/`FAILED`。`SUCCEEDED` 仅当共享缓存出现 succeeded_at 晚于动作
+  开始、且 payload 的 (business_date, remote_job_id) 与本动作派发任务精确
+  一致的新 current 行(producer 仅诊断展示,跨日 REUSED 的 auto-pass producer
+  行同样算);远端任务终态 FAILED → 诚实 `FAILED`;派发本身绝不是成功。
+  同一 URL 非终态期间二次发起 → 409(`ACTION_IN_FLIGHT`)。跨日 REUSED
+  (复用更早业务日的未完成任务)时,动作 worker 即该任务的有界 lifecycle
+  owner——有界循环执行既有手动重导出通道(零二次 POST,只写原业务日
+  state DB)+ 幂等镜像进共享缓存;预算耗尽保持 `WAITING_REMOTE` 并释放
+  同 URL 锁,操作员再次点击即重新探测并重启该循环。
 
 ## 排障
 

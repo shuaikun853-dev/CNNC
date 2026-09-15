@@ -29,7 +29,13 @@ that re-crawls EXACTLY ONE prewarm link URL:
 
   While ``WAITING_REMOTE`` the (route, original_url) in-flight key stays
   HELD (Round 3 D8): a second start for the same URL fails with
-  ``ACTION_IN_FLIGHT`` until the action turns terminal.  Every
+  ``ACTION_IN_FLIGHT`` until the action turns terminal.  This hold is a
+  SAME-DAY contract (the scan/STEP1 pass externally owns the day's state
+  DB): a CROSS-DAY action's worker is the URL's ONLY lifecycle owner, so
+  when its attempt budget runs out the worker retires and RELEASES the key
+  (the action stays honestly WAITING_REMOTE) — a further operator click
+  re-probes through dispatch (no duplicate POST) and restarts the bounded
+  loop.  Every
   :meth:`ManualRecrawlRunner.get` lazily re-evaluates, in order:
 
   1. the dispatched remote job's owning state DB
@@ -58,9 +64,13 @@ that re-crawls EXACTLY ONE prewarm link URL:
      and the action keeps waiting (D9 resolves it if the manual job failed).
 
   Every lazy terminal flip appends a durable ``completed`` JSONL event
-  (Round 3 D11).  Nothing is ever written by the action itself — the
-  eventual remote-side sync owns the new row.  Poll-driven only (no
-  background thread); evaluation never raises.
+  (Round 3 D11).  Same-day actions stay pure poll-driven: nothing is ever
+  written by the action itself — the eventual remote-side sync owns the new
+  row.  Cross-day actions additionally harvest through their worker thread
+  (see the cross-day paragraph below): a bounded loop of the EXISTING
+  ``run_manual_reexport`` primitive (writes D1's own state DB, never a
+  second POST) followed by the idempotent ``sync_daily_internet_results``
+  mirror into the shared crawl cache.  Evaluation never raises.
 
   Cross-day continuation (Issue #13 blocker B): when dispatch REUSED an
   UNFINISHED remote job from an EARLIER business day (``cross_day=True`` +
@@ -78,8 +88,10 @@ that re-crawls EXACTLY ONE prewarm link URL:
   correlation → SUCCEEDED).  When the attempt budget runs out the action
   stays honestly WAITING_REMOTE (the remote job may genuinely still be
   running; whitelisted diagnostics land in ``outcome["cross_day_harvest"]``)
-  and a further operator click re-probes (no duplicate POST) and restarts
-  the bounded loop.  All cross-day imports stay lazy INSIDE this path, so
+  and the worker — this URL's only lifecycle owner — RELEASES the
+  (route, url) in-flight key as it retires; a further operator click
+  re-probes (no duplicate POST) and restarts the bounded loop.  All
+  cross-day imports stay lazy INSIDE this path, so
   the §44 isolation list (STEP2 / STEP3 / closeout / push / workflows) is
   unaffected.
 
@@ -89,7 +101,9 @@ Guards run synchronously in :meth:`ManualRecrawlRunner.start` and fail closed
 with :class:`ManualRecrawlError`: missing prewarm DB → ``STATE_DB_MISSING``,
 unknown candidate → ``CANDIDATE_NOT_FOUND``, stale operator link/status →
 ``STALE_PREWARM_LINK``, staples/tmall/unmapped URL → ``RECRAWL_NOT_SUPPORTED``,
-same URL already being re-crawled (non-terminal action, D8) →
+same URL already being re-crawled (non-terminal action, D8 — same-day
+actions hold the key for their whole WAITING_REMOTE life; cross-day
+actions release it when the worker's attempt budget runs out) →
 ``ACTION_IN_FLIGHT``.
 
 Durability & isolation: every action appends a JSONL intent/finish record
@@ -331,7 +345,11 @@ class ManualRecrawlRunner:
         Poll-driven completion: while the status is ``WAITING_REMOTE`` every
         call lazily re-evaluates, first the dispatched remote job's owning
         state DB (terminal FAILED → FAILED, D9) then the shared cache
-        read-only for a new manual-producer current success (D10); terminal
+        read-only for a new current success row that correlates EXACTLY with
+        this action's dispatched job — ``succeeded_at >= started_at`` plus
+        the payload's exact ``(business_date, remote_job_id)`` pair (Round 4
+        Slice G2, superseding the Round 3 D10 producer gate; the row's
+        producer is surfaced for diagnostics only, never the gate); terminal
         flips release the in-flight key (D8) and append the ``completed``
         JSONL event (D11).  The handle is mutated under the runner lock.
         ``PRIORITY_PENDING`` never auto-flips and no dispatch is ever re-run
@@ -388,8 +406,17 @@ class ManualRecrawlRunner:
             with self._lock:
                 if handle.get("finished_at") is None:
                     handle["finished_at"] = _utcnow_iso()
-                if handle.get("status") != "WAITING_REMOTE":
-                    self._release_inflight_locked(handle)
+                # Cross-day budget exhaustion: the worker IS this URL's only
+                # lifecycle owner and it is retiring — keep holding the
+                # (route, url) key would lock the URL forever (unlike the
+                # same-day tail below, no scan/STEP1 external owner exists
+                # for an earlier day).  Release so a further operator click
+                # can re-probe through dispatch (no duplicate POST) and
+                # rearm the bounded loop.  Terminal flips inside the loop
+                # already released via _complete_terminal_locked; the
+                # key==action_id guard makes a re-release a no-op and keeps
+                # a later lazy flip from deleting a newer action's key.
+                self._release_inflight_locked(handle)
             self._append_log(self._log_record(handle, "finished"))
             return
         with self._lock:
