@@ -1,16 +1,20 @@
 # -*- coding: utf-8 -*-
 """scripts/cnnc_auth_browser.py 一次性临时 Profile 落盘位置与陈旧清扫测试（Case 22）。
 
-背景（2026-09-15 生产事故）：harvest 子进程被调用方 30 秒预算硬杀
-（TerminateProcess）后 finally rmtree 不会执行，tempfile.mkdtemp 出的一次性
-Chrome Profile（每个约 78MB）滞留原地；原先落在系统 %TEMP%（C 盘），146 个
-残留约 5GB 压满 C 盘，计划任务 PowerShell 包装脚本 Add-Type 编译临时文件失败、
-整点审计 tick 静默崩溃。
+背景（2026-09-15 生产事故）：
+浏览器认证相关进程异常终止或被外层超时/进程终止机制结束时，
+finally 清理可能无法执行，从而留下 tempfile.mkdtemp 创建的一次性
+Chrome Profile。此前这些 Profile 默认位于系统 TEMP，长期残留会持续
+占用系统 TEMP 所在磁盘空间。事故排查发现系统 TEMP 下存在 Chrome
+Profile 残留并伴随 C 盘空间不足。
 
-修复契约：三处 cmd_* 的一次性临时 Profile 统一经 _make_browser_profile_dir
-落到仓库 E 盘 runtime/browser_tmp（.gitignore 已忽略 runtime/），创建前清扫
-超过 STALE_BROWSER_TMP_MAX_AGE_SECONDS 的 cnnc_login_/cnnc_harvest_ 陈旧残留
-自愈；E 盘不可用时回退系统 TEMP，认证链路不因辅助目录中断。
+修复契约：
+login / harvest / smoke 的一次性临时 Profile 统一经
+_make_browser_profile_dir 创建在仓库 runtime/browser_tmp。
+当前生产 checkout 位于 E 盘，因此生产正常路径下实际落在 E 盘；
+创建前清扫超过 STALE_BROWSER_TMP_MAX_AGE_SECONDS 的
+cnnc_login_/cnnc_harvest_ 陈旧残留。
+若 BROWSER_TMP_ROOT 不可用，则回退系统 TEMP，以认证可用性优先。
 
 全部离线：只动 tmp_path 下的目录，不启动 Chrome、不访问网络。
 """
