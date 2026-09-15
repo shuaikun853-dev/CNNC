@@ -120,7 +120,7 @@ def test_write_xlsx_split_sheets(tmp_path):
 def test_write_xlsx_customer_headers_frozen_spec():
     assert F.customer_headers("01") == [
         "标准商品编码", "标准商品名称", "互联网商品编码（SKUID）", "互联网商城编码",
-        "互联网商品名称", "互联网链接", "互联网商品价格", "同款判断(是/否)"]
+        "互联网商品名称", "互联网链接", "互联网商品价格", "同款判断"]
     assert F.customer_headers("02") == F.customer_headers("01")[:7]
     assert F.customer_headers("03") == F.customer_headers("02")
     assert F.customer_headers("04") == F.customer_headers("02") + ["评论数", "人工审核结果"]
@@ -147,7 +147,7 @@ def test_scanner_clean_and_whitelist():
     pat = F.build_sensitive_pattern()
     assert F.find_sensitive_hit(pat, "去极值后结果数据") is None   # 流程名允许
     assert F.find_sensitive_hit(pat, "价格指数计算结果数据") is None
-    assert F.find_sensitive_hit(pat, "同款判断(是/否)") is None
+    assert F.find_sensitive_hit(pat, "同款判断") is None
     assert F.find_sensitive_hit(pat, "https://item.jd.com/1.html") is None
 
 
