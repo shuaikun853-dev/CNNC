@@ -58,17 +58,22 @@ def test_no_write_endpoints(client):
 
 
 def test_static_assets_served(client):
-    for name in ("index.html", "app.css", "app.js"):
+    for name in ("index.html", "app.css", "app.js", "shell.css", "prewarm.css", "prewarm.js", "prewarm.html"):
         r = client.get(f"/dashboard/static/{name}")
         assert r.status_code == 200, name
-    css = client.get("/dashboard/static/app.css").text
+    shell_css = client.get("/dashboard/static/shell.css").text
+    app_css = client.get("/dashboard/static/app.css").text
+    prewarm_css = client.get("/dashboard/static/prewarm.css").text
+    prewarm_js = client.get("/dashboard/static/prewarm.js").text
     js = client.get("/dashboard/static/app.js").text
     html = client.get("/dashboard").text
-    assert "--ok" in css and "--err" in css          # 五色令牌
+    assert "--ok" in shell_css and "--err" in shell_css     # 五色令牌(Issue #13 已抽至 shell.css)
     assert "If-None-Match" in js                      # 304 条件请求头接线
     # 不可见暂停/回前台补刷不再用字符串存在性冒充行为测试:
     # 真实行为由 tests/js/run_dashboard_js_tests.js(node)驱动 createPollController 验证。
-    assert "cdn" not in css.lower() and "http://" not in css and "https://" not in css  # 零外链
+    # 零外链约束覆盖共用外壳与两个页面(静态切片新增 shell/prewarm 资产)。
+    for text in (shell_css, app_css, prewarm_css, prewarm_js):
+        assert "cdn" not in text.lower() and "http://" not in text and "https://" not in text  # 零外链
     for hook in ("hero", "attn", "stages", "zs", "final", "more", "jobs-table", "drawer", "tech", "conn-lost", "live", "refresh", "jobs-toggle", "prod-identity", "pi-chips"):
         assert hook in html, hook
 
@@ -275,10 +280,12 @@ def test_dashboard_index_cache_busting(client):
     html = r.text
     assert re.search(r"/dashboard/static/app\.js\?v=\d+", html)
     assert re.search(r"/dashboard/static/app\.css\?v=\d+", html)
-    assert html.count("?v=") == 2
+    # Issue #13 多页外壳:index.html 亦注入 shell.css 版本(共 3 个静态资源)。
+    assert re.search(r"/dashboard/static/shell\.css\?v=\d+", html)
+    assert html.count("?v=") == 3
     disk = (ROOT / "app" / "static" / "dashboard" / "index.html").read_text(encoding="utf-8")
     assert "?v=" not in disk
-    for name in ("app.js", "app.css"):
+    for name in ("app.js", "app.css", "shell.css"):
         assert client.get(f"/dashboard/static/{name}").status_code == 200
     assert "cdn" not in html.lower()
     assert 'src="/dashboard/static/app.js?v=' in html

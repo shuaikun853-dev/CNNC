@@ -90,7 +90,7 @@ CnncLegacyZhaoshangAdapter(app/services/legacy_zhaoshang_adapter.py:478)
 
 - `harvest`(:3160)= wait-export-only 子进程(**无 create 路径**);已存在文件→`harvest_existing`(:2709,零远端调用)。
 - 验收门 `_validate_result_workbook`(:2512):provenance 必需(执行编号/批次号==task_name/商城标识==mall_key)+ 外批行过滤 + 全量 Counter 严格相等。部分导出走 `classify_existing_export_partial`(:2964,执行编号前缀 `{task_number}-` + ambiguous/exact_absent)。**此处是 Z-1/Z-2 历史 Bug 区,测试最密(30+),改动必须先读测试**。
-- Re-export(Dashboard"重新导出")与首次导出共用 `_existing_remote_harvest_core`(recovery/harvest.py:569):create_calls 恒 0;admissible_states={SUBMITTED,RUNNING,EXPORTED};attempt_headroom=2;2026-09-04 hotfix 后 live_identity_proof(progress probe 答案)可替代 priority 证据过 exact-identity 门——修掉了"远端任务完好但 priority 从未确认→re-export 被 INVALID_REMOTE_STATE 拒"的根因。
+- Re-export(Dashboard"重新导出")与首次导出共用 `_existing_remote_harvest_core`(recovery/harvest.py:569):create_calls 恒 0;admissible_states={SUBMITTED,RUNNING,EXPORTED};attempt_headroom=2;2026-09-04 hotfix 后 live_identity_proof(progress probe 答案)可替代 priority 证据过 exact-identity 门——修掉了"远端任务完好但 priority 从未确认→re-export 被 INVALID_REMOTE_STATE 拒"的根因。第三入口 `harvest_existing_customer_prewarm_job`(Issue #13 跨日收割,recovery/harvest.py:1001)复用同一 core:source_scope="prewarm_payload"——溯源取自 durable prewarm payload 的 mapping source(mall_source_id),无 STEP1 快照要求;re-export/首次导出的 frozen/latest 快照 scope 语义不变。
 - 导出失败重试:子进程内 exportTask 重试≤5(读性质);启动失败分 transient(→RUNNING 同身份重排)与 deterministic(→MANUAL fail-closed)。
 
 ## 7. Rebuild(重建)——与 Re-export 严格互斥的语义

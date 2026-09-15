@@ -39,9 +39,16 @@ introduces a second remote-task store:
   ``UNCONFIRMED``, an exception, or a readback whose weight_type is not -1 —
   leaves the job ``PRIORITY_PENDING`` and retries next pass (candidates
   ``REMOTE_DISPATCHED``/``REMOTE_REUSED`` stay, never re-created).
-  ``priority_boosted`` keeps counting the idempotent evidence-replay boosts of
-  reused jobs.  ``PRIORITY_PENDING`` jobs with a remote identity re-enter the
-  confirm list from BOTH remote candidate statuses every pass.
+  ``priority_boosted`` counts only PROVEN boosts of reused jobs (status
+  ``UPDATED``/``ALREADY_HIGHEST`` AND readback ``weight_type == -1``; a
+  status-accepted-but-weight-unproven outcome takes the unconfirmed path with
+  counter ``priority_unconfirmed``).  ``PRIORITY_PENDING`` jobs with a remote
+  identity re-enter the confirm list from BOTH remote candidate statuses every
+  pass.  Round 3 cross-day protection: pass Phase 1 never resolves a
+  candidate's bound job by bare id against today's DB when a linkage row dates
+  that job on an earlier day (skipped with a phase note — the manual-recrawl
+  exact path owns cross-day work through a strictly read-only probe of that
+  day's state DB and a no-write boost).
 - plan-only: the whole report is built from read-only probes and returns
   BEFORE any lock, store write, or adapter construction — provably zero-write.
 
@@ -99,6 +106,10 @@ from app.services.legacy_zhaoshang_adapter import (
     CrawlRequest,
     PriorityStatus,
     SubmitStatus,
+)
+from app.services.shared_crawl_cache import (
+    PRODUCER_CUSTOMER_PREWARM_ZHAOSHANG,
+    PRODUCER_MANUAL_RECRAWL_ZHAOSHANG,
 )
 from scripts.zhaoshang_mall_mapping import ZhaoshangMallMapping
 
@@ -351,8 +362,10 @@ def _empty_summary(
         # priority_confirmed: distinct jobs PROVEN weight_type == -1 this pass
         # (same-pass confirms of fresh creates + PRIORITY_PENDING confirms of
         # REMOTE_* candidates; state reconciled to SUBMITTED).
-        # priority_boosted: idempotent evidence-replay boosts of reused jobs
-        # (status-level confirmation only; the legacy job state is untouched).
+        # priority_boosted: PROVEN boosts of reused jobs — status accepted
+        # (UPDATED/ALREADY_HIGHEST) AND readback weight_type == -1.  Round 3
+        # D3: a status-accepted-but-weight-unproven outcome counts into
+        # priority_unconfirmed instead (never claimed as proven).
         "priority_confirmed": 0,
         "priority_boosted": 0,
         "priority_unconfirmed": 0,
@@ -413,11 +426,66 @@ def _read_remote_job_readonly(state_db_path: str | Path, job_id: int) -> dict[st
     return dict(row) if row is not None else None
 
 
+def _read_remote_job_row_readonly(state_db_path: str | Path, job_id: int) -> dict[str, Any] | None:
+    """Full ``remote_jobs`` row probe (``mode=ro``) for the cross-day boost
+    (Round 3 D4): the row lives in ANOTHER day's state DB and is only ever
+    read from here — the owning day's lifecycle stays authoritative."""
+    connection = _open_state_db_readonly(state_db_path)
+    if connection is None:
+        return None
+    try:
+        row = connection.execute(
+            "SELECT * FROM remote_jobs WHERE id=?",
+            (int(job_id),),
+        ).fetchone()
+    finally:
+        connection.close()
+    return dict(row) if row is not None else None
+
+
 def _candidate_mall(candidate: Mapping[str, Any], mappings: Sequence[ZhaoshangMallMapping]) -> str:
     mall = str(candidate.get("mall") or "").strip()
     if mall:
         return mall
     return classify_reference_url(str(candidate.get("lookup_url") or ""), mappings).mall_key
+
+
+def _cross_day_link(
+    prewarm_store: Any,
+    candidate_id: int,
+    business_date: str,
+    phase_errors: list[str],
+) -> dict[str, Any] | None:
+    """Latest candidate linkage when it dates the bound job on ANOTHER day.
+
+    Round 3 D5 guard: a candidate whose latest linkage row names a different
+    ``business_date`` has its remote job owned by that day's state DB —
+    resolving the bare ``remote_job_id`` against today's DB can hit an
+    unrelated same-numbered job.  Returns ``None`` (keep current behavior)
+    when there is no linkage, when the linkage is same-day, or when the probe
+    itself fails (isolated into ``phase_errors``)."""
+    try:
+        link = prewarm_store.remote_job_link_for_candidate(int(candidate_id))
+    except Exception as exc:  # noqa: BLE001 - probe failure never breaks the pass
+        phase_errors.append(
+            f"candidate {candidate_id}: remote job link probe: {type(exc).__name__}: {exc}"
+        )
+        return None
+    if link is None:
+        return None
+    link_date = str(link.get("business_date") or "")
+    if not link_date or link_date == business_date:
+        return None
+    return link
+
+
+def _cross_day_skip_note(candidate_id: int, link: Mapping[str, Any]) -> str:
+    """Phase note for a candidate skipped because its job lives on another day."""
+    return (
+        f"candidate {int(candidate_id)}: cross-day job "
+        f"{link.get('remote_job_id')}@{link.get('business_date')} skipped "
+        "(manual recrawl path owns cross-day work)"
+    )
 
 
 def _record(
@@ -444,6 +512,30 @@ def _record(
     except Exception as exc:  # noqa: BLE001 - per-candidate isolation
         phase_errors.append(f"candidate {candidate_id}: {type(exc).__name__}: {exc}")
         return False
+
+
+def _record_remote_job_link(
+    prewarm_store: CustomerPrewarmStore,
+    business_date: str,
+    candidate_id: int,
+    job_id: int,
+    producer: str,
+    phase_errors: list[str],
+) -> None:
+    """Best-effort candidate↔remote-job linkage (Issue #13 Round 2).
+
+    Pure bookkeeping at every site where a candidate is bound to a remote job
+    id; a failure is collected into ``phase_errors`` and never breaks the
+    dispatch outcome (and never touches the candidate's cache_status).
+    """
+    try:
+        prewarm_store.record_remote_job_link(
+            business_date, int(candidate_id), int(job_id), producer
+        )
+    except Exception as exc:  # noqa: BLE001 - linkage is best-effort
+        phase_errors.append(
+            f"candidate {candidate_id} job link {job_id}: {type(exc).__name__}: {exc}"
+        )
 
 
 def validate_canary_preflight(
@@ -594,6 +686,13 @@ def _plan_only_report(
                 summary["candidates_in_scope"] += 1
             job_id = candidate.get("remote_job_id")
             if job_id is None or int(job_id) in seen_priority_job_ids:
+                continue
+            candidate_id = int(candidate["id"])
+            link = _cross_day_link(prewarm_store, candidate_id, business_date, phase_errors)
+            if link is not None:
+                # D5 (plan-only): never count a cross-day-linked candidate's
+                # bare job id against today's state DB.
+                phase_errors.append(_cross_day_skip_note(candidate_id, link))
                 continue
             job = _read_remote_job_readonly(state_db_path, int(job_id))
             if job is None:
@@ -936,6 +1035,17 @@ def _run_leased_pass(
                     counters["absorbed"] += 1
                 continue
             if candidate.get("remote_job_id") is not None:
+                link = _cross_day_link(
+                    prewarm_store, candidate_id, summary["business_date"], phase_errors
+                )
+                if link is not None:
+                    # D5: the candidate's bound job lives on an earlier day's
+                    # state DB.  Resolving the bare id against today's DB could
+                    # confirm/boost an unrelated same-numbered job — skip the
+                    # candidate from the confirm/reuse lists this pass; the
+                    # manual-recrawl exact path owns cross-day work.
+                    phase_errors.append(_cross_day_skip_note(candidate_id, link))
+                    continue
                 item = {
                     "candidate_id": candidate_id,
                     "job_id": int(candidate["remote_job_id"]),
@@ -1224,6 +1334,14 @@ def _dispatch_mall_group(
         unfinished = (probe or {}).get("unfinished_bound")
         if unfinished is not None:
             job_id = int(unfinished["job"]["id"])
+            _record_remote_job_link(
+                prewarm_store,
+                summary["business_date"],
+                candidate_id,
+                job_id,
+                PRODUCER_CUSTOMER_PREWARM_ZHAOSHANG,
+                phase_errors,
+            )
             if _record(
                 prewarm_store,
                 candidate_id,
@@ -1238,6 +1356,13 @@ def _dispatch_mall_group(
                 reused_job_ids_this_pass.add(job_id)
             continue
         if (probe or {}).get("terminal_success"):
+            # Cross-day rule (Round 2 review): only a FIRST-EVER binding may be
+            # linked under today's business_date.  A remote_job_id the candidate
+            # already carried before this pass was bound on an earlier day whose
+            # own linkage row stays authoritative — re-linking that job under
+            # today would fabricate a same-day dispatch that never happened.
+            # This branch binds nothing itself (the probe classifies terminal
+            # rows as booleans only), so it records no linkage at all.
             _record(
                 prewarm_store,
                 candidate_id,
@@ -1247,6 +1372,9 @@ def _dispatch_mall_group(
             )
             continue
         if (probe or {}).get("terminal_failed"):
+            # Same cross-day rule as terminal_success: a pre-existing binding
+            # belongs to its earlier day (authoritative linkage there); this
+            # branch binds nothing, so it records no linkage either.
             _record(
                 prewarm_store,
                 candidate_id,
@@ -1374,6 +1502,14 @@ def _dispatch_mall_group(
     if claim is None:
         # Another writer dispatched this job: never double-POST.
         for entry in batch_entries:
+            _record_remote_job_link(
+                prewarm_store,
+                summary["business_date"],
+                int(entry["candidate"]["id"]),
+                int(job_row["id"]),
+                PRODUCER_CUSTOMER_PREWARM_ZHAOSHANG,
+                phase_errors,
+            )
             _record(
                 prewarm_store,
                 int(entry["candidate"]["id"]),
@@ -1392,6 +1528,14 @@ def _dispatch_mall_group(
             token, int(job_row["id"]), f"prewarm dispatch submit unknown: {diagnostic}"
         )
         for entry in batch_entries:
+            _record_remote_job_link(
+                prewarm_store,
+                summary["business_date"],
+                int(entry["candidate"]["id"]),
+                int(job_row["id"]),
+                PRODUCER_CUSTOMER_PREWARM_ZHAOSHANG,
+                phase_errors,
+            )
             _record(
                 prewarm_store,
                 int(entry["candidate"]["id"]),
@@ -1426,6 +1570,14 @@ def _dispatch_mall_group(
                 token, int(job_row["id"]), "prewarm dispatch submit returned incomplete identity"
             )
             for entry in batch_entries:
+                _record_remote_job_link(
+                    prewarm_store,
+                    summary["business_date"],
+                    int(entry["candidate"]["id"]),
+                    int(job_row["id"]),
+                    PRODUCER_CUSTOMER_PREWARM_ZHAOSHANG,
+                    phase_errors,
+                )
                 _record(
                     prewarm_store,
                     int(entry["candidate"]["id"]),
@@ -1446,6 +1598,14 @@ def _dispatch_mall_group(
             )
             store.advance_crawl_work_for_job(token, int(job_row["id"]), "PRIORITY_PENDING")
             for entry in batch_entries:
+                _record_remote_job_link(
+                    prewarm_store,
+                    summary["business_date"],
+                    int(entry["candidate"]["id"]),
+                    int(job_row["id"]),
+                    PRODUCER_CUSTOMER_PREWARM_ZHAOSHANG,
+                    phase_errors,
+                )
                 _record(
                     prewarm_store,
                     int(entry["candidate"]["id"]),
@@ -1476,6 +1636,14 @@ def _dispatch_mall_group(
             token, int(job_row["id"]), f"prewarm dispatch submit unknown status: {status}"
         )
         for entry in batch_entries:
+            _record_remote_job_link(
+                prewarm_store,
+                summary["business_date"],
+                int(entry["candidate"]["id"]),
+                int(job_row["id"]),
+                PRODUCER_CUSTOMER_PREWARM_ZHAOSHANG,
+                phase_errors,
+            )
             _record(
                 prewarm_store,
                 int(entry["candidate"]["id"]),
@@ -1633,16 +1801,26 @@ def _boost_reused_job(
     summary: dict[str, Any],
     canary_scope: CanaryScope | None = None,
     canary_budget: CanaryLiveBudget | None = None,
-) -> None:
-    """One idempotent priority boost for a reused job (fail-closed)."""
+) -> bool | None:
+    """One idempotent priority boost for a reused job (fail-closed).
+
+    Issue #13 Round 3 D3: ``True`` means PROVEN — outcome status accepted
+    (``UPDATED``/``ALREADY_HIGHEST``) AND readback ``weight_type == -1``
+    (the same honest bar as :func:`_priority_proven` / the confirm path).
+    ``False`` = attempted-but-unconfirmed (including status accepted without
+    the -1 readback), budget-deferred, canary-blocked, or the failure path —
+    the counter ``priority_unconfirmed`` is honest bookkeeping, never a
+    proven boost.  ``None`` = not actionable (missing job, missing identity,
+    or a non-boostable state the existing lifecycle owns).
+    """
     phase_errors = summary["phase_errors"]
     try:
         job_row = store.get_remote_job(job_id)
         if job_row is None:
-            return
+            return None
         identity = str(job_row.get("remote_identity") or "").strip()
         if not identity or str(job_row.get("state") or "") not in _BOOSTABLE_JOB_STATES:
-            return  # the existing lifecycle owns identity-less / terminal jobs
+            return None  # the existing lifecycle owns identity-less / terminal jobs
         adapter = get_adapter()
         prepared = _reconstruct_prepared_job(adapter, business_date, job_row)
         parts = identity.split("|")
@@ -1664,7 +1842,7 @@ def _boost_reused_job(
                 f"boost job {job_id}: {CANARY_PRIORITY_SCOPE_VIOLATION} "
                 f"(job mall evidence does not prove {canary_scope.only_mall!r})"
             )
-            return
+            return False
         if canary_budget is not None:
             # Second canary layer (per call): the job's durable payload
             # (mall, url) pairs must all sit inside the preflight budget
@@ -1680,12 +1858,19 @@ def _boost_reused_job(
         )
         if canary_scope is not None:
             summary["priority_updates_performed"] += 1
-        status = _status_value(priority.status)
-        if status in (PriorityStatus.UPDATED.value, PriorityStatus.ALREADY_HIGHEST.value):
+        if _priority_proven(priority):
+            # D3: PROVEN means status accepted AND readback weight_type == -1
+            # — a status-accepted-but-weight-unproven outcome takes the
+            # unconfirmed path below instead of claiming a proven boost.
             summary["priority_boosted"] += 1
-        else:
-            summary["priority_unconfirmed"] += 1
-            diagnostic = str(getattr(priority, "diagnostic", "") or "highest priority was not confirmed")
+            return True
+        summary["priority_unconfirmed"] += 1
+        diagnostic = str(getattr(priority, "diagnostic", "") or "highest priority was not confirmed")
+        if not getattr(prewarm_store, "_no_candidate_writes", False):
+            # D6: the guarded manual path never writes candidate rows; the
+            # unconfirmed note is pass-only bookkeeping, so skip the doomed
+            # _record round-trip instead of synthesizing RuntimeError
+            # phase_errors on every guarded exact-REUSED-unconfirmed pass.
             _record(
                 prewarm_store,
                 candidate_id,
@@ -1694,5 +1879,568 @@ def _boost_reused_job(
                 error=f"{_PRIORITY_UNCONFIRMED_PREFIX}: {diagnostic}",
                 phase_errors=phase_errors,
             )
+        return False
     except Exception as exc:  # noqa: BLE001 - boost failure never fails the pass
         phase_errors.append(f"boost job {job_id}: {type(exc).__name__}: {exc}")
+        return False
+
+
+def _boost_cross_day_job(
+    *,
+    prewarm_store: Any,
+    store: DailyAuditStore,
+    token: LeaseToken,
+    get_adapter: Callable[[], Any],
+    link_date: str,
+    job_row: Mapping[str, Any],
+    candidate_id: int,
+    deadline: float,
+    monotonic_value: Callable[[], float],
+    summary: dict[str, Any],
+) -> bool | None:
+    """Read-only priority boost of ANOTHER day's unfinished job (Round 3 D4).
+
+    Same prioritize logic as :func:`_boost_reused_job` with three hard
+    differences: the job row comes from the link date's state DB (opened
+    read-only — this function never writes that DB and never resolves the job
+    against today's DB), the prepared job is reconstructed under ``link_date``
+    (the payload's logical key dates from the original day), and no state
+    reconciles happen — the owning day's lifecycle stays authoritative and no
+    linkage row is written (the existing ``(link_date, candidate_id, job_id)``
+    row remains the authoritative binding).  Only TODAY's lease is renewed so
+    the long remote call cannot expire the currently held lease.  Tri-state
+    return mirrors :func:`_boost_reused_job` (proven ``True`` counts
+    ``priority_boosted``; everything else is honest and retried).
+    """
+    phase_errors = summary["phase_errors"]
+    job_id = int(job_row.get("id") or 0)
+    try:
+        identity = str(job_row.get("remote_identity") or "").strip()
+        if not identity or str(job_row.get("state") or "") not in _BOOSTABLE_JOB_STATES:
+            return None
+        adapter = get_adapter()
+        prepared = _reconstruct_prepared_job(adapter, link_date, job_row)
+        parts = identity.split("|")
+        if (
+            len(parts) != 3
+            or parts[0] != prepared.mall_key
+            or not parts[1]
+            or not parts[2]
+        ):
+            raise ValueError("legacy remote task identity is invalid")
+        store.renew_lease(token, LEASE_TTL_SECONDS)
+        priority = adapter.prioritize(
+            prepared,
+            task_id=parts[1],
+            task_number=parts[2],
+            timeout_seconds=max(0.001, deadline - monotonic_value()),
+        )
+        if _priority_proven(priority):
+            summary["priority_boosted"] += 1
+            return True
+        summary["priority_unconfirmed"] += 1
+        diagnostic = str(getattr(priority, "diagnostic", "") or "highest priority was not confirmed")
+        if not getattr(prewarm_store, "_no_candidate_writes", False):
+            # D6 guard, same rationale as the same-day boost's unconfirmed
+            # branch: the guarded manual path never writes candidate rows.
+            _record(
+                prewarm_store,
+                candidate_id,
+                cache_status=CACHE_STATUS_REMOTE_REUSED,
+                remote_job_id=job_id,
+                error=f"{_PRIORITY_UNCONFIRMED_PREFIX}: {diagnostic}",
+                phase_errors=phase_errors,
+            )
+        return False
+    except Exception as exc:  # noqa: BLE001 - cross-day boost failure never fails the dispatch
+        phase_errors.append(
+            f"cross-day boost job {job_id}@{link_date}: {type(exc).__name__}: {exc}"
+        )
+        return False
+
+
+# ---- Issue #13 Slice B: guarded single-URL manual recrawl ---------------------
+
+
+class _NoCandidateWriteStore:
+    """Read-candidate proxy over :class:`CustomerPrewarmStore`.
+
+    Manual recrawl NEVER changes a candidate's ``cache_status`` — including
+    the indirect path: a boost's unconfirmed branch records a candidate note
+    through ``record_candidate_result``.  The class flag ``_no_candidate_writes``
+    lets write-shaped helpers (:func:`_boost_reused_job` / Round 3 D6, and the
+    cross-day variant) skip that pass-only note bookkeeping up front instead
+    of failing here; any candidate write that still reaches this proxy fails
+    closed loudly while every other attribute delegates untouched.
+    """
+
+    _no_candidate_writes = True
+
+    def __init__(self, store: CustomerPrewarmStore) -> None:
+        self._store = store
+
+    def record_candidate_result(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        raise RuntimeError("manual recrawl never writes candidate cache_status")
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._store, name)
+
+
+def dispatch_single_candidate_exact(
+    prewarm_store: CustomerPrewarmStore,
+    shared_cache: Any,
+    *,
+    business_date: str,
+    runtime_root: str | Path,
+    candidate_id: int,
+    mappings: Sequence[ZhaoshangMallMapping],
+    adapter: Any | None = None,
+    budget_seconds: float = 90.0,
+    state_runtime_root: str | Path | None = None,
+    monotonic: Callable[[], float] | None = None,
+) -> dict[str, Any]:
+    """Dispatch EXACTLY ONE candidate's URL through the existing lifecycle.
+
+    Issue #13 manual recrawl semantics (hard invariants):
+
+    - candidate rows are NEVER written — ``record_candidate_result`` is never
+      called, directly or indirectly (``CACHE_HIT`` stays terminal; the shared
+      cache and remote lifecycle carry all new evidence).
+    - probe first (:func:`find_remote_work_for_url`): an unfinished bound job
+      is reused with one idempotent :func:`_boost_reused_job` boost (result
+      ``REUSED``); terminal crawl rows mean the URL is finished — per the
+      manual-recrawl intent a fresh job is still created exactly once.
+    - create: the single-URL batch walks the exact STEP1 chain (placeholder
+      SKU, fingerprint, ``cnnc_current_opt_*`` task name, ``BATCH_STATE.md``),
+      then claim → submit → honest outcome handling: ``SUBMIT_UNKNOWN`` /
+      incomplete identity reconciles only; pre-send ``NOT_ATTEMPTED`` releases
+      the burned claim; ``SUBMITTED`` reconciles ``PRIORITY_PENDING`` and gets
+      one same-pass :func:`_confirm_pending_priority_job` confirm with
+      ``note_targets=[]`` (no candidate writes by construction).
+
+    Locks/lease mirror :func:`run_prewarm_dispatch_pass` byte for byte except
+    the instance-lock owner carries ``"invocation": "manual-recrawl"``.  All
+    skip outcomes are write-free by construction.  ``shared_cache`` is part of
+    the call contract for symmetry; the function itself performs no cache
+    writes (cache sync owns absorption, never the dispatcher).
+    """
+    candidate = prewarm_store.candidate_by_id(int(candidate_id))
+    if candidate is None:
+        return {"outcome": "CANDIDATE_NOT_FOUND", "phase_errors": []}
+    routing = classify_reference_url(str(candidate["original_url"] or ""), mappings)
+    if routing.outcome != OUTCOME_ZHAOSHANG:
+        return {
+            "outcome": "NOT_DISPATCHABLE",
+            "reason": routing.outcome,
+            "phase_errors": [],
+        }
+
+    monotonic_value = monotonic or time.monotonic
+    deadline = monotonic_value() + max(0.0, float(budget_seconds))
+    effective_state_root = (
+        state_runtime_root if state_runtime_root is not None else runtime_root
+    )
+    paths = runtime_paths(business_date, effective_state_root)
+    summary: dict[str, Any] = {
+        "outcome": "OK",
+        "business_date": business_date,
+        "candidate_id": int(candidate_id),
+        "mall_key": routing.mall_key,
+        "lookup_url": routing.lookup_url,
+        "phase_errors": [],
+        "priority_confirmed": 0,
+        "priority_boosted": 0,
+        "priority_unconfirmed": 0,
+    }
+    phase_errors = summary["phase_errors"]
+    guarded_store = _NoCandidateWriteStore(prewarm_store)
+    adapter_holder: list[Any] = []
+
+    def get_adapter() -> Any:
+        if not adapter_holder:
+            adapter_holder.append(
+                adapter if adapter is not None else CnncLegacyZhaoshangAdapter(mappings=mappings)
+            )
+        return adapter_holder[0]
+
+    lock_owner = {
+        "pid": os.getpid(),
+        "command": "customer_prewarm_dispatch",
+        "business_date": business_date,
+        "invocation": "manual-recrawl",
+    }
+    instance_lock = ProcessLock(Path(runtime_root) / DISPATCH_LOCK_NAME)
+    try:
+        instance_lock.acquire(owner=lock_owner)
+    except LeaseUnavailable:
+        summary["outcome"] = "SKIPPED_ALREADY_RUNNING"
+        return summary
+    try:
+        day_lock = ProcessLock(paths.lock_path)
+        try:
+            day_lock.acquire(owner=lock_owner)
+        except LeaseUnavailable:
+            summary["outcome"] = "LOCK_BUSY"
+            return summary
+        try:
+            if not paths.state_path.is_file():
+                summary["outcome"] = "STATE_DB_MISSING"
+                return summary
+            store = DailyAuditStore(paths.state_path)
+            if store.get_run(business_date) is None:
+                summary["outcome"] = "STATE_DB_MISSING"
+                return summary
+            try:
+                token = store.acquire_lease(
+                    business_date,
+                    LEASE_OWNER,
+                    LEASE_TTL_SECONDS,
+                    allow_unexpired_takeover=True,
+                    process_lock=day_lock,
+                )
+            except LeaseUnavailable:
+                summary["outcome"] = "LOCK_BUSY"
+                return summary
+            try:
+                return _dispatch_exact_leased(
+                    prewarm_store=guarded_store,
+                    store=store,
+                    token=token,
+                    paths=paths,
+                    routing=routing,
+                    candidate_id=int(candidate_id),
+                    mappings=mappings,
+                    get_adapter=get_adapter,
+                    business_date=business_date,
+                    deadline=deadline,
+                    monotonic_value=monotonic_value,
+                    summary=summary,
+                    state_runtime_root=effective_state_root,
+                )
+            finally:
+                try:
+                    store.release_lease(token)
+                except Exception as exc:  # noqa: BLE001 - release never masks the result
+                    phase_errors.append(f"lease release: {type(exc).__name__}: {exc}")
+        finally:
+            day_lock.release()
+    finally:
+        instance_lock.release()
+
+
+def _dispatch_exact_leased(
+    *,
+    prewarm_store: Any,
+    store: DailyAuditStore,
+    token: LeaseToken,
+    paths: Any,
+    routing: Any,
+    candidate_id: int,
+    mappings: Sequence[ZhaoshangMallMapping],
+    get_adapter: Callable[[], Any],
+    business_date: str,
+    deadline: float,
+    monotonic_value: Callable[[], float],
+    summary: dict[str, Any],
+    state_runtime_root: str | Path,
+) -> dict[str, Any]:
+    """Probe → reuse-boost or single-URL create+submit.  Caller owns the lease.
+
+    Return contract (Round 3, consumed by the manual-recrawl runner): every
+    ``REUSED`` summary carries ``remote_job_id`` (int), ``remote_identity``
+    (str), ``priority_proven`` (True proven / False unconfirmed / None not
+    actionable), ``cross_day`` (bool) and ``job_business_date`` (str — the
+    business_date of the state DB owning the reused job; equals the action
+    day unless ``cross_day`` is True).  ``job_terminal_success: True`` is
+    added ONLY when ``priority_proven`` is None and the re-probe found a
+    terminal SUCCESS crawl row for the URL (D7).  ``CREATED`` summaries carry
+    ``remote_job_id``/``task_name``/``task_number``/``remote_identity``/
+    ``priority_confirmed`` and are same-day by construction.
+    """
+    phase_errors = summary["phase_errors"]
+    mall_key = routing.mall_key
+    lookup_url = routing.lookup_url
+
+    probe = find_remote_work_for_url(paths.state_path, mall_key, lookup_url)
+    unfinished = (probe or {}).get("unfinished_bound")
+    if unfinished is not None:
+        job = unfinished.get("job") or {}
+        job_id = int(job.get("id") or 0)
+        _record_remote_job_link(
+            prewarm_store,
+            business_date,
+            candidate_id,
+            job_id,
+            PRODUCER_MANUAL_RECRAWL_ZHAOSHANG,
+            phase_errors,
+        )
+        boost_proven = _boost_reused_job(
+            prewarm_store=prewarm_store,
+            store=store,
+            token=token,
+            get_adapter=get_adapter,
+            business_date=business_date,
+            candidate_id=candidate_id,
+            job_id=job_id,
+            deadline=deadline,
+            monotonic_value=monotonic_value,
+            summary=summary,
+        )
+        job_terminal_success = False
+        if boost_proven is None:
+            # D7: the job is no longer boostable (its state moved on between
+            # the probe and the boost).  Re-probe before reporting: a terminal
+            # SUCCESS crawl row means the URL is actually finished — report
+            # that honestly via ``job_terminal_success`` instead of a bare
+            # None.  terminal_failed / still-unfinished keeps the plain REUSED
+            # + None semantics.
+            reprobe = find_remote_work_for_url(paths.state_path, mall_key, lookup_url)
+            job_terminal_success = bool((reprobe or {}).get("terminal_success"))
+        summary["outcome"] = "REUSED"
+        summary["remote_job_id"] = job_id
+        summary["remote_identity"] = str(job.get("remote_identity") or "")
+        # Issue #13 Round 2/3: surface the honest boost proof (True=proven,
+        # False=unconfirmed/failed, None=not actionable) for the caller.
+        summary["priority_proven"] = boost_proven
+        summary["cross_day"] = False
+        summary["job_business_date"] = business_date
+        if job_terminal_success:
+            summary["job_terminal_success"] = True
+        return summary
+
+    # ---- Round 3 D4: cross-day linkage probe (strictly read-only) --------
+    # The candidate may be linked to an unfinished job living on an EARLIER
+    # day's state DB.  Today's probe cannot see it, so without this check the
+    # create chain below would fabricate a duplicate live remote task for the
+    # same URL.  The link date's DB is opened read-only; no linkage row is
+    # written here (the existing (link_date, candidate, job) row stays
+    # authoritative), and the boost is the no-write cross-day variant.
+    link = _cross_day_link(prewarm_store, candidate_id, business_date, phase_errors)
+    if link is not None:
+        link_date = str(link["business_date"])
+        link_db = runtime_paths(link_date, state_runtime_root).state_path
+        cross_unfinished = (find_remote_work_for_url(link_db, mall_key, lookup_url) or {}).get(
+            "unfinished_bound"
+        )
+        if link.get("remote_job_id") is not None and cross_unfinished is not None:
+            job_id = int(cross_unfinished["job"]["id"])
+            link_job_row = _read_remote_job_row_readonly(link_db, job_id)
+            if link_job_row is not None:
+                boost_proven = _boost_cross_day_job(
+                    prewarm_store=prewarm_store,
+                    store=store,
+                    token=token,
+                    get_adapter=get_adapter,
+                    link_date=link_date,
+                    job_row=link_job_row,
+                    candidate_id=candidate_id,
+                    deadline=deadline,
+                    monotonic_value=monotonic_value,
+                    summary=summary,
+                )
+                summary["outcome"] = "REUSED"
+                summary["remote_job_id"] = job_id
+                summary["remote_identity"] = str(link_job_row.get("remote_identity") or "")
+                summary["priority_proven"] = boost_proven
+                summary["cross_day"] = True
+                summary["job_business_date"] = link_date
+                return summary
+            # The linked job row vanished from the owning day's DB: the stale
+            # linkage is not actionable — fall through to the honest create.
+        # Missing link-date DB, no unfinished bound work there, or no job row:
+        # treat as no cross-day work and fall through to the normal same-day
+        # decision (create per the manual-recrawl intent).
+
+    mapping = next((m for m in mappings if m.mall_key == mall_key), None)
+    if mapping is None:
+        summary["outcome"] = "MALL_NOT_MAPPED"
+        summary["reason"] = f"no ZhaoshangMallMapping loaded for mall {mall_key!r}"
+        return summary
+
+    # ---- create: exactly one single-URL job through the idempotent chain ----
+    sku_id = prewarm_placeholder_sku(mall_key, lookup_url)
+    fingerprint = prewarm_crawl_fingerprint(
+        mall_key, mapping.source_id, sku_id, lookup_url, business_date
+    )
+    work = store.ensure_crawl_work(
+        token,
+        mall_key,
+        sku_id,
+        lookup_url,
+        BACKEND_VERSION,
+        fingerprint,
+        source_id=mapping.source_id,
+    )
+    requests = [
+        CrawlRequest(
+            mall_key=mall_key,
+            mall_source_id=mapping.source_id,
+            mall_name=mapping.mall_name,
+            sku_id=sku_id,
+            url=lookup_url,
+            backend_version=BACKEND_VERSION,
+        )
+    ]
+    # Mirror legacy_zhaoshang_bridge.finalize byte for byte (same as the pass).
+    # DEFERRED REFACTOR (Issue #13 reviews): this create/submit chain is a
+    # consciously kept duplicate of _dispatch_mall_group's — extracting a
+    # shared primitive would rewrite the production-frozen pass path mid
+    # review round; first refactor target once the branch merges.
+    task_fingerprint = hashlib.sha256(
+        json.dumps(
+            {
+                "business_date": business_date,
+                "requests": [
+                    request.identity
+                    for request in sorted(requests, key=lambda value: value.identity)
+                ],
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    numeric_suffix = f"{int(task_fingerprint, 16) % (10 ** 14):014d}"
+    task_name = f"cnnc_current_opt_{requests[0].mall_name}_{numeric_suffix}"
+    job_dir = paths.run_dir / "zhaoshang" / mall_key / numeric_suffix
+    job_dir.mkdir(parents=True, exist_ok=True)
+    batch_state = _ensure_batch_state_file(paths.run_dir)
+
+    job = get_adapter().prepare_job(
+        business_date,
+        requests,
+        job_dir / "input.xlsx",
+        job_dir / "result.xlsx",
+        task_name,
+        batch_state_path=batch_state,
+    )
+    payload_json = {
+        "requests": [
+            {
+                "mall_key": request.mall_key,
+                "mall_source_id": request.mall_source_id,
+                "mall_name": request.mall_name,
+                "sku_id": request.sku_id,
+                "url": request.url,
+                "backend_version": request.backend_version,
+            }
+            for request in requests
+        ],
+        "batch_state": str(batch_state),
+    }
+    job_row = store.prepare_remote_intent(
+        token,
+        job.logical_job_key,
+        job.task_name,
+        job.payload_sha256,
+        mall_key=job.mall_key,
+        input_path=str(job.template_path),
+        result_path=str(job.result_path),
+        payload_json=payload_json,
+    )
+    job_id = int(job_row["id"])
+    summary["remote_job_id"] = job_id
+    summary["task_name"] = task_name
+    store.link_crawl_work_batch_to_remote_job(token, [int(work["id"])], job_id)
+    store.renew_lease(token, LEASE_TTL_SECONDS)
+
+    # Pre-send boundary: below the budget floor the intent stays unclaimed so
+    # a real adapter never burns into a fake SUBMIT_UNKNOWN (same as the pass).
+    remaining = deadline - monotonic_value()
+    if remaining < SUBMIT_MIN_SECONDS:
+        phase_errors.append(
+            f"manual recrawl: budget floor reached before claim; job {job_id} "
+            "stays SUBMIT_INTENT for resume"
+        )
+        summary["outcome"] = "SUBMIT_DEFERRED"
+        summary["note"] = "SUBMIT_INTENT for resume"
+        return summary
+
+    claim = store.claim_remote_submission(token, job_id)
+    if claim is None:
+        # Another writer dispatched this job: never double-POST.
+        summary["outcome"] = "CLAIM_LOST"
+        return summary
+
+    remaining = deadline - monotonic_value()
+    outcome = get_adapter().submit(job, timeout_seconds=max(0.001, remaining))
+    status = _status_value(outcome.status)
+    diagnostic = str(getattr(outcome, "diagnostic", "") or "")
+    task_id = getattr(outcome, "task_id", None)
+    task_number = getattr(outcome, "task_number", None)
+    if status == SubmitStatus.SUBMIT_UNKNOWN.value or (
+        status == SubmitStatus.SUBMITTED.value and (not task_id or not task_number)
+    ):
+        # Fail closed like the pass: reconcile-only, never a silent success.
+        if status == SubmitStatus.SUBMIT_UNKNOWN.value:
+            note = f"manual recrawl submit unknown: {diagnostic}"
+        else:
+            note = "manual recrawl submit returned incomplete identity"
+            diagnostic = diagnostic or "incomplete identity"
+        store.mark_submit_unknown(token, job_id, note)
+        # The job exists (POST may have landed): record the linkage either way.
+        _record_remote_job_link(
+            prewarm_store,
+            business_date,
+            candidate_id,
+            job_id,
+            PRODUCER_MANUAL_RECRAWL_ZHAOSHANG,
+            phase_errors,
+        )
+        summary["outcome"] = "SUBMIT_UNKNOWN"
+        summary["diagnostic"] = diagnostic
+        return summary
+    if status == SubmitStatus.NOT_ATTEMPTED.value:
+        # Pre-send failure: no dispatch happened; the unclaimed intent is
+        # re-planned by the next call through the idempotent create chain.
+        store.release_remote_submission_claim(
+            token, job_id, f"manual recrawl submit not attempted: {diagnostic}"
+        )
+        summary["outcome"] = "SUBMIT_NOT_ATTEMPTED"
+        summary["diagnostic"] = diagnostic
+        phase_errors.append(
+            f"manual recrawl: {_SUBMIT_NOT_ATTEMPTED_NOTE}"
+            + (f" ({diagnostic})" if diagnostic else "")
+        )
+        return summary
+    if status == SubmitStatus.SUBMITTED.value:
+        remote_identity = f"{mall_key}|{task_id}|{task_number}"
+        # weight_type=-1 is PROVEN, never assumed: hold at PRIORITY_PENDING
+        # until the same-pass confirm proves it (note_targets=[] -> zero
+        # candidate writes by construction).
+        store.reconcile_remote_job(
+            token, job_id, remote_identity=remote_identity, state="PRIORITY_PENDING"
+        )
+        store.advance_crawl_work_for_job(token, job_id, "PRIORITY_PENDING")
+        _record_remote_job_link(
+            prewarm_store,
+            business_date,
+            candidate_id,
+            job_id,
+            PRODUCER_MANUAL_RECRAWL_ZHAOSHANG,
+            phase_errors,
+        )
+        confirmed = _confirm_pending_priority_job(
+            prewarm_store=prewarm_store,
+            store=store,
+            token=token,
+            get_adapter=get_adapter,
+            business_date=business_date,
+            note_targets=[],
+            job_id=job_id,
+            deadline=deadline,
+            monotonic_value=monotonic_value,
+            summary=summary,
+            prepared=job,
+        )
+        summary["outcome"] = "CREATED"
+        summary["task_number"] = task_number
+        summary["remote_identity"] = remote_identity
+        summary["priority_confirmed"] = bool(confirmed)
+        return summary
+    # defensive: unknown submit status is treated fail-closed
+    store.mark_submit_unknown(
+        token, job_id, f"manual recrawl submit unknown status: {status}"
+    )
+    summary["outcome"] = "SUBMIT_UNKNOWN"
+    summary["diagnostic"] = f"unknown submit status: {status}"
+    return summary

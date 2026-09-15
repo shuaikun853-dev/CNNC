@@ -598,7 +598,9 @@ def _existing_remote_harvest_core(
     - ``source_scope``: ``"frozen"`` requires the run's frozen snapshot;
       ``"latest"`` prefers the frozen snapshot and otherwise falls back to the
       run's latest observed snapshot (manual re-export must work before the
-      freeze), and neither existing rejects;
+      freeze), and neither existing rejects; ``"prewarm_payload"`` needs no
+      snapshot at all — linked-crawl source provenance is validated against
+      the durable prewarm payload's own mapping sources (``mall_source_id``);
     - ``operation``: the diagnostic prefix used in operator-facing reasons;
     - ``attempt_headroom``: extra harvest attempts granted over the durable
       count for this invocation.  The recovery channel keeps the historical
@@ -643,12 +645,20 @@ def _existing_remote_harvest_core(
                     snapshot_id = int(latest["id"])
         if snapshot_id is None:
             raise RecoveryRejected("re-export requires an authoritative snapshot scope")
+    elif source_scope == "prewarm_payload":
+        # Customer-prewarm provenance (Issue #13): NO STEP1 snapshot is
+        # required.  The linked-crawl source fan-out below is validated
+        # against the durable prewarm payload's own mapping sources instead
+        # of a snapshot document identity.
+        snapshot_id = None
     else:
         raise RecoveryRejected(f"unknown snapshot source scope: {source_scope}")
-    frozen_sources = {
-        str(item["row"].get("vCommodityId") or item["row"].get("documentId") or "").strip()
-        for item in store.ordered_snapshot_items(snapshot_id)
-    }
+    frozen_sources: set[str] = set()
+    if snapshot_id is not None:
+        frozen_sources = {
+            str(item["row"].get("vCommodityId") or item["row"].get("documentId") or "").strip()
+            for item in store.ordered_snapshot_items(snapshot_id)
+        }
     process_lock = ProcessLock(lock_path)
     token = _acquire_recovery_lease(
         store,
@@ -736,6 +746,16 @@ def _existing_remote_harvest_core(
                 and is_priority_unconfirmed_manual_family(job)
             ):
                 raise RecoveryRejected("exact accepted priority evidence is required")
+
+        if source_scope == "prewarm_payload":
+            # Customer-prewarm provenance (Issue #13 Round 6): production-shape
+            # prewarm crawl work carries the payload's mapping source_id, so
+            # the fan-out gate below validates against the durable prewarm
+            # payload's own mapping sources instead of a STEP1 snapshot.
+            frozen_sources = {
+                str(request.mall_source_id or "").strip()
+                for request in prepared.requests
+            }
 
         crawls = store.crawl_work_for_job(int(remote_job_id))
         validate_linked_crawls_against_remote_payload(
@@ -976,3 +996,47 @@ def run_existing_remote_harvest(
         operation="existing harvest",
         attempt_headroom=1,
     )
+
+
+def harvest_existing_customer_prewarm_job(
+    *,
+    state_path: Path | str,
+    lock_path: Path | str,
+    business_date: str,
+    remote_job_id: int,
+    remote_identity: str,
+    adapter: CnncLegacyZhaoshangAdapter,
+    timeout_seconds: float = 180.0,
+) -> dict[str, Any]:
+    """Harvest ONE exact existing customer-prewarm remote job (Issue #13).
+
+    Cross-day lifecycle channel for the guarded manual recrawl: it targets
+    the exact ``(business_date, remote_job_id, remote_identity)`` triple and
+    runs the full shared harvest protocol — durable POST evidence, immutable
+    payload reconstruction and verification, ProcessLock + durable lease,
+    NO create channel, bounded wait/export, and the ordinary per-request
+    result backfill.  The ONLY difference from the STEP1 channels is source
+    provenance: linked-crawl ``source_id`` is validated against the durable
+    prewarm payload's own mapping sources (``mall_source_id``) instead of a
+    STEP1 snapshot fan-out, because customer-prewarm crawl work carries the
+    mapping source, not a snapshot document identity.
+    """
+    return {
+        **_existing_remote_harvest_core(
+            state_path=state_path,
+            lock_path=lock_path,
+            business_date=business_date,
+            remote_job_id=remote_job_id,
+            remote_identity=remote_identity,
+            adapter=adapter,
+            timeout_seconds=timeout_seconds,
+            admissible_states=frozenset({"SUBMITTED", "RUNNING", "EXPORTED"}),
+            allow_manual_requeue=False,
+            manual_requeue_diagnostics=frozenset(),
+            source_scope="prewarm_payload",
+            operation="customer prewarm harvest",
+            attempt_headroom=2,
+            live_identity_proof=None,
+        ),
+        "create_calls": 0,
+    }

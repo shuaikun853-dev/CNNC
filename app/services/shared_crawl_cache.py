@@ -60,6 +60,15 @@ class AliasConflictError(RuntimeError):
     """A (mall, url) already belongs to a different identity; fail-closed."""
 
 
+# ---- producer provenance constants (Issue #13 Round 2, single authority home) ----
+# 谁写入了这行成功证据。写入方从本模块导入这些常量,禁止在别处硬编码字符串。
+PRODUCER_DAILY_INTERNET = "daily-internet"
+PRODUCER_CUSTOMER_PREWARM_ZHAOSHANG = "customer-prewarm-zhaoshang"
+PRODUCER_STAPLES_LOCAL = "staples-local"
+PRODUCER_MANUAL_RECRAWL_STAPLES = "manual-recrawl-staples"
+PRODUCER_MANUAL_RECRAWL_ZHAOSHANG = "manual-recrawl-zhaoshang"
+
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS crawl_identities (
     id INTEGER PRIMARY KEY,
@@ -211,6 +220,16 @@ class SharedCrawlCache:
     def _initialize(self) -> None:
         with self._transaction(immediate=True) as connection:
             connection.executescript(_SCHEMA)
+            # Pure-addition migration (Issue #13 Round 2 producer provenance),
+            # mirroring customer_prewarm_store._initialize: check PRAGMA
+            # table_info, then ALTER TABLE; idempotent on every open.  Existing
+            # rows keep producer NULL; read-only opens never migrate.
+            result_columns = {
+                row["name"]
+                for row in connection.execute("PRAGMA table_info(crawl_results)")
+            }
+            if "producer" not in result_columns:
+                connection.execute("ALTER TABLE crawl_results ADD COLUMN producer TEXT")
 
     # ---- shared helpers ------------------------------------------------------
 
@@ -496,8 +515,15 @@ class SharedCrawlCache:
         succeeded_at: str | None = None,
         payload: Mapping[str, Any] | None = None,
         document_id: str | None = None,
+        producer: str | None = None,
     ) -> dict[str, Any]:
-        """Record one successful crawl as a new append-only evidence row."""
+        """Record one successful crawl as a new append-only evidence row.
+
+        ``producer`` (Issue #13 Round 2 provenance) records which writer
+        produced this row; use the module-level ``PRODUCER_*`` constants.
+        Legacy rows keep ``NULL`` (source-based classification stays the
+        documented fallback for them).
+        """
         self._assert_writable()
         mall_value = self._require_text(mall, "mall")
         submitted_value = self._require_text(submitted_url, "submitted_url")
@@ -545,6 +571,7 @@ class SharedCrawlCache:
         payload_json = self._canonical_json(dict(payload or {}))
         title_value = self._optional_text(title)
         document_value = self._optional_text(document_id)
+        producer_value = self._optional_text(producer)
         now = self._utcnow()
 
         with self._transaction(immediate=True) as connection:
@@ -591,8 +618,8 @@ class SharedCrawlCache:
                 """INSERT INTO crawl_results
                    (identity_id, mall, original_url, submitted_url, returned_url, canonical_url,
                     crawl_id, real_sku_id, sku_status, title, price, comment_count, source,
-                    payload_json, succeeded_at, created_at, is_current)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)""",
+                    payload_json, succeeded_at, created_at, producer, is_current)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)""",
                 (
                     identity_id,
                     mall_value,
@@ -610,6 +637,7 @@ class SharedCrawlCache:
                     payload_json,
                     succeeded_value,
                     now,
+                    producer_value,
                 ),
             )
             new_id = int(cursor.lastrowid)

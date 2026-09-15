@@ -73,7 +73,11 @@ from app.services.customer_prewarm_store import (
     CustomerPrewarmStore,
 )
 from app.services.customer_reference_links import extract_reference_links
-from app.services.shared_crawl_cache import AliasConflictError, SharedCrawlCache
+from app.services.shared_crawl_cache import (
+    PRODUCER_DAILY_INTERNET,
+    AliasConflictError,
+    SharedCrawlCache,
+)
 from scripts.zhaoshang_mall_mapping import ZhaoshangMallMapping
 
 DETAIL_BUDGET_RESERVE_SECONDS = 5.0
@@ -245,6 +249,7 @@ def process_document(
     mappings: Sequence[ZhaoshangMallMapping],
     detail_fetch: Callable[[str, str], Mapping[str, Any]],
     source: str = "detail",
+    business_date: str | None = None,
 ) -> dict[str, Any]:
     """Discover reference links of one document and resolve them against the cache.
 
@@ -257,10 +262,20 @@ def process_document(
     A document whose links hit per-link errors (e.g. sqlite busy) also stays
     retryable: it is recorded as a deferred failure instead of DONE, so the
     next pass re-processes it and the missing links are not lost.
+
+    ``business_date`` (Issue #13 Round 3) is the SCAN PASS's business date:
+    when provided it dates both the candidate first-seen of newly discovered
+    links and the daily observation of every link processed here; when
+    ``None`` the document's immutable first-seen ``business_date`` is used
+    (legacy callers).
     """
     document_id = str(document_row["document_id"])
     four_category_id = str(document_row.get("four_category_id") or "")
-    business_date = str(document_row["business_date"])
+    link_business_date = (
+        str(business_date)
+        if business_date is not None
+        else str(document_row["business_date"])
+    )
     try:
         response = detail_fetch(document_id, four_category_id)
     except Exception as exc:  # noqa: BLE001 - detail failure must never raise
@@ -288,7 +303,7 @@ def process_document(
                     mall=routed.mall,
                     lookup_url=routed.lookup_url,
                     routing_url=routed.routing_url,
-                    business_date=business_date,
+                    business_date=link_business_date,
                     source=source,
                 )
                 candidate_id = int(upsert["candidate"]["id"])
@@ -627,6 +642,15 @@ def sync_daily_internet_results(
             real_sku_id = None
             sku_status = SKU_STATUS_UNRESOLVED
         payload["request_sku_id"] = sku_value
+        # Issue #13 Round 2 provenance: a crawl row whose remote job is linked
+        # in the prewarm store was produced by the customer-prewarm dispatcher;
+        # everything else stays the plain daily-internet producer.
+        producer = (
+            prewarm_store.remote_job_producer(business_date, row["remote_job_id"])
+            if row["remote_job_id"] is not None
+            else None
+        )
+        effective_producer = producer or PRODUCER_DAILY_INTERNET
         try:
             row_out = shared_cache.record_success(
                 mall=mall_key,
@@ -638,6 +662,7 @@ def sync_daily_internet_results(
                 source=source,
                 succeeded_at=succeeded_at,
                 payload=payload,
+                producer=effective_producer,
             )
         except sqlite3.OperationalError:
             # 瞬时失败(库锁/繁忙):不记 ledger,下轮重试。
@@ -1023,6 +1048,10 @@ def run_prewarm_scan(
                 document_row,
                 mappings=mappings,
                 detail_fetch=detail_fetch,
+                # Issue #13 Round 3: the pass's business date (not the
+                # document's immutable first-seen day) dates the candidate
+                # first-seen of new links and the daily observation.
+                business_date=business_date,
             )
             documents_processed += 1
             if outcome.get("detail_ok"):

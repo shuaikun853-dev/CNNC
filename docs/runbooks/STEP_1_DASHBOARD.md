@@ -135,6 +135,33 @@ CLI 等价命令(与页面按钮走同一实现,供脚本/应急):
 `python scripts/incremental_price_audit.py reexport-existing-remote --remote-job-id N --remote-identity "mall|id|number"`
 `python scripts/incremental_price_audit.py rebuild-remote-task --remote-job-id N --remote-identity "mall|id|number"`
 
+## 客户预热面板(Issue #13,2026-09-14)
+
+- 页面:`/dashboard/prewarm`,独立的只读投影页(主看板之外)。按业务日期取数
+  (`?date=YYYY-MM-DD`,默认上海业务日),支持商城/SKU 状态等过滤;三库
+  (customer_prewarm、共享爬取缓存、当日 `state.sqlite3`)一律 `mode=ro` 只读。
+- **GET 零业务写契约**:summary/links/detail 等 GET 绝不修改三个库的内容与哈希;
+  WAL 库的只读连接可能物化瞬态 `-shm/-wal` 读辅助文件(SQLite 读端产物,
+  同 `customer_prewarm_discovery` 记录的现象),不是业务写、不是内容变化。
+- 受控 operator action(单 URL 手动重爬):`POST /dashboard/api/prewarm/links/{id}/recrawl`,
+  门禁同主操作台(本机 Host/Origin + 操作令牌),只接受精确候选 id 与期望
+  URL/状态(防陈旧)。按 URL 路由:史泰博 → 本机直接爬取;招商 → 派发单个
+  招商任务并提优 priority -1。返回 `202 + action_id`,以
+  `GET /dashboard/api/prewarm/recrawl-actions/{action_id}` 轮询生命周期:
+  `WAITING_REMOTE`(远端在途)/`PRIORITY_PENDING`(提优未证实,需人工重试)/
+  `SUCCEEDED`/`FAILED`。`SUCCEEDED` 仅当共享缓存出现 succeeded_at 晚于动作
+  开始、且 payload 的 (business_date, remote_job_id) 与本动作派发任务精确
+  一致的新 current 行(producer 仅诊断展示,跨日 REUSED 的 auto-pass producer
+  行同样算);远端任务终态 FAILED → 诚实 `FAILED`;派发本身绝不是成功。
+  同一 URL 非终态期间二次发起 → 409(`ACTION_IN_FLIGHT`)。跨日 REUSED
+  (复用更早业务日的未完成任务)时,动作 worker 即该任务的有界 lifecycle
+  owner——有界循环执行 prewarm 专属的既有生命周期收割原语
+  `harvest_existing_customer_prewarm_job`(共享 harvest core,溯源取自
+  durable prewarm payload 的 mapping source;零二次 POST,只写原业务日
+  state DB;普通 STEP1 手动重导出对这类任务保持 fail-closed——
+  `NO_SNAPSHOT_SCOPE`)+ 幂等镜像进共享缓存;预算耗尽保持
+  `WAITING_REMOTE` 并释放同 URL 锁,操作员再次点击即重新探测并重启该循环。
+
 ## 排障
 
 | 症状 | 含义 | 处理 |

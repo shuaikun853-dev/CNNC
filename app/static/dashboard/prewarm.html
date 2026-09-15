@@ -1,0 +1,108 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>客户链接预爬</title>
+<link rel="stylesheet" href="/dashboard/static/shell.css">
+<link rel="stylesheet" href="/dashboard/static/prewarm.css">
+<script src="/dashboard/static/prewarm.js" defer></script>
+</head>
+<body>
+<nav class="app-nav"><div class="wrap nav-inner"><a class="nav-link" href="/dashboard/">每日价格审计</a><a class="nav-link active" href="/dashboard/prewarm">客户链接预爬</a></div></nav>
+<div class="wrap" id="prewarm-root">
+
+<header class="page-header" data-testid="page-header">
+  <h1>客户链接预爬</h1>
+  <span class="pw-chip" id="pw-bizdate-chip">业务日期:—</span>
+  <input type="date" id="pw-date" aria-label="业务日期">
+  <span class="spacer"></span>
+  <button class="btn" id="pw-refresh">刷新</button>
+</header>
+
+<!-- 数据降级/接口未就绪横幅(仅在 degraded 或读取失败时显示) -->
+<div class="pw-degraded" id="pw-degraded" data-testid="degraded-banner" hidden></div>
+
+<!-- KPI 指标条(16 项,由 /dashboard/api/prewarm/summary 渲染) -->
+<section class="kpi-grid" id="pw-kpis" data-testid="kpi-strip" aria-label="预爬 KPI">
+  <div class="kpi-card"><div class="kpi-num">—</div><div class="kpi-label">加载中…</div></div>
+</section>
+
+<!-- 状态分布(原始 cache_status × 数量,来自 summary.kpi.status_distribution) -->
+<div class="pw-status-dist" id="pw-status-dist"></div>
+
+<!-- 筛选栏 -->
+<section class="card">
+  <div class="filter-bar" id="pw-filter-bar" data-testid="filter-bar">
+    <label>商城 <input type="text" id="pw-f-mall" placeholder="商城关键字" size="12"></label>
+    <label>状态
+      <select id="pw-f-status">
+        <option value="">全部</option>
+        <option value="PENDING_PREWARM">待预爬</option>
+        <option value="STAPLES_PENDING">史泰博预爬中</option>
+        <option value="REMOTE_DISPATCHED">招商局已派发</option>
+        <option value="REMOTE_REUSED">招商局复用中</option>
+        <option value="CACHE_HIT">缓存命中</option>
+        <option value="ROUTING_BLOCKED">路由受阻</option>
+        <option value="MANUAL_SKIP">人工跳过</option>
+      </select>
+    </label>
+    <label>来源
+      <select id="pw-f-source">
+        <option value="">全部</option>
+        <option value="daily-internet">每日互联网</option>
+        <option value="customer-prewarm-zhaoshang">招商局预爬</option>
+        <option value="staples-local-prewarm">史泰博本地预爬</option>
+        <option value="manual-recrawl">手动重爬</option>
+        <option value="other">其他</option>
+      </select>
+    </label>
+    <button type="button" class="chip-toggle" data-flag="missing_title">缺标题</button>
+    <button type="button" class="chip-toggle" data-flag="unverified_sku">URL解析未验证</button>
+    <button type="button" class="chip-toggle" data-flag="unresolved_sku">未解析SKU</button>
+    <button type="button" class="chip-toggle" data-flag="failure">失败</button>
+    <button type="button" class="chip-toggle" data-flag="cache_miss">未命中缓存</button>
+    <span class="spacer"></span>
+    <button class="btn" id="pw-apply">查询</button>
+  </div>
+</section>
+
+<!-- 候选链接表 -->
+<section class="card">
+  <table id="pw-links-table" data-testid="links-table">
+    <thead><tr><th>文档</th><th>商城</th><th>原始URL</th><th>状态</th><th>匹配</th><th>来源</th><th>标题</th><th class="num">价格</th><th>crawl_id</th><th>SKU</th><th>最近成功</th></tr></thead>
+    <tbody id="pw-links-body"></tbody>
+  </table>
+  <div class="empty-state" id="pw-links-empty" hidden>暂无数据</div>
+  <div class="pagination" id="pw-pagination" data-testid="pagination"></div>
+</section>
+
+<footer>客户链接预爬 · 数据来自本机 runtime 只读投影;仅人工重爬按钮触发受控写</footer>
+</div>
+
+<!-- 详情抽屉(固定右侧覆盖层,含遮罩) -->
+<div class="pw-backdrop" id="pw-backdrop" hidden></div>
+<aside class="drawer pw-drawer" id="pw-drawer" data-testid="link-drawer" aria-hidden="true">
+  <h3>链接详情 <button class="btn" style="float:right;padding:0 8px" id="pw-drawer-close">关闭</button></h3>
+  <div class="sec"><b class="pw-sec-title">基本信息</b><div class="kv" id="pw-d-basic"></div></div>
+  <div class="sec"><b class="pw-sec-title">URL 证据</b><div class="kv" id="pw-d-urls"></div></div>
+  <div class="sec"><b class="pw-sec-title">缓存当前结果</b><div class="kv" id="pw-d-current"></div></div>
+  <div class="sec"><b class="pw-sec-title">远端任务</b><div class="kv" id="pw-d-remote"></div></div>
+  <div class="sec"><b class="pw-sec-title">史泰博任务</b><div class="kv" id="pw-d-staples"></div></div>
+  <div class="sec"><b class="pw-sec-title">爬取历史(旧 → 新)</b>
+    <ul class="timeline" id="pw-history" data-testid="history-timeline"></ul></div>
+  <div class="sec"><b class="pw-sec-title">人工操作</b>
+    <div class="pw-recrawl">
+      <div class="pw-recrawl-cur" id="pw-recrawl-current"></div>
+      <div class="pw-recrawl-confirm" id="pw-recrawl-confirm" hidden>
+        <p class="pw-recrawl-facts" id="pw-recrawl-facts"></p>
+        <p class="pw-recrawl-hint" id="recrawl-route-hint"></p>
+        <button class="btn danger" id="pw-recrawl-btn" data-testid="recrawl-button">重新爬取此 URL</button>
+        <button class="btn" id="pw-recrawl-cancel">取消</button>
+      </div>
+      <div class="action-status" id="pw-recrawl-status"></div>
+    </div>
+  </div>
+</aside>
+</body>
+</html>
