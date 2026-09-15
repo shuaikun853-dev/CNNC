@@ -88,6 +88,8 @@ def _patch_login_env(monkeypatch, tmp_path, ctx):
             _FakeLoginProc(), _FakeLoginBrowser(ctx), _FakeLoginPlaywright()))
     monkeypatch.setattr(browser, "STORAGE_STATE",
                         tmp_path / "cnnc_auth_storage_state.json")
+    # 2026-09-15 起 mkdtemp 经 _make_browser_profile_dir 落 BROWSER_TMP_ROOT，指到 tmp_path 保证 hermetic（不写仓库 runtime/）
+    monkeypatch.setattr(browser, "BROWSER_TMP_ROOT", tmp_path / "browser_tmp")
     monkeypatch.setattr(browser.time, "sleep", lambda *_a, **_k: None)
     monkeypatch.setattr(browser.shutil, "rmtree", lambda *_a, **_k: None)
 

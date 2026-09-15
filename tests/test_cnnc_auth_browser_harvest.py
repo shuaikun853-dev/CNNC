@@ -263,6 +263,9 @@ def test_case17_cmd_harvest_removes_temp_profile_even_on_launch_failure(
     storage_state = tmp_path / "cnnc_auth_storage_state.json"
     storage_state.write_text(json.dumps({"cookies": []}), encoding="utf-8")
     monkeypatch.setattr(browser, "STORAGE_STATE", storage_state)
+    # 2026-09-15 起 mkdtemp 经 _make_browser_profile_dir 落 BROWSER_TMP_ROOT：
+    # 指到 tmp_path 保证 hermetic（不写仓库 runtime/、清扫不产生多余 rmtree 记录）
+    monkeypatch.setattr(browser, "BROWSER_TMP_ROOT", tmp_path / "browser_tmp")
 
     controlled = tmp_path / "controlled-harvest-profile"
     controlled.mkdir()
@@ -288,10 +291,16 @@ def test_case17_cmd_harvest_removes_temp_profile_even_on_launch_failure(
 
 
 def test_case17_cmd_harvest_source_never_touches_persistent_profile():
-    """源码级断言：cmd_harvest 只用 mkdtemp 临时 Profile + rmtree 清理。"""
+    """源码级断言：cmd_harvest 只用临时 Profile + rmtree 清理。
+
+    2026-09-15 起 mkdtemp 收敛进 _make_browser_profile_dir（E 盘
+    runtime/browser_tmp + 陈旧清扫，见 tests/test_cnnc_auth_browser_tmp_root.py），
+    本断言随之更新为"经由该辅助函数取临时 Profile"（非削弱：mkdtemp 落盘位置
+    与清扫语义由新文件专测）。
+    """
     source = inspect.getsource(browser.cmd_harvest)
     assert "PROFILE_DIR" not in source
-    assert "tempfile.mkdtemp" in source
+    assert "_make_browser_profile_dir(" in source
     assert "shutil.rmtree" in source
 
 
@@ -435,6 +444,9 @@ def test_case21_cmd_login_launches_ephemeral_profile_and_removes_it(
     monkeypatch.setattr(browser, "_launch_chrome_cdp", fake_launch)
     storage_state = tmp_path / "cnnc_auth_storage_state.json"
     monkeypatch.setattr(browser, "STORAGE_STATE", storage_state)
+    # 2026-09-15 起 mkdtemp 经 _make_browser_profile_dir 落 BROWSER_TMP_ROOT：
+    # 指到 tmp_path 保证 hermetic（真实 mkdtemp 落在 pytest tmp，不写仓库 runtime/）
+    monkeypatch.setattr(browser, "BROWSER_TMP_ROOT", tmp_path / "browser_tmp")
     monkeypatch.setattr(browser.time, "sleep", lambda *_a, **_k: None)
     rmtree_calls = []
 
@@ -468,6 +480,9 @@ def test_case21_cmd_login_removes_temp_profile_even_on_launch_failure(
     """
     controlled = tmp_path / "controlled-login-profile"
     controlled.mkdir()
+    # 2026-09-15 起 mkdtemp 经 _make_browser_profile_dir 落 BROWSER_TMP_ROOT：
+    # 指到 tmp_path 保证 hermetic（不写仓库 runtime/、清扫不产生多余 rmtree 记录）
+    monkeypatch.setattr(browser, "BROWSER_TMP_ROOT", tmp_path / "browser_tmp")
     monkeypatch.setattr(
         browser.tempfile, "mkdtemp", lambda *_a, **_k: str(controlled)
     )
@@ -490,10 +505,15 @@ def test_case21_cmd_login_removes_temp_profile_even_on_launch_failure(
 
 
 def test_case21_cmd_login_source_uses_ephemeral_profile():
-    """源码级断言：cmd_login 只用 mkdtemp 临时 Profile + rmtree 清理。"""
+    """源码级断言：cmd_login 只用临时 Profile + rmtree 清理。
+
+    2026-09-15 起 mkdtemp 收敛进 _make_browser_profile_dir（E 盘
+    runtime/browser_tmp + 陈旧清扫，见 tests/test_cnnc_auth_browser_tmp_root.py），
+    本断言随之更新为"经由该辅助函数取临时 Profile"（非削弱，理由同 Case 17）。
+    """
     source = inspect.getsource(browser.cmd_login)
     assert "PROFILE_DIR" not in source
-    assert "tempfile.mkdtemp" in source
+    assert "_make_browser_profile_dir(" in source
     assert "shutil.rmtree" in source
 
 
