@@ -95,6 +95,24 @@ def test_case22_sweep_failure_does_not_break_profile_creation(monkeypatch, tmp_p
     assert profile.is_dir()
 
 
+def test_case22_stale_login_dirs_swept(monkeypatch, tmp_path):
+    """cnnc_login_ 前缀的 >6 小时陈旧残留同样被清扫，新鲜目录保留（覆盖补全）。"""
+    root = tmp_path / "browser_tmp"
+    root.mkdir(parents=True)
+    monkeypatch.setattr(browser, "BROWSER_TMP_ROOT", root)
+    stale_login = root / "cnnc_login_stale"
+    stale_login.mkdir()
+    os.utime(stale_login, (time.time() - 7 * 3600,) * 2)
+    fresh_login = root / "cnnc_login_fresh"
+    fresh_login.mkdir()
+
+    profile = browser._make_browser_profile_dir("cnnc_login_")
+
+    assert not stale_login.exists()  # 陈旧 login 残留被清扫
+    assert fresh_login.exists()  # 新鲜 login 目录保留
+    assert profile.is_dir()
+
+
 # ------------------------------------------------- E 盘不可用回退
 
 
@@ -119,6 +137,31 @@ def test_case22_mkdir_failure_falls_back_to_system_temp(monkeypatch, tmp_path, c
     assert Path(profile) == tmp_path / "fallback-profile"
     assert "dir" not in seen  # 回退路径不带 dir=（用系统 TEMP）
     assert seen.get("prefix") == "cnnc_login_"
+    assert "WARN" in capsys.readouterr().err
+
+
+def test_case22_mkdir_ok_but_mkdtemp_with_dir_fails_falls_back_to_system_temp(
+        monkeypatch, tmp_path, capsys):
+    """BROWSER_TMP_ROOT 就绪但 mkdtemp(dir=...) 失败（如磁盘满）时也回退系统 TEMP。"""
+    root = tmp_path / "browser_tmp"
+    root.mkdir(parents=True, exist_ok=True)  # 真实 mkdir 成功，不 monkeypatch mkdir
+    monkeypatch.setattr(browser, "BROWSER_TMP_ROOT", root)
+    calls = {"with_dir": 0, "fallback_kwargs": None}
+
+    def fake_mkdtemp(*_args, **kwargs):
+        if "dir" in kwargs:
+            calls["with_dir"] += 1
+            raise OSError("simulated disk full")
+        calls["fallback_kwargs"] = dict(kwargs)
+        return str(tmp_path / "fallback-profile")  # 不真实落盘
+
+    monkeypatch.setattr(browser.tempfile, "mkdtemp", fake_mkdtemp)
+
+    profile = browser._make_browser_profile_dir("cnnc_login_")  # 不抛，正常返回
+
+    assert Path(profile) == tmp_path / "fallback-profile"
+    assert calls["with_dir"] == 1  # 带 dir= 的调用恰好发生一次
+    assert calls["fallback_kwargs"] == {"prefix": "cnnc_login_"}  # 回退不带 dir= 且 prefix 正确
     assert "WARN" in capsys.readouterr().err
 
 

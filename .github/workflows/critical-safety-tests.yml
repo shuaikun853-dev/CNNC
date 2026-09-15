@@ -139,6 +139,9 @@ jobs:
           tests/test_auth_manager.py
           tests/test_cnnc_auth_provider_autorenew.py
           tests/test_cnnc_auth_recover.py
+          tests/test_cnnc_auth_browser_harvest.py
+          tests/test_cnnc_auth_browser_login_autofill.py
+          tests/test_cnnc_auth_browser_tmp_root.py
           tests/test_legacy_zhaoshang_adapter.py
           tests/test_legacy_adapter_progress_stop.py
           tests/test_zhaoshang_mall_mapping_aliases.py

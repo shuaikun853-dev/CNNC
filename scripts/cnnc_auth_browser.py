@@ -356,7 +356,9 @@ def _make_browser_profile_dir(prefix):
     2. 顺带清扫根目录下超过 STALE_BROWSER_TMP_MAX_AGE_SECONDS 的
        cnnc_login_/cnnc_harvest_ 陈旧残留：进程被硬杀时 finally rmtree 走不到，
        残留只能靠下一次启动自愈回收；整个清扫吞一切异常、绝不影响返回；
-    3. 返回 Path(tempfile.mkdtemp(prefix, dir=BROWSER_TMP_ROOT))。
+    3. 返回 Path(tempfile.mkdtemp(prefix, dir=BROWSER_TMP_ROOT))；这一步若也
+       抛 OSError（如 BROWSER_TMP_ROOT 所在盘满了），同样打一行 WARN 回退
+       系统 TEMP mkdtemp，系统 TEMP 再失败则异常自然抛出。
     """
     try:
         BROWSER_TMP_ROOT.mkdir(parents=True, exist_ok=True)
@@ -377,7 +379,12 @@ def _make_browser_profile_dir(prefix):
                 pass
     except Exception:
         pass
-    return Path(tempfile.mkdtemp(prefix=prefix, dir=str(BROWSER_TMP_ROOT)))
+    try:
+        return Path(tempfile.mkdtemp(prefix=prefix, dir=str(BROWSER_TMP_ROOT)))
+    except OSError:
+        print("WARN：BROWSER_TMP_ROOT 下创建 Profile 失败，本次回退系统 TEMP: %s"
+              % BROWSER_TMP_ROOT, file=sys.stderr)
+        return Path(tempfile.mkdtemp(prefix=prefix))
 
 
 def cmd_login(args):

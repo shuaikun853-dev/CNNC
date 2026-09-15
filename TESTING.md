@@ -51,7 +51,7 @@ python -m pytest tests\test_zhaoshang_priority_boost.py tests\test_zhaoshang_res
 
 # 旧诊断和工作流安全边界
 python -m pytest tests\test_safety_guard.py tests\test_scope_guard.py tests\test_workflow_scope_guard.py -q
-python -m pytest tests\test_cnnc_auth_browser_harvest.py tests\test_cnnc_auth_browser_tmp_root.py -q  # CNNC 认证浏览器一次性临时 Profile 落 E 盘 runtime/browser_tmp + 启动清扫陈旧残留（2026-09-15 C 盘满事故回归）
+python -m pytest tests\test_cnnc_auth_browser_harvest.py tests\test_cnnc_auth_browser_login_autofill.py tests\test_cnnc_auth_browser_tmp_root.py -q  # CNNC 认证浏览器一次性临时 Profile 落仓库 runtime/browser_tmp（生产 checkout 在 E 盘；runtime 根不可用时回退系统 TEMP 保认证）+ 启动清扫陈旧残留（2026-09-15 C 盘满事故回归）
 
 # 上下文文档体积、链接和必备规则
 python -m pytest tests\test_context_documents.py -q
