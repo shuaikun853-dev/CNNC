@@ -76,6 +76,9 @@ CURL_BACKUP_KEEP = 5
 
 # SSO 断路器：harvest 失败（SSO 会话失效）后的冷却窗口，避免每个 tick 都弹浏览器。
 SSO_RETRY_COOLDOWN_SECONDS = 900.0
+# deadline 断路器：refresh 超时（AUTH_REFRESH_DEADLINE_EXCEEDED）多为门户 302 链
+# 瞬态停滞，冷却 240 秒防止轮换窗口内每分钟重复开浏览器（对比 SSO 失效需人工重登故 900 秒）。
+DEADLINE_RETRY_COOLDOWN_SECONDS = 240.0
 # preflight 缓存窗口：verify 通过后 6 小时内不再发网络验证请求。
 PREFLIGHT_MAX_VERIFY_AGE_SECONDS = 6 * 3600.0
 
@@ -588,6 +591,11 @@ class CnncAuthProvider:
         距今仍在冷却窗口内时，直接抛 CnncAuthError(SSO_LOGIN_REQUIRED)，不
         harvest（避免每 tick 弹浏览器）。``force=True`` 跳过冷却（人工显式重试）。
 
+        deadline 冷却断路器与之对称：上次失败于 AUTH_REFRESH_DEADLINE_EXCEEDED
+        且 ``last_failure_at`` 距今不足 4 分钟时，同样直接抛
+        CnncAuthError(AUTH_REFRESH_DEADLINE_EXCEEDED)，不 harvest（门户 302 链
+        瞬态停滞窗口内避免每分钟重复开浏览器）。
+
         deadline 契约（absolute deadline）：``deadline_monotonic`` 为
         ``time.monotonic()`` 基准的绝对截止时刻。入口已过期立即抛
         AUTH_REFRESH_DEADLINE_EXCEEDED（不做任何动作）；进程锁等待与
@@ -615,6 +623,14 @@ class CnncAuthProvider:
                 raise CnncAuthError(
                     CnncAuthStatus.SSO_LOGIN_REQUIRED,
                     "SSO 冷却中，跳过刷新（15 分钟内已失败）",
+                )
+            if (
+                not force
+                and self._deadline_cooldown_remaining_seconds(state) > 0.0
+            ):
+                raise CnncAuthError(
+                    CnncAuthStatus.AUTH_REFRESH_DEADLINE_EXCEEDED,
+                    "deadline 冷却中，跳过刷新（4 分钟内 harvest 已超时，force 可绕过）",
                 )
             try:
                 remaining = self._remaining_seconds(deadline_monotonic)
@@ -727,6 +743,28 @@ class CnncAuthProvider:
             return 0.0  # 解析失败/旧 state 无该字段：视为已过期，不拦截
         return max(0.0, SSO_RETRY_COOLDOWN_SECONDS - (time.time() - epoch))
 
+    def _deadline_cooldown_remaining_seconds(
+        self, state: dict[str, Any] | None = None
+    ) -> float:
+        """当前 deadline 刷新冷却剩余秒数（自 state.last_failure_at 起算）；无冷却为 0。
+
+        与 SSO 冷却断路器对称：last_status 为 AUTH_REFRESH_DEADLINE_EXCEEDED 且
+        ``last_failure_at`` 距今不足 DEADLINE_RETRY_COOLDOWN_SECONDS 时生效
+        （超时多为门户 302 链瞬态停滞，短窗口防止轮换期内每分钟重复开浏览器）。
+        旧 state 无 last_failure_at 或解析失败 → 视为冷却已过期，不拦截（与
+        SSO 冷却的过渡兼容语义一致）。
+        """
+        state = state if state is not None else self._read_state()
+        if (
+            str((state or {}).get("last_status") or "").strip()
+            != CnncAuthStatus.AUTH_REFRESH_DEADLINE_EXCEEDED
+        ):
+            return 0.0
+        epoch = _iso_to_epoch(str((state or {}).get("last_failure_at") or ""))
+        if epoch is None:
+            return 0.0  # 解析失败/旧 state 无该字段：视为已过期，不拦截
+        return max(0.0, DEADLINE_RETRY_COOLDOWN_SECONDS - (time.time() - epoch))
+
     def preflight_check(self) -> str:
         """发现/任务前的轻量预检：返回状态字符串，绝不抛异常，默认不弹浏览器。
 
@@ -755,6 +793,8 @@ class CnncAuthProvider:
                 state = self._read_state()
             if self._sso_cooldown_remaining_seconds(state) > 0.0:
                 return CnncAuthStatus.SSO_LOGIN_REQUIRED
+            if self._deadline_cooldown_remaining_seconds(state) > 0.0:
+                return CnncAuthStatus.AUTH_REFRESH_DEADLINE_EXCEEDED
             last_status = str((state or {}).get("last_status") or "").strip()
             verify_epoch = _iso_to_epoch(str((state or {}).get("last_verify_at") or ""))
             if (

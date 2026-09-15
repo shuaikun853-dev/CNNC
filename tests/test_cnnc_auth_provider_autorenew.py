@@ -20,6 +20,9 @@
   _default_harvest 解析 stdout 的 OC=/AT= 两行
 - R2 Case 20-23：_default_harvest 重试预算衰减 / preflight lazy 契约 /
   login_required 覆盖 LOGIN_RECOVERY_FAILED（后端）/ WAF 412 落失败状态
+- Case 24 deadline 冷却断路器（与 SSO 冷却对称）：冷却期内 refresh 不
+  harvest 直接抛 DEADLINE、过期恢复刷新并清空 last_failure_at、force 绕过、
+  preflight 返回 DEADLINE、SSO 冷却仍独立生效
 
 注入契约：provider 恒以 ``harvest_func(timeout_seconds=...)`` 关键字调用，
 所有 fake harvest 均须接受该关键字参数；返回 ``str``（仅 OC）或
@@ -935,3 +938,127 @@ def test_case23_waf_412_records_failure_state_without_touching_at(tmp_path):
     assert state["access_token"] == OLD_AT  # _failure_mutator 不触碰凭证
     assert provider._sso_cooldown_remaining_seconds() == 0.0  # 不触发 SSO 冷却
     assert calls["harvest"] == 0  # 不刷新
+
+
+# --------------------------------------------------------------------- Case 24
+
+
+def test_case24_deadline_cooldown_blocks_refresh_without_harvest(tmp_path):
+    """deadline 冷却期内 refresh 直接抛 DEADLINE，不再 harvest（不弹浏览器）。
+
+    生产现象回归：30s 紧预算 lazy 刷新在门户 302 链停滞窗口内连续超时，
+    每分钟的业务调用各自再开一次真 Chrome。DEADLINE 失败已由
+    _failure_mutator 落盘（last_status + last_failure_at），冷却断路器
+    消费该状态：240 秒窗口内直接拦截。
+    """
+    state_path, _ledger_path = _auth_paths(tmp_path)
+    _write_state(
+        state_path,
+        access_token=OLD_AT,
+        last_status=CnncAuthStatus.AUTH_REFRESH_DEADLINE_EXCEEDED,
+        last_failure_at=_now_iso(),
+    )
+    harvest_calls = []
+
+    def harvest(timeout_seconds=180):
+        harvest_calls.append("harvest")
+        return "OC-X"
+
+    provider, _calls = _make_provider(tmp_path, harvest=harvest)
+
+    with pytest.raises(CnncAuthError) as cooldown_exc:
+        provider.refresh()
+
+    assert (
+        cooldown_exc.value.status == CnncAuthStatus.AUTH_REFRESH_DEADLINE_EXCEEDED
+    )
+    assert harvest_calls == []  # 冷却期绝不触发 harvest（不开浏览器）
+
+
+def test_case24_deadline_cooldown_expires_and_success_clears_failure_at(tmp_path):
+    """last_failure_at 拨回 250 秒前（>240 秒窗口）→ 冷却过期，照常刷新。
+
+    成功发布后 last_failure_at 清空（解除冷却），与 SSO 冷却现状语义一致。
+    """
+    state_path, _ledger_path = _auth_paths(tmp_path)
+    _write_state(
+        state_path,
+        access_token=OLD_AT,
+        last_status=CnncAuthStatus.AUTH_REFRESH_DEADLINE_EXCEEDED,
+        last_failure_at=(
+            datetime.now(timezone.utc) - timedelta(seconds=250)
+        ).isoformat(),
+    )
+    provider, calls = _make_provider(tmp_path)  # 注入成功 harvest/exchange/verify
+
+    at = provider.refresh()
+
+    assert at == NEW_AT
+    assert calls["harvest"] == 1
+    state = _read_state(state_path)
+    assert state["access_token"] == NEW_AT
+    assert state["last_status"] == CnncAuthStatus.REFRESHED
+    assert state["last_failure_at"] == ""  # 成功清空失败时刻，解除冷却
+
+
+def test_case24_force_bypasses_deadline_cooldown(tmp_path):
+    """force=True 绕过 deadline 冷却（人工显式重试），与 SSO 冷却语义对称。"""
+    state_path, _ledger_path = _auth_paths(tmp_path)
+    _write_state(
+        state_path,
+        access_token=OLD_AT,
+        last_status=CnncAuthStatus.AUTH_REFRESH_DEADLINE_EXCEEDED,
+        last_failure_at=_now_iso(),
+    )
+    provider, calls = _make_provider(tmp_path)
+
+    at = provider.refresh(force=True)
+
+    assert at == NEW_AT
+    assert calls["harvest"] == 1
+
+
+def test_case24_preflight_returns_deadline_status_during_cooldown(tmp_path):
+    """preflight 在 deadline 冷却期返回 DEADLINE，不做 verify/任何动作。"""
+    state_path, _ledger_path = _auth_paths(tmp_path)
+    _write_state(
+        state_path,
+        access_token=OLD_AT,
+        last_status=CnncAuthStatus.AUTH_REFRESH_DEADLINE_EXCEEDED,
+        last_failure_at=_now_iso(),
+    )
+    provider, calls = _make_provider(tmp_path)
+
+    result = provider.preflight_check()
+
+    assert result == CnncAuthStatus.AUTH_REFRESH_DEADLINE_EXCEEDED
+    assert calls["verify"] == 0  # 冷却期短路，不做网络验证
+    assert calls["harvest"] == 0
+    state = _read_state(state_path)
+    assert state["access_token"] == OLD_AT  # 预检不动凭证
+
+
+def test_case24_sso_cooldown_independent_of_deadline_cooldown(tmp_path):
+    """回归守护：last_status=SSO_LOGIN_REQUIRED 时 SSO 冷却照常生效，且
+    deadline 冷却不受其影响（两种断路器互不串扰）。"""
+    state_path, _ledger_path = _auth_paths(tmp_path)
+    _write_state(
+        state_path,
+        access_token=OLD_AT,
+        last_status=CnncAuthStatus.SSO_LOGIN_REQUIRED,
+        last_failure_at=_now_iso(),
+    )
+    harvest_calls = []
+
+    def harvest(timeout_seconds=180):
+        harvest_calls.append("harvest")
+        return "OC-X"
+
+    provider, _calls = _make_provider(tmp_path, harvest=harvest)
+
+    assert provider._deadline_cooldown_remaining_seconds() == 0.0
+    with pytest.raises(CnncAuthError) as cooldown_exc:
+        provider.refresh()
+
+    assert cooldown_exc.value.status == CnncAuthStatus.SSO_LOGIN_REQUIRED
+    assert harvest_calls == []  # SSO 冷却自身拦截，不 harvest
