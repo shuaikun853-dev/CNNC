@@ -62,6 +62,27 @@ that re-crawls EXACTLY ONE prewarm link URL:
   eventual remote-side sync owns the new row.  Poll-driven only (no
   background thread); evaluation never raises.
 
+  Cross-day continuation (Issue #13 blocker B): when dispatch REUSED an
+  UNFINISHED remote job from an EARLIER business day (``cross_day=True`` +
+  ``job_business_date=D1``), NO scheduled component owns D1's lifecycle any
+  more (the scan/STEP1 pass only processes its own day's state DB and the
+  dispatch pass explicitly skips cross-day candidates), so the action's own
+  worker becomes the bounded lifecycle owner: a bounded loop of the
+  EXISTING ``run_manual_reexport`` lifecycle harvest (read-only preflight +
+  shared harvest core, ``create_calls=0`` — never a second POST — writing
+  only D1's own state DB under D1's day lock + lease) followed by the
+  idempotent ``sync_daily_internet_results`` (ledger-guarded) mirroring
+  D1's successful crawl rows into the shared crawl cache, then a locked
+  re-evaluation through the ordinary lazy-completion proofs (terminal
+  FAILED → FAILED; exact ``(business_date, remote_job_id)`` cache
+  correlation → SUCCEEDED).  When the attempt budget runs out the action
+  stays honestly WAITING_REMOTE (the remote job may genuinely still be
+  running; whitelisted diagnostics land in ``outcome["cross_day_harvest"]``)
+  and a further operator click re-probes (no duplicate POST) and restarts
+  the bounded loop.  All cross-day imports stay lazy INSIDE this path, so
+  the §44 isolation list (STEP2 / STEP3 / closeout / push / workflows) is
+  unaffected.
+
   Candidate ``cache_status`` is never written on either route.
 
 Guards run synchronously in :meth:`ManualRecrawlRunner.start` and fail closed
@@ -181,6 +202,11 @@ class ManualRecrawlRunner:
         dispatch_exact: Callable[..., dict[str, Any]] | None = None,
         mappings_loader: Callable[[], list] | None = None,
         sleeper: Callable[[float], None] | None = None,
+        reexport: Callable[..., dict[str, Any]] | None = None,
+        adapter_factory: Callable[[], Any] | None = None,
+        cross_day_max_attempts: int = 20,
+        cross_day_interval_seconds: float = 60.0,
+        cross_day_reexport_timeout_seconds: float = 180.0,
     ) -> None:
         self.runtime_root = (
             Path(runtime_root) if runtime_root is not None else Path(DEFAULT_RUNTIME_ROOT)
@@ -189,6 +215,16 @@ class ManualRecrawlRunner:
         self._dispatch_exact = dispatch_exact
         self._mappings_loader = mappings_loader or load_zhaoshang_mall_mappings
         self._sleeper = sleeper
+        # Cross-day lifecycle ownership (Issue #13 blocker B): defaults lazily
+        # wire the real dashboard re-export / legacy adapter inside the
+        # cross-day path only (never at construction, never on same-day actions).
+        self._reexport = reexport
+        self._adapter_factory = adapter_factory
+        self._cross_day_max_attempts = int(cross_day_max_attempts)
+        self._cross_day_interval_seconds = float(cross_day_interval_seconds)
+        self._cross_day_reexport_timeout_seconds = float(
+            cross_day_reexport_timeout_seconds
+        )
         self._lock = threading.Lock()
         self._actions: dict[str, dict[str, Any]] = {}
         self._inflight: dict[tuple[str, str], str] = {}
@@ -338,6 +374,24 @@ class ManualRecrawlRunner:
         except Exception as exc:  # noqa: BLE001 - API-facing catch-all, no traceback
             status = "FAILED"
             outcome_summary = {"outcome": "ERROR", "error": f"{type(exc).__name__}: {exc}"}
+        # Cross-day continuation (Issue #13 blocker B): a REUSED dispatch of
+        # an EARLIER day's unfinished job leaves NO other component owning
+        # that day's lifecycle — the action worker becomes the bounded
+        # lifecycle owner (harvest + idempotent sync + locked re-evaluation)
+        # until a terminal proof or the attempt budget runs out.  Same-day
+        # actions take the ORIGINAL tail below, byte-for-byte unchanged.
+        if status == "WAITING_REMOTE" and self._outcome_is_cross_day(outcome_summary):
+            with self._lock:
+                handle["status"] = status
+                handle["outcome"] = outcome_summary
+            self._run_cross_day_lifecycle(handle)
+            with self._lock:
+                if handle.get("finished_at") is None:
+                    handle["finished_at"] = _utcnow_iso()
+                if handle.get("status") != "WAITING_REMOTE":
+                    self._release_inflight_locked(handle)
+            self._append_log(self._log_record(handle, "finished"))
+            return
         with self._lock:
             handle["status"] = status
             handle["outcome"] = outcome_summary
@@ -361,6 +415,157 @@ class ManualRecrawlRunner:
         key = (handle["route"], handle["original_url"])
         if self._inflight.get(key) == handle["action_id"]:
             del self._inflight[key]
+
+    # ---- cross-day lifecycle ownership (Issue #13 blocker B) ---------------------
+
+    @staticmethod
+    def _outcome_is_cross_day(outcome: dict[str, Any] | None) -> bool:
+        """True only when the dispatch summary proves a cross-day REUSED job
+        (``cross_day is True`` always travels with ``job_business_date``)."""
+        dispatch = (outcome or {}).get("dispatch") if isinstance(outcome, dict) else None
+        return isinstance(dispatch, dict) and dispatch.get("cross_day") is True
+
+    def _cross_day_reexport_fn(self) -> Callable[..., dict[str, Any]]:
+        """Injected re-export seam, else the real ``run_manual_reexport``
+        (lazy import inside the cross-day path only)."""
+        if self._reexport is not None:
+            return self._reexport
+        from app.services.dashboard_manual_ops import run_manual_reexport
+
+        return run_manual_reexport
+
+    def _cross_day_adapter(self) -> Any:
+        """Injected adapter factory, else the real legacy adapter built on the
+        runner's mappings (lazy import inside the cross-day path only)."""
+        if self._adapter_factory is not None:
+            return self._adapter_factory()
+        from app.services.legacy_zhaoshang_adapter import CnncLegacyZhaoshangAdapter
+
+        return CnncLegacyZhaoshangAdapter(mappings=list(self._mappings_loader()))
+
+    def _run_cross_day_lifecycle(self, handle: dict[str, Any]) -> None:
+        """Bounded lifecycle owner for a REUSED remote job of an EARLIER day.
+
+        The dispatch result is the live contract: ``job_business_date`` (D1),
+        ``remote_job_id`` and ``remote_identity`` pin the EXACT ``(date, id,
+        identity)`` triple — every operation below targets D1's OWN state DB
+        and D1's day lock/lease through ``runtime_paths(job_business_date,
+        runtime_root)``, never the action day's DB and never a bare job id.
+        A missing reference returns silently (the action stays as the
+        dispatch classification left it).
+
+        Each bounded attempt: sleep, then the EXISTING
+        ``run_manual_reexport`` lifecycle harvest against D1 (read-only
+        preflight + shared harvest core; ``create_calls`` is always 0 — there
+        is no create channel, so a re-click can never fabricate a duplicate
+        remote task), then the UNCONDITIONAL idempotent
+        ``sync_daily_internet_results`` (ledger-guarded; re-running is safe)
+        mirroring D1's successful crawl rows into the shared cache, then a
+        locked re-evaluation through the ordinary lazy-completion proofs
+        (terminal FAILED → FAILED; exact ``(business_date, remote_job_id)``
+        cache correlation → SUCCEEDED).  Re-export outcomes (including
+        ``REEXPORT_REJECTED`` / ``REEXPORT_STILL_RUNNING`` / ``REEXPORT_MANUAL``)
+        are diagnostics only — they never remap the state machine.
+
+        When the attempt budget runs out the action stays honestly
+        ``WAITING_REMOTE`` (the remote job may genuinely still be running; a
+        budget expiry must never fabricate a FAILED) with a whitelisted
+        ``outcome["cross_day_harvest"]`` diagnostic; a further operator click
+        re-probes through dispatch (no duplicate POST) and restarts this
+        bounded loop.
+        """
+        dispatch = (handle.get("outcome") or {}).get("dispatch")
+        if not isinstance(dispatch, dict):
+            return
+        raw_job_id = dispatch.get("remote_job_id")
+        job_business_date = str(dispatch.get("job_business_date") or "")
+        remote_identity = str(dispatch.get("remote_identity") or "")
+        if raw_job_id is None or not job_business_date or not remote_identity:
+            return
+        try:
+            remote_job_id = int(raw_job_id)
+        except (TypeError, ValueError):
+            return
+
+        # Lazy imports stay INSIDE the cross-day path: the worker still never
+        # imports any closeout / STEP2 / STEP3 / push module (§44 isolation).
+        from app.services.incremental_audit_runtime import runtime_paths
+
+        paths = runtime_paths(job_business_date, self.runtime_root)
+        prewarm_db = Path(self.runtime_root) / PREWARM_STORE_NAME
+        cache_db = Path(self.runtime_root) / SHARED_CACHE_NAME
+        sleep = self._sleeper or time.sleep
+
+        attempts = 0
+        last_reexport_outcome = ""
+        last_reexport_error_code: str | None = None
+        last_sync_ok_synced = 0
+        while attempts < self._cross_day_max_attempts:
+            with self._lock:
+                if handle.get("status") != "WAITING_REMOTE":
+                    break
+            sleep(self._cross_day_interval_seconds)
+            attempts += 1
+
+            # 1) bounded harvest of the JOB's own day (create_calls == 0).
+            try:
+                reexport_result = self._cross_day_reexport_fn()(
+                    state_path=paths.state_path,
+                    lock_path=paths.lock_path,
+                    business_date=job_business_date,
+                    remote_job_id=remote_job_id,
+                    remote_identity=remote_identity,
+                    adapter=self._cross_day_adapter(),
+                    timeout_seconds=self._cross_day_reexport_timeout_seconds,
+                )
+                if isinstance(reexport_result, dict):
+                    last_reexport_outcome = str(reexport_result.get("outcome") or "")
+                    error_code = reexport_result.get("error_code")
+                    last_reexport_error_code = (
+                        str(error_code) if error_code is not None else None
+                    )
+            except Exception as exc:  # noqa: BLE001 - harvest errors are diagnostics only
+                last_reexport_outcome = "REEXPORT_ERROR"
+                last_reexport_error_code = type(exc).__name__
+
+            # 2) unconditional idempotent mirror of the job day into the
+            #    shared cache (ledger-guarded; safe to re-run every attempt).
+            try:
+                from app.services.customer_prewarm_discovery import (
+                    sync_daily_internet_results,
+                )
+                from app.services.shared_crawl_cache import SharedCrawlCache
+
+                sync_summary = sync_daily_internet_results(
+                    CustomerPrewarmStore(prewarm_db),
+                    SharedCrawlCache(cache_db),
+                    state_db_path=paths.state_path,
+                    business_date=job_business_date,
+                )
+                last_sync_ok_synced = int(
+                    (sync_summary or {}).get("ok_synced") or 0
+                )
+            except Exception:  # noqa: BLE001 - sync failure keeps the loop honest
+                pass
+
+            # 3) locked re-evaluation: the existing D9/G2 lazy-completion
+            #    proofs decide (terminal FAILED → FAILED; exact cache
+            #    correlation → SUCCEEDED).  Never raises.
+            with self._lock:
+                if handle.get("status") == "WAITING_REMOTE":
+                    self._evaluate_waiting_remote_locked(handle)
+
+        # Whitelisted diagnostics only.  WAITING_REMOTE stays honest on
+        # budget exhaustion — no state flip here.
+        with self._lock:
+            outcome = dict(handle.get("outcome") or {})
+            outcome["cross_day_harvest"] = {
+                "attempts": attempts,
+                "last_reexport_outcome": last_reexport_outcome,
+                "last_reexport_error_code": last_reexport_error_code,
+                "last_sync_ok_synced": last_sync_ok_synced,
+            }
+            handle["outcome"] = outcome
 
     def _run_staples_action(self, handle: dict[str, Any]) -> tuple[str, dict[str, Any]]:
         """Local crawl of the exact URL; on success one cache write, else none.

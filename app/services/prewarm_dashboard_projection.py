@@ -32,14 +32,19 @@ the transparent unit as ``scope`` = ``{"business_date", ...,
 "candidate_count_in_scope"}``.
 
 Remote job resolution (B2): per candidate the linkage row
-(``prewarm_remote_job_links``, latest ``recorded_at`` among the rows dated
-ON OR BEFORE the viewed business date — a linkage dated after the viewed
-day never projects) pins the job to ITS business date, and the job row is
-read from that date's ``runtime_root/<date>/state.sqlite3``; a legacy
-candidate without linkage falls back to the candidate's OWN first-seen
-date.  Job ids collide across dates, so jobs are keyed by
-``(business_date, job_id)`` — the selected date's DB is NEVER queried by
-bare integer id.
+(``prewarm_remote_job_links``, dated ON OR BEFORE the viewed business date —
+a linkage dated after the viewed day never projects) pins the job to ITS
+business date, and the job row is read from that date's
+``runtime_root/<date>/state.sqlite3``.  Among the qualifying rows the MAX
+``business_date`` wins first; only inside that newest business day does
+``recorded_at`` (then rowid) pick the row — a wall-clock refresh of an
+older day's linkage never out-ranks the newest business day (this ordering
+deliberately diverges from the store's ``remote_job_link_for_candidate``,
+whose global ``recorded_at`` ordering serves dispatch's duplicate-create
+detection).  A legacy candidate without linkage falls back to the
+candidate's OWN first-seen date.  Job ids collide across dates, so jobs are
+keyed by ``(business_date, job_id)`` — the selected date's DB is NEVER
+queried by bare integer id.
 
 Cache current-row resolution (Review Round 2, B1): identity is ``mall + URL``
 (parent #6).  ``resolved_identity_id`` → the ``crawl_results`` row with
@@ -564,10 +569,15 @@ def _load_remote_job_links(
 ) -> dict[int, dict[str, Any]]:
     """candidate_id → latest linkage row dated ON OR BEFORE the viewed
     business date (ISO ``YYYY-MM-DD`` compares lexicographically, so the
-    string ``<=`` is the date comparison); among the qualifying rows, max
-    ``recorded_at`` with tie-break max ``rowid`` — the same ordering the
-    store's own ``remote_job_link_for_candidate`` uses.  A linkage dated
-    AFTER the viewed day never projects (no future-date leakage).
+    string ``<=`` is the date comparison); among the qualifying rows the MAX
+    ``business_date`` wins FIRST (ISO date order), and only inside that
+    newest business day does max ``recorded_at`` (tie-break max ``rowid``)
+    pick the row.  A linkage dated AFTER the viewed day never projects (no
+    future-date leakage).  This ordering deliberately DIVERGES from the
+    store's ``remote_job_link_for_candidate`` (global ``recorded_at``
+    ordering, which serves dispatch's duplicate-create detection): the
+    projection pins the job to the candidate's NEWEST business day so a
+    wall-clock refresh of an older day's linkage can never out-rank it.
 
     Missing linkage table (legacy store) → no linkage at all, without a
     degraded note — the per-candidate legacy fallback then applies.
@@ -580,7 +590,7 @@ def _load_remote_job_links(
             f"""SELECT candidate_id, business_date, remote_job_id
                 FROM prewarm_remote_job_links
                 WHERE candidate_id IN ({placeholders}) AND business_date <= ?
-                ORDER BY recorded_at, rowid""",
+                ORDER BY business_date, recorded_at, rowid""",
             [int(candidate_id) for candidate_id in candidate_ids]
             + [str(view["business_date"])],
         ).fetchall()

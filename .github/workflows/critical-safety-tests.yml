@@ -158,5 +158,6 @@ jobs:
           tests/test_prewarm_dashboard_api.py
           tests/test_prewarm_page_smoke.py
           tests/test_prewarm_round2_infra.py
+          tests/test_prewarm_cross_day_lifecycle.py
           --deselect "tests/test_remote_running_recovery.py::test_default_dependencies_wire_probe_and_write_gated_restart"
           -q -l --timeout=600 --timeout-method=thread

@@ -939,6 +939,70 @@ def test_no_future_linkage_leak(tmp_path):
     assert detail_d1b["remote_job"]["state"] == "RUNNING"
 
 
+def test_latest_business_date_linkage_wins_over_refreshed_recorded_at(tmp_path):
+    """Among the linkage rows dated ON OR BEFORE the viewed day the MAX
+    business date must win first (then recorded_at, rowid INSIDE that day):
+    a late wall-clock refresh of an OLDER day's linkage never out-ranks the
+    newest business day's linkage."""
+    runtime_root = tmp_path / "runtime"
+    runtime_root.mkdir()
+    prewarm = CustomerPrewarmStore(runtime_root / "customer_prewarm.sqlite3")
+    SharedCrawlCache(runtime_root / "shared_crawl_cache.sqlite3")  # every store exists
+    StaplesPrewarmStore(runtime_root / "customer_prewarm.sqlite3")
+    day1_task = "cnnc_current_opt_mallx_d1_17"
+    day2_task = "cnnc_current_opt_mallx_d2_31"
+    _make_state_db(runtime_root, jobs=[(17, "RUNNING")],
+                   business_date=BUSINESS_DATE, task_names={17: day1_task})
+    _make_state_db(runtime_root, jobs=[(31, "RUNNING")],
+                   business_date=DAY_2, task_names={31: day2_task})
+
+    url = "https://qx.com/late-refresh.html"
+    upserted = prewarm.upsert_link("DOC-R", url, mall="comix", business_date=BUSINESS_DATE)
+    candidate_id = int(upserted["candidate"]["id"])
+    prewarm.record_candidate_result(candidate_id, cache_status=CACHE_STATUS_PENDING_PREWARM)
+    prewarm.record_candidate_result(
+        candidate_id, cache_status=CACHE_STATUS_REMOTE_DISPATCHED, remote_job_id=17
+    )
+    # Same candidate observed again on Day 2 (so both views are in scope).
+    prewarm.record_daily_observation(DAY_2, candidate_id, "DOC-R", url)
+
+    # Natural wall-clock order: the D1 linkage recorded BEFORE the D2 one.
+    prewarm.record_remote_job_link(
+        BUSINESS_DATE, candidate_id, 17, "customer-prewarm-zhaoshang",
+        now=datetime(2026, 9, 14, 20, 0, tzinfo=UTC),
+    )
+    prewarm.record_remote_job_link(
+        DAY_2, candidate_id, 31, "customer-prewarm-zhaoshang",
+        now=datetime(2026, 9, 15, 8, 0, tzinfo=UTC),
+    )
+
+    detail_d1 = projection.get_prewarm_link_detail(
+        BUSINESS_DATE, candidate_id, runtime_root=runtime_root
+    )
+    assert detail_d1["degraded"] is False
+    assert detail_d1["remote_job"]["task_name"] == day1_task
+    assert detail_d1["remote_job"]["state"] == "RUNNING"
+
+    detail_d2 = projection.get_prewarm_link_detail(
+        DAY_2, candidate_id, runtime_root=runtime_root
+    )
+    assert detail_d2["remote_job"]["task_name"] == day2_task
+    assert detail_d2["remote_job"]["state"] == "RUNNING"
+
+    # Refresh the D1 linkage so its recorded_at becomes the LATEST of all —
+    # max business_date must still decide: View D2 keeps resolving job 31.
+    prewarm.record_remote_job_link(
+        BUSINESS_DATE, candidate_id, 17, "customer-prewarm-zhaoshang",
+        now=datetime(2026, 9, 15, 23, 0, tzinfo=UTC),
+    )
+    detail_d2b = projection.get_prewarm_link_detail(
+        DAY_2, candidate_id, runtime_root=runtime_root
+    )
+    assert detail_d2b["degraded"] is False
+    assert detail_d2b["remote_job"]["task_name"] == day2_task
+    assert detail_d2b["remote_job"]["state"] == "RUNNING"
+
+
 def test_no_linkage_falls_back_to_candidate_day(tmp_path):
     """B2: legacy pre-linkage candidate (remote_job_id only) resolves its job
     from the candidate's OWN business date DB, regardless of the viewed day."""
