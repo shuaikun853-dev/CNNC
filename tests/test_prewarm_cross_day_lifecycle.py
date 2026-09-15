@@ -2,8 +2,9 @@
 
 D2 手动重爬 REUSED 跨日 D1 任务(dispatch 返回 cross_day=True +
 job_business_date=D1)后,动作 worker 即 lifecycle owner:有界现有生命周期
-harvest(run_manual_reexport:只读 preflight + 共享 harvest core,create_calls=0,
-绝不二次 POST,只写 D1 自己的 state DB 并持 D1 日锁+租约)+
+harvest(harvest_existing_customer_prewarm_job:精确 (date, id, identity) 走
+共享 harvest core,溯源取自 durable prewarm payload 的 mapping source,
+create_calls=0,绝不二次 POST,只写 D1 自己的 state DB 并持 D1 日锁+租约)+
 sync_daily_internet_results(幂等 ledger)镜像进共享缓存 → 既有 G2 精确关联
 完成。预算耗尽保持 WAITING_REMOTE(诚实),操作员再次点击会重新探测
 (无重复 POST)并重启该有界循环。
@@ -13,7 +14,8 @@ sync_daily_internet_results(幂等 ledger)镜像进共享缓存 → 既有 G2 �
 remote job,BATCH_STATE.md 写 CREATED/ENABLED/PRIORITY_UPDATED 事件,招商局
 adapter 注入 fake runner + 可控 fake progress_probe,mall 用 comix);dispatch
 注入 fake 或真实 dispatch 薄包装(counting adapter);reexport 默认走真实
-run_manual_reexport,个别测试注入记录型 fake。远端状态库最小造库方式镜像
+harvest_existing_customer_prewarm_job,个别测试注入记录型 fake。远端状态库
+最小造库方式镜像
 tests/test_prewarm_manual_recrawl.py 的 _write_state_db。
 """
 
@@ -246,7 +248,7 @@ class _JobSeed:
             self.url,
             BACKEND_VERSION,
             self.url,
-            source_id="v-0",  # 快照行 vCommodityId(冻结快照 source 集合)
+            source_id=COMIX.source_id,  # mapping source(prewarm payload 溯源,与 requests.mall_source_id 一致)
         )
         store.link_crawl_work_to_remote_job(lease, int(crawl["id"]), int(job["id"]))
         store.release_lease(lease)
@@ -451,7 +453,7 @@ def test_cross_day_full_lifecycle_zero_second_post_to_succeeded(tmp_path, monkey
     runner = _make_runner(
         runtime_root,
         dispatch_exact=dispatch_wrapper,
-        reexport=None,  # 真实 run_manual_reexport
+        reexport=None,  # 真实 harvest_existing_customer_prewarm_job
         adapter_factory=lambda: seed.adapter,
         max_attempts=4,
     )

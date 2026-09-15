@@ -67,10 +67,11 @@ that re-crawls EXACTLY ONE prewarm link URL:
   (Round 3 D11).  Same-day actions stay pure poll-driven: nothing is ever
   written by the action itself — the eventual remote-side sync owns the new
   row.  Cross-day actions additionally harvest through their worker thread
-  (see the cross-day paragraph below): a bounded loop of the EXISTING
-  ``run_manual_reexport`` primitive (writes D1's own state DB, never a
-  second POST) followed by the idempotent ``sync_daily_internet_results``
-  mirror into the shared crawl cache.  Evaluation never raises.
+  (see the cross-day paragraph below): a bounded loop of the prewarm-
+  compatible ``harvest_existing_customer_prewarm_job`` primitive (writes D1's
+  own state DB, never a second POST) followed by the idempotent
+  ``sync_daily_internet_results`` mirror into the shared crawl cache.
+  Evaluation never raises.
 
   Cross-day continuation (Issue #13 blocker B): when dispatch REUSED an
   UNFINISHED remote job from an EARLIER business day (``cross_day=True`` +
@@ -78,9 +79,11 @@ that re-crawls EXACTLY ONE prewarm link URL:
   more (the scan/STEP1 pass only processes its own day's state DB and the
   dispatch pass explicitly skips cross-day candidates), so the action's own
   worker becomes the bounded lifecycle owner: a bounded loop of the
-  EXISTING ``run_manual_reexport`` lifecycle harvest (read-only preflight +
-  shared harvest core, ``create_calls=0`` — never a second POST — writing
-  only D1's own state DB under D1's day lock + lease) followed by the
+  prewarm-compatible ``harvest_existing_customer_prewarm_job`` lifecycle
+  harvest (exact (date, id, identity) harvest through the shared harvest
+  core with durable prewarm-payload source provenance, ``create_calls=0``
+  — never a second POST — writing only D1's own state DB under D1's day
+  lock + lease) followed by the
   idempotent ``sync_daily_internet_results`` (ledger-guarded) mirroring
   D1's successful crawl rows into the shared crawl cache, then a locked
   re-evaluation through the ordinary lazy-completion proofs (terminal
@@ -453,13 +456,14 @@ class ManualRecrawlRunner:
         return isinstance(dispatch, dict) and dispatch.get("cross_day") is True
 
     def _cross_day_reexport_fn(self) -> Callable[..., dict[str, Any]]:
-        """Injected re-export seam, else the real ``run_manual_reexport``
+        """Injected re-export seam, else the prewarm-compatible
+        ``harvest_existing_customer_prewarm_job`` existing-lifecycle harvest
         (lazy import inside the cross-day path only)."""
         if self._reexport is not None:
             return self._reexport
-        from app.services.dashboard_manual_ops import run_manual_reexport
+        from app.services.recovery.harvest import harvest_existing_customer_prewarm_job
 
-        return run_manual_reexport
+        return harvest_existing_customer_prewarm_job
 
     def _cross_day_adapter(self) -> Any:
         """Injected adapter factory, else the real legacy adapter built on the
@@ -481,17 +485,19 @@ class ManualRecrawlRunner:
         A missing reference returns silently (the action stays as the
         dispatch classification left it).
 
-        Each bounded attempt: sleep, then the EXISTING
-        ``run_manual_reexport`` lifecycle harvest against D1 (read-only
-        preflight + shared harvest core; ``create_calls`` is always 0 — there
-        is no create channel, so a re-click can never fabricate a duplicate
-        remote task), then the UNCONDITIONAL idempotent
+        Each bounded attempt: sleep, then the prewarm-compatible
+        ``harvest_existing_customer_prewarm_job`` lifecycle harvest against
+        D1 (exact (date, id, identity) harvest through the shared core, source
+        provenance validated against the durable prewarm payload's mapping
+        sources; ``create_calls`` is always 0 — there is no create channel, so
+        a re-click can never fabricate a duplicate remote task), then the
+        UNCONDITIONAL idempotent
         ``sync_daily_internet_results`` (ledger-guarded; re-running is safe)
         mirroring D1's successful crawl rows into the shared cache, then a
         locked re-evaluation through the ordinary lazy-completion proofs
         (terminal FAILED → FAILED; exact ``(business_date, remote_job_id)``
-        cache correlation → SUCCEEDED).  Re-export outcomes (including
-        ``REEXPORT_REJECTED`` / ``REEXPORT_STILL_RUNNING`` / ``REEXPORT_MANUAL``)
+        cache correlation → SUCCEEDED).  Harvest outcomes (including
+        ``REMOTE_EXISTING_HARVEST_*`` and injected-seam ``REEXPORT_*``)
         are diagnostics only — they never remap the state machine.
 
         When the attempt budget runs out the action stays honestly
