@@ -114,6 +114,26 @@ WHERE j.state = 'SUBMIT_UNKNOWN'
 ORDER BY j.id
 """
 
+_CRAWL_STATES_FOR_JOB_SQL = """
+SELECT c.state AS state
+FROM crawl_work c
+WHERE c.remote_job_id = ?
+ORDER BY c.id
+"""
+
+# ---- WS-B: failed customer links projected into the final workbook -----------
+
+# Cross-day prewarm store lives at the runtime root (next to the per-day
+# directories), the same placement the scan CLI and the tick intake use.
+PREWARM_STORE_FILENAME = "customer_prewarm.sqlite3"
+
+# Final-workbook failure reasons (spec B / user ruling 2026-09-16: NO_RESULT is
+# a failure; texts are the business-visible wording of the 结果 column).
+FAILED_LINK_REASON_SUBMIT_UNKNOWN = "提交超时无身份"
+FAILED_LINK_REASON_NO_RESULT = "远端无匹配价格行"
+FAILED_LINK_REASON_TERMINAL = "终端失败"
+FAILED_LINK_REASON_REDISPATCH_EXHAUSTED = "重排超限"
+
 
 def redispatch_placeholder_sku(mall_key: str, url: str, attempt_index: int) -> str:
     """Deterministic ``zhpq-`` placeholder SKU for the attempt-th redispatch.
@@ -298,6 +318,150 @@ def plan_lifecycle_actions(
         "redispatch_groups": redispatch_groups,
         "redispatch_blocked": collected["blocked"],
     }
+
+
+def _crawl_states_for_job_readonly(state_db_path: str | Path, job_id: int) -> list[str]:
+    """``mode=ro`` probe: the crawl row states bound to one remote job."""
+    connection = _open_state_db_readonly(state_db_path)
+    if connection is None:
+        return []
+    try:
+        rows = connection.execute(_CRAWL_STATES_FOR_JOB_SQL, (int(job_id),)).fetchall()
+    finally:
+        connection.close()
+    return [str(row["state"] or "") for row in rows]
+
+
+def _failed_link_reason(
+    *,
+    job_row: Mapping[str, Any] | None,
+    job_is_dead: bool,
+    crawl_states: Sequence[str],
+    redispatch_links_used: int,
+    daily_cap: int,
+) -> str | None:
+    """The workbook failure reason for one candidate, or ``None`` when it lives.
+
+    Precedence: an exhausted redispatch budget is the day's final disposition;
+    a NO_RESULT crawl row beats the coarser job-state reasons; a dead
+    SUBMIT_UNKNOWN job is the submit-timeout wording; every other dead job or
+    terminally failed crawl row is 终端失败.
+    """
+    if job_is_dead and redispatch_links_used >= daily_cap:
+        return FAILED_LINK_REASON_REDISPATCH_EXHAUSTED
+    if "NO_RESULT" in crawl_states:
+        return FAILED_LINK_REASON_NO_RESULT
+    if job_is_dead:
+        if str((job_row or {}).get("state") or "") == "SUBMIT_UNKNOWN":
+            return FAILED_LINK_REASON_SUBMIT_UNKNOWN
+        return FAILED_LINK_REASON_TERMINAL
+    if "TERMINAL_FAILED" in crawl_states:
+        return FAILED_LINK_REASON_TERMINAL
+    return None
+
+
+def failed_customer_link_rows(
+    business_date: str,
+    runtime_root: str | Path,
+    mappings: Sequence[ZhaoshangMallMapping],
+    *,
+    dead_threshold: int = RECONCILE_DEAD_THRESHOLD,
+    redispatch_daily_cap: int = REDISPATCH_DAILY_CAP,
+) -> list[dict[str, Any]]:
+    """Strictly read-only WS-B query: customer links whose crawl failed today.
+
+    Scope (user ruling 2026-09-16): candidates observed on ``business_date``
+    (``prewarm_daily_observations`` — the store's authoritative day index) that
+    are NOT ``CACHE_HIT`` and carry a failure — a dead bound job
+    (``MANUAL_REQUIRED`` / ``TERMINAL_FAILED`` / ``SUBMIT_UNKNOWN`` judged dead
+    by ``dead_threshold``), a ``NO_RESULT`` or ``TERMINAL_FAILED`` crawl row on
+    the bound job, or an exhausted redispatch budget (the day's
+    ``prewarm_remote_job_links`` count at ``redispatch_daily_cap``).  Only the
+    two remote statuses can carry a binding, so they are the only candidates
+    enumerated.  Rows are deduped by ``(mall, original_url)`` (the store's
+    candidate identity) and sorted deterministically.
+
+    Every probe is ``mode=ro`` (missing state DBs / stores yield fewer rows,
+    never a write); a candidate whose linkage probes fail is skipped fail-open,
+    exactly like the lifecycle planning stages.  Returns per row: ``mall``,
+    ``mall_name`` (mapped via ``mappings``, falling back to the mall key),
+    ``original_url``, ``document_ids``, ``reason``, ``last_task_name``,
+    ``last_time``, plus durable provenance (``job_state``, ``remote_job_id``,
+    ``candidate_id``, ``redispatch_links_used``, ``owning_day``).
+    """
+    prewarm_path = Path(runtime_root) / PREWARM_STORE_FILENAME
+    if not prewarm_path.is_file():
+        return []
+    prewarm_store = CustomerPrewarmStore.open_read_only(prewarm_path)
+    scoped_ids = prewarm_store.candidate_ids_for_business_date(business_date)
+    if not scoped_ids:
+        return []
+    state_root = Path(runtime_root)
+
+    def job_reader(job_id: int, owning_day: str) -> dict[str, Any] | None:
+        return _read_job_row_readonly(runtime_paths(owning_day, state_root).state_path, job_id)
+
+    rows: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    probe_errors: list[str] = []
+    for status in (CACHE_STATUS_REMOTE_DISPATCHED, CACHE_STATUS_REMOTE_REUSED):
+        for candidate in prewarm_store.candidates(status):
+            candidate_id = int(candidate["id"])
+            if candidate_id not in scoped_ids:
+                continue
+            identity = (str(candidate["mall"] or ""), str(candidate["original_url"] or ""))
+            if identity in seen:
+                continue
+            raw_job_id = candidate.get("remote_job_id")
+            if raw_job_id is None:
+                continue
+            owning_day, job_row = _owning_day_job(
+                prewarm_store, candidate_id, int(raw_job_id), business_date, job_reader, probe_errors
+            )
+            crawl_states = _crawl_states_for_job_readonly(
+                runtime_paths(owning_day, state_root).state_path, int(raw_job_id)
+            )
+            used = prewarm_store.remote_job_link_count(business_date, candidate_id)
+            reason = _failed_link_reason(
+                job_row=job_row,
+                job_is_dead=job_row is not None and _job_is_dead(job_row, dead_threshold),
+                crawl_states=crawl_states,
+                redispatch_links_used=used,
+                daily_cap=redispatch_daily_cap,
+            )
+            if reason is None:
+                continue
+            seen.add(identity)
+            mall = str(candidate["mall"] or "")
+            rows.append(
+                {
+                    "mall": mall,
+                    "mall_name": next(
+                        (m.mall_name for m in mappings if m.mall_key == mall),
+                        mall,
+                    ),
+                    "original_url": str(candidate["original_url"] or ""),
+                    "document_ids": sorted(
+                        {
+                            str(link["document_id"])
+                            for link in prewarm_store.links_for_candidate(candidate_id)
+                            if str(link.get("document_id") or "")
+                        }
+                    ),
+                    "reason": reason,
+                    "last_task_name": str((job_row or {}).get("task_name") or ""),
+                    "last_time": str(
+                        candidate.get("last_checked_at") or candidate.get("last_seen_at") or ""
+                    ),
+                    "job_state": str((job_row or {}).get("state") or ""),
+                    "remote_job_id": int(raw_job_id),
+                    "candidate_id": candidate_id,
+                    "redispatch_links_used": used,
+                    "owning_day": owning_day,
+                }
+            )
+    rows.sort(key=lambda row: (row["mall"], row["original_url"]))
+    return rows
 
 
 # ---- A2: reconcile identity-less SUBMIT_UNKNOWN prewarm jobs -----------------
