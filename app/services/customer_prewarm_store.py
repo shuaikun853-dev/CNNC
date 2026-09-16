@@ -944,6 +944,22 @@ class CustomerPrewarmStore:
             ).fetchone()
         return str(row["producer"]) if row is not None else None
 
+    def remote_job_link_count(self, business_date: str, candidate_id: int) -> int:
+        """Rows in ``prewarm_remote_job_links`` for one (business_date, candidate).
+
+        The redispatch daily budget basis: each remote job a candidate was
+        bound to on a day adds exactly one row, so the count is the number of
+        remote dispatch attempts that candidate consumed that day.
+        """
+        business_date_value = self._require_text(business_date, "business_date")
+        with self._reader() as connection:
+            row = connection.execute(
+                """SELECT COUNT(*) AS n FROM prewarm_remote_job_links
+                   WHERE business_date=? AND candidate_id=?""",
+                (business_date_value, int(candidate_id)),
+            ).fetchone()
+        return int(row["n"]) if row is not None else 0
+
     # ---- sync ledger -------------------------------------------------------------
 
     def ledger_get(self, source: str, source_event_key: str) -> dict[str, Any] | None:
