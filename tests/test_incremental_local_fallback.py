@@ -260,6 +260,139 @@ def test_remote_check_proof_requires_per_job_evidence(tmp_path):
     ) == set()
 
 
+@pytest.mark.parametrize(
+    "evidence",
+    [
+        {"manual_error": "remote query failed"},
+        {"state": "PRIORITY_PENDING", "remote_identity": "remote-job"},
+        {
+            "state": "PRIORITY_PENDING",
+            "remote_identity": "remote-job",
+            "retryable_error": "priority rows are not ready",
+        },
+    ],
+)
+def test_final_remote_check_rejects_non_query_evidence(tmp_path, evidence):
+    store, token, rows, _job = setup_work(tmp_path)
+    deps = TickDependencies(
+        discover=lambda _timeout: None,
+        harvest=lambda jobs, _timeout: {int(jobs[0]["id"]): evidence},
+        monotonic=lambda: 0,
+    )
+
+    checked = _final_remote_check_for_local_fallback(
+        store, token, deps, TickBudget(0, 60, 5, lambda: 0),
+        [store.get_crawl_work(rows[0]["id"])],
+    )
+
+    assert checked == set()
+
+
+@pytest.mark.parametrize("state", ["RUNNING", "EXPORTED", "COMPLETED"])
+def test_final_remote_check_accepts_successful_remote_query_states(tmp_path, state):
+    store, token, rows, job = setup_work(tmp_path)
+    deps = TickDependencies(
+        discover=lambda _timeout: None,
+        harvest=lambda _jobs, _timeout: {
+            int(job["id"]): {"state": state, "remote_identity": "remote-job"}
+        },
+        monotonic=lambda: 0,
+    )
+
+    checked = _final_remote_check_for_local_fallback(
+        store, token, deps, TickBudget(0, 60, 5, lambda: 0),
+        [store.get_crawl_work(rows[0]["id"])],
+    )
+
+    assert checked == {int(job["id"])}
+
+
+def test_opening_harvest_manual_error_is_not_a_completed_remote_check(tmp_path):
+    store, token, _rows, job = setup_work(tmp_path)
+    deps = TickDependencies(
+        discover=lambda _timeout: None,
+        harvest=lambda _jobs, _timeout: {
+            int(job["id"]): {"manual_error": "remote query failed"}
+        },
+        monotonic=lambda: 0,
+    )
+    checked: set[int] = set()
+
+    _harvest(
+        store, token, deps, TickBudget(0, 60, 5, lambda: 0),
+        {"crawl_harvested": 0}, TickConfig(business_date="2026-09-17"),
+        checked_job_ids=checked,
+    )
+
+    assert checked == set()
+
+
+@pytest.mark.parametrize("terminal_state", ["NO_RESULT", "TERMINAL_FAILED"])
+def test_terminal_remote_crawl_cannot_be_claimed_for_local_fallback(tmp_path, terminal_state):
+    store, token, rows, job = setup_work(tmp_path)
+    store.observe_local_fallback_remote_checks(
+        token, at(8, 30).isoformat(), SUPPORTED_MALLS,
+        checked_remote_job_ids={int(job["id"])},
+    )
+    with sqlite3.connect(store.path) as conn:
+        conn.execute(
+            "UPDATE crawl_work SET state=? WHERE id=?",
+            (terminal_state, rows[0]["id"]),
+        )
+
+    assert store.claim_local_fallback(
+        token, rows[0]["id"], DAYTIME_60M, "late-claim", at(8, 31).isoformat()
+    ) is None
+
+
+@pytest.mark.parametrize("terminal_state", ["NO_RESULT", "TERMINAL_FAILED"])
+@pytest.mark.parametrize("settle", ["fail", "recover"])
+def test_local_failure_paths_preserve_concurrent_terminal_remote_evidence(
+    tmp_path, terminal_state, settle
+):
+    store, token, rows, job = setup_work(tmp_path)
+    store.observe_local_fallback_remote_checks(
+        token, at(8, 30).isoformat(), SUPPORTED_MALLS,
+        checked_remote_job_ids={int(job["id"])},
+    )
+    claim = store.claim_local_fallback(
+        token, rows[0]["id"], DAYTIME_60M, "claim", at(8, 30).isoformat()
+    )
+    assert claim is not None
+
+    if terminal_state == "TERMINAL_FAILED":
+        store.fail_crawl_work(token, rows[0]["id"], "remote terminal", retryable=False)
+    else:
+        with sqlite3.connect(store.path) as conn:
+            conn.execute(
+                """UPDATE remote_jobs
+                      SET state='COMPLETED', remote_identity='remote-job',
+                          post_attempted=1, result_path='remote.xlsx'
+                    WHERE id=?""",
+                (job["id"],),
+            )
+        store.complete_partial_exact_no_result(
+            token, rows[0]["id"], remote_job_id=job["id"],
+            remote_identity="remote-job", result_path="remote.xlsx",
+            reason="remote export has no matching row",
+        )
+    before = store.get_crawl_work(rows[0]["id"])
+
+    if settle == "fail":
+        store.fail_local_fallback(
+            token, claim["id"], "local terminal", retryable=False
+        )
+    else:
+        assert store.recover_interrupted_local_fallback_claims(
+            token, "next-tick", at(8, 30, 2).isoformat(), max_attempts=1
+        ) == 1
+
+    after = store.get_crawl_work(rows[0]["id"])
+    assert after["state"] == terminal_state
+    assert after["result_json"] == before["result_json"]
+    assert after["error_text"] == before["error_text"]
+
+
 def test_stale_submit_unknown_does_not_block_after_local_success(tmp_path):
     store, token, rows, job = setup_work(tmp_path, state="SUBMIT_UNKNOWN")
     run_incremental_local_fallback(
