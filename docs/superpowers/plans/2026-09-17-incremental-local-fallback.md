@@ -79,4 +79,3 @@
 - [ ] Parse both PowerShell files with the real parser and run scheduler simulations.
 - [ ] Run focused, critical-safety, and full repository tests; compare the two known worktree-config baseline failures.
 - [ ] Commit scheduler/tests/docs in natural reviewable commits, then push the feature branch without merge or deploy.
-

@@ -206,4 +206,3 @@ Run `git fetch origin prod/closeout-20260818` and require `git rev-parse origin/
 - [ ] **Step 5: Push only the integration branch and open the PR**
 
 Push `integration/incremental-local-fallback-prod-54e78c3-20260917`, create a PR to `prod/closeout-20260818`, record its URL, and do not merge it.
-
