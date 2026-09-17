@@ -45,22 +45,31 @@ SQLite 仅有七张 checkpoint 表：`daily_runs`、`snapshots`、`audit_items`�
 | Runner | `scripts\run_incremental_price_audit_scheduled.ps1` |
 | Start in | 仓库根目录 |
 | Principal | 注册时的交互用户,`LogonType Interactive` + `RunLevel Limited`(S4U 需先验证网络/cookie/profile,未验证不切换) |
-| Trigger | 每周一至周五共四个 trigger：09:00 起每 15 分钟唤醒至 16:45；17:00 起每 5 分钟唤醒至 17:55；18:00 起每 5 分钟唤醒至 20:00；另加 20:35 一次性 Safety Closeout（最后一次自动启动 20:35） |
+| Trigger | 每周一至周五共四个 trigger：09:00 起每 15 分钟唤醒至 16:45；17:00 起每 3 分钟唤醒至 17:57；18:00 起每 5 分钟唤醒至 20:00；另加 20:35 一次性 Safety Closeout（最后一次自动启动 20:35） |
 | Multiple instances | **IgnoreNew** |
 | Application budget | tick/harvest-only **720 秒**；closeout **1680 秒** |
 | ExecutionTimeLimit | **32 分钟（1920 秒）** |
 
 runner 是一次性有限进程，不含常驻 daemon。09:00-16:00 整点运行 `tick`；09:15-16:45 的白天非整点
 15 分钟唤醒运行 `harvest-only`（只回收已存在的招商局 remote jobs：不查 SaaS、不跑 Detail/Model、不
-submit、不 finalize；本地无 eligible remote job 时纯本地 NOOP，不请求招商局）。17:00-17:50 每 5 分钟
-运行一次 `tick`（17 点是 SaaS 新数据高峰，提高启动机会；单轮超时不并发，靠 IgnoreNew 丢弃重叠
-trigger）；**17:55 只运行 `harvest-only`**，优先排空 17 点已创建的招商局远端任务，不产生新 discovery、
-新 ADD 或新 remote create。18:00-20:00 每 5 分钟提供一次 `closeout` 启动机会，
+submit、不 finalize；本地无 eligible remote job 时纯本地 NOOP，不请求招商局）。17:00-17:57 每 3 分钟
+运行一次完整 `tick`（harvest、reconcile、local fallback eligibility/execution 均在场；单轮超时不并发，靠
+IgnoreNew 丢弃重叠 trigger）。不再保留 17:55 harvest-only 特例。18:00-20:00 每 5 分钟提供一次 `closeout` 启动机会，
 **20:00 是 5 分钟窗口的最后一次**；20:35 是一次性的 Safety Closeout，也是当天最后一次自动启动：
 19:55 的 closeout 运行超过 5 分钟时 20:00 trigger 会被 IgnoreNew 丢弃，若该轮随后以 WAITING_REMOTE
 结束，当天仍由 20:35 补一次自动 closeout（20:00 起跑的一轮最晚 20:32 被 32 分钟硬上限终止，20:35
 必可启动；当天已 FINALIZED 时按现有幂等语义直接 NOOP，不重写 final.xlsx）。20:36 后不再有任何
 自动调度，即使被人工误调用也会快速空操作退出。
+
+### 增量自动本地兜底
+
+该策略只属于日常 incremental scheduler，与完整 STEP_1 的人工 manifest 授权入口相互独立：
+
+- 09:00-16:59：远端任务开始满 60 分钟后的第一个完整 tick，先做最终招商局查询，仍无有效价格才进入本地兜底。
+- 17:00-17:59：第一次远端检查只落账 `last_remote_check_at`；至少 3 分钟后的下一次完整 tick 再最终查询，无价格才以 `PEAK_3M` 兜底。
+- 18:00 以后：closeout 先最终 harvest，再以 `AFTER_1800` 立即处理受支持的 unresolved URL，然后重新计算 blockers。
+
+自动范围固定为 `nbdeli / guangbo / ofs / lxwlmall / qstbg / ycw / comix / tima`。每个 exact URL 原子 claim，partial job 只发送仍未取得可信价格的 URL；可重试错误最多在后续 tick 自动尝试 2 次，同一轮不 tight-loop。验证码、登录墙、风控、外来/重复 URL、manifest 不一致和非法价格均 fail-closed。成功证据标记 `本地兜底:<site>`，招商局迟到结果不得覆盖；若远端状态仍为 `SUBMIT_UNKNOWN` 或 `MANUAL_REQUIRED`，但其关联 URL 已全部由可信结果解决，该陈旧任务状态不再阻塞 finalization。
 closeout 在一个进程内持续推进，不为下一个 5 分钟唤醒等待：SaaS 稳定观察最快每 300 秒一次，
 招商局 full sweep 最快每 600 秒一次（单批最多 6 个，一轮覆盖全部 eligible remote jobs）。18:00 后只要
 最近 authoritative 观测的 `row_count` 与 `ordered_hash` 连续 600 秒一致且本次分页完整，即可 freeze
@@ -146,7 +155,7 @@ Arguments,再 `-Apply`,然后用 `status_incremental_price_audit_tasks.ps1` 复�
    退出码 70/74 仅对应启动失败/日志写失败并在日志中有对应诊断行。
 
 脚本固定使用 legacy 招商局 backend、`MultipleInstances=IgnoreNew`、三重复 trigger 加 20:35 一次性
-Safety Closeout（白天 15 分钟、17:00-17:55 与 18:00-20:00 每 5 分钟、20:35 一次）和 32 分钟硬上限。
+Safety Closeout（白天 15 分钟、17:00-17:57 每 3 分钟、18:00-20:00 每 5 分钟、20:35 一次）和 32 分钟硬上限。
 若发现旧的 `-Tick` / `-Finalize` 双任务仍存在，注册会拒绝继续，而不会暗中删除或制造竞争任务。
 注册身份沿用当前项目的交互式低权限用户上下文；机器关机或用户未登录时不会强行改用另一套凭证。
 
