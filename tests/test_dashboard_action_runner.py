@@ -122,6 +122,30 @@ def test_closeout_publication_maps_finalized(tmp_path):
     assert finished[-1]["outcome"]["publication"].endswith("saas_audit_final_20260828.xlsx")
 
 
+def test_force_closeout_argv_is_explicit_and_count_locked(tmp_path):
+    stdout = json.dumps({
+        "outcome": "FORCE_FINALIZED", "finalized": True,
+        "output_path": r"E:\runtime\saas_audit_final_20260828.xlsx",
+    })
+    runner, calls = _runner(tmp_path, _FakeProcess(returncode=0, stdout=stdout))
+
+    handle = runner.start(
+        action_type="force-closeout",
+        business_date=BUSINESS_DATE,
+        max_incomplete=20,
+        expected_missing_page_price_rows=7,
+    )
+    _wait_done(handle)
+
+    argv = calls[0]["argv"]
+    assert "force-finalize" in argv
+    assert "--accept-unresolved-crawl" in argv
+    assert argv[argv.index("--max-incomplete") + 1] == "20"
+    assert argv[argv.index("--expected-missing-page-price-rows") + 1] == "7"
+    assert handle.status == "SUCCEEDED"
+    assert handle.outcome["outcome"] == "FORCE_FINALIZED"
+
+
 def test_closeout_exit2_blocked_outcome(tmp_path):
     stdout = json.dumps({"outcome": "MANUAL_REVIEW_REQUIRED",
                          "publication": None, "publication_blocked": None})

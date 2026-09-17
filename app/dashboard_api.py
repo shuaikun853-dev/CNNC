@@ -1,7 +1,7 @@
 """Read-only STEP_1 dashboard routes + strictly guarded local operator actions.
 
 GET 层保持零业务写。新增 POST 只允许本机驾驶舱触发既有 CLI 子进程
-(closeout/re-export/rebuild)或只读 refresh-progress;每个 POST 首行执行
+(closeout/force-closeout/re-export/rebuild)或只读 refresh-progress;每个 POST 首行执行
 _guard_operator_action(Host/Origin/X-Dashboard-Action-Token),绝无轮询触写。
 """
 from __future__ import annotations
@@ -46,6 +46,8 @@ from app.services.prewarm_manual_recrawl import (
     get_manual_recrawl_runner,
 )
 from app.services.incremental_audit_runtime import runtime_paths
+from app.services.incremental_audit_status import collect_runtime_status
+from app.services.page_price_semantics import FORCE_CLOSEOUT_MISSING_PRICE_LIMIT
 from app.services.production_identity import get_production_identity_service
 from app.services.saas_flow_diagnostic import get_saas_flow_diagnostic
 # 常量单源（2026-09-10）:认证维护锁/cURL 结果工件路径由 scripts.cnnc_auth_refresh
@@ -221,6 +223,11 @@ class _CloseoutBody(BaseModel):
     business_date: str | None = None
 
 
+class _ForceCloseoutBody(_CloseoutBody):
+    confirm: bool = False
+    expected_missing_page_price_rows: int = Field(ge=0)
+
+
 class _ReexportBody(BaseModel):
     model_config = ConfigDict(extra="forbid")
     business_date: str | None = None
@@ -351,6 +358,57 @@ def dashboard_action_closeout(request: Request, body: _CloseoutBody | None = Non
             "message": "business_date 必须为合法的 YYYY-MM-DD 日历日期"})
     handle = _start_action_or_http_error(
         action_type="closeout", business_date=business_date)
+    return _accepted_action_response(handle)
+
+
+@router.post("/api/actions/force-closeout")
+def dashboard_action_force_closeout(
+    request: Request, body: _ForceCloseoutBody
+) -> JSONResponse:
+    _guard_operator_action(request, "force-closeout")
+    business_date = _resolve_action_body_date(body.business_date)
+    if not _valid_business_date(business_date):
+        raise HTTPException(status_code=400, detail={
+            "error_code": "BAD_BUSINESS_DATE",
+            "message": "business_date 必须为合法的 YYYY-MM-DD 日历日期"})
+    if not body.confirm:
+        raise HTTPException(status_code=409, detail={
+            "error_code": "CONFIRM_REQUIRED",
+            "message": "强制收口必须显式确认"})
+    try:
+        status = collect_runtime_status(business_date=business_date)
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail={
+            "error_code": "FORCE_CLOSEOUT_STATUS_FAILED",
+            "message": "无法读取最新收口状态,未执行强制收口"}) from exc
+    final = status.get("final") or {}
+    if not final.get("frozen"):
+        raise HTTPException(status_code=409, detail={
+            "error_code": "FORCE_CLOSEOUT_NOT_FROZEN",
+            "message": "当前业务日尚未冻结,不能强制收口"})
+    if final.get("finalized"):
+        raise HTTPException(status_code=409, detail={
+            "error_code": "ALREADY_FINALIZED",
+            "message": "当前业务日已经生成最终表"})
+    actual = int(final.get("missing_page_price_rows") or 0)
+    if actual != body.expected_missing_page_price_rows:
+        raise HTTPException(status_code=409, detail={
+            "error_code": "STALE_MISSING_PRICE_COUNT",
+            "expected": body.expected_missing_page_price_rows,
+            "actual": actual,
+            "message": "未爬到价格的业务行数已变化,请刷新页面后重新确认"})
+    if actual > FORCE_CLOSEOUT_MISSING_PRICE_LIMIT:
+        raise HTTPException(status_code=409, detail={
+            "error_code": "MISSING_PRICE_LIMIT_EXCEEDED",
+            "actual": actual,
+            "limit": FORCE_CLOSEOUT_MISSING_PRICE_LIMIT,
+            "message": "未爬到价格的业务行超过强制收口上限"})
+    handle = _start_action_or_http_error(
+        action_type="force-closeout",
+        business_date=business_date,
+        max_incomplete=FORCE_CLOSEOUT_MISSING_PRICE_LIMIT,
+        expected_missing_page_price_rows=actual,
+    )
     return _accepted_action_response(handle)
 
 
@@ -637,20 +695,25 @@ get_production_identity_service()
 
 
 @router.get("/api/actions")
-def dashboard_actions_list() -> JSONResponse:
+def dashboard_actions_list(date: str = Query(default=None)) -> JSONResponse:
+    business_date = date or _today()
+    if not _valid_business_date(business_date):
+        raise HTTPException(status_code=400, detail={
+            "error_code": "BAD_BUSINESS_DATE",
+            "message": "business_date 必须为合法的 YYYY-MM-DD 日历日期"})
     runner = get_action_runner()
     running = [{"action_id": h.action_id, "action_type": h.action_type,
                 "status": h.status, "target": h.target, "started_at": h.started_at,
                 "business_date": h.business_date}
                for h in runner.list_recent(20) if h.status == "RUNNING"]
     try:
-        recent = read_operator_actions(runtime_paths(_today()).run_dir, limit=20)
+        recent = read_operator_actions(runtime_paths(business_date).run_dir, limit=20)
     except Exception:
         recent = []
     # 顶层 business_date:前端 closeout RUNNING 匹配的服务端权威日期
     # (bootstrap 失败时 operator-context 的 businessDate 为空,靠它兜底)。
     return JSONResponse({"running": running, "recent": recent,
-                         "business_date": _today()}, headers=_NO_STORE)
+                         "business_date": business_date}, headers=_NO_STORE)
 
 
 @router.get("/api/actions/{action_id}")

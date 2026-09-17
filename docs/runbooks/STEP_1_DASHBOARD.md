@@ -2,7 +2,7 @@
 
 > 这是 CNNC STEP_1 看板的运行手册。看板通过 FastAPI 提供 `http://127.0.0.1:8765/dashboard/`
 > 单页视图,展示当日审计总状态、阶段进展、招商局任务表(含远端实时子任务进度)、近 14 天日历
-> 与计划任务状态;并提供**仅本机、带严格门禁、可审计**的人工操作(立即收口/重新导出/重建任务)。
+> 与计划任务状态;并提供**仅本机、带严格门禁、可审计**的人工操作(立即收口/强制收口/重新导出/重建任务)。
 > 仓库提供登录自启的注册/卸载脚本,但两者默认预览,必须显式传 `-Apply` 才会改系统;
 > 自启任务只新增/删除 `CNNC-Dashboard-ReadOnly`,不读取、不修改现有审计计划任务。
 
@@ -22,14 +22,14 @@
   - 只绑定 `127.0.0.1:8765`,不监听其他网卡,不提供远程访问。
 - **写边界(新增,仅本机受控 operator actions)**:
   - Dashboard 主状态读取仍为只读;**仅**以下明确 operator actions 允许本机受控写:
-    manual closeout(立即收口)、exact re-export(重新导出)、explicit rebuild(重建任务)。
+    manual closeout(立即收口)、bounded force-closeout(强制收口)、exact re-export(重新导出)、explicit rebuild(重建任务)。
   - **页面轮询本身不会产生任何业务写**;所有业务写都要求用户在页面上明确点击按钮。
   - POST 路由全部要求:Host/Origin 本机校验 + `X-Dashboard-Action-Token`(进程启动时
     生成,页面经 `/dashboard/api/operator-context` 获取)+ 严格 JSON schema
     (不接受客户端提交任何 taskName/batchNumber/路径/远端身份;服务器一律从 durable
     state 重新取权威值)。
-  - 写操作经现有 CLI 子进程执行(`closeout` / `reexport-existing-remote` /
-    `rebuild-remote-task`),完全复用既有 ProcessLock、durable lease、exact identity、
+  - 写操作经现有 CLI 子进程执行(`closeout` / `force-finalize` /
+    `reexport-existing-remote` / `rebuild-remote-task`),完全复用既有 ProcessLock、durable lease、exact identity、
     immutable payload、fail-closed 语义;每次操作落审计文件
     `<业务日>/dashboard_actions.jsonl`。
   - 重新导出绝不创建新招商局任务;重建必须先安全停用旧任务(确认不会双跑)并生成
@@ -112,7 +112,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\unregister_dashboard
 
 ## 本机人工操作台(2026-08-28)
 
-招商局任务 Drawer 与最终收口卡提供四个受控操作。所有操作只在用户点击后发生;
+招商局任务 Drawer 与最终收口卡提供五个受控操作。所有操作只在用户点击后发生;
 按钮按任务状态启用;每次操作的启动/结果都写入 `<业务日>/dashboard_actions.jsonl`。
 
 | 操作 | 入口 | 语义 | 关键规则 |
@@ -121,6 +121,10 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\unregister_dashboard
 | 重新导出 | 任务 Drawer | 对当前已有任务再次执行 wait/export/harvest | 绝不创建新任务;执行前强制 progress 预检(TERMINAL 立即导出/ACTIVE 有界探测并如实提示/UNKNOWN 拒绝并返回 `REMOTE_PROGRESS_UNKNOWN`);此前导出 0 条不阻止再次执行 |
 | 重建任务 | 任务 Drawer(二次确认) | 停用旧任务→迁移未完成采集→创建 replacement | 新 taskName==新 batchNumber(自动生成,≠旧值,`cnnc_current_opt_<商城>_<14位数字>` 形态);旧任务 ACTIVE 时必须先 disable 并确认(否则 `OLD_TASK_STILL_ACTIVE`/`OLD_TASK_STOP_UNCONFIRMED`);SUCCESS/终态采集行绝不迁移;旧任务转 SUPERSEDED 不再阻塞 finalize,证据全部保留;同一动作幂等,绝不双发 create |
 | 立即收口 | 最终收口卡 | 正常生产 closeout(非 force-finalize) | 完全复用 `run_runtime_command("closeout", invocation="manual")`:ProcessLock 冲突→`ALREADY_RUNNING`,已出表→`ALREADY_FINALIZED`,阻塞未清→`BLOCKED`(绝不绕过 blocker);页面显示"收口中…"并轮询结果,不阻塞 HTTP |
+| 强制收口 | 最终收口卡(二次确认) | 按冻结快照生成正式最终表,接受不超过 20 条业务行缺少页面价格 | 页面与执行前都按冻结业务行重算 `missing_page_price_rows`,价格为 0 不算缺价,NO_RESULT/未完成/人工采集行算缺价;请求携带用户确认时看到的精确数量,数量变化或 >20 即拒绝。只放宽采集/远端未决状态,Detail、模型、客户价和无效价格证据仍阻塞;不新建、不重试、不修改招商局任务,原 durable 状态完整保留 |
+
+最终收口卡的“未爬到价格”是冻结快照中的**业务行数**;“底层采集工作项”来自
+`crawl_work` 状态,可能因历史轮次或重复采集显著大于业务缺价行数,两者不得混用。查看历史批次时用页头业务日期选择器;页面以 `?date=YYYY-MM-DD` 将 summary、操作记录和 POST 目标锁到同一业务日。
 
 结果语义(重新导出):`REEXPORT_COMPLETED`(取得有效结果,N 条)/`REEXPORT_COMPLETED_NO_RESULT`
 (任务已结束但导出 0 条,可稍后再点)/`REEXPORT_STILL_RUNNING`(任务仍在执行,本次未取得最终导出)/
@@ -134,6 +138,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\unregister_dashboard
 CLI 等价命令(与页面按钮走同一实现,供脚本/应急):
 `python scripts/incremental_price_audit.py reexport-existing-remote --remote-job-id N --remote-identity "mall|id|number"`
 `python scripts/incremental_price_audit.py rebuild-remote-task --remote-job-id N --remote-identity "mall|id|number"`
+`python scripts/incremental_price_audit.py force-finalize --max-incomplete 20 --accept-unresolved-crawl --expected-missing-page-price-rows N`
 
 ## 客户预热面板(Issue #13,2026-09-14)
 

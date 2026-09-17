@@ -14,6 +14,11 @@ from app.services.customer_price_semantics import customer_price_business_state
 from app.services.daily_audit_store import ProcessLock
 from app.services.incremental_audit_runtime import DEFAULT_RUNTIME_ROOT, runtime_paths
 from app.services.legacy_zhaoshang_adapter import EXTERNAL_TOOL_PATH
+from app.services.page_price_semantics import (
+    FORCE_CLOSEOUT_MISSING_PRICE_LIMIT,
+    crawl_identity,
+    valid_page_price_result,
+)
 from app.services.remote_stall_breaker import evaluate_remote_stall
 
 
@@ -159,6 +164,8 @@ def _empty_status(
             "pending": 0, "computed_pending": 0, "frozen": False, "finalized": False,
             "forced": False,
             "output_path": None, "output_exists": False, "manifest_recorded": False,
+            "page_price_required_rows": 0, "missing_page_price_rows": 0,
+            "force_closeout_limit": FORCE_CLOSEOUT_MISSING_PRICE_LIMIT,
             "blocker_summary": _empty_blocker_summary(),
         },
         "lease": {"active": False, "stale": False, "expires_at": None},
@@ -170,6 +177,47 @@ def _empty_status(
 
 def _group_counts(rows: Iterable[sqlite3.Row]) -> dict[str, int]:
     return {str(row["state"]): int(row["count"]) for row in rows}
+
+
+def _page_price_coverage(
+    frozen_rows: Iterable[sqlite3.Row],
+    crawl_rows: Iterable[sqlite3.Row],
+) -> tuple[int, int]:
+    """Count required and price-missing business rows, never crawl work rows."""
+    crawls_by_key: dict[tuple[str, str, str], list[sqlite3.Row]] = {}
+    for crawl in crawl_rows:
+        key = (
+            str(crawl["source_id"] or "").strip(),
+            str(crawl["sku_id"] or "").strip(),
+            str(crawl["exact_url"] or "").strip(),
+        )
+        crawls_by_key.setdefault(key, []).append(crawl)
+    required_count = 0
+    missing_count = 0
+    for frozen_row in frozen_rows:
+        try:
+            row = json.loads(str(frozen_row["row_json"] or "{}"))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        required = bool(row.get("__crawl_required", bool(str(row.get("extLink") or "").strip())))
+        if not required:
+            continue
+        required_count += 1
+        successful = [
+            crawl for crawl in crawls_by_key.get(crawl_identity(row), [])
+            if str(crawl["state"] or "") == "SUCCESS"
+        ]
+        if not successful:
+            missing_count += 1
+            continue
+        selected = max(successful, key=lambda value: int(value["id"]))
+        try:
+            result = json.loads(str(selected["result_json"] or "{}"))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            result = {}
+        if not isinstance(result, dict) or not valid_page_price_result(result):
+            missing_count += 1
+    return required_count, missing_count
 
 
 def _lease_active(owner: object, expires_at: object) -> bool:
@@ -403,6 +451,11 @@ def collect_runtime_status(
             detail.update(_customer_price_summary(connection, target_snapshot_id, unique_items))
             model = _stage_status(connection, target_snapshot_id, "MODEL", unique_items)
 
+        crawl_rows = connection.execute(
+            """SELECT id, source_id, sku_id, exact_url, state, result_json
+               FROM crawl_work WHERE run_id=? ORDER BY id""",
+            (run_id,),
+        ).fetchall()
         crawl_states = _group_counts(
             connection.execute(
                 "SELECT state, COUNT(*) AS count FROM crawl_work WHERE run_id=? GROUP BY state",
@@ -434,13 +487,12 @@ def collect_runtime_status(
             else:
                 crawl_pending_breakdown["unclassified"] += count
         crawl_unplanned = 0
+        page_price_required_rows = 0
+        missing_page_price_rows = 0
         if target_snapshot_id is not None:
             crawl_keys = {
                 (str(row["source_id"]).strip(), str(row["sku_id"]).strip(), str(row["exact_url"]).strip())
-                for row in connection.execute(
-                    "SELECT source_id, sku_id, exact_url FROM crawl_work WHERE run_id=?",
-                    (run_id,),
-                ).fetchall()
+                for row in crawl_rows
             }
             frozen_rows = connection.execute(
                 """SELECT i.row_json
@@ -462,6 +514,9 @@ def collect_runtime_status(
                 )
                 if required and key not in crawl_keys:
                     crawl_unplanned += 1
+            page_price_required_rows, missing_page_price_rows = _page_price_coverage(
+                frozen_rows, crawl_rows
+            )
         remote_states = _group_counts(
             connection.execute(
                 "SELECT state, COUNT(*) AS count FROM remote_jobs WHERE run_id=? GROUP BY state",
@@ -594,6 +649,9 @@ def collect_runtime_status(
             "output_path": output_path,
             "output_exists": bool(output_path and Path(output_path).is_file()),
             "manifest_recorded": bool(run["final_manifest_hash"]),
+            "page_price_required_rows": page_price_required_rows,
+            "missing_page_price_rows": missing_page_price_rows,
+            "force_closeout_limit": FORCE_CLOSEOUT_MISSING_PRICE_LIMIT,
             # The detail/model/crawl/remote keys decompose computed_pending
             # one-to-one.  detail_terminal is part of that sum (terminal detail
             # now blocks); the customer_price_* keys are a business cross-cut

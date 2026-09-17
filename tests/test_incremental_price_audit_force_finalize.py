@@ -326,6 +326,108 @@ def test_force_finalize_rejects_remote_manual(tmp_path):
     assert not output.exists()
 
 
+def test_operator_force_closeout_accepts_remote_manual_when_missing_price_rows_are_bounded(tmp_path):
+    store, _snapshot, crawls = _seed_force(tmp_path)
+    job = _link_inflight_job(store, tmp_path, crawls)
+    token = store.acquire_lease(DATE, "manual", 60)
+    store.mark_remote_manual(token, int(job["id"]), "remote task requires manual intervention")
+    store.release_lease(token)
+    output = tmp_path / "formal.xlsx"
+
+    publication = materialize_forced_frozen_daily_run(
+        store,
+        ProcessLock(tmp_path / "finalize.lock"),
+        DATE,
+        output,
+        max_incomplete=20,
+        accept_unresolved_crawl=True,
+        expected_missing_page_price_rows=2,
+    )
+
+    assert publication.forced_incomplete_count == 2
+    assert publication.readiness.missing_page_price_rows == 2
+    assert output.is_file()
+    assert store.get_run(DATE)["state"] == "FINALIZED"
+
+
+def test_operator_force_closeout_rejects_stale_missing_price_count(tmp_path):
+    store, _snapshot, crawls = _seed_force(tmp_path)
+    _link_inflight_job(store, tmp_path, crawls)
+    output = tmp_path / "formal.xlsx"
+
+    with pytest.raises(ForceFinalizeRejected) as excinfo:
+        materialize_forced_frozen_daily_run(
+            store,
+            ProcessLock(tmp_path / "finalize.lock"),
+            DATE,
+            output,
+            max_incomplete=20,
+            accept_unresolved_crawl=True,
+            expected_missing_page_price_rows=1,
+        )
+
+    assert excinfo.value.error_type == "FORCE_FINALIZE_STALE_MISSING_PRICE_COUNT"
+    assert excinfo.value.readiness.missing_page_price_rows == 2
+    assert not output.exists()
+
+
+def test_operator_force_closeout_counts_no_result_and_unresolved_rows_but_not_zero_price(tmp_path):
+    rows = [
+        _row("v-ok", "sku-ok", "https://shop.example/ok"),
+        _row("v-zero", "sku-zero", "https://shop.example/zero"),
+        _row("v-none", "sku-none", "https://shop.example/none"),
+        _row("v-manual", "sku-manual", "https://shop.example/manual"),
+    ]
+    store, _snapshot, crawls = _seed_force(tmp_path, rows=rows)
+    _complete_crawl(store, crawls[0], "9.5")
+    token = store.acquire_lease(DATE, "zero", 60)
+    store.complete_crawl_work(token, crawls[1]["id"], {
+        "page_price_value": "0",
+        "page_price_status": "PRICE_IS_ZERO",
+        "page_price_source": "招商局",
+    })
+    store.release_lease(token)
+    _complete_no_result_crawl(store, tmp_path, crawls[2], index=2)
+    job = _link_inflight_job(store, tmp_path, [crawls[3]], index=3)
+    token = store.acquire_lease(DATE, "manual", 60)
+    store.mark_remote_manual(token, int(job["id"]), "manual")
+    store.release_lease(token)
+
+    token = store.acquire_lease(DATE, "inspect", 60)
+    built = build_frozen_audit_artifact(
+        store, token, output_identity="inspect", tolerate_pending=True,
+    )
+    store.release_lease(token)
+
+    assert built.readiness.page_price_required_rows == 4
+    assert built.readiness.missing_page_price_rows == 2
+
+
+def test_operator_force_closeout_rejects_more_than_twenty_missing_price_rows(tmp_path):
+    rows = [
+        _row(f"v-{index}", f"sku-{index}", f"https://shop.example/{index}")
+        for index in range(21)
+    ]
+    store, _snapshot, crawls = _seed_force(tmp_path, rows=rows)
+    _link_inflight_job(store, tmp_path, crawls)
+    output = tmp_path / "formal.xlsx"
+
+    with pytest.raises(ForceFinalizeRejected) as excinfo:
+        materialize_forced_frozen_daily_run(
+            store,
+            ProcessLock(tmp_path / "finalize.lock"),
+            DATE,
+            output,
+            max_incomplete=20,
+            accept_unresolved_crawl=True,
+            expected_missing_page_price_rows=21,
+        )
+
+    assert excinfo.value.error_type == "FORCE_FINALIZE_INCOMPLETE_LIMIT_EXCEEDED"
+    assert excinfo.value.readiness.missing_page_price_rows == 21
+    assert not output.exists()
+
+
 # Case 6: crawl-level SUBMIT_UNKNOWN must be refused.
 def test_force_finalize_rejects_crawl_submit_unknown(tmp_path):
     store, _snapshot, crawls = _seed_force(tmp_path)

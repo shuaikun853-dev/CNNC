@@ -16,6 +16,7 @@
 <header class="top">
   <h1>中核 STEP_1 每日价格审计</h1>
   <span class="spacer"></span>
+  <label class="date-control">业务日期 <input type="date" id="business-date-picker" aria-label="业务日期"></label>
   <button class="btn" id="refresh">刷新</button>
 </header>
 
@@ -68,9 +69,20 @@
 <div class="final" id="final">
   <div class="q">为什么还没出最终 Excel?</div>
   <span class="why">正在获取……</span>
+  <div class="price-gap" id="price-gap">
+    <span>未爬到价格 <b id="missing-page-price-count">—</b> 条</span>
+    <span>强制收口上限 <b id="force-closeout-limit">20</b> 条</span>
+    <span class="muted">底层采集工作项 <b id="crawl-work-count">—</b> 个（不等于缺价商品数）</span>
+  </div>
   <div class="final-actions" id="final-actions">
     <button class="btn" id="closeout-btn" disabled>检查收口状态…</button>
+    <button class="btn danger" id="force-closeout-btn" disabled style="display:none">强制收口</button>
     <span class="final-status" id="closeout-status"></span>
+  </div>
+  <div class="force-closeout-confirm" id="force-closeout-confirm" style="display:none">
+    <p class="fc-text"></p>
+    <button class="btn danger" id="force-closeout-ok">确认强制收口</button>
+    <button class="btn" id="force-closeout-cancel">取消</button>
   </div>
   <div class="final-output" id="final-output" style="display:none">
     <span class="lab">输出位置</span>

@@ -107,9 +107,14 @@ def test_healthy_no_attention_single_line():
 
 
 def test_final_text_natural_language_blockers():
-    s = _status(final={**_status()["final"], "blocker_summary": {"remote_pending": 3, "remote_intent": 1, "remote_manual": 2}})
+    s = _status(final={**_status()["final"], "missing_page_price_rows": 7,
+                       "force_closeout_limit": 20,
+                       "blocker_summary": {"remote_pending": 3, "remote_intent": 1,
+                                           "remote_manual": 2, "crawl_pending": 57}})
     out = compute_overall_status(s)
     assert "招商局" in out["final_text"] and "下一次 closeout" in out["final_text"]
+    assert "未爬到价格:7 条" in out["final_text"]
+    assert "57 个底层采集工作项" in out["final_text"]
 
 
 def test_explanation_sentence_boundaries_no_reversal_reading():

@@ -674,6 +674,8 @@ def run_force_finalize_command(
     runtime_root: Path | str,
     max_incomplete: int = 10,
     output_path: Path | str | None = None,
+    accept_unresolved_crawl: bool = False,
+    expected_missing_page_price_rows: int | None = None,
 ) -> dict[str, Any]:
     """Guarded force-finalize: publish the formal final despite remote long tail.
 
@@ -701,6 +703,8 @@ def run_force_finalize_command(
             business_date,
             resolved_output,
             max_incomplete=max_incomplete,
+            accept_unresolved_crawl=accept_unresolved_crawl,
+            expected_missing_page_price_rows=expected_missing_page_price_rows,
         )
     except ForceFinalizeRejected as exc:
         blockers: dict[str, int] = {}
@@ -715,6 +719,7 @@ def run_force_finalize_command(
             "business_date": business_date,
             "output_path": str(resolved_output.resolve()),
             "max_incomplete": max_incomplete,
+            "accept_unresolved_crawl": accept_unresolved_crawl,
             "blockers": blockers,
             "finalized": False,
         }
@@ -727,6 +732,7 @@ def run_force_finalize_command(
             "remote_incomplete_job_count": publication.remote_incomplete_job_count,
             "blocker_count": publication.blocker_count,
             "max_incomplete": max_incomplete,
+            "missing_page_price_rows": publication.readiness.missing_page_price_rows,
             "output_path": str(publication.output_path) if publication.output_path is not None else str(resolved_output.resolve()),
             "forced": publication.forced,
             "manifest_recorded": True,
@@ -743,6 +749,7 @@ def run_force_finalize_command(
         "remote_incomplete_job_count": publication.remote_incomplete_job_count,
         "blocker_count": publication.blocker_count,
         "max_incomplete": max_incomplete,
+        "missing_page_price_rows": publication.readiness.missing_page_price_rows,
         "output_path": str(materialization.output_path),
         "manifest_recorded": True,
         "finalized": True,

@@ -49,7 +49,7 @@ const path = require("path");
 // 2026-09-10:#cnnc-auth-login 初始 style 为空(index.html 不再 display:none,
 // 重新登录入口常驻);#cnnc-auth 返回可变 details 对象(自动展开断言)。
 const cnncFakeElements = new Map();
-const cnncKnownSelectors = new Set(["#cnnc-auth", "#cnnc-auth-chips", "#cnnc-auth-meta", "#cnnc-auth-login", "#closeout-btn"]);
+const cnncKnownSelectors = new Set(["#cnnc-auth", "#cnnc-auth-chips", "#cnnc-auth-meta", "#cnnc-auth-login", "#closeout-btn", "#force-closeout-btn"]);
 global.document = {
   addEventListener() {},
   querySelector(sel) {
@@ -59,8 +59,8 @@ global.document = {
         ? { style: {} }
         : sel === "#cnnc-auth"
           ? { open: false }
-          : sel === "#closeout-btn"
-            ? { textContent: "立即收口", disabled: false, dataset: {} }
+          : sel === "#closeout-btn" || sel === "#force-closeout-btn"
+            ? { textContent: "立即收口", disabled: false, dataset: {}, style: {} }
             : { textContent: "" });
     }
     return cnncFakeElements.get(sel);
@@ -74,6 +74,8 @@ const { createPollController, createSaasFlowPoller, safeProgressText, sfPartialN
         fmtShanghaiDateTime, createCnncAuthFetcher, computeCloseoutBackendRunning,
         applyCloseoutRunningOverlay, isCloseoutWriter, resolveCloseoutActionsDate,
         updateCloseoutUI, pollDelay, inCloseoutWatchWindow, _setCloseoutStateForTest,
+        forceCloseoutAvailability,
+        businessDateFromSearch, datedApiPath,
         armRebuildDrawerSwitch, resolveRebuildDrawerSwitch,
         rebuildOutcomeAdmitsLocalSupersede,
         cpStatusCn, cpStatusPill, cpRowMatchesFilter, cpSortRows,
@@ -1143,6 +1145,10 @@ function test_closeout_running_seam() {
         computeCloseoutBackendRunning(
           [{ action_type: "re-export", status: "RUNNING", business_date: "2026-09-02",
              target: "2026-09-02:7" }], "2026-09-02") === false);
+  check("CLOSE force-closeout RUNNING → true",
+        computeCloseoutBackendRunning(
+          [{ action_type: "force-closeout", status: "RUNNING", business_date: "2026-09-02",
+             target: "2026-09-02:-" }], "2026-09-02") === true);
   check("CLOSE status 非 RUNNING → false",
         computeCloseoutBackendRunning(
           [{ action_type: "closeout", status: "SUCCEEDED", business_date: "2026-09-02",
@@ -1280,9 +1286,54 @@ function test_closeout_r2_round2() {
         html.includes('id="closeout-btn" disabled'), "missing disabled attr");
   check("R2R2 index.html closeout-btn 初始文案 检查收口状态…",
         html.includes("检查收口状态…"), "missing initial text");
+  check("FORCE index.html 有强制收口按钮和业务缺价计数",
+        html.includes('id="force-closeout-btn"') &&
+        html.includes('id="missing-page-price-count"') &&
+        html.includes('id="crawl-work-count"'), "missing force closeout controls");
   // 结束前复位 seam(不影响后续/既有断言)
   _setCloseoutStateForTest({ actionInFlight: false, backendRunning: false,
                              writerRunning: false, summarySeen: false, actionsSeen: false });
+}
+
+function test_force_closeout_availability() {
+  let out = forceCloseoutAvailability({
+    frozen: true, finalized: false, missing_page_price_rows: 7, force_closeout_limit: 20,
+  });
+  check("FORCE 冻结且缺价 7/20 → 可强制收口",
+        out.visible === true && out.enabled === true && out.missing === 7 && out.limit === 20,
+        JSON.stringify(out));
+  out = forceCloseoutAvailability({
+    frozen: true, finalized: false, missing_page_price_rows: 21, force_closeout_limit: 20,
+  });
+  check("FORCE 缺价 21/20 → 禁止", out.visible === true && out.enabled === false,
+        JSON.stringify(out));
+  out = forceCloseoutAvailability({
+    frozen: false, finalized: false, missing_page_price_rows: 7, force_closeout_limit: 20,
+  });
+  check("FORCE 未冻结 → 不显示", out.visible === false && out.enabled === false,
+        JSON.stringify(out));
+  check("FORCE outcome 文案",
+        actionOutcomeText("force-closeout", {
+          status: "SUCCEEDED", outcome: { outcome: "FORCE_FINALIZED", missing_page_price_rows: 7 },
+        }).includes("强制收口完成"));
+}
+
+function test_dashboard_business_date_routing() {
+  check("DATE query 读取历史业务日",
+        businessDateFromSearch("?date=2026-09-16") === "2026-09-16");
+  check("DATE 非法日期格式拒绝",
+        businessDateFromSearch("?date=2026-9-16") === "");
+  check("DATE summary URL 附带业务日",
+        datedApiPath("/dashboard/api/summary", "2026-09-16") ===
+          "/dashboard/api/summary?date=2026-09-16");
+  check("DATE 已有 query 时使用 &",
+        datedApiPath("/dashboard/api/customer-price?filter=all", "2026-09-16") ===
+          "/dashboard/api/customer-price?filter=all&date=2026-09-16");
+  const fs = require("fs");
+  const html = fs.readFileSync(
+    path.join(__dirname, "..", "..", "app", "static", "dashboard", "index.html"), "utf-8");
+  check("DATE 页面提供业务日期选择器",
+        html.includes('id="business-date-picker"'), "missing business date picker");
 }
 
 // R3 P2-1(2026-09-03):opsUnavailable 最高优先级——operator-context 引导失败时
@@ -1577,6 +1628,8 @@ function test_production_identity_seams() {
   await test_sf_poller_broken_poll_still_schedules();
   test_index_html_disk_contract();
   test_closeout_running_seam();
+  test_force_closeout_availability();
+  test_dashboard_business_date_routing();
   test_closeout_overlay_survives_summary_rerenders();
   test_closeout_r2_round2();
   test_closeout_r3_ops_unavailable();

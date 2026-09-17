@@ -290,6 +290,16 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         help="formal output path; defaults to the day's reserved final workbook path",
     )
+    force_finalize.add_argument(
+        "--accept-unresolved-crawl",
+        action="store_true",
+        help="explicit operator mode: accept bounded unresolved crawl states while preserving them",
+    )
+    force_finalize.add_argument(
+        "--expected-missing-page-price-rows",
+        type=int,
+        help="optimistic-lock count confirmed by the dashboard operator",
+    )
     return parser
 
 
@@ -348,6 +358,8 @@ def main(argv: list[str] | None = None) -> int:
             runtime_root=args.runtime_root,
             max_incomplete=args.max_incomplete,
             output_path=args.output,
+            accept_unresolved_crawl=args.accept_unresolved_crawl,
+            expected_missing_page_price_rows=args.expected_missing_page_price_rows,
         )
         print(json.dumps(result, ensure_ascii=False, sort_keys=True))
         return 0 if result.get("outcome") in {"FORCE_FINALIZED", "ALREADY_FINALIZED"} else 2

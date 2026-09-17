@@ -31,11 +31,16 @@ from app.services.incremental_audit_runtime import DEFAULT_RUNTIME_ROOT
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 _AUDIT_SCRIPT = Path("scripts") / "incremental_price_audit.py"
 
-ACTION_TYPES = frozenset({"closeout", "re-export", "rebuild"})
+ACTION_TYPES = frozenset({"closeout", "force-closeout", "re-export", "rebuild"})
 
 # Per-type supervision budget (wall seconds) for the joiner thread; the CLI
 # budgets themselves are smaller (closeout 720s), these add restart headroom.
-_MAX_WAIT_SECONDS = {"closeout": 900.0, "re-export": 420.0, "rebuild": 300.0}
+_MAX_WAIT_SECONDS = {
+    "closeout": 900.0,
+    "force-closeout": 900.0,
+    "re-export": 420.0,
+    "rebuild": 300.0,
+}
 _TERMINATE_GRACE_SECONDS = 10.0
 
 # closeout result codes that map onto a FAILED handle.
@@ -43,6 +48,7 @@ _CLOSEOUT_FAILED_CODES = frozenset({"BLOCKED", "FAILED", "TIMEOUT"})
 _CLOSEOUT_BLOCKED_OUTCOMES = frozenset(
     {"FAILED", "MANUAL_REVIEW_REQUIRED", "DISCOVERY_INCOMPLETE", "INCOMPLETE"}
 )
+_FINALIZATION_ACTION_TYPES = frozenset({"closeout", "force-closeout"})
 
 
 class DashboardActionError(RuntimeError):
@@ -105,6 +111,8 @@ def _closeout_result_code(parsed: dict | None, exit_code: int | None, stdout: st
     blocked = (parsed or {}).get("publication_blocked")
     if publication is not None:
         return "FINALIZED"
+    if raw == "FORCE_FINALIZED" and bool((parsed or {}).get("finalized")):
+        return "FINALIZED"
     if raw == "ALREADY_FINALIZED":
         return "ALREADY_FINALIZED"
     if raw == "ALREADY_RUNNING" or "SKIPPED_ALREADY_RUNNING" in (stdout or ""):
@@ -113,6 +121,8 @@ def _closeout_result_code(parsed: dict | None, exit_code: int | None, stdout: st
         return "BLOCKED"
     if raw == "CLOSEOUT_DEADLINE":
         return "DEADLINE"
+    if raw.startswith("FORCE_FINALIZE_"):
+        return "BLOCKED"
     return "FAILED"
 
 
@@ -168,6 +178,8 @@ class DashboardActionRunner:
         remote_identity: str | None = None,
         timeout_seconds: float | None = None,
         action_id: str | None = None,
+        max_incomplete: int | None = None,
+        expected_missing_page_price_rows: int | None = None,
     ) -> ActionHandle:
         if action_type not in ACTION_TYPES:
             raise DashboardActionError(
@@ -176,7 +188,8 @@ class DashboardActionRunner:
             )
         resolved_action_id = str(action_id) if action_id else uuid.uuid4().hex
         target = f"{business_date}:{remote_job_id if remote_job_id is not None else '-'}"
-        key = (action_type, target)
+        action_group = "closeout" if action_type in _FINALIZATION_ACTION_TYPES else action_type
+        key = (action_group, target)
         handle = ActionHandle(
             action_id=resolved_action_id,
             action_type=action_type,
@@ -205,6 +218,8 @@ class DashboardActionRunner:
             remote_identity=remote_identity,
             timeout_seconds=timeout_seconds,
             action_id=resolved_action_id,
+            max_incomplete=max_incomplete,
+            expected_missing_page_price_rows=expected_missing_page_price_rows,
         )
         run_dir = self._runtime_root / business_date
         # Durable intent precedes the subprocess: a crash between the two
@@ -315,6 +330,8 @@ class DashboardActionRunner:
         remote_identity: str | None,
         timeout_seconds: float | None,
         action_id: str,
+        max_incomplete: int | None,
+        expected_missing_page_price_rows: int | None,
     ) -> list[str]:
         script = str(self._repo_root / _AUDIT_SCRIPT)
         common = [
@@ -331,6 +348,20 @@ class DashboardActionRunner:
                 str(self._runtime_root),
                 "--invocation",
                 "manual",
+            ]
+        if action_type == "force-closeout":
+            return [
+                *common,
+                "force-finalize",
+                "--business-date",
+                business_date,
+                "--runtime-root",
+                str(self._runtime_root),
+                "--max-incomplete",
+                str(int(max_incomplete if max_incomplete is not None else 20)),
+                "--accept-unresolved-crawl",
+                "--expected-missing-page-price-rows",
+                str(int(expected_missing_page_price_rows or 0)),
             ]
         command = "reexport-existing-remote" if action_type == "re-export" else "rebuild-remote-task"
         default_timeout = 180.0 if action_type == "re-export" else 120.0
@@ -400,7 +431,7 @@ class DashboardActionRunner:
                     stdout, _stderr = process.communicate()
             exit_code = process.returncode
             parsed = _parse_last_json_line(stdout or "")
-            if handle.action_type == "closeout":
+            if handle.action_type in _FINALIZATION_ACTION_TYPES:
                 if timed_out:
                     result_code = "TIMEOUT"
                 else:
@@ -408,8 +439,9 @@ class DashboardActionRunner:
                 raw_outcome = str((parsed or {}).get("outcome") or "") or None
                 summary = {
                     "outcome": raw_outcome,
-                    "publication": (parsed or {}).get("publication"),
+                    "publication": (parsed or {}).get("publication") or (parsed or {}).get("output_path"),
                     "publication_blocked": (parsed or {}).get("publication_blocked"),
+                    "missing_page_price_rows": (parsed or {}).get("missing_page_price_rows"),
                 }
                 handle.outcome = {
                     "result_code": result_code,
@@ -451,9 +483,14 @@ class DashboardActionRunner:
             )
         finally:
             with self._lock:
-                current = self._inflight.get((handle.action_type, handle.target))
+                action_group = (
+                    "closeout"
+                    if handle.action_type in _FINALIZATION_ACTION_TYPES
+                    else handle.action_type
+                )
+                current = self._inflight.get((action_group, handle.target))
                 if current == handle.action_id:
-                    self._inflight.pop((handle.action_type, handle.target), None)
+                    self._inflight.pop((action_group, handle.target), None)
 
 
 _RUNNER: DashboardActionRunner | None = None

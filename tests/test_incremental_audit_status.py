@@ -273,3 +273,42 @@ def test_detail_statistics_follow_frozen_snapshot_not_latest(tmp_path):
     # Frozen A still blocks exactly once; the empty latest snapshot must not
     # dilute the frozen-authoritative view to zero.
     assert status["final"]["computed_pending"] == 1
+
+
+def test_final_status_counts_missing_page_price_by_frozen_business_row(tmp_path):
+    root = tmp_path / "runtime"
+    store = _store(root)
+    store.ensure_run(BUSINESS_DATE)
+    rows = []
+    for index in range(4):
+        row = _row(f"doc-{index}", f"sku-{index}")
+        row["extLink"] = f"https://shop.example/{index}"
+        row["__crawl_required"] = True
+        rows.append(row)
+    snapshot = _seed_snapshot(store, rows, "2026-08-11T09:00:00+00:00")
+    token = store.acquire_lease(BUSINESS_DATE, "seed-crawl", 60)
+    store.freeze_snapshot(token, int(snapshot["id"]))
+    crawls = []
+    for row in rows:
+        crawls.append(store.ensure_crawl_work(
+            token,
+            "mall-a",
+            row["skuId"],
+            row["extLink"],
+            "legacy-v1",
+            f"crawl-{row['skuId']}",
+            source_id=row["vCommodityId"],
+        ))
+    store.complete_crawl_work(token, crawls[0]["id"], {
+        "page_price_value": "9.5", "page_price_status": "OK", "page_price_source": "招商局",
+    })
+    store.complete_crawl_work(token, crawls[1]["id"], {
+        "page_price_value": "0", "page_price_status": "PRICE_IS_ZERO", "page_price_source": "招商局",
+    })
+    store.release_lease(token)
+
+    status = collect_runtime_status(business_date=BUSINESS_DATE, runtime_root=root)
+
+    assert status["final"]["page_price_required_rows"] == 4
+    assert status["final"]["missing_page_price_rows"] == 2
+    assert status["final"]["force_closeout_limit"] == 20
