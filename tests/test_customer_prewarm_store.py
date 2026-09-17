@@ -35,6 +35,7 @@ EXPECTED_TABLES = {
     # Issue #13 Round 2: 逐日 observation 与 remote job link 两张增量表
     "prewarm_daily_observations",
     "prewarm_remote_job_links",
+    "prewarm_lifecycle_cursors",
 }
 
 

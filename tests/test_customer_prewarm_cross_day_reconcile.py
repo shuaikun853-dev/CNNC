@@ -920,6 +920,72 @@ def test_cross_day_pass_cap_and_per_job_timeout_are_bounded(tmp_path):
     )
 
 
+def test_cross_day_cap_rotates_persistent_pending_jobs_without_starvation(tmp_path):
+    """Four permanently pending jobs must not starve later historical jobs."""
+    from app.services.legacy_zhaoshang_adapter import (
+        LegacyPriorityOutcome,
+        PriorityStatus,
+    )
+
+    runtime_root = tmp_path / "runtime"
+    prewarm = CustomerPrewarmStore(runtime_root / "customer_prewarm.sqlite3")
+    job_ids = []
+    for index in range(6):
+        paths, job_id = seed_unknown_job(
+            runtime_root,
+            YESTERDAY,
+            _CountingAdapter(),
+            mapping=COMIX,
+            url=f"https://qx.com/fair-priority-{index}.html",
+        )
+        with sqlite3.connect(paths.state_path) as connection:
+            connection.execute(
+                """UPDATE remote_jobs
+                   SET state='PRIORITY_PENDING', remote_identity=? WHERE id=?""",
+                (f"comix|fair-task-{job_id}|fair-number-{job_id}", job_id),
+            )
+            connection.execute(
+                "UPDATE crawl_work SET state='PRIORITY_PENDING' WHERE remote_job_id=?",
+                (job_id,),
+            )
+        seed_remote_candidate(
+            prewarm,
+            f"https://qx.com/fair-priority-bound-{index}.html",
+            job_id,
+            business_date=YESTERDAY,
+            document=f"FAIR-{index}",
+        )
+        job_ids.append(job_id)
+
+    class RecordingUnconfirmedAdapter(_CountingAdapter):
+        def __init__(self):
+            super().__init__()
+            self.priority_task_ids = []
+
+        def prioritize(self, job, *, task_id, task_number, timeout_seconds):
+            self.prioritize_calls += 1
+            self.priority_task_ids.append(task_id)
+            return LegacyPriorityOutcome(PriorityStatus.UNCONFIRMED, weight_type=None)
+
+    adapter = RecordingUnconfirmedAdapter()
+
+    _run_cross_day(runtime_root, prewarm, adapter)
+    first_pass_tasks = list(adapter.priority_task_ids)
+    _run_cross_day(runtime_root, prewarm, adapter)
+    second_pass_tasks = adapter.priority_task_ids[len(first_pass_tasks) :]
+
+    assert first_pass_tasks == [f"fair-task-{job_id}" for job_id in job_ids[:4]]
+    assert set(second_pass_tasks).issuperset(
+        {f"fair-task-{job_id}" for job_id in job_ids[4:]}
+    )
+    assert all(
+        _remote_job_row(paths.state_path, job_id)["state"] == "PRIORITY_PENDING"
+        for job_id in job_ids
+    )
+    assert adapter.reconcile_calls == 0
+    assert adapter.submit_calls == 0
+
+
 def test_expired_absolute_deadline_defers_all_jobs_without_lock_or_remote(tmp_path):
     """Cross-day work must share the process deadline rather than reset it."""
     runtime_root = tmp_path / "runtime"
@@ -1144,6 +1210,160 @@ def test_linkage_rebound_after_found_discards_priority_result(tmp_path):
     assert _remote_job_row(old_paths.state_path, old_job_id)["state"] == "PRIORITY_PENDING"
     assert adapter.reconcile_calls == 1
     assert adapter.prioritize_calls == 1
+    assert adapter.submit_calls == 0
+
+
+def test_priority_commit_holds_linkage_fence_until_historical_write(
+    tmp_path, monkeypatch
+):
+    """A rebind cannot linearize between final linkage check and DB commit."""
+    from threading import Event, Thread
+
+    from app.services.daily_audit_store import DailyAuditStore
+    from app.services.legacy_zhaoshang_adapter import (
+        LegacyPriorityOutcome,
+        PriorityStatus,
+    )
+
+    runtime_root = tmp_path / "runtime"
+    prewarm = CustomerPrewarmStore(runtime_root / "customer_prewarm.sqlite3")
+    old_paths, old_job_id = seed_unknown_job(
+        runtime_root,
+        YESTERDAY,
+        _CountingAdapter(),
+        mapping=COMIX,
+        url="https://qx.com/priority-commit-fence.html",
+    )
+    candidate_id = seed_remote_candidate(
+        prewarm,
+        "https://qx.com/priority-commit-fence.html",
+        old_job_id,
+        business_date=YESTERDAY,
+    )
+    adapter = _CountingAdapter(
+        reconcile_outcome=RECONCILE_FOUND,
+        priority_outcomes=[
+            LegacyPriorityOutcome(PriorityStatus.UNCONFIRMED, weight_type=None),
+            LegacyPriorityOutcome(PriorityStatus.ALREADY_HIGHEST, weight_type=-1),
+        ],
+    )
+    _run_cross_day(runtime_root, prewarm, adapter)
+
+    original = DailyAuditStore.confirm_remote_job_priority_and_crawl_work
+    writer_started = Event()
+    writer_finished = Event()
+    writer_threads = []
+    writer_finished_before_commit = []
+
+    def fenced_commit(store, token, job_id, *, remote_identity):
+        def rebind():
+            writer_started.set()
+            prewarm.record_candidate_result(
+                candidate_id,
+                cache_status="REMOTE_DISPATCHED",
+                remote_job_id=999,
+            )
+            prewarm.record_remote_job_link(TODAY, candidate_id, 999, "test-rebind")
+            writer_finished.set()
+
+        writer = Thread(target=rebind)
+        writer_threads.append(writer)
+        writer.start()
+        assert writer_started.wait(1.0)
+        writer_finished_before_commit.append(writer_finished.wait(0.1))
+        return original(
+            store,
+            token,
+            job_id,
+            remote_identity=remote_identity,
+        )
+
+    monkeypatch.setattr(
+        DailyAuditStore,
+        "confirm_remote_job_priority_and_crawl_work",
+        fenced_commit,
+    )
+
+    _run_cross_day(runtime_root, prewarm, adapter)
+    for writer in writer_threads:
+        writer.join(2.0)
+
+    assert writer_finished_before_commit == [False]
+    assert writer_finished.is_set()
+    assert _remote_job_row(old_paths.state_path, old_job_id)["state"] == "SUBMITTED"
+    assert adapter.reconcile_calls == 1
+    assert adapter.submit_calls == 0
+
+
+def test_found_commit_holds_linkage_fence_until_historical_write(
+    tmp_path, monkeypatch
+):
+    """FOUND ownership cannot change between the fenced check and commit."""
+    from threading import Event, Thread
+
+    from app.services.daily_audit_store import DailyAuditStore
+
+    runtime_root = tmp_path / "runtime"
+    prewarm = CustomerPrewarmStore(runtime_root / "customer_prewarm.sqlite3")
+    old_paths, old_job_id = seed_unknown_job(
+        runtime_root,
+        YESTERDAY,
+        _CountingAdapter(),
+        mapping=COMIX,
+        url="https://qx.com/found-commit-fence.html",
+    )
+    candidate_id = seed_remote_candidate(
+        prewarm,
+        "https://qx.com/found-commit-fence.html",
+        old_job_id,
+        business_date=YESTERDAY,
+    )
+    adapter = _CountingAdapter(reconcile_outcome=RECONCILE_FOUND)
+
+    original = DailyAuditStore.reconcile_remote_job_and_crawl_work
+    writer_started = Event()
+    writer_finished = Event()
+    writer_threads = []
+    writer_finished_before_commit = []
+
+    def fenced_commit(store, token, job_id, *, remote_identity, state):
+        def rebind():
+            writer_started.set()
+            prewarm.record_candidate_result(
+                candidate_id,
+                cache_status="REMOTE_DISPATCHED",
+                remote_job_id=999,
+            )
+            prewarm.record_remote_job_link(TODAY, candidate_id, 999, "test-rebind")
+            writer_finished.set()
+
+        writer = Thread(target=rebind)
+        writer_threads.append(writer)
+        writer.start()
+        assert writer_started.wait(1.0)
+        writer_finished_before_commit.append(writer_finished.wait(0.1))
+        return original(
+            store,
+            token,
+            job_id,
+            remote_identity=remote_identity,
+            state=state,
+        )
+
+    monkeypatch.setattr(
+        DailyAuditStore,
+        "reconcile_remote_job_and_crawl_work",
+        fenced_commit,
+    )
+
+    _run_cross_day(runtime_root, prewarm, adapter)
+    for writer in writer_threads:
+        writer.join(2.0)
+
+    assert writer_finished_before_commit == [False]
+    assert writer_finished.is_set()
+    assert _remote_job_row(old_paths.state_path, old_job_id)["state"] == "SUBMITTED"
+    assert adapter.reconcile_calls == 1
     assert adapter.submit_calls == 0
 
 

@@ -11,6 +11,7 @@ module never creates replacement remote work.
 from __future__ import annotations
 
 import os
+from contextlib import contextmanager
 from datetime import date
 from pathlib import Path
 from typing import Any, Callable
@@ -27,6 +28,7 @@ from app.services.shared_crawl_cache import PRODUCER_CUSTOMER_PREWARM_ZHAOSHANG
 
 CROSS_DAY_RECONCILE_PER_PASS = 4
 CROSS_DAY_RECONCILE_PER_JOB_TIMEOUT_SECONDS = 30.0
+_CROSS_DAY_RECONCILE_CURSOR = "cross-day-reconcile"
 
 _ELIGIBLE_JOB_SQL = """
 SELECT j.id
@@ -56,6 +58,24 @@ def _resolve_dead_threshold(dead_threshold: int | None) -> int:
     from app.services.customer_prewarm_lifecycle import RECONCILE_DEAD_THRESHOLD
 
     return RECONCILE_DEAD_THRESHOLD
+
+
+def _rotate_after_cursor(
+    keys: list[tuple[str, int]], cursor_value: str | None
+) -> list[tuple[str, int]]:
+    if not keys or not cursor_value:
+        return keys
+    try:
+        cursor_day, cursor_job_id = cursor_value.rsplit("|", 1)
+        cursor = (cursor_day, int(cursor_job_id))
+    except (TypeError, ValueError):
+        return keys
+    split_at = next((index for index, key in enumerate(keys) if key > cursor), 0)
+    return keys[split_at:] + keys[:split_at]
+
+
+def _cursor_value(key: tuple[str, int]) -> str:
+    return f"{key[0]}|{key[1]}"
 
 
 def _linked_cross_day_job_keys(
@@ -198,6 +218,10 @@ def run_cross_day_reconcile_phase(
     effective_dead_threshold = _resolve_dead_threshold(dead_threshold)
     try:
         keys = _linked_cross_day_job_keys(prewarm_store, current_business_date)
+        keys = _rotate_after_cursor(
+            keys,
+            prewarm_store.lifecycle_cursor(_CROSS_DAY_RECONCILE_CURSOR),
+        )
         planned = set(
             plan_cross_day_reconcile_jobs(
                 prewarm_store,
@@ -302,6 +326,16 @@ def run_cross_day_reconcile_phase(
                     continue
                 attempted += 1
                 summary["cross_day_reconcile_attempted"] += 1
+                try:
+                    prewarm_store.set_lifecycle_cursor(
+                        _CROSS_DAY_RECONCILE_CURSOR,
+                        _cursor_value(key),
+                    )
+                except Exception as exc:  # noqa: BLE001 - job can still run safely
+                    phase_errors.append(
+                        "cross-day reconcile cursor: "
+                        f"{type(exc).__name__}: {exc}"
+                    )
                 job_deadline = min(
                     deadline,
                     monotonic_value() + float(per_job_timeout_seconds),
@@ -315,7 +349,7 @@ def run_cross_day_reconcile_phase(
                     continue
                 prepared = _reconstruct_prepared_job(get_adapter(), owning_day, job)
 
-                def priority_result_still_owned() -> bool:
+                def linkage_still_current() -> bool:
                     if key in set(
                         _linked_cross_day_job_keys(
                             prewarm_store, current_business_date
@@ -329,8 +363,23 @@ def run_cross_day_reconcile_phase(
                     )
                     return False
 
+                @contextmanager
+                def historical_link_commit_fence():
+                    with prewarm_store.fence_current_remote_job_link(
+                        business_date=owning_day,
+                        remote_job_id=job_id,
+                        producer=PRODUCER_CUSTOMER_PREWARM_ZHAOSHANG,
+                    ) as owned:
+                        if not owned:
+                            summary["cross_day_reconcile_deferred"] += 1
+                            phase_errors.append(
+                                f"cross-day job {owning_day}/{job_id}: candidate "
+                                "linkage changed before historical commit; result discarded"
+                            )
+                        yield owned
+
                 if str(job.get("state") or "") == "PRIORITY_PENDING":
-                    if not priority_result_still_owned():
+                    if not linkage_still_current():
                         continue
                     _confirm_pending_priority_job(
                         prewarm_store=None,
@@ -344,7 +393,7 @@ def run_cross_day_reconcile_phase(
                         monotonic_value=monotonic_value,
                         summary=summary,
                         prepared=prepared,
-                        result_commit_guard=priority_result_still_owned,
+                        result_commit_fence=historical_link_commit_fence,
                     )
                     continue
                 timeout = job_deadline - monotonic_value()
@@ -374,12 +423,15 @@ def run_cross_day_reconcile_phase(
                 if status == "FOUND" and task_id and task_number:
                     mall_key = str(job.get("mall_key") or prepared.mall_key)
                     remote_identity = f"{mall_key}|{task_id}|{task_number}"
-                    store.reconcile_remote_job_and_crawl_work(
-                        token,
-                        job_id,
-                        remote_identity=remote_identity,
-                        state="PRIORITY_PENDING",
-                    )
+                    with historical_link_commit_fence() as commit_allowed:
+                        if not commit_allowed:
+                            continue
+                        store.reconcile_remote_job_and_crawl_work(
+                            token,
+                            job_id,
+                            remote_identity=remote_identity,
+                            state="PRIORITY_PENDING",
+                        )
                     summary["cross_day_reconciled_found"] += 1
                     _confirm_pending_priority_job(
                         prewarm_store=None,
@@ -393,7 +445,7 @@ def run_cross_day_reconcile_phase(
                         monotonic_value=monotonic_value,
                         summary=summary,
                         prepared=prepared,
-                        result_commit_guard=priority_result_still_owned,
+                        result_commit_fence=historical_link_commit_fence,
                     )
                 else:
                     if status == "FOUND":

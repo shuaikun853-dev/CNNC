@@ -114,6 +114,11 @@ CREATE TABLE IF NOT EXISTS prewarm_remote_job_links (
     recorded_at TEXT NOT NULL,
     PRIMARY KEY(business_date, candidate_id, remote_job_id)
 );
+CREATE TABLE IF NOT EXISTS prewarm_lifecycle_cursors (
+    name TEXT PRIMARY KEY,
+    cursor_value TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
 """
 
 CACHE_STATUS_PENDING_LOOKUP = "PENDING_LOOKUP"
@@ -938,6 +943,88 @@ class CustomerPrewarmStore:
                 (int(candidate_id),),
             ).fetchone()
         return dict(row) if row is not None else None
+
+    @staticmethod
+    def _connection_has_current_remote_job_link(
+        connection: sqlite3.Connection,
+        *,
+        business_date: str,
+        remote_job_id: int,
+        producer: str,
+    ) -> bool:
+        rows = connection.execute(
+            """SELECT id FROM prewarm_candidates
+               WHERE cache_status IN ('REMOTE_DISPATCHED', 'REMOTE_REUSED')
+                 AND remote_job_id=?
+               ORDER BY id""",
+            (int(remote_job_id),),
+        ).fetchall()
+        for row in rows:
+            link = connection.execute(
+                """SELECT business_date, remote_job_id, producer
+                   FROM prewarm_remote_job_links
+                   WHERE candidate_id=?
+                   ORDER BY recorded_at DESC, rowid DESC
+                   LIMIT 1""",
+                (int(row["id"]),),
+            ).fetchone()
+            if (
+                link is not None
+                and str(link["business_date"]) == business_date
+                and int(link["remote_job_id"]) == int(remote_job_id)
+                and str(link["producer"]) == producer
+            ):
+                return True
+        return False
+
+    @contextmanager
+    def fence_current_remote_job_link(
+        self,
+        *,
+        business_date: str,
+        remote_job_id: int,
+        producer: str,
+    ) -> Iterator[bool]:
+        """Fence the latest candidate linkage through an external state commit.
+
+        ``BEGIN IMMEDIATE`` serializes every candidate/link writer while the
+        caller performs the short historical-DB transition inside this
+        context.  Remote I/O must happen before entering the fence.
+        """
+        self._assert_writable()
+        business_date_value = self._require_text(business_date, "business_date")
+        producer_value = self._require_text(producer, "producer")
+        with self._transaction(immediate=True) as connection:
+            yield self._connection_has_current_remote_job_link(
+                connection,
+                business_date=business_date_value,
+                remote_job_id=int(remote_job_id),
+                producer=producer_value,
+            )
+
+    def lifecycle_cursor(self, name: str) -> str | None:
+        name_value = self._require_text(name, "name")
+        with self._reader() as connection:
+            row = connection.execute(
+                "SELECT cursor_value FROM prewarm_lifecycle_cursors WHERE name=?",
+                (name_value,),
+            ).fetchone()
+        return str(row["cursor_value"]) if row is not None else None
+
+    def set_lifecycle_cursor(self, name: str, cursor_value: str) -> None:
+        self._assert_writable()
+        name_value = self._require_text(name, "name")
+        cursor_value_text = self._require_text(cursor_value, "cursor_value")
+        now_text = datetime.now(UTC).isoformat(timespec="microseconds")
+        with self._transaction(immediate=True) as connection:
+            connection.execute(
+                """INSERT INTO prewarm_lifecycle_cursors
+                   (name, cursor_value, updated_at) VALUES (?, ?, ?)
+                   ON CONFLICT(name) DO UPDATE SET
+                     cursor_value=excluded.cursor_value,
+                     updated_at=excluded.updated_at""",
+                (name_value, cursor_value_text, now_text),
+            )
 
     def remote_job_producer(self, business_date: str, remote_job_id: int) -> str | None:
         """Producer of any linkage row for (business_date, remote_job_id)."""

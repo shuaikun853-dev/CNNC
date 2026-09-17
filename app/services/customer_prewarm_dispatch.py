@@ -70,6 +70,7 @@ import hashlib
 import json
 import os
 import time
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
@@ -1769,6 +1770,7 @@ def _confirm_pending_priority_job(
     canary_scope: CanaryScope | None = None,
     canary_budget: CanaryLiveBudget | None = None,
     result_commit_guard: Callable[[], bool] | None = None,
+    result_commit_fence: Callable[[], Any] | None = None,
 ) -> bool | None:
     """One prioritize-only confirm for a job still exactly ``PRIORITY_PENDING``
     with a remote identity (fail-closed; never creates or submits).
@@ -1784,6 +1786,8 @@ def _confirm_pending_priority_job(
     ``result_commit_guard`` is a final ownership check for cross-day callers;
     a false result discards otherwise proven remote evidence before any state
     write.  Same-day callers leave it unset and keep their existing behavior.
+    ``result_commit_fence`` additionally serializes the ownership check through
+    the historical state commit when ownership lives in another database.
     """
     if note_targets and prewarm_store is None:
         raise ValueError("prewarm_store is required when candidate notes are requested")
@@ -1844,11 +1848,20 @@ def _confirm_pending_priority_job(
             if result_commit_guard is not None and not result_commit_guard():
                 summary["priority_unconfirmed"] += 1
                 return False
-            store.confirm_remote_job_priority_and_crawl_work(
-                token,
-                job_id,
-                remote_identity=identity,
+            commit_fence = (
+                result_commit_fence()
+                if result_commit_fence is not None
+                else nullcontext(True)
             )
+            with commit_fence as commit_allowed:
+                if not commit_allowed:
+                    summary["priority_unconfirmed"] += 1
+                    return False
+                store.confirm_remote_job_priority_and_crawl_work(
+                    token,
+                    job_id,
+                    remote_identity=identity,
+                )
             summary["priority_confirmed"] += 1
             return True
         summary["priority_unconfirmed"] += 1

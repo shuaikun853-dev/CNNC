@@ -436,10 +436,12 @@ python -m pytest tests\test_incremental_audit_runtime.py tests\test_incremental_
   `PRIORITY_PENDING`，且至少一条 crawl 的 `sku_id LIKE 'zhpq-%'`；普通 STEP1 job fail-closed 跳过。
 - 每个历史 job 使用所属日期自己的 `state.sqlite3`、`ProcessLock` 和 durable lease。
   `LOCK_BUSY` 或历史 DB 缺失只计 deferred，零远程调用、零 attempt 变化；每轮最多 4 job，
-  单 job 最多 30 秒，并与 dispatch、harvest 共享同一个绝对 `--budget-seconds` deadline。
+  durable fairness cursor 从上一轮最后 attempt 后继续，持续 pending 的前四项不会饿死后续 job；单 job 最多 30 秒，
+  并与 dispatch、harvest 共享同一个绝对 `--budget-seconds` deadline。
 - `FOUND` 只恢复历史 DB identity 并沿用既有 priority confirm；若当轮未证明 `weight_type=-1`，job 保持
   `PRIORITY_PENDING`，下一轮只重试 priority confirm，不重复 reconcile、submit 或 create。priority 结果写回前再次验证
-  candidate linkage，失配则丢弃结果；job 与 crawl_work 的 `SUBMITTED` 推进为同一事务。
+  candidate linkage；最终 linkage 验证通过 `customer_prewarm.sqlite3` 的短 `BEGIN IMMEDIATE` fence
+  一直覆盖到历史 DB commit，失配则丢弃结果；job 与 crawl_work 的 `SUBMITTED` 推进为同一事务。
   `NOT_FOUND`/`MANUAL`/不完整 identity
   只令历史 `recovery_attempts + 1`。达到 4 后本阶段仍不建任务，由下一轮当天既有 redispatch
   唯一路径创建 fresh today job。`--plan-only` 仅以 SQLite `mode=ro` 增加
