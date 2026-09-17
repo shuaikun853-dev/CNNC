@@ -425,7 +425,7 @@ def test_stale_submit_unknown_local_success_has_one_successful_final_row(tmp_pat
     ]
     assert len(matching) == 1
     assert matching[0]["__page_price_status"] == "OK"
-    assert matching[0]["__page_price_value"] == "218.37"
+    assert str(matching[0]["__page_price_value"]) == "218.37"
     assert len(built.artifact.audit_response.record_results) == 2
 
 
