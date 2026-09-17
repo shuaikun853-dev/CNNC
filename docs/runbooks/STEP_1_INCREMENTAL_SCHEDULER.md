@@ -353,6 +353,8 @@ formal output path。`NO_RESULT` 价格留空，真实零价保留为 0，未决
 
 - `--shadow` 是默认模式：runtime 装配 SaaS/中核发现、Detail、模型，以及已记录任务的 legacy
   `wait-export-only` / 精确 unknown-submit 对账，但没有 crawl planner 或 submitter，不能创建招商局任务。
+  它不是本地网络 dry-run：已有 remote job 满足上文时间、最终远端查询成功和 exact URL 原子 claim 门禁时，
+  仍会执行固定 revision 的 8 站本地自动兜底并持久化结果；需要零本地请求时不得对含 eligible work 的状态运行 tick。
 - `--enable-remote-writes` 才接通受控 legacy `create-only`；旧名 `--enable-zhaoshang` 暂作兼容别名。
   它先把精确成员、模板和 immutable payload 持久化，
   再发起正式建任务。它是写能力，必须有明确授权；注册预览默认不携带该参数，生产注册必须显式加入。
