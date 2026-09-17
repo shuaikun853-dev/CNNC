@@ -28,7 +28,7 @@ python -m pytest tests -q
 ### 按改动范围
 
 ```powershell
-# 第一步审计、模型、Excel、cURL 和爬价回填
+# 第一步审计、模型、Excel、cURL、爬价回填及 multi-site 并发 claim/锁定 final/SUCCESS 价格/全表终态/双 Git 门禁（全 fake worker）
 python -m pytest tests\test_work_01_saas_approval_json_audit.py -q
 
 # SaaS / 招商局 Token 初始化、Rotation、原子保存、并发锁和只读 401 单次重试
@@ -136,7 +136,6 @@ Get-ChildItem runtime -Recurse -Filter BATCH_STATE.md |
 7. 没有真实密钥、Cookie、Token、账号、密码或连接串。
 
 ## 4. 第一步验收
-
 权威流程：`docs/runbooks/STEP_1_PRICE_AUDIT.md`。
 
 ### 运行前
@@ -162,6 +161,7 @@ Get-ChildItem runtime -Recurse -Filter BATCH_STATE.md |
 - 页面价 0 使用 `PRICE_IS_ZERO`/“价格为0”并整行高亮。
 - 任意后补价格都重新计算 `page_vs_customer_check`、`price_changed`、`over_30pct`、`final_decision`。
 - 缺价时先有清单和授权门，未授权不启动本地脚本。
+- multi-site 首轮只生成 review/manifest 并锁定候选数、清单及文件 SHA-256、已审查 Git 提交 `95437150efcf7cae7412d212c1fa49d932a42a80`，设 `WAITING_USER`且零爬取；计划失败只用 review 恢复入口，不重跑第一步；二次授权后的独立续跑不重跑招商局，不继承认证/模型/数据库密钥，并严格对账每站输入输出；初始化/建任务/启用/提优证据异常、exit 2/3、部分/外来/重复输出都不生成 formal final，也不自动重跑。
 - 驳回和通过都不是第一步默认动作；驳回仅限指定最终 Excel，受控通过可用指定最终 Excel，或用户在同一授权消息中明确指定为本轮结果表的 `saas_audit_review_*.xlsx`。两者都必须有候选数、清单 SHA-256、写前待审核对、逐批 `rspCode=0000` 证据和写后目标无遗留；驳回固定使用 `data/sass-bohui.curl`，`--fill-colors yellow-only --require-customer-price` 必须只选 F 列黄色且表头“客户价”非空的行；通过固定使用 `data/sass-tongguo.curl` 并排除 F 列红/黄色行，`--require-customer-price` 必须再排除表头“客户价”的空值和空白字符串，数值 0 视为非空。
 
 重点回归：
