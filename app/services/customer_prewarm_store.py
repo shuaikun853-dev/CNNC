@@ -740,10 +740,17 @@ class CustomerPrewarmStore:
         return [dict(row) for row in rows]
 
     def list_unique_cache_misses(self) -> list[dict[str, Any]]:
-        """Stable seam for the follow-up prewarm phase: PENDING_PREWARM only."""
+        """Candidates eligible for routing/re-routing in the prewarm phase.
+
+        ROUTING_BLOCKED is intentionally retried: the store transition matrix
+        permits reclassification after a mall mapping is added or restored.
+        Truly unmapped URLs remain ROUTING_BLOCKED after the next pass.
+        """
         with self._reader() as connection:
             rows = connection.execute(
-                "SELECT * FROM prewarm_candidates WHERE cache_status='PENDING_PREWARM' ORDER BY id"
+                """SELECT * FROM prewarm_candidates
+                   WHERE cache_status IN ('PENDING_PREWARM', 'ROUTING_BLOCKED')
+                   ORDER BY id"""
             ).fetchall()
         return [dict(row) for row in rows]
 
