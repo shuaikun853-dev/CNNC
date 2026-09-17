@@ -97,6 +97,7 @@ jobs:
           tests/test_customer_price_projection.py
           tests/test_customer_reference_routing.py
           tests/test_customer_prewarm_dispatch.py
+          tests/test_customer_prewarm_cross_day_reconcile.py
           tests/test_customer_prewarm_dispatch_cli.py
           tests/test_detail_business_retry.py
           tests/test_incremental_price_audit_finalize.py

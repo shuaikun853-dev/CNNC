@@ -306,34 +306,32 @@ def run_cross_day_reconcile_phase(
                     deadline,
                     monotonic_value() + float(per_job_timeout_seconds),
                 )
+                if job_deadline - monotonic_value() < SUBMIT_MIN_SECONDS:
+                    summary["cross_day_reconcile_deferred"] += 1
+                    phase_errors.append(
+                        f"cross-day job {owning_day}/{job_id}: per-job budget "
+                        "exhausted; deferred"
+                    )
+                    continue
                 prepared = _reconstruct_prepared_job(get_adapter(), owning_day, job)
-                if str(job.get("state") or "") == "PRIORITY_PENDING":
-                    if key not in set(
+
+                def priority_result_still_owned() -> bool:
+                    if key in set(
                         _linked_cross_day_job_keys(
                             prewarm_store, current_business_date
                         )
                     ):
-                        summary["cross_day_reconcile_deferred"] += 1
-                        phase_errors.append(
-                            f"cross-day job {owning_day}/{job_id}: candidate linkage "
-                            "changed before priority confirm; skipped"
-                        )
+                        return True
+                    summary["cross_day_reconcile_deferred"] += 1
+                    phase_errors.append(
+                        f"cross-day job {owning_day}/{job_id}: candidate linkage "
+                        "changed during priority confirm; result discarded"
+                    )
+                    return False
+
+                if str(job.get("state") or "") == "PRIORITY_PENDING":
+                    if not priority_result_still_owned():
                         continue
-
-                    def priority_result_still_owned() -> bool:
-                        if key in set(
-                            _linked_cross_day_job_keys(
-                                prewarm_store, current_business_date
-                            )
-                        ):
-                            return True
-                        summary["cross_day_reconcile_deferred"] += 1
-                        phase_errors.append(
-                            f"cross-day job {owning_day}/{job_id}: candidate linkage "
-                            "changed during priority confirm; result discarded"
-                        )
-                        return False
-
                     _confirm_pending_priority_job(
                         prewarm_store=None,
                         store=store,
@@ -395,6 +393,7 @@ def run_cross_day_reconcile_phase(
                         monotonic_value=monotonic_value,
                         summary=summary,
                         prepared=prepared,
+                        result_commit_guard=priority_result_still_owned,
                     )
                 else:
                     if status == "FOUND":

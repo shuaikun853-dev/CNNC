@@ -1098,6 +1098,55 @@ def test_linkage_rebound_during_priority_discards_proven_result(tmp_path):
     assert adapter.submit_calls == 0
 
 
+def test_linkage_rebound_after_found_discards_priority_result(tmp_path):
+    """The same ownership fence must protect immediate FOUND confirmation."""
+    from app.services.legacy_zhaoshang_adapter import (
+        LegacyPriorityOutcome,
+        PriorityStatus,
+    )
+
+    runtime_root = tmp_path / "runtime"
+    prewarm = CustomerPrewarmStore(runtime_root / "customer_prewarm.sqlite3")
+    old_paths, old_job_id = seed_unknown_job(
+        runtime_root,
+        YESTERDAY,
+        _CountingAdapter(),
+        mapping=COMIX,
+        url="https://qx.com/rebound-after-found.html",
+    )
+    candidate_id = seed_remote_candidate(
+        prewarm,
+        "https://qx.com/rebound-after-found.html",
+        old_job_id,
+        business_date=YESTERDAY,
+    )
+
+    class RebindingPriorityAdapter(_CountingAdapter):
+        def prioritize(self, job, *, task_id, task_number, timeout_seconds):
+            self.prioritize_calls += 1
+            prewarm.record_candidate_result(
+                candidate_id,
+                cache_status="REMOTE_DISPATCHED",
+                remote_job_id=999,
+            )
+            prewarm.record_remote_job_link(TODAY, candidate_id, 999, "test-rebind")
+            return LegacyPriorityOutcome(
+                PriorityStatus.ALREADY_HIGHEST,
+                weight_type=-1,
+            )
+
+    adapter = RebindingPriorityAdapter(reconcile_outcome=RECONCILE_FOUND)
+
+    summary = _run_cross_day(runtime_root, prewarm, adapter)
+
+    assert summary["cross_day_reconciled_found"] == 1
+    assert summary["cross_day_reconcile_deferred"] == 1
+    assert _remote_job_row(old_paths.state_path, old_job_id)["state"] == "PRIORITY_PENDING"
+    assert adapter.reconcile_calls == 1
+    assert adapter.prioritize_calls == 1
+    assert adapter.submit_calls == 0
+
+
 def test_plan_only_reports_cross_day_jobs_with_zero_write_lock_adapter_or_remote(
     tmp_path, monkeypatch
 ):
