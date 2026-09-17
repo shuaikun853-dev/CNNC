@@ -55,6 +55,10 @@ header.top h1{font-size:15px;margin:0;font-weight:600}
 .zs .lab{color:var(--muted);font-size:12px;margin-right:2px}
 .zs .run{color:var(--run)} .zs .warn{color:var(--warn)} .zs .err{color:var(--err)} .zs .ok{color:var(--ok)}
 .zs .more{margin-left:auto}
+.local-fallback{border-top:1px solid var(--line);border-bottom:1px solid var(--line);padding:8px 2px;margin-bottom:10px;font-size:12.5px;overflow-wrap:anywhere}
+.local-fallback-main{display:flex;gap:12px;flex-wrap:wrap;align-items:baseline}
+.local-fallback-detail{font-size:11.5px;color:var(--muted);margin-top:3px}
+.local-fallback-links{max-height:150px;overflow:auto;margin-top:5px;padding-top:4px;border-top:1px dashed var(--line);font:11px var(--mono);color:var(--muted);white-space:pre-wrap}
 /* 最终表 */
 .final{background:var(--surface);border:1px solid var(--line);border-radius:var(--radius);box-shadow:var(--shadow);
   padding:11px 13px;margin-bottom:10px;font-size:13.5px}

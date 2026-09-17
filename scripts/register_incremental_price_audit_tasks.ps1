@@ -103,9 +103,9 @@ function New-WeeklyRepetitionTrigger([datetime] $StartAt, [string] $Interval, [s
 }
 
 # One task, four weekday-only triggers.  Trigger A keeps the daytime 15-minute
-# baseline and ends before the peak; Trigger B wakes every 5 minutes through
-# 17:00-17:55 (17:00-17:50 full ticks routed by the runner plus the 17:55
-# harvest-only drain); Trigger C offers a closeout start every 5 minutes from
+# baseline and ends before the peak; Trigger B wakes every 3 minutes through
+# 17:00-17:57 and every wake is a full tick with fallback eligibility;
+# Trigger C offers a closeout start every 5 minutes from
 # 18:00 through 20:00.  Trigger D is a one-shot 20:35 safety closeout: a 19:55
 # run can hold the writer past the dropped 20:00 trigger, and the PT32M
 # ExecutionTimeLimit guarantees any 20:00 run is gone by 20:32, so 20:35 is
@@ -114,7 +114,7 @@ function New-WeeklyRepetitionTrigger([datetime] $StartAt, [string] $Interval, [s
 # rather than queued or parallelized.
 $triggerSpecs = @(
     [pscustomobject]@{ Name = "Baseline"; Interval = "PT15M"; At = $StartAt; LastStart = "16:45" }
-    [pscustomobject]@{ Name = "Peak"; Interval = "PT5M"; At = "17:00"; LastStart = "17:55" }
+    [pscustomobject]@{ Name = "Peak"; Interval = "PT3M"; At = "17:00"; LastStart = "17:57" }
     [pscustomobject]@{ Name = "Closeout"; Interval = "PT5M"; At = "18:00"; LastStart = "20:00" }
     [pscustomobject]@{ Name = "SafetyCloseout"; Interval = $null; At = "20:35"; LastStart = "20:35" }
 )
@@ -175,8 +175,8 @@ $plan = [pscustomobject]@{
     StartBoundary = $triggerPlans[0].StartBoundary
     LastPlannedStart = $triggerPlans[-1].LastPlannedStart
     Triggers = $triggerPlans
-    TickTimes = "$($triggerPlans[0].StartBoundary)-16:00 hourly; 17:00-17:50 every 5 minutes"
-    HarvestOnlyTimes = "09:15-16:45 quarter-hour slots and the 17:55 drain (sweep existing Zhaoshang remote jobs only; no SaaS discovery, Detail, Model, submit, or finalize)"
+    TickTimes = "$($triggerPlans[0].StartBoundary)-16:00 hourly; 17:00-17:57 every 3 minutes"
+    HarvestOnlyTimes = "09:15-16:45 quarter-hour slots (sweep existing Zhaoshang remote jobs only; no SaaS discovery, Detail, Model, submit, or finalize)"
     CloseoutHours = "18:00-20:00 every 5 minutes plus a one-shot 20:35 safety closeout (wall budget $CloseoutBudgetSeconds s; IgnoreNew drops overlaps; 20:35 is the last automatic start)"
     FinalizeHours = "none after 20:35; operators run an explicit manual closeout instead"
 }

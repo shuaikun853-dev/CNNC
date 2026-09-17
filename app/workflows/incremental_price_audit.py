@@ -22,7 +22,18 @@ from urllib import error
 
 from app.services import customer_price_semantics
 from app.services.customer_price_semantics import DetailBusinessRetryRequired
-from app.services.daily_audit_store import DailyAuditStore, LeaseToken, LeaseUnavailable, ProcessLock
+from app.services.daily_audit_store import (
+    DailyAuditStore,
+    LeaseToken,
+    LeaseUnavailable,
+    ProcessLock,
+    RemoteIntentConflict,
+)
+from app.services.incremental_local_fallback import run_incremental_local_fallback
+from app.services.page_price_semantics import (
+    remote_job_is_closed_by_local_fallback,
+    valid_page_price_result,
+)
 from app.services.remote_running_recovery import (
     RECOVERY_CALLBACK_TIMEOUT_SECONDS,
     run_running_recovery_pass,
@@ -215,6 +226,9 @@ class TickDependencies:
     # exception is caught below and only counted - it can never change the
     # tick outcome, trace, approval, closeout, price or model behaviour.
     prewarm_intake: Callable[[str, Sequence[Mapping[str, Any]]], None] | None = None
+    # Incremental-only automatic recovery. Full STEP_1 keeps its independent
+    # count/SHA/manual authorization gate.
+    local_fallback: Callable[[Sequence[Mapping[str, Any]], str], Mapping[int, Mapping[str, Any]]] | None = None
     monotonic: Callable[[], float] = time.monotonic
     wall_clock: Callable[[], datetime] = lambda: datetime.now(UTC)
 
@@ -357,6 +371,7 @@ def _harvest(
     config: TickConfig,
     *,
     skip_job_ids: frozenset[int] | set[int] = frozenset(),
+    checked_job_ids: set[int] | None = None,
 ) -> set[int]:
     """Sweep every eligible remote job once, in batches, within one round.
 
@@ -385,8 +400,10 @@ def _harvest(
         if not budget.can_start_heavy():
             break
         batch = snapshot[start : start + config.harvest_batch_size]
-        _harvest_batch(store, token, deps, budget, counters, config, batch)
-        swept.update(int(job["id"]) for job in batch)
+        swept.update(_harvest_batch(
+            store, token, deps, budget, counters, config, batch,
+            checked_job_ids=checked_job_ids,
+        ))
     return swept
 
 
@@ -398,7 +415,9 @@ def _harvest_batch(
     counters: dict[str, int],
     config: TickConfig,
     jobs: Sequence[Mapping[str, Any]],
-) -> None:
+    *,
+    checked_job_ids: set[int] | None = None,
+) -> set[int]:
     claimed = []
     claim_limits: dict[int, tuple[int, float]] = {}
     for job in jobs:
@@ -413,7 +432,7 @@ def _harvest_batch(
             claimed.append(claim)
             claim_limits[int(claim["id"])] = (max_attempts, max_elapsed_seconds)
     if not claimed:
-        return
+        return set()
     counters["harvest_batches"] = counters.get("harvest_batches", 0) + 1
     counters["harvest_swept"] = counters.get("harvest_swept", 0) + len(claimed)
     store.renew_lease(token, max(1, budget.remaining() + budget.reserve_seconds))
@@ -429,11 +448,11 @@ def _harvest_batch(
         for job in claimed:
             max_attempts, max_elapsed_seconds = claim_limits[int(job["id"])]
             store.record_harvest(token, int(job["id"]), elapsed_seconds=elapsed, max_attempts=max_attempts, max_elapsed_seconds=max_elapsed_seconds, error=_safe_error(exc))
-        return
+        return set()
     elapsed = budget.monotonic() - started
     for job in claimed:
         job_id = int(job["id"])
-        evidence = result.get(job_id) or result.get(str(job_id))
+        evidence = result.get(job_id) if job_id in result else result.get(str(job_id))
         evidence_elapsed = elapsed
         if isinstance(evidence, Mapping):
             try:
@@ -446,6 +465,8 @@ def _harvest_batch(
             max_attempts, max_elapsed_seconds = claim_limits[job_id]
             store.record_harvest(token, job_id, elapsed_seconds=elapsed, max_attempts=max_attempts, max_elapsed_seconds=max_elapsed_seconds)
             continue
+        if checked_job_ids is not None:
+            checked_job_ids.add(job_id)
         if evidence.get("manual_error"):
             store.mark_remote_manual(token, job_id, str(evidence["manual_error"]))
             continue
@@ -453,6 +474,15 @@ def _harvest_batch(
         manual_crawl_results: list[tuple[int, str]] = []
         if isinstance(crawl_results, Mapping):
             for raw_crawl_id, crawl_result in crawl_results.items():
+                existing = store.get_crawl_work(int(raw_crawl_id))
+                if existing is not None and existing.get("state") == "SUCCESS":
+                    try:
+                        prior = json.loads(str(existing.get("result_json") or "{}"))
+                    except (TypeError, ValueError):
+                        prior = {}
+                    if isinstance(prior, Mapping) and str(prior.get("page_price_source") or "").startswith("本地兜底:"):
+                        counters["late_remote_ignored"] = counters.get("late_remote_ignored", 0) + 1
+                        continue
                 if isinstance(crawl_result, Mapping) and crawl_result.get("manual"):
                     manual_crawl_results.append(
                         (
@@ -484,7 +514,25 @@ def _harvest_batch(
                 elif isinstance(crawl_result, Mapping) and crawl_result.get("terminal"):
                     store.fail_crawl_work(token, int(raw_crawl_id), str(crawl_result.get("error", "terminal crawler result")), retryable=False)
                 else:
-                    store.complete_crawl_work(token, int(raw_crawl_id), crawl_result)
+                    try:
+                        store.complete_crawl_work(token, int(raw_crawl_id), crawl_result)
+                    except RemoteIntentConflict:
+                        existing = store.get_crawl_work(int(raw_crawl_id))
+                        existing_result: Mapping[str, Any] = {}
+                        if existing is not None and existing.get("result_json"):
+                            try:
+                                parsed = json.loads(str(existing["result_json"]))
+                                if isinstance(parsed, Mapping):
+                                    existing_result = parsed
+                            except (TypeError, ValueError):
+                                pass
+                        if not (
+                            existing is not None
+                            and existing.get("state") == "SUCCESS"
+                            and str(existing_result.get("page_price_source") or "").startswith("本地兜底:")
+                        ):
+                            raise
+                        counters["late_remote_ignored"] = counters.get("late_remote_ignored", 0) + 1
                 counters["crawl_harvested"] += 1
         state = str(evidence.get("state", "RUNNING"))
         remote_identity = str(evidence.get("remote_identity") or store.get_remote_job(job_id).get("remote_identity") or "")
@@ -528,6 +576,7 @@ def _harvest_batch(
             max_elapsed_seconds=max_elapsed_seconds,
             error=retryable_error,
         )
+    return {int(job["id"]) for job in claimed}
 
 
 def _stage(
@@ -1065,6 +1114,24 @@ def _backlog(
     stages = store.list_stage_work(token)
     crawls = store.list_crawl_work(token)
     jobs = store.list_remote_jobs(token)
+    linked_job_ids = {
+        int(work["remote_job_id"])
+        for work in crawls
+        if work.get("remote_job_id") is not None
+    }
+    crawls_by_remote_job: dict[int, list[Mapping[str, Any]]] = {}
+    for work in crawls:
+        if work.get("remote_job_id") is not None:
+            crawls_by_remote_job.setdefault(int(work["remote_job_id"]), []).append(work)
+    local_closed_job_ids = {
+        job_id
+        for job_id, crawl_rows in crawls_by_remote_job.items()
+        if remote_job_is_closed_by_local_fallback(crawl_rows)
+    }
+
+    def _remote_blocks(job: Mapping[str, Any]) -> bool:
+        job_id = int(job["id"])
+        return job_id not in linked_job_ids or job_id not in local_closed_job_ids
     missing_stages = 0
     # DETAIL rows are only re-scoped when the caller passes an authoritative
     # snapshot.  ``None`` means "no authoritative snapshot this pass"
@@ -1168,9 +1235,67 @@ def _backlog(
         "customer_absent_skipped": customer_absent_skipped,
         "customer_price_success_blockers": customer_price_success_blockers,
         "crawl_pending": sum(work["state"] in {"PENDING", "RUNNING", "RETRYABLE_FAILED", "SUBMITTED", "EXPORTED", "SUBMIT_UNKNOWN"} for work in crawls),
-        "remote_pending": sum(job["state"] in {"PRIORITY_PENDING", "SUBMITTED", "RUNNING", "EXPORTED"} for job in jobs),
-        "remote_unknown": sum(job["state"] == "SUBMIT_UNKNOWN" for job in jobs),
-        "remote_manual": sum(job["state"] == "MANUAL_REQUIRED" for job in jobs),
+        "remote_pending": sum(_remote_blocks(job) and job["state"] in {"PRIORITY_PENDING", "SUBMITTED", "RUNNING", "EXPORTED"} for job in jobs),
+        "remote_unknown": sum(_remote_blocks(job) and job["state"] == "SUBMIT_UNKNOWN" for job in jobs),
+        "remote_manual": sum(_remote_blocks(job) and job["state"] == "MANUAL_REQUIRED" for job in jobs),
+    }
+
+
+def _final_remote_check_for_local_fallback(
+    store: DailyAuditStore,
+    token: LeaseToken,
+    deps: TickDependencies,
+    budget: TickBudget,
+    candidates: Sequence[Mapping[str, Any]],
+) -> set[int]:
+    """Perform one final read-only remote query and persist exact prices only."""
+    if deps.harvest is None or not candidates:
+        return set()
+    candidate_ids = {int(candidate["id"]) for candidate in candidates}
+    job_ids = sorted({
+        int(candidate["remote_job_id"])
+        for candidate in candidates
+        if candidate.get("remote_job_id") is not None
+    })
+    jobs: list[dict[str, Any]] = []
+    for job_id in job_ids:
+        job = store.get_remote_job(job_id)
+        if job is not None:
+            jobs.append({**job, "crawl_work": store.crawl_work_for_job(job_id)})
+    if not jobs:
+        return set()
+    result = deps.harvest(jobs, budget.callback_timeout(30.0)) or {}
+    for job in jobs:
+        job_id = int(job["id"])
+        evidence = result.get(job_id) if job_id in result else result.get(str(job_id))
+        if not isinstance(evidence, Mapping):
+            continue
+        crawl_results = evidence.get("crawl_results")
+        if not isinstance(crawl_results, Mapping):
+            continue
+        for raw_id, crawl_result in crawl_results.items():
+            crawl_id = int(raw_id)
+            if (
+                crawl_id not in candidate_ids
+                or not isinstance(crawl_result, Mapping)
+                or not valid_page_price_result(crawl_result)
+            ):
+                continue
+            try:
+                store.complete_crawl_work(token, crawl_id, crawl_result)
+            except RemoteIntentConflict:
+                # An already terminal remote no-result remains immutable here;
+                # local fallback has its own audited supersession transition.
+                continue
+    return {
+        int(job["id"])
+        for job in jobs
+        if isinstance(
+            result.get(int(job["id"]))
+            if int(job["id"]) in result
+            else result.get(str(job["id"])),
+            Mapping,
+        )
     }
 
 
@@ -1532,10 +1657,14 @@ def run_incremental_tick(
             return TickSummary("BUDGET_EXHAUSTED", tuple(trace), counters, backlog, None)
         trace.append("harvest")
         swept_remote_jobs: set[int] = set()
+        checked_remote_jobs: set[int] = set()
         if skip_opening_harvest:
             trace.append("harvest_deferred")
         else:
-            swept_remote_jobs = _harvest(store, token, deps, budget, counters, config)
+            swept_remote_jobs = _harvest(
+                store, token, deps, budget, counters, config,
+                checked_job_ids=checked_remote_jobs,
+            )
         if not budget.can_start_heavy():
             trace.append("checkpoint")
             backlog = _backlog(store, token)
@@ -1649,10 +1778,11 @@ def run_incremental_tick(
             trace.append("post_harvest")
             # Jobs already checked by this run's opening sweep must not be
             # polled twice in one tick; only submissions made after it apply.
-            _harvest(
+            swept_remote_jobs.update(_harvest(
                 store, token, deps, budget, counters, config,
                 skip_job_ids=swept_remote_jobs,
-            )
+                checked_job_ids=checked_remote_jobs,
+            ))
         if deps.remote_recovery_probe is not None and budget.can_start_heavy():
             # Tail-position recovery: core intake (discovery/detail/model/
             # submit/post-harvest) has already claimed its budget, and every
@@ -1684,6 +1814,30 @@ def run_incremental_tick(
             )
             for key, value in recovery_counters.items():
                 counters[key] = counters.get(key, 0) + int(value)
+        local_fallback_metrics: dict[str, Any] = {}
+        if (
+            deps.local_fallback is not None
+            and deps.harvest is not None
+            and budget.can_start_heavy()
+        ):
+            trace.append("local_fallback")
+            fallback_now = deps.wall_clock()
+            fallback_tick_id = fallback_now.astimezone(UTC).isoformat(timespec="seconds")
+            local_fallback_metrics = run_incremental_local_fallback(
+                store,
+                token,
+                now=fallback_now,
+                tick_id=fallback_tick_id,
+                final_remote_check=lambda candidates: _final_remote_check_for_local_fallback(
+                    store, token, deps, budget, candidates
+                ),
+                execute=lambda claims: deps.local_fallback(claims, fallback_tick_id),
+                checked_remote_job_ids=checked_remote_jobs,
+            )
+            counters["local_fallback_pending"] = int(local_fallback_metrics["pending"])
+            counters["local_fallback_running"] = int(local_fallback_metrics["running"])
+            counters["local_fallback_success"] = int(local_fallback_metrics["success"])
+            counters["local_fallback_failed"] = int(local_fallback_metrics["failed"])
         trace.append("checkpoint")
         backlog = _backlog(store, token, snapshot_items)
         waiting_source_count = False
@@ -1784,7 +1938,10 @@ def run_incremental_tick(
             + backlog["detail_terminal"]
             + backlog["customer_price_success_blockers"]
         )
-        store.update_daily_metrics(token, {**counters, "final_pending": final_pending})
+        store.update_daily_metrics(
+            token,
+            {**counters, "final_pending": final_pending, "local_fallback": local_fallback_metrics},
+        )
         final_run = store.get_run(config.business_date)
         return TickSummary(outcome, tuple(trace), counters, backlog, final_run["frozen_snapshot_id"] if final_run else None)
     except Exception as exc:
