@@ -4,6 +4,9 @@ body.offline .conn-lost{display:block}
 body.offline .wrap{opacity:.55}
 header.top{display:flex;align-items:center;gap:10px;padding:10px 0 6px;flex-wrap:wrap}
 header.top h1{font-size:15px;margin:0;font-weight:600}
+.date-control{display:inline-flex;align-items:center;gap:6px;color:var(--muted);font-size:12px}
+.date-control input{border:1px solid var(--line2);border-radius:var(--radius);background:var(--surface);
+  color:var(--text);font:inherit;padding:2px 6px}
 .spacer{flex:1}
 /* HERO 主状态卡 */
 .hero{background:var(--surface);border:1px solid var(--line);border-left-width:5px;border-radius:var(--radius);
@@ -57,6 +60,9 @@ header.top h1{font-size:15px;margin:0;font-weight:600}
   padding:11px 13px;margin-bottom:10px;font-size:13.5px}
 .final.ok{border-color:#bbf7d0}
 .final .q{font-weight:600;margin-bottom:2px}
+.price-gap{display:flex;align-items:center;gap:14px;flex-wrap:wrap;margin-top:7px;padding-top:7px;
+  border-top:1px dashed var(--line);font-size:12.5px}
+.price-gap b{font-size:15px}.price-gap .muted{color:var(--muted)}
 /* 二级:任务全表 + 抽屉 + 技术详情 */
 .more-block{display:none}
 .more-block.show{display:block}
@@ -103,6 +109,8 @@ td.mono{max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowra
 .rebuild-confirm{margin-top:8px;padding:8px 10px;border:1px solid var(--err);border-radius:var(--radius);background:var(--err-soft);font-size:12px}
 .rebuild-confirm p{margin:0 0 8px}
 .rebuild-confirm .btn{margin-right:8px}
+.force-closeout-confirm{margin-top:8px;padding:8px 10px;border:1px solid var(--err);border-radius:var(--radius);background:var(--err-soft);font-size:12px}
+.force-closeout-confirm p{margin:0 0 8px}.force-closeout-confirm .btn{margin-right:8px}
 .final-actions{display:flex;align-items:center;gap:10px;margin-top:6px;flex-wrap:wrap}
 #closeout-status{font-size:12.5px;color:var(--muted);overflow-wrap:anywhere}
 .final-output{display:flex;align-items:center;gap:8px;margin-top:6px;flex-wrap:wrap;font-size:12.5px}
