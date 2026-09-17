@@ -127,7 +127,7 @@ def _zs_summary(s: Mapping, recovering: int, recovery_exhausted_invalid: int = 0
 # 显示进行中;锁 active 但 command 缺失(如无 owner 的 force-finalize)按
 # "不能证明是收口"保守判 False。finalize 与 closeout 同为收尾出版链
 # (closeout 锁内完成冻结→观察→finalize),独立 finalize 命令是同一链条尾部。
-_CLOSEOUT_WRITER_COMMANDS = frozenset({"closeout", "finalize"})
+_CLOSEOUT_WRITER_COMMANDS = frozenset({"closeout", "finalize", "force-finalize"})
 
 
 def _closeout_writer_active(s: Mapping) -> bool:
@@ -221,13 +221,20 @@ def _final_text(s: Mapping, closeout_running: bool = False) -> tuple[str, str]:
             text += ";文件存在校验:" + ("通过" if f["output_exists"] else "失败,请检查")
         return text + "。", state
     b = f.get("blocker_summary") or {}
+    missing_prefix = ""
+    if "missing_page_price_rows" in f:
+        missing_prefix = (
+            f"未爬到价格:{int(f.get('missing_page_price_rows') or 0)} 条"
+            f"(强制收口上限 {int(f.get('force_closeout_limit') or 20)} 条)。"
+        )
     mapping = [("remote_pending", "个招商局任务仍在执行/待回收"), ("remote_intent", "个任务已排队待提交"),
                ("remote_unknown", "个任务提交结果待确认"), ("remote_manual", "项招商局任务需人工"),
                ("model_pending", "条模型处理未完成"), ("model_terminal", "条模型终态失败"),
                ("detail_terminal", "条客户价获取失败(重试耗尽)"),
                ("customer_price_absent_proven", "条客户价确定性缺失(无详情身份/未提供价)"),
                ("customer_price_invalid", "条客户价证据无效(价格与状态矛盾)"),
-               ("detail_pending", "条 Detail 未完成"), ("crawl_pending", "条采集未完成"),
+               ("detail_pending", "条 Detail 未完成"),
+               ("crawl_pending", "个底层采集工作项未完成(非缺价商品数)"),
                ("crawl_unplanned", "条必爬行未规划"), ("crawl_planning_pending", "条必爬行待规划"),
                ("crawl_unknown", "条采集提交待确认"), ("crawl_manual", "条采集需人工")]
     parts = [f"{b[key]} {phrase}" for key, phrase in mapping if b.get(key, 0) > 0]
@@ -235,11 +242,11 @@ def _final_text(s: Mapping, closeout_running: bool = False) -> tuple[str, str]:
         # closeout 正在执行时不得宣称"下一次 closeout 自动生成"(自相矛盾);
         # 无阻塞时不重复"正在执行"措辞,一句话说明将自动出表。
         if parts:
-            return "还不能生成最终 Excel:" + ";".join(parts) + "。本轮 closeout 正在执行。", "pending"
-        return "还不能生成最终 Excel:当前 closeout 正在执行,完成后将自动生成最终 Excel。", "pending"
+            return missing_prefix + "还不能生成最终 Excel:" + ";".join(parts) + "。本轮 closeout 正在执行。", "pending"
+        return missing_prefix + "还不能生成最终 Excel:当前 closeout 正在执行,完成后将自动生成最终 Excel。", "pending"
     if not parts:
         parts = ["全部阻塞已清零,等待下一次 closeout 自动出表"]
-    return "还不能生成最终 Excel:" + ";".join(parts) + "。阻塞清零后系统将在下一次 closeout 自动生成。", "pending"
+    return missing_prefix + "还不能生成最终 Excel:" + ";".join(parts) + "。阻塞清零后系统将在下一次 closeout 自动生成。", "pending"
 
 
 def compute_overall_status(status: Mapping, *, recovering: int = 0,

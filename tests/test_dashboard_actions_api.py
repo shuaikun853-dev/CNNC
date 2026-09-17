@@ -149,6 +149,65 @@ def test_closeout_bad_business_date_400(client, monkeypatch):
     assert r.json()["detail"]["error_code"] == "BAD_BUSINESS_DATE"
 
 
+def test_force_closeout_requires_confirm_and_fresh_bounded_count(client, monkeypatch):
+    fake = _FakeRunner()
+    monkeypatch.setattr("app.dashboard_api.get_action_runner", lambda: fake)
+    monkeypatch.setattr("app.dashboard_api.collect_runtime_status", lambda **kwargs: {
+        "final": {
+            "frozen": True,
+            "finalized": False,
+            "missing_page_price_rows": 7,
+            "force_closeout_limit": 20,
+        }
+    })
+    headers = _auth(client)
+
+    r = client.post("/dashboard/api/actions/force-closeout", json={
+        "business_date": BUSINESS_DATE,
+        "confirm": False,
+        "expected_missing_page_price_rows": 7,
+    }, headers=headers)
+    assert r.status_code == 409
+    assert r.json()["detail"]["error_code"] == "CONFIRM_REQUIRED"
+
+    r = client.post("/dashboard/api/actions/force-closeout", json={
+        "business_date": BUSINESS_DATE,
+        "confirm": True,
+        "expected_missing_page_price_rows": 6,
+    }, headers=headers)
+    assert r.status_code == 409
+    assert r.json()["detail"]["error_code"] == "STALE_MISSING_PRICE_COUNT"
+
+    r = client.post("/dashboard/api/actions/force-closeout", json={
+        "business_date": BUSINESS_DATE,
+        "confirm": True,
+        "expected_missing_page_price_rows": 7,
+    }, headers=headers)
+    assert r.status_code == 202, r.text
+    assert fake.starts[-1]["action_type"] == "force-closeout"
+    assert fake.starts[-1]["max_incomplete"] == 20
+    assert fake.starts[-1]["expected_missing_page_price_rows"] == 7
+
+
+def test_force_closeout_rejects_more_than_twenty_missing_rows(client, monkeypatch):
+    monkeypatch.setattr("app.dashboard_api.get_action_runner", lambda: _FakeRunner())
+    monkeypatch.setattr("app.dashboard_api.collect_runtime_status", lambda **kwargs: {
+        "final": {
+            "frozen": True,
+            "finalized": False,
+            "missing_page_price_rows": 21,
+            "force_closeout_limit": 20,
+        }
+    })
+    r = client.post("/dashboard/api/actions/force-closeout", json={
+        "business_date": BUSINESS_DATE,
+        "confirm": True,
+        "expected_missing_page_price_rows": 21,
+    }, headers=_auth(client))
+    assert r.status_code == 409
+    assert r.json()["detail"]["error_code"] == "MISSING_PRICE_LIMIT_EXCEEDED"
+
+
 # ---- 5. re-export ----
 
 def test_reexport_branches(client, monkeypatch):
@@ -313,6 +372,20 @@ def test_actions_list_reports_running_and_recent(client, monkeypatch, tmp_path):
     assert body["running"][0]["action_id"] == "act-1"
     assert body["recent"][0]["action_id"] == "a1"
     assert body["recent"][0]["action_type"] == "closeout"
+
+
+def test_actions_list_uses_requested_business_date(client, monkeypatch, tmp_path):
+    fake = _FakeRunner()
+    monkeypatch.setattr("app.dashboard_api.get_action_runner", lambda: fake)
+    seen = []
+    monkeypatch.setattr(
+        "app.dashboard_api.runtime_paths",
+        lambda bd, root=None: seen.append(bd) or SimpleNamespace(run_dir=tmp_path),
+    )
+    r = client.get(f"/dashboard/api/actions?date={BUSINESS_DATE}")
+    assert r.status_code == 200
+    assert r.json()["business_date"] == BUSINESS_DATE
+    assert seen == [BUSINESS_DATE]
 
 
 def test_actions_list_degrades_when_read_fails(client, monkeypatch, tmp_path):

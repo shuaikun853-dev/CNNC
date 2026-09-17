@@ -5,6 +5,19 @@
     (c) => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"}[c]));
   const ACTIVE_MS = 5000, IDLE_MS = 30000, RETRY_MS = 10000;
 
+  function businessDateFromSearch(search) {
+    const value = new URLSearchParams(String(search || "")).get("date") || "";
+    return /^\d{4}-\d{2}-\d{2}$/.test(value) ? value : "";
+  }
+  const requestedBusinessDate = typeof window !== "undefined"
+    ? businessDateFromSearch(window.location && window.location.search)
+    : "";
+  function datedApiPath(path, dateValue) {
+    const date = String(dateValue || "");
+    if (!date) return path;
+    return path + (path.indexOf("?") === -1 ? "?" : "&") + "date=" + encodeURIComponent(date);
+  }
+
   // ---- 轮询控制器(纯逻辑 seam,无 DOM;tests/js/run_dashboard_js_tests.js 直接驱动) ----
   // 语义(Review Fix Round 1 P2-1/P2-2):
   //   200 → 记一次成功同步 + 渲染内容 + 按状态排程;
@@ -95,7 +108,7 @@
   async function fetchSummary() {
     const headers = {};
     if (etag) headers["If-None-Match"] = etag;
-    const res = await fetch("/dashboard/api/summary", { headers });
+    const res = await fetch(datedApiPath("/dashboard/api/summary", requestedBusinessDate), { headers });
     if (res.status === 304) return { status: 304 };
     if (!res.ok) return { status: res.status };
     etag = res.headers.get("ETag");
@@ -146,6 +159,7 @@
     // 首个成功 summary 即完成 summary 侧 hydration;writer 权威先于 overlay 计算,
     // closeoutRunning 覆盖必须施加在每次 summary 重渲上(5s 重刷不打回"○ 等待")。
     closeoutSummarySeen = true;
+    if (p.status && p.status.business_date) businessDate = String(p.status.business_date);
     closeoutWriterRunning = isCloseoutWriter(p.status && p.status.production_writer);
     renderHero(p.overall); renderAttention(p.overall.attention);
     renderStages(applyCloseoutRunningOverlay(p.overall.stages, { closeoutRunning: closeoutUIRunning() }));
@@ -294,7 +308,9 @@
     const tbody = $("#cp-table tbody");
     if (tbody) tbody.innerHTML = `<tr><td colspan="9" style="color:var(--muted)">加载中…</td></tr>`;
     try {
-      const res = await fetch(`/dashboard/api/customer-price?filter=${encodeURIComponent(cpFilter)}`);
+      const res = await fetch(datedApiPath(
+        `/dashboard/api/customer-price?filter=${encodeURIComponent(cpFilter)}`,
+        businessDate || requestedBusinessDate));
       if (!res.ok) throw new Error("HTTP " + res.status);
       renderCpRows(await res.json());
     } catch (e) {
@@ -318,6 +334,7 @@
       }));
   }
 
+  let lastFinalStatus = null;
   function renderFinal(o, status) {
     const f = $("#final");
     f.className = "final" + (o.final_state === "ok" ? " ok" : "");
@@ -329,6 +346,14 @@
     // 输出位置:完整路径仅在已出表且 payload 提供时显示(可选中复制)
     const outBox = $("#final-output");
     const outputPath = status && status.final && status.final.output_path;
+    lastFinalStatus = (status && status.final) || null;
+    const finalStatus = lastFinalStatus || {};
+    const missing = Number(finalStatus.missing_page_price_rows || 0);
+    const limit = Number(finalStatus.force_closeout_limit || 20);
+    const rawCrawl = Number(((finalStatus.blocker_summary || {}).crawl_pending) || 0);
+    if ($("#missing-page-price-count")) $("#missing-page-price-count").textContent = String(missing);
+    if ($("#force-closeout-limit")) $("#force-closeout-limit").textContent = String(limit);
+    if ($("#crawl-work-count")) $("#crawl-work-count").textContent = String(rawCrawl);
     if (outBox) {
       if (finalized && outputPath) {
         outBox.style.display = "";
@@ -341,6 +366,8 @@
   function renderMeta(p) {
     const st = p.status || {};
     $("#bizdate").textContent = "业务日期:" + (esc(st.business_date) || "—");
+    const picker = $("#business-date-picker");
+    if (picker && st.business_date) picker.value = String(st.business_date);
     const s = p.scheduler || {};
     $("#sched").textContent = !s.available ? "计划任务:不可用" :
       (s.running ? "计划任务:正在运行" :
@@ -457,6 +484,10 @@
     INVALID_ACTION_TOKEN: "操作令牌失效,请刷新页面",
     INVALID_REMOTE_STATE: "该任务缺少可用的精确远端身份",
     ACTION_IN_FLIGHT: "同类型操作正在执行,请等待其完成",
+    CONFIRM_REQUIRED: "请先确认强制收口",
+    STALE_MISSING_PRICE_COUNT: "缺价数量已变化,请刷新后重新确认",
+    MISSING_PRICE_LIMIT_EXCEEDED: "缺价数量超过 20 条,不能强制收口",
+    FORCE_CLOSEOUT_NOT_FROZEN: "业务数据尚未冻结,不能强制收口",
   };
   function _blockersSummary(outcome) {
     const b = outcome && outcome.publication_blocked;
@@ -523,6 +554,12 @@
     if (result.status === "TIMEOUT") return "操作仍在执行,结果请稍后在操作记录中查看";
     const oc = result.outcome || {};
     if (actionType === "closeout") return closeoutOutcomeText(oc);
+    if (actionType === "force-closeout") {
+      if (oc.outcome === "FORCE_FINALIZED" || oc.outcome === "ALREADY_FINALIZED") {
+        return "强制收口完成,最终 Excel 已生成";
+      }
+      return "强制收口未完成:" + (oc.error_type || oc.outcome || oc.error || "未知结果");
+    }
     if (actionType === "re-export") return reexportOutcomeText(oc);
     if (actionType === "rebuild") return rebuildOutcomeText(oc);
     return "操作完成";
@@ -756,7 +793,7 @@
     if (!ul) return;
     const sec = ul.closest(".sec");
     try {
-      const res = await fetch("/dashboard/api/actions");
+      const res = await fetch(datedApiPath("/dashboard/api/actions", businessDate || requestedBusinessDate));
       if (!res.ok) throw new Error("HTTP " + res.status);
       const data = await res.json();
       const idStr = String(jobId);
@@ -791,7 +828,7 @@
       if (!res.ok) throw new Error("HTTP " + res.status);
       const data = await res.json();
       actionToken = data.action_token || "";
-      businessDate = data.business_date || "";
+      businessDate = requestedBusinessDate || data.business_date || "";
       actionClient = createActionClient({
         token: actionToken, fetchJson: realFetchJson,
         setTimeout: (fn, ms) => setTimeout(fn, ms), clearTimeout: (t) => clearTimeout(t),
@@ -825,7 +862,7 @@
 
   // 与后端 _closeout_writer_active 同语义:active 且 command ∈ {closeout,finalize};
   // tick/harvest-only/drain-only 持锁或 command 缺失都不算。
-  const CLOSEOUT_WRITER_COMMANDS = ["closeout", "finalize"];
+  const CLOSEOUT_WRITER_COMMANDS = ["closeout", "finalize", "force-finalize"];
   function isCloseoutWriter(writer) {
     if (!writer || !writer.active) return false;
     return CLOSEOUT_WRITER_COMMANDS.indexOf(String(writer.command || "")) !== -1;
@@ -835,7 +872,8 @@
   function computeCloseoutBackendRunning(runningList, businessDate) {
     const date = String(businessDate || "");
     return (Array.isArray(runningList) ? runningList : []).some((r) =>
-      r && r.action_type === "closeout" && r.status === "RUNNING" &&
+      r && (r.action_type === "closeout" || r.action_type === "force-closeout") &&
+      r.status === "RUNNING" &&
       (date && (String(r.business_date || "") === date ||
                 String(r.target || "").startsWith(date + ":"))));
   }
@@ -862,11 +900,27 @@
     });
   }
 
+  function forceCloseoutAvailability(finalStatus) {
+    const f = finalStatus || {};
+    const missing = Math.max(0, Number(f.missing_page_price_rows || 0));
+    const limit = Math.max(0, Number(f.force_closeout_limit || 20));
+    const visible = !!f.frozen && !f.finalized;
+    return {
+      visible,
+      enabled: visible && missing <= limit,
+      missing,
+      limit,
+    };
+  }
+
   // 纯 DOM,幂等:summary 重刷(render)反复调用也不闪文案;finalized 后区域隐藏
   // 仍由 renderFinal 管,这里只负责"操作台不可用/进行中/hydration 未完成/可点"四态。
   function updateCloseoutUI() {
     const btn = $("#closeout-btn");
     if (!btn) return;
+    const forceBtn = $("#force-closeout-btn");
+    const force = forceCloseoutAvailability(lastFinalStatus);
+    if (forceBtn) forceBtn.style.display = force.visible ? "" : "none";
     if (opsUnavailable) {
       // R3 P2-1:操作台不可用是最高优先级——按钮语义是"人工可发起收口",此时必不
       // 可能发起;收口运行态由阶段卡 overlay 传达,按钮只需不可点+说明原因。
@@ -882,6 +936,23 @@
       btn.disabled = false;
       if (btn.textContent !== "立即收口") btn.textContent = "立即收口";
     }
+    if (!forceBtn) return;
+    if (opsUnavailable) {
+      forceBtn.disabled = true;
+      forceBtn.textContent = "操作台不可用";
+    } else if (closeoutUIRunning()) {
+      forceBtn.disabled = true;
+      forceBtn.textContent = "收口中…";
+    } else if (!(closeoutSummarySeen && closeoutActionsSeen)) {
+      forceBtn.disabled = true;
+      forceBtn.textContent = "检查收口状态…";
+    } else if (!force.enabled) {
+      forceBtn.disabled = true;
+      forceBtn.textContent = force.visible ? `缺价超过 ${force.limit} 条` : "强制收口";
+    } else {
+      forceBtn.disabled = false;
+      forceBtn.textContent = "强制收口";
+    }
   }
   // 测试 seam:行为级验证需要驱动模块内权威状态(与生产同源,生产路径绝不调用)。
   // seen 缺省 true,旧式只关心 running 的断言不必每次都传;hydration 专项测试显式传 false;
@@ -894,6 +965,7 @@
     opsUnavailable = !!s.opsUnavailable;
     closeoutSummarySeen = s.summarySeen === undefined ? true : !!s.summarySeen;
     closeoutActionsSeen = s.actionsSeen === undefined ? true : !!s.actionsSeen;
+    if (s.finalStatus !== undefined) lastFinalStatus = s.finalStatus;
   }
 
   // actions 轻量轮询:复用 createSaasFlowPoller,零新基建;有 RUNNING 收口时提速到 5s。
@@ -906,7 +978,7 @@
     poll: async () => {
       // try/finally 保证首轮读取 settle(成功或失败)都完成 hydration。
       try {
-        const res = await fetch("/dashboard/api/actions");
+        const res = await fetch(datedApiPath("/dashboard/api/actions", businessDate || requestedBusinessDate));
         if (!res.ok) throw new Error("HTTP " + res.status);
         const data = await res.json();
         // 权威日期优先取服务端顶层 business_date(bootstrap 失败时 businessDate
@@ -935,6 +1007,20 @@
     panel.querySelector(".rc-text").textContent =
       "即将停用当前招商局任务并创建新的替代任务。旧任务:" + j.task_name +
       "。新任务名称和批次号将由系统自动生成(不会复用旧值),未完成的采集行将迁移到新任务。";
+    panel.style.display = "";
+  }
+
+  function hideForceCloseoutConfirm() {
+    const panel = $("#force-closeout-confirm");
+    if (panel) panel.style.display = "none";
+  }
+  function showForceCloseoutConfirm() {
+    const panel = $("#force-closeout-confirm");
+    const availability = forceCloseoutAvailability(lastFinalStatus);
+    if (!panel || !availability.enabled) return;
+    panel.querySelector(".fc-text").textContent =
+      `将按当前冻结快照生成最终表，${availability.missing} 条页面价格保留为空；` +
+      "不会新建、重试或修改招商局任务。";
     panel.style.display = "";
   }
 
@@ -1064,6 +1150,45 @@
       }
     });
 
+    const forceCloseoutBtn = $("#force-closeout-btn");
+    if (forceCloseoutBtn) forceCloseoutBtn.addEventListener("click", () => {
+      if (closeoutUIRunning() || forceCloseoutBtn.disabled) return;
+      showForceCloseoutConfirm();
+    });
+    const forceCloseoutOk = $("#force-closeout-ok");
+    if (forceCloseoutOk) forceCloseoutOk.addEventListener("click", async () => {
+      const st = $("#closeout-status");
+      const availability = forceCloseoutAvailability(lastFinalStatus);
+      hideForceCloseoutConfirm();
+      if (!availability.enabled || closeoutUIRunning()) {
+        if (st) st.textContent = "状态已变化,请刷新后重新确认";
+        return;
+      }
+      closeoutActionInFlight = true;
+      updateCloseoutUI();
+      if (st) st.textContent = "";
+      try {
+        const client = getActionClient();
+        if (!client) { if (st) st.textContent = "操作台不可用"; return; }
+        const res = await client.post("/dashboard/api/actions/force-closeout", {
+          business_date: businessDate,
+          confirm: true,
+          expected_missing_page_price_rows: availability.missing,
+        });
+        if (res.error && res.error.code === "ACTION_IN_FLIGHT") refreshCloseoutActions();
+        if (st) st.textContent = actionOutcomeText("force-closeout", res);
+      } catch (e) {
+        if (st) st.textContent = "强制收口请求失败,请稍后重试";
+      } finally {
+        closeoutActionInFlight = false;
+        refreshCloseoutActions();
+        updateCloseoutUI();
+        ctl.run();
+      }
+    });
+    const forceCloseoutCancel = $("#force-closeout-cancel");
+    if (forceCloseoutCancel) forceCloseoutCancel.addEventListener("click", hideForceCloseoutConfirm);
+
     const copyBtn = $("#copy-path");
     if (copyBtn) copyBtn.addEventListener("click", () => {
       const text = $("#final-output-path") ? $("#final-output-path").textContent : "";
@@ -1127,7 +1252,9 @@
     sfInFlight = true;
     sfLastFetchAt = now;
     try {
-      const url = force ? "/dashboard/api/saas-flow?refresh=1" : "/dashboard/api/saas-flow";
+      const url = datedApiPath(
+        force ? "/dashboard/api/saas-flow?refresh=1" : "/dashboard/api/saas-flow",
+        businessDate || requestedBusinessDate);
       const res = await fetch(url);
       if (!res.ok) throw new Error("HTTP " + res.status);
       renderSaasFlow(await res.json());
@@ -1657,6 +1784,15 @@
       }
     });
     $("#refresh").addEventListener("click", () => ctl.run());
+    const datePicker = $("#business-date-picker");
+    if (datePicker) {
+      datePicker.value = requestedBusinessDate;
+      datePicker.addEventListener("change", () => {
+        if (/^\d{4}-\d{2}-\d{2}$/.test(datePicker.value || "")) {
+          window.location.search = "?date=" + encodeURIComponent(datePicker.value);
+        }
+      });
+    }
     $("#jobs-toggle").addEventListener("click", () => {
       const m = $("#more"); m.classList.toggle("show");
       $("#jobs-toggle").textContent = m.classList.contains("show") ? "收起任务列表 ↑" : "查看全部招商局任务 ↓";
@@ -1682,9 +1818,11 @@
     createProductionIdentityFetcher,
     computeCloseoutBackendRunning, applyCloseoutRunningOverlay, isCloseoutWriter,
     resolveCloseoutActionsDate, closeoutUIRunning, updateCloseoutUI,
+    forceCloseoutAvailability,
     pollDelay, inCloseoutWatchWindow, _setCloseoutStateForTest,
     armRebuildDrawerSwitch, resolveRebuildDrawerSwitch,
     rebuildOutcomeAdmitsLocalSupersede,
+    businessDateFromSearch, datedApiPath,
     cpStatusCn, cpStatusPill, cpRowMatchesFilter, cpSortRows };
   if (typeof window !== "undefined") { window.Dashboards = api; }
   if (typeof module !== "undefined" && module.exports) { module.exports = api; }

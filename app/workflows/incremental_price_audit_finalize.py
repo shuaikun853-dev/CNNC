@@ -9,7 +9,7 @@ import os
 import uuid
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -39,6 +39,7 @@ from app.services.incremental_audit_materializer import (
     LegacyWorkbookMaterializer,
     MaterializationResult,
 )
+from app.services.page_price_semantics import crawl_identity, valid_page_price_result
 from app.services.saas_audit_core import build_records, normalize_cell_str, parse_decimal
 from app.services.title_match_model_adapter import TitleMatchModelResult
 from app.workflows.work_01_saas_approval_json_audit import audit_saas_approval_records
@@ -47,6 +48,8 @@ from app.workflows.work_01_saas_approval_json_audit import audit_saas_approval_r
 @dataclass(frozen=True)
 class FinalizeReadiness:
     frozen_rows: int = 0
+    page_price_required_rows: int = 0
+    missing_page_price_rows: int = 0
     detail_pending: int = 0
     detail_terminal: int = 0
     model_pending: int = 0
@@ -215,6 +218,23 @@ NON_TOLERABLE_BLOCKERS = (
     "customer_price_failed",
     "customer_price_invalid",
 )
+
+# Explicit dashboard force-closeout may accept unresolved crawl execution
+# states. Detail/model/customer-price evidence and malformed crawl prices stay
+# blocking. The existing force-finalize command remains strict by default.
+OPERATOR_FORCE_TOLERABLE_BLOCKERS = frozenset({
+    "crawl_terminal",
+    "crawl_unplanned",
+    "crawl_submit_unknown",
+    "crawl_pending_waiting_submit",
+    "crawl_pending_awaiting_priority",
+    "crawl_pending_blocked",
+    "remote_invalid",
+    "remote_manual",
+    "remote_intent",
+    "remote_submit_unknown",
+    "remote_priority_pending",
+})
 
 
 def _crawl_awaiting_remote(
@@ -387,20 +407,11 @@ def _project_customer_absent_results(
 
 
 def _crawl_key(row: Mapping[str, Any]) -> tuple[str, str, str]:
-    return (
-        normalize_cell_str(row.get("vCommodityId") or row.get("documentId")),
-        normalize_cell_str(row.get("skuId")),
-        normalize_cell_str(row.get("extLink")),
-    )
+    return crawl_identity(row)
 
 
 def _valid_crawl_price(result: Mapping[str, Any]) -> bool:
-    status = normalize_cell_str(result.get("page_price_status"))
-    try:
-        value = Decimal(str(result.get("page_price_value")))
-    except (InvalidOperation, TypeError, ValueError):
-        return False
-    return (status == "OK" and value > 0) or (status == "PRICE_IS_ZERO" and value == 0)
+    return valid_page_price_result(result)
 
 
 EXPORT_NO_PRICE_TERMINAL_EVIDENCE_TYPE = "EXPORT_NO_PRICE_TERMINAL"
@@ -576,6 +587,8 @@ def build_frozen_audit_artifact(
 
     counts = {
         "frozen_rows": len(items),
+        "page_price_required_rows": 0,
+        "missing_page_price_rows": 0,
         "detail_pending": 0,
         "detail_terminal": 0,
         "model_pending": 0,
@@ -749,6 +762,10 @@ def build_frozen_audit_artifact(
                 )
             if not review_reason and review_selected is not None:
                 review_reason = f"crawl state={review_selected['state']}"
+        if required:
+            counts["page_price_required_rows"] += 1
+            if review_status != "SUCCESS":
+                counts["missing_page_price_rows"] += 1
         if review_mode:
             if review_status == "MANUAL_REVIEW":
                 row["__page_price_value"] = None
@@ -1217,6 +1234,8 @@ def materialize_forced_frozen_daily_run(
     output_path: Path | str,
     *,
     max_incomplete: int = 10,
+    accept_unresolved_crawl: bool = False,
+    expected_missing_page_price_rows: int | None = None,
     materializer: LegacyWorkbookMaterializer | None = None,
 ) -> ForceFinalizePublication:
     """Publish the formal final workbook while tolerating bounded remote long tail.
@@ -1241,7 +1260,7 @@ def materialize_forced_frozen_daily_run(
     if run["state"] == "FINALIZED":
         return _already_finalized_publication(run)
     try:
-        process_lock.acquire()
+        process_lock.acquire(owner={"command": "force-finalize"})
     except LeaseUnavailable as exc:
         raise ForceFinalizeRejected(
             "FORCE_FINALIZE_PRODUCTION_WRITER_ACTIVE",
@@ -1281,7 +1300,19 @@ def materialize_forced_frozen_daily_run(
             name: getattr(readiness, name)
             for name in NON_TOLERABLE_BLOCKERS
             if getattr(readiness, name)
+            and not (
+                accept_unresolved_crawl
+                and name in OPERATOR_FORCE_TOLERABLE_BLOCKERS
+            )
         }
+        if expected_missing_page_price_rows is not None and (
+            readiness.missing_page_price_rows != expected_missing_page_price_rows
+        ):
+            raise ForceFinalizeRejected(
+                "FORCE_FINALIZE_STALE_MISSING_PRICE_COUNT",
+                "missing page-price row count changed after operator confirmation",
+                readiness,
+            )
         if blockers:
             rendered = ", ".join(f"{name}={value}" for name, value in sorted(blockers.items()))
             raise ForceFinalizeRejected(
@@ -1292,8 +1323,16 @@ def materialize_forced_frozen_daily_run(
         # Business threshold: at most N data rows may lack a crawl result.
         # In-flight remote jobs are recorded separately and never consume the
         # item budget.
-        item_count = readiness.crawl_awaiting_remote
-        remote_job_count = readiness.remote_awaiting_remote
+        item_count = (
+            readiness.missing_page_price_rows
+            if accept_unresolved_crawl
+            else readiness.crawl_awaiting_remote
+        )
+        remote_job_count = (
+            readiness.remote_pending + readiness.remote_manual + readiness.remote_invalid
+            if accept_unresolved_crawl
+            else readiness.remote_awaiting_remote
+        )
         blocker_count = item_count + remote_job_count
         if item_count > max_incomplete:
             raise ForceFinalizeRejected(
@@ -1320,6 +1359,9 @@ def materialize_forced_frozen_daily_run(
                 "force_finalize_at": datetime.now(UTC).isoformat(timespec="seconds"),
                 "force_finalize_max_incomplete": max_incomplete,
                 "force_finalize_actual_incomplete": item_count,
+                "force_finalize_accept_unresolved_crawl": accept_unresolved_crawl,
+                "missing_page_price_rows": readiness.missing_page_price_rows,
+                "page_price_required_rows": readiness.page_price_required_rows,
                 "force_finalize_reason": FORCE_FINALIZE_REASON,
                 "frozen_snapshot_id": int(run["frozen_snapshot_id"]),
                 "frozen_row_count": readiness.frozen_rows,
