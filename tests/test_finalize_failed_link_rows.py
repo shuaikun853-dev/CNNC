@@ -18,6 +18,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -36,7 +37,7 @@ from app.services.customer_prewarm_store import (
     CACHE_STATUS_REMOTE_DISPATCHED,
     CustomerPrewarmStore,
 )
-from app.services.daily_audit_store import DailyAuditStore, ProcessLock
+from app.services.daily_audit_store import DailyAuditStore, ProcessLock, RemoteIntentConflict
 from app.services.incremental_audit_runtime import runtime_paths
 from app.workflows.incremental_price_audit_finalize import (
     build_frozen_audit_artifact,
@@ -104,7 +105,9 @@ def _row(v="v-1", sku="sku-1", url="https://shop.example/item", **extra):
     }
 
 
-def _seed_frozen_day(runtime_root: Path, business_date: str = BD) -> DailyAuditStore:
+def _seed_frozen_day(
+    runtime_root: Path, business_date: str = BD, *, complete_crawl: bool = True,
+) -> DailyAuditStore:
     """One frozen, finalize-ready day at the standard runtime layout."""
     paths = runtime_paths(business_date, runtime_root)
     paths.run_dir.mkdir(parents=True, exist_ok=True)
@@ -142,9 +145,10 @@ def _seed_frozen_day(runtime_root: Path, business_date: str = BD) -> DailyAuditS
         token, "mall", "sku-1", "https://shop.example/item", "legacy-v1", "crawl-fp",
         source_id="v-1",
     )
-    store.complete_crawl_work(token, crawl["id"], {
-        "page_price_value": "9.5", "page_price_status": "OK", "page_price_source": "招商局",
-    })
+    if complete_crawl:
+        store.complete_crawl_work(token, crawl["id"], {
+            "page_price_value": "9.5", "page_price_status": "OK", "page_price_source": "招商局",
+        })
     store.release_lease(token)
     return store
 
@@ -282,6 +286,44 @@ def _seed_failure_scenario(runtime_root: Path):
     }
 
 
+def _bind_candidate_to_job(
+    prewarm: CustomerPrewarmStore,
+    store: DailyAuditStore,
+    token,
+    *,
+    url: str,
+    document: str,
+    job_id: int,
+    mall: str = "comix",
+    existing_crawl_id: int | None = None,
+) -> int:
+    candidate = prewarm.upsert_link(document, url, mall=mall, business_date=BD)["candidate"]
+    candidate_id = int(candidate["id"])
+    prewarm.record_candidate_result(candidate_id, cache_status=CACHE_STATUS_PENDING_PREWARM)
+    prewarm.record_candidate_result(
+        candidate_id, cache_status=CACHE_STATUS_REMOTE_DISPATCHED, remote_job_id=job_id,
+    )
+    prewarm.record_remote_job_link(BD, candidate_id, job_id, PRODUCER)
+    if existing_crawl_id is None:
+        crawl = store.ensure_crawl_work(
+            token, mall, f"zhpq-{candidate_id}", url, "legacy-v1", f"fp-{candidate_id}",
+            source_id=document,
+        )
+        crawl_id = int(crawl["id"])
+    else:
+        crawl_id = existing_crawl_id
+    store.link_crawl_work_to_remote_job(token, crawl_id, job_id)
+    return crawl_id
+
+
+def _local_price(value: str = "218.37") -> dict[str, str]:
+    return {
+        "page_price_value": value,
+        "page_price_status": "OK",
+        "page_price_source": "本地兜底:comix",
+    }
+
+
 # ---- failed_customer_link_rows (unit) -----------------------------------------
 
 
@@ -348,6 +390,132 @@ def test_failed_link_rows_unmapped_mall_falls_back_to_mall_key(tmp_path):
     assert len(rows) == 1
     assert rows[0]["mall"] == "unknownmall"
     assert rows[0]["mall_name"] == "unknownmall"
+
+
+def test_stale_submit_unknown_local_success_has_one_successful_final_row(tmp_path, monkeypatch):
+    monkeypatch.setattr(mapping_module, "load_zhaoshang_mall_mappings", lambda: [COMIX])
+    store = _seed_frozen_day(tmp_path, complete_crawl=False)
+    prewarm = CustomerPrewarmStore(tmp_path / "customer_prewarm.sqlite3")
+    token = store.acquire_lease(BD, "local-final", 60)
+    try:
+        job_id = _seed_remote_job(
+            store, token, tmp_path, logical_key="local-final", task_name="local-final-job",
+            state="DEAD_SUBMIT_UNKNOWN",
+        )
+        crawl = store.list_crawl_work(token)[0]
+        crawl_id = _bind_candidate_to_job(
+            prewarm, store, token, url="https://shop.example/item", document="v-1",
+            job_id=job_id, mall="mall", existing_crawl_id=int(crawl["id"]),
+        )
+        store.complete_crawl_work(token, crawl_id, _local_price())
+        built = build_frozen_audit_artifact(
+            store, token, output_identity="local-final", include_failed_customer_links=True,
+        )
+    finally:
+        store.release_lease(token)
+
+    assert store.get_remote_job(job_id)["state"] == "SUBMIT_UNKNOWN"
+    assert failed_customer_link_rows(BD, tmp_path, [COMIX]) == []
+    assert built.readiness.ready is True
+    assert built.readiness.remote_pending == 0
+    assert built.artifact is not None
+    matching = [
+        row for row in built.artifact.frozen_rows
+        if row.get("extLink") == "https://shop.example/item"
+    ]
+    assert len(matching) == 1
+    assert matching[0]["__page_price_status"] == "OK"
+    assert matching[0]["__page_price_value"] == "218.37"
+    assert len(built.artifact.audit_response.record_results) == 2
+
+
+def test_shared_remote_job_suppresses_only_locally_resolved_urls(tmp_path):
+    store = _seed_frozen_day(tmp_path)
+    prewarm = CustomerPrewarmStore(tmp_path / "customer_prewarm.sqlite3")
+    token = store.acquire_lease(BD, "shared-job", 60)
+    try:
+        job_id = _seed_remote_job(
+            store, token, tmp_path, logical_key="shared", task_name="shared-job",
+            state="COMPLETED_NO_RESULT",
+        )
+        crawls = {
+            suffix: _bind_candidate_to_job(
+                prewarm, store, token, url=f"https://comix.example/item-{suffix}",
+                document=f"DOC-{suffix}", job_id=job_id,
+            )
+            for suffix in "ABCD"
+        }
+        for suffix in "AB":
+            store.complete_crawl_work(token, crawls[suffix], _local_price())
+        store.fail_crawl_work(token, crawls["C"], "terminal remote failure", retryable=False)
+        store.fail_crawl_work(token, crawls["D"], NO_ROW_REASON, retryable=False)
+        store.complete_crawl_work_without_result(token, crawls["D"], reason=NO_ROW_REASON)
+        # A late terminal job state must not erase already persisted per-URL evidence.
+        store.mark_remote_manual(token, job_id, "late remote terminal")
+    finally:
+        store.release_lease(token)
+
+    by_url = {row["original_url"]: row for row in failed_customer_link_rows(BD, tmp_path, [COMIX])}
+    assert set(by_url) == {
+        "https://comix.example/item-C", "https://comix.example/item-D",
+    }
+    assert by_url["https://comix.example/item-D"]["reason"] == FAILED_LINK_REASON_NO_RESULT
+    assert by_url["https://comix.example/item-C"]["reason"] == FAILED_LINK_REASON_TERMINAL
+
+
+def test_late_remote_failure_cannot_replace_local_success_or_project_failure(tmp_path):
+    store = _seed_frozen_day(tmp_path)
+    prewarm = CustomerPrewarmStore(tmp_path / "customer_prewarm.sqlite3")
+    token = store.acquire_lease(BD, "late-remote", 60)
+    try:
+        job_id = _seed_remote_job(
+            store, token, tmp_path, logical_key="late", task_name="late-job",
+            state="DEAD_SUBMIT_UNKNOWN",
+        )
+        url = "https://comix.example/late"
+        crawl_id = _bind_candidate_to_job(
+            prewarm, store, token, url=url, document="DOC-LATE", job_id=job_id,
+        )
+        store.complete_crawl_work(token, crawl_id, _local_price())
+        before = store.get_crawl_work(crawl_id)
+        store.mark_remote_manual(token, job_id, "late remote terminal")
+        with pytest.raises(RemoteIntentConflict, match="immutable"):
+            store.fail_crawl_work(token, crawl_id, "late remote failure", retryable=False)
+        after = store.get_crawl_work(crawl_id)
+    finally:
+        store.release_lease(token)
+
+    assert after["result_json"] == before["result_json"]
+    assert json.loads(after["result_json"])["page_price_value"] == "218.37"
+    assert all(row["original_url"] != url for row in failed_customer_link_rows(BD, tmp_path, [COMIX]))
+
+
+def test_no_result_sibling_does_not_make_local_success_fail(tmp_path):
+    store = _seed_frozen_day(tmp_path)
+    prewarm = CustomerPrewarmStore(tmp_path / "customer_prewarm.sqlite3")
+    token = store.acquire_lease(BD, "no-result-sibling", 60)
+    try:
+        job_id = _seed_remote_job(
+            store, token, tmp_path, logical_key="no-result-sibling",
+            task_name="no-result-sibling-job", state="COMPLETED_NO_RESULT",
+        )
+        local_url = "https://comix.example/local"
+        no_result_url = "https://comix.example/no-result"
+        local_crawl = _bind_candidate_to_job(
+            prewarm, store, token, url=local_url, document="DOC-LOCAL", job_id=job_id,
+        )
+        missing_crawl = _bind_candidate_to_job(
+            prewarm, store, token, url=no_result_url, document="DOC-NO-RESULT", job_id=job_id,
+        )
+        store.complete_crawl_work(token, local_crawl, _local_price())
+        store.fail_crawl_work(token, missing_crawl, NO_ROW_REASON, retryable=False)
+        store.complete_crawl_work_without_result(token, missing_crawl, reason=NO_ROW_REASON)
+    finally:
+        store.release_lease(token)
+
+    by_url = {row["original_url"]: row for row in failed_customer_link_rows(BD, tmp_path, [COMIX])}
+    assert set(by_url) == {no_result_url}
+    assert by_url[no_result_url]["reason"] == FAILED_LINK_REASON_NO_RESULT
 
 
 # ---- final workbook projection (integration) ----------------------------------
