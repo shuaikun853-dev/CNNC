@@ -28,7 +28,7 @@ python -m pytest tests -q
 ### 按改动范围
 
 ```powershell
-# 第一步审计、模型、Excel、cURL 和爬价回填
+# 第一步审计、模型、Excel、cURL、爬价回填及 multi-site 并发 claim/锁定 final/SUCCESS 价格/全表终态/双 Git 门禁（全 fake worker）
 python -m pytest tests\test_work_01_saas_approval_json_audit.py -q
 
 # SaaS / 招商局 Token 初始化、Rotation、原子保存、并发锁和只读 401 单次重试

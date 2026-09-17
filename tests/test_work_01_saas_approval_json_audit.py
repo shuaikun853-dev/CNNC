@@ -1,5 +1,7 @@
 import json
 import os
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -2854,7 +2856,7 @@ class TestRunCrawlerSubprocess:
 
 class TestRunMultiSiteFallback:
     @staticmethod
-    def _review(path, urls):
+    def _review(path, urls, extra_rows=()):
         fields = [
             "extLink", "skuId", "price", "customerPrice", "saas_price_vs_customer",
             "page_price_value", "page_price_status", "page_price_source",
@@ -2867,9 +2869,12 @@ class TestRunMultiSiteFallback:
         for url in urls:
             sheet.append([url, "SKU", 100, 200, "SAAS_WITHIN_CUSTOMER_THRESHOLD",
                           None, "PENDING_CRAWL", None, None, None, None, None])
+        for url, status in extra_rows:
+            sheet.append([url, "EXTRA", 100, 200, "SAAS_WITHIN_CUSTOMER_THRESHOLD",
+                          None, status, None, None, None, None, None])
         book.save(path)
 
-    def _plan(self, tmp_path, monkeypatch, urls_by_site):
+    def _plan(self, tmp_path, monkeypatch, urls_by_site, *, extra_review_rows=()):
         crawler_root = tmp_path / "cnnc-mall-crawler"
         (crawler_root / "mall_crawler").mkdir(parents=True)
         (crawler_root / "mall_crawler" / "cli.py").write_text(
@@ -2877,16 +2882,22 @@ class TestRunMultiSiteFallback:
             encoding="utf-8",
         )
         monkeypatch.setattr(excel_audit_mod, "_verify_multi_site_crawler_revision",
-                            lambda *_args, **_kwargs: "a" * 40)
+                            lambda *_args, **_kwargs:
+                            excel_audit_mod.EXPECTED_MULTI_SITE_CRAWLER_REVISION)
         runtime_dir = tmp_path / "runtime"
         runtime_dir.mkdir()
         review = runtime_dir / "review.xlsx"
-        self._review(review, [url for urls in urls_by_site.values() for url in urls])
+        self._review(
+            review,
+            [url for urls in urls_by_site.values() for url in urls],
+            extra_rows=extra_review_rows,
+        )
         (runtime_dir / "BATCH_STATE.md").write_text("状态：ACTIVE\n", encoding="utf-8")
         summary = excel_audit_mod.prepare_multi_site_fallback(
             urls_by_site=urls_by_site,
             runtime_dir=runtime_dir,
             review_xlsx=review,
+            requested_output=runtime_dir / "final.xlsx",
             crawler_root=crawler_root,
         )
         excel_audit_mod._record_multi_site_waiting_authorization(
@@ -2894,6 +2905,425 @@ class TestRunMultiSiteFallback:
             fallback_summary=summary, requested_output=runtime_dir / "final.xlsx",
         )
         return crawler_root, runtime_dir, review, summary
+
+    @staticmethod
+    def _single_output_runner(url, price):
+        def runner(argv, _cwd, _env):
+            manifest = load_workbook(Path(argv[-1]), data_only=True, read_only=True)
+            try:
+                _site, _input_path, output_path = next(
+                    manifest.active.iter_rows(min_row=2, values_only=True)
+                )
+            finally:
+                manifest.close()
+            workbook = Workbook()
+            sheet = workbook.active
+            sheet.append([
+                "商城商品编码", "商品标题", "商品价格",
+                "商品链接", "采集状态", "失败原因",
+            ])
+            sheet.append(["SKU", "测试商品", price, url, "SUCCESS", None])
+            workbook.save(output_path)
+            return 0
+
+        return runner
+
+    def _assert_success_price_rejected(self, tmp_path, monkeypatch, price):
+        url = "https://b2b.nbdeli.com/pcweb/detail?sku=invalid-price"
+        crawler_root, runtime_dir, review, summary = self._plan(
+            tmp_path, monkeypatch, {"nbdeli": [url]},
+        )
+        with pytest.raises(ValueError, match="SUCCESS.*价格"):
+            excel_audit_mod.resume_multi_site_fallback(
+                manifest_path=Path(summary["manifest_path"]),
+                review_xlsx=review,
+                output_xlsx=runtime_dir / "final.xlsx",
+                expected_count=summary["candidate_count"],
+                expected_sha256=summary["plan_sha256"],
+                crawler_root=crawler_root,
+                runner=self._single_output_runner(url, price),
+            )
+        assert not (runtime_dir / "final.xlsx").exists()
+        assert "状态：COMPLETE" not in (
+            runtime_dir / "BATCH_STATE.md"
+        ).read_text(encoding="utf-8")
+
+    def test_concurrent_resume_only_one_worker_starts(self, tmp_path, monkeypatch):
+        url = "https://b2b.nbdeli.com/pcweb/detail?sku=concurrent"
+        crawler_root, runtime_dir, review, summary = self._plan(
+            tmp_path, monkeypatch, {"nbdeli": [url]},
+        )
+        original_file_sha256 = excel_audit_mod._file_sha256
+        preclaim_barrier = threading.Barrier(2)
+
+        def synchronized_file_sha256(path):
+            digest = original_file_sha256(path)
+            if Path(path).resolve() == review.resolve():
+                preclaim_barrier.wait(timeout=5)
+            return digest
+
+        monkeypatch.setattr(excel_audit_mod, "_file_sha256", synchronized_file_sha256)
+        worker_invocations = 0
+        invocation_lock = threading.Lock()
+
+        def worker(_argv, _cwd, _env):
+            nonlocal worker_invocations
+            with invocation_lock:
+                worker_invocations += 1
+            return 2
+
+        def resume():
+            return excel_audit_mod.resume_multi_site_fallback(
+                manifest_path=Path(summary["manifest_path"]),
+                review_xlsx=review,
+                output_xlsx=runtime_dir / "final.xlsx",
+                expected_count=summary["candidate_count"],
+                expected_sha256=summary["plan_sha256"],
+                crawler_root=crawler_root,
+                runner=worker,
+            )
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            futures = [executor.submit(resume) for _ in range(2)]
+            errors = [future.exception(timeout=10) for future in futures]
+
+        assert worker_invocations == 1
+        assert all(isinstance(error, RuntimeError) for error in errors)
+        claim_path = runtime_dir / "multi_site_fallback" / "execution.claim.json"
+        claim = json.loads(claim_path.read_text(encoding="utf-8"))
+        assert claim["schema"] == "cnnc.multi_site_fallback.execution_claim"
+        assert claim["version"] == 1
+        assert claim["plan_sha256"] == summary["plan_sha256"]
+        assert claim["manifest_sha256"] == summary["manifest_sha256"]
+        assert claim["review_sha256"] == summary["review_sha256"]
+        assert claim["pid"] == os.getpid()
+        assert claim["started_at"]
+
+    def test_worker_spawn_failure_keeps_claim_and_blocks_retry(
+        self, tmp_path, monkeypatch,
+    ):
+        url = "https://b2b.nbdeli.com/pcweb/detail?sku=spawn-failure"
+        crawler_root, runtime_dir, review, summary = self._plan(
+            tmp_path, monkeypatch, {"nbdeli": [url]},
+        )
+        calls = 0
+
+        def spawn_failure(_argv, _cwd, _env):
+            nonlocal calls
+            calls += 1
+            raise OSError("spawn failed")
+
+        kwargs = {
+            "manifest_path": Path(summary["manifest_path"]),
+            "review_xlsx": review,
+            "output_xlsx": runtime_dir / "final.xlsx",
+            "expected_count": summary["candidate_count"],
+            "expected_sha256": summary["plan_sha256"],
+            "crawler_root": crawler_root,
+            "runner": spawn_failure,
+        }
+        with pytest.raises(OSError, match="spawn failed"):
+            excel_audit_mod.resume_multi_site_fallback(**kwargs)
+        claim_path = runtime_dir / "multi_site_fallback" / "execution.claim.json"
+        assert claim_path.is_file()
+
+        with pytest.raises(RuntimeError):
+            excel_audit_mod.resume_multi_site_fallback(**kwargs)
+        assert calls == 1
+
+    def test_claimed_execution_uses_locked_input_and_review_snapshots(
+        self, tmp_path, monkeypatch,
+    ):
+        authorized_url = "https://b2b.nbdeli.com/pcweb/detail?sku=authorized"
+        foreign_url = "https://b2b.nbdeli.com/pcweb/detail?sku=foreign"
+        crawler_root, runtime_dir, review, summary = self._plan(
+            tmp_path, monkeypatch, {"nbdeli": [authorized_url]},
+        )
+        manifest_path = Path(summary["manifest_path"])
+        plan = excel_audit_mod._read_multi_site_manifest(manifest_path)
+        input_path = plan["jobs"][0]["input"]
+        original_acquire = excel_audit_mod._acquire_multi_site_execution_claim
+
+        def acquire_then_mutate(*args, **kwargs):
+            original_acquire(*args, **kwargs)
+            input_book = Workbook()
+            input_sheet = input_book.active
+            input_sheet.append(["URL"])
+            input_sheet.append([foreign_url])
+            input_book.save(input_path)
+            review_book = load_workbook(review)
+            try:
+                review_book["record_results"].append([
+                    "https://unsupported.example/late", "EXTRA", 100, 200,
+                    "SAAS_WITHIN_CUSTOMER_THRESHOLD", None, "PENDING_CRAWL",
+                    None, None, None, None, None,
+                ])
+                review_book.save(review)
+            finally:
+                review_book.close()
+
+        monkeypatch.setattr(
+            excel_audit_mod,
+            "_acquire_multi_site_execution_claim",
+            acquire_then_mutate,
+        )
+        worker_urls = []
+
+        def worker(argv, _cwd, _env):
+            execution_manifest = load_workbook(
+                Path(argv[-1]), data_only=True, read_only=True
+            )
+            try:
+                _site, execution_input, output_path = next(
+                    execution_manifest.active.iter_rows(min_row=2, values_only=True)
+                )
+            finally:
+                execution_manifest.close()
+            input_book = load_workbook(
+                execution_input, data_only=True, read_only=True
+            )
+            try:
+                worker_urls.extend(
+                    row[0]
+                    for row in input_book.active.iter_rows(min_row=2, values_only=True)
+                )
+            finally:
+                input_book.close()
+            output_book = Workbook()
+            output_sheet = output_book.active
+            output_sheet.append([
+                "商城商品编码", "商品标题", "商品价格",
+                "商品链接", "采集状态", "失败原因",
+            ])
+            output_sheet.append([
+                "SKU", "测试商品", "12.34", authorized_url, "SUCCESS", None,
+            ])
+            output_book.save(output_path)
+            return 0
+
+        result = excel_audit_mod.resume_multi_site_fallback(
+            manifest_path=manifest_path,
+            review_xlsx=review,
+            output_xlsx=runtime_dir / "final.xlsx",
+            expected_count=summary["candidate_count"],
+            expected_sha256=summary["plan_sha256"],
+            crawler_root=crawler_root,
+            runner=worker,
+        )
+
+        assert worker_urls == [authorized_url]
+        assert result["unresolved"] == 0
+
+    def test_resume_rejects_manifest_crawler_revision_outside_fixed_pin(
+        self, tmp_path, monkeypatch,
+    ):
+        url = "https://b2b.nbdeli.com/pcweb/detail?sku=fixed-pin"
+        crawler_root, runtime_dir, review, summary = self._plan(
+            tmp_path, monkeypatch, {"nbdeli": [url]},
+        )
+        manifest_path = Path(summary["manifest_path"])
+        manifest = load_workbook(manifest_path)
+        try:
+            meta = manifest[excel_audit_mod.MULTI_SITE_META_SHEET]
+            for row in meta.iter_rows(min_row=2):
+                if row[0].value == "crawler_git_revision":
+                    row[1].value = "a" * 40
+            manifest.save(manifest_path)
+        finally:
+            manifest.close()
+        state_path = runtime_dir / "BATCH_STATE.md"
+        state_text = state_path.read_text(encoding="utf-8")
+        state_text = state_text.replace(
+            summary["manifest_sha256"],
+            excel_audit_mod._file_sha256(manifest_path),
+        )
+        state_path.write_text(state_text, encoding="utf-8")
+        runner_calls = 0
+
+        def runner(_argv, _cwd, _env):
+            nonlocal runner_calls
+            runner_calls += 1
+            return 0
+
+        with pytest.raises(RuntimeError, match="版本|revision"):
+            excel_audit_mod.resume_multi_site_fallback(
+                manifest_path=manifest_path,
+                review_xlsx=review,
+                output_xlsx=runtime_dir / "final.xlsx",
+                expected_count=summary["candidate_count"],
+                expected_sha256=summary["plan_sha256"],
+                crawler_root=crawler_root,
+                runner=runner,
+            )
+        assert runner_calls == 0
+
+    def test_resume_rejects_output_path_different_from_locked_output(
+        self, tmp_path, monkeypatch,
+    ):
+        url = "https://b2b.nbdeli.com/pcweb/detail?sku=locked-output"
+        crawler_root, runtime_dir, review, summary = self._plan(
+            tmp_path, monkeypatch, {"nbdeli": [url]},
+        )
+        runner_calls = 0
+
+        def runner(_argv, _cwd, _env):
+            nonlocal runner_calls
+            runner_calls += 1
+            return 2
+
+        other_output = runtime_dir / "other-final.xlsx"
+        with pytest.raises(RuntimeError, match="锁定 final"):
+            excel_audit_mod.resume_multi_site_fallback(
+                manifest_path=Path(summary["manifest_path"]),
+                review_xlsx=review,
+                output_xlsx=other_output,
+                expected_count=summary["candidate_count"],
+                expected_sha256=summary["plan_sha256"],
+                crawler_root=crawler_root,
+                runner=runner,
+            )
+
+        assert runner_calls == 0
+        assert not other_output.exists()
+        assert not (runtime_dir / "final.xlsx").exists()
+
+    def test_resume_rejects_output_in_other_batch_directory(
+        self, tmp_path, monkeypatch,
+    ):
+        url = "https://b2b.nbdeli.com/pcweb/detail?sku=other-batch"
+        crawler_root, runtime_dir, review, summary = self._plan(
+            tmp_path, monkeypatch, {"nbdeli": [url]},
+        )
+        runner_calls = 0
+
+        def runner(_argv, _cwd, _env):
+            nonlocal runner_calls
+            runner_calls += 1
+            return 2
+
+        other_output = tmp_path / "other-runtime" / "final.xlsx"
+        with pytest.raises(RuntimeError, match="锁定 final|批次目录"):
+            excel_audit_mod.resume_multi_site_fallback(
+                manifest_path=Path(summary["manifest_path"]),
+                review_xlsx=review,
+                output_xlsx=other_output,
+                expected_count=summary["candidate_count"],
+                expected_sha256=summary["plan_sha256"],
+                crawler_root=crawler_root,
+                runner=runner,
+            )
+
+        assert runner_calls == 0
+        assert not other_output.exists()
+        assert not (runtime_dir / "final.xlsx").exists()
+
+    def test_success_negative_price_is_rejected(self, tmp_path, monkeypatch):
+        self._assert_success_price_rejected(tmp_path, monkeypatch, "-1")
+
+    def test_success_missing_price_is_rejected(self, tmp_path, monkeypatch):
+        self._assert_success_price_rejected(tmp_path, monkeypatch, None)
+
+    @pytest.mark.parametrize("price", ["NaN", "Infinity", "-Infinity"])
+    def test_success_nan_or_infinite_price_is_rejected(
+        self, tmp_path, monkeypatch, price,
+    ):
+        self._assert_success_price_rejected(tmp_path, monkeypatch, price)
+
+    def test_success_zero_price_is_price_is_zero(self, tmp_path, monkeypatch):
+        url = "https://b2b.nbdeli.com/pcweb/detail?sku=zero-price"
+        crawler_root, runtime_dir, review, summary = self._plan(
+            tmp_path, monkeypatch, {"nbdeli": [url]},
+        )
+        result = excel_audit_mod.resume_multi_site_fallback(
+            manifest_path=Path(summary["manifest_path"]),
+            review_xlsx=review,
+            output_xlsx=runtime_dir / "final.xlsx",
+            expected_count=summary["candidate_count"],
+            expected_sha256=summary["plan_sha256"],
+            crawler_root=crawler_root,
+            runner=self._single_output_runner(url, 0),
+        )
+
+        assert result["results_by_url"][url]["page_price_status"] == "PRICE_IS_ZERO"
+        assert result["results_by_url"][url]["page_price_value"] == Decimal("0")
+
+    def test_supported_fallback_success_but_other_pending_row_is_not_complete(
+        self, tmp_path, monkeypatch,
+    ):
+        url = "https://b2b.nbdeli.com/pcweb/detail?sku=fallback-success"
+        crawler_root, runtime_dir, review, summary = self._plan(
+            tmp_path,
+            monkeypatch,
+            {"nbdeli": [url]},
+            extra_review_rows=[("https://unsupported.example/item", "PENDING_CRAWL")],
+        )
+        result = excel_audit_mod.resume_multi_site_fallback(
+            manifest_path=Path(summary["manifest_path"]),
+            review_xlsx=review,
+            output_xlsx=runtime_dir / "final.xlsx",
+            expected_count=summary["candidate_count"],
+            expected_sha256=summary["plan_sha256"],
+            crawler_root=crawler_root,
+            runner=self._single_output_runner(url, "12.34"),
+        )
+
+        assert result["unresolved"] == 1
+        assert result["unresolved_status_counts"] == {"PENDING_CRAWL": 1}
+        state = (runtime_dir / "BATCH_STATE.md").read_text(encoding="utf-8")
+        assert "状态：WAITING_USER" in state
+        assert "状态：COMPLETE" not in state
+
+    def test_whole_workbook_complete_marks_complete(self, tmp_path, monkeypatch):
+        url = "https://b2b.nbdeli.com/pcweb/detail?sku=whole-complete"
+        crawler_root, runtime_dir, review, summary = self._plan(
+            tmp_path,
+            monkeypatch,
+            {"nbdeli": [url]},
+            extra_review_rows=[("https://unsupported.example/item", "NO_RESULT")],
+        )
+        result = excel_audit_mod.resume_multi_site_fallback(
+            manifest_path=Path(summary["manifest_path"]),
+            review_xlsx=review,
+            output_xlsx=runtime_dir / "final.xlsx",
+            expected_count=summary["candidate_count"],
+            expected_sha256=summary["plan_sha256"],
+            crawler_root=crawler_root,
+            runner=self._single_output_runner(url, "12.34"),
+        )
+
+        assert result["unresolved"] == 0
+        assert result["unresolved_status_counts"] == {}
+        assert "状态：COMPLETE" in (
+            runtime_dir / "BATCH_STATE.md"
+        ).read_text(encoding="utf-8")
+
+    def test_prepare_plan_verifies_actual_crawler_revision(self, tmp_path, monkeypatch):
+        url = "https://b2b.nbdeli.com/pcweb/detail?sku=revision"
+        crawler_root = tmp_path / "crawler"
+        review = tmp_path / "review.xlsx"
+        self._review(review, [url])
+        calls = []
+
+        def wrong_revision(root, expected):
+            calls.append((root, expected))
+            raise RuntimeError("crawler revision mismatch")
+
+        monkeypatch.setattr(
+            excel_audit_mod, "_verify_multi_site_crawler_revision", wrong_revision,
+        )
+        with pytest.raises(RuntimeError, match="crawler revision mismatch"):
+            excel_audit_mod.prepare_multi_site_fallback(
+                urls_by_site={"nbdeli": [url]},
+                runtime_dir=tmp_path,
+                review_xlsx=review,
+                requested_output=tmp_path / "final.xlsx",
+                crawler_root=crawler_root,
+            )
+
+        assert calls == [
+            (crawler_root, excel_audit_mod.EXPECTED_MULTI_SITE_CRAWLER_REVISION)
+        ]
+        assert not (tmp_path / "multi_site_fallback" / "manifest.xlsx").exists()
 
     def test_plan_ignores_displayed_success_rows(self, tmp_path, monkeypatch):
         successful = "https://b2b.nbdeli.com/pcweb/detail?sku=ok"
@@ -2916,11 +3346,12 @@ class TestRunMultiSiteFallback:
 
         summary = excel_audit_mod.prepare_multi_site_fallback(
             urls_by_site={"nbdeli": [missing]}, runtime_dir=tmp_path,
-            review_xlsx=review, crawler_root=crawler_root,
+            review_xlsx=review, requested_output=tmp_path / "final.xlsx",
+            crawler_root=crawler_root,
         )
 
         assert summary["candidate_count"] == 1
-        assert summary["crawler_git_revision"] == excel_audit_mod.EXPECTED_MULTI_SITE_CRAWLER_REVISION
+        assert summary["crawler_git_revision"] == "a" * 40
 
     def test_failed_plan_can_be_recovered_without_crawling(self, tmp_path, monkeypatch):
         url = "https://b2b.nbdeli.com/pcweb/detail?sku=recover"
@@ -2942,6 +3373,10 @@ class TestRunMultiSiteFallback:
         partial_input.write_bytes(b"original failed-plan evidence")
         monkeypatch.setattr(excel_audit_mod, "resume_multi_site_fallback",
                             lambda **_kwargs: pytest.fail("计划恢复不得爬取"))
+        monkeypatch.setattr(
+            excel_audit_mod, "_verify_multi_site_crawler_revision",
+            lambda *_args, **_kwargs: excel_audit_mod.EXPECTED_MULTI_SITE_CRAWLER_REVISION,
+        )
 
         summary = excel_audit_mod.recover_multi_site_fallback_plan(
             review_xlsx=review,
@@ -2956,6 +3391,9 @@ class TestRunMultiSiteFallback:
         )
         assert partial_input.read_bytes() == b"original failed-plan evidence"
         assert "状态：WAITING_USER" in state.read_text(encoding="utf-8")
+        plan = excel_audit_mod._read_multi_site_manifest(Path(summary["manifest_path"]))
+        assert Path(plan["meta"]["requested_output"]) == (tmp_path / "out.xlsx").resolve()
+        assert Path(plan["meta"]["runtime_dir"]) == tmp_path.resolve()
 
     def test_recovery_rejects_modified_review(self, tmp_path):
         url = "https://b2b.nbdeli.com/pcweb/detail?sku=locked"

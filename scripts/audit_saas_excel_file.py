@@ -1594,6 +1594,7 @@ def run_main(
                     urls_by_site=urls_by_site,
                     runtime_dir=runtime_dir,
                     review_xlsx=review_path,
+                    requested_output=output_xlsx,
                     crawler_root=DEFAULT_MULTI_SITE_CRAWLER_ROOT,
                 )
             except Exception as exc:
@@ -1814,6 +1815,16 @@ MULTI_SITE_HOST_TO_SITE = {
 MULTI_SITE_FALLBACK_DIRNAME = "multi_site_fallback"
 MULTI_SITE_MANIFEST_FILENAME = "manifest.xlsx"
 MULTI_SITE_META_SHEET = "cnnc_meta"
+FINAL_PAGE_PRICE_TERMINAL_STATUSES = {
+    "OK",
+    "PRICE_IS_ZERO",
+    "NO_RESULT",
+    "SKIPPED_JD",
+    "SKIPPED_ZHAOSHANG",
+    "SKIPPED_NO_LINK",
+    "SKIPPED_MODEL_NOT_SAME",
+    "SKIPPED",
+}
 CRAWL_INPUT_FILENAME = "_crawl_input.xlsx"
 CRAWL_DRY_RUN_FILENAME = "_crawl_dry_run.xlsx"
 CRAWL_OUTPUT_FILENAME = "_crawl_output.xlsx"
@@ -1919,6 +1930,31 @@ def _review_missing_supported_urls(review_xlsx: Path) -> dict[str, list[str]]:
         workbook.close()
 
 
+def inspect_final_page_price_completion(output_xlsx: Path) -> dict[str, Any]:
+    """Inspect every final record using the existing terminal status semantics."""
+    workbook = load_workbook(output_xlsx, data_only=True, read_only=True)
+    try:
+        if "record_results" not in workbook.sheetnames:
+            raise ValueError("final Excel 缺少 record_results")
+        sheet = workbook["record_results"]
+        headers = [normalize_cell_str(cell.value) for cell in sheet[1]]
+        display_status = _display_header("page_price_status")
+        if display_status not in headers:
+            raise ValueError("final Excel 缺少 page_price_status")
+        status_col = headers.index(display_status)
+        counts: dict[str, int] = {}
+        for values in sheet.iter_rows(min_row=2, values_only=True):
+            status = _page_status_code(values[status_col]) or "<BLANK>"
+            if status not in FINAL_PAGE_PRICE_TERMINAL_STATUSES:
+                counts[status] = counts.get(status, 0) + 1
+        return {
+            "remaining_unresolved_count": sum(counts.values()),
+            "remaining_unresolved_status_counts": dict(sorted(counts.items())),
+        }
+    finally:
+        workbook.close()
+
+
 def _multi_site_child_env(fallback_dir: Path) -> dict[str, str]:
     allowed = {
         "SystemRoot", "WINDIR", "PATH", "PATHEXT", "COMSPEC", "USERPROFILE",
@@ -1973,6 +2009,8 @@ def _write_multi_site_fallback_files(
     fallback_dir: Path,
     *,
     review_xlsx: Path,
+    requested_output: Path,
+    runtime_dir: Path,
     crawler_revision: str,
 ) -> tuple[Path, list[tuple[str, Path]], str]:
     fallback_dir.mkdir(parents=True, exist_ok=True)
@@ -2001,6 +2039,8 @@ def _write_multi_site_fallback_files(
     meta.append(["candidate_count", sum(len(urls) for urls in urls_by_site.values())])
     meta.append(["plan_sha256", plan_sha256])
     meta.append(["review_xlsx", str(Path(review_xlsx).resolve())])
+    meta.append(["requested_output", str(Path(requested_output).resolve())])
+    meta.append(["runtime_dir", str(Path(runtime_dir).resolve())])
     meta.append(["crawler_git_revision", crawler_revision])
     manifest.save(manifest_path)
     return manifest_path.resolve(), outputs, plan_sha256
@@ -2011,19 +2051,29 @@ def prepare_multi_site_fallback(
     urls_by_site: dict[str, list[str]],
     runtime_dir: Path,
     review_xlsx: Path,
+    requested_output: Path,
     crawler_root: Path,
     fallback_dirname: str = MULTI_SITE_FALLBACK_DIRNAME,
 ) -> dict[str, Any]:
     if not urls_by_site:
         raise ValueError("multi-site 兜底候选不得为空")
+    runtime_dir = Path(runtime_dir).resolve()
+    review_xlsx = Path(review_xlsx).resolve()
+    requested_output = Path(requested_output).resolve()
+    if requested_output.parent != runtime_dir:
+        raise ValueError("multi-site 预定 final 必须位于当前批次目录")
     if _review_missing_supported_urls(review_xlsx) != urls_by_site:
         raise ValueError("multi-site 候选与 review Excel 缺价链接不一致")
-    revision = EXPECTED_MULTI_SITE_CRAWLER_REVISION
+    revision = _verify_multi_site_crawler_revision(
+        crawler_root, EXPECTED_MULTI_SITE_CRAWLER_REVISION
+    )
     fallback_dir = Path(runtime_dir) / fallback_dirname
     manifest_path, outputs, plan_sha256 = _write_multi_site_fallback_files(
         urls_by_site,
         fallback_dir,
         review_xlsx=review_xlsx,
+        requested_output=requested_output,
+        runtime_dir=runtime_dir,
         crawler_revision=revision,
     )
     return {
@@ -2132,7 +2182,11 @@ def _read_multi_site_fallback_output(
             reason = normalize_cell_str(values[index["失败原因"]])
             price = parse_decimal(values[index["商品价格"]])
             source = f"本地兜底:{site}"
-            if status == "SUCCESS" and price is not None:
+            if status == "SUCCESS":
+                if price is None or not price.is_finite() or price < 0:
+                    raise ValueError(
+                        f"multi-site worker SUCCESS 价格违反契约: site={site} url={url}"
+                    )
                 page_status = "PRICE_IS_ZERO" if price == 0 else "OK"
                 page_value = price
             elif status == "NOT_FOUND":
@@ -2249,6 +2303,7 @@ def recover_multi_site_fallback_plan(
             urls_by_site=urls_by_site,
             runtime_dir=runtime_dir,
             review_xlsx=review_xlsx,
+            requested_output=requested_output,
             crawler_root=crawler_root,
             fallback_dirname=recovery_dirname,
         )
@@ -2266,6 +2321,70 @@ def recover_multi_site_fallback_plan(
         requested_output=requested_output,
     )
     return summary
+
+
+def _acquire_multi_site_execution_claim(
+    claim_path: Path,
+    *,
+    plan_sha256: str,
+    manifest_sha256: str,
+    review_sha256: str,
+) -> None:
+    claim = {
+        "schema": "cnnc.multi_site_fallback.execution_claim",
+        "version": 1,
+        "plan_sha256": plan_sha256,
+        "manifest_sha256": manifest_sha256,
+        "review_sha256": review_sha256,
+        "pid": os.getpid(),
+        "started_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+    }
+    try:
+        with Path(claim_path).open("x", encoding="utf-8") as stream:
+            json.dump(claim, stream, ensure_ascii=False, indent=2)
+            stream.write("\n")
+    except FileExistsError as exc:
+        raise RuntimeError(
+            "multi-site manifest 已被执行 claim 消费或可能已发送请求，不得自动重跑"
+        ) from exc
+
+
+def _write_multi_site_execution_snapshot(
+    *,
+    fallback_dir: Path,
+    plan: dict[str, Any],
+    review_bytes: bytes,
+) -> tuple[Path, Path]:
+    snapshot_dir = fallback_dir / "execution_snapshot"
+    try:
+        snapshot_dir.mkdir()
+    except FileExistsError as exc:
+        raise RuntimeError(
+            "multi-site 执行快照已存在，claim 已消费，不得自动重跑"
+        ) from exc
+    review_snapshot = snapshot_dir / "review.xlsx"
+    with review_snapshot.open("xb") as stream:
+        stream.write(review_bytes)
+
+    manifest = Workbook()
+    sheet = manifest.active
+    sheet.title = "jobs"
+    sheet.append(["site", "input", "output"])
+    for job in plan["jobs"]:
+        input_snapshot = snapshot_dir / f"{job['site']}_input.xlsx"
+        write_crawler_input_xlsx(job["urls"], input_snapshot)
+        sheet.append([
+            job["site"],
+            str(input_snapshot.resolve()),
+            str(Path(job["output"]).resolve()),
+        ])
+    meta = manifest.create_sheet(MULTI_SITE_META_SHEET)
+    meta.append(["key", "value"])
+    for key, value in plan["meta"].items():
+        meta.append([key, value])
+    execution_manifest = snapshot_dir / "manifest.xlsx"
+    manifest.save(execution_manifest)
+    return execution_manifest.resolve(), review_snapshot.resolve()
 
 
 def resume_multi_site_fallback(
@@ -2291,11 +2410,28 @@ def resume_multi_site_fallback(
         raise FileNotFoundError(f"multi-site review Excel 不存在: {review_xlsx}")
     if _review_missing_supported_urls(review_xlsx) != plan["urls_by_site"]:
         raise RuntimeError("multi-site review 缺价链接与锁定候选不一致")
-    if Path(output_xlsx).exists():
+    fallback_dir = Path(manifest_path).resolve().parent
+    locked_output_text = plan["meta"].get("requested_output", "")
+    runtime_dir_text = plan["meta"].get("runtime_dir", "")
+    if not locked_output_text or not runtime_dir_text:
+        raise RuntimeError("multi-site manifest 缺少锁定 final 或批次目录")
+    locked_output = Path(locked_output_text).resolve()
+    runtime_dir = Path(runtime_dir_text).resolve()
+    actual_output = Path(output_xlsx).resolve()
+    if actual_output != locked_output:
+        raise RuntimeError("multi-site output_xlsx 与 manifest 锁定 final 不一致")
+    if actual_output.parent != runtime_dir or fallback_dir.parent != runtime_dir:
+        raise RuntimeError("multi-site final 或 manifest 不在锁定批次目录")
+    if actual_output.exists():
         raise RuntimeError(f"multi-site final Excel 已存在，不得覆盖: {output_xlsx}")
     expected_revision = plan["meta"].get("crawler_git_revision", "")
-    _verify_multi_site_crawler_revision(crawler_root, expected_revision)
-    fallback_dir = Path(manifest_path).resolve().parent
+    if expected_revision.lower() != EXPECTED_MULTI_SITE_CRAWLER_REVISION.lower():
+        raise RuntimeError(
+            "multi-site manifest 爬虫版本不等于固定审查版本，不得续跑"
+        )
+    _verify_multi_site_crawler_revision(
+        crawler_root, EXPECTED_MULTI_SITE_CRAWLER_REVISION
+    )
     outputs = [(job["site"], job["output"], job["urls"]) for job in plan["jobs"]]
     existing_outputs = [str(path) for _site, path, _urls in outputs if path.exists()]
     if existing_outputs:
@@ -2307,22 +2443,44 @@ def resume_multi_site_fallback(
     state_text = batch_state_path.read_text(encoding="utf-8") if batch_state_path.is_file() else ""
     if "状态：WAITING_USER" not in state_text or plan["plan_sha256"] not in state_text:
         raise RuntimeError("BATCH_STATE.md 未锁定当前 multi-site 续跑计划")
+    manifest_sha256 = _file_sha256(manifest_path)
+    review_sha256 = _file_sha256(review_xlsx)
+    review_snapshot_bytes = Path(review_xlsx).read_bytes()
+    if hashlib.sha256(review_snapshot_bytes).hexdigest() != review_sha256:
+        raise RuntimeError("multi-site review Excel 在预检期间发生变化")
     if (
-        f"manifest_sha256={_file_sha256(manifest_path)}" not in state_text
-        or f"review_sha256={_file_sha256(review_xlsx)}" not in state_text
+        f"manifest_sha256={manifest_sha256}" not in state_text
+        or f"review_sha256={review_sha256}" not in state_text
     ):
         raise RuntimeError("multi-site manifest 或 review Excel 已变更，不得使用旧授权续跑")
+    _acquire_multi_site_execution_claim(
+        fallback_dir / "execution.claim.json",
+        plan_sha256=plan["plan_sha256"],
+        manifest_sha256=manifest_sha256,
+        review_sha256=review_sha256,
+    )
     _record_batch_state_fields(batch_state_path, {
         "状态": "BLOCKED",
         "multi_site_fallback_execution": "STARTED; 请求可能已发出，未确认前不得重跑。",
         "阻塞": "multi-site 已启动；如进程中断，须人工对账请求和输出。",
+    })
+    execution_manifest, execution_review = _write_multi_site_execution_snapshot(
+        fallback_dir=fallback_dir,
+        plan=plan,
+        review_bytes=review_snapshot_bytes,
+    )
+    _record_batch_state_fields(batch_state_path, {
+        "multi_site_fallback_execution_snapshot": (
+            f"manifest={execution_manifest}; review={execution_review}; "
+            f"plan_sha256={plan['plan_sha256']}"
+        ),
     })
     argv = [
         _resolve_crawler_python_executable(),
         "-m",
         "mall_crawler.cli",
         "--manifest",
-        str(manifest_path),
+        str(execution_manifest),
     ]
     cwd = str(crawler_root.resolve())
     env = _multi_site_child_env(fallback_dir)
@@ -2358,16 +2516,18 @@ def resume_multi_site_fallback(
         results_by_url.update(mapped)
     _record_batch_state_fields(batch_state_path, {"后台进程": "无。"})
     stats = backfill_page_results_into_workbook(
-        Path(review_xlsx), Path(output_xlsx), results_by_url
+        execution_review, Path(output_xlsx), results_by_url
     )
-    unresolved = sum(
-        hit.get("page_price_status") not in {"OK", "PRICE_IS_ZERO"}
-        for hit in results_by_url.values()
-    )
+    completion = inspect_final_page_price_completion(Path(output_xlsx))
+    unresolved = completion["remaining_unresolved_count"]
+    unresolved_status_counts = completion["remaining_unresolved_status_counts"]
     _record_batch_state_fields(batch_state_path, {
         "状态": "COMPLETE" if unresolved == 0 else "WAITING_USER",
         "阻塞": "无。" if unresolved == 0 else f"multi-site 续跑后仍有 {unresolved} 条未取得有效价格。",
         "下一条动作": "无；本批次完成。" if unresolved == 0 else "复核未取得有效价格的记录；不得重跑该 manifest。",
+        "multi_site_fallback_unresolved_status_counts": json.dumps(
+            unresolved_status_counts, ensure_ascii=False, sort_keys=True
+        ),
     })
     _append_batch_state_field(batch_state_path, "输出", f"multi-site final={Path(output_xlsx).resolve()}")
     return {
@@ -2377,6 +2537,7 @@ def resume_multi_site_fallback(
         "results_by_url": results_by_url,
         "backfilled": stats["backfilled"],
         "unresolved": unresolved,
+        "unresolved_status_counts": unresolved_status_counts,
     }
 
 
