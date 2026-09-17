@@ -47,17 +47,11 @@ $hour = $now.Hour
 $minute = $now.Minute
 $phases = @()
 $isWeekday = $now.DayOfWeek -notin @([DayOfWeek]::Saturday, [DayOfWeek]::Sunday)
-if ($isWeekday -and $hour -eq 17 -and ($minute % 5) -eq 0 -and $minute -le 50) {
-    # 17:00-17:50 is the SaaS new-data peak: every 5-minute wakeup is a full
-    # tick with unchanged business semantics.  A tick still running at the
-    # next 5-minute boundary is dropped by the task's IgnoreNew policy.
+if ($isWeekday -and $hour -eq 17 -and ($minute % 3) -eq 0 -and $minute -le 57) {
+    # 17:00-17:57 is the recovery peak: every 3-minute wakeup is a full tick
+    # with harvest, reconcile and local fallback eligibility. IgnoreNew drops
+    # a boundary when the preceding tick still owns the writer.
     $phases = @("tick")
-}
-elseif ($isWeekday -and $hour -eq 17 -and $minute -eq 55) {
-    # 17:55 only sweeps already-submitted Zhaoshang remote jobs so the peak
-    # submissions drain before the closeout takes the writer: no SaaS
-    # discovery, no Detail/Model, no new remote submission, no finalize.
-    $phases = @("harvest-only")
 }
 elseif ($isWeekday -and $minute -eq 0 -and $hour -ge 9 -and $hour -le 16) {
     $phases = @("tick")

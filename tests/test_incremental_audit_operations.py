@@ -1123,9 +1123,8 @@ def test_scheduler_scripts_preview_weekday_production_plan_without_mutation():
     assert task["WeeksInterval"] == 1
     assert task["StartBoundary"] == "09:00"
     assert task["LastPlannedStart"] == "20:35"
-    # One task, three weekly triggers: the daytime 15-minute baseline ends at
-    # 16:45, the 17:00-17:55 peak window and the 18:00-20:00 closeout window
-    # wake up every 5 minutes, and 20:00 stays the last automatic start.
+    # The daytime baseline ends at 16:45; the recovery peak runs full ticks
+    # every 3 minutes through 17:57; closeout remains on its 5-minute grid.
     assert [
         (
             trigger["Name"],
@@ -1137,7 +1136,7 @@ def test_scheduler_scripts_preview_weekday_production_plan_without_mutation():
         for trigger in task["Triggers"]
     ] == [
         ("Baseline", "09:00", "PT15M", "PT7H46M", "16:45"),
-        ("Peak", "17:00", "PT5M", "PT56M", "17:55"),
+        ("Peak", "17:00", "PT3M", "PT58M", "17:57"),
         ("Closeout", "18:00", "PT5M", "PT2H1M", "20:00"),
         ("SafetyCloseout", "20:35", None, None, "20:35"),
     ]
@@ -1145,9 +1144,9 @@ def test_scheduler_scripts_preview_weekday_production_plan_without_mutation():
         assert trigger["DaysOfWeek"] == ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]
         assert "Saturday" not in trigger["DaysOfWeek"]
         assert "Sunday" not in trigger["DaysOfWeek"]
-    assert task["TickTimes"] == "09:00-16:00 hourly; 17:00-17:50 every 5 minutes"
+    assert task["TickTimes"] == "09:00-16:00 hourly; 17:00-17:57 every 3 minutes"
     assert task["HarvestOnlyTimes"].startswith("09:15-16:45 quarter-hour slots")
-    assert "17:55" in task["HarvestOnlyTimes"]
+    assert "17:55" not in task["HarvestOnlyTimes"]
     assert task["CloseoutHours"].startswith("18:00-20:00 every 5 minutes")
     assert "one-shot 20:35 safety closeout" in task["CloseoutHours"]
     assert "20:35 is the last automatic start" in task["CloseoutHours"]
@@ -1229,22 +1228,28 @@ def test_scheduled_runner_routes_hours_without_running_python(tmp_path):
         ("2026-08-13T16:30:00", ["harvest-only"]),
         ("2026-08-13T16:45:00", ["harvest-only"]),
         ("2026-08-13T16:50:00", []),
-        # 17:00-17:50 is the SaaS new-data peak: every 5-minute wakeup is a
-        # full tick with unchanged business semantics.
+        # 17:00-17:57 runs a full tick every 3 minutes.
         ("2026-08-13T17:00:00", ["tick"]),
-        ("2026-08-13T17:05:00", ["tick"]),
-        ("2026-08-13T17:10:00", ["tick"]),
+        ("2026-08-13T17:03:00", ["tick"]),
+        ("2026-08-13T17:06:00", ["tick"]),
+        ("2026-08-13T17:09:00", ["tick"]),
+        ("2026-08-13T17:12:00", ["tick"]),
         ("2026-08-13T17:15:00", ["tick"]),
-        ("2026-08-13T17:20:00", ["tick"]),
-        ("2026-08-13T17:25:00", ["tick"]),
+        ("2026-08-13T17:18:00", ["tick"]),
+        ("2026-08-13T17:21:00", ["tick"]),
+        ("2026-08-13T17:24:00", ["tick"]),
+        ("2026-08-13T17:27:00", ["tick"]),
         ("2026-08-13T17:30:00", ["tick"]),
-        ("2026-08-13T17:35:00", ["tick"]),
-        ("2026-08-13T17:40:00", ["tick"]),
+        ("2026-08-13T17:33:00", ["tick"]),
+        ("2026-08-13T17:36:00", ["tick"]),
+        ("2026-08-13T17:39:00", ["tick"]),
+        ("2026-08-13T17:42:00", ["tick"]),
         ("2026-08-13T17:45:00", ["tick"]),
-        ("2026-08-13T17:50:00", ["tick"]),
-        # 17:55 only sweeps already-submitted Zhaoshang remote jobs ahead of
-        # the 18:00 closeout; it must never be a full tick.
-        ("2026-08-13T17:55:00", ["harvest-only"]),
+        ("2026-08-13T17:48:00", ["tick"]),
+        ("2026-08-13T17:51:00", ["tick"]),
+        ("2026-08-13T17:54:00", ["tick"]),
+        ("2026-08-13T17:57:00", ["tick"]),
+        ("2026-08-13T17:55:00", []),
         ("2026-08-13T17:52:00", []),
         ("2026-08-13T17:58:00", []),
         # 18:00-20:00 closeout start opportunities every 5 minutes; IgnoreNew
