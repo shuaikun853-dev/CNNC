@@ -68,13 +68,20 @@ from app.services.customer_prewarm_store import (
 )
 from app.services.daily_audit_store import DailyAuditStore, LeaseToken
 from app.services.incremental_audit_runtime import runtime_paths
-from app.services.legacy_zhaoshang_adapter import (
-    CnncLegacyZhaoshangAdapter,
-    CrawlRequest,
-    ReconcileStatus,
-    SubmitStatus,
-)
-from app.services.recovery.harvest import harvest_existing_customer_prewarm_job
+
+def harvest_existing_customer_prewarm_job(**kwargs: Any) -> dict[str, Any]:
+    """Lazy bridge to the recovery primitive.
+
+    Importing the lifecycle planner must stay free of Zhaoshang module access;
+    the heavy recovery module is loaded only when a real harvest is attempted.
+    The wrapper also preserves the established monkeypatch seam used by tests.
+    """
+    from app.services.recovery.harvest import (
+        harvest_existing_customer_prewarm_job as _harvest_existing_customer_prewarm_job,
+    )
+
+    return _harvest_existing_customer_prewarm_job(**kwargs)
+
 from app.services.shared_crawl_cache import PRODUCER_CUSTOMER_PREWARM_ZHAOSHANG
 from scripts.zhaoshang_mall_mapping import ZhaoshangMallMapping
 
@@ -534,7 +541,7 @@ def run_reconcile_phase(
                 prepared, timeout_seconds=max(0.001, deadline - monotonic_value())
             )
             status = _status_value(outcome.status)
-            if status == ReconcileStatus.FOUND.value:
+            if status == "FOUND":
                 task_id = getattr(outcome, "task_id", None)
                 task_number = getattr(outcome, "task_number", None)
                 if not task_id or not task_number:
@@ -710,7 +717,7 @@ def _redispatch_mall_group(
 
     crawl_ids: list[int] = []
     requests = [
-        CrawlRequest(
+        dispatch_service.CrawlRequest(
             mall_key=mall_key,
             mall_source_id=mapping.source_id,
             mall_name=mapping.mall_name,
@@ -841,13 +848,13 @@ def _redispatch_mall_group(
                 phase_errors=phase_errors,
             )
 
-    if status == SubmitStatus.SUBMIT_UNKNOWN.value:
+    if status == dispatch_service.SubmitStatus.SUBMIT_UNKNOWN.value:
         store.mark_submit_unknown(
             token, job_id, f"prewarm redispatch submit unknown: {diagnostic}"
         )
         _bind_candidates(error="submit unknown; reconcile pending")
         counters["submit_unknown"] += 1
-    elif status == SubmitStatus.NOT_ATTEMPTED.value:
+    elif status == dispatch_service.SubmitStatus.NOT_ATTEMPTED.value:
         # Pre-send failure: no dispatch happened; the unclaimed intent is
         # re-planned by the next pass through the idempotent create chain.
         store.release_remote_submission_claim(
@@ -860,7 +867,7 @@ def _redispatch_mall_group(
             f"redispatch mall {mall_key}: submit not attempted (pre-send); retry next pass"
             + (f" ({diagnostic})" if diagnostic else "")
         )
-    elif status == SubmitStatus.SUBMITTED.value:
+    elif status == dispatch_service.SubmitStatus.SUBMITTED.value:
         task_id = getattr(outcome, "task_id", None)
         task_number = getattr(outcome, "task_number", None)
         if not task_id or not task_number:
@@ -919,7 +926,7 @@ def run_harvest_phase(
     summary: dict[str, Any],
     per_job_timeout_seconds: float = HARVEST_PER_JOB_TIMEOUT_SECONDS,
     max_jobs: int = HARVEST_PER_PASS,
-    adapter: CnncLegacyZhaoshangAdapter | None = None,
+    adapter: Any | None = None,
     mappings: Sequence[ZhaoshangMallMapping] | None = None,
 ) -> None:
     """Harvest up to ``max_jobs`` live prewarm jobs via the existing primitive.
@@ -943,9 +950,9 @@ def run_harvest_phase(
     for row in rows:
         targets.setdefault(int(row["job_id"]), str(row["remote_identity"] or ""))
 
-    adapter_holder: list[CnncLegacyZhaoshangAdapter] = []
+    adapter_holder: list[Any] = []
 
-    def get_adapter() -> CnncLegacyZhaoshangAdapter:
+    def get_adapter() -> Any:
         if not adapter_holder:
             # Constructed through the dispatch service's attribute so the
             # established test seam (monkeypatching
