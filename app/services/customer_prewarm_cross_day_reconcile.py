@@ -291,6 +291,17 @@ def run_cross_day_reconcile_phase(
                 outcome = get_adapter().reconcile_unknown(
                     prepared, timeout_seconds=timeout
                 )
+                if key not in set(
+                    _linked_cross_day_job_keys(
+                        prewarm_store, current_business_date
+                    )
+                ):
+                    summary["cross_day_reconcile_deferred"] += 1
+                    phase_errors.append(
+                        f"cross-day job {owning_day}/{job_id}: candidate linkage "
+                        "changed during remote lookup; result discarded"
+                    )
+                    continue
                 status = _status_value(outcome.status)
                 task_id = getattr(outcome, "task_id", None)
                 task_number = getattr(outcome, "task_number", None)

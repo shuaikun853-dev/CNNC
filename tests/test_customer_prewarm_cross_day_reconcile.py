@@ -717,6 +717,48 @@ def test_target_linkage_is_revalidated_before_historical_remote_call(
     assert summary["cross_day_reconcile_deferred"] == 1
 
 
+def test_linkage_rebound_during_remote_lookup_prevents_historical_write(tmp_path):
+    """A remote result for a newly unbound old job must be discarded."""
+    runtime_root = tmp_path / "runtime"
+    prewarm = CustomerPrewarmStore(runtime_root / "customer_prewarm.sqlite3")
+    old_paths, old_job_id = seed_unknown_job(
+        runtime_root,
+        YESTERDAY,
+        _CountingAdapter(),
+        mapping=COMIX,
+        url="https://qx.com/rebound-during-reconcile.html",
+    )
+    candidate_id = seed_remote_candidate(
+        prewarm,
+        "https://qx.com/rebound-during-reconcile.html",
+        old_job_id,
+        business_date=YESTERDAY,
+    )
+
+    class RebindingAdapter(_CountingAdapter):
+        def reconcile_unknown(self, job, *, timeout_seconds):
+            outcome = super().reconcile_unknown(job, timeout_seconds=timeout_seconds)
+            prewarm.record_candidate_result(
+                candidate_id,
+                cache_status="REMOTE_DISPATCHED",
+                remote_job_id=999,
+            )
+            prewarm.record_remote_job_link(TODAY, candidate_id, 999, "test-rebind")
+            return outcome
+
+    adapter = RebindingAdapter(reconcile_outcome=RECONCILE_NOT_FOUND)
+
+    summary = _run_cross_day(runtime_root, prewarm, adapter)
+
+    assert adapter.reconcile_calls == 1
+    assert summary["cross_day_reconcile_not_found"] == 0
+    assert summary["cross_day_reconcile_deferred"] == 1
+    historical = _remote_job_row(old_paths.state_path, old_job_id)
+    assert historical["state"] == "SUBMIT_UNKNOWN"
+    assert historical["recovery_attempts"] == 0
+    assert not str(historical["remote_identity"] or "")
+
+
 def test_plan_only_reports_cross_day_jobs_with_zero_write_lock_adapter_or_remote(
     tmp_path, monkeypatch
 ):
