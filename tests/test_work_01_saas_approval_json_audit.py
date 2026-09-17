@@ -3273,6 +3273,42 @@ class TestRunMultiSiteFallback:
         assert "状态：WAITING_USER" in state
         assert "状态：COMPLETE" not in state
 
+    def test_skipped_zhaoshang_remaining_row_prevents_complete(
+        self, tmp_path, monkeypatch,
+    ):
+        url = "https://b2b.nbdeli.com/pcweb/detail?sku=fallback-success"
+        zhaoshang_url = "https://item.jd.com/100237336261.html"
+        crawler_root, runtime_dir, review, summary = self._plan(
+            tmp_path,
+            monkeypatch,
+            {"nbdeli": [url]},
+            extra_review_rows=[(zhaoshang_url, "SKIPPED_ZHAOSHANG")],
+        )
+        result = excel_audit_mod.resume_multi_site_fallback(
+            manifest_path=Path(summary["manifest_path"]),
+            review_xlsx=review,
+            output_xlsx=runtime_dir / "final.xlsx",
+            expected_count=summary["candidate_count"],
+            expected_sha256=summary["plan_sha256"],
+            crawler_root=crawler_root,
+            runner=self._single_output_runner(url, "12.34"),
+        )
+
+        final_book = load_workbook(runtime_dir / "final.xlsx", data_only=True)
+        try:
+            final_sheet = final_book["record_results"]
+            headers = [str(cell.value or "") for cell in final_sheet[1]]
+            status_col = headers.index(_display_header("page_price_status")) + 1
+            assert final_sheet.cell(row=2, column=status_col).value == _display_value("OK")
+            assert final_sheet.cell(row=3, column=status_col).value == "SKIPPED_ZHAOSHANG"
+        finally:
+            final_book.close()
+        assert result["unresolved"] == 1
+        assert result["unresolved_status_counts"] == {"SKIPPED_ZHAOSHANG": 1}
+        state = (runtime_dir / "BATCH_STATE.md").read_text(encoding="utf-8")
+        assert "状态：WAITING_USER" in state
+        assert "状态：COMPLETE" not in state
+
     def test_whole_workbook_complete_marks_complete(self, tmp_path, monkeypatch):
         url = "https://b2b.nbdeli.com/pcweb/detail?sku=whole-complete"
         crawler_root, runtime_dir, review, summary = self._plan(
