@@ -1362,7 +1362,84 @@ def test_found_commit_holds_linkage_fence_until_historical_write(
 
     assert writer_finished_before_commit == [False]
     assert writer_finished.is_set()
-    assert _remote_job_row(old_paths.state_path, old_job_id)["state"] == "SUBMITTED"
+    historical_state = _remote_job_row(old_paths.state_path, old_job_id)["state"]
+    assert historical_state in {"PRIORITY_PENDING", "SUBMITTED"}
+    assert {
+        row["state"]
+        for row in _state_rows(
+            old_paths.state_path,
+            "SELECT state FROM crawl_work WHERE remote_job_id=?",
+            (old_job_id,),
+        )
+    } == {historical_state}
+    assert adapter.reconcile_calls == 1
+    assert adapter.submit_calls == 0
+
+
+def test_not_found_commit_holds_linkage_fence_until_attempt_write(
+    tmp_path, monkeypatch
+):
+    """A stale negative lookup cannot increment recovery attempts."""
+    from threading import Event, Thread
+
+    from app.services.daily_audit_store import DailyAuditStore
+
+    runtime_root = tmp_path / "runtime"
+    prewarm = CustomerPrewarmStore(runtime_root / "customer_prewarm.sqlite3")
+    old_paths, old_job_id = seed_unknown_job(
+        runtime_root,
+        YESTERDAY,
+        _CountingAdapter(),
+        mapping=COMIX,
+        url="https://qx.com/not-found-commit-fence.html",
+    )
+    candidate_id = seed_remote_candidate(
+        prewarm,
+        "https://qx.com/not-found-commit-fence.html",
+        old_job_id,
+        business_date=YESTERDAY,
+    )
+    adapter = _CountingAdapter(reconcile_outcome=RECONCILE_NOT_FOUND)
+
+    original = DailyAuditStore.bump_remote_job_recovery_attempt
+    writer_started = Event()
+    writer_finished = Event()
+    writer_threads = []
+    writer_finished_before_commit = []
+
+    def fenced_commit(store, token, job_id):
+        def rebind():
+            writer_started.set()
+            prewarm.record_candidate_result(
+                candidate_id,
+                cache_status="REMOTE_DISPATCHED",
+                remote_job_id=999,
+            )
+            prewarm.record_remote_job_link(TODAY, candidate_id, 999, "test-rebind")
+            writer_finished.set()
+
+        writer = Thread(target=rebind)
+        writer_threads.append(writer)
+        writer.start()
+        assert writer_started.wait(1.0)
+        writer_finished_before_commit.append(writer_finished.wait(0.1))
+        return original(store, token, job_id)
+
+    monkeypatch.setattr(
+        DailyAuditStore,
+        "bump_remote_job_recovery_attempt",
+        fenced_commit,
+    )
+
+    _run_cross_day(runtime_root, prewarm, adapter)
+    for writer in writer_threads:
+        writer.join(2.0)
+
+    assert writer_finished_before_commit == [False]
+    assert writer_finished.is_set()
+    historical = _remote_job_row(old_paths.state_path, old_job_id)
+    assert historical["state"] == "SUBMIT_UNKNOWN"
+    assert historical["recovery_attempts"] == 1
     assert adapter.reconcile_calls == 1
     assert adapter.submit_calls == 0
 

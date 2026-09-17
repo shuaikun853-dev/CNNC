@@ -452,7 +452,12 @@ def run_cross_day_reconcile_phase(
                         phase_errors.append(
                             f"cross-day job {owning_day}/{job_id}: incomplete FOUND identity"
                         )
-                    new_attempts = store.bump_remote_job_recovery_attempt(token, job_id)
+                    with historical_link_commit_fence() as commit_allowed:
+                        if not commit_allowed:
+                            continue
+                        new_attempts = store.bump_remote_job_recovery_attempt(
+                            token, job_id
+                        )
                     summary["cross_day_reconcile_not_found"] += 1
                     if new_attempts >= effective_dead_threshold:
                         summary["cross_day_reconcile_dead"] += 1
