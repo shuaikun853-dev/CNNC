@@ -15,6 +15,16 @@ through their read-only modes, so a missing store file is reported as
 ``PREWARM_STORE_MISSING`` / ``SHARED_CACHE_MISSING`` (exit 0, diagnosis JSON)
 instead of being silently created.
 
+Lifecycle closeout (WS-A, default on): after the pass's own phases the same
+lease reconciles identity-less ``SUBMIT_UNKNOWN`` prewarm jobs and re-dispatches
+dead-job candidates (daily per-candidate budget from ``prewarm_remote_job_links``
+rows of the day); once the pass released every lock the CLI harvests live
+prewarm jobs through the existing ``harvest_existing_customer_prewarm_job``
+primitive (which owns its own locks) — inside the SAME absolute wall-clock
+budget as the pass (one process = ``--budget-seconds``, so the scheduler's
+budget + grace ceiling can never be exceeded).  ``--no-lifecycle`` skips all
+three stages.  Canary mode (``--only-mall``) never runs any lifecycle stage.
+
 The three data sources are independently overridable and default to today's
 layout: ``--state-runtime-root`` locates the STEP1 ``<date>/state.sqlite3``
 plus per-day lock / zhaoshang job dirs (defaults to ``--runtime-root``),
@@ -59,6 +69,7 @@ import json
 import os
 import sqlite3
 import sys
+import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -66,6 +77,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from app.services import customer_prewarm_dispatch as dispatch_service
 from app.services.customer_prewarm_dispatch import (
     DEFAULT_BUDGET_SECONDS,
     DEFAULT_MAX_JOBS_PER_PASS,
@@ -73,10 +85,12 @@ from app.services.customer_prewarm_dispatch import (
     CanaryScope,
     run_prewarm_dispatch_pass,
 )
+from app.services.customer_prewarm_lifecycle import run_harvest_phase
 from app.services.customer_prewarm_store import CustomerPrewarmStore
 from app.services.incremental_audit_runtime import (
     DEFAULT_RUNTIME_ROOT,
     business_date_in_shanghai,
+    runtime_paths,
 )
 from app.services.shared_crawl_cache import SharedCrawlCache
 from app.services.zhaoshang_history_backfill import (
@@ -140,6 +154,14 @@ def build_parser() -> argparse.ArgumentParser:
         "db opened mode=ro only)",
     )
     parser.add_argument(
+        "--no-lifecycle",
+        action="store_true",
+        help="skip the lifecycle closeout stages (harvest / reconcile / "
+        "redispatch); by default the pass reconciles SUBMIT_UNKNOWN jobs, "
+        "re-dispatches dead-job candidates and, after the pass released the "
+        "locks, harvests live prewarm jobs via the existing primitive",
+    )
+    parser.add_argument(
         "--backfill-zhaoshang-history",
         type=int,
         default=None,
@@ -196,6 +218,18 @@ def _backfill_dates(business_date: str, days: int) -> list[str]:
     return [
         (end - timedelta(days=offset)).isoformat() for offset in range(days - 1, -1, -1)
     ]
+
+
+def _shared_harvest_deadline(pass_started: float, budget_seconds: float) -> float:
+    """One process, one wall-clock budget: the dispatch pass and the harvest
+    stage share the SAME absolute deadline (``pass_started + budget``), so the
+    whole process stays inside the scheduler's per-run ceiling (budget +
+    grace).  A pass that consumed its full budget yields a harvest deadline at
+    or behind the current time — :func:`run_harvest_phase` then skips with a
+    phase note; a quiet pass (a few seconds) leaves the harvest almost the
+    entire window.  Never below ``pass_started`` (a negative budget clamps).
+    """
+    return float(pass_started) + max(0.0, float(budget_seconds))
 
 
 def _write_json_output(path: Path, summary: dict) -> None:
@@ -506,6 +540,20 @@ def _run_dispatch(args: argparse.Namespace, business_date: str, runtime_root: Pa
         else:
             prewarm_store = CustomerPrewarmStore(prewarm_store_path)
             shared_cache = SharedCrawlCache(shared_cache_path)
+            lifecycle_on = not args.no_lifecycle
+            # With the lifecycle stages on, ONE adapter instance is shared by
+            # the pass and the harvest stage (its constructor performs no
+            # remote I/O; construction through the dispatch service attribute
+            # keeps the established test seam).  Without them the pass keeps
+            # its lazy construction behavior unchanged.
+            adapter = (
+                dispatch_service.CnncLegacyZhaoshangAdapter(mappings=mappings)
+                if lifecycle_on
+                else None
+            )
+            # One absolute wall-clock anchor for the WHOLE process (pass +
+            # harvest): the scheduler's per-run ceiling is budget + grace.
+            pass_started = time.monotonic()
             summary = run_prewarm_dispatch_pass(
                 prewarm_store,
                 shared_cache,
@@ -513,10 +561,32 @@ def _run_dispatch(args: argparse.Namespace, business_date: str, runtime_root: Pa
                 runtime_root=runtime_root,
                 state_runtime_root=state_runtime_root,
                 mappings=mappings,
+                adapter=adapter,
                 budget_seconds=args.budget_seconds,
                 max_jobs_per_pass=args.max_jobs_per_pass,
                 plan_only=False,
             )
+            if lifecycle_on and summary.get("outcome") == "OK":
+                # A1 harvest stage: AFTER the pass returned (it owns its own
+                # ProcessLock + lease, so it must never run under the
+                # dispatcher's day lock).  The harvest shares the pass's
+                # ABSOLUTE wall-clock deadline (one process = one budget): a
+                # fresh window here could double the process runtime past the
+                # scheduler's per-run ceiling and get it hard-killed.
+                state_root = (
+                    state_runtime_root if state_runtime_root is not None else runtime_root
+                )
+                day_paths = runtime_paths(business_date, state_root)
+                run_harvest_phase(
+                    day_paths.state_path,
+                    day_paths.lock_path,
+                    business_date,
+                    deadline=_shared_harvest_deadline(pass_started, args.budget_seconds),
+                    monotonic_value=time.monotonic,
+                    summary=summary,
+                    adapter=adapter,
+                    mappings=mappings,
+                )
     except Exception as exc:  # noqa: BLE001 - scheduler-facing failure
         print(
             json.dumps(
@@ -550,8 +620,19 @@ def _run_dispatch(args: argparse.Namespace, business_date: str, runtime_root: Pa
         f"priority_confirmed={summary.get('priority_confirmed', 0)} "
         f"priority_boosted={summary.get('priority_boosted', 0)} "
         f"priority_unconfirmed={summary.get('priority_unconfirmed', 0)} "
-        f"phase_errors={len(summary.get('phase_errors', []))}"
+        f"phase_errors={len(summary.get('phase_errors', []))} "
+        f"reconciled={summary.get('reconciled_found', 0)} "
+        f"redispatched={summary.get('redispatched_urls', 0)} "
+        f"harvested={summary.get('harvested', 0)}"
     )
+    if summary.get("lifecycle_planned"):
+        planned = summary["lifecycle_planned"]
+        print(
+            f"lifecycle_planned harvest_jobs={planned.get('harvest_jobs', 0)} "
+            f"reconcile_jobs={planned.get('reconcile_jobs', 0)} "
+            f"redispatch_urls={planned.get('redispatch_urls', 0)} "
+            f"redispatch_blocked={planned.get('redispatch_blocked', 0)}"
+        )
     if canary_scope is not None:
         print(
             f"canary only_mall={summary.get('only_mall', canary_scope.only_mall)} "

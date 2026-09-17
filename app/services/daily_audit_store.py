@@ -1642,6 +1642,28 @@ class DailyAuditStore:
     def mark_submit_unknown(self, token: LeaseToken, job_id: int, error: str) -> dict[str, Any]:
         return self._set_job_state(token, job_id, "SUBMIT_UNKNOWN", error=error, require_post_attempted=True)
 
+    def bump_remote_job_recovery_attempt(self, token: LeaseToken, job_id: int) -> int:
+        """Count one failed SUBMIT_UNKNOWN reconciliation attempt (narrow).
+
+        Returns the new durable ``recovery_attempts`` value.  Legal only while
+        the job is exactly ``SUBMIT_UNKNOWN``: a job the tick already pushed to
+        ``MANUAL_REQUIRED`` (or any other state) raises
+        :class:`RemoteIntentConflict` instead of being silently bumped.
+        """
+        with self._transaction(immediate=True) as connection:
+            self._validate_lease(connection, token)
+            job = self._job_for_lease(connection, token, job_id)
+            if str(job["state"]) != "SUBMIT_UNKNOWN":
+                raise RemoteIntentConflict("recovery attempt bump requires the SUBMIT_UNKNOWN state")
+            connection.execute(
+                "UPDATE remote_jobs SET recovery_attempts=recovery_attempts+1, updated_at=? WHERE id=?",
+                (self._utcnow(), job_id),
+            )
+            refreshed = connection.execute(
+                "SELECT recovery_attempts FROM remote_jobs WHERE id=?", (job_id,)
+            ).fetchone()
+            return int(refreshed["recovery_attempts"] or 0)
+
     def release_remote_submission_claim(self, token: LeaseToken, job_id: int, error: str) -> dict[str, Any]:
         """Retreat a burned claim only with proof the POST never started.
 

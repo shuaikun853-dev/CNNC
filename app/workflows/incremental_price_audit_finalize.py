@@ -11,7 +11,7 @@ from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 from openpyxl import load_workbook
 from openpyxl.styles import PatternFill
@@ -550,6 +550,120 @@ def _conflicting_export_price_reason(
     return f"同一 exact identity 存在冲突价格：{rendered}"
 
 
+# ---- WS-B: failed customer links projected into the final workbook -----------
+
+# 结果列（页面价格状态）的失败标记（用户口径 2026-09-16：不新建 sheet，
+# 失败数据按最终表本来的行格式放入，结果列写"爬取失败"）。
+FAILED_LINK_STATUS_TEXT = "爬取失败"
+
+
+def _failed_customer_link_runtime_root(store: DailyAuditStore) -> Path | None:
+    """The runtime root that owns the cross-day prewarm store, if resolvable."""
+    if str(store.path) == ":memory:":
+        return None
+    return store.path.parent.parent
+
+
+def _failed_customer_link_native_row(
+    headers: Sequence[str],
+    failed: Mapping[str, Any],
+) -> dict[str, Any]:
+    """One failed link in the workbook's native row format.
+
+    Only the columns a failure can honestly fill carry values (店铺名称=mall,
+    互联网链接=original_url, 文档ID=关联单据); every other legacy header stays
+    empty, the page-price trio keys force the writer to render 结果列
+    "爬取失败" with the price column blank, and the provenance fingerprint
+    marks the row as a projected failure (never a frozen business row).
+    """
+    row: dict[str, Any] = {str(header): "" for header in headers}
+    row["documentId"] = ",".join(str(item) for item in failed.get("document_ids") or [])
+    row["shopName"] = str(failed.get("mall_name") or "")
+    row["extLink"] = str(failed.get("original_url") or "")
+    row["__source_fingerprint"] = (
+        f"failed-customer-link:{failed.get('mall', '')}:{failed.get('original_url', '')}"
+    )
+    row["__page_price_value"] = None
+    row["__page_price_status"] = FAILED_LINK_STATUS_TEXT
+    row["__page_price_source"] = ""
+    return row
+
+
+def _failed_customer_link_record(failed: Mapping[str, Any]) -> SaasSameProductApprovalAuditResult:
+    """The minimal audit record for one appended failed-link row.
+
+    The row is an informational failure projection, not an audit decision: the
+    action columns stay at the neutral NO_ACTION/FALSE defaults and the
+    failure wording plus durable provenance (末次任务名 / 任务状态 / 最后时间)
+    go into the 原因 and 证据 columns.
+    """
+    evidence: list[str] = []
+    if failed.get("last_task_name"):
+        evidence.append(f"failed_remote_task={failed['last_task_name']}")
+    if failed.get("job_state"):
+        evidence.append(f"failed_remote_state={failed['job_state']}")
+    if failed.get("last_time"):
+        evidence.append(f"last_checked_at={failed['last_time']}")
+    used = int(failed.get("redispatch_links_used") or 0)
+    if used:
+        evidence.append(f"redispatch_links_used={used}")
+    return SaasSameProductApprovalAuditResult(
+        extLink=str(failed.get("original_url") or ""),
+        shopName=str(failed.get("mall_name") or ""),
+        primary_action=WorkflowAction.NO_ACTION,
+        suggested_actions=[WorkflowAction.NO_ACTION],
+        reason=f"{FAILED_LINK_STATUS_TEXT}：{failed.get('reason', '')}",
+        evidence=evidence,
+        needs_human_approval=False,
+        execution_allowed=False,
+        executed=False,
+    )
+
+
+def _append_failed_customer_link_rows(
+    store: DailyAuditStore,
+    business_date: str,
+    headers: Sequence[str],
+    rows: list[dict[str, Any]],
+    enriched: list[dict[str, Any]],
+    audit_response: Any,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], Any]:
+    """Extend the built artifact with failed-link rows in build time.
+
+    Runs AFTER the audit response and its customer-absent projection, so the
+    1:1 alignment over the frozen rows is untouched, the audit summary counters
+    never see the appended rows, and the appended row/record triples flow into
+    the materializer's length checks, source matrix, ordered keys and manifest
+    hashes naturally.  Read-only data source; the mapping loader is imported at
+    call time to keep the finalize module's load graph free of the CLI layer.
+    """
+    runtime_root = _failed_customer_link_runtime_root(store)
+    if runtime_root is None:
+        return rows, enriched, audit_response
+    from app.services.customer_prewarm_lifecycle import failed_customer_link_rows
+    from scripts import zhaoshang_mall_mapping as mapping_module
+
+    failures = failed_customer_link_rows(
+        business_date,
+        runtime_root,
+        mapping_module.load_zhaoshang_mall_mappings(),
+    )
+    if not failures:
+        return rows, enriched, audit_response
+    projected_rows = list(rows)
+    projected_enriched = list(enriched)
+    projected_records = list(audit_response.record_results)
+    for failed in failures:
+        projected_rows.append(_failed_customer_link_native_row(headers, failed))
+        projected_enriched.append({})
+        projected_records.append(_failed_customer_link_record(failed))
+    return (
+        projected_rows,
+        projected_enriched,
+        audit_response.model_copy(update={"record_results": projected_records}),
+    )
+
+
 def build_frozen_audit_artifact(
     store: DailyAuditStore,
     token: LeaseToken,
@@ -557,6 +671,7 @@ def build_frozen_audit_artifact(
     output_identity: str,
     review_mode: bool = False,
     tolerate_pending: bool = False,
+    include_failed_customer_links: bool = False,
 ) -> FrozenArtifactBuild:
     run = store.get_run(token.business_date)
     if run is None or int(run["id"]) != token.run_id or run["frozen_snapshot_id"] is None:
@@ -866,6 +981,15 @@ def build_frozen_audit_artifact(
         price_states,
         enriched,
     )
+    if include_failed_customer_links:
+        rows, enriched, audit_response = _append_failed_customer_link_rows(
+            store,
+            token.business_date,
+            headers,
+            rows,
+            enriched,
+            audit_response,
+        )
     artifact = FrozenAuditArtifact(
         business_date=token.business_date,
         tenant_id=str(run["tenant_id"]),
@@ -1097,6 +1221,7 @@ def materialize_frozen_daily_run(
             store,
             token,
             output_identity=f"daily-final-{business_date.replace('-', '')}",
+            include_failed_customer_links=True,
         )
         if not built.readiness.ready or built.artifact is None:
             raise FinalizeBlocked("frozen snapshot still has mandatory pending or invalid work", built.readiness)
@@ -1288,6 +1413,7 @@ def materialize_forced_frozen_daily_run(
             token,
             output_identity=f"daily-final-{business_date.replace('-', '')}",
             tolerate_pending=True,
+            include_failed_customer_links=True,
         )
         readiness = built.readiness
         if built.artifact is None:

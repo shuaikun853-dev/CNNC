@@ -373,6 +373,22 @@ def _empty_summary(
         "by_mall": {},
         "batch_sizes": [],
     }
+    if canary_scope is None:
+        # WS-A lifecycle counters (normal mode ONLY): the canary key set must
+        # stay byte-identical, so these keys exist exclusively without scope.
+        # harvest_attempted / harvested are filled by run_harvest_phase,
+        # which the CLI calls after the pass released every lock.
+        summary.update(
+            {
+                "reconciled_found": 0,
+                "reconcile_not_found": 0,
+                "redispatched_urls": 0,
+                "redispatch_jobs": 0,
+                "redispatch_blocked": 0,
+                "harvest_attempted": 0,
+                "harvested": 0,
+            }
+        )
     if canary_scope is not None:
         # §11 canary 键集合：scope 存在时才追加（普通模式键集合逐字节不变）。
         summary.update(
@@ -724,6 +740,25 @@ def _plan_only_report(
     ]
     summary["existing_remote_reused"] = reused_planned
     summary["new_remote_urls"] = summary["new_remote_urls_planned"]
+    if canary_scope is None:
+        # WS-A plan summary (normal mode only, strictly read-only probes —
+        # plan_lifecycle_actions opens the state DB mode=ro and never writes).
+        from app.services.customer_prewarm_lifecycle import plan_lifecycle_actions
+
+        lifecycle_plan = plan_lifecycle_actions(
+            state_db_path,
+            prewarm_store,
+            business_date,
+            mappings,
+        )
+        summary["lifecycle_planned"] = {
+            "harvest_jobs": len(lifecycle_plan["harvest_job_ids"]),
+            "reconcile_jobs": len(lifecycle_plan["reconcile_jobs"]),
+            "redispatch_urls": sum(
+                len(entries) for entries in lifecycle_plan["redispatch_groups"].values()
+            ),
+            "redispatch_blocked": len(lifecycle_plan["redispatch_blocked"]),
+        }
     if canary_scope is not None:
         # §3 口径 = URL 身份集合（durable 且 adapter 无关）：复用 + 新建 + 待
         # 确认优先级的 (mall, exact_url) 对，去重后一个 URL 只计一次。
@@ -1257,6 +1292,53 @@ def _run_leased_pass(
             + summary["priority_updates_performed"]
             - priority_updates_before_phase4
         )
+        # Canary mode: the whole lifecycle stage is skipped — its summary key
+        # set must stay byte-identical and no remote/write side effect may
+        # happen outside the preflight budget.
+        phase_errors.append("lifecycle skipped in canary mode")
+        return
+
+    # ---- Phase 5: lifecycle closeout (reconcile + redispatch) ----------------
+    # Normal mode only, with the lease still held (error-isolated like every
+    # phase; both stages re-check the same pass deadline before each action).
+    if monotonic_value() < deadline:
+        try:
+            from app.services.customer_prewarm_lifecycle import run_reconcile_phase
+
+            run_reconcile_phase(
+                store=store,
+                token=token,
+                get_adapter=get_adapter,
+                paths=paths,
+                deadline=deadline,
+                monotonic_value=monotonic_value,
+                summary=summary,
+            )
+        except Exception as exc:  # noqa: BLE001 - stage isolation
+            phase_errors.append(f"lifecycle reconcile: {type(exc).__name__}: {exc}")
+    else:
+        phase_errors.append("budget deadline reached; lifecycle reconcile deferred")
+    if monotonic_value() < deadline:
+        try:
+            from app.services.customer_prewarm_lifecycle import run_redispatch_phase
+
+            run_redispatch_phase(
+                store=store,
+                token=token,
+                prewarm_store=prewarm_store,
+                paths=paths,
+                mappings=mappings,
+                get_adapter=get_adapter,
+                business_date=summary["business_date"],
+                deadline=deadline,
+                monotonic_value=monotonic_value,
+                max_jobs_per_pass=max_jobs_per_pass,
+                summary=summary,
+            )
+        except Exception as exc:  # noqa: BLE001 - stage isolation
+            phase_errors.append(f"lifecycle redispatch: {type(exc).__name__}: {exc}")
+    else:
+        phase_errors.append("budget deadline reached; lifecycle redispatch deferred")
 
 
 def _dispatch_mall_group(
