@@ -199,8 +199,10 @@ watchdog 和 `max-iterations` 是额外保险。已经 `COMPLETED` 的 job 不�
 
 命令可重复触发：未 drain 时保持 `FINALIZING`，只有 Detail/Model/crawl/remote pending 时按正常等待退出；terminal、未规划 crawl、
 无效价格、remote `MANUAL_REQUIRED`、非法 remote state 或产物冲突才作为可操作阻塞返回非零。关联 frozen
-mandatory crawl 的 remote job 必须全部为 `COMPLETED`；即使 crawl 已写成 `SUCCESS`，remote 仍为
-`RUNNING` 或 `EXPORTED` 也禁止生成 formal artifact。命令总预算至少还剩 60 秒才开始正式物化，
+mandatory crawl 的 remote job 通常必须全部为 `COMPLETED`；唯一例外是
+`remote_job_is_closed_by_local_fallback(...)` 已证明该 job 的每条关联 crawl 均为有效 `SUCCESS`，且至少一条
+来自 `本地兜底:*`。只有这个 exact-link 全量闭合证明成立时，陈旧 remote 状态才不阻塞 formal artifact；
+任一关联 URL 仍是 `NO_RESULT`、terminal 或 unresolved 时都不能按 job 级别放行。命令总预算至少还剩 60 秒才开始正式物化，
 否则 checkpoint 后交给下一次 `drain-only`。完成后 workbook/manifest 只会复用同一 frozen artifact，
 输出路径 intent 在落盘前已唯一登记，冲突不会先写出第二份正式文件。
 
@@ -403,7 +405,7 @@ task name 使用业务日和 immutable 请求集生成同日稳定、跨日不�
   普通 RUNNING 的 blocker 语义不变。该状态在 `status` 的 `remote.recovery_exhausted` 计数。
 - 每次命令都会安全更新该业务日的 `BATCH_STATE.md`；SQLite 仍是状态权威。重叠实例正常返回 0，
   可恢复 pending/defer 返回 0，`FAILED`、人工项或正式产物阻塞返回非零。
-- 不要在此调度中加入审批、驳回、通过、保存、提交、推送、本地 crawler fallback 或任何 SQL。
+- 不要在此调度中加入审批、驳回、通过、保存、提交、推送、任何 SQL，或内建固定 8 站策略之外的本地 crawler 入口；自动本地兜底只能遵守上文 exact URL、最终远端查询成功、原子 claim 和 fail-closed 门禁。
 
 ## 每日核对
 
