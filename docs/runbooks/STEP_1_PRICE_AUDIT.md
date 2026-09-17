@@ -27,6 +27,7 @@
 | 模型配置 | `data/model.env` | 标题同款模型 |
 | 招商局 DB 配置 | `data/ZHAOSHANG_DB.env` | 通过既有受控加载器注入当前进程的 `ZHAOSHANG_DB_*`，仅供调整本轮当前任务优先级 |
 | 商城映射 | `商城sourceId映射表/` | mall/sourceId/域名映射 |
+| multi-site 兜底 | `E:\.A中核运维\cnnc-mall-crawler` | 本批次明确授权后处理得力、广博、欧菲斯、领先未来新商城缺价 |
 
 缺少、无法解析或范围不符时暂停。只检查文件存在、必要键存在和 cURL 可解析；不要显示敏感值。
 
@@ -34,7 +35,7 @@
 
 用户明确要求跑第一步，即授权本批次的只读查询、模型调用、招商局正式建任务、任务启用、受控优先级调整、等待和导出。
 
-这不授权 `multi_mall_crawler`、史泰博专用脚本或其他本地爬虫。任何本地脚本兜底都要先给出缺价清单，再取得本批次明确确认。未经授权不得传 `--enable-crawler` 或 `--auto-stbchina-fallback`。
+这不授权 multi-site 兜底、史泰博专用脚本或其他本地爬虫。任何本地脚本兜底都要先给出缺价清单，再取得本批次明确确认。`--enable-crawler` 仅是历史 `multi_mall_crawler` 开关，不是新 multi-site 授权门；未经授权不得传它、`--auto-stbchina-fallback` 或 multi-site 续跑参数。
 
 驳回和通过都不在上述默认授权中。用户必须在最终 Excel 生成后，再次指定准确路径、F 列颜色范围和对应动作；一次授权只对该动作、该文件和预览锁定的候选清单有效。
 
@@ -51,7 +52,7 @@
 9. **招商局全链路**：先刷新招商局 Token，再对每个支持商城执行 `add -> 精确 task_name 查询 -> updateState 启用 -> 当前任务优先级轮询/更新 -> 等待完成 -> exportTask`。任务名在正式创建前生成，固定为 `cnnc_current_opt_<商城名>_<至少14位纯数字时间标识>`；并发默认 6。主任务查询必须精确得到唯一的 taskNumber 和与 `MALL_CONFIG` 一致的 mall code，不得取模糊查询首条或默认商城。每次真实 add、启用、提优和导出后立即把 taskId、taskNumber 和结果写入本批次 `BATCH_STATE.md`。`/add` 发出后任何认证或网络异常都暂停，不得自动重试创建。
 10. **受控提优**：`taskNumber` 不是唯一任务标识，同一编号可属于多个商城。必须把本次 add payload 的有效子任务数传入提优工具，先用 `mall` 首列的现有 `idx_opt_distinctmall`，结合 `task_num + create_time` 窗口轮询到数量完全一致的当前商城有效 `task_id`；少于预期继续等，多于预期立即失败。随后以主键 `SELECT ... FOR UPDATE` 做当前读和锁定，仅按这些主键分批更新尚未为 `weight_type=-1` 的有效行；`task_status` 只表示采集进度，不得参与 priority 的 SELECT、UPDATE 或回读成功判定。禁止锁定宽范围 mall 扫描，禁止 `task_num` 单条件或 `batch_num LIKE` 回退。只有 `affected_rows>0` 可报告本次已提优；预查确认全部精确行已为 `-1` 时记录独立的幂等状态，不称为本次提优。无论任务正在执行还是已经完成，只有回读确认 `expected == matched == weight_type=-1` 才可记录 priority 成功；其他 0 行、越界或异常立即暂停，不得放宽 SQL。
 11. **回填并复算**：所有首次或后补结果都走同一回填逻辑，重新计算 `page_vs_customer_check`、`price_changed`、`over_30pct`、`final_decision`。数值 0 标记“价格为0”并整行高亮；SaaS JSON 价与本次页面价不同必须标记价格变动。
-12. **缺价门**：汇总招商局未覆盖、失败、导出无价格和未回填 URL。先写清单，把本批次 `BATCH_STATE.md` 设为 `WAITING_USER` 或真实故障对应的 `BLOCKED`，再暂停当前批次；用户明确授权后可以在原任务继续，且结果另存后重新回填复算。其他批次不受影响。
+12. **缺价门与 multi-site 兜底**：汇总招商局未覆盖、采集等待失败、导出无价格和未回填 URL。脚本先生成不得当作 formal final 的 review Excel 和 `multi_site_fallback/manifest.xlsx`，锁定候选数、清单 SHA-256、manifest/review SHA-256 及已审查爬虫提交 `95437150efcf7cae7412d212c1fa49d932a42a80`，把 `BATCH_STATE.md` 设为 `WAITING_USER` 后暂停，零本地爬取。用户对该批次准确数量、SHA-256 和 manifest 二次授权后，只能用 `--resume-multi-site-manifest` + `--resume-review-xlsx` + `--expected-fallback-count` + `--expected-fallback-sha256` 独立续跑；该入口不重跑快照、模型或招商局 add/启用/提优。候选计划准备若失败，只能对已有 review 使用 `--recover-multi-site-plan-from-review`，不得重跑原第一步命令。兜底只处理 `b2b.nbdeli.com`、`btob.guangbo.net`、`officemate.cn` 和 `www.lxwlmall.com`，且启动前要求 manifest、review、固定 Git revision、站点/链接和批次状态全部一致；子进程只继承 Windows/Playwright 运行所需的白名单环境变量，不继承认证、模型或数据库密钥。招商局初始化、建任务、启用或提优证据异常不得被兜底掩盖；失败任务只有 `priority_state=updated` 且 `affected_rows>0`，或 `priority_state=already_highest_priority` 且有已验证数量时才能生成兜底计划。输出必须与各站锁定输入逐项一致；exit 2、全局风控 exit 3、部分/外来/重复输出均停止并保留证据，不生成 formal final，也不自动重跑。
 13. **最终验收**：最终 Excel 行数必须等于本轮 SaaS 总数，文件可打开，所有阶段均有状态证据。完成后把本批次 `BATCH_STATE.md` 改为 `COMPLETE`；不得修改其他批次状态。
 
 ## 审计入口
@@ -100,8 +101,9 @@ python scripts\audit_saas_excel_file.py `
 - 招商局 `/add` 认证失败、payload/模板错误、任务创建或启用失败。
 - 优先级复合身份或主键范围异常、存在待更新行但实际更新 `affected_rows=0`、回读未全部为 `-1`、需要放宽 SQL 才能继续。
 - 招商局未覆盖、导出无价格或仍有未回填链接，且用户尚未授权脚本兜底。
+- multi-site manifest/输入错误、worker 异常，或任一站触发全局风控停止。
 - 最终 Excel 行数、价格回填数或决策统计无法对账。
 
 ## 完成汇报
 
-至少给出：SaaS 总数、中核总数、客户价状态分布、模型结论分布、招商局成功/失败商城、priority 更新/幂等确认任务数、回填数、0 价格数、明确 `NO_RESULT` 数、价格变动数、最终决策分布、缺价数、输出和日志路径。`NO_RESULT` 必须保留原缺失证据且价格留空，不得与真实 0 价格合并。
+至少给出：SaaS 总数、中核总数、客户价状态分布、模型结论分布、招商局成功/失败商城、priority 更新/幂等确认任务数、招商局回填数、multi-site 兜底站点/exit code/回填数、0 价格数、明确 `NO_RESULT` 数、价格变动数、最终决策分布、缺价数、输出和日志路径。`NO_RESULT` 必须保留原缺失证据且价格留空，不得与真实 0 价格合并。
