@@ -30,7 +30,10 @@ from app.services.daily_audit_store import (
     RemoteIntentConflict,
 )
 from app.services.incremental_local_fallback import run_incremental_local_fallback
-from app.services.page_price_semantics import valid_page_price_result
+from app.services.page_price_semantics import (
+    remote_job_is_closed_by_local_fallback,
+    valid_page_price_result,
+)
 from app.services.remote_running_recovery import (
     RECOVERY_CALLBACK_TIMEOUT_SECONDS,
     run_running_recovery_pass,
@@ -1116,16 +1119,19 @@ def _backlog(
         for work in crawls
         if work.get("remote_job_id") is not None
     }
-    unresolved_job_ids = {
-        int(work["remote_job_id"])
-        for work in crawls
-        if work.get("remote_job_id") is not None
-        and work["state"] not in {"SUCCESS", "NO_RESULT"}
+    crawls_by_remote_job: dict[int, list[Mapping[str, Any]]] = {}
+    for work in crawls:
+        if work.get("remote_job_id") is not None:
+            crawls_by_remote_job.setdefault(int(work["remote_job_id"]), []).append(work)
+    local_closed_job_ids = {
+        job_id
+        for job_id, crawl_rows in crawls_by_remote_job.items()
+        if remote_job_is_closed_by_local_fallback(crawl_rows)
     }
 
     def _remote_blocks(job: Mapping[str, Any]) -> bool:
         job_id = int(job["id"])
-        return job_id not in linked_job_ids or job_id in unresolved_job_ids
+        return job_id not in linked_job_ids or job_id not in local_closed_job_ids
     missing_stages = 0
     # DETAIL rows are only re-scoped when the caller passes an authoritative
     # snapshot.  ``None`` means "no authoritative snapshot this pass"

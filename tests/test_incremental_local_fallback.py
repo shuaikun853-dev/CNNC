@@ -4,6 +4,7 @@ from datetime import UTC, datetime, timedelta
 import json
 import sqlite3
 from decimal import Decimal
+from zipfile import ZipFile
 
 import pytest
 from openpyxl import Workbook
@@ -271,6 +272,31 @@ def test_stale_submit_unknown_does_not_block_after_local_success(tmp_path):
     assert backlog["crawl_pending"] == 0
 
 
+def test_mixed_remote_and_local_success_does_not_keep_job_pending(tmp_path):
+    store, token, rows, job = setup_work(tmp_path, count=2, state="SUBMIT_UNKNOWN")
+    store.complete_crawl_work(token, rows[0]["id"], {
+        "page_price_value": "1.23", "page_price_status": "OK",
+        "page_price_source": "招商局",
+    })
+    store.complete_crawl_work(token, rows[1]["id"], success_result("4.56"))
+
+    assert store.get_remote_job(job["id"])["state"] == "SUBMIT_UNKNOWN"
+    assert _backlog(store, token, [])["remote_unknown"] == 0
+
+
+@pytest.mark.parametrize("bad_price", ["not-a-price", "NaN", "Infinity"])
+def test_malformed_sibling_success_keeps_stale_remote_job_pending(tmp_path, bad_price):
+    store, token, rows, job = setup_work(tmp_path, count=2, state="SUBMIT_UNKNOWN")
+    store.complete_crawl_work(token, rows[0]["id"], {
+        "page_price_value": bad_price, "page_price_status": "OK",
+        "page_price_source": "招商局",
+    })
+    store.complete_crawl_work(token, rows[1]["id"], success_result("4.56"))
+
+    assert store.get_remote_job(job["id"])["state"] == "SUBMIT_UNKNOWN"
+    assert _backlog(store, token, [])["remote_unknown"] == 1
+
+
 def test_retryable_failure_waits_for_future_tick_and_caps_at_two(tmp_path):
     store, token, rows, _job = setup_work(tmp_path)
     calls = []
@@ -366,5 +392,13 @@ def test_crawler_output_maps_zero_and_rejects_duplicate_foreign_or_missing(tmp_p
 def test_crawler_output_rejects_malformed_xlsx(tmp_path):
     path = tmp_path / "malformed.xlsx"
     path.write_bytes(b"not a zip workbook")
+    with pytest.raises(ValueError, match="不是有效 XLSX"):
+        read_crawler_output(path, "nbdeli", ["https://b2b.nbdeli.com/pcweb/detail?sku=1"])
+
+
+def test_crawler_output_rejects_structurally_invalid_xlsx(tmp_path):
+    path = tmp_path / "missing-content-types.xlsx"
+    with ZipFile(path, "w") as archive:
+        archive.writestr("xl/workbook.xml", "<workbook/>")
     with pytest.raises(ValueError, match="不是有效 XLSX"):
         read_crawler_output(path, "nbdeli", ["https://b2b.nbdeli.com/pcweb/detail?sku=1"])

@@ -13,10 +13,8 @@ import sys
 from typing import Any, Callable, Mapping, Sequence
 from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
-from zipfile import BadZipFile
 
 from openpyxl import Workbook, load_workbook
-from openpyxl.utils.exceptions import InvalidFileException
 
 from app.services.daily_audit_store import DailyAuditStore, LeaseToken
 from app.services.page_price_semantics import valid_page_price_result
@@ -29,7 +27,7 @@ SUPPORTED_MALLS = frozenset({
     "nbdeli", "guangbo", "ofs", "lxwlmall", "qstbg", "ycw", "comix", "tima",
 })
 MAX_ATTEMPTS = 2
-EXPECTED_CRAWLER_REVISION = "6880b301c641c080982a7ab1757cac4e84ceef18"
+EXPECTED_CRAWLER_REVISION = "28870666aeb99a10494ebb91419aadf3bff4c0a8"
 DEFAULT_CRAWLER_ROOT = Path(r"E:\.A中核运维\cnnc-mall-crawler")
 SITE_ALIASES = {"ofs": "officemate"}
 SITE_HOSTS = {
@@ -164,7 +162,7 @@ def read_crawler_output(
         raise ValueError(f"本地 crawler 输出不存在: {path}")
     try:
         workbook = load_workbook(path, data_only=True, read_only=True)
-    except (OSError, BadZipFile, InvalidFileException) as exc:
+    except Exception as exc:
         raise ValueError(f"本地 crawler 输出不是有效 XLSX: {path}") from exc
     try:
         rows = workbook.active.iter_rows(values_only=True)

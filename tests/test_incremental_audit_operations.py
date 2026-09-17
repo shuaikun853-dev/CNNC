@@ -1679,7 +1679,7 @@ def test_scheduled_runner_log_open_failure_or_noop_is_bounded_and_starts_no_chil
     scheduled = now.weekday() < 5 and (
         (now.minute == 0 and 9 <= now.hour <= 16)
         or (9 <= now.hour <= 16 and now.minute in {15, 30, 45})
-        or (now.hour == 17 and now.minute % 5 == 0)  # 17:00-17:50 ticks + 17:55 drain
+        or (now.hour == 17 and now.minute % 3 == 0)  # 17:00-17:57 full ticks
         or (now.hour in {18, 19} and now.minute % 5 == 0)
         or (now.hour == 20 and now.minute == 0)
     )

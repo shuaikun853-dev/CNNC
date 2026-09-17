@@ -1798,7 +1798,7 @@ import subprocess as _subprocess  # noqa: E402
 
 DEFAULT_CRAWLER_SCRIPT = Path(r"E:\.A2026\多商城爬取\multi_mall_crawler\main.py")
 DEFAULT_MULTI_SITE_CRAWLER_ROOT = Path(r"E:\.A中核运维\cnnc-mall-crawler")
-EXPECTED_MULTI_SITE_CRAWLER_REVISION = "6880b301c641c080982a7ab1757cac4e84ceef18"
+EXPECTED_MULTI_SITE_CRAWLER_REVISION = "28870666aeb99a10494ebb91419aadf3bff4c0a8"
 MULTI_SITE_MALL_KEY_TO_SITE = {
     "nbdeli": "nbdeli",
     "guangbo": "guangbo",

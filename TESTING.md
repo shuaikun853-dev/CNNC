@@ -161,7 +161,7 @@ Get-ChildItem runtime -Recurse -Filter BATCH_STATE.md |
 - 页面价 0 使用 `PRICE_IS_ZERO`/“价格为0”并整行高亮。
 - 任意后补价格都重新计算 `page_vs_customer_check`、`price_changed`、`over_30pct`、`final_decision`。
 - 缺价时先有清单和授权门，未授权不启动本地脚本。
-- multi-site 首轮只生成 review/manifest 并锁定候选数、清单及文件 SHA-256、已审查 Git 提交 `6880b301c641c080982a7ab1757cac4e84ceef18`，设 `WAITING_USER`且零爬取；计划失败只用 review 恢复入口，不重跑第一步；二次授权后的独立续跑不重跑招商局，不继承认证/模型/数据库密钥，并严格对账每站输入输出；初始化/建任务/启用/提优证据异常、exit 2/3、部分/外来/重复输出都不生成 formal final，也不自动重跑。
+- multi-site 首轮只生成 review/manifest 并锁定候选数、清单及文件 SHA-256、已审查 Git 提交 `28870666aeb99a10494ebb91419aadf3bff4c0a8`，设 `WAITING_USER`且零爬取；计划失败只用 review 恢复入口，不重跑第一步；二次授权后的独立续跑不重跑招商局，不继承认证/模型/数据库密钥，并严格对账每站输入输出；初始化/建任务/启用/提优证据异常、exit 2/3、部分/外来/重复输出都不生成 formal final，也不自动重跑。
 - 驳回和通过都不是第一步默认动作；驳回仅限指定最终 Excel，受控通过可用指定最终 Excel，或用户在同一授权消息中明确指定为本轮结果表的 `saas_audit_review_*.xlsx`。两者都必须有候选数、清单 SHA-256、写前待审核对、逐批 `rspCode=0000` 证据和写后目标无遗留；驳回固定使用 `data/sass-bohui.curl`，`--fill-colors yellow-only --require-customer-price` 必须只选 F 列黄色且表头“客户价”非空的行；通过固定使用 `data/sass-tongguo.curl` 并排除 F 列红/黄色行，`--require-customer-price` 必须再排除表头“客户价”的空值和空白字符串，数值 0 视为非空。
 
 重点回归：

@@ -17,6 +17,7 @@ from app.services.legacy_zhaoshang_adapter import EXTERNAL_TOOL_PATH
 from app.services.page_price_semantics import (
     FORCE_CLOSEOUT_MISSING_PRICE_LIMIT,
     crawl_identity,
+    remote_job_is_closed_by_local_fallback,
     valid_page_price_result,
 )
 from app.services.remote_stall_breaker import evaluate_remote_stall
@@ -452,7 +453,7 @@ def collect_runtime_status(
             model = _stage_status(connection, target_snapshot_id, "MODEL", unique_items)
 
         crawl_rows = connection.execute(
-            """SELECT id, source_id, sku_id, exact_url, state, result_json
+            """SELECT id, source_id, sku_id, exact_url, state, result_json, remote_job_id
                FROM crawl_work WHERE run_id=? ORDER BY id""",
             (run_id,),
         ).fetchall()
@@ -523,22 +524,30 @@ def collect_runtime_status(
                 (run_id,),
             ).fetchall()
         )
-        remote_blocking_states = _group_counts(
-            connection.execute(
-                """SELECT r.state, COUNT(*) AS count
-                     FROM remote_jobs r
-                    WHERE r.run_id=? AND (
-                        NOT EXISTS (SELECT 1 FROM crawl_work c WHERE c.remote_job_id=r.id)
-                        OR EXISTS (
-                            SELECT 1 FROM crawl_work c
-                             WHERE c.remote_job_id=r.id
-                               AND c.state NOT IN ('SUCCESS','NO_RESULT')
-                        )
-                    )
-                    GROUP BY r.state""",
-                (run_id,),
-            ).fetchall()
-        )
+        remote_rows = connection.execute(
+            "SELECT id, state FROM remote_jobs WHERE run_id=?",
+            (run_id,),
+        ).fetchall()
+        linked_job_ids = {
+            int(row["remote_job_id"])
+            for row in crawl_rows
+            if row["remote_job_id"] is not None
+        }
+        crawls_by_remote_job: dict[int, list[dict[str, Any]]] = {}
+        for row in crawl_rows:
+            if row["remote_job_id"] is not None:
+                crawls_by_remote_job.setdefault(int(row["remote_job_id"]), []).append(dict(row))
+        local_closed_job_ids = {
+            job_id
+            for job_id, job_crawls in crawls_by_remote_job.items()
+            if remote_job_is_closed_by_local_fallback(job_crawls)
+        }
+        remote_blocking_states: dict[str, int] = {}
+        for row in remote_rows:
+            job_id = int(row["id"])
+            if job_id not in linked_job_ids or job_id not in local_closed_job_ids:
+                state = str(row["state"])
+                remote_blocking_states[state] = remote_blocking_states.get(state, 0) + 1
         remote_health = evaluate_remote_stall(
             [
                 dict(row)
