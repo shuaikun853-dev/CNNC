@@ -247,6 +247,55 @@ def test_legacy_snapshot_hash_constraint_migrates_without_losing_members(tmp_pat
     assert second["reused"] is False
 
 
+def test_legacy_store_adds_recovery_and_local_fallback_schema_idempotently(tmp_path):
+    path = tmp_path / "legacy-local-fallback.sqlite3"
+    original = DailyAuditStore(path)
+    lease = _lease(original)
+    job = original.prepare_remote_intent(
+        lease, "legacy-job", "legacy-task", "legacy-payload", mall_key="comix",
+    )
+    crawl = original.ensure_crawl_work(
+        lease, "comix", "SKU-1", "https://comix.example/item", "legacy-v1", "fp-1",
+        source_id="DOC-1",
+    )
+    original.link_crawl_work_to_remote_job(lease, int(crawl["id"]), int(job["id"]))
+    original.release_lease(lease)
+
+    with sqlite3.connect(path) as connection:
+        connection.execute("DROP TABLE local_fallback_work")
+        connection.execute("ALTER TABLE remote_jobs DROP COLUMN recovery_evidence_json")
+        connection.execute("ALTER TABLE remote_jobs DROP COLUMN recovery_attempts")
+
+    migrated = DailyAuditStore(path)
+    reopened = DailyAuditStore(path)
+    with sqlite3.connect(path) as connection:
+        remote_columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(remote_jobs)")
+        }
+        tables = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+        indexes = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='index'"
+            )
+        }
+        retained = connection.execute(
+            "SELECT logical_key, recovery_attempts FROM remote_jobs WHERE id=?",
+            (int(job["id"]),),
+        ).fetchone()
+
+    assert migrated.path == reopened.path == path
+    assert {"recovery_attempts", "recovery_evidence_json"} <= remote_columns
+    assert "local_fallback_work" in tables
+    assert "ux_local_fallback_active_url" in indexes
+    assert retained == ("legacy-job", 0)
+
+
 def test_customer_fingerprint_is_part_of_audit_version_and_same_snapshot_is_unchanged(store):
     lease = _lease(store)
     row = _row()

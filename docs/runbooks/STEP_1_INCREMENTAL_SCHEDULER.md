@@ -29,9 +29,9 @@ terminal、crawl 与远端任务的 pending/running/exported/unknown/manual、fr
 过期 lease 和 finalized artifact；不会显示密钥值。默认只把 shadow 所需依赖当硬要求；带 `--enable-remote-writes` 才把招商局依赖
 计入健康判定，避免一个系统的认证问题无条件阻塞其他阶段。
 
-SQLite 仅有七张 checkpoint 表：`daily_runs`、`snapshots`、`audit_items`、`snapshot_members`、
-`stage_work`、`remote_jobs`、`crawl_work`。不要手改数据库、删除 lock，或把不同调度任务指向
-不同的 runtime root。
+SQLite 仅有十张 checkpoint 表：`daily_runs`、`snapshots`、`audit_items`、`snapshot_members`、
+`stage_work`、`remote_jobs`、`crawl_work`、`local_fallback_work`、`remote_job_replacements` 和
+`remote_job_rebuild_actions`。不要手改数据库、删除 lock，或把不同调度任务指向不同的 runtime root。
 
 ## 推荐的 Scheduler 配置
 
@@ -69,7 +69,7 @@ IgnoreNew 丢弃重叠 trigger）。不再保留 17:55 harvest-only 特例。18:
 - 17:00-17:59：第一次远端检查只落账 `last_remote_check_at`；至少 3 分钟后的下一次完整 tick 再最终查询，无价格才以 `PEAK_3M` 兜底。
 - 18:00 以后：closeout 先最终 harvest，再以 `AFTER_1800` 立即处理受支持的 unresolved URL，然后重新计算 blockers。
 
-自动范围固定为 `nbdeli / guangbo / ofs / lxwlmall / qstbg / ycw / comix / tima`。每个 exact URL 原子 claim，partial job 只发送仍未取得可信价格的 URL；可重试错误最多在后续 tick 自动尝试 2 次，同一轮不 tight-loop。验证码、登录墙、风控、外来/重复 URL、manifest 不一致和非法价格均 fail-closed。成功证据标记 `本地兜底:<site>`，招商局迟到结果不得覆盖；若远端状态仍为 `SUBMIT_UNKNOWN` 或 `MANUAL_REQUIRED`，但其关联 URL 已全部由可信结果解决，该陈旧任务状态不再阻塞 finalization。
+自动范围固定为 `nbdeli / guangbo / ofs / lxwlmall / qstbg / ycw / comix / tima`。每个 exact URL 原子 claim，partial job 只发送仍未取得可信价格的 URL；可重试错误最多在后续 tick 自动尝试 2 次，同一轮不 tight-loop。验证码、登录墙、风控、外来/重复 URL、manifest 不一致和非法价格均 fail-closed。成功证据标记 `本地兜底:<site>`，招商局迟到结果不得覆盖；若远端状态仍为 `SUBMIT_UNKNOWN` 或 `MANUAL_REQUIRED`，但其关联 URL 已全部由可信结果解决，该陈旧任务状态不再阻塞 finalization。最终失败链接投影也按 exact `(mall, original_url)` 判定：`SUCCESS`、结果 JSON 可解析、价格语义有效且来源为 `本地兜底:*` 的 URL 不再追加“爬取失败”，同一 remote job 的其他 `NO_RESULT`、terminal 或仍未解决 URL 继续分别输出失败行。
 closeout 在一个进程内持续推进，不为下一个 5 分钟唤醒等待：SaaS 稳定观察最快每 300 秒一次，
 招商局 full sweep 最快每 600 秒一次（单批最多 6 个，一轮覆盖全部 eligible remote jobs）。18:00 后只要
 最近 authoritative 观测的 `row_count` 与 `ordered_hash` 连续 600 秒一致且本次分页完整，即可 freeze
