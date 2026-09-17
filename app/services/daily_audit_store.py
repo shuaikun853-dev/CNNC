@@ -2473,7 +2473,7 @@ class DailyAuditStore:
                        JOIN remote_jobs r ON r.id=c.remote_job_id AND r.run_id=c.run_id
                        LEFT JOIN local_fallback_work f ON f.crawl_work_id=c.id
                       WHERE c.run_id=? AND c.mall_key IN ({placeholders})
-                        AND c.state<>'SUCCESS'
+                        AND c.state NOT IN ('SUCCESS','NO_RESULT','TERMINAL_FAILED')
                       ORDER BY c.id""",
                 (token.run_id, *malls),
             ).fetchall()
@@ -2524,7 +2524,7 @@ class DailyAuditStore:
             self._validate_crawl_lease(connection, token, crawl_work_id)
             crawl = connection.execute("SELECT * FROM crawl_work WHERE id=?", (crawl_work_id,)).fetchone()
             assert crawl is not None
-            if crawl["state"] == "SUCCESS":
+            if crawl["state"] in {"SUCCESS", "NO_RESULT", "TERMINAL_FAILED"}:
                 return None
             work = connection.execute(
                 "SELECT * FROM local_fallback_work WHERE crawl_work_id=?", (crawl_work_id,)
@@ -2592,7 +2592,8 @@ class DailyAuditStore:
                         """UPDATE crawl_work SET state='MANUAL_REQUIRED',
                                   error_text='local fallback: interrupted claim exhausted retry budget',
                                   updated_at=?
-                            WHERE id=? AND state<>'SUCCESS'""",
+                            WHERE id=?
+                              AND state NOT IN ('SUCCESS','NO_RESULT','TERMINAL_FAILED')""",
                         (self._utcnow(), row["crawl_work_id"]),
                     )
                 count += 1
@@ -2660,7 +2661,8 @@ class DailyAuditStore:
             if state == "TERMINAL_FAILED":
                 connection.execute(
                     """UPDATE crawl_work SET state='MANUAL_REQUIRED', error_text=?, updated_at=?
-                        WHERE run_id=? AND mall_key=? AND exact_url=? AND state<>'SUCCESS'""",
+                        WHERE run_id=? AND mall_key=? AND exact_url=?
+                          AND state NOT IN ('SUCCESS','NO_RESULT','TERMINAL_FAILED')""",
                     (f"local fallback: {error}", self._utcnow(), token.run_id, work["mall_key"], work["exact_url"]),
                 )
             return self._row(connection.execute("SELECT * FROM local_fallback_work WHERE id=?", (fallback_id,)).fetchone())  # type: ignore[return-value]

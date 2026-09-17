@@ -407,6 +407,15 @@ def _harvest(
     return swept
 
 
+def _is_successful_remote_price_check(evidence: Any) -> bool:
+    """Accept only evidence produced by a completed remote price query."""
+    if not isinstance(evidence, Mapping):
+        return False
+    if evidence.get("manual_error") or evidence.get("retryable_error"):
+        return False
+    return str(evidence.get("state") or "") in {"RUNNING", "EXPORTED", "COMPLETED"}
+
+
 def _harvest_batch(
     store: DailyAuditStore,
     token: LeaseToken,
@@ -465,7 +474,7 @@ def _harvest_batch(
             max_attempts, max_elapsed_seconds = claim_limits[job_id]
             store.record_harvest(token, job_id, elapsed_seconds=elapsed, max_attempts=max_attempts, max_elapsed_seconds=max_elapsed_seconds)
             continue
-        if checked_job_ids is not None:
+        if checked_job_ids is not None and _is_successful_remote_price_check(evidence):
             checked_job_ids.add(job_id)
         if evidence.get("manual_error"):
             store.mark_remote_manual(token, job_id, str(evidence["manual_error"]))
@@ -1290,11 +1299,10 @@ def _final_remote_check_for_local_fallback(
     return {
         int(job["id"])
         for job in jobs
-        if isinstance(
+        if _is_successful_remote_price_check(
             result.get(int(job["id"]))
             if int(job["id"]) in result
-            else result.get(str(job["id"])),
-            Mapping,
+            else result.get(str(job["id"]))
         )
     }
 
