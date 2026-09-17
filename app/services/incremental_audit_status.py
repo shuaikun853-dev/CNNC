@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sqlite3
@@ -16,6 +17,7 @@ from app.services.incremental_audit_runtime import DEFAULT_RUNTIME_ROOT, runtime
 from app.services.legacy_zhaoshang_adapter import EXTERNAL_TOOL_PATH
 from app.services.page_price_semantics import (
     FORCE_CLOSEOUT_MISSING_PRICE_LIMIT,
+    build_final_page_price_projection,
     crawl_identity,
     valid_page_price_result,
 )
@@ -165,6 +167,9 @@ def _empty_status(
             "forced": False,
             "output_path": None, "output_exists": False, "manifest_recorded": False,
             "page_price_required_rows": 0, "missing_page_price_rows": 0,
+            "frozen_missing_page_price_rows": 0,
+            "failed_customer_link_rows": 0,
+            "appended_failed_customer_link_rows": 0,
             "force_closeout_limit": FORCE_CLOSEOUT_MISSING_PRICE_LIMIT,
             "blocker_summary": _empty_blocker_summary(),
         },
@@ -179,11 +184,11 @@ def _group_counts(rows: Iterable[sqlite3.Row]) -> dict[str, int]:
     return {str(row["state"]): int(row["count"]) for row in rows}
 
 
-def _page_price_coverage(
+def _page_price_rows(
     frozen_rows: Iterable[sqlite3.Row],
     crawl_rows: Iterable[sqlite3.Row],
-) -> tuple[int, int]:
-    """Count required and price-missing business rows, never crawl work rows."""
+) -> list[dict[str, Any]]:
+    """Project persisted crawl evidence onto frozen business rows."""
     crawls_by_key: dict[tuple[str, str, str], list[sqlite3.Row]] = {}
     for crawl in crawl_rows:
         key = (
@@ -192,32 +197,91 @@ def _page_price_coverage(
             str(crawl["exact_url"] or "").strip(),
         )
         crawls_by_key.setdefault(key, []).append(crawl)
-    required_count = 0
-    missing_count = 0
+    projected: list[dict[str, Any]] = []
     for frozen_row in frozen_rows:
         try:
             row = json.loads(str(frozen_row["row_json"] or "{}"))
         except (TypeError, ValueError, json.JSONDecodeError):
             continue
         required = bool(row.get("__crawl_required", bool(str(row.get("extLink") or "").strip())))
+        row["__crawl_required"] = required
         if not required:
+            projected.append(row)
             continue
-        required_count += 1
         successful = [
             crawl for crawl in crawls_by_key.get(crawl_identity(row), [])
             if str(crawl["state"] or "") == "SUCCESS"
         ]
         if not successful:
-            missing_count += 1
+            projected.append(row)
             continue
         selected = max(successful, key=lambda value: int(value["id"]))
         try:
             result = json.loads(str(selected["result_json"] or "{}"))
         except (TypeError, ValueError, json.JSONDecodeError):
             result = {}
-        if not isinstance(result, dict) or not valid_page_price_result(result):
-            missing_count += 1
-    return required_count, missing_count
+        if isinstance(result, dict) and valid_page_price_result(result):
+            row["__page_price_value"] = result.get("page_price_value")
+            row["__page_price_status"] = result.get("page_price_status")
+            row["__page_price_source"] = result.get("page_price_source")
+        projected.append(row)
+    return projected
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _final_workbook_missing_rows(
+    output_path: str | None,
+    final_manifest_hash: object,
+) -> tuple[int | None, bool]:
+    """Read final evidence only when workbook and manifest agree."""
+    if not output_path:
+        return None, False
+    workbook_path = Path(output_path)
+    manifest_path = workbook_path.with_name(workbook_path.name + ".manifest.json")
+    if not workbook_path.is_file() or not manifest_path.is_file():
+        return None, False
+    try:
+        manifest_bytes = manifest_path.read_bytes()
+        manifest = json.loads(manifest_bytes.decode("utf-8"))
+        if not isinstance(manifest, dict):
+            return None, False
+        if final_manifest_hash and hashlib.sha256(manifest_bytes).hexdigest() != str(
+            final_manifest_hash
+        ):
+            return None, False
+        if _sha256(workbook_path) != str(manifest.get("workbook_sha256") or ""):
+            return None, False
+        from openpyxl import load_workbook
+
+        workbook = load_workbook(workbook_path, read_only=True, data_only=True)
+        try:
+            rows = list(workbook["record_results"].iter_rows(values_only=True))
+        finally:
+            workbook.close()
+    except (OSError, ValueError, KeyError, json.JSONDecodeError):
+        return None, False
+    if not rows:
+        return 0, True
+    headers = [str(value or "").strip() for value in rows[0]]
+    try:
+        url_index = headers.index("互联网链接")
+        status_index = headers.index("页面价格状态")
+    except ValueError:
+        return None, False
+    successful = {"成功", "价格为0", "OK", "PRICE_IS_ZERO"}
+    missing = sum(
+        bool(str(row[url_index] or "").strip())
+        and str(row[status_index] or "").strip() not in successful
+        for row in rows[1:]
+    )
+    return missing, True
 
 
 def _lease_active(owner: object, expires_at: object) -> bool:
@@ -487,8 +551,7 @@ def collect_runtime_status(
             else:
                 crawl_pending_breakdown["unclassified"] += count
         crawl_unplanned = 0
-        page_price_required_rows = 0
-        missing_page_price_rows = 0
+        projected_frozen_rows: list[dict[str, Any]] = []
         if target_snapshot_id is not None:
             crawl_keys = {
                 (str(row["source_id"]).strip(), str(row["sku_id"]).strip(), str(row["exact_url"]).strip())
@@ -514,7 +577,7 @@ def collect_runtime_status(
                 )
                 if required and key not in crawl_keys:
                     crawl_unplanned += 1
-            page_price_required_rows, missing_page_price_rows = _page_price_coverage(
+            projected_frozen_rows = _page_price_rows(
                 frozen_rows, crawl_rows
             )
         remote_states = _group_counts(
@@ -557,6 +620,51 @@ def collect_runtime_status(
             crawl_unplanned = 0
     finally:
         connection.close()
+
+    finalized = str(run["state"]) == "FINALIZED"
+    failed_links: list[dict[str, Any]] = []
+    if not finalized and target_snapshot_id is not None:
+        from app.services.customer_prewarm_lifecycle import failed_customer_link_rows
+        from scripts import zhaoshang_mall_mapping as mapping_module
+
+        failed_links = failed_customer_link_rows(
+            business_date,
+            runtime_root,
+            mapping_module.load_zhaoshang_mall_mappings(),
+        )
+    projection = build_final_page_price_projection(projected_frozen_rows, failed_links)
+    page_price_required_rows = projection.page_price_required_rows
+    missing_page_price_rows = projection.missing_page_price_rows
+    frozen_missing_page_price_rows = projection.frozen_missing_page_price_rows
+    failed_customer_link_count = projection.failed_customer_link_rows
+    appended_failed_customer_link_rows = projection.appended_failed_customer_link_rows
+    final_artifact_consistent: bool | None = None
+    if finalized:
+        output_path = str(run["final_output_path"] or "") or None
+        artifact_missing, final_artifact_consistent = _final_workbook_missing_rows(
+            output_path, run["final_manifest_hash"]
+        )
+        if "final_missing_page_price_rows" in metrics:
+            missing_page_price_rows = int(metrics["final_missing_page_price_rows"])
+            frozen_missing_page_price_rows = int(
+                metrics.get("final_frozen_missing_page_price_rows", frozen_missing_page_price_rows)
+            )
+            failed_customer_link_count = int(metrics.get("final_failed_customer_link_rows", 0))
+            appended_failed_customer_link_rows = int(
+                metrics.get("final_appended_failed_customer_link_rows", 0)
+            )
+            page_price_required_rows = int(
+                metrics.get("final_page_price_required_rows", page_price_required_rows)
+            )
+        elif artifact_missing is not None:
+            missing_page_price_rows = artifact_missing
+        else:
+            # A legacy final with no trustworthy artifact cannot be rebuilt
+            # from mutable prewarm observations.  Retain only durable metrics.
+            missing_page_price_rows = int(metrics.get("missing_page_price_rows", 0) or 0)
+            page_price_required_rows = int(metrics.get("page_price_required_rows", 0) or 0)
+        if artifact_missing is not None and artifact_missing != missing_page_price_rows:
+            final_artifact_consistent = False
 
     discovered = int(latest["row_count"]) if latest else 0
     crawl = {
@@ -642,7 +750,7 @@ def collect_runtime_status(
             "pending": final_pending,
             "computed_pending": computed_final_pending,
             "frozen": run["frozen_snapshot_id"] is not None,
-            "finalized": str(run["state"]) == "FINALIZED",
+            "finalized": finalized,
             # True only when the FINALIZED outcome came from an explicit
             # guarded force-finalize; metrics carry the durable audit flag.
             "forced": bool(metrics.get("force_finalize", False)),
@@ -651,6 +759,10 @@ def collect_runtime_status(
             "manifest_recorded": bool(run["final_manifest_hash"]),
             "page_price_required_rows": page_price_required_rows,
             "missing_page_price_rows": missing_page_price_rows,
+            "frozen_missing_page_price_rows": frozen_missing_page_price_rows,
+            "failed_customer_link_rows": failed_customer_link_count,
+            "appended_failed_customer_link_rows": appended_failed_customer_link_rows,
+            "artifact_consistent": final_artifact_consistent,
             "force_closeout_limit": FORCE_CLOSEOUT_MISSING_PRICE_LIMIT,
             # The detail/model/crawl/remote keys decompose computed_pending
             # one-to-one.  detail_terminal is part of that sum (terminal detail

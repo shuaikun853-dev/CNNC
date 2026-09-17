@@ -423,7 +423,58 @@ def test_operator_force_closeout_rejects_more_than_twenty_missing_price_rows(tmp
             expected_missing_page_price_rows=21,
         )
 
-    assert excinfo.value.error_type == "FORCE_FINALIZE_INCOMPLETE_LIMIT_EXCEEDED"
+    assert excinfo.value.error_type == "MISSING_PRICE_LIMIT_EXCEEDED"
+    assert excinfo.value.readiness.missing_page_price_rows == 21
+    assert not output.exists()
+
+
+def test_force_closeout_limit_uses_failed_link_projection(tmp_path, monkeypatch):
+    rows = [
+        _row(f"v-{index}", f"sku-{index}", f"https://shop.example/{index}")
+        for index in range(7)
+    ]
+    store, _snapshot, crawls = _seed_force(tmp_path, rows=rows)
+    for index, crawl in enumerate(crawls):
+        _complete_no_result_crawl(store, tmp_path, crawl, index=index)
+    failures = [
+        {
+            "mall": "comix",
+            "mall_name": "齐心商城",
+            "original_url": f"https://comix.example/failed-{index}",
+            "document_id": f"DOC-FAILED-{index}",
+            "document_ids": [f"DOC-FAILED-{index}"],
+            "reason": "终端失败",
+            "last_task_name": f"task-{index}",
+            "last_time": f"{DATE}T10:00:00+00:00",
+            "job_state": "MANUAL_REQUIRED",
+            "remote_job_id": 1000 + index,
+            "candidate_id": 1000 + index,
+            "redispatch_links_used": 1,
+            "owning_day": DATE,
+            "customer_evidence": {},
+        }
+        for index in range(14)
+    ]
+    monkeypatch.setattr(
+        "app.services.customer_prewarm_lifecycle.failed_customer_link_rows",
+        lambda *_args, **_kwargs: failures,
+    )
+    output = tmp_path / "formal.xlsx"
+
+    with pytest.raises(ForceFinalizeRejected) as excinfo:
+        materialize_forced_frozen_daily_run(
+            store,
+            ProcessLock(tmp_path / "projection-limit.lock"),
+            DATE,
+            output,
+            max_incomplete=20,
+            accept_unresolved_crawl=True,
+        )
+
+    assert excinfo.value.error_type == "MISSING_PRICE_LIMIT_EXCEEDED"
+    assert excinfo.value.readiness is not None
+    assert excinfo.value.readiness.frozen_missing_page_price_rows == 7
+    assert excinfo.value.readiness.failed_customer_link_rows == 14
     assert excinfo.value.readiness.missing_page_price_rows == 21
     assert not output.exists()
 

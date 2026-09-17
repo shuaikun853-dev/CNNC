@@ -73,6 +73,7 @@ from app.services.customer_prewarm_store import (
     CustomerPrewarmStore,
 )
 from app.services.customer_reference_links import extract_reference_links
+from app.services.saas_audit_core import extract_customer_price_from_detail
 from app.services.shared_crawl_cache import (
     PRODUCER_DAILY_INTERNET,
     AliasConflictError,
@@ -158,6 +159,14 @@ def intake_documents(
             continue
         category = str(row.get("fourCategoryId") or "").strip()
         store.upsert_document(business_date, document_id, category, source=source)
+        store.record_daily_document_evidence(
+            business_date,
+            document_id,
+            four_category_id=category,
+            four_category_name=row.get("fourCategoryName"),
+            customer_title=row.get("commodityName"),
+            source=source,
+        )
         seen.add(document_id)
     return len(seen)
 
@@ -288,7 +297,20 @@ def process_document(
         store.record_document_detail_failure(document_id, error)
         return {"document_id": document_id, "detail_ok": False, "error": error}
 
-    links = extract_reference_links(response.get("payload"))
+    detail_payload = response.get("payload")
+    customer_price = extract_customer_price_from_detail(detail_payload)
+    store.record_daily_document_evidence(
+        link_business_date,
+        document_id,
+        four_category_id=four_category_id,
+        customer_price=customer_price.get("customerPrice"),
+        customer_price_status=customer_price.get("customerPriceStatus"),
+        customer_price_source=customer_price.get("customerPriceSource"),
+        customer_price_warning=customer_price.get("customerPriceWarning"),
+        customer_price_evidence=customer_price.get("customerPriceEvidence"),
+        source=source,
+    )
+    links = extract_reference_links(detail_payload)
     hits = 0
     misses = 0
     errors: list[str] = []
