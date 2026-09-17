@@ -9,6 +9,7 @@ runner and never creates replacement remote work.
 from __future__ import annotations
 
 import os
+from datetime import date
 from pathlib import Path
 from typing import Any, Callable
 
@@ -20,6 +21,7 @@ from app.services.customer_prewarm_store import (
 )
 from app.services.incremental_audit_runtime import runtime_paths
 from app.services.daily_audit_store import DailyAuditStore, LeaseUnavailable, ProcessLock
+from app.services.shared_crawl_cache import PRODUCER_CUSTOMER_PREWARM_ZHAOSHANG
 
 CROSS_DAY_RECONCILE_PER_PASS = 4
 CROSS_DAY_RECONCILE_PER_JOB_TIMEOUT_SECONDS = 30.0
@@ -44,6 +46,12 @@ def _linked_cross_day_job_keys(
 ) -> list[tuple[str, int]]:
     """Return deduplicated current candidate bindings owned by earlier days."""
     keys: set[tuple[str, int]] = set()
+    try:
+        current_day = date.fromisoformat(current_business_date)
+    except ValueError:
+        return []
+    if current_day.isoformat() != current_business_date:
+        return []
     for status in (CACHE_STATUS_REMOTE_DISPATCHED, CACHE_STATUS_REMOTE_REUSED):
         for candidate in prewarm_store.candidates(status):
             candidate_job_id = candidate.get("remote_job_id")
@@ -54,9 +62,15 @@ def _linked_cross_day_job_keys(
                 continue
             owning_day = str(link.get("business_date") or "")
             linked_job_id = int(link["remote_job_id"])
+            try:
+                historical_day = date.fromisoformat(owning_day)
+            except ValueError:
+                continue
             if (
-                not owning_day
-                or owning_day == current_business_date
+                historical_day.isoformat() != owning_day
+                or historical_day >= current_day
+                or str(link.get("producer") or "")
+                != PRODUCER_CUSTOMER_PREWARM_ZHAOSHANG
                 or linked_job_id != int(candidate_job_id)
             ):
                 continue
@@ -77,8 +91,11 @@ def plan_cross_day_reconcile_jobs(
     for owning_day, job_id in _linked_cross_day_job_keys(
         prewarm_store, current_business_date
     ):
+        paths = runtime_paths(owning_day, root)
+        if paths.run_dir.resolve().parent != root.resolve():
+            continue
         connection = _open_state_db_readonly(
-            runtime_paths(owning_day, root).state_path
+            paths.state_path
         )
         if connection is None:
             continue
@@ -171,6 +188,12 @@ def run_cross_day_reconcile_phase(
     attempted = 0
     for owning_day, job_id in keys:
         paths = runtime_paths(owning_day, root)
+        if paths.run_dir.resolve().parent != root.resolve():
+            summary["cross_day_reconcile_deferred"] += 1
+            phase_errors.append(
+                f"cross-day job {owning_day}/{job_id}: historical path invalid; deferred"
+            )
+            continue
         key = (owning_day, job_id)
         if not paths.state_path.is_file():
             summary["cross_day_reconcile_deferred"] += 1
@@ -274,13 +297,12 @@ def run_cross_day_reconcile_phase(
                 if status == "FOUND" and task_id and task_number:
                     mall_key = str(job.get("mall_key") or prepared.mall_key)
                     remote_identity = f"{mall_key}|{task_id}|{task_number}"
-                    store.reconcile_remote_job(
+                    store.reconcile_remote_job_and_crawl_work(
                         token,
                         job_id,
                         remote_identity=remote_identity,
                         state="PRIORITY_PENDING",
                     )
-                    store.advance_crawl_work_for_job(token, job_id, "PRIORITY_PENDING")
                     summary["cross_day_reconciled_found"] += 1
                     _confirm_pending_priority_job(
                         prewarm_store=None,

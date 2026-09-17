@@ -1866,6 +1866,53 @@ class DailyAuditStore:
                 ) from exc
             return self._row(connection.execute("SELECT * FROM remote_jobs WHERE id=?", (job_id,)).fetchone())  # type: ignore[return-value]
 
+    def reconcile_remote_job_and_crawl_work(
+        self,
+        token: LeaseToken,
+        job_id: int,
+        *,
+        remote_identity: str,
+        state: str = "PRIORITY_PENDING",
+    ) -> dict[str, Any]:
+        """Atomically restore a found unknown job and its linked crawl rows.
+
+        This narrow cross-day transition prevents an identity-bearing job from
+        being stranded with stale crawl rows if the process exits between two
+        otherwise separate store calls.
+        """
+        if state != "PRIORITY_PENDING":
+            raise ValueError("atomic unknown reconciliation requires PRIORITY_PENDING")
+        identity = str(remote_identity or "").strip()
+        parts = identity.split("|")
+        if len(parts) != 3 or not all(parts):
+            raise RemoteIntentConflict("remote reconciliation requires an exact remote identity")
+        with self._transaction(immediate=True) as connection:
+            self._validate_lease(connection, token)
+            job = self._job_for_lease(connection, token, job_id)
+            if str(job["state"]) != "SUBMIT_UNKNOWN" or str(job["remote_identity"] or "").strip():
+                raise RemoteIntentConflict("atomic unknown reconciliation requires an identity-less SUBMIT_UNKNOWN job")
+            if not int(job["post_attempted"]):
+                raise RemoteIntentConflict("remote reconciliation requires durable post_attempted evidence")
+            try:
+                connection.execute(
+                    """UPDATE remote_jobs SET state='PRIORITY_PENDING', remote_identity=?,
+                       error_text=NULL, updated_at=? WHERE id=?""",
+                    (identity, self._utcnow(), job_id),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise RemoteIntentConflict(
+                    "remote identity is already bound to another logical job in this daily run"
+                ) from exc
+            connection.execute(
+                """UPDATE crawl_work SET state='PRIORITY_PENDING', updated_at=?
+                   WHERE run_id=? AND remote_job_id=?
+                     AND state NOT IN ('SUCCESS', 'NO_RESULT', 'TERMINAL_FAILED')""",
+                (self._utcnow(), token.run_id, job_id),
+            )
+            return self._row(
+                connection.execute("SELECT * FROM remote_jobs WHERE id=?", (job_id,)).fetchone()
+            )  # type: ignore[return-value]
+
     def claim_harvest(self, token: LeaseToken, job_id: int, *, max_attempts: int, max_elapsed_seconds: float) -> dict[str, Any] | None:
         with self._transaction(immediate=True) as connection:
             self._validate_lease(connection, token)

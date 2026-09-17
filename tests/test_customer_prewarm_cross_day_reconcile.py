@@ -188,6 +188,100 @@ def test_planner_excludes_non_prewarm_step1_job(tmp_path):
     ) == []
 
 
+def test_planner_excludes_zhpq_job_linked_by_wrong_producer(tmp_path):
+    """The zhpq prefix alone must not claim work owned by another producer."""
+    runtime_root = tmp_path / "runtime"
+    prewarm_path = runtime_root / "customer_prewarm.sqlite3"
+    prewarm = CustomerPrewarmStore(prewarm_path)
+    _paths, job_id = seed_unknown_job(
+        runtime_root,
+        YESTERDAY,
+        _CountingAdapter(),
+        mapping=COMIX,
+        url="https://qx.com/wrong-producer.html",
+    )
+    seed_remote_candidate(
+        prewarm,
+        "https://qx.com/wrong-producer.html",
+        job_id,
+        business_date=YESTERDAY,
+    )
+    with sqlite3.connect(prewarm_path) as connection:
+        connection.execute(
+            "UPDATE prewarm_remote_job_links SET producer='ordinary-step1'"
+        )
+
+    assert plan_cross_day_reconcile_jobs(
+        prewarm,
+        current_business_date=TODAY,
+        state_runtime_root=runtime_root,
+    ) == []
+
+
+@pytest.mark.parametrize("owning_day", ["2026-09-18", "../escaped-day", "not-a-date"])
+def test_planner_rejects_non_historical_or_noncanonical_link_dates(
+    tmp_path, owning_day
+):
+    """A corrupt linkage date must never become a filesystem target."""
+    runtime_root = tmp_path / "runtime"
+    prewarm = CustomerPrewarmStore(runtime_root / "customer_prewarm.sqlite3")
+    candidate_id = seed_remote_candidate(
+        prewarm,
+        f"https://qx.com/invalid-day-{owning_day.replace('/', '-')}.html",
+        88,
+        business_date=owning_day,
+    )
+
+    assert plan_cross_day_reconcile_jobs(
+        prewarm,
+        current_business_date=TODAY,
+        state_runtime_root=runtime_root,
+    ) == []
+    assert prewarm.candidate_by_id(candidate_id)["remote_job_id"] == 88
+
+
+def test_atomic_found_transition_rolls_back_job_when_crawl_update_fails(tmp_path):
+    """A crash/failure between FOUND writes must not strand a half-transition."""
+    runtime_root = tmp_path / "runtime"
+    paths, job_id = seed_unknown_job(
+        runtime_root,
+        YESTERDAY,
+        _CountingAdapter(),
+        mapping=COMIX,
+        url="https://qx.com/atomic-found.html",
+    )
+    with sqlite3.connect(paths.state_path) as connection:
+        connection.execute(
+            """CREATE TRIGGER fail_priority_crawl_update
+               BEFORE UPDATE OF state ON crawl_work
+               WHEN NEW.state = 'PRIORITY_PENDING'
+               BEGIN
+                   SELECT RAISE(ABORT, 'injected crawl update failure');
+               END"""
+        )
+
+    with leased(paths, YESTERDAY) as (store, token):
+        with pytest.raises(sqlite3.IntegrityError, match="injected crawl"):
+            store.reconcile_remote_job_and_crawl_work(
+                token,
+                job_id,
+                remote_identity="comix|atomic-task|atomic-number",
+                state="PRIORITY_PENDING",
+            )
+
+    job = _remote_job_row(paths.state_path, job_id)
+    assert job["state"] == "SUBMIT_UNKNOWN"
+    assert not str(job["remote_identity"] or "")
+    assert {
+        row["state"]
+        for row in _state_rows(
+            paths.state_path,
+            "SELECT state FROM crawl_work WHERE remote_job_id=?",
+            (job_id,),
+        )
+    } == {"PENDING"}
+
+
 def _run_cross_day(runtime_root, prewarm, adapter, **overrides):
     summary = overrides.pop("summary", _new_summary())
     run_cross_day_reconcile_phase(
@@ -240,7 +334,59 @@ def test_found_updates_only_historical_db_once_and_uses_owning_day(tmp_path):
     assert historical["remote_identity"] == "comix|found-task|found-number"
     assert historical["state"] == "SUBMITTED"
     assert historical["recovery_attempts"] == 2
+    assert {
+        row["state"]
+        for row in _state_rows(
+            old_paths.state_path,
+            "SELECT state FROM crawl_work WHERE remote_job_id=?",
+            (job_id,),
+        )
+    } == {"SUBMITTED"}
     assert _state_rows(today_paths.state_path, "SELECT id FROM remote_jobs") == []
+
+
+def test_found_without_priority_proof_remains_pending_in_historical_db(tmp_path):
+    """FOUND alone must not claim SUBMITTED without weight_type=-1 proof."""
+    from app.services.legacy_zhaoshang_adapter import (
+        LegacyPriorityOutcome,
+        PriorityStatus,
+    )
+
+    runtime_root = tmp_path / "runtime"
+    prewarm = CustomerPrewarmStore(runtime_root / "customer_prewarm.sqlite3")
+    old_paths, job_id = seed_unknown_job(
+        runtime_root,
+        YESTERDAY,
+        _CountingAdapter(),
+        mapping=COMIX,
+        url="https://qx.com/found-priority-unconfirmed.html",
+    )
+    seed_remote_candidate(
+        prewarm,
+        "https://qx.com/found-priority-unconfirmed.html",
+        job_id,
+        business_date=YESTERDAY,
+    )
+    adapter = _CountingAdapter(
+        reconcile_outcome=RECONCILE_FOUND,
+        priority_outcomes=[
+            LegacyPriorityOutcome(PriorityStatus.UNCONFIRMED, weight_type=None)
+        ],
+    )
+
+    summary = _run_cross_day(runtime_root, prewarm, adapter)
+
+    assert summary["cross_day_reconciled_found"] == 1
+    assert summary["priority_confirmed"] == 0
+    assert _remote_job_row(old_paths.state_path, job_id)["state"] == "PRIORITY_PENDING"
+    assert {
+        row["state"]
+        for row in _state_rows(
+            old_paths.state_path,
+            "SELECT state FROM crawl_work WHERE remote_job_id=?",
+            (job_id,),
+        )
+    } == {"PRIORITY_PENDING"}
 
 
 def test_not_found_bumps_historical_attempt_once(tmp_path):
