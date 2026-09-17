@@ -443,6 +443,33 @@ def test_unmapped_candidate_recorded_routing_blocked(tmp_path):
 # ---- Case 6:新任务创建 + 提交 -------------------------------------------------------
 
 
+def test_routing_blocked_candidate_reclassified_after_mapping_available(tmp_path):
+    runtime_root = tmp_path / "runtime"
+    paths = make_state_db(runtime_root, BUSINESS_DATE)
+    prewarm = CustomerPrewarmStore(runtime_root / "customer_prewarm.sqlite3")
+    cache = SharedCrawlCache(runtime_root / "shared_crawl_cache.sqlite3")
+    url = "https://qx.com/product-reclassified.html"
+    candidate_id = make_candidate(prewarm, url)
+    prewarm.record_candidate_result(
+        candidate_id,
+        cache_status=CACHE_STATUS_ROUTING_BLOCKED,
+        error="unmapped mall: qx.com",
+    )
+    adapter = _CountingAdapter()
+
+    summary = run_pass(runtime_root, prewarm, cache, adapter=adapter)
+
+    assert summary["routing_blocked"] == 0
+    assert summary["mapped_zhaoshang"] == 1
+    assert summary["jobs_created"] == 1
+    row = candidate_by_id(prewarm, candidate_id)
+    assert row["cache_status"] == CACHE_STATUS_REMOTE_DISPATCHED
+    assert row["remote_job_id"] is not None
+    assert adapter.submit_calls == 1
+    assert len(_crawl_rows(paths.state_path)) == 1
+
+
+
 def test_case6_new_task_created_submitted_once(tmp_path):
     runtime_root = tmp_path / "runtime"
     paths = make_state_db(runtime_root, BUSINESS_DATE)
