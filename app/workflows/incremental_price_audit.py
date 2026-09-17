@@ -25,6 +25,8 @@ from app.services.customer_price_semantics import DetailBusinessRetryRequired
 from app.services.daily_audit_store import DailyAuditStore, LeaseToken, LeaseUnavailable, ProcessLock
 from app.services.remote_running_recovery import (
     RECOVERY_CALLBACK_TIMEOUT_SECONDS,
+    RemoteExecutionState,
+    classify_remote_execution_state,
     run_running_recovery_pass,
 )
 from app.services.saas_audit_core import crawl_fingerprint, detail_fingerprint, model_fingerprint
@@ -449,6 +451,48 @@ def _harvest_batch(
         if evidence.get("manual_error"):
             store.mark_remote_manual(token, job_id, str(evidence["manual_error"]))
             continue
+        state = str(evidence.get("state", "RUNNING"))
+        remote_identity = str(
+            evidence.get("remote_identity")
+            or store.get_remote_job(job_id).get("remote_identity")
+            or ""
+        )
+        priority_terminal_bypass = evidence.get("priority_terminal_bypass") is True
+        if priority_terminal_bypass:
+            progress = evidence.get("remote_terminal_progress")
+            classification = classify_remote_execution_state(
+                progress if isinstance(progress, Mapping) else None,
+                evidence.get("remote_terminal_rsp_desc"),
+            )
+            if (
+                str(job.get("state")) != "PRIORITY_PENDING"
+                or state not in {"EXPORTED", "COMPLETED"}
+                or not remote_identity
+                or remote_identity != str(job.get("remote_identity") or "")
+                or classification is not RemoteExecutionState.TERMINAL
+            ):
+                store.mark_remote_manual(
+                    token,
+                    job_id,
+                    "priority-terminal export bypass lacked exact terminal identity evidence",
+                )
+                continue
+            # Preserve the ordinary durable state machine: exact read-only
+            # terminal proof admits the existing task into harvest, but never
+            # fabricates a successful priority update.  The batch-state event
+            # remains PRIORITY_UNCONFIRMED and no priority write is dispatched.
+            store.reconcile_remote_job(
+                token,
+                job_id,
+                remote_identity=remote_identity,
+                state="SUBMITTED",
+                result={
+                    "state": "PRIORITY_PENDING",
+                    "priority_evidence": None,
+                    "terminal_before_priority": True,
+                    "remote_terminal_progress": dict(progress or {}),
+                },
+            )
         crawl_results = evidence.get("crawl_results")
         manual_crawl_results: list[tuple[int, str]] = []
         if isinstance(crawl_results, Mapping):
@@ -486,8 +530,6 @@ def _harvest_batch(
                 else:
                     store.complete_crawl_work(token, int(raw_crawl_id), crawl_result)
                 counters["crawl_harvested"] += 1
-        state = str(evidence.get("state", "RUNNING"))
-        remote_identity = str(evidence.get("remote_identity") or store.get_remote_job(job_id).get("remote_identity") or "")
         if not remote_identity:
             max_attempts, max_elapsed_seconds = claim_limits[job_id]
             store.record_harvest(token, job_id, elapsed_seconds=evidence_elapsed, max_attempts=max_attempts, max_elapsed_seconds=max_elapsed_seconds)

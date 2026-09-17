@@ -680,6 +680,56 @@ def test_retryable_priority_failure_stays_pending_then_succeeds_on_same_job(tmp_
     assert attempts == [(int(job["id"]), identity), (int(job["id"]), identity)]
 
 
+def test_terminal_priority_pending_export_completes_without_priority_confirmation(
+    tmp_path,
+):
+    store = DailyAuditStore(tmp_path / "state.sqlite")
+    clock = Clock()
+    identity = "jd|1242978|RW-20260818110643"
+    job = _seed_priority_pending_job(store, "2026-08-11", identity)
+    deps = _deps([], [], clock)
+    deps.harvest = lambda _jobs, _timeout: {
+        int(job["id"]): {
+            "state": "COMPLETED",
+            "remote_identity": identity,
+            "priority_terminal_bypass": True,
+            "remote_terminal_progress": {
+                "total": 1,
+                "pending": 0,
+                "running": 0,
+                "failed": 0,
+                "waiting_db": 0,
+                "finished": 1,
+            },
+            "result": {"https://same.invalid/p": {"page_price_value": 11}},
+            "crawl_results": {},
+        }
+    }
+    deps.submit_crawl = lambda *_args: pytest.fail(
+        "terminal priority bypass must never call /add"
+    )
+    config = TickConfig(
+        business_date="2026-08-11",
+        runtime_budget_seconds=60,
+        heavy_work_reserve_seconds=5,
+        lease_ttl_seconds=30,
+        harvest_max_attempts=3,
+        harvest_max_elapsed_seconds=60,
+    )
+
+    run_incremental_tick(
+        store,
+        ProcessLock(tmp_path / "tick.lock"),
+        config,
+        deps,
+    )
+
+    completed = store.get_remote_job(int(job["id"]))
+    assert completed["state"] == "COMPLETED"
+    assert completed["remote_identity"] == identity
+    assert completed["error_text"] is None
+
+
 @pytest.mark.parametrize(
     (
         "max_attempts",

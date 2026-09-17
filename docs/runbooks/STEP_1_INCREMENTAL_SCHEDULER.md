@@ -188,6 +188,12 @@ Ctrl+C 或被操作系统终止后都会由 `finally` 或 OS 自动释放。旁�
 不等待下一次调度。单批 harvest callback 上限仍为 60 秒；手工命令预算保留正式物化时间，外层 hard timeout
 watchdog 和 `max-iterations` 是额外保险。已经 `COMPLETED` 的 job 不进入候选集。
 
+`PRIORITY_PENDING` 每次先对持久化的精确 `mall|task_id|task_number` 做只读进度查询。若六个进度计数已严格证明
+远端终态，说明任务在提优确认前已跑完：本轮跳过 priority 写入，直接进入同一个 `wait-export-only`
+导出与回填路径，不创建、不启用、不补发、不冒充“已提优”。远端仍活动时才继续原有提优重试；进度不完整、
+业务失败或 identity 冲突时 fail-closed，不以“大概完成”为由导出。完成前的状态落库仍经过
+`PRIORITY_PENDING -> SUBMITTED -> EXPORTED/COMPLETED`，而 `BATCH_STATE.md` 保留原 `PRIORITY_UNCONFIRMED` 证据。
+
 命令可重复触发：未 drain 时保持 `FINALIZING`，只有 Detail/Model/crawl/remote pending 时按正常等待退出；terminal、未规划 crawl、
 无效价格、remote `MANUAL_REQUIRED`、非法 remote state 或产物冲突才作为可操作阻塞返回非零。关联 frozen
 mandatory crawl 的 remote job 必须全部为 `COMPLETED`；即使 crawl 已写成 `SUCCESS`，remote 仍为

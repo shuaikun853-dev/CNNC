@@ -675,6 +675,7 @@ class _BridgeAdapter:
         self.harvest_calls = 0
         self.reconcile_calls = 0
         self.priority_calls = 0
+        self.progress_calls = 0
 
     def request_from_saas_row(self, row, *, backend_version):
         return CrawlRequest("mall", "mall-source", "Mall", str(row["skuId"]), str(row["extLink"]), backend_version)
@@ -704,6 +705,24 @@ class _BridgeAdapter:
     def prioritize(self, _job, *, task_id, task_number, timeout_seconds):
         self.priority_calls += 1
         return LegacyPriorityOutcome(PriorityStatus.UPDATED, weight_type=-1)
+
+    def query_task_progress_for_job(
+        self, _job, task_id, task_number, timeout_seconds
+    ):
+        self.progress_calls += 1
+        return {
+            "task_id": task_id,
+            "task_number": task_number,
+            "progress": {
+                "total": 1,
+                "pending": 1,
+                "running": 0,
+                "failed": 0,
+                "waiting_db": 0,
+                "finished": 0,
+            },
+            "rsp_desc": "",
+        }
 
     def reconcile_unknown(self, _job, *, timeout_seconds):
         self.reconcile_calls += 1
@@ -969,6 +988,142 @@ def test_legacy_bridge_retries_transient_priority_on_same_remote_identity(tmp_pa
     assert second["remote_identity"] == identity
     assert adapter.priority_calls == 2
     assert adapter.submit_calls == 0
+
+
+def test_legacy_bridge_exports_terminal_priority_pending_job_without_priority_write(
+    tmp_path,
+):
+    class TerminalBeforePriorityAdapter(_BridgeAdapter):
+        def query_task_progress_for_job(
+            self, _job, task_id, task_number, timeout_seconds
+        ):
+            self.progress_calls += 1
+            return {
+                "task_id": task_id,
+                "task_number": task_number,
+                "progress": {
+                    "total": 1,
+                    "pending": 0,
+                    "running": 0,
+                    "failed": 0,
+                    "waiting_db": 0,
+                    "finished": 1,
+                },
+                "rsp_desc": "",
+            }
+
+    paths = runtime_paths("2026-08-11", tmp_path / "runtime")
+    paths.run_dir.mkdir(parents=True)
+    adapter = TerminalBeforePriorityAdapter()
+    propose, finalize, _submit, harvest, _probe, _restart = legacy_zhaoshang_bridge(
+        adapter,
+        paths=paths,
+        business_date="2026-08-11",
+    )
+    row = {
+        "vCommodityId": "v-a",
+        "skuId": "sku-a",
+        "extLink": "https://same.invalid/p",
+    }
+    plan = propose([{"row": row}], 10)[0]
+    finalized = finalize(plan, tuple(plan.members), 10)
+    identity = "mall|remote-1|number-1"
+    durable = {
+        "id": 17,
+        "logical_key": finalized.logical_key,
+        "task_name": finalized.task_name,
+        "payload_hash": finalized.payload_hash,
+        "payload_json": json.dumps(finalized.payload_json),
+        "input_path": finalized.input_path,
+        "result_path": finalized.result_path,
+        "state": "PRIORITY_PENDING",
+        "remote_identity": identity,
+        "crawl_work": [
+            {
+                "id": 101,
+                "sku_id": "sku-a",
+                "exact_url": "https://same.invalid/p",
+                "source_id": "v-a",
+            }
+        ],
+    }
+
+    outcome = harvest([durable], 10)[17]
+
+    assert outcome["state"] == "COMPLETED"
+    assert outcome["remote_identity"] == identity
+    assert outcome["priority_terminal_bypass"] is True
+    assert outcome["crawl_results"][101]["page_price_value"] == 11
+    assert adapter.progress_calls == 1
+    assert adapter.priority_calls == 0
+    assert adapter.harvest_calls == 1
+    assert adapter.submit_calls == 0
+
+
+def test_legacy_bridge_keeps_terminal_priority_job_pending_until_export_exists(
+    tmp_path,
+):
+    class TerminalExportPendingAdapter(_BridgeAdapter):
+        def query_task_progress_for_job(
+            self, _job, task_id, task_number, timeout_seconds
+        ):
+            self.progress_calls += 1
+            return {
+                "progress": {
+                    "total": 1,
+                    "pending": 0,
+                    "running": 0,
+                    "failed": 0,
+                    "waiting_db": 0,
+                    "finished": 1,
+                },
+                "rsp_desc": "",
+            }
+
+        def harvest(self, _job, *, timeout_seconds):
+            self.harvest_calls += 1
+            return LegacyHarvestOutcome(
+                HarvestStatus.RUNNING,
+                diagnostic="export is not available yet",
+            )
+
+    paths = runtime_paths("2026-08-11", tmp_path / "runtime")
+    paths.run_dir.mkdir(parents=True)
+    adapter = TerminalExportPendingAdapter()
+    propose, finalize, _submit, harvest, _probe, _restart = legacy_zhaoshang_bridge(
+        adapter,
+        paths=paths,
+        business_date="2026-08-11",
+    )
+    row = {
+        "vCommodityId": "v-a",
+        "skuId": "sku-a",
+        "extLink": "https://same.invalid/p",
+    }
+    plan = propose([{"row": row}], 10)[0]
+    finalized = finalize(plan, tuple(plan.members), 10)
+    outcome = harvest(
+        [
+            {
+                "id": 17,
+                "logical_key": finalized.logical_key,
+                "task_name": finalized.task_name,
+                "payload_hash": finalized.payload_hash,
+                "payload_json": json.dumps(finalized.payload_json),
+                "input_path": finalized.input_path,
+                "result_path": finalized.result_path,
+                "state": "PRIORITY_PENDING",
+                "remote_identity": "mall|remote-1|number-1",
+                "crawl_work": [],
+            }
+        ],
+        10,
+    )[17]
+
+    assert outcome["state"] == "PRIORITY_PENDING"
+    assert outcome["retryable_error"] == "export is not available yet"
+    assert adapter.priority_calls == 0
+    assert adapter.harvest_calls == 1
 
 
 def test_legacy_bridge_sends_deterministic_priority_conflict_directly_to_manual(

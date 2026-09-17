@@ -11,7 +11,6 @@
 - 项目内主要依赖：FastAPI、Pydantic、PyYAML、pytest、httpx、openpyxl。
 - 敏感输入位于被忽略的 `data/*.curl`、`data/*.env`、`data/*.json` 或当前进程环境变量；不得打印其值。
 - 运行前设置：`$env:PYTHONIOENCODING='utf-8'`。
-
 ## 2. 自动化测试
 
 ### 收集和全量
@@ -60,7 +59,7 @@ python -m pytest tests\test_context_documents.py -q
 ```powershell
 # Scheduler 路由（白天 15 分钟、17:00-17:50 每 5 分钟 tick、17:55 harvest-only、18:00-20:00 每 5 分钟 closeout、20:35 一次性 safety closeout）、snapshot 180 秒有限重试、公平/post harvest、freeze gate、writer lock、只读 status；simulation 文件另证四 trigger 时间线 + IgnoreNew 重叠丢弃/不堆积/单 writer（2/6/9 分钟 tick、12/20/28/32 分钟 closeout）
 python -m pytest tests\test_incremental_audit_operations.py -k "scheduler or scheduled" -q; python -m pytest tests\test_scheduler_frequency_simulation.py -q
-python -m pytest tests\test_harvest_only.py -q  # 白天 harvest-only：无 discovery/Detail/Model/submit/finalize、本地 NOOP、全量 sweep、幂等
+python -m pytest tests\test_harvest_only.py -q; python -m pytest tests\test_incremental_audit_runtime.py::test_legacy_bridge_exports_terminal_priority_pending_job_without_priority_write tests\test_incremental_price_audit.py::test_terminal_priority_pending_export_completes_without_priority_confirmation -q  # harvest-only 零提交；提优前远端已终态则精确只读证明后零 priority/add 写入，直接导出并完成
 python -m pytest tests\test_incremental_price_audit.py tests\test_incremental_audit_runtime.py -k "existing_remote_drain or drain_only" -q; python -m pytest tests\test_remote_running_recovery.py -q  # RUNNING 停滞判定/一次性精确重启/RECOVERY_EXHAUSTED 终态（全 fake adapter）
 python -m pytest tests\test_daily_audit_store.py tests\test_incremental_audit_runtime.py tests\test_incremental_audit_operations.py -k "process_lock or writer_lock or lock_conflict or lock_status or active_writer or materialization_remains" -q
 python -m pytest tests\test_daily_audit_store.py tests\test_cnnc_saas_snapshot_adapter.py tests\test_saas_audit_core.py tests\test_title_match_model_retry.py tests\test_incremental_price_audit.py tests\test_incremental_audit_runtime.py tests\test_harvest_only.py `

@@ -74,6 +74,10 @@ from app.services.legacy_zhaoshang_adapter import (
     RestartStatus,
     SubmitStatus,
 )
+from app.services.remote_running_recovery import (
+    RemoteExecutionState,
+    classify_remote_execution_state,
+)
 from app.services.remote_stall_breaker import remote_submit_pause_reason
 from app.services.saas_audit_core import (
     SAAS_PENDING_HEADERS,
@@ -1578,6 +1582,7 @@ def legacy_zhaoshang_bridge(
                 break
             job_timeout = max(0.001, remaining / max(1, len(jobs) - index))
             job_started = monotonic()
+            job_deadline = job_started + job_timeout
             def publish(payload: Mapping[str, Any]) -> None:
                 results[int(job["id"])] = {**payload, "elapsed_seconds": max(0.0, monotonic() - job_started)}
             try:
@@ -1585,6 +1590,9 @@ def legacy_zhaoshang_bridge(
             except Exception:
                 publish({"manual_error": "exact legacy job reconstruction is unavailable"})
                 continue
+            priority_terminal_bypass = False
+            remote_terminal_progress: Mapping[str, Any] | None = None
+            remote_terminal_rsp_desc = ""
             if str(job.get("state")) == "SUBMIT_UNKNOWN":
                 reconcile = adapter.reconcile_unknown(prepared_job, timeout_seconds=job_timeout)
                 if reconcile.status is ReconcileStatus.FOUND:
@@ -1603,39 +1611,124 @@ def legacy_zhaoshang_bridge(
                 except RuntimeConfigurationError:
                     publish({"manual_error": "priority pending job has invalid remote identity"})
                     continue
-                priority = adapter.prioritize(
-                    prepared_job,
-                    task_id=task_id,
-                    task_number=task_number,
-                    timeout_seconds=job_timeout,
-                )
-                if priority.status in {PriorityStatus.UPDATED, PriorityStatus.ALREADY_HIGHEST}:
-                    publish({
-                        "state": "SUBMITTED",
-                        "remote_identity": str(job.get("remote_identity")),
-                        "result": {
-                            "priority_status": priority.status.value,
-                            "weight_type": priority.weight_type,
-                        },
-                    })
-                elif priority.retryable:
+                try:
+                    progress_answer = adapter.query_task_progress_for_job(
+                        prepared_job,
+                        task_id,
+                        task_number,
+                        max(0.001, job_deadline - monotonic()),
+                    )
+                except RemoteTaskIdentityConflictError:
+                    publish({"manual_error": "live task identity conflicts with durable remote identity"})
+                    continue
+                except Exception as exc:
                     publish({
                         "state": "PRIORITY_PENDING",
                         "remote_identity": str(job.get("remote_identity")),
                         "retryable_error": (
-                            priority.diagnostic
-                            or "transient priority infrastructure failure"
+                            "read-only remote completion probe failed: "
+                            f"{type(exc).__name__}"
                         ),
                         "result": {
                             "state": "PRIORITY_PENDING",
-                            "priority_status": priority.status.value,
-                            "diagnostic": priority.diagnostic,
+                            "priority_evidence": None,
+                            "progress_probe": "FAILED",
                         },
                     })
+                    continue
+                progress = (
+                    progress_answer.get("progress")
+                    if isinstance(progress_answer, Mapping)
+                    else None
+                )
+                rsp_desc = (
+                    str(progress_answer.get("rsp_desc") or "")
+                    if isinstance(progress_answer, Mapping)
+                    else ""
+                )
+                execution_state = classify_remote_execution_state(
+                    progress if isinstance(progress, Mapping) else None,
+                    rsp_desc,
+                )
+                if execution_state is RemoteExecutionState.TERMINAL:
+                    priority_terminal_bypass = True
+                    remote_terminal_progress = (
+                        dict(progress) if isinstance(progress, Mapping) else None
+                    )
+                    remote_terminal_rsp_desc = rsp_desc
+                elif execution_state is RemoteExecutionState.UNKNOWN:
+                    publish({
+                        "state": "PRIORITY_PENDING",
+                        "remote_identity": str(job.get("remote_identity")),
+                        "retryable_error": (
+                            "read-only remote completion probe did not prove "
+                            "an active or terminal task"
+                        ),
+                        "result": {
+                            "state": "PRIORITY_PENDING",
+                            "priority_evidence": None,
+                            "progress_probe": execution_state.value,
+                        },
+                    })
+                    continue
                 else:
-                    publish({"manual_error": priority.diagnostic or "highest priority was not confirmed"})
+                    remaining_after_probe = job_deadline - monotonic()
+                    if remaining_after_probe <= 0:
+                        publish({
+                            "state": "PRIORITY_PENDING",
+                            "remote_identity": str(job.get("remote_identity")),
+                            "retryable_error": "priority retry deferred after progress probe exhausted the callback budget",
+                            "result": {
+                                "state": "PRIORITY_PENDING",
+                                "priority_evidence": None,
+                                "progress_probe": execution_state.value,
+                            },
+                        })
+                        continue
+                    priority = adapter.prioritize(
+                        prepared_job,
+                        task_id=task_id,
+                        task_number=task_number,
+                        timeout_seconds=max(0.001, remaining_after_probe),
+                    )
+                    if priority.status in {PriorityStatus.UPDATED, PriorityStatus.ALREADY_HIGHEST}:
+                        publish({
+                            "state": "SUBMITTED",
+                            "remote_identity": str(job.get("remote_identity")),
+                            "result": {
+                                "priority_status": priority.status.value,
+                                "weight_type": priority.weight_type,
+                            },
+                        })
+                    elif priority.retryable:
+                        publish({
+                            "state": "PRIORITY_PENDING",
+                            "remote_identity": str(job.get("remote_identity")),
+                            "retryable_error": (
+                                priority.diagnostic
+                                or "transient priority infrastructure failure"
+                            ),
+                            "result": {
+                                "state": "PRIORITY_PENDING",
+                                "priority_status": priority.status.value,
+                                "diagnostic": priority.diagnostic,
+                            },
+                        })
+                    else:
+                        publish({"manual_error": priority.diagnostic or "highest priority was not confirmed"})
+                    continue
+            remaining_for_harvest = job_deadline - monotonic()
+            if remaining_for_harvest <= 0:
+                publish({
+                    "state": "PRIORITY_PENDING" if priority_terminal_bypass else "RUNNING",
+                    "remote_identity": str(job.get("remote_identity") or "legacy"),
+                    "retryable_error": "remote export deferred because the callback budget was exhausted",
+                })
                 continue
-            outcome = adapter.harvest(prepared_job, timeout_seconds=job_timeout)
+            outcome = adapter.harvest(
+                prepared_job,
+                timeout_seconds=max(0.001, remaining_for_harvest),
+            )
             if outcome.status is HarvestStatus.EXPORTED:
                 result_map = dict(outcome.result_map or {})
                 result_by_identity = dict(outcome.result_by_identity or {})
@@ -1687,9 +1780,33 @@ def legacy_zhaoshang_bridge(
                     "export_path": str(prepared_job.result_path),
                     "result": result_map,
                     "crawl_results": crawl_results,
+                    **(
+                        {
+                            "priority_terminal_bypass": True,
+                            "remote_terminal_progress": remote_terminal_progress,
+                            "remote_terminal_rsp_desc": remote_terminal_rsp_desc,
+                        }
+                        if priority_terminal_bypass
+                        else {}
+                    ),
                 })
             elif outcome.status is HarvestStatus.RUNNING:
-                publish({"state": "RUNNING", "remote_identity": str(job.get("remote_identity") or "legacy")})
+                if priority_terminal_bypass:
+                    publish({
+                        "state": "PRIORITY_PENDING",
+                        "remote_identity": str(job.get("remote_identity") or "legacy"),
+                        "retryable_error": (
+                            outcome.diagnostic
+                            or "terminal remote task export is not available yet"
+                        ),
+                        "result": {
+                            "state": "PRIORITY_PENDING",
+                            "priority_evidence": None,
+                            "terminal_before_priority": True,
+                        },
+                    })
+                else:
+                    publish({"state": "RUNNING", "remote_identity": str(job.get("remote_identity") or "legacy")})
             else:
                 publish({"manual_error": "legacy wait-export-only requires manual review"})
         return results
