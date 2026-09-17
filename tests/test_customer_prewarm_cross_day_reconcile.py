@@ -389,6 +389,63 @@ def test_found_without_priority_proof_remains_pending_in_historical_db(tmp_path)
     } == {"PRIORITY_PENDING"}
 
 
+def test_priority_pending_retries_priority_next_pass_without_reconcile_or_submit(
+    tmp_path,
+):
+    """A FOUND identity must stay live across passes until priority is proven."""
+    from app.services.legacy_zhaoshang_adapter import (
+        LegacyPriorityOutcome,
+        PriorityStatus,
+    )
+
+    runtime_root = tmp_path / "runtime"
+    prewarm = CustomerPrewarmStore(runtime_root / "customer_prewarm.sqlite3")
+    old_paths, job_id = seed_unknown_job(
+        runtime_root,
+        YESTERDAY,
+        _CountingAdapter(),
+        mapping=COMIX,
+        url="https://qx.com/priority-pending-next-pass.html",
+    )
+    seed_remote_candidate(
+        prewarm,
+        "https://qx.com/priority-pending-next-pass.html",
+        job_id,
+        business_date=YESTERDAY,
+    )
+    adapter = _CountingAdapter(
+        reconcile_outcome=RECONCILE_FOUND,
+        priority_outcomes=[
+            LegacyPriorityOutcome(PriorityStatus.UNCONFIRMED, weight_type=None),
+            LegacyPriorityOutcome(PriorityStatus.ALREADY_HIGHEST, weight_type=-1),
+        ],
+    )
+
+    first = _run_cross_day(runtime_root, prewarm, adapter)
+
+    assert first["cross_day_reconcile_planned"] == 1
+    assert _remote_job_row(old_paths.state_path, job_id)["state"] == "PRIORITY_PENDING"
+    assert adapter.reconcile_calls == 1
+    assert adapter.prioritize_calls == 1
+    assert adapter.submit_calls == 0
+
+    second = _run_cross_day(runtime_root, prewarm, adapter)
+
+    assert second["cross_day_reconcile_planned"] == 1
+    assert _remote_job_row(old_paths.state_path, job_id)["state"] == "SUBMITTED"
+    assert {
+        row["state"]
+        for row in _state_rows(
+            old_paths.state_path,
+            "SELECT state FROM crawl_work WHERE remote_job_id=?",
+            (job_id,),
+        )
+    } == {"SUBMITTED"}
+    assert adapter.reconcile_calls == 1
+    assert adapter.prioritize_calls == 2
+    assert adapter.submit_calls == 0
+
+
 def test_not_found_bumps_historical_attempt_once(tmp_path):
     """Losing the historical write would leave attempts frozen across days."""
     runtime_root = tmp_path / "runtime"
