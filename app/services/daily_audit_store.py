@@ -1913,6 +1913,43 @@ class DailyAuditStore:
                 connection.execute("SELECT * FROM remote_jobs WHERE id=?", (job_id,)).fetchone()
             )  # type: ignore[return-value]
 
+    def confirm_remote_job_priority_and_crawl_work(
+        self,
+        token: LeaseToken,
+        job_id: int,
+        *,
+        remote_identity: str,
+    ) -> dict[str, Any]:
+        """Atomically advance a proven priority job and its linked crawl rows."""
+        identity = str(remote_identity or "").strip()
+        parts = identity.split("|")
+        if len(parts) != 3 or not all(parts):
+            raise RemoteIntentConflict("priority confirmation requires an exact remote identity")
+        with self._transaction(immediate=True) as connection:
+            self._validate_lease(connection, token)
+            job = self._job_for_lease(connection, token, job_id)
+            if (
+                str(job["state"]) != "PRIORITY_PENDING"
+                or str(job["remote_identity"] or "").strip() != identity
+            ):
+                raise RemoteIntentConflict(
+                    "atomic priority confirmation requires the exact PRIORITY_PENDING job"
+                )
+            connection.execute(
+                """UPDATE remote_jobs SET state='SUBMITTED', error_text=NULL, updated_at=?
+                   WHERE id=?""",
+                (self._utcnow(), job_id),
+            )
+            connection.execute(
+                """UPDATE crawl_work SET state='SUBMITTED', updated_at=?
+                   WHERE run_id=? AND remote_job_id=?
+                     AND state NOT IN ('SUCCESS', 'NO_RESULT', 'TERMINAL_FAILED')""",
+                (self._utcnow(), token.run_id, job_id),
+            )
+            return self._row(
+                connection.execute("SELECT * FROM remote_jobs WHERE id=?", (job_id,)).fetchone()
+            )  # type: ignore[return-value]
+
     def claim_harvest(self, token: LeaseToken, job_id: int, *, max_attempts: int, max_elapsed_seconds: float) -> dict[str, Any] | None:
         with self._transaction(immediate=True) as connection:
             self._validate_lease(connection, token)

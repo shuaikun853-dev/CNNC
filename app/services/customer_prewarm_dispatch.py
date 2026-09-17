@@ -1755,7 +1755,7 @@ def _dispatch_mall_group(
 
 def _confirm_pending_priority_job(
     *,
-    prewarm_store: CustomerPrewarmStore,
+    prewarm_store: CustomerPrewarmStore | None,
     store: DailyAuditStore,
     token: LeaseToken,
     get_adapter: Callable[[], Any],
@@ -1768,6 +1768,7 @@ def _confirm_pending_priority_job(
     prepared: Any | None = None,
     canary_scope: CanaryScope | None = None,
     canary_budget: CanaryLiveBudget | None = None,
+    result_commit_guard: Callable[[], bool] | None = None,
 ) -> bool | None:
     """One prioritize-only confirm for a job still exactly ``PRIORITY_PENDING``
     with a remote identity (fail-closed; never creates or submits).
@@ -1780,7 +1781,12 @@ def _confirm_pending_priority_job(
     candidate (missing / identity-less / already moved on) so the reuse-boost
     path may own it.  ``prepared`` may carry the in-memory job of a fresh
     create; otherwise it is reconstructed from durable payload evidence.
+    ``result_commit_guard`` is a final ownership check for cross-day callers;
+    a false result discards otherwise proven remote evidence before any state
+    write.  Same-day callers leave it unset and keep their existing behavior.
     """
+    if note_targets and prewarm_store is None:
+        raise ValueError("prewarm_store is required when candidate notes are requested")
     phase_errors = summary["phase_errors"]
     try:
         job_row = store.get_remote_job(job_id)
@@ -1835,8 +1841,14 @@ def _confirm_pending_priority_job(
         if canary_scope is not None:
             summary["priority_updates_performed"] += 1
         if _priority_proven(priority):
-            store.reconcile_remote_job(token, job_id, remote_identity=identity, state="SUBMITTED")
-            store.advance_crawl_work_for_job(token, job_id, "SUBMITTED")
+            if result_commit_guard is not None and not result_commit_guard():
+                summary["priority_unconfirmed"] += 1
+                return False
+            store.confirm_remote_job_priority_and_crawl_work(
+                token,
+                job_id,
+                remote_identity=identity,
+            )
             summary["priority_confirmed"] += 1
             return True
         summary["priority_unconfirmed"] += 1
@@ -1862,7 +1874,7 @@ def _confirm_pending_priority_job(
 
 
 def _record_priority_pending_note(
-    prewarm_store: CustomerPrewarmStore,
+    prewarm_store: CustomerPrewarmStore | None,
     note_targets: Sequence[tuple[int, str]],
     job_id: int,
     diagnostic: str,
@@ -1873,6 +1885,10 @@ def _record_priority_pending_note(
     Same-status records never erase prior evidence (the store only refreshes
     ``last_error`` when a non-NULL note is supplied).
     """
+    if not note_targets:
+        return
+    if prewarm_store is None:
+        raise ValueError("prewarm_store is required when candidate notes are requested")
     for candidate_id, cache_status in note_targets:
         _record(
             prewarm_store,

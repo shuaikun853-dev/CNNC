@@ -1,4 +1,4 @@
-"""Cross-day SUBMIT_UNKNOWN reconciliation regression tests.
+"""Cross-day identity and priority recovery regression tests.
 
 All state lives below ``tmp_path``.  The adapter is a counting fake and no
 test creates or contacts a real Zhaoshang task.
@@ -282,6 +282,61 @@ def test_atomic_found_transition_rolls_back_job_when_crawl_update_fails(tmp_path
     } == {"PENDING"}
 
 
+def test_atomic_priority_confirmation_rolls_back_job_when_crawl_update_fails(
+    tmp_path,
+):
+    """A crawl write failure must not split PRIORITY_PENDING and SUBMITTED."""
+    from app.services.legacy_zhaoshang_adapter import (
+        LegacyPriorityOutcome,
+        PriorityStatus,
+    )
+
+    runtime_root = tmp_path / "runtime"
+    prewarm = CustomerPrewarmStore(runtime_root / "customer_prewarm.sqlite3")
+    old_paths, job_id = seed_unknown_job(
+        runtime_root,
+        YESTERDAY,
+        _CountingAdapter(),
+        mapping=COMIX,
+        url="https://qx.com/atomic-priority-confirm.html",
+    )
+    seed_remote_candidate(
+        prewarm,
+        "https://qx.com/atomic-priority-confirm.html",
+        job_id,
+        business_date=YESTERDAY,
+    )
+    adapter = _CountingAdapter(
+        reconcile_outcome=RECONCILE_FOUND,
+        priority_outcomes=[
+            LegacyPriorityOutcome(PriorityStatus.UNCONFIRMED, weight_type=None),
+            LegacyPriorityOutcome(PriorityStatus.ALREADY_HIGHEST, weight_type=-1),
+        ],
+    )
+    _run_cross_day(runtime_root, prewarm, adapter)
+    with sqlite3.connect(old_paths.state_path) as connection:
+        connection.execute(
+            """CREATE TRIGGER fail_submitted_crawl_update
+               BEFORE UPDATE OF state ON crawl_work
+               WHEN NEW.state = 'SUBMITTED'
+               BEGIN
+                   SELECT RAISE(ABORT, 'injected submitted crawl update failure');
+               END"""
+        )
+
+    _run_cross_day(runtime_root, prewarm, adapter)
+
+    assert _remote_job_row(old_paths.state_path, job_id)["state"] == "PRIORITY_PENDING"
+    assert {
+        row["state"]
+        for row in _state_rows(
+            old_paths.state_path,
+            "SELECT state FROM crawl_work WHERE remote_job_id=?",
+            (job_id,),
+        )
+    } == {"PRIORITY_PENDING"}
+
+
 def _run_cross_day(runtime_root, prewarm, adapter, **overrides):
     summary = overrides.pop("summary", _new_summary())
     run_cross_day_reconcile_phase(
@@ -443,6 +498,170 @@ def test_priority_pending_retries_priority_next_pass_without_reconcile_or_submit
     } == {"SUBMITTED"}
     assert adapter.reconcile_calls == 1
     assert adapter.prioritize_calls == 2
+    assert adapter.submit_calls == 0
+
+    third = _run_cross_day(runtime_root, prewarm, adapter)
+
+    assert third["cross_day_reconcile_planned"] == 0
+    assert adapter.reconcile_calls == 1
+    assert adapter.prioritize_calls == 2
+    assert adapter.submit_calls == 0
+
+
+def test_found_priority_deferred_by_budget_recovers_on_next_pass(tmp_path):
+    """Budget exhaustion after FOUND must defer only the priority action."""
+    from app.services.legacy_zhaoshang_adapter import (
+        LegacyPriorityOutcome,
+        PriorityStatus,
+    )
+
+    class Clock:
+        value = 1.0
+
+        def __call__(self):
+            return self.value
+
+    clock = Clock()
+
+    class BudgetExhaustingAdapter(_CountingAdapter):
+        def reconcile_unknown(self, job, *, timeout_seconds):
+            outcome = super().reconcile_unknown(job, timeout_seconds=timeout_seconds)
+            clock.value = 27.0
+            return outcome
+
+    runtime_root = tmp_path / "runtime"
+    prewarm = CustomerPrewarmStore(runtime_root / "customer_prewarm.sqlite3")
+    old_paths, job_id = seed_unknown_job(
+        runtime_root,
+        YESTERDAY,
+        _CountingAdapter(),
+        mapping=COMIX,
+        url="https://qx.com/priority-budget-next-pass.html",
+    )
+    seed_remote_candidate(
+        prewarm,
+        "https://qx.com/priority-budget-next-pass.html",
+        job_id,
+        business_date=YESTERDAY,
+    )
+    adapter = BudgetExhaustingAdapter(
+        reconcile_outcome=RECONCILE_FOUND,
+        priority_outcomes=[
+            LegacyPriorityOutcome(PriorityStatus.ALREADY_HIGHEST, weight_type=-1)
+        ],
+    )
+
+    first = _run_cross_day(
+        runtime_root,
+        prewarm,
+        adapter,
+        deadline=100.0,
+        monotonic_value=clock,
+    )
+
+    assert first["priority_confirmed"] == 0
+    assert adapter.prioritize_calls == 0
+    assert _remote_job_row(old_paths.state_path, job_id)["state"] == "PRIORITY_PENDING"
+
+    clock.value = 1.0
+    second = _run_cross_day(
+        runtime_root,
+        prewarm,
+        adapter,
+        deadline=100.0,
+        monotonic_value=clock,
+    )
+
+    assert second["priority_confirmed"] == 1
+    assert _remote_job_row(old_paths.state_path, job_id)["state"] == "SUBMITTED"
+    assert adapter.reconcile_calls == 1
+    assert adapter.prioritize_calls == 1
+    assert adapter.submit_calls == 0
+
+
+def test_priority_exception_recovers_on_next_pass_without_reconcile(tmp_path):
+    """A transient priority exception must leave the durable retry state live."""
+    from app.services.legacy_zhaoshang_adapter import (
+        LegacyPriorityOutcome,
+        PriorityStatus,
+    )
+
+    class TransientPriorityAdapter(_CountingAdapter):
+        def prioritize(self, job, *, task_id, task_number, timeout_seconds):
+            self.prioritize_calls += 1
+            if self.prioritize_calls == 1:
+                raise TimeoutError("injected transient priority timeout")
+            return LegacyPriorityOutcome(
+                PriorityStatus.ALREADY_HIGHEST,
+                weight_type=-1,
+            )
+
+    runtime_root = tmp_path / "runtime"
+    prewarm = CustomerPrewarmStore(runtime_root / "customer_prewarm.sqlite3")
+    old_paths, job_id = seed_unknown_job(
+        runtime_root,
+        YESTERDAY,
+        _CountingAdapter(),
+        mapping=COMIX,
+        url="https://qx.com/priority-exception-next-pass.html",
+    )
+    seed_remote_candidate(
+        prewarm,
+        "https://qx.com/priority-exception-next-pass.html",
+        job_id,
+        business_date=YESTERDAY,
+    )
+    adapter = TransientPriorityAdapter(reconcile_outcome=RECONCILE_FOUND)
+
+    _run_cross_day(runtime_root, prewarm, adapter)
+    assert _remote_job_row(old_paths.state_path, job_id)["state"] == "PRIORITY_PENDING"
+
+    _run_cross_day(runtime_root, prewarm, adapter)
+
+    assert _remote_job_row(old_paths.state_path, job_id)["state"] == "SUBMITTED"
+    assert adapter.reconcile_calls == 1
+    assert adapter.prioritize_calls == 2
+    assert adapter.submit_calls == 0
+
+
+@pytest.mark.parametrize(
+    "remote_identity",
+    ["comix|task-only", "wrong-mall|task|number", "comix||number", "comix|task|"],
+)
+def test_priority_pending_malformed_identity_fails_closed(tmp_path, remote_identity):
+    """Malformed recovered identity must never authorize priority or SUBMITTED."""
+    runtime_root = tmp_path / "runtime"
+    prewarm = CustomerPrewarmStore(runtime_root / "customer_prewarm.sqlite3")
+    old_paths, job_id = seed_unknown_job(
+        runtime_root,
+        YESTERDAY,
+        _CountingAdapter(),
+        mapping=COMIX,
+        url=f"https://qx.com/malformed-{hashlib.sha256(remote_identity.encode()).hexdigest()}.html",
+    )
+    with sqlite3.connect(old_paths.state_path) as connection:
+        connection.execute(
+            "UPDATE remote_jobs SET state='PRIORITY_PENDING', remote_identity=? WHERE id=?",
+            (remote_identity, job_id),
+        )
+        connection.execute(
+            "UPDATE crawl_work SET state='PRIORITY_PENDING' WHERE remote_job_id=?",
+            (job_id,),
+        )
+    seed_remote_candidate(
+        prewarm,
+        "https://qx.com/malformed-bound.html",
+        job_id,
+        business_date=YESTERDAY,
+    )
+    adapter = _CountingAdapter()
+
+    summary = _run_cross_day(runtime_root, prewarm, adapter)
+
+    assert summary["cross_day_reconcile_planned"] == 1
+    assert _remote_job_row(old_paths.state_path, job_id)["state"] == "PRIORITY_PENDING"
+    assert adapter.reconcile_calls == 0
+    assert adapter.prioritize_calls == 0
     assert adapter.submit_calls == 0
 
 
@@ -814,6 +1033,69 @@ def test_linkage_rebound_during_remote_lookup_prevents_historical_write(tmp_path
     assert historical["state"] == "SUBMIT_UNKNOWN"
     assert historical["recovery_attempts"] == 0
     assert not str(historical["remote_identity"] or "")
+
+
+def test_linkage_rebound_during_priority_discards_proven_result(tmp_path):
+    """A priority result for an unbound historical job must not advance state."""
+    from app.services.legacy_zhaoshang_adapter import (
+        LegacyPriorityOutcome,
+        PriorityStatus,
+    )
+
+    runtime_root = tmp_path / "runtime"
+    prewarm = CustomerPrewarmStore(runtime_root / "customer_prewarm.sqlite3")
+    old_paths, old_job_id = seed_unknown_job(
+        runtime_root,
+        YESTERDAY,
+        _CountingAdapter(),
+        mapping=COMIX,
+        url="https://qx.com/rebound-during-priority.html",
+    )
+    candidate_id = seed_remote_candidate(
+        prewarm,
+        "https://qx.com/rebound-during-priority.html",
+        old_job_id,
+        business_date=YESTERDAY,
+    )
+
+    class RebindingPriorityAdapter(_CountingAdapter):
+        def prioritize(self, job, *, task_id, task_number, timeout_seconds):
+            self.prioritize_calls += 1
+            if self.prioritize_calls == 1:
+                return LegacyPriorityOutcome(
+                    PriorityStatus.UNCONFIRMED,
+                    weight_type=None,
+                )
+            prewarm.record_candidate_result(
+                candidate_id,
+                cache_status="REMOTE_DISPATCHED",
+                remote_job_id=999,
+            )
+            prewarm.record_remote_job_link(TODAY, candidate_id, 999, "test-rebind")
+            return LegacyPriorityOutcome(
+                PriorityStatus.ALREADY_HIGHEST,
+                weight_type=-1,
+            )
+
+    adapter = RebindingPriorityAdapter(reconcile_outcome=RECONCILE_FOUND)
+    _run_cross_day(runtime_root, prewarm, adapter)
+
+    summary = _run_cross_day(runtime_root, prewarm, adapter)
+
+    historical = _remote_job_row(old_paths.state_path, old_job_id)
+    assert historical["state"] == "PRIORITY_PENDING"
+    assert {
+        row["state"]
+        for row in _state_rows(
+            old_paths.state_path,
+            "SELECT state FROM crawl_work WHERE remote_job_id=?",
+            (old_job_id,),
+        )
+    } == {"PRIORITY_PENDING"}
+    assert summary["cross_day_reconcile_deferred"] == 1
+    assert adapter.reconcile_calls == 1
+    assert adapter.prioritize_calls == 2
+    assert adapter.submit_calls == 0
 
 
 def test_plan_only_reports_cross_day_jobs_with_zero_write_lock_adapter_or_remote(

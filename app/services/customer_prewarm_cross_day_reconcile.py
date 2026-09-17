@@ -1,9 +1,11 @@
-"""Bounded reconciliation of customer-prewarm jobs owned by earlier days.
+"""Bounded recovery of customer-prewarm jobs owned by earlier days.
 
 Discovery starts from durable active customer candidates and their latest
 ``prewarm_remote_job_links`` row.  Historical state databases are opened
 read-only while planning; execution support is added below by the lifecycle
-runner and never creates replacement remote work.
+runner.  Identity-less ``SUBMIT_UNKNOWN`` jobs recover identity, while
+identity-bearing ``PRIORITY_PENDING`` jobs retry priority confirmation.  This
+module never creates replacement remote work.
 """
 
 from __future__ import annotations
@@ -30,14 +32,30 @@ _ELIGIBLE_JOB_SQL = """
 SELECT j.id
 FROM remote_jobs j
 WHERE j.id = ?
-  AND j.state = 'SUBMIT_UNKNOWN'
-  AND TRIM(COALESCE(j.remote_identity, '')) = ''
-  AND COALESCE(j.recovery_attempts, 0) < ?
+  AND (
+      (
+          j.state = 'SUBMIT_UNKNOWN'
+          AND TRIM(COALESCE(j.remote_identity, '')) = ''
+          AND COALESCE(j.recovery_attempts, 0) < ?
+      )
+      OR (
+          j.state = 'PRIORITY_PENDING'
+          AND TRIM(COALESCE(j.remote_identity, '')) <> ''
+      )
+  )
   AND EXISTS (
       SELECT 1 FROM crawl_work c
       WHERE c.remote_job_id = j.id AND c.sku_id LIKE 'zhpq-%'
   )
 """
+
+
+def _resolve_dead_threshold(dead_threshold: int | None) -> int:
+    if dead_threshold is not None:
+        return int(dead_threshold)
+    from app.services.customer_prewarm_lifecycle import RECONCILE_DEAD_THRESHOLD
+
+    return RECONCILE_DEAD_THRESHOLD
 
 
 def _linked_cross_day_job_keys(
@@ -83,9 +101,10 @@ def plan_cross_day_reconcile_jobs(
     *,
     current_business_date: str,
     state_runtime_root: str | Path,
-    dead_threshold: int = 4,
+    dead_threshold: int | None = None,
 ) -> list[tuple[str, int]]:
-    """Plan eligible cross-day unknown jobs using read-only state DB probes."""
+    """Plan eligible identity recovery or priority confirmation read-only."""
+    effective_dead_threshold = _resolve_dead_threshold(dead_threshold)
     planned: list[tuple[str, int]] = []
     root = Path(state_runtime_root)
     for owning_day, job_id in _linked_cross_day_job_keys(
@@ -101,7 +120,7 @@ def plan_cross_day_reconcile_jobs(
             continue
         try:
             row = connection.execute(
-                _ELIGIBLE_JOB_SQL, (int(job_id), int(dead_threshold))
+                _ELIGIBLE_JOB_SQL, (int(job_id), effective_dead_threshold)
             ).fetchone()
         finally:
             connection.close()
@@ -117,11 +136,17 @@ def _eligible_locked_job(
 ) -> dict[str, Any] | None:
     """Revalidate a discovered job under its owning day's lock and lease."""
     job = store.get_remote_job(job_id)
-    if job is None or str(job.get("state") or "") != "SUBMIT_UNKNOWN":
+    if job is None:
         return None
-    if str(job.get("remote_identity") or "").strip():
-        return None
-    if int(job.get("recovery_attempts") or 0) >= dead_threshold:
+    state = str(job.get("state") or "")
+    identity = str(job.get("remote_identity") or "").strip()
+    if state == "SUBMIT_UNKNOWN":
+        if identity or int(job.get("recovery_attempts") or 0) >= dead_threshold:
+            return None
+    elif state == "PRIORITY_PENDING":
+        if not identity:
+            return None
+    else:
         return None
     if not any(
         str(crawl.get("sku_id") or "").startswith("zhpq-")
@@ -142,9 +167,9 @@ def run_cross_day_reconcile_phase(
     summary: dict[str, Any],
     max_jobs: int = CROSS_DAY_RECONCILE_PER_PASS,
     per_job_timeout_seconds: float = CROSS_DAY_RECONCILE_PER_JOB_TIMEOUT_SECONDS,
-    dead_threshold: int = 4,
+    dead_threshold: int | None = None,
 ) -> None:
-    """Reconcile each exact historical prewarm job under its own daily lease.
+    """Recover each exact historical prewarm job under its own daily lease.
 
     The caller must have released today's dispatch lock before entry.  This
     phase never submits or redispatches; the existing today's redispatch phase
@@ -170,6 +195,7 @@ def run_cross_day_reconcile_phase(
     for name in counters:
         summary.setdefault(name, 0)
     phase_errors = summary["phase_errors"]
+    effective_dead_threshold = _resolve_dead_threshold(dead_threshold)
     try:
         keys = _linked_cross_day_job_keys(prewarm_store, current_business_date)
         planned = set(
@@ -177,7 +203,7 @@ def run_cross_day_reconcile_phase(
                 prewarm_store,
                 current_business_date=current_business_date,
                 state_runtime_root=state_runtime_root,
-                dead_threshold=dead_threshold,
+                dead_threshold=effective_dead_threshold,
             )
         )
     except Exception as exc:  # noqa: BLE001 - discovery failure is phase-isolated
@@ -260,7 +286,7 @@ def run_cross_day_reconcile_phase(
                 phase_errors.append(f"cross-day job {owning_day}/{job_id}: LOCK_BUSY; deferred")
                 continue
             try:
-                job = _eligible_locked_job(store, job_id, dead_threshold)
+                job = _eligible_locked_job(store, job_id, effective_dead_threshold)
                 if job is None or int(job["run_id"]) != token.run_id:
                     summary["cross_day_reconcile_deferred"] += 1
                     phase_errors.append(
@@ -281,6 +307,48 @@ def run_cross_day_reconcile_phase(
                     monotonic_value() + float(per_job_timeout_seconds),
                 )
                 prepared = _reconstruct_prepared_job(get_adapter(), owning_day, job)
+                if str(job.get("state") or "") == "PRIORITY_PENDING":
+                    if key not in set(
+                        _linked_cross_day_job_keys(
+                            prewarm_store, current_business_date
+                        )
+                    ):
+                        summary["cross_day_reconcile_deferred"] += 1
+                        phase_errors.append(
+                            f"cross-day job {owning_day}/{job_id}: candidate linkage "
+                            "changed before priority confirm; skipped"
+                        )
+                        continue
+
+                    def priority_result_still_owned() -> bool:
+                        if key in set(
+                            _linked_cross_day_job_keys(
+                                prewarm_store, current_business_date
+                            )
+                        ):
+                            return True
+                        summary["cross_day_reconcile_deferred"] += 1
+                        phase_errors.append(
+                            f"cross-day job {owning_day}/{job_id}: candidate linkage "
+                            "changed during priority confirm; result discarded"
+                        )
+                        return False
+
+                    _confirm_pending_priority_job(
+                        prewarm_store=None,
+                        store=store,
+                        token=token,
+                        get_adapter=get_adapter,
+                        business_date=owning_day,
+                        note_targets=[],
+                        job_id=job_id,
+                        deadline=job_deadline,
+                        monotonic_value=monotonic_value,
+                        summary=summary,
+                        prepared=prepared,
+                        result_commit_guard=priority_result_still_owned,
+                    )
+                    continue
                 timeout = job_deadline - monotonic_value()
                 if timeout <= 0:
                     summary["cross_day_reconcile_deferred"] += 1
@@ -335,7 +403,7 @@ def run_cross_day_reconcile_phase(
                         )
                     new_attempts = store.bump_remote_job_recovery_attempt(token, job_id)
                     summary["cross_day_reconcile_not_found"] += 1
-                    if new_attempts >= dead_threshold:
+                    if new_attempts >= effective_dead_threshold:
                         summary["cross_day_reconcile_dead"] += 1
                         phase_errors.append(
                             f"cross-day job {owning_day}/{job_id}: judged dead after "
