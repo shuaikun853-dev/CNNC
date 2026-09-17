@@ -198,6 +198,53 @@ def test_duplicate_exact_url_is_claimed_once_and_fans_out(tmp_path):
     }]
 
 
+@pytest.mark.parametrize("terminal_state", ["NO_RESULT", "TERMINAL_FAILED"])
+def test_local_success_supersedes_terminal_duplicate_exact_url(tmp_path, terminal_state):
+    store, token, rows, job = setup_work(tmp_path)
+    duplicate = store.ensure_crawl_work(
+        token, "nbdeli", "sku-0", rows[0]["exact_url"], "legacy-v1",
+        "other-fp", source_id="doc-other",
+    )
+    store.link_crawl_work_to_remote_job(token, duplicate["id"], job["id"])
+    with sqlite3.connect(store.path) as conn:
+        conn.execute("UPDATE crawl_work SET state='SUBMITTED' WHERE id=?", (duplicate["id"],))
+    store.observe_local_fallback_remote_checks(
+        token, at(8, 30).isoformat(), SUPPORTED_MALLS,
+        checked_remote_job_ids={int(job["id"])},
+    )
+    claim = store.claim_local_fallback(
+        token, rows[0]["id"], DAYTIME_60M, "local", at(8, 30).isoformat()
+    )
+    assert claim is not None
+
+    if terminal_state == "TERMINAL_FAILED":
+        store.fail_crawl_work(token, duplicate["id"], "remote terminal", retryable=False)
+    else:
+        with sqlite3.connect(store.path) as conn:
+            conn.execute(
+                """UPDATE remote_jobs
+                      SET state='COMPLETED', remote_identity='remote-job',
+                          post_attempted=1, result_path='remote.xlsx'
+                    WHERE id=?""",
+                (job["id"],),
+            )
+        store.complete_partial_exact_no_result(
+            token, duplicate["id"], remote_job_id=job["id"],
+            remote_identity="remote-job", result_path="remote.xlsx",
+            reason="remote export has no matching row",
+        )
+
+    store.complete_local_fallback(
+        token, claim["id"], success_result("4.56"),
+        crawler_revision="crawler-revision", completed_at=at(8, 31).isoformat(),
+    )
+
+    for crawl_id in (rows[0]["id"], duplicate["id"]):
+        crawl = store.get_crawl_work(crawl_id)
+        assert crawl["state"] == "SUCCESS"
+        assert json.loads(crawl["result_json"])["page_price_value"] == "4.56"
+
+
 def test_late_remote_cannot_overwrite_local_success(tmp_path):
     store, token, rows, _job = setup_work(tmp_path)
     run_incremental_local_fallback(
