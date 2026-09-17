@@ -2425,8 +2425,10 @@ class DailyAuditStore:
         token: LeaseToken,
         checked_at: str,
         supported_malls: set[str] | frozenset[str],
+        *,
+        checked_remote_job_ids: set[int] | frozenset[int],
     ) -> list[dict[str, Any]]:
-        """Persist one real remote-check timestamp and return its prior value.
+        """Ensure fallback rows and stamp only remote jobs actually checked.
 
         ``crawl_work.updated_at`` is deliberately not used: it may change for
         unrelated lifecycle transitions and cannot prove a harvest/reconcile.
@@ -2434,6 +2436,7 @@ class DailyAuditStore:
         checked = self._utc_timestamp(checked_at, field="checked_at")
         assert checked is not None
         malls = sorted({str(value).strip() for value in supported_malls if str(value).strip()})
+        checked_job_ids = {int(value) for value in checked_remote_job_ids}
         if not malls:
             return []
         with self._transaction(immediate=True) as connection:
@@ -2463,9 +2466,13 @@ class DailyAuditStore:
                                run_id, crawl_work_id, mall_key, exact_url,
                                last_remote_check_at, created_at, updated_at
                            ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                        (token.run_id, row["id"], row["mall_key"], row["exact_url"], checked, now, now),
+                        (
+                            token.run_id, row["id"], row["mall_key"], row["exact_url"],
+                            checked if int(row["remote_job_id"]) in checked_job_ids else None,
+                            now, now,
+                        ),
                     )
-                else:
+                elif int(row["remote_job_id"]) in checked_job_ids:
                     connection.execute(
                         "UPDATE local_fallback_work SET last_remote_check_at=?, updated_at=? WHERE id=?",
                         (checked, now, row["fallback_id"]),
@@ -2597,8 +2604,13 @@ class DailyAuditStore:
             connection.execute(
                 """UPDATE local_fallback_work
                       SET state='SUCCESS', completed_at=?, crawler_revision=?, result_json=?,
-                          error_text=NULL, updated_at=? WHERE id=?""",
-                (completed, crawler_revision, encoded, self._utcnow(), fallback_id),
+                          error_text=NULL, updated_at=?
+                    WHERE run_id=? AND mall_key=? AND exact_url=?
+                      AND state NOT IN ('SUCCESS','TERMINAL_FAILED')""",
+                (
+                    completed, crawler_revision, encoded, self._utcnow(), token.run_id,
+                    work["mall_key"], work["exact_url"],
+                ),
             )
             return self._row(connection.execute("SELECT * FROM local_fallback_work WHERE id=?", (fallback_id,)).fetchone())  # type: ignore[return-value]
 
@@ -2635,7 +2647,12 @@ class DailyAuditStore:
         with self._transaction(immediate=False) as connection:
             self._validate_lease(connection, token)
             return [self._row(row) for row in connection.execute(
-                "SELECT * FROM local_fallback_work WHERE run_id=? ORDER BY id", (token.run_id,)
+                """SELECT f.*, c.state AS crawl_state,
+                           c.result_json AS crawl_result_json, c.remote_job_id
+                      FROM local_fallback_work f
+                      JOIN crawl_work c ON c.id=f.crawl_work_id
+                     WHERE f.run_id=? ORDER BY f.id""",
+                (token.run_id,)
             ).fetchall()]  # type: ignore[list-item]
 
     def complete_crawl_work(self, token: LeaseToken, crawl_work_id: int, result: Any) -> dict[str, Any]:

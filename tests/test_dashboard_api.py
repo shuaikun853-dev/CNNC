@@ -220,8 +220,10 @@ def test_rf_p2_2_poll_pause_behavior_via_node():
     if not node:
         pytest.skip("node 未安装,跳过前端轮控行为测试")
     script = ROOT / "tests" / "js" / "run_dashboard_js_tests.js"
-    proc = subprocess.run([node, str(script)], capture_output=True, text=True,
-                          timeout=60, cwd=str(ROOT))
+    proc = subprocess.run(
+        [node, str(script)], capture_output=True, text=True, encoding="utf-8",
+        errors="replace", timeout=60, cwd=str(ROOT),
+    )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert "ALL PASS" in proc.stdout
 

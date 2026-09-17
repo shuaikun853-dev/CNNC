@@ -4,6 +4,7 @@ from __future__ import annotations
 from collections import Counter
 from datetime import UTC, datetime, time as datetime_time
 from decimal import Decimal, InvalidOperation
+import json
 import os
 from pathlib import Path
 import re
@@ -12,8 +13,10 @@ import sys
 from typing import Any, Callable, Mapping, Sequence
 from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
+from zipfile import BadZipFile
 
 from openpyxl import Workbook, load_workbook
+from openpyxl.utils.exceptions import InvalidFileException
 
 from app.services.daily_audit_store import DailyAuditStore, LeaseToken
 from app.services.page_price_semantics import valid_page_price_result
@@ -26,7 +29,7 @@ SUPPORTED_MALLS = frozenset({
     "nbdeli", "guangbo", "ofs", "lxwlmall", "qstbg", "ycw", "comix", "tima",
 })
 MAX_ATTEMPTS = 2
-EXPECTED_CRAWLER_REVISION = "8a46fb8b036c5e17e2d39851cc9dd4b5775917db"
+EXPECTED_CRAWLER_REVISION = "6880b301c641c080982a7ab1757cac4e84ceef18"
 DEFAULT_CRAWLER_ROOT = Path(r"E:\.A中核运维\cnnc-mall-crawler")
 SITE_ALIASES = {"ofs": "officemate"}
 SITE_HOSTS = {
@@ -76,28 +79,67 @@ def eligibility_reason(
 
 def _metrics(store: DailyAuditStore, token: LeaseToken) -> dict[str, Any]:
     rows = store.list_local_fallback_work(token)
-    states = Counter(str(row["state"]) for row in rows)
-    reasons = Counter(str(row.get("eligible_reason") or "") for row in rows if row.get("eligible_reason"))
-    sites: dict[str, dict[str, int]] = {}
+    unique: dict[tuple[str, str], dict[str, Any]] = {}
     for row in rows:
-        site = sites.setdefault(str(row["mall_key"]), {"pending": 0, "running": 0, "success": 0, "failed": 0})
-        state = str(row["state"])
-        if state == "CLAIMED":
+        key = (str(row["mall_key"]), str(row["exact_url"]))
+        item = unique.setdefault(key, dict(row))
+        reason = item.get("eligible_reason") or row.get("eligible_reason")
+        if str(row.get("crawl_state")) == "SUCCESS":
+            item.update(row)
+        if reason:
+            item["eligible_reason"] = reason
+    states: Counter[str] = Counter()
+    reasons: Counter[str] = Counter()
+    sites: dict[str, dict[str, int]] = {}
+    links: list[dict[str, Any]] = []
+    for row in unique.values():
+        source = ""
+        if str(row.get("crawl_state")) == "SUCCESS":
+            try:
+                result = json.loads(str(row.get("crawl_result_json") or "{}"))
+            except (TypeError, ValueError):
+                result = {}
+            if isinstance(result, Mapping):
+                source = str(result.get("page_price_source") or "")
+        if str(row.get("crawl_state")) == "SUCCESS":
+            state = "SUCCESS" if source.startswith("本地兜底:") else "REMOTE_SUCCESS"
+        else:
+            state = str(row["state"])
+        states[state] += 1
+        if row.get("eligible_reason"):
+            reasons[str(row["eligible_reason"])] += 1
+        site = sites.setdefault(
+            str(row["mall_key"]),
+            {"pending": 0, "running": 0, "success": 0, "remote_success": 0, "failed": 0},
+        )
+        effective_state = state
+        if effective_state == "CLAIMED":
             site["running"] += 1
-        elif state == "SUCCESS":
+        elif effective_state == "SUCCESS":
             site["success"] += 1
-        elif state in {"RETRYABLE_FAILED", "TERMINAL_FAILED"}:
+        elif effective_state == "REMOTE_SUCCESS":
+            site["remote_success"] += 1
+        elif effective_state in {"RETRYABLE_FAILED", "TERMINAL_FAILED"}:
             site["failed"] += 1
         else:
             site["pending"] += 1
+        links.append({
+            "mall_key": str(row["mall_key"]),
+            "exact_url": str(row["exact_url"]),
+            "state": effective_state,
+            "source": source or "待定",
+            "remote_job_id": row.get("remote_job_id"),
+        })
     return {
-        "total": len(rows),
+        "total": len(unique),
         "pending": states["PENDING"],
         "running": states["CLAIMED"],
         "success": states["SUCCESS"],
+        "remote_success": states["REMOTE_SUCCESS"],
         "failed": states["RETRYABLE_FAILED"] + states["TERMINAL_FAILED"],
         "reasons": dict(reasons),
         "sites": sites,
+        "links": links,
     }
 
 
@@ -120,7 +162,10 @@ def read_crawler_output(
         raise ValueError("锁定输入 URL 重复")
     if not path.is_file():
         raise ValueError(f"本地 crawler 输出不存在: {path}")
-    workbook = load_workbook(path, data_only=True, read_only=True)
+    try:
+        workbook = load_workbook(path, data_only=True, read_only=True)
+    except (OSError, BadZipFile, InvalidFileException) as exc:
+        raise ValueError(f"本地 crawler 输出不是有效 XLSX: {path}") from exc
     try:
         rows = workbook.active.iter_rows(values_only=True)
         headers = [str(value or "").strip() for value in (next(rows, ()) or ())]
@@ -298,8 +343,9 @@ def run_incremental_local_fallback(
     *,
     now: datetime,
     tick_id: str,
-    final_remote_check: Callable[[Sequence[Mapping[str, Any]]], None],
+    final_remote_check: Callable[[Sequence[Mapping[str, Any]]], set[int]],
     execute: Callable[[Sequence[Mapping[str, Any]]], Mapping[int, Mapping[str, Any]]],
+    checked_remote_job_ids: set[int] | frozenset[int] = frozenset(),
 ) -> dict[str, Any]:
     """Observe, final-check, claim, execute and settle exact unresolved URLs."""
     current = _moment(now)
@@ -307,26 +353,74 @@ def run_incremental_local_fallback(
     store.recover_interrupted_local_fallback_claims(
         token, tick_id, current.isoformat(timespec="seconds"), max_attempts=MAX_ATTEMPTS
     )
+    opening_checked = {int(value) for value in checked_remote_job_ids}
     observed = store.observe_local_fallback_remote_checks(
-        token, current.isoformat(timespec="seconds"), SUPPORTED_MALLS
+        token,
+        current.isoformat(timespec="seconds"),
+        SUPPORTED_MALLS,
+        checked_remote_job_ids=opening_checked,
     )
     eligible: list[dict[str, Any]] = []
+    peak_initial_checks: list[dict[str, Any]] = []
     seen_urls: set[str] = set()
+    local_time = current.astimezone(SHANGHAI)
+    peak_start = local_time.replace(hour=17, minute=0, second=0, microsecond=0).astimezone(UTC)
+    in_peak = datetime_time(17, 0) <= local_time.timetz().replace(tzinfo=None) < datetime_time(18, 0)
     for row in observed:
         reason = eligibility_reason(current, row["remote_started_at"], row.get("last_remote_check_at"))
         exact_url = str(row["exact_url"])
-        if reason is None or exact_url in seen_urls:
+        if exact_url in seen_urls:
+            continue
+        previous = _moment(row.get("last_remote_check_at"))
+        remote_job_id = int(row["remote_job_id"])
+        if (
+            reason is None
+            and in_peak
+            and (previous is None or previous < peak_start)
+            and remote_job_id not in opening_checked
+        ):
+            seen_urls.add(exact_url)
+            peak_initial_checks.append(dict(row))
+            continue
+        if reason is None:
             continue
         seen_urls.add(exact_url)
         eligible.append({**row, "eligible_reason": reason})
+    if peak_initial_checks:
+        try:
+            checked = {int(value) for value in final_remote_check(peak_initial_checks)}
+        except Exception:
+            return _metrics(store, token)
+        if checked:
+            store.observe_local_fallback_remote_checks(
+                token,
+                current.isoformat(timespec="seconds"),
+                SUPPORTED_MALLS,
+                checked_remote_job_ids=checked,
+            )
     if not eligible:
         return _metrics(store, token)
 
-    # This callback performs one final read-only remote query and persists any
-    # exact remote successes. Claims happen only after it returns.
-    final_remote_check(eligible)
+    # The final check is separate from the opening sweep. A local claim
+    # requires proof that this exact remote job completed that final query.
+    final_candidates = eligible
+    final_checked: set[int] = set()
+    if final_candidates:
+        try:
+            final_checked = {int(value) for value in final_remote_check(final_candidates)}
+        except Exception:
+            return _metrics(store, token)
+        if final_checked:
+            store.observe_local_fallback_remote_checks(
+                token,
+                current.isoformat(timespec="seconds"),
+                SUPPORTED_MALLS,
+                checked_remote_job_ids=final_checked,
+            )
     claims: list[dict[str, Any]] = []
     for row in eligible:
+        if int(row["remote_job_id"]) not in final_checked:
+            continue
         current_work = store.get_crawl_work(int(row["id"]))
         if current_work is None or current_work["state"] == "SUCCESS":
             continue
