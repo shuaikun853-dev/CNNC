@@ -49,6 +49,7 @@ from app.services.incremental_audit_materializer import (
     ArtifactConflictError,
     MaterializationValidationError,
 )
+from app.services.incremental_local_fallback import execute_pinned_crawler
 from app.services.incremental_audit_recovery import (
     RecoveryRejected,
     requeue_model_transient_failures,
@@ -1977,6 +1978,11 @@ def build_default_dependencies(
         # counts it; drain-only dependencies stay without it on purpose.
         dependencies.prewarm_intake = _prewarm_intake_worker(
             paths.run_dir.parent / "customer_prewarm.sqlite3"
+        )
+        dependencies.local_fallback = lambda claims, tick_id: execute_pinned_crawler(
+            claims,
+            run_dir=paths.run_dir,
+            tick_id=tick_id,
         )
     if enable_zhaoshang:
         if paths is None or business_date is None:

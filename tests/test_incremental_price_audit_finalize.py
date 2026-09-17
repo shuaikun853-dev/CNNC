@@ -178,6 +178,31 @@ def test_build_artifact_replays_duplicate_frozen_order_and_precomputed_results(t
     assert len(built.artifact.audit_response.record_results) == 2
     assert all(row["__page_price_status"] == "OK" for row in built.artifact.frozen_rows)
     assert built.artifact.frozen_snapshot_id == str(snapshot["id"])
+
+
+def test_stale_submit_unknown_does_not_block_local_success_finalization(tmp_path):
+    store, _snapshot = _seed(tmp_path, rows=[_row()], crawl_pending=True)
+    token = store.acquire_lease("2026-08-11", "local-success", 60)
+    crawl = store.list_crawl_work(token)[0]
+    job = store.prepare_remote_intent(
+        token, "mall:unknown", "daily-unknown", "payload", mall_key="mall"
+    )
+    store.claim_remote_submission(token, int(job["id"]))
+    store.mark_submit_unknown(token, int(job["id"]), "submission uncertain")
+    store.link_crawl_work_to_remote_job(token, int(crawl["id"]), int(job["id"]))
+    store.complete_crawl_work(token, int(crawl["id"]), {
+        "page_price_value": "8.88",
+        "page_price_status": "OK",
+        "page_price_source": "本地兜底:mall",
+    })
+
+    built = build_frozen_audit_artifact(
+        store, token, output_identity="daily-final-20260811"
+    )
+
+    assert store.get_remote_job(int(job["id"]))["state"] == "SUBMIT_UNKNOWN"
+    assert built.readiness.ready is True
+    assert built.readiness.remote_pending == 0
     store.release_lease(token)
 
 

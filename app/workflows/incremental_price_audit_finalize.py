@@ -676,7 +676,7 @@ def build_frozen_audit_artifact(
         successful = [crawl for crawl in crawl_candidates if crawl["state"] == "SUCCESS"]
         no_results = [crawl for crawl in crawl_candidates if crawl["state"] == "NO_RESULT"]
         required = bool(row.get("__crawl_required", bool(normalize_cell_str(row.get("extLink")))))
-        if required:
+        if required and not successful and not no_results:
             relevant_remote_job_ids.update(
                 int(crawl["remote_job_id"])
                 for crawl in crawl_candidates

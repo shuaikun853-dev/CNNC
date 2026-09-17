@@ -523,6 +523,22 @@ def collect_runtime_status(
                 (run_id,),
             ).fetchall()
         )
+        remote_blocking_states = _group_counts(
+            connection.execute(
+                """SELECT r.state, COUNT(*) AS count
+                     FROM remote_jobs r
+                    WHERE r.run_id=? AND (
+                        NOT EXISTS (SELECT 1 FROM crawl_work c WHERE c.remote_job_id=r.id)
+                        OR EXISTS (
+                            SELECT 1 FROM crawl_work c
+                             WHERE c.remote_job_id=r.id
+                               AND c.state NOT IN ('SUCCESS','NO_RESULT')
+                        )
+                    )
+                    GROUP BY r.state""",
+                (run_id,),
+            ).fetchall()
+        )
         remote_health = evaluate_remote_stall(
             [
                 dict(row)
@@ -573,16 +589,16 @@ def collect_runtime_status(
         **crawl_pending_breakdown,
     }
     remote = {
-        "intent": remote_states.get("SUBMIT_INTENT", 0),
-        "pending": remote_states.get("PRIORITY_PENDING", 0) + remote_states.get("SUBMITTED", 0),
-        "running": remote_states.get("RUNNING", 0),
-        "exported": remote_states.get("EXPORTED", 0),
+        "intent": remote_blocking_states.get("SUBMIT_INTENT", 0),
+        "pending": remote_blocking_states.get("PRIORITY_PENDING", 0) + remote_blocking_states.get("SUBMITTED", 0),
+        "running": remote_blocking_states.get("RUNNING", 0),
+        "exported": remote_blocking_states.get("EXPORTED", 0),
         "completed": remote_states.get("COMPLETED", 0),
-        "unknown": remote_states.get("SUBMIT_UNKNOWN", 0),
-        "manual": remote_states.get("MANUAL_REQUIRED", 0),
+        "unknown": remote_blocking_states.get("SUBMIT_UNKNOWN", 0),
+        "manual": remote_blocking_states.get("MANUAL_REQUIRED", 0),
         # Additive sub-views of pending/exported by next required action.
-        "awaiting_priority": remote_states.get("PRIORITY_PENDING", 0),
-        "awaiting_harvest": remote_states.get("SUBMITTED", 0) + remote_states.get("EXPORTED", 0),
+        "awaiting_priority": remote_blocking_states.get("PRIORITY_PENDING", 0),
+        "awaiting_harvest": remote_blocking_states.get("SUBMITTED", 0) + remote_blocking_states.get("EXPORTED", 0),
         # Local give-up terminal: the remote task was never completed; the
         # business decided to stop waiting after one confirmed restart.
         "recovery_exhausted": remote_states.get("RECOVERY_EXHAUSTED", 0),
