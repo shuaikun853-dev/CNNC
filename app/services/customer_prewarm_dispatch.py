@@ -382,6 +382,13 @@ def _empty_summary(
             {
                 "reconciled_found": 0,
                 "reconcile_not_found": 0,
+                "cross_day_reconcile_planned": 0,
+                "cross_day_reconcile_attempted": 0,
+                "cross_day_reconciled_found": 0,
+                "cross_day_reconcile_not_found": 0,
+                "cross_day_reconcile_lock_busy": 0,
+                "cross_day_reconcile_deferred": 0,
+                "cross_day_reconcile_dead": 0,
                 "redispatched_urls": 0,
                 "redispatch_jobs": 0,
                 "redispatch_blocked": 0,
@@ -609,6 +616,7 @@ def _plan_only_report(
     mappings: Sequence[ZhaoshangMallMapping],
     max_jobs_per_pass: int,
     canary_scope: CanaryScope | None = None,
+    state_runtime_root: str | Path | None = None,
 ) -> dict[str, Any]:
     """Build the §26 report with ZERO writes (no locks, no adapter, ro probes)."""
     summary = _empty_summary(business_date, plan_only=True, canary_scope=canary_scope)
@@ -750,10 +758,14 @@ def _plan_only_report(
             prewarm_store,
             business_date,
             mappings,
+            state_runtime_root=state_runtime_root,
         )
         summary["lifecycle_planned"] = {
             "harvest_jobs": len(lifecycle_plan["harvest_job_ids"]),
             "reconcile_jobs": len(lifecycle_plan["reconcile_jobs"]),
+            "cross_day_reconcile_jobs": len(
+                lifecycle_plan["cross_day_reconcile_jobs"]
+            ),
             "redispatch_urls": sum(
                 len(entries) for entries in lifecycle_plan["redispatch_groups"].values()
             ),
@@ -903,6 +915,9 @@ def run_prewarm_dispatch_pass(
             mappings=mappings,
             max_jobs_per_pass=max_jobs_per_pass,
             canary_scope=canary_scope,
+            state_runtime_root=(
+                state_runtime_root if state_runtime_root is not None else runtime_root
+            ),
         )
 
     summary = _empty_summary(business_date, plan_only=False, canary_scope=canary_scope)

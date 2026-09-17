@@ -426,6 +426,22 @@ python -m pytest tests\test_incremental_audit_runtime.py tests\test_incremental_
 - 注册脚本 `scripts\register_customer_prewarm_scan_tasks.ps1` 默认只预览;必须显式 `-Apply` 且经用户授权后
   才能注册(1 分钟重复、IgnoreNew、Hidden、Limited)。Issue #9 本身不注册任何计划任务。
 
+### 客户预爬派发生命周期
+
+- `scripts\customer_prewarm_dispatch.py` 的正常 live pass 在当天 dispatch lock/lease
+  完全释放后，才处理 candidate 最新 linkage 指向的跨日 `SUBMIT_UNKNOWN`；严禁持有当天锁时申请历史日锁。
+- discovery 只从 `customer_prewarm.sqlite3` 中仍为 `REMOTE_DISPATCHED`/`REMOTE_REUSED`
+  的 durable candidate 出发，并按 `(owning_day, remote_job_id)` 去重。执行前在历史 DB 锁内再次验证：
+  job 仍为无 identity 的 `SUBMIT_UNKNOWN`、`recovery_attempts < 4`，且至少一条 crawl 的
+  `sku_id LIKE 'zhpq-%'`；普通 STEP1 job fail-closed 跳过。
+- 每个历史 job 使用所属日期自己的 `state.sqlite3`、`ProcessLock` 和 durable lease。
+  `LOCK_BUSY` 或历史 DB 缺失只计 deferred，零远程调用、零 attempt 变化；每轮最多 4 job，
+  单 job 最多 30 秒，并与 dispatch、harvest 共享同一个绝对 `--budget-seconds` deadline。
+- `FOUND` 只恢复历史 DB identity 并沿用既有 priority confirm；`NOT_FOUND`/`MANUAL`/不完整 identity
+  只令历史 `recovery_attempts + 1`。达到 4 后本阶段仍不建任务，由下一轮当天既有 redispatch
+  唯一路径创建 fresh today job。`--plan-only` 仅以 SQLite `mode=ro` 增加
+  `lifecycle_planned.cross_day_reconcile_jobs`，保持零锁、零 adapter、零远程 I/O、零写。
+
 ## 启用与回滚门槛
 
 按顺序推进，不跨级：

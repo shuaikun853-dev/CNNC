@@ -31,8 +31,14 @@ primitive — no second remote-task store is introduced:
   per-candidate daily budget is the candidate's ``prewarm_remote_job_links``
   row count of the day (cap :data:`REDISPATCH_DAILY_CAP`).
 
+Cross-day identity-less ``SUBMIT_UNKNOWN`` jobs are deliberately handled by
+``customer_prewarm_cross_day_reconcile`` after the dispatch pass has released
+today's lock.  That phase acquires each owning day's own lock and lease; this
+module's A2 implementation remains today-only.
+
 ``plan_lifecycle_actions`` is the strictly read-only planner behind the
-plan-only report's ``lifecycle_planned`` summary.  Every stage is
+plan-only report's ``lifecycle_planned`` summary, including the cross-day
+target count.  Every stage is
 error-isolated and budget-bounded (``deadline``/``monotonic_value`` pairs,
 mirroring the dispatch pass phases).  Canary mode never enters any stage (the
 dispatch pass skips Phase 5 entirely and the CLI never calls the harvest
@@ -274,8 +280,9 @@ def plan_lifecycle_actions(
 ) -> dict[str, Any]:
     """Strictly read-only (``mode=ro``) lifecycle planning for one day.
 
-    Returns ``{"harvest_job_ids", "reconcile_jobs", "redispatch_groups",
-    "redispatch_blocked"}``; the plan-only report folds this into its
+    Returns ``{"harvest_job_ids", "reconcile_jobs",
+    "cross_day_reconcile_jobs", "redispatch_groups", "redispatch_blocked"}``;
+    the plan-only report folds this into its
     ``lifecycle_planned`` summary.  Missing state DB / empty stores yield an
     empty plan — never a write.
     """
@@ -319,9 +326,20 @@ def plan_lifecycle_actions(
         mall: [entry["candidate"] for entry in entries]
         for mall, entries in collected["groups"].items()
     }
+    from app.services.customer_prewarm_cross_day_reconcile import (
+        plan_cross_day_reconcile_jobs,
+    )
+
+    cross_day_reconcile_jobs = plan_cross_day_reconcile_jobs(
+        prewarm_store,
+        current_business_date=business_date,
+        state_runtime_root=state_root,
+        dead_threshold=reconcile_dead_threshold,
+    )
     return {
         "harvest_job_ids": harvest_job_ids,
         "reconcile_jobs": reconcile_jobs,
+        "cross_day_reconcile_jobs": cross_day_reconcile_jobs,
         "redispatch_groups": redispatch_groups,
         "redispatch_blocked": collected["blocked"],
     }

@@ -416,7 +416,14 @@ def test_plan_classifies_harvest_reconcile_and_redispatch(tmp_path):
 
     plan = plan_lifecycle_actions(paths.state_path, prewarm, TODAY, [COMIX])
 
-    assert set(plan) == {"harvest_job_ids", "reconcile_jobs", "redispatch_groups", "redispatch_blocked"}
+    assert set(plan) == {
+        "harvest_job_ids",
+        "reconcile_jobs",
+        "cross_day_reconcile_jobs",
+        "redispatch_groups",
+        "redispatch_blocked",
+    }
+    assert plan["cross_day_reconcile_jobs"] == []
     assert live_job in plan["harvest_job_ids"]
     assert {"job_id": unknown_job, "recovery_attempts": 0} in plan["reconcile_jobs"]
     assert plan["redispatch_groups"] == {"comix": [candidate_by_id(prewarm, manual_candidate)]}
@@ -835,6 +842,7 @@ def test_plan_only_report_has_lifecycle_planned_and_zero_write(tmp_path, monkeyp
     assert summary["lifecycle_planned"] == {
         "harvest_jobs": 1,
         "reconcile_jobs": 1,
+        "cross_day_reconcile_jobs": 0,
         "redispatch_urls": 1,
         "redispatch_blocked": 0,
     }

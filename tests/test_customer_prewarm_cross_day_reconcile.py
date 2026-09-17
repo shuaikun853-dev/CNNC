@@ -8,11 +8,11 @@ from __future__ import annotations
 
 import hashlib
 import sqlite3
-import time
 
 import pytest
 
 from app.services import customer_prewarm_dispatch as dispatch_service
+from app.services import customer_prewarm_cross_day_reconcile as cross_day
 from app.services.customer_prewarm_cross_day_reconcile import (
     CROSS_DAY_RECONCILE_PER_JOB_TIMEOUT_SECONDS,
     CROSS_DAY_RECONCILE_PER_PASS,
@@ -528,6 +528,47 @@ def test_expired_absolute_deadline_defers_all_jobs_without_lock_or_remote(tmp_pa
     assert summary["cross_day_reconcile_attempted"] == 0
     assert summary["cross_day_reconcile_deferred"] == 1
     assert adapter.reconcile_calls == 0
+
+
+def test_target_linkage_is_revalidated_before_historical_remote_call(
+    tmp_path, monkeypatch
+):
+    """A candidate rebound after discovery must not trigger work on its old job."""
+    runtime_root = tmp_path / "runtime"
+    prewarm = CustomerPrewarmStore(runtime_root / "customer_prewarm.sqlite3")
+    _old_paths, old_job_id = seed_unknown_job(
+        runtime_root,
+        YESTERDAY,
+        _CountingAdapter(),
+        mapping=COMIX,
+        url="https://qx.com/rebound-old.html",
+    )
+    candidate_id = seed_remote_candidate(
+        prewarm,
+        "https://qx.com/rebound-old.html",
+        old_job_id,
+        business_date=YESTERDAY,
+    )
+    original_plan = cross_day.plan_cross_day_reconcile_jobs
+
+    def plan_then_rebind(*args, **kwargs):
+        planned = original_plan(*args, **kwargs)
+        prewarm.record_candidate_result(
+            candidate_id,
+            cache_status="REMOTE_DISPATCHED",
+            remote_job_id=999,
+        )
+        prewarm.record_remote_job_link(TODAY, candidate_id, 999, "test-rebind")
+        return planned
+
+    monkeypatch.setattr(cross_day, "plan_cross_day_reconcile_jobs", plan_then_rebind)
+    adapter = _CountingAdapter(reconcile_outcome=RECONCILE_NOT_FOUND)
+
+    summary = _run_cross_day(runtime_root, prewarm, adapter)
+
+    assert adapter.reconcile_calls == 0
+    assert summary["cross_day_reconcile_attempted"] == 0
+    assert summary["cross_day_reconcile_deferred"] == 1
 
 
 def test_plan_only_reports_cross_day_jobs_with_zero_write_lock_adapter_or_remote(

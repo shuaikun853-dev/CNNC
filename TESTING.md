@@ -82,9 +82,9 @@ python -m pytest tests\test_refresh_v2_cross_contract.py -q
 `tests\test_production_identity.py`（生产部署身份只读投影：fake runner + tmp git 迷你仓库，不碰生产 git/调度器/网络）：
 `E:\Python314\python.exe -m pytest tests\test_production_identity.py -q --basetemp=runtime\pytest-tmp\prodidentity`
 # Issue #13 客户链接预爬看板:projection/手动重爬/精确派发/API+页面 smoke
-# 跨日生命周期:tests\test_prewarm_cross_day_lifecycle.py 覆盖跨日 REUSED 动作的 worker 有界收割(harvest_existing_customer_prewarm_job,零二次 POST)+ 幂等 sync 镜像 → G2 精确关联完成,预算耗尽保持 WAITING_REMOTE
+# 跨日生命周期:tests\test_prewarm_cross_day_lifecycle.py 覆盖跨日 REUSED 有界收割+幂等 sync；tests\test_customer_prewarm_cross_day_reconcile.py 覆盖 SUBMIT_UNKNOWN durable linkage、(owning_day,job_id) 去重、历史日独立 lock+lease、FOUND/NOT_FOUND/dead→既有 redispatch、lock busy/missing DB/预算/cap、plan-only 零写与 owning_day 重建
 # production-shape 跨日收割:tests\test_prewarm_cross_day_production_shape.py 覆盖真实 dispatch 创建的 D1 任务(无 snapshot / 无关冻结 snapshot)经 prewarm-payload 溯源收割成 SUCCESS,且普通 STEP1 run_manual_reexport 对同一任务继续 fail-closed
-python -m pytest tests\test_prewarm_dashboard_projection.py tests\test_prewarm_manual_recrawl.py tests\test_customer_prewarm_dispatch_exact.py tests\test_prewarm_cross_day_lifecycle.py tests\test_prewarm_cross_day_production_shape.py tests\test_prewarm_dashboard_api.py tests\test_prewarm_page_smoke.py tests\test_prewarm_round2_infra.py -q
+python -m pytest tests\test_prewarm_dashboard_projection.py tests\test_prewarm_manual_recrawl.py tests\test_customer_prewarm_dispatch_exact.py tests\test_customer_prewarm_cross_day_reconcile.py tests\test_prewarm_cross_day_lifecycle.py tests\test_prewarm_cross_day_production_shape.py tests\test_prewarm_dashboard_api.py tests\test_prewarm_page_smoke.py tests\test_prewarm_round2_infra.py -q
 fixture 原则：只用 `tmp_path` 下的临时 SQLite/`daily_status.json` 或 monkeypatch 替身，不碰生产 `runtime\incremental_price_audit`；不注册真实计划任务，自启用例只读文本、从不执行 `-Apply`。
 ### 编译检查
 
