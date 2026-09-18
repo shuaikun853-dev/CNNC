@@ -1730,6 +1730,82 @@ class DailyAuditStore:
                 )
             return self._row(connection.execute("SELECT * FROM remote_jobs WHERE id=?", (job_id,)).fetchone())
 
+    def supersede_unposted_prewarm_intent(
+        self, token: LeaseToken, job_id: int, survivor_crawl_ids: Sequence[int], reason: str,
+    ) -> bool:
+        """Retire a never-posted placeholder job and free its exact crawl rows."""
+        with self._transaction(immediate=True) as connection:
+            self._validate_lease(connection, token)
+            job = self._job_for_lease(connection, token, job_id)
+            if (
+                str(job["state"]) != "SUBMIT_INTENT"
+                or int(job["post_attempted"] or 0)
+                or str(job["remote_identity"] or "").strip()
+            ):
+                return False
+            try:
+                payload = json.loads(str(job["payload_json"] or ""))
+                requests = payload["requests"]
+                expected = [
+                    (
+                        str(request["mall_key"]), str(request["sku_id"]),
+                        str(request["url"]), str(request["backend_version"]),
+                    )
+                    for request in requests
+                ]
+            except (KeyError, TypeError, ValueError):
+                return False
+            if not expected or len(expected) != len(set(expected)):
+                return False
+            rows = connection.execute(
+                """SELECT id, mall_key, sku_id, exact_url, backend_version,
+                          state, result_json
+                   FROM crawl_work WHERE run_id=? AND remote_job_id=? ORDER BY id""",
+                (token.run_id, job_id),
+            ).fetchall()
+            actual = [
+                (str(row["mall_key"]), str(row["sku_id"]),
+                 str(row["exact_url"]), str(row["backend_version"]))
+                for row in rows
+            ]
+            survivor_ids = {int(work_id) for work_id in survivor_crawl_ids}
+            row_ids = {int(row["id"]) for row in rows}
+            if (
+                len(rows) != len(expected)
+                or set(actual) != set(expected)
+                or not survivor_ids
+                or not survivor_ids < row_ids
+                or any(
+                    str(row["state"]) != "PENDING"
+                    or row["result_json"] is not None
+                    or not str(row["sku_id"]).startswith("zhpq-")
+                    or not is_placeholder_code(str(row["sku_id"]))
+                    for row in rows
+                )
+            ):
+                return False
+            now = self._utcnow()
+            detached = connection.execute(
+                "UPDATE crawl_work SET remote_job_id=NULL, updated_at=? WHERE run_id=? AND remote_job_id=?",
+                (now, token.run_id, job_id),
+            )
+            if detached.rowcount != len(rows):
+                raise RemoteIntentConflict("unposted crawl detachment changed during retirement")
+            retired_ids = sorted(row_ids - survivor_ids)
+            placeholders = ",".join("?" for _ in retired_ids)
+            retired = connection.execute(
+                f"UPDATE crawl_work SET state='SUPERSEDED', error_text=?, updated_at=? "
+                f"WHERE id IN ({placeholders}) AND remote_job_id IS NULL AND state='PENDING'",
+                (str(reason), now, *retired_ids),
+            )
+            if retired.rowcount != len(retired_ids):
+                raise RemoteIntentConflict("retired crawl set changed during unposted retirement")
+            connection.execute(
+                "UPDATE remote_jobs SET state='SUPERSEDED', error_text=?, updated_at=? WHERE id=?",
+                (str(reason), now, job_id),
+            )
+            return True
+
     def mark_remote_manual(self, token: LeaseToken, job_id: int, error: str) -> dict[str, Any]:
         return self._set_job_state(token, job_id, "MANUAL_REQUIRED", error=error)
 
@@ -1909,6 +1985,90 @@ class DailyAuditStore:
                     "remote identity is already bound to another logical job in this daily run"
                 ) from exc
             return self._row(connection.execute("SELECT * FROM remote_jobs WHERE id=?", (job_id,)).fetchone())  # type: ignore[return-value]
+
+    def reconcile_remote_job_and_crawl_work(
+        self,
+        token: LeaseToken,
+        job_id: int,
+        *,
+        remote_identity: str,
+        state: str = "PRIORITY_PENDING",
+    ) -> dict[str, Any]:
+        """Atomically restore a found unknown job and its linked crawl rows.
+
+        This narrow cross-day transition prevents an identity-bearing job from
+        being stranded with stale crawl rows if the process exits between two
+        otherwise separate store calls.
+        """
+        if state != "PRIORITY_PENDING":
+            raise ValueError("atomic unknown reconciliation requires PRIORITY_PENDING")
+        identity = str(remote_identity or "").strip()
+        parts = identity.split("|")
+        if len(parts) != 3 or not all(parts):
+            raise RemoteIntentConflict("remote reconciliation requires an exact remote identity")
+        with self._transaction(immediate=True) as connection:
+            self._validate_lease(connection, token)
+            job = self._job_for_lease(connection, token, job_id)
+            if str(job["state"]) != "SUBMIT_UNKNOWN" or str(job["remote_identity"] or "").strip():
+                raise RemoteIntentConflict("atomic unknown reconciliation requires an identity-less SUBMIT_UNKNOWN job")
+            if not int(job["post_attempted"]):
+                raise RemoteIntentConflict("remote reconciliation requires durable post_attempted evidence")
+            try:
+                connection.execute(
+                    """UPDATE remote_jobs SET state='PRIORITY_PENDING', remote_identity=?,
+                       error_text=NULL, updated_at=? WHERE id=?""",
+                    (identity, self._utcnow(), job_id),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise RemoteIntentConflict(
+                    "remote identity is already bound to another logical job in this daily run"
+                ) from exc
+            connection.execute(
+                """UPDATE crawl_work SET state='PRIORITY_PENDING', updated_at=?
+                   WHERE run_id=? AND remote_job_id=?
+                     AND state NOT IN ('SUCCESS', 'NO_RESULT', 'TERMINAL_FAILED')""",
+                (self._utcnow(), token.run_id, job_id),
+            )
+            return self._row(
+                connection.execute("SELECT * FROM remote_jobs WHERE id=?", (job_id,)).fetchone()
+            )  # type: ignore[return-value]
+
+    def confirm_remote_job_priority_and_crawl_work(
+        self,
+        token: LeaseToken,
+        job_id: int,
+        *,
+        remote_identity: str,
+    ) -> dict[str, Any]:
+        """Atomically advance a proven priority job and its linked crawl rows."""
+        identity = str(remote_identity or "").strip()
+        parts = identity.split("|")
+        if len(parts) != 3 or not all(parts):
+            raise RemoteIntentConflict("priority confirmation requires an exact remote identity")
+        with self._transaction(immediate=True) as connection:
+            self._validate_lease(connection, token)
+            job = self._job_for_lease(connection, token, job_id)
+            if (
+                str(job["state"]) != "PRIORITY_PENDING"
+                or str(job["remote_identity"] or "").strip() != identity
+            ):
+                raise RemoteIntentConflict(
+                    "atomic priority confirmation requires the exact PRIORITY_PENDING job"
+                )
+            connection.execute(
+                """UPDATE remote_jobs SET state='SUBMITTED', error_text=NULL, updated_at=?
+                   WHERE id=?""",
+                (self._utcnow(), job_id),
+            )
+            connection.execute(
+                """UPDATE crawl_work SET state='SUBMITTED', updated_at=?
+                   WHERE run_id=? AND remote_job_id=?
+                     AND state NOT IN ('SUCCESS', 'NO_RESULT', 'TERMINAL_FAILED')""",
+                (self._utcnow(), token.run_id, job_id),
+            )
+            return self._row(
+                connection.execute("SELECT * FROM remote_jobs WHERE id=?", (job_id,)).fetchone()
+            )  # type: ignore[return-value]
 
     def claim_harvest(self, token: LeaseToken, job_id: int, *, max_attempts: int, max_elapsed_seconds: float) -> dict[str, Any] | None:
         with self._transaction(immediate=True) as connection:
@@ -2267,6 +2427,17 @@ class DailyAuditStore:
             if work is None:
                 cursor = connection.execute("INSERT INTO crawl_work(run_id, mall_key, source_id, sku_id, exact_url, backend_version, fingerprint, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", (token.run_id, mall_key, source_id, sku_id, normalized_url, backend_version, fingerprint, now))
                 work = connection.execute("SELECT * FROM crawl_work WHERE id=?", (cursor.lastrowid,)).fetchone()
+            elif (
+                work["remote_job_id"] is None
+                and work["state"] == "SUPERSEDED"
+                and sku_id.startswith("zhpq-")
+                and is_placeholder_code(sku_id)
+            ):
+                connection.execute(
+                    "UPDATE crawl_work SET fingerprint=?, state='PENDING', result_json=NULL, error_text=NULL, updated_at=? WHERE id=?",
+                    (fingerprint, now, work["id"]),
+                )
+                work = connection.execute("SELECT * FROM crawl_work WHERE id=?", (work["id"],)).fetchone()
             elif work["fingerprint"] != fingerprint:
                 if work["remote_job_id"] is None and work["state"] in {"PENDING", "RETRYABLE_FAILED"}:
                     connection.execute("UPDATE crawl_work SET fingerprint=?, state='PENDING', result_json=NULL, error_text=NULL, updated_at=? WHERE id=?", (fingerprint, now, work["id"]))

@@ -19,6 +19,8 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+
+import pytest
 import time
 from contextlib import contextmanager
 from pathlib import Path
@@ -26,11 +28,13 @@ from pathlib import Path
 from app.services import customer_prewarm_dispatch as dispatch_service
 from app.services import customer_prewarm_lifecycle as lifecycle
 from app.services.customer_prewarm_lifecycle import (
+    FAILED_LINK_REASON_REDISPATCH_UNKNOWN,
     HARVEST_PER_PASS,
     RECONCILE_PER_PASS,
     REDISPATCH_DAILY_CAP,
     RECONCILE_DEAD_THRESHOLD,
     plan_lifecycle_actions,
+    failed_customer_link_rows,
     run_harvest_phase,
     run_reconcile_phase,
     run_redispatch_phase,
@@ -40,6 +44,7 @@ from app.services.customer_prewarm_dispatch import (
     run_prewarm_dispatch_pass,
 )
 from app.services.customer_prewarm_store import (
+    CACHE_STATUS_CACHE_HIT,
     CACHE_STATUS_PENDING_PREWARM,
     CACHE_STATUS_REMOTE_DISPATCHED,
     CustomerPrewarmStore,
@@ -373,8 +378,9 @@ def run_reconcile(paths, adapter, *, summary=None):
     return summary
 
 
-def run_redispatch(runtime_root, paths, prewarm, adapter, *, summary=None, business_date=TODAY, max_jobs_per_pass=8, mappings=(COMIX,)):
+def run_redispatch(runtime_root, paths, prewarm, adapter, *, summary=None, business_date=TODAY, max_jobs_per_pass=8, mappings=(COMIX,), deadline_seconds=30.0):
     summary = summary if summary is not None else _new_summary()
+    summary["business_date"] = business_date
     with leased(paths, business_date) as (store, token):
         run_redispatch_phase(
             store=store,
@@ -384,7 +390,7 @@ def run_redispatch(runtime_root, paths, prewarm, adapter, *, summary=None, busin
             mappings=list(mappings),
             get_adapter=lambda: adapter,
             business_date=business_date,
-            deadline=time.monotonic() + 30.0,
+            deadline=time.monotonic() + deadline_seconds,
             monotonic_value=time.monotonic,
             max_jobs_per_pass=max_jobs_per_pass,
             summary=summary,
@@ -416,7 +422,15 @@ def test_plan_classifies_harvest_reconcile_and_redispatch(tmp_path):
 
     plan = plan_lifecycle_actions(paths.state_path, prewarm, TODAY, [COMIX])
 
-    assert set(plan) == {"harvest_job_ids", "reconcile_jobs", "redispatch_groups", "redispatch_blocked"}
+    assert set(plan) == {
+        "harvest_job_ids",
+        "reconcile_jobs",
+            "cross_day_reconcile_jobs",
+            "cross_day_harvest_jobs",
+        "redispatch_groups",
+        "redispatch_blocked",
+    }
+    assert plan["cross_day_reconcile_jobs"] == []
     assert live_job in plan["harvest_job_ids"]
     assert {"job_id": unknown_job, "recovery_attempts": 0} in plan["reconcile_jobs"]
     assert plan["redispatch_groups"] == {"comix": [candidate_by_id(prewarm, manual_candidate)]}
@@ -447,6 +461,7 @@ def test_plan_dead_unknown_excluded_and_cap_blocked(tmp_path):
         prewarm.record_remote_job_link(
             TODAY, exhausted_candidate, 9000 + index, PRODUCER
         )
+    prewarm.record_remote_job_link(TODAY, exhausted_candidate, exhausted_job, PRODUCER)
 
     plan = plan_lifecycle_actions(paths.state_path, prewarm, TODAY, [COMIX])
 
@@ -517,6 +532,76 @@ def test_reconcile_not_found_bumps_attempts_until_dead(tmp_path):
     assert plan["reconcile_jobs"] == []
 
 
+def test_today_manual_reconcile_blocks_existing_redispatch_owner(tmp_path):
+    runtime_root = tmp_path / "runtime"
+    paths, job_id = seed_unknown_job(
+        runtime_root, TODAY, _CountingAdapter(), mapping=COMIX,
+        url="https://qx.com/today-manual-conflict.html",
+    )
+    prewarm = CustomerPrewarmStore(runtime_root / "customer_prewarm.sqlite3")
+    seed_remote_candidate(
+        prewarm, "https://qx.com/today-manual-conflict.html", job_id
+    )
+    adapter = _CountingAdapter(
+        reconcile_outcome=LegacyReconcileOutcome(
+            ReconcileStatus.MANUAL, diagnostic="submission evidence conflicts with exact remote identity"
+        )
+    )
+
+    run_reconcile(paths, adapter)
+    run_reconcile(paths, adapter)
+
+    job = _remote_job_row(paths.state_path, job_id)
+    assert job["state"] == "MANUAL_REQUIRED"
+    assert job["recovery_attempts"] == 0
+    assert adapter.reconcile_calls == 1
+    assert plan_lifecycle_actions(paths.state_path, prewarm, TODAY, [COMIX])[
+        "redispatch_groups"
+    ] == {}
+    assert adapter.submit_calls == 0
+
+
+def test_identityless_post_attempt_manual_job_cannot_auto_redispatch(tmp_path):
+    runtime_root = tmp_path / "runtime"
+    paths, job_id = seed_unknown_job(
+        runtime_root, TODAY, _CountingAdapter(), mapping=COMIX,
+        url="https://qx.com/tick-manual-unknown.html",
+    )
+    prewarm = CustomerPrewarmStore(runtime_root / "customer_prewarm.sqlite3")
+    seed_remote_candidate(prewarm, "https://qx.com/tick-manual-unknown.html", job_id)
+    with leased(paths, TODAY) as (store, token):
+        store.mark_remote_manual(token, job_id, "ambiguous submit evidence")
+
+    job = _remote_job_row(paths.state_path, job_id)
+    assert job["post_attempted"] == 1
+    assert not job["remote_identity"]
+    assert plan_lifecycle_actions(paths.state_path, prewarm, TODAY, [COMIX])[
+        "redispatch_groups"
+    ] == {}
+
+
+def test_inconclusive_not_found_does_not_spend_absence_attempts(tmp_path):
+    runtime_root = tmp_path / "runtime"
+    paths, job_id = seed_unknown_job(
+        runtime_root, TODAY, _CountingAdapter(), mapping=COMIX,
+        url="https://qx.com/today-inconclusive.html",
+    )
+    adapter = _CountingAdapter(
+        reconcile_outcome=LegacyReconcileOutcome(
+            ReconcileStatus.NOT_FOUND,
+            diagnostic="exact task reconciliation is not yet conclusive",
+        )
+    )
+
+    for _ in range(RECONCILE_DEAD_THRESHOLD):
+        run_reconcile(paths, adapter)
+
+    job = _remote_job_row(paths.state_path, job_id)
+    assert job["state"] == "SUBMIT_UNKNOWN"
+    assert job["recovery_attempts"] == 0
+    assert adapter.submit_calls == 0
+
+
 def test_reconcile_respects_per_pass_cap(tmp_path):
     runtime_root = tmp_path / "runtime"
     paths = make_state_db(runtime_root, TODAY)
@@ -583,6 +668,599 @@ def test_redispatch_creates_new_job_and_records_linkage(tmp_path):
     assert all(str(row["sku_id"]).startswith("zhpq-") for row in crawls)
 
 
+def test_redispatch_binding_cannot_crash_between_link_and_candidate(tmp_path, monkeypatch):
+    runtime_root = tmp_path / "runtime"
+    paths = make_state_db(runtime_root, TODAY)
+    prewarm = CustomerPrewarmStore(runtime_root / "customer_prewarm.sqlite3")
+    url = "https://qx.com/atomic-rebind.html"
+    _dead_paths, dead_job = seed_manual_job(
+        runtime_root, TODAY, _CountingAdapter(), mapping=COMIX, url=url,
+    )
+    candidate_id = seed_remote_candidate(prewarm, url, dead_job)
+
+    def crash_on_separate_candidate_write(*_args, **_kwargs):
+        raise RuntimeError("crash between linkage writes")
+
+    monkeypatch.setattr(lifecycle, "_record", crash_on_separate_candidate_write)
+    try:
+        run_redispatch(runtime_root, paths, prewarm, _CountingAdapter())
+    except RuntimeError:
+        pass
+    candidate = prewarm.candidate_by_id(candidate_id)
+    latest = prewarm.remote_job_link_for_candidate(candidate_id)
+    assert latest["remote_job_id"] == candidate["remote_job_id"]
+
+
+def test_redispatch_does_not_submit_after_candidate_becomes_cache_hit(tmp_path):
+    runtime_root = tmp_path / "runtime"
+    paths = make_state_db(runtime_root, TODAY)
+    prewarm = CustomerPrewarmStore(runtime_root / "customer_prewarm.sqlite3")
+    url = "https://qx.com/stale-before-submit.html"
+    _dead_paths, dead_job = seed_manual_job(
+        runtime_root, TODAY, _CountingAdapter(), mapping=COMIX, url=url,
+    )
+    candidate_id = seed_remote_candidate(prewarm, url, dead_job)
+
+    class ScannerRacesBeforeSubmit(_CountingAdapter):
+        def prepare_job(self, *args, **kwargs):
+            prepared = super().prepare_job(*args, **kwargs)
+            prewarm.record_candidate_result(candidate_id, cache_status=CACHE_STATUS_CACHE_HIT)
+            return prepared
+
+    adapter = ScannerRacesBeforeSubmit()
+    run_redispatch(runtime_root, paths, prewarm, adapter)
+    assert adapter.submit_calls == 0
+    assert adapter.prioritize_calls == 0
+
+
+def test_redispatch_defers_while_customer_scan_holds_lock(tmp_path):
+    runtime_root = tmp_path / "runtime"
+    paths = make_state_db(runtime_root, TODAY)
+    prewarm = CustomerPrewarmStore(runtime_root / "customer_prewarm.sqlite3")
+    url = "https://qx.com/scan-lock-busy.html"
+    _dead_paths, dead_job = seed_manual_job(
+        runtime_root, TODAY, _CountingAdapter(), mapping=COMIX, url=url,
+    )
+    seed_remote_candidate(prewarm, url, dead_job)
+    adapter = _CountingAdapter()
+    held = ProcessLock(runtime_root / "customer_prewarm.lock")
+    held.acquire()
+    try:
+        summary = run_redispatch(runtime_root, paths, prewarm, adapter)
+    finally:
+        held.release()
+    assert adapter.submit_calls == adapter.prioritize_calls == 0
+    assert any("scan lock busy" in error for error in summary["phase_errors"])
+
+
+def test_redispatch_post_send_rebind_does_not_prioritize_orphan(tmp_path):
+    runtime_root = tmp_path / "runtime"
+    paths = make_state_db(runtime_root, TODAY)
+    prewarm = CustomerPrewarmStore(runtime_root / "customer_prewarm.sqlite3")
+    url = "https://qx.com/rebind-during-submit.html"
+    _dead_paths, dead_job = seed_manual_job(
+        runtime_root, TODAY, _CountingAdapter(), mapping=COMIX, url=url,
+    )
+    candidate_id = seed_remote_candidate(prewarm, url, dead_job)
+
+    class RebindDuringSubmit(_CountingAdapter):
+        def submit(self, job, *, timeout_seconds):
+            prewarm.record_candidate_result(candidate_id, cache_status=CACHE_STATUS_CACHE_HIT)
+            return super().submit(job, timeout_seconds=timeout_seconds)
+
+    adapter = RebindDuringSubmit()
+    run_redispatch(runtime_root, paths, prewarm, adapter)
+    assert adapter.submit_calls == 1
+    assert adapter.prioritize_calls == 0
+
+
+def test_redispatch_post_send_partial_rebind_keeps_remaining_candidate_on_sent_job(tmp_path):
+    runtime_root = tmp_path / "runtime"
+    paths = make_state_db(runtime_root, TODAY)
+    prewarm = CustomerPrewarmStore(runtime_root / "customer_prewarm.sqlite3")
+    first_url = "https://qx.com/partial-post-a.html"
+    second_url = "https://qx.com/partial-post-b.html"
+    _dead_paths, dead_job = seed_manual_job(
+        runtime_root, TODAY, _CountingAdapter(), mapping=COMIX, url=first_url,
+    )
+    first_id = seed_remote_candidate(prewarm, first_url, dead_job, document="PARTIAL-A")
+    second_id = seed_remote_candidate(prewarm, second_url, dead_job, document="PARTIAL-B")
+
+    class PartialRebindDuringSubmit(_CountingAdapter):
+        def submit(self, job, *, timeout_seconds):
+            prewarm.record_candidate_result(first_id, cache_status=CACHE_STATUS_CACHE_HIT)
+            return super().submit(job, timeout_seconds=timeout_seconds)
+
+    adapter = PartialRebindDuringSubmit()
+    run_redispatch(runtime_root, paths, prewarm, adapter)
+    assert adapter.submit_calls == 1
+    assert prewarm.candidate_by_id(first_id)["cache_status"] == CACHE_STATUS_CACHE_HIT
+    remaining = prewarm.candidate_by_id(second_id)
+    assert remaining["remote_job_id"] != dead_job
+    assert prewarm.remote_job_link_for_candidate(second_id)["remote_job_id"] == remaining["remote_job_id"]
+    run_redispatch(runtime_root, paths, prewarm, adapter)
+    assert adapter.submit_calls == 1
+
+
+def test_redispatch_filters_stale_member_after_planning_before_intent(tmp_path, monkeypatch):
+    runtime_root = tmp_path / "runtime"
+    paths = make_state_db(runtime_root, TODAY)
+    prewarm = CustomerPrewarmStore(runtime_root / "customer_prewarm.sqlite3")
+    first_url = "https://qx.com/stale-planned-a.html"
+    second_url = "https://qx.com/stale-planned-b.html"
+    _dead_paths, dead_job = seed_manual_job(
+        runtime_root, TODAY, _CountingAdapter(), mapping=COMIX, url=first_url,
+    )
+    first_id = seed_remote_candidate(prewarm, first_url, dead_job, document="STALE-A")
+    second_id = seed_remote_candidate(prewarm, second_url, dead_job, document="STALE-B")
+    original_collect = lifecycle._collect_redispatch_candidates
+
+    def stale_after_plan(*args, **kwargs):
+        collected = original_collect(*args, **kwargs)
+        prewarm.record_candidate_result(first_id, cache_status=CACHE_STATUS_CACHE_HIT)
+        return collected
+
+    monkeypatch.setattr(lifecycle, "_collect_redispatch_candidates", stale_after_plan)
+    adapter = _CountingAdapter()
+    run_redispatch(runtime_root, paths, prewarm, adapter)
+    assert adapter.submit_calls == 1
+    assert prewarm.candidate_by_id(second_id)["remote_job_id"] != dead_job
+
+
+def test_redispatch_recovers_survivor_after_partial_rebind_and_binding_error(tmp_path, monkeypatch):
+    runtime_root = tmp_path / "runtime"
+    paths = make_state_db(runtime_root, TODAY)
+    prewarm = CustomerPrewarmStore(runtime_root / "customer_prewarm.sqlite3")
+    first_url = "https://qx.com/partial-error-a.html"
+    second_url = "https://qx.com/partial-error-b.html"
+    _dead_paths, dead_job = seed_manual_job(
+        runtime_root, TODAY, _CountingAdapter(), mapping=COMIX, url=first_url,
+    )
+    first_id = seed_remote_candidate(prewarm, first_url, dead_job, document="ERROR-A")
+    second_id = seed_remote_candidate(prewarm, second_url, dead_job, document="ERROR-B")
+    original_bind = prewarm.bind_redispatched_remote_job_batch
+    calls = 0
+
+    def fail_first_bind(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise sqlite3.OperationalError("transient partial bind failure")
+        return original_bind(*args, **kwargs)
+
+    class PartialRebindDuringSubmit(_CountingAdapter):
+        def submit(self, job, *, timeout_seconds):
+            prewarm.record_candidate_result(first_id, cache_status=CACHE_STATUS_CACHE_HIT)
+            return super().submit(job, timeout_seconds=timeout_seconds)
+
+    monkeypatch.setattr(prewarm, "bind_redispatched_remote_job_batch", fail_first_bind)
+    adapter = PartialRebindDuringSubmit()
+    first = run_redispatch(runtime_root, paths, prewarm, adapter)
+    assert adapter.submit_calls == 1
+    assert any("transient partial bind failure" in error for error in first["phase_errors"])
+    assert prewarm.candidate_by_id(second_id)["remote_job_id"] == dead_job
+    run_redispatch(runtime_root, paths, prewarm, adapter)
+    remaining = prewarm.candidate_by_id(second_id)
+    assert remaining["remote_job_id"] != dead_job
+    assert adapter.submit_calls == 1
+
+
+def test_redispatch_prior_intent_does_not_block_new_mall_candidate(tmp_path, monkeypatch):
+    runtime_root = tmp_path / "runtime"
+    paths = make_state_db(runtime_root, TODAY)
+    prewarm = CustomerPrewarmStore(runtime_root / "customer_prewarm.sqlite3")
+    first_url = "https://qx.com/mixed-prior-a.html"
+    second_url = "https://qx.com/mixed-prior-b.html"
+    third_url = "https://qx.com/mixed-prior-c.html"
+    _dead_paths, dead_job = seed_manual_job(
+        runtime_root, TODAY, _CountingAdapter(), mapping=COMIX, url=first_url,
+    )
+    first_id = seed_remote_candidate(prewarm, first_url, dead_job, document="MIX-A")
+    second_id = seed_remote_candidate(prewarm, second_url, dead_job, document="MIX-B")
+    original_bind = prewarm.bind_redispatched_remote_job_batch
+    calls = 0
+
+    def fail_first_bind(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise sqlite3.OperationalError("first bind lost")
+        return original_bind(*args, **kwargs)
+
+    class PartialRebindDuringSubmit(_CountingAdapter):
+        def submit(self, job, *, timeout_seconds):
+            if self.submit_calls == 0:
+                prewarm.record_candidate_result(first_id, cache_status=CACHE_STATUS_CACHE_HIT)
+            result = super().submit(job, timeout_seconds=timeout_seconds)
+            return LegacySubmitOutcome(
+                result.status, task_id=f"remote-{self.submit_calls}",
+                task_number=f"number-{self.submit_calls}",
+                priority_evidence="updated",
+            )
+
+    monkeypatch.setattr(prewarm, "bind_redispatched_remote_job_batch", fail_first_bind)
+    adapter = PartialRebindDuringSubmit()
+    run_redispatch(runtime_root, paths, prewarm, adapter)
+    third_id = seed_remote_candidate(prewarm, third_url, dead_job, document="MIX-C")
+    second = run_redispatch(runtime_root, paths, prewarm, adapter)
+    assert adapter.submit_calls == 2
+    assert prewarm.candidate_by_id(second_id)["remote_job_id"] != dead_job
+    assert prewarm.candidate_by_id(third_id)["remote_job_id"] != dead_job, second["phase_errors"]
+
+
+def test_redispatch_unposted_intent_resumes_after_budget_floor(tmp_path):
+    runtime_root = tmp_path / "runtime"
+    paths = make_state_db(runtime_root, TODAY)
+    prewarm = CustomerPrewarmStore(runtime_root / "customer_prewarm.sqlite3")
+    url = "https://qx.com/unposted-budget.html"
+    _dead_paths, dead_job = seed_manual_job(
+        runtime_root, TODAY, _CountingAdapter(), mapping=COMIX, url=url,
+    )
+    candidate_id = seed_remote_candidate(prewarm, url, dead_job)
+    adapter = _CountingAdapter()
+    first = run_redispatch(
+        runtime_root, paths, prewarm, adapter, deadline_seconds=4.0,
+    )
+    assert adapter.submit_calls == 0
+    assert any("budget floor" in error for error in first["phase_errors"])
+    run_redispatch(runtime_root, paths, prewarm, adapter)
+    assert adapter.submit_calls == 1
+    assert prewarm.candidate_by_id(candidate_id)["remote_job_id"] != dead_job
+
+
+def test_redispatch_unposted_intent_resumes_after_not_attempted(tmp_path):
+    runtime_root = tmp_path / "runtime"
+    paths = make_state_db(runtime_root, TODAY)
+    prewarm = CustomerPrewarmStore(runtime_root / "customer_prewarm.sqlite3")
+    url = "https://qx.com/unposted-not-attempted.html"
+    _dead_paths, dead_job = seed_manual_job(
+        runtime_root, TODAY, _CountingAdapter(), mapping=COMIX, url=url,
+    )
+    candidate_id = seed_remote_candidate(prewarm, url, dead_job)
+    adapter = _CountingAdapter(
+        submit_outcome=LegacySubmitOutcome(SubmitStatus.NOT_ATTEMPTED)
+    )
+    run_redispatch(runtime_root, paths, prewarm, adapter)
+    assert adapter.submit_calls == 1
+    adapter.submit_outcome = SUBMITTED_SUCCESS
+    run_redispatch(runtime_root, paths, prewarm, adapter)
+    assert adapter.submit_calls == 2
+    assert prewarm.candidate_by_id(candidate_id)["remote_job_id"] != dead_job
+
+
+@pytest.mark.parametrize("first_outcome", ["budget_floor", "not_attempted"])
+@pytest.mark.parametrize("resolved_old_marker", [False, True])
+def test_redispatch_unposted_group_shrinks_after_cache_hit(tmp_path, first_outcome, resolved_old_marker):
+    runtime_root = tmp_path / "runtime"
+    paths = make_state_db(runtime_root, TODAY)
+    prewarm = CustomerPrewarmStore(runtime_root / "customer_prewarm.sqlite3")
+    first_url = "https://qx.com/unposted-shrink-a.html"
+    second_url = "https://qx.com/unposted-shrink-b.html"
+    _dead_paths, dead_job = seed_manual_job(
+        runtime_root, TODAY, _CountingAdapter(), mapping=COMIX, url=first_url,
+    )
+    first_id = seed_remote_candidate(prewarm, first_url, dead_job, document="SHRINK-A")
+    second_id = seed_remote_candidate(prewarm, second_url, dead_job, document="SHRINK-B")
+    if resolved_old_marker:
+        assert prewarm.record_redispatch_intent_batch(
+            TODAY,
+            [(first_id, TODAY, dead_job), (second_id, TODAY, dead_job)],
+            dead_job,
+            PRODUCER,
+        )
+    adapter = _CountingAdapter(
+        submit_outcome=LegacySubmitOutcome(SubmitStatus.NOT_ATTEMPTED)
+        if first_outcome == "not_attempted" else SUBMITTED_SUCCESS
+    )
+    first = run_redispatch(
+        runtime_root, paths, prewarm, adapter,
+        deadline_seconds=4.0 if first_outcome == "budget_floor" else 30.0,
+    )
+    assert adapter.submit_calls == (0 if first_outcome == "budget_floor" else 1)
+    assert prewarm.candidate_by_id(second_id)["remote_job_id"] == dead_job
+    with sqlite3.connect(paths.state_path) as connection:
+        unposted = connection.execute(
+            "SELECT id, post_attempted FROM remote_jobs WHERE state='SUBMIT_INTENT'"
+        ).fetchone()
+    assert unposted is not None and unposted[1] == 0
+
+    prewarm.record_candidate_result(first_id, cache_status=CACHE_STATUS_CACHE_HIT)
+    adapter.submit_outcome = SUBMITTED_SUCCESS
+    second = run_redispatch(runtime_root, paths, prewarm, adapter)
+
+    assert adapter.submit_calls == (1 if first_outcome == "budget_floor" else 2)
+    assert prewarm.candidate_by_id(first_id)["cache_status"] == CACHE_STATUS_CACHE_HIT
+    assert prewarm.candidate_by_id(second_id)["remote_job_id"] != dead_job
+    assert [request.url for request in adapter.prepared_log[-1].requests] == [second_url]
+    assert not any("unposted prior group changed" in error for error in second["phase_errors"])
+    with sqlite3.connect(paths.state_path) as connection:
+        retired = connection.execute(
+            "SELECT state, post_attempted FROM remote_jobs WHERE id=?", (unposted[0],)
+        ).fetchone()
+        old_links = connection.execute(
+            "SELECT COUNT(*) FROM crawl_work WHERE remote_job_id=?", (unposted[0],)
+        ).fetchone()[0]
+        retired_row = connection.execute(
+            "SELECT state, remote_job_id FROM crawl_work WHERE exact_url=? AND sku_id LIKE 'zhpq-%' AND remote_job_id IS NULL",
+            (first_url,),
+        ).fetchone()
+        orphan_pending = connection.execute(
+            "SELECT COUNT(*) FROM crawl_work WHERE remote_job_id IS NULL AND state='PENDING' AND sku_id LIKE 'zhpq-%'"
+        ).fetchone()[0]
+    assert retired == ("SUPERSEDED", 0)
+    assert old_links == 0
+    assert retired_row == ("SUPERSEDED", None)
+    assert orphan_pending == 0
+
+
+def test_redispatch_changed_unposted_group_with_nonpending_crawl_fails_closed(tmp_path):
+    runtime_root = tmp_path / "runtime"
+    paths = make_state_db(runtime_root, TODAY)
+    prewarm = CustomerPrewarmStore(runtime_root / "customer_prewarm.sqlite3")
+    first_url = "https://qx.com/unposted-uncertain-a.html"
+    second_url = "https://qx.com/unposted-uncertain-b.html"
+    _dead_paths, dead_job = seed_manual_job(
+        runtime_root, TODAY, _CountingAdapter(), mapping=COMIX, url=first_url,
+    )
+    first_id = seed_remote_candidate(prewarm, first_url, dead_job, document="UNCERTAIN-A")
+    second_id = seed_remote_candidate(prewarm, second_url, dead_job, document="UNCERTAIN-B")
+    adapter = _CountingAdapter()
+    run_redispatch(runtime_root, paths, prewarm, adapter, deadline_seconds=4.0)
+    with sqlite3.connect(paths.state_path) as connection:
+        old_job = connection.execute(
+            "SELECT id FROM remote_jobs WHERE state='SUBMIT_INTENT'"
+        ).fetchone()[0]
+        connection.execute(
+            "UPDATE crawl_work SET state='RUNNING' WHERE remote_job_id=? AND exact_url=?",
+            (old_job, first_url),
+        )
+        connection.commit()
+    prewarm.record_candidate_result(first_id, cache_status=CACHE_STATUS_CACHE_HIT)
+
+    second = run_redispatch(runtime_root, paths, prewarm, adapter)
+
+    assert adapter.submit_calls == 0
+    assert prewarm.candidate_by_id(second_id)["remote_job_id"] == dead_job
+    assert any("cannot be retired" in error for error in second["phase_errors"])
+    with sqlite3.connect(paths.state_path) as connection:
+        assert connection.execute(
+            "SELECT state FROM remote_jobs WHERE id=?", (old_job,)
+        ).fetchone()[0] == "SUBMIT_INTENT"
+        assert connection.execute(
+            "SELECT COUNT(*) FROM crawl_work WHERE remote_job_id=?", (old_job,)
+        ).fetchone()[0] == 2
+
+
+def test_redispatch_survivor_resumes_after_retirement_crash(tmp_path, monkeypatch):
+    runtime_root = tmp_path / "runtime"
+    paths = make_state_db(runtime_root, TODAY)
+    prewarm = CustomerPrewarmStore(runtime_root / "customer_prewarm.sqlite3")
+    first_url = "https://qx.com/unposted-crash-a.html"
+    second_url = "https://qx.com/unposted-crash-b.html"
+    _dead_paths, dead_job = seed_manual_job(
+        runtime_root, TODAY, _CountingAdapter(), mapping=COMIX, url=first_url,
+    )
+    first_id = seed_remote_candidate(prewarm, first_url, dead_job, document="CRASH-A")
+    second_id = seed_remote_candidate(prewarm, second_url, dead_job, document="CRASH-B")
+    adapter = _CountingAdapter()
+    run_redispatch(runtime_root, paths, prewarm, adapter, deadline_seconds=4.0)
+    prewarm.record_candidate_result(first_id, cache_status=CACHE_STATUS_CACHE_HIT)
+    original_prepare = DailyAuditStore.prepare_remote_intent
+    crashed = False
+
+    def interrupt_after_retirement(self, *args, **kwargs):
+        nonlocal crashed
+        if not crashed:
+            crashed = True
+            raise KeyboardInterrupt("stopped after unposted retirement")
+        return original_prepare(self, *args, **kwargs)
+
+    monkeypatch.setattr(DailyAuditStore, "prepare_remote_intent", interrupt_after_retirement)
+    with pytest.raises(KeyboardInterrupt):
+        run_redispatch(runtime_root, paths, prewarm, adapter)
+    assert adapter.submit_calls == 0
+    with sqlite3.connect(paths.state_path) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM crawl_work WHERE exact_url=? AND state='SUPERSEDED' AND remote_job_id IS NULL",
+            (first_url,),
+        ).fetchone()[0] == 1
+        assert connection.execute(
+            "SELECT COUNT(*) FROM crawl_work WHERE exact_url=? AND state='PENDING' AND remote_job_id IS NULL",
+            (second_url,),
+        ).fetchone()[0] == 1
+
+    run_redispatch(runtime_root, paths, prewarm, adapter)
+    assert adapter.submit_calls == 1
+    assert prewarm.candidate_by_id(second_id)["remote_job_id"] != dead_job
+
+
+def test_redispatch_mixed_prior_groups_obey_remote_job_cap(tmp_path):
+    runtime_root = tmp_path / "runtime"
+    paths = make_state_db(runtime_root, TODAY)
+    prewarm = CustomerPrewarmStore(runtime_root / "customer_prewarm.sqlite3")
+    first_url = "https://qx.com/capped-prior-a.html"
+    second_url = "https://qx.com/capped-prior-b.html"
+    _dead_paths, dead_job = seed_manual_job(
+        runtime_root, TODAY, _CountingAdapter(), mapping=COMIX, url=first_url,
+    )
+    seed_remote_candidate(prewarm, first_url, dead_job, document="CAP-A")
+    adapter = _CountingAdapter()
+    run_redispatch(runtime_root, paths, prewarm, adapter, deadline_seconds=4.0)
+    seed_remote_candidate(prewarm, second_url, dead_job, document="CAP-B")
+    run_redispatch(runtime_root, paths, prewarm, adapter, deadline_seconds=4.0)
+    assert adapter.submit_calls == 0
+    run_redispatch(runtime_root, paths, prewarm, adapter, max_jobs_per_pass=1)
+    assert adapter.submit_calls == 1
+
+
+def test_redispatch_post_claim_crash_cannot_create_again_next_day(tmp_path):
+    runtime_root = tmp_path / "runtime"
+    first_paths = make_state_db(runtime_root, TODAY)
+    prewarm = CustomerPrewarmStore(runtime_root / "customer_prewarm.sqlite3")
+    url = "https://qx.com/cross-day-post-crash.html"
+    _dead_paths, dead_job = seed_manual_job(
+        runtime_root, TODAY, _CountingAdapter(), mapping=COMIX, url=url,
+    )
+    candidate_id = seed_remote_candidate(prewarm, url, dead_job)
+
+    class CrashAfterPost(_CountingAdapter):
+        def submit(self, job, *, timeout_seconds):
+            self.submit_calls += 1
+            if self.submit_calls == 1:
+                raise KeyboardInterrupt("process stopped after remote POST")
+            return SUBMITTED_SUCCESS
+
+    adapter = CrashAfterPost()
+    with pytest.raises(KeyboardInterrupt):
+        run_redispatch(runtime_root, first_paths, prewarm, adapter)
+    assert adapter.submit_calls == 1
+    assert prewarm.candidate_by_id(candidate_id)["remote_job_id"] == dead_job
+
+    next_day = "2026-09-17"
+    next_paths = make_state_db(runtime_root, next_day)
+    run_redispatch(
+        runtime_root, next_paths, prewarm, adapter, business_date=next_day,
+    )
+    assert adapter.submit_calls == 1
+    assert prewarm.candidate_by_id(candidate_id)["last_error"] == "prior redispatch intent unresolved"
+    prewarm.record_daily_observation(next_day, candidate_id, "D1", url)
+    rows = failed_customer_link_rows(next_day, runtime_root, [COMIX])
+    assert len(rows) == 1
+    assert rows[0]["reason"] == FAILED_LINK_REASON_REDISPATCH_UNKNOWN
+
+
+def test_redispatch_budget_deferred_before_claim_can_resume_next_day(tmp_path):
+    runtime_root = tmp_path / "runtime"
+    first_paths = make_state_db(runtime_root, TODAY)
+    prewarm = CustomerPrewarmStore(runtime_root / "customer_prewarm.sqlite3")
+    url = "https://qx.com/cross-day-budget-resume.html"
+    _dead_paths, dead_job = seed_manual_job(
+        runtime_root, TODAY, _CountingAdapter(), mapping=COMIX, url=url,
+    )
+    candidate_id = seed_remote_candidate(prewarm, url, dead_job)
+    adapter = _CountingAdapter()
+    run_redispatch(runtime_root, first_paths, prewarm, adapter, deadline_seconds=4.0)
+    assert adapter.submit_calls == 0
+    assert prewarm.latest_redispatch_intent_for_candidate(candidate_id) is None
+    next_day = "2026-09-17"
+    next_paths = make_state_db(runtime_root, next_day)
+    run_redispatch(runtime_root, next_paths, prewarm, adapter, business_date=next_day)
+    assert adapter.submit_calls == 1
+
+
+def test_redispatch_not_attempted_clears_marker_for_next_day(tmp_path):
+    runtime_root = tmp_path / "runtime"
+    first_paths = make_state_db(runtime_root, TODAY)
+    prewarm = CustomerPrewarmStore(runtime_root / "customer_prewarm.sqlite3")
+    url = "https://qx.com/cross-day-not-attempted.html"
+    _dead_paths, dead_job = seed_manual_job(
+        runtime_root, TODAY, _CountingAdapter(), mapping=COMIX, url=url,
+    )
+    candidate_id = seed_remote_candidate(prewarm, url, dead_job)
+    adapter = _CountingAdapter(submit_outcome=LegacySubmitOutcome(SubmitStatus.NOT_ATTEMPTED))
+    run_redispatch(runtime_root, first_paths, prewarm, adapter)
+    assert adapter.submit_calls == 1
+    assert prewarm.latest_redispatch_intent_for_candidate(candidate_id) is None
+    adapter.submit_outcome = SUBMITTED_SUCCESS
+    next_day = "2026-09-17"
+    next_paths = make_state_db(runtime_root, next_day)
+    run_redispatch(runtime_root, next_paths, prewarm, adapter, business_date=next_day)
+    assert adapter.submit_calls == 2
+
+
+def test_redispatch_recovers_exact_posted_job_after_binding_failure(tmp_path, monkeypatch):
+    runtime_root = tmp_path / "runtime"
+    paths = make_state_db(runtime_root, TODAY)
+    prewarm = CustomerPrewarmStore(runtime_root / "customer_prewarm.sqlite3")
+    url = "https://qx.com/recover-atomic-binding.html"
+    _dead_paths, dead_job = seed_manual_job(
+        runtime_root, TODAY, _CountingAdapter(), mapping=COMIX, url=url,
+    )
+    candidate_id = seed_remote_candidate(prewarm, url, dead_job)
+    adapter = _CountingAdapter()
+    original_bind = prewarm.bind_redispatched_remote_job_batch
+    calls = 0
+
+    def fail_once(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise sqlite3.OperationalError("transient binding failure")
+        return original_bind(*args, **kwargs)
+
+    monkeypatch.setattr(prewarm, "bind_redispatched_remote_job_batch", fail_once)
+    first = run_redispatch(runtime_root, paths, prewarm, adapter)
+    assert adapter.submit_calls == 1
+    assert adapter.prioritize_calls == 0
+    assert any("transient binding failure" in error for error in first["phase_errors"])
+    second = run_redispatch(runtime_root, paths, prewarm, adapter)
+    assert adapter.submit_calls == 1
+    assert adapter.prioritize_calls == 1
+    candidate = prewarm.candidate_by_id(candidate_id)
+    latest = prewarm.remote_job_link_for_candidate(candidate_id)
+    assert int(candidate["remote_job_id"]) != dead_job
+    assert int(latest["remote_job_id"]) == int(candidate["remote_job_id"])
+    assert second["priority_confirmed"] == 1
+
+
+def test_multi_candidate_redispatch_binding_is_all_or_none(tmp_path, monkeypatch):
+    runtime_root = tmp_path / "runtime"
+    paths = make_state_db(runtime_root, TODAY)
+    prewarm = CustomerPrewarmStore(runtime_root / "customer_prewarm.sqlite3")
+    first_url = "https://qx.com/batch-bind-a.html"
+    second_url = "https://qx.com/batch-bind-b.html"
+    _dead_paths, dead_job = seed_manual_job(
+        runtime_root, TODAY, _CountingAdapter(), mapping=COMIX, url=first_url,
+    )
+    first_id = seed_remote_candidate(prewarm, first_url, dead_job, document="BATCH-A")
+    second_id = seed_remote_candidate(prewarm, second_url, dead_job, document="BATCH-B")
+    adapter = _CountingAdapter()
+    original_bind = prewarm.bind_redispatched_remote_job_batch
+    calls = 0
+
+    def fail_first_batch(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise sqlite3.OperationalError("batch binding interrupted")
+        return original_bind(*args, **kwargs)
+
+    monkeypatch.setattr(prewarm, "bind_redispatched_remote_job_batch", fail_first_batch)
+    run_redispatch(runtime_root, paths, prewarm, adapter)
+    assert adapter.submit_calls == 1
+    assert all(
+        prewarm.candidate_by_id(candidate_id)["remote_job_id"] == dead_job
+        for candidate_id in (first_id, second_id)
+    )
+    run_redispatch(runtime_root, paths, prewarm, adapter)
+    assert adapter.submit_calls == 1
+    assert adapter.prioritize_calls == 1
+    new_ids = {
+        prewarm.candidate_by_id(candidate_id)["remote_job_id"]
+        for candidate_id in (first_id, second_id)
+    }
+    assert len(new_ids) == 1
+    assert dead_job not in new_ids
+
+
+def test_orphan_submit_unknown_cannot_reconcile_or_prioritize(tmp_path):
+    runtime_root = tmp_path / "runtime"
+    prewarm = CustomerPrewarmStore(runtime_root / "customer_prewarm.sqlite3")
+    cache = SharedCrawlCache(runtime_root / "shared_crawl_cache.sqlite3")
+    paths, job_id = seed_unknown_job(
+        runtime_root, TODAY, _CountingAdapter(), mapping=COMIX,
+        url="https://qx.com/orphan-unknown.html",
+    )
+    adapter = _CountingAdapter(reconcile_outcome=RECONCILE_FOUND)
+    run_prewarm_dispatch_pass(
+        prewarm, cache, business_date=TODAY, runtime_root=runtime_root,
+        mappings=[COMIX], adapter=adapter,
+    )
+    assert adapter.reconcile_calls == 0
+    assert adapter.prioritize_calls == 0
+    assert _remote_job_row(paths.state_path, job_id)["state"] == "SUBMIT_UNKNOWN"
+
+
 def test_redispatch_daily_cap_blocks_and_notes_last_error(tmp_path):
     runtime_root = tmp_path / "runtime"
     paths = make_state_db(runtime_root, TODAY)
@@ -594,6 +1272,7 @@ def test_redispatch_daily_cap_blocks_and_notes_last_error(tmp_path):
     candidate_id = seed_remote_candidate(prewarm, "https://qx.com/redispatch-cap.html", dead_job)
     for index in range(REDISPATCH_DAILY_CAP):
         prewarm.record_remote_job_link(TODAY, candidate_id, 8000 + index, PRODUCER)
+    prewarm.record_remote_job_link(TODAY, candidate_id, dead_job, PRODUCER)
     adapter = _CountingAdapter()
 
     summary = run_redispatch(runtime_root, paths, prewarm, adapter)
@@ -835,6 +1514,8 @@ def test_plan_only_report_has_lifecycle_planned_and_zero_write(tmp_path, monkeyp
     assert summary["lifecycle_planned"] == {
         "harvest_jobs": 1,
         "reconcile_jobs": 1,
+        "cross_day_reconcile_jobs": 0,
+        "cross_day_harvest_jobs": 0,
         "redispatch_urls": 1,
         "redispatch_blocked": 0,
     }

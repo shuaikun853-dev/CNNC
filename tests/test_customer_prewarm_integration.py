@@ -501,6 +501,7 @@ LEGACY_EXPECTED_TABLES = {
     # Issue #13 Round 2: 逐日 observation 与 remote job link 两张增量表
     "prewarm_daily_observations",
     "prewarm_remote_job_links",
+    "prewarm_lifecycle_cursors",
 }
 
 
@@ -560,6 +561,9 @@ def test_case_d_legacy_schema_additive_migration_preserves_rows(tmp_path):
             "prewarm_document_evidence",
             "staples_prewarm_jobs",
             "staples_prewarm_attempts",
+            "prewarm_redispatch_intents",
+            "idx_prewarm_redispatch_intents_candidate_time",
+            "idx_prewarm_remote_job_links_candidate_time",
         }
     ) - {
         "prewarm_candidates"

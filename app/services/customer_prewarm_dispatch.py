@@ -70,6 +70,7 @@ import hashlib
 import json
 import os
 import time
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
@@ -382,6 +383,13 @@ def _empty_summary(
             {
                 "reconciled_found": 0,
                 "reconcile_not_found": 0,
+                "cross_day_reconcile_planned": 0,
+                "cross_day_reconcile_attempted": 0,
+                "cross_day_reconciled_found": 0,
+                "cross_day_reconcile_not_found": 0,
+                "cross_day_reconcile_lock_busy": 0,
+                "cross_day_reconcile_deferred": 0,
+                "cross_day_reconcile_dead": 0,
                 "redispatched_urls": 0,
                 "redispatch_jobs": 0,
                 "redispatch_blocked": 0,
@@ -609,6 +617,7 @@ def _plan_only_report(
     mappings: Sequence[ZhaoshangMallMapping],
     max_jobs_per_pass: int,
     canary_scope: CanaryScope | None = None,
+    state_runtime_root: str | Path | None = None,
 ) -> dict[str, Any]:
     """Build the §26 report with ZERO writes (no locks, no adapter, ro probes)."""
     summary = _empty_summary(business_date, plan_only=True, canary_scope=canary_scope)
@@ -648,6 +657,14 @@ def _plan_only_report(
                 continue
             if hit is not None:
                 summary["cache_hit_after_recheck"] += 1
+                continue
+            try:
+                latest_link = prewarm_store.remote_job_link_for_candidate(candidate_id)
+            except Exception as exc:  # noqa: BLE001 - uncertain link cannot authorize create
+                phase_errors.append(f"candidate {candidate_id}: remote link probe failed; create omitted: {type(exc).__name__}: {exc}")
+                continue
+            if latest_link is not None and str(latest_link.get("business_date") or "") != business_date:
+                phase_errors.append(f"candidate {candidate_id}: prior-day remote link present; create omitted")
                 continue
             summary["mapped_zhaoshang"] += 1
             if routing.mall_key == "comix" and routing.host.endswith("qx.com"):
@@ -704,6 +721,28 @@ def _plan_only_report(
             if job_id is None or int(job_id) in seen_priority_job_ids:
                 continue
             candidate_id = int(candidate["id"])
+            if str(candidate.get("business_date") or "") != business_date:
+                try:
+                    latest = prewarm_store.remote_job_link_for_candidate(candidate_id)
+                except Exception as exc:  # noqa: BLE001 - plan must fail closed
+                    phase_errors.append(f"candidate {candidate_id}: link proof unavailable: {type(exc).__name__}: {exc}")
+                    continue
+                if not (
+                    latest is not None
+                    and str(latest.get("business_date") or "") == business_date
+                    and int(latest.get("remote_job_id") or 0) == int(job_id)
+                    and str(latest.get("producer") or "") == PRODUCER_CUSTOMER_PREWARM_ZHAOSHANG
+                ):
+                    if (
+                        latest is not None
+                        and int(latest.get("remote_job_id") or 0) == int(job_id)
+                        and str(latest.get("producer") or "") == PRODUCER_CUSTOMER_PREWARM_ZHAOSHANG
+                        and str(latest.get("business_date") or "") != business_date
+                    ):
+                        phase_errors.append(_cross_day_skip_note(candidate_id, latest))
+                    else:
+                        phase_errors.append(f"candidate {candidate_id}: no exact current-day remote link; priority omitted")
+                    continue
             link = _cross_day_link(prewarm_store, candidate_id, business_date, phase_errors)
             if link is not None:
                 # D5 (plan-only): never count a cross-day-linked candidate's
@@ -750,10 +789,15 @@ def _plan_only_report(
             prewarm_store,
             business_date,
             mappings,
+            state_runtime_root=state_runtime_root,
         )
         summary["lifecycle_planned"] = {
             "harvest_jobs": len(lifecycle_plan["harvest_job_ids"]),
             "reconcile_jobs": len(lifecycle_plan["reconcile_jobs"]),
+            "cross_day_reconcile_jobs": len(
+                lifecycle_plan["cross_day_reconcile_jobs"]
+            ),
+            "cross_day_harvest_jobs": len(lifecycle_plan["cross_day_harvest_jobs"]),
             "redispatch_urls": sum(
                 len(entries) for entries in lifecycle_plan["redispatch_groups"].values()
             ),
@@ -903,6 +947,9 @@ def run_prewarm_dispatch_pass(
             mappings=mappings,
             max_jobs_per_pass=max_jobs_per_pass,
             canary_scope=canary_scope,
+            state_runtime_root=(
+                state_runtime_root if state_runtime_root is not None else runtime_root
+            ),
         )
 
     summary = _empty_summary(business_date, plan_only=False, canary_scope=canary_scope)
@@ -1070,6 +1117,28 @@ def _run_leased_pass(
                     counters["absorbed"] += 1
                 continue
             if candidate.get("remote_job_id") is not None:
+                if str(candidate.get("business_date") or "") != summary["business_date"]:
+                    try:
+                        latest = prewarm_store.remote_job_link_for_candidate(candidate_id)
+                    except Exception as exc:  # noqa: BLE001 - never trust an unproven bare ID
+                        phase_errors.append(f"candidate {candidate_id}: link proof unavailable: {type(exc).__name__}: {exc}")
+                        continue
+                    if not (
+                        latest is not None
+                        and str(latest.get("business_date") or "") == summary["business_date"]
+                        and int(latest.get("remote_job_id") or 0) == int(candidate["remote_job_id"])
+                        and str(latest.get("producer") or "") == PRODUCER_CUSTOMER_PREWARM_ZHAOSHANG
+                    ):
+                        if (
+                            latest is not None
+                            and int(latest.get("remote_job_id") or 0) == int(candidate["remote_job_id"])
+                            and str(latest.get("producer") or "") == PRODUCER_CUSTOMER_PREWARM_ZHAOSHANG
+                            and str(latest.get("business_date") or "") != summary["business_date"]
+                        ):
+                            phase_errors.append(_cross_day_skip_note(candidate_id, latest))
+                        else:
+                            phase_errors.append(f"candidate {candidate_id}: no exact current-day remote link; priority deferred")
+                        continue
                 link = _cross_day_link(
                     prewarm_store, candidate_id, summary["business_date"], phase_errors
                 )
@@ -1113,6 +1182,45 @@ def _run_leased_pass(
                     phase_errors=phase_errors,
                 ):
                     counters["cache_hit_after_recheck"] += 1
+                continue
+            # A prior POST can durably record its job link just before the
+            # candidate-status write fails. On the next day the candidate is
+            # still PENDING, but today's DB cannot prove the old task absent.
+            try:
+                latest_link = prewarm_store.remote_job_link_for_candidate(candidate_id)
+            except Exception as exc:  # noqa: BLE001 - uncertain provenance is not create permission
+                phase_errors.append(
+                    f"candidate {candidate_id}: remote link probe failed; create deferred: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+                continue
+            if latest_link is not None and str(latest_link.get("business_date") or "") != summary["business_date"]:
+                probe = find_remote_work_for_url(paths.state_path, routing.mall_key, routing.lookup_url)
+                exact_old_binding = (
+                    candidate.get("remote_job_id") is not None
+                    and int(latest_link.get("remote_job_id") or 0) == int(candidate["remote_job_id"])
+                    and str(latest_link.get("producer") or "") == PRODUCER_CUSTOMER_PREWARM_ZHAOSHANG
+                )
+                if exact_old_binding and ((probe or {}).get("terminal_success") or (probe or {}).get("terminal_failed")):
+                    _record(
+                        prewarm_store, candidate_id,
+                        cache_status=CACHE_STATUS_REMOTE_DISPATCHED,
+                        error=(
+                            _CACHE_SYNC_PENDING_NOTE if (probe or {}).get("terminal_success")
+                            else _TERMINAL_FAILURE_NOTE
+                        ),
+                        phase_errors=phase_errors,
+                    )
+                    continue
+                phase_errors.append(
+                    f"candidate {candidate_id}: prior-day remote link present; create deferred"
+                )
+                _record(
+                    prewarm_store, candidate_id,
+                    cache_status=str(candidate["cache_status"]),
+                    error="prior-day remote link unresolved; manual review",
+                    phase_errors=phase_errors,
+                )
                 continue
             counters["mapped_zhaoshang"] += 1
             groups.setdefault(routing.mall_key, []).append(
@@ -1308,6 +1416,7 @@ def _run_leased_pass(
             run_reconcile_phase(
                 store=store,
                 token=token,
+                prewarm_store=prewarm_store,
                 get_adapter=get_adapter,
                 paths=paths,
                 deadline=deadline,
@@ -1740,7 +1849,7 @@ def _dispatch_mall_group(
 
 def _confirm_pending_priority_job(
     *,
-    prewarm_store: CustomerPrewarmStore,
+    prewarm_store: CustomerPrewarmStore | None,
     store: DailyAuditStore,
     token: LeaseToken,
     get_adapter: Callable[[], Any],
@@ -1753,6 +1862,9 @@ def _confirm_pending_priority_job(
     prepared: Any | None = None,
     canary_scope: CanaryScope | None = None,
     canary_budget: CanaryLiveBudget | None = None,
+    result_commit_guard: Callable[[], bool] | None = None,
+    result_commit_fence: Callable[[], Any] | None = None,
+    pre_remote_guard: Callable[[], bool] | None = None,
 ) -> bool | None:
     """One prioritize-only confirm for a job still exactly ``PRIORITY_PENDING``
     with a remote identity (fail-closed; never creates or submits).
@@ -1765,7 +1877,17 @@ def _confirm_pending_priority_job(
     candidate (missing / identity-less / already moved on) so the reuse-boost
     path may own it.  ``prepared`` may carry the in-memory job of a fresh
     create; otherwise it is reconstructed from durable payload evidence.
+    ``result_commit_guard`` is a final ownership check for cross-day callers;
+    a false result discards otherwise proven remote evidence before any state
+    write.  Same-day callers leave it unset and keep their existing behavior.
+    ``result_commit_fence`` additionally serializes the ownership check through
+    the historical state commit when ownership lives in another database.
+    ``pre_remote_guard`` checks cross-day linkage after lease renewal and
+    immediately before the remote priority write. It does not replace the
+    post-call commit fence.
     """
+    if note_targets and prewarm_store is None:
+        raise ValueError("prewarm_store is required when candidate notes are requested")
     phase_errors = summary["phase_errors"]
     try:
         job_row = store.get_remote_job(job_id)
@@ -1811,6 +1933,9 @@ def _confirm_pending_priority_job(
             )
             return False
         store.renew_lease(token, LEASE_TTL_SECONDS)
+        if pre_remote_guard is not None and not pre_remote_guard():
+            summary["priority_unconfirmed"] += 1
+            return False
         priority = get_adapter().prioritize(
             prepared,
             task_id=parts[1],
@@ -1820,8 +1945,23 @@ def _confirm_pending_priority_job(
         if canary_scope is not None:
             summary["priority_updates_performed"] += 1
         if _priority_proven(priority):
-            store.reconcile_remote_job(token, job_id, remote_identity=identity, state="SUBMITTED")
-            store.advance_crawl_work_for_job(token, job_id, "SUBMITTED")
+            if result_commit_guard is not None and not result_commit_guard():
+                summary["priority_unconfirmed"] += 1
+                return False
+            commit_fence = (
+                result_commit_fence()
+                if result_commit_fence is not None
+                else nullcontext(True)
+            )
+            with commit_fence as commit_allowed:
+                if not commit_allowed:
+                    summary["priority_unconfirmed"] += 1
+                    return False
+                store.confirm_remote_job_priority_and_crawl_work(
+                    token,
+                    job_id,
+                    remote_identity=identity,
+                )
             summary["priority_confirmed"] += 1
             return True
         summary["priority_unconfirmed"] += 1
@@ -1847,7 +1987,7 @@ def _confirm_pending_priority_job(
 
 
 def _record_priority_pending_note(
-    prewarm_store: CustomerPrewarmStore,
+    prewarm_store: CustomerPrewarmStore | None,
     note_targets: Sequence[tuple[int, str]],
     job_id: int,
     diagnostic: str,
@@ -1858,6 +1998,10 @@ def _record_priority_pending_note(
     Same-status records never erase prior evidence (the store only refreshes
     ``last_error`` when a non-NULL note is supplied).
     """
+    if not note_targets:
+        return
+    if prewarm_store is None:
+        raise ValueError("prewarm_store is required when candidate notes are requested")
     for candidate_id, cache_status in note_targets:
         _record(
             prewarm_store,

@@ -445,6 +445,24 @@ python -m pytest tests\test_incremental_audit_runtime.py tests\test_incremental_
 - 注册脚本 `scripts\register_customer_prewarm_scan_tasks.ps1` 默认只预览;必须显式 `-Apply` 且经用户授权后
   才能注册(1 分钟重复、IgnoreNew、Hidden、Limited)。Issue #9 本身不注册任何计划任务。
 
+### 客户预爬派发生命周期
+
+- `scripts\customer_prewarm_dispatch.py` 的正常 live pass 预留总预算中最多 24 秒（且不超过 60%）给后续生命周期；当天 dispatch lock/lease 完全释放后，依次运行跨日 identity/priority、跨日 historical harvest/cache sync、当天 harvest。剩余至少 20 秒时跨日 reconcile 最多分 10 秒，余量由历史和当天 harvest 平分；小预算按剩余时间动态划分。这样默认 50 秒预算下忙碌 dispatch 后三个阶段仍各有可用时间。严禁持有当天锁时申请历史日锁，也不得在 reconcile 的历史锁内嵌套调用 harvest 原语。
+- A3 重排在远端 POST claim 前先于全局预爬库原子记录 candidate→新 daily intent marker；marker 写入失败绝不 POST。预算不足或 max-jobs 限额在 marker 前判断；明确 `NOT_ATTEMPTED` 后清除 marker。若 POST 已可能发生而进程中断、candidate 尚未完成新 job 绑定，次日 marker 会阻断再次创建，并将该候选标记为需人工核对，最终失败行保留这一不确定性，不能猜成 `NOT_FOUND`。同日未发送 intent 复用原有 daily job；若原组员已命中缓存，只有在 `post_attempted=0`、无远端身份且所有原始预爬 crawl 行仍为未提交状态并与 immutable payload 精确一致时，才在单个事务中退役旧 intent、解绑原 crawl 行，将退出组员的 crawl 标为 `SUPERSEDED`（不残留 `PENDING` 阻塞 STEP1），并为剩余候选重排。任何证据不符转人工，不发送旧大组。已发送 intent 只按精确 crawl/payload 证据重新绑定，不另建任务。
+- discovery 只从 `customer_prewarm.sqlite3` 中仍为 `REMOTE_DISPATCHED`/`REMOTE_REUSED`
+  的 durable candidate 出发，并按 `(owning_day, remote_job_id)` 去重。执行前在历史 DB 锁内再次验证：
+  job 仍为无 identity 且未到 dead threshold 的 `SUBMIT_UNKNOWN`，或带 exact identity 的
+  `PRIORITY_PENDING`，且至少一条 crawl 的 `sku_id LIKE 'zhpq-%'`；普通 STEP1 job fail-closed 跳过。历史 harvest 另以同一最新 linkage 筛选所属日 `SUBMITTED`/`RUNNING`/`EXPORTED`，并对已有 SUCCESS 的 terminal job 重试 cache sync；历史 DB 缺失不创建。
+- 每个历史 job 使用所属日期自己的 `state.sqlite3`、`ProcessLock` 和 durable lease。
+  `LOCK_BUSY` 或历史 DB 缺失只计 deferred，零远程调用、零 attempt 变化；每轮最多 4 job，
+  durable fairness cursor 从上一轮最后 attempt 后继续，持续 pending 的前四项不会饿死后续 job；单 job 最多 30 秒，
+  并与 dispatch、harvest 共享同一个绝对 `--budget-seconds` deadline。
+- `FOUND` 只恢复历史 DB identity 并沿用既有 priority confirm；若当轮未证明 `weight_type=-1`，job 保持
+  `PRIORITY_PENDING`，下一轮只重试 priority confirm，不重复 reconcile、submit 或 create。priority 结果写回前再次验证
+  candidate linkage；priority 远程写前还须在 lease 更新后最后检查 linkage。最终 linkage 验证通过 `customer_prewarm.sqlite3` 的短 `BEGIN IMMEDIATE` fence
+  一直覆盖到历史 DB commit，失配则丢弃结果；job 与 crawl_work 的 `SUBMITTED` 推进为同一事务。
+  只有无诊断的确切 `NOT_FOUND` 消耗 recovery attempt；诊断为不确定的 NOT_FOUND 保留待重试。`MANUAL`/不完整 FOUND 原子记为带 provenance blocker 的 `MANUAL_REQUIRED`，不进入 A3；无 identity 且已 POST 或已有 harvest attempt 的 MANUAL_REQUIRED 也不得自动重建，但仍进入最终失败链接投影。A3 必须先确认 candidate 当前 job id 与最新 producer linkage 完全一致、owning day 是不晚于本轮的规范日期，避免跨日同号误判；重绑时 candidate 与 linkage 同事务提交，POST 前与客户扫描互斥且再次确认候选未变；POST 后绑定失败只按同一 durable intent 的既有远端身份重接，不重发。确切 NOT_FOUND 到 4 次后仍只由既有 A3 创建。历史 harvest 每轮最多 3 job、单 job 90 秒、独立 durable cursor；复用既有 ProcessLock+lease 原语，SUCCESS 按 exact job 镜像 shared cache，所有 scanner/backfill/harvest 通过同一 prewarm-store 同步锁串行，避免同一事件重复写缓存；下轮 candidate 吸收 CACHE_HIT。MANUAL 和确定性缓存同步失败都显式报阻断。`--plan-only` 用 `mode=ro` 统计两个跨日阶段，保持四库零写、零锁、零 adapter 和零远程 I/O。
+
 ## 启用与回滚门槛
 
 按顺序推进，不跨级：

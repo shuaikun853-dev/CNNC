@@ -16,14 +16,15 @@ through their read-only modes, so a missing store file is reported as
 instead of being silently created.
 
 Lifecycle closeout (WS-A, default on): after the pass's own phases the same
-lease reconciles identity-less ``SUBMIT_UNKNOWN`` prewarm jobs and re-dispatches
-dead-job candidates (daily per-candidate budget from ``prewarm_remote_job_links``
-rows of the day); once the pass released every lock the CLI harvests live
-prewarm jobs through the existing ``harvest_existing_customer_prewarm_job``
-primitive (which owns its own locks) — inside the SAME absolute wall-clock
-budget as the pass (one process = ``--budget-seconds``, so the scheduler's
-budget + grace ceiling can never be exceeded).  ``--no-lifecycle`` skips all
-three stages.  Canary mode (``--only-mall``) never runs any lifecycle stage.
+lease reconciles today's identity-less ``SUBMIT_UNKNOWN`` prewarm jobs and
+re-dispatches dead-job candidates (daily per-candidate budget from
+``prewarm_remote_job_links`` rows of the day).  Once the pass released every
+lock, the CLI first reconciles linked historical-day ``SUBMIT_UNKNOWN`` jobs
+under each owning day's own ProcessLock + lease, then harvests live prewarm
+jobs through the existing ``harvest_existing_customer_prewarm_job`` primitive.
+Both outside-pass stages share the SAME absolute wall-clock budget as the pass
+(one process = ``--budget-seconds``).  ``--no-lifecycle`` skips every lifecycle
+stage.  Canary mode (``--only-mall``) never runs any lifecycle stage.
 
 The three data sources are independently overridable and default to today's
 layout: ``--state-runtime-root`` locates the STEP1 ``<date>/state.sqlite3``
@@ -101,6 +102,24 @@ from scripts.zhaoshang_mall_mapping import load_zhaoshang_mall_mappings
 
 PREWARM_STORE_NAME = "customer_prewarm.sqlite3"
 SHARED_CACHE_NAME = "shared_crawl_cache.sqlite3"
+
+
+def run_cross_day_reconcile_phase(**kwargs):
+    """Lazy bridge keeping plan-only and unrelated paths adapter-free."""
+    from app.services.customer_prewarm_cross_day_reconcile import (
+        run_cross_day_reconcile_phase as _run_cross_day_reconcile_phase,
+    )
+
+    return _run_cross_day_reconcile_phase(**kwargs)
+
+
+def run_cross_day_harvest_phase(**kwargs):
+    """Lazy bridge for the separate historical harvest/cache phase."""
+    from app.services.customer_prewarm_cross_day_reconcile import (
+        run_cross_day_harvest_phase as _run_cross_day_harvest_phase,
+    )
+
+    return _run_cross_day_harvest_phase(**kwargs)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -554,6 +573,9 @@ def _run_dispatch(args: argparse.Namespace, business_date: str, runtime_root: Pa
             # One absolute wall-clock anchor for the WHOLE process (pass +
             # harvest): the scheduler's per-run ceiling is budget + grace.
             pass_started = time.monotonic()
+            lifecycle_reserve = (
+                min(24.0, float(args.budget_seconds) * 0.6) if lifecycle_on else 0.0
+            )
             summary = run_prewarm_dispatch_pass(
                 prewarm_store,
                 shared_cache,
@@ -562,7 +584,7 @@ def _run_dispatch(args: argparse.Namespace, business_date: str, runtime_root: Pa
                 state_runtime_root=state_runtime_root,
                 mappings=mappings,
                 adapter=adapter,
-                budget_seconds=args.budget_seconds,
+                budget_seconds=float(args.budget_seconds) - lifecycle_reserve,
                 max_jobs_per_pass=args.max_jobs_per_pass,
                 plan_only=False,
             )
@@ -577,11 +599,43 @@ def _run_dispatch(args: argparse.Namespace, business_date: str, runtime_root: Pa
                     state_runtime_root if state_runtime_root is not None else runtime_root
                 )
                 day_paths = runtime_paths(business_date, state_root)
+                lifecycle_deadline = _shared_harvest_deadline(
+                    pass_started, args.budget_seconds
+                )
+                lifecycle_now = time.monotonic()
+                lifecycle_remaining = max(0.0, lifecycle_deadline - lifecycle_now)
+                reconcile_slice = min(
+                    lifecycle_remaining,
+                    10.0 if lifecycle_remaining >= 20.0 else max(5.0, lifecycle_remaining * 0.6),
+                )
+                reconcile_deadline = lifecycle_now + reconcile_slice
+                historical_deadline = reconcile_deadline + max(
+                    0.0, lifecycle_deadline - reconcile_deadline
+                ) / 2
+                run_cross_day_reconcile_phase(
+                    prewarm_store=prewarm_store,
+                    current_business_date=business_date,
+                    state_runtime_root=state_root,
+                    get_adapter=lambda: adapter,
+                    deadline=reconcile_deadline,
+                    monotonic_value=time.monotonic,
+                    summary=summary,
+                )
+                run_cross_day_harvest_phase(
+                    prewarm_store=prewarm_store,
+                    shared_cache=shared_cache,
+                    current_business_date=business_date,
+                    state_runtime_root=state_root,
+                    get_adapter=lambda: adapter,
+                    deadline=historical_deadline,
+                    monotonic_value=time.monotonic,
+                    summary=summary,
+                )
                 run_harvest_phase(
                     day_paths.state_path,
                     day_paths.lock_path,
                     business_date,
-                    deadline=_shared_harvest_deadline(pass_started, args.budget_seconds),
+                    deadline=lifecycle_deadline,
                     monotonic_value=time.monotonic,
                     summary=summary,
                     adapter=adapter,
@@ -622,14 +676,21 @@ def _run_dispatch(args: argparse.Namespace, business_date: str, runtime_root: Pa
         f"priority_unconfirmed={summary.get('priority_unconfirmed', 0)} "
         f"phase_errors={len(summary.get('phase_errors', []))} "
         f"reconciled={summary.get('reconciled_found', 0)} "
+        f"cross_day_reconciled={summary.get('cross_day_reconciled_found', 0)} "
+        f"cross_day_not_found={summary.get('cross_day_reconcile_not_found', 0)} "
+        f"cross_day_lock_busy={summary.get('cross_day_reconcile_lock_busy', 0)} "
         f"redispatched={summary.get('redispatched_urls', 0)} "
-        f"harvested={summary.get('harvested', 0)}"
+        f"harvested={summary.get('harvested', 0)} "
+        f"cross_day_harvested={summary.get('cross_day_harvested', 0)} "
+        f"cross_day_cache_synced={summary.get('cross_day_harvest_cache_synced', 0)}"
     )
     if summary.get("lifecycle_planned"):
         planned = summary["lifecycle_planned"]
         print(
             f"lifecycle_planned harvest_jobs={planned.get('harvest_jobs', 0)} "
             f"reconcile_jobs={planned.get('reconcile_jobs', 0)} "
+            f"cross_day_reconcile_jobs={planned.get('cross_day_reconcile_jobs', 0)} "
+            f"cross_day_harvest_jobs={planned.get('cross_day_harvest_jobs', 0)} "
             f"redispatch_urls={planned.get('redispatch_urls', 0)} "
             f"redispatch_blocked={planned.get('redispatch_blocked', 0)}"
         )

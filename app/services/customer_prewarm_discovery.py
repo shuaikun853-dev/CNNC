@@ -73,6 +73,7 @@ from app.services.customer_prewarm_store import (
     CustomerPrewarmStore,
 )
 from app.services.customer_reference_links import extract_reference_links
+from app.services.daily_audit_store import LeaseUnavailable, ProcessLock
 from app.services.saas_audit_core import extract_customer_price_from_detail
 from app.services.shared_crawl_cache import (
     PRODUCER_DAILY_INTERNET,
@@ -490,6 +491,46 @@ def sync_daily_internet_results(
     state_db_path: str | Path,
     business_date: str,
     source: str = "daily-internet",
+    remote_job_id: int | None = None,
+    stale_claim_seconds: int = 600,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Serialize every scanner/backfill/harvest mirror against one ledger."""
+    if not Path(state_db_path).is_file():
+        return _sync_daily_internet_results_unlocked(
+            prewarm_store, shared_cache, state_db_path=state_db_path,
+            business_date=business_date, source=source,
+            remote_job_id=remote_job_id, stale_claim_seconds=stale_claim_seconds, now=now,
+        )
+    lock = ProcessLock(prewarm_store.path.with_name(f"{prewarm_store.path.name}.sync.lock"))
+    try:
+        lock.acquire()
+    except LeaseUnavailable:
+        return {
+            "state_db": "deferred", "scanned": 0, "skipped_non_ok": 0,
+            "skipped_invalid": 0, "already_synced": 0, "errored_before": 0,
+            "ok_synced": 0, "transient_failures": 0, "deterministic_failures": 0,
+            "recovered_claims": 0, "dropped_claims": 0,
+            "errors": ["shared cache sync lock busy; retry next pass"],
+        }
+    try:
+        return _sync_daily_internet_results_unlocked(
+            prewarm_store, shared_cache, state_db_path=state_db_path,
+            business_date=business_date, source=source,
+            remote_job_id=remote_job_id, stale_claim_seconds=stale_claim_seconds, now=now,
+        )
+    finally:
+        lock.release()
+
+
+def _sync_daily_internet_results_unlocked(
+    prewarm_store: CustomerPrewarmStore,
+    shared_cache: SharedCrawlCache,
+    *,
+    state_db_path: str | Path,
+    business_date: str,
+    source: str = "daily-internet",
+    remote_job_id: int | None = None,
     stale_claim_seconds: int = 600,
     now: datetime | None = None,
 ) -> dict[str, Any]:
@@ -573,7 +614,9 @@ def sync_daily_internet_results(
                       c.updated_at, c.remote_job_id, r.task_name
                FROM crawl_work c LEFT JOIN remote_jobs r ON r.id=c.remote_job_id
                WHERE c.state='SUCCESS' AND c.result_json IS NOT NULL
+                 AND (? IS NULL OR c.remote_job_id=?)
                ORDER BY c.id"""
+            , (remote_job_id, remote_job_id)
         ).fetchall()
     finally:
         connection.close()

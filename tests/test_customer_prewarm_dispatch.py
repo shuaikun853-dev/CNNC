@@ -189,7 +189,7 @@ def make_state_db(runtime_root: Path, business_date: str) -> object:
 
 
 def make_candidate(prewarm: CustomerPrewarmStore, url: str, *, mall="comix", lookup_url=None, document="D1"):
-    upsert = prewarm.upsert_link(document, url, mall=mall, lookup_url=lookup_url or url)
+    upsert = prewarm.upsert_link(document, url, mall=mall, lookup_url=lookup_url or url, business_date=BUSINESS_DATE)
     candidate_id = int(upsert["candidate"]["id"])
     prewarm.record_candidate_result(candidate_id, cache_status=CACHE_STATUS_PENDING_PREWARM)
     return candidate_id
@@ -468,6 +468,79 @@ def test_routing_blocked_candidate_reclassified_after_mapping_available(tmp_path
     assert adapter.submit_calls == 1
     assert len(_crawl_rows(paths.state_path)) == 1
 
+
+
+@pytest.mark.parametrize("terminal_probe", [False, True])
+def test_posted_link_with_pending_candidate_cannot_create_again_next_day(tmp_path, monkeypatch, terminal_probe):
+    runtime_root = tmp_path / "runtime"
+    make_state_db(runtime_root, BUSINESS_DATE)
+    prewarm = CustomerPrewarmStore(runtime_root / "customer_prewarm.sqlite3")
+    cache = SharedCrawlCache(runtime_root / "shared_crawl_cache.sqlite3")
+    candidate_id = make_candidate(prewarm, "https://qx.com/post-link-crash.html")
+    adapter = _CountingAdapter()
+    original_record = prewarm.record_candidate_result
+    failed = False
+
+    def fail_after_link(candidate, *, cache_status, **kwargs):
+        nonlocal failed
+        if candidate == candidate_id and cache_status == CACHE_STATUS_REMOTE_DISPATCHED and not failed:
+            failed = True
+            raise sqlite3.OperationalError("candidate write interrupted after remote POST")
+        return original_record(candidate, cache_status=cache_status, **kwargs)
+
+    monkeypatch.setattr(prewarm, "record_candidate_result", fail_after_link)
+    run_pass(runtime_root, prewarm, cache, adapter=adapter)
+    assert adapter.submit_calls == 1
+    assert prewarm.candidate_by_id(candidate_id)["cache_status"] == CACHE_STATUS_PENDING_PREWARM
+    assert prewarm.remote_job_link_for_candidate(candidate_id)["business_date"] == BUSINESS_DATE
+
+    next_day = "2026-09-08"
+    next_paths = make_state_db(runtime_root, next_day)
+    if terminal_probe:
+        with sqlite3.connect(next_paths.state_path) as connection:
+            run_id = connection.execute("SELECT id FROM daily_runs LIMIT 1").fetchone()[0]
+            connection.execute(
+                """INSERT INTO crawl_work
+                   (run_id, mall_key, source_id, sku_id, exact_url, backend_version,
+                    fingerprint, state, updated_at)
+                   VALUES (?, 'comix', 'SRC-COMIX', ?, ?, ?, 'terminal-probe',
+                           'TERMINAL_FAILED', '2026-09-08T00:00:00+00:00')""",
+                (run_id, prewarm_placeholder_sku("comix", "https://qx.com/post-link-crash.html"),
+                 "https://qx.com/post-link-crash.html", BACKEND_VERSION),
+            )
+    planned = run_prewarm_dispatch_pass(
+        prewarm, cache, business_date=next_day, runtime_root=runtime_root,
+        mappings=[COMIX], adapter=adapter, plan_only=True,
+    )
+    assert planned["new_remote_urls"] == 0
+    run_prewarm_dispatch_pass(
+        prewarm, cache, business_date=next_day, runtime_root=runtime_root,
+        mappings=[COMIX], adapter=adapter,
+    )
+    assert adapter.submit_calls == 1
+    assert prewarm.candidate_by_id(candidate_id)["cache_status"] == CACHE_STATUS_PENDING_PREWARM
+
+
+def test_missing_link_cannot_prioritize_same_numbered_job_next_day(tmp_path):
+    runtime_root = tmp_path / "runtime"
+    next_day = "2026-09-08"
+    paths, job_id = seed_remote_work(
+        runtime_root, next_day, _CountingAdapter(), mapping=COMIX,
+        url="https://qx.com/unrelated-day-two.html",
+        job_state="PRIORITY_PENDING", remote_identity="comix|other-task|other-number",
+    )
+    prewarm = CustomerPrewarmStore(runtime_root / "customer_prewarm.sqlite3")
+    cache = SharedCrawlCache(runtime_root / "shared_crawl_cache.sqlite3")
+    candidate_id = make_candidate(prewarm, "https://qx.com/day-one-no-link.html")
+    prewarm.record_candidate_result(
+        candidate_id, cache_status=CACHE_STATUS_REMOTE_DISPATCHED, remote_job_id=job_id,
+    )
+    adapter = _CountingAdapter()
+    run_prewarm_dispatch_pass(
+        prewarm, cache, business_date=next_day, runtime_root=runtime_root,
+        mappings=[COMIX], adapter=adapter,
+    )
+    assert adapter.prioritize_calls == 0
 
 
 def test_case6_new_task_created_submitted_once(tmp_path):

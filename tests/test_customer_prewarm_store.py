@@ -32,10 +32,12 @@ EXPECTED_TABLES = {
     "prewarm_links",
     "prewarm_sync_ledger",
     "prewarm_recovery_runs",
+    "prewarm_redispatch_intents",
     # Issue #13 Round 2: 逐日 observation 与 remote job link 两张增量表
     "prewarm_daily_observations",
     "prewarm_document_evidence",
     "prewarm_remote_job_links",
+    "prewarm_lifecycle_cursors",
 }
 
 
@@ -895,3 +897,18 @@ def test_same_status_record_keeps_prior_evidence_but_lands_new_error_note(tmp_pa
         candidate_id, cache_status="CACHE_HIT", match_level="EXACT", resolved_identity_id=7
     )
     assert hit["last_error"] is None
+
+
+def test_read_only_old_schema_treats_absent_redispatch_marker_table_as_empty(tmp_path):
+    path = tmp_path / "old-prewarm.sqlite3"
+    store = CustomerPrewarmStore(path)
+    candidate_id = int(store.upsert_link("D1", "https://x.example/old")["candidate"]["id"])
+    with sqlite3.connect(path) as connection:
+        connection.execute("DROP TABLE prewarm_redispatch_intents")
+    read_only = CustomerPrewarmStore.open_read_only(path)
+    assert read_only.latest_redispatch_intent_for_candidate(candidate_id) is None
+    with sqlite3.connect(path) as connection:
+        present = connection.execute(
+            "SELECT name FROM sqlite_master WHERE name='prewarm_redispatch_intents'"
+        ).fetchone()
+    assert present is None

@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import json
+
 import sqlite3
 from pathlib import Path
 
@@ -325,6 +326,8 @@ def _seed_failed_candidate(
             state="SUBMITTED",
         )
         prewarm.record_remote_job_link(BD, candidate_id, filler, PRODUCER)
+    if extra_links_today:
+        prewarm.record_remote_job_link(BD, candidate_id, job_id, PRODUCER)
     return candidate_id, job_id
 
 
@@ -436,6 +439,55 @@ def test_failed_link_rows_unmapped_mall_falls_back_to_mall_key(tmp_path):
     assert rows[0]["mall"] == "unknownmall"
     assert rows[0]["mall_name"] == "unknownmall"
 
+
+@pytest.mark.parametrize("harvest_attempts,error_text", [
+    (0, "prewarm reconcile identity conflict: ambiguous exact matches"),
+    (1, "exact EXPORTED evidence does not match durable remote identity"),
+])
+def test_manual_blocker_remains_visible_in_final_failure_rows(
+    tmp_path, harvest_attempts, error_text
+):
+    store = _seed_frozen_day(tmp_path)
+    prewarm = CustomerPrewarmStore(tmp_path / "customer_prewarm.sqlite3")
+    token = store.acquire_lease(BD, "seed-manual-blocker", 60)
+    try:
+        _candidate_id, job_id = _seed_failed_candidate(
+            prewarm, store, token, tmp_path,
+            url="https://comix.example/manual-blocker", document="DOC-M",
+            job_state="MANUAL_REQUIRED",
+        )
+    finally:
+        store.release_lease(token)
+    with sqlite3.connect(runtime_paths(BD, tmp_path).state_path) as connection:
+        connection.execute(
+            "UPDATE remote_jobs SET harvest_attempts=?, error_text=? WHERE id=?",
+            (harvest_attempts, error_text, job_id),
+        )
+    rows = failed_customer_link_rows(BD, tmp_path, [COMIX])
+    assert len(rows) == 1
+    assert rows[0]["reason"] == FAILED_LINK_REASON_TERMINAL
+
+
+def test_failed_link_rows_does_not_attribute_colliding_job_after_link_mismatch(tmp_path):
+    store = _seed_frozen_day(tmp_path)
+    prewarm = CustomerPrewarmStore(tmp_path / "customer_prewarm.sqlite3")
+    token = store.acquire_lease(BD, "seed-mismatched-link", 60)
+    try:
+        candidate_id, job_id = _seed_failed_candidate(
+            prewarm, store, token, tmp_path,
+            url="https://comix.example/mismatched-link", document="DOC-M",
+            job_state="MANUAL_REQUIRED",
+        )
+        crawl = store.ensure_crawl_work(
+            token, "comix", "zhpq-mismatch", "https://comix.example/mismatched-link",
+            "legacy-v1", "fp-mismatch", source_id="SRC",
+        )
+        store.link_crawl_work_to_remote_job(token, int(crawl["id"]), job_id)
+        store.fail_crawl_work(token, int(crawl["id"]), NO_ROW_REASON, retryable=False)
+    finally:
+        store.release_lease(token)
+    prewarm.record_remote_job_link(BD, candidate_id, job_id + 100, PRODUCER)
+    assert failed_customer_link_rows(BD, tmp_path, [COMIX]) == []
 
 def test_failed_link_rows_use_only_today_document_evidence(tmp_path):
     store = _seed_frozen_day(tmp_path)
@@ -839,6 +891,7 @@ def test_no_result_sibling_does_not_make_local_success_fail(tmp_path):
     by_url = {row["original_url"]: row for row in failed_customer_link_rows(BD, tmp_path, [COMIX])}
     assert set(by_url) == {no_result_url}
     assert by_url[no_result_url]["reason"] == FAILED_LINK_REASON_NO_RESULT
+
 
 # ---- final workbook projection (integration) ----------------------------------
 

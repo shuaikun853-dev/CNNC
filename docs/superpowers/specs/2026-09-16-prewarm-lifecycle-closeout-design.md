@@ -1,6 +1,6 @@
 # 客户链接预爬生命周期收口设计（治本三件套 + 失败进最终表）
 
-日期：2026-09-16 · 状态：已确认（用户拍板：失败数据按原行格式进表不建新 sheet；NO_RESULT 算失败；ofs/ycw 脚本兜底推迟到脚本定稿后接入）
+日期：2026-09-16 · 状态：原始设计记录（用户拍板：失败数据按原行格式进表不建新 sheet；NO_RESULT 算失败；ofs/ycw 脚本兜底推迟到脚本定稿后接入）。下文 A2/A3 与“非目标”保留当时范围，现行跨日扩展及 MANUAL 安全规则见文末更新。
 
 ## 背景与问题
 
@@ -55,3 +55,9 @@
 - 不改主看板按钮谓词（身份缺失的灰钮是诚实语义）。
 - 不实现 ofs/ycw 脚本调用（脚本修改中，等定稿）。
 - 不处理跨日 SUBMIT_UNKNOWN 的历史僵尸清理（A3 重排自然覆盖当日 scope；历史存量另行处理）。
+
+## 2026-09-18 PR #26 扩展（覆盖原始 A2/A3 的跨日与 MANUAL 语义）
+
+- 最新 durable candidate linkage 定位 `(owning_day, job_id)`：跨日无身份 `SUBMIT_UNKNOWN` 只做 exact reconcile；`PRIORITY_PENDING` 跨轮只做提优证明，`weight_type=-1` 才原子进入 `SUBMITTED`，不重发 submit/create。远程提优前检查 linkage，结果写回用短事务 fence；绝不在远程 I/O 期间持有 prewarm SQLite 写事务。
+- 跨日 `SUBMITTED`/`RUNNING`/`EXPORTED` 由独立 historical harvest 阶段调用既有 prewarm recovery 原语，自己取得所属日 ProcessLock+lease；terminal SUCCESS 可重试 exact-job cache sync，避免 harvest 完成后进程中断造成缓存缺口。两个跨日阶段各有 durable fairness cursor、cap 和共享 deadline。
+- adapter 的 `MANUAL` 或不完整 FOUND 是 provenance blocker：持久化 `MANUAL_REQUIRED` 与分类诊断，A3 排除；任何已 POST 且无 identity 的 MANUAL_REQUIRED 也不自动重建。只有无诊断的确切 NOT_FOUND 消耗有限 attempt；不确定 NOT_FOUND 保持待重试。
