@@ -77,10 +77,9 @@ python -m pytest tests\test_refresh_v2_cross_contract.py -q
 历史 fixture 缺失时，最后一项会 skip；不得用生产接口补齐它。
 ### Dashboard 测试（只读看板）
 `tests\test_dashboard_projection.py`（投影/分级/日历/scheduler 降级/fingerprint）+ `tests\test_dashboard_api.py`（GET-only、400/503、ETag/304、自启脚本与 runbook 的 -Apply 门控）：
-`E:\Python314\python.exe -m pytest tests\test_dashboard_projection.py tests\test_dashboard_api.py tests\test_dashboard_action_runner.py tests\test_dashboard_actions_api.py tests\test_incremental_price_audit_force_finalize.py tests\test_incremental_audit_status.py -q --basetemp=runtime\pytest-tmp\dash; node tests\js\run_dashboard_js_tests.js`（受控操作台均用 fake runner/tmp SQLite,不触网、不碰生产 runtime）。
+`E:\Python314\python.exe -m pytest tests\test_dashboard_projection.py tests\test_dashboard_api.py tests\test_remediation_tracker.py tests\test_dashboard_action_runner.py tests\test_dashboard_actions_api.py tests\test_incremental_price_audit_force_finalize.py tests\test_incremental_audit_status.py -q --basetemp=runtime\pytest-tmp\dash; node tests\js\run_dashboard_js_tests.js; node tests\js\run_remediation_dashboard_js_tests.js`（受控操作台与整改追踪均只用 fake runner/tmp SQLite 或只读 Git 证据，不碰生产 runtime）。
 `tests\test_saas_flow_diagnostic.py`（SaaS 链路诊断：SQL registry 只读、降级/缓存/限流、分支分类、18:00 前增长分叉、summary 隔离；全部 fake connection/tmp SQLite，绝不连真实数据库）一并执行，命令追加该文件名即可。
-`tests\test_production_identity.py`（生产部署身份只读投影：fake runner + tmp git 迷你仓库，不碰生产 git/调度器/网络）：
-`E:\Python314\python.exe -m pytest tests\test_production_identity.py -q --basetemp=runtime\pytest-tmp\prodidentity`
+`tests\test_production_identity.py`（生产部署身份只读投影：fake runner + tmp git 迷你仓库，不碰生产 git/调度器/网络）：`E:\Python314\python.exe -m pytest tests\test_production_identity.py -q --basetemp=runtime\pytest-tmp\prodidentity`
 # Issue #13 客户链接预爬看板:projection/手动重爬/精确派发/API+页面 smoke
 # 跨日生命周期:tests\test_prewarm_cross_day_lifecycle.py 覆盖跨日 REUSED 动作的 worker 有界收割(harvest_existing_customer_prewarm_job,零二次 POST)+ 幂等 sync 镜像 → G2 精确关联完成,预算耗尽保持 WAITING_REMOTE
 # production-shape 跨日收割:tests\test_prewarm_cross_day_production_shape.py 覆盖真实 dispatch 创建的 D1 任务(无 snapshot / 无关冻结 snapshot)经 prewarm-payload 溯源收割成 SUCCESS,且普通 STEP1 run_manual_reexport 对同一任务继续 fail-closed
