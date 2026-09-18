@@ -928,6 +928,92 @@ def test_redispatch_unposted_intent_resumes_after_not_attempted(tmp_path):
     assert prewarm.candidate_by_id(candidate_id)["remote_job_id"] != dead_job
 
 
+@pytest.mark.parametrize("first_outcome", ["budget_floor", "not_attempted"])
+def test_redispatch_unposted_group_shrinks_after_cache_hit(tmp_path, first_outcome):
+    runtime_root = tmp_path / "runtime"
+    paths = make_state_db(runtime_root, TODAY)
+    prewarm = CustomerPrewarmStore(runtime_root / "customer_prewarm.sqlite3")
+    first_url = "https://qx.com/unposted-shrink-a.html"
+    second_url = "https://qx.com/unposted-shrink-b.html"
+    _dead_paths, dead_job = seed_manual_job(
+        runtime_root, TODAY, _CountingAdapter(), mapping=COMIX, url=first_url,
+    )
+    first_id = seed_remote_candidate(prewarm, first_url, dead_job, document="SHRINK-A")
+    second_id = seed_remote_candidate(prewarm, second_url, dead_job, document="SHRINK-B")
+    adapter = _CountingAdapter(
+        submit_outcome=LegacySubmitOutcome(SubmitStatus.NOT_ATTEMPTED)
+        if first_outcome == "not_attempted" else SUBMITTED_SUCCESS
+    )
+    first = run_redispatch(
+        runtime_root, paths, prewarm, adapter,
+        deadline_seconds=4.0 if first_outcome == "budget_floor" else 30.0,
+    )
+    assert adapter.submit_calls == (0 if first_outcome == "budget_floor" else 1)
+    assert prewarm.candidate_by_id(second_id)["remote_job_id"] == dead_job
+    with sqlite3.connect(paths.state_path) as connection:
+        unposted = connection.execute(
+            "SELECT id, post_attempted FROM remote_jobs WHERE state='SUBMIT_INTENT'"
+        ).fetchone()
+    assert unposted is not None and unposted[1] == 0
+
+    prewarm.record_candidate_result(first_id, cache_status=CACHE_STATUS_CACHE_HIT)
+    adapter.submit_outcome = SUBMITTED_SUCCESS
+    second = run_redispatch(runtime_root, paths, prewarm, adapter)
+
+    assert adapter.submit_calls == (1 if first_outcome == "budget_floor" else 2)
+    assert prewarm.candidate_by_id(first_id)["cache_status"] == CACHE_STATUS_CACHE_HIT
+    assert prewarm.candidate_by_id(second_id)["remote_job_id"] != dead_job
+    assert [request.url for request in adapter.prepared_log[-1].requests] == [second_url]
+    assert not any("unposted prior group changed" in error for error in second["phase_errors"])
+    with sqlite3.connect(paths.state_path) as connection:
+        retired = connection.execute(
+            "SELECT state, post_attempted FROM remote_jobs WHERE id=?", (unposted[0],)
+        ).fetchone()
+        old_links = connection.execute(
+            "SELECT COUNT(*) FROM crawl_work WHERE remote_job_id=?", (unposted[0],)
+        ).fetchone()[0]
+    assert retired == ("SUPERSEDED", 0)
+    assert old_links == 0
+
+
+def test_redispatch_changed_unposted_group_with_nonpending_crawl_fails_closed(tmp_path):
+    runtime_root = tmp_path / "runtime"
+    paths = make_state_db(runtime_root, TODAY)
+    prewarm = CustomerPrewarmStore(runtime_root / "customer_prewarm.sqlite3")
+    first_url = "https://qx.com/unposted-uncertain-a.html"
+    second_url = "https://qx.com/unposted-uncertain-b.html"
+    _dead_paths, dead_job = seed_manual_job(
+        runtime_root, TODAY, _CountingAdapter(), mapping=COMIX, url=first_url,
+    )
+    first_id = seed_remote_candidate(prewarm, first_url, dead_job, document="UNCERTAIN-A")
+    second_id = seed_remote_candidate(prewarm, second_url, dead_job, document="UNCERTAIN-B")
+    adapter = _CountingAdapter()
+    run_redispatch(runtime_root, paths, prewarm, adapter, deadline_seconds=4.0)
+    with sqlite3.connect(paths.state_path) as connection:
+        old_job = connection.execute(
+            "SELECT id FROM remote_jobs WHERE state='SUBMIT_INTENT'"
+        ).fetchone()[0]
+        connection.execute(
+            "UPDATE crawl_work SET state='RUNNING' WHERE remote_job_id=? AND exact_url=?",
+            (old_job, first_url),
+        )
+        connection.commit()
+    prewarm.record_candidate_result(first_id, cache_status=CACHE_STATUS_CACHE_HIT)
+
+    second = run_redispatch(runtime_root, paths, prewarm, adapter)
+
+    assert adapter.submit_calls == 0
+    assert prewarm.candidate_by_id(second_id)["remote_job_id"] == dead_job
+    assert any("cannot be retired" in error for error in second["phase_errors"])
+    with sqlite3.connect(paths.state_path) as connection:
+        assert connection.execute(
+            "SELECT state FROM remote_jobs WHERE id=?", (old_job,)
+        ).fetchone()[0] == "SUBMIT_INTENT"
+        assert connection.execute(
+            "SELECT COUNT(*) FROM crawl_work WHERE remote_job_id=?", (old_job,)
+        ).fetchone()[0] == 2
+
+
 def test_redispatch_mixed_prior_groups_obey_remote_job_cap(tmp_path):
     runtime_root = tmp_path / "runtime"
     paths = make_state_db(runtime_root, TODAY)
