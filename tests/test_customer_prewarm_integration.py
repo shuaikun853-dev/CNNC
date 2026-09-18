@@ -555,7 +555,17 @@ def test_case_d_legacy_schema_additive_migration_preserves_rows(tmp_path):
     after_objects, after_columns = _schema_snapshot(db)
     # 新增对象 = #10 的一列 + #11 的两张 sidecar 表 + #9 其余既有表,additive 无改删
     # (UNIQUE 约束带来的 sqlite_autoindex_* 内部对象不计入)
-    expected_new_tables = (LEGACY_EXPECTED_TABLES | {"staples_prewarm_jobs", "staples_prewarm_attempts", "prewarm_redispatch_intents", "idx_prewarm_redispatch_intents_candidate_time", "idx_prewarm_remote_job_links_candidate_time"}) - {
+    expected_new_tables = (
+        LEGACY_EXPECTED_TABLES
+        | {
+            "prewarm_document_evidence",
+            "staples_prewarm_jobs",
+            "staples_prewarm_attempts",
+            "prewarm_redispatch_intents",
+            "idx_prewarm_redispatch_intents_candidate_time",
+            "idx_prewarm_remote_job_links_candidate_time",
+        }
+    ) - {
         "prewarm_candidates"
     }
 

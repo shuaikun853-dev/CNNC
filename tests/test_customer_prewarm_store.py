@@ -35,6 +35,7 @@ EXPECTED_TABLES = {
     "prewarm_redispatch_intents",
     # Issue #13 Round 2: 逐日 observation 与 remote job link 两张增量表
     "prewarm_daily_observations",
+    "prewarm_document_evidence",
     "prewarm_remote_job_links",
     "prewarm_lifecycle_cursors",
 }
@@ -91,6 +92,66 @@ def test_init_never_touches_sibling_files(tmp_path):
     store.upsert_document("2026-09-07", "D1", "C1")
     store.upsert_link("D1", "https://x.example/1")
     assert sibling.read_text(encoding="utf-8") == "do-not-touch"
+
+
+def test_old_store_adds_daily_evidence_without_losing_candidates_or_links(tmp_path):
+    db = tmp_path / "prewarm.sqlite3"
+    legacy = CustomerPrewarmStore(db)
+    legacy.upsert_document("2026-09-16", "DOC-OLD", "CAT-OLD")
+    linked = legacy.upsert_link(
+        "DOC-OLD",
+        "https://comix.example/old",
+        mall="comix",
+        business_date="2026-09-16",
+    )
+    candidate_id = int(linked["candidate"]["id"])
+    with sqlite3.connect(str(db)) as connection:
+        connection.execute("DROP TABLE IF EXISTS prewarm_document_evidence")
+
+    migrated = CustomerPrewarmStore(db)
+    assert migrated.candidate_by_id(candidate_id)["original_url"] == "https://comix.example/old"
+    assert migrated.links_for_candidate(candidate_id)[0]["document_id"] == "DOC-OLD"
+    migrated.record_daily_document_evidence(
+        "2026-09-17",
+        "DOC-OLD",
+        customer_title="当日客户标题",
+        customer_price="82.8",
+        customer_price_status="FOUND",
+    )
+    evidence = migrated.daily_document_evidence("2026-09-17", "DOC-OLD")
+    assert evidence["customer_title"] == "当日客户标题"
+    assert evidence["customer_price"] == "82.8"
+    assert evidence["customer_price_status"] == "FOUND"
+
+
+def test_daily_evidence_success_clears_failure_and_survives_title_only_intake(store):
+    store.record_daily_document_evidence(
+        "2026-09-17",
+        "DOC-EVIDENCE",
+        customer_price_status="NOT_FOUND",
+        customer_price_warning="temporary failure",
+    )
+    store.record_daily_document_evidence(
+        "2026-09-17",
+        "DOC-EVIDENCE",
+        customer_price="82.8",
+        customer_price_status="FOUND",
+        customer_price_source="DETAIL_REFERENCE_INFOS",
+        customer_price_warning="",
+        customer_price_evidence="customer=82.8",
+    )
+    store.record_daily_document_evidence(
+        "2026-09-17",
+        "DOC-EVIDENCE",
+        customer_title="updated title",
+        source="scanner-recovery",
+    )
+
+    evidence = store.daily_document_evidence("2026-09-17", "DOC-EVIDENCE")
+    assert evidence["customer_title"] == "updated title"
+    assert evidence["customer_price"] == "82.8"
+    assert evidence["customer_price_status"] == "FOUND"
+    assert evidence["customer_price_warning"] == ""
 
 
 # ---- documents ----------------------------------------------------------------

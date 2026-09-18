@@ -164,6 +164,7 @@
     renderHero(p.overall); renderAttention(p.overall.attention);
     renderStages(applyCloseoutRunningOverlay(p.overall.stages, { closeoutRunning: closeoutUIRunning() }));
     renderZs(p.overall.zs_summary);
+    renderLocalFallback(p.local_fallback);
     renderCustomerPrice(p.customer_price);
     renderFinal(p.overall, p.status); renderMeta(p);
     renderJobs(p.jobs);
@@ -373,6 +374,43 @@
       (s.running ? "计划任务:正在运行" :
        (s.last_result_cn ? "计划任务:" + s.last_result_cn :
         (s.next_run ? "下次运行:" + String(s.next_run) : "计划任务:正常")));
+  }
+  function localFallbackView(raw) {
+    const data = raw && typeof raw === "object" ? raw : {};
+    const count = (key) => Math.max(0, Number(data[key]) || 0);
+    const reasons = data.reasons && typeof data.reasons === "object" ? data.reasons : {};
+    const sites = data.sites && typeof data.sites === "object" ? data.sites : {};
+    return {
+      counts: "待处理 " + count("pending") + " · 运行中 " + count("running") +
+        " · 本地成功 " + count("success") + " · 远端抢先 " + count("remote_success") +
+        " · 失败 " + count("failed"),
+      reasons: "触发原因: " + (Object.entries(reasons).map(([key, value]) =>
+        key + " " + (Math.max(0, Number(value) || 0))).join(" · ") || "无"),
+      sites: "商城: " + (Object.entries(sites).map(([site, value]) => {
+        const v = value && typeof value === "object" ? value : {};
+        return site + " 待处理 " + (Number(v.pending) || 0) +
+          " / 运行中 " + (Number(v.running) || 0) +
+          " / 成功 " + (Number(v.success) || 0) +
+          " / 远端 " + (Number(v.remote_success) || 0) +
+          " / 失败 " + (Number(v.failed) || 0);
+      }).join(" · ") || "无"),
+      links: (Array.isArray(data.links) ? data.links : []).map((item) => {
+        const link = item && typeof item === "object" ? item : {};
+        return String(link.mall_key || "—") + " · " + String(link.state || "PENDING") +
+          " · " + String(link.source || "待定") + " · " + String(link.exact_url || "—");
+      }).join("\n") || "暂无本地兜底候选链接",
+    };
+  }
+  function renderLocalFallback(raw) {
+    const view = localFallbackView(raw);
+    const counts = $("#local-fallback-counts");
+    const reasons = $("#local-fallback-reasons");
+    const sites = $("#local-fallback-sites");
+    const links = $("#local-fallback-links");
+    if (counts) counts.textContent = view.counts;
+    if (reasons) reasons.textContent = view.reasons;
+    if (sites) sites.textContent = view.sites;
+    if (links) links.textContent = view.links;
   }
   function renderJobs(jobs) {
     lastSummaryJobs = jobs || [];
@@ -1823,7 +1861,8 @@
     armRebuildDrawerSwitch, resolveRebuildDrawerSwitch,
     rebuildOutcomeAdmitsLocalSupersede,
     businessDateFromSearch, datedApiPath,
-    cpStatusCn, cpStatusPill, cpRowMatchesFilter, cpSortRows };
+    cpStatusCn, cpStatusPill, cpRowMatchesFilter, cpSortRows,
+    localFallbackView, renderLocalFallback };
   if (typeof window !== "undefined") { window.Dashboards = api; }
   if (typeof module !== "undefined" && module.exports) { module.exports = api; }
   if (typeof document !== "undefined") { document.addEventListener("DOMContentLoaded", start); }

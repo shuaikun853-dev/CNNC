@@ -25,6 +25,14 @@ import scripts.incremental_price_audit as cli
 
 
 DATE = "2026-08-11"
+FINAL_METRICS = {
+    "finalized_rows": 1,
+    "final_missing_page_price_rows": 0,
+    "final_frozen_missing_page_price_rows": 0,
+    "final_failed_customer_link_rows": 0,
+    "final_appended_failed_customer_link_rows": 0,
+    "final_page_price_required_rows": 0,
+}
 
 
 @dataclass
@@ -429,7 +437,7 @@ def test_harvest_only_on_finalized_run_is_a_noop(tmp_path):
     job, _ = _seed_job(store, token, 0, state="COMPLETED", crawls=0)
     store.freeze_snapshot(token, int(snapshot["id"]))
     store.prepare_finalization(token, str(tmp_path / "final.xlsx"))
-    store.mark_finalized(token, str(tmp_path / "final.xlsx"), "manifest")
+    store.commit_finalization(token, str(tmp_path / "final.xlsx"), "manifest", FINAL_METRICS)
     store.release_lease(token)
     deps = _forbidden_deps(Clock())
     deps.harvest = lambda *_args: pytest.fail("a finalized run must not re-harvest")

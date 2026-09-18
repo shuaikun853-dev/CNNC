@@ -16,7 +16,7 @@ from pathlib import Path
 import pytest
 from openpyxl import load_workbook
 
-from app.services.daily_audit_store import DailyAuditStore, ProcessLock
+from app.services.daily_audit_store import DailyAuditStore, FrozenSnapshotConflict, ProcessLock
 from app.services.incremental_audit_runtime import (
     run_force_finalize_command,
     run_runtime_command,
@@ -193,8 +193,20 @@ def test_force_finalize_publishes_formal_workbook_with_force_audit(tmp_path):
     run = store.get_run(DATE)
     assert run["state"] == "FINALIZED"
     assert run["final_output_path"] == str(output.resolve())
-    assert run["final_manifest_hash"]
+    assert run["final_manifest_hash"] == publication.materialization.manifest_sha256
     metrics = _metrics(store)
+    assert {key: metrics[key] for key in (
+        "finalized_rows", "final_missing_page_price_rows",
+        "final_frozen_missing_page_price_rows", "final_failed_customer_link_rows",
+        "final_appended_failed_customer_link_rows", "final_page_price_required_rows",
+    )} == {
+        "finalized_rows": 2,
+        "final_missing_page_price_rows": 2,
+        "final_frozen_missing_page_price_rows": 2,
+        "final_failed_customer_link_rows": 0,
+        "final_appended_failed_customer_link_rows": 0,
+        "final_page_price_required_rows": 2,
+    }
     assert metrics["force_finalize"] is True
     assert metrics["forced"] is True
     assert metrics["forced_incomplete_count"] == 2
@@ -219,6 +231,87 @@ def test_force_finalize_publishes_formal_workbook_with_force_audit(tmp_path):
     assert task["expected_subtask_count"] == 2
     assert task["crawl_item_count"] == 2
     assert {item["crawl_state"] for item in task["crawl_items"]} == {"SUBMITTED"}
+
+
+def test_force_publish_then_final_commit_failure_recovers_without_rewriting(tmp_path, monkeypatch):
+    store, _snapshot, crawls = _seed_force(tmp_path)
+    _link_inflight_job(store, tmp_path, crawls)
+    output = tmp_path / "formal.xlsx"
+
+    def crash(*_args, **_kwargs):
+        raise SystemExit("injected force final DB failure")
+
+    monkeypatch.setattr(store, "update_daily_metrics", crash)
+    monkeypatch.setattr(store, "commit_finalization", crash, raising=False)
+    with pytest.raises(SystemExit, match="injected force final DB failure"):
+        materialize_forced_frozen_daily_run(
+            store, ProcessLock(tmp_path / "finalize.lock"), DATE, output, max_incomplete=2,
+            expected_missing_page_price_rows=2,
+        )
+    published = output.read_bytes()
+    manifest_path = output.with_name(output.name + ".manifest.json")
+    manifest = manifest_path.read_bytes()
+    interrupted = store.get_run(DATE)
+    assert interrupted["state"] == "FINALIZING"
+    assert interrupted["final_manifest_hash"] is None
+    assert "forced" not in _metrics(store)
+    assert "final_missing_page_price_rows" not in _metrics(store)
+
+    monkeypatch.undo()
+    recovered = materialize_forced_frozen_daily_run(
+        store, ProcessLock(tmp_path / "finalize.lock"), DATE, output, max_incomplete=2,
+        expected_missing_page_price_rows=2,
+    )
+    assert recovered.already_finalized is False
+    assert recovered.materialization is not None and recovered.materialization.reused is True
+    assert output.read_bytes() == published
+    assert manifest_path.read_bytes() == manifest
+    assert store.get_run(DATE)["state"] == "FINALIZED"
+
+
+def test_force_retry_after_evidence_drift_commits_published_metrics(tmp_path, monkeypatch):
+    store, _snapshot, crawls = _seed_force(tmp_path)
+    job = _link_inflight_job(store, tmp_path, crawls)
+    output = tmp_path / "formal.xlsx"
+
+    def crash(*_args, **_kwargs):
+        raise SystemExit("injected final DB failure")
+
+    monkeypatch.setattr(store, "commit_finalization", crash, raising=False)
+    with pytest.raises(SystemExit):
+        materialize_forced_frozen_daily_run(
+            store, ProcessLock(tmp_path / "finalize.lock"), DATE, output, max_incomplete=2,
+            expected_missing_page_price_rows=2,
+        )
+    published = output.read_bytes()
+    manifest_path = output.with_name(output.name + ".manifest.json")
+    manifest = manifest_path.read_bytes()
+    monkeypatch.undo()
+    token = store.acquire_lease(DATE, "late-harvest", 60)
+    store.reconcile_remote_job(
+        token, int(job["id"]), remote_identity="mall|task-id-0|task-number-0",
+        state="COMPLETED", result={"https://shop.example/item": {"price": "9.5"}},
+    )
+    store.release_lease(token)
+    for crawl in crawls:
+        _complete_crawl(store, crawl)
+    with pytest.raises(FrozenSnapshotConflict, match="force publication intent"):
+        materialize_frozen_daily_run(
+            store, ProcessLock(tmp_path / "finalize.lock"), DATE, output,
+        )
+    assert store.get_run(DATE)["state"] == "FINALIZING"
+    recovered = materialize_forced_frozen_daily_run(
+        store, ProcessLock(tmp_path / "finalize.lock"), DATE, output, max_incomplete=2,
+        expected_missing_page_price_rows=2,
+    )
+    assert recovered.materialization is not None and recovered.materialization.reused is True
+    assert recovered.readiness.missing_page_price_rows == 2
+    assert recovered.forced_incomplete_count == 2
+    assert store.get_run(DATE)["state"] == "FINALIZED"
+    assert _metrics(store)["final_missing_page_price_rows"] == 2
+    assert _metrics(store)["force_finalize_actual_incomplete"] == 2
+    assert output.read_bytes() == published
+    assert manifest_path.read_bytes() == manifest
 
 
 # Business example: 10 crawl rows + 1 remote job is allowed at max_incomplete=10.
@@ -423,7 +516,58 @@ def test_operator_force_closeout_rejects_more_than_twenty_missing_price_rows(tmp
             expected_missing_page_price_rows=21,
         )
 
-    assert excinfo.value.error_type == "FORCE_FINALIZE_INCOMPLETE_LIMIT_EXCEEDED"
+    assert excinfo.value.error_type == "MISSING_PRICE_LIMIT_EXCEEDED"
+    assert excinfo.value.readiness.missing_page_price_rows == 21
+    assert not output.exists()
+
+
+def test_force_closeout_limit_uses_failed_link_projection(tmp_path, monkeypatch):
+    rows = [
+        _row(f"v-{index}", f"sku-{index}", f"https://shop.example/{index}")
+        for index in range(7)
+    ]
+    store, _snapshot, crawls = _seed_force(tmp_path, rows=rows)
+    for index, crawl in enumerate(crawls):
+        _complete_no_result_crawl(store, tmp_path, crawl, index=index)
+    failures = [
+        {
+            "mall": "comix",
+            "mall_name": "齐心商城",
+            "original_url": f"https://comix.example/failed-{index}",
+            "document_id": f"DOC-FAILED-{index}",
+            "document_ids": [f"DOC-FAILED-{index}"],
+            "reason": "终端失败",
+            "last_task_name": f"task-{index}",
+            "last_time": f"{DATE}T10:00:00+00:00",
+            "job_state": "MANUAL_REQUIRED",
+            "remote_job_id": 1000 + index,
+            "candidate_id": 1000 + index,
+            "redispatch_links_used": 1,
+            "owning_day": DATE,
+            "customer_evidence": {},
+        }
+        for index in range(14)
+    ]
+    monkeypatch.setattr(
+        "app.services.customer_prewarm_lifecycle.failed_customer_link_rows",
+        lambda *_args, **_kwargs: failures,
+    )
+    output = tmp_path / "formal.xlsx"
+
+    with pytest.raises(ForceFinalizeRejected) as excinfo:
+        materialize_forced_frozen_daily_run(
+            store,
+            ProcessLock(tmp_path / "projection-limit.lock"),
+            DATE,
+            output,
+            max_incomplete=20,
+            accept_unresolved_crawl=True,
+        )
+
+    assert excinfo.value.error_type == "MISSING_PRICE_LIMIT_EXCEEDED"
+    assert excinfo.value.readiness is not None
+    assert excinfo.value.readiness.frozen_missing_page_price_rows == 7
+    assert excinfo.value.readiness.failed_customer_link_rows == 14
     assert excinfo.value.readiness.missing_page_price_rows == 21
     assert not output.exists()
 
@@ -559,6 +703,7 @@ def test_late_remote_completion_never_rewrites_published_final(tmp_path):
         store, ProcessLock(tmp_path / "finalize.lock"), DATE, output, max_incomplete=10,
     )
     published = output.read_bytes()
+    committed_metrics = _metrics(store)
 
     # The Zhaoshang remote task finishes much later and a harvest is replayed.
     token = store.acquire_lease(DATE, "late-harvest", 60)
@@ -578,7 +723,9 @@ def test_late_remote_completion_never_rewrites_published_final(tmp_path):
         store, ProcessLock(tmp_path / "finalize.lock"), DATE, output,
     )
     assert replayed.materialization is not None and replayed.materialization.reused is True
+    assert replayed.readiness.missing_page_price_rows == committed_metrics["final_missing_page_price_rows"]
     assert output.read_bytes() == published
+    assert _metrics(store) == committed_metrics
     rerun = materialize_forced_frozen_daily_run(
         store, ProcessLock(tmp_path / "finalize.lock"), DATE, output, max_incomplete=10,
     )

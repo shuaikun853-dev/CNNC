@@ -168,6 +168,50 @@ def test_intake_documents_dedupes_and_skips_empty_ids(prewarm_store):
     assert pending[0]["four_category_id"] == "C1"
 
 
+def test_intake_and_detail_persist_business_day_customer_evidence(
+    prewarm_store,
+    shared_cache,
+):
+    url = "https://b2b.nbdeli.com/goods/customer-evidence.html"
+    rows = [{
+        "documentId": "DOC-EVIDENCE",
+        "fourCategoryId": "CAT-4",
+        "fourCategoryName": "量具",
+        "commodityName": "世达 SATA 91513 0-300mm",
+        "referenceLink": url,
+    }]
+    assert intake_documents(prewarm_store, BUSINESS_DATE, rows) == 1
+    before = prewarm_store.daily_document_evidence(BUSINESS_DATE, "DOC-EVIDENCE")
+    assert before["customer_title"] == "世达 SATA 91513 0-300mm"
+    assert before["four_category_name"] == "量具"
+    assert before["customer_price"] is None
+
+    payload = {
+        "data": {
+            "referenceInfos": [{
+                "referenceLink": url,
+                "referencePrice": "1871.52",
+            }]
+        }
+    }
+    result = process_document(
+        prewarm_store,
+        shared_cache,
+        prewarm_store.pending_documents(10)[0],
+        mappings=MAPPINGS,
+        detail_fetch=make_fetcher({"DOC-EVIDENCE": payload}),
+        business_date=BUSINESS_DATE,
+    )
+
+    assert result["detail_ok"] is True
+    after = prewarm_store.daily_document_evidence(BUSINESS_DATE, "DOC-EVIDENCE")
+    assert after["customer_title"] == "世达 SATA 91513 0-300mm"
+    assert after["customer_price"] == "1871.52"
+    assert after["customer_price_status"] == "FOUND_SINGLE_REFERENCE"
+    assert after["customer_price_source"] == "DETAIL_SINGLE_REFERENCE"
+    assert "1871.52" in after["customer_price_evidence"]
+
+
 # ---- Case 1: 历史精确命中 ---------------------------------------------------------
 
 

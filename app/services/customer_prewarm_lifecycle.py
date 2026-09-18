@@ -75,6 +75,7 @@ from app.services.customer_prewarm_store import (
 )
 from app.services.daily_audit_store import DailyAuditStore, LeaseToken, LeaseUnavailable, ProcessLock
 from app.services.incremental_audit_runtime import runtime_paths
+from app.services.page_price_semantics import is_local_fallback_success
 
 def harvest_existing_customer_prewarm_job(**kwargs: Any) -> dict[str, Any]:
     """Lazy bridge to the recovery primitive.
@@ -129,10 +130,10 @@ WHERE j.state = 'SUBMIT_UNKNOWN'
 ORDER BY j.id
 """
 
-_CRAWL_STATES_FOR_JOB_SQL = """
-SELECT c.state AS state
+_CRAWLS_FOR_EXACT_IDENTITY_SQL = """
+SELECT c.*
 FROM crawl_work c
-WHERE c.remote_job_id = ?
+WHERE c.mall_key = ? AND c.exact_url = ?
 ORDER BY c.id
 """
 
@@ -441,16 +442,23 @@ def plan_lifecycle_actions(
     }
 
 
-def _crawl_states_for_job_readonly(state_db_path: str | Path, job_id: int) -> list[str]:
-    """``mode=ro`` probe: the crawl row states bound to one remote job."""
+def _crawls_for_exact_identity_readonly(
+    state_db_path: str | Path,
+    mall: str,
+    original_url: str,
+) -> list[dict[str, Any]]:
+    """Read crawl evidence for one exact candidate identity without writes."""
     connection = _open_state_db_readonly(state_db_path)
     if connection is None:
         return []
     try:
-        rows = connection.execute(_CRAWL_STATES_FOR_JOB_SQL, (int(job_id),)).fetchall()
+        rows = connection.execute(
+            _CRAWLS_FOR_EXACT_IDENTITY_SQL,
+            (str(mall or ""), str(original_url or "")),
+        ).fetchall()
     finally:
         connection.close()
-    return [str(row["state"] or "") for row in rows]
+    return [dict(row) for row in rows]
 
 
 def _failed_link_reason(
@@ -501,8 +509,12 @@ def failed_customer_link_rows(
     the bound job, or an exhausted redispatch budget (the day's
     ``prewarm_remote_job_links`` count at ``redispatch_daily_cap``).  Only the
     two remote statuses can carry a binding, so they are the only candidates
-    enumerated.  Rows are deduped by ``(mall, original_url)`` (the store's
-    candidate identity) and sorted deterministically.
+    enumerated.  Output granularity is the current-day document observation,
+    not the cross-day candidate: one URL observed by two documents yields two
+    rows, while documents observed only on another day never leak in.  A
+    candidate with valid local-fallback SUCCESS evidence for that exact
+    ``(mall, original_url)`` is already resolved and is not projected; sibling
+    URLs on the same remote job keep their independent failure disposition.
 
     Every probe is ``mode=ro`` (missing state DBs / stores yield fewer rows,
     never a write); a candidate whose linkage probes fail is skipped fail-open,
@@ -525,7 +537,8 @@ def failed_customer_link_rows(
         return _read_job_row_readonly(runtime_paths(owning_day, state_root).state_path, job_id)
 
     rows: list[dict[str, Any]] = []
-    seen: set[tuple[str, str]] = set()
+    seen_candidates: set[tuple[str, str]] = set()
+    seen_rows: set[tuple[str, str, str]] = set()
     probe_errors: list[str] = []
     for status in (CACHE_STATUS_REMOTE_DISPATCHED, CACHE_STATUS_REMOTE_REUSED):
         for candidate in prewarm_store.candidates(status):
@@ -533,7 +546,7 @@ def failed_customer_link_rows(
             if candidate_id not in scoped_ids:
                 continue
             identity = (str(candidate["mall"] or ""), str(candidate["original_url"] or ""))
-            if identity in seen:
+            if identity in seen_candidates:
                 continue
             raw_job_id = candidate.get("remote_job_id")
             if raw_job_id is None:
@@ -543,9 +556,14 @@ def failed_customer_link_rows(
             )
             if job_row is None:
                 continue
-            crawl_states = _crawl_states_for_job_readonly(
-                runtime_paths(owning_day, state_root).state_path, int(raw_job_id)
+            exact_crawls = _crawls_for_exact_identity_readonly(
+                runtime_paths(owning_day, state_root).state_path,
+                str(candidate["mall"] or ""),
+                str(candidate["original_url"] or ""),
             )
+            if any(is_local_fallback_success(crawl) for crawl in exact_crawls):
+                continue
+            crawl_states = [str(crawl.get("state") or "") for crawl in exact_crawls]
             used = prewarm_store.remote_job_link_count(business_date, candidate_id)
             marker = prewarm_store.latest_redispatch_intent_for_candidate(candidate_id)
             unresolved_marker = bool(
@@ -569,22 +587,13 @@ def failed_customer_link_rows(
             )
             if reason is None:
                 continue
-            seen.add(identity)
+            seen_candidates.add(identity)
             mall = str(candidate["mall"] or "")
-            rows.append(
-                {
+            base_row = {
                     "mall": mall,
                     "mall_name": next(
                         (m.mall_name for m in mappings if m.mall_key == mall),
                         mall,
-                    ),
-                    "original_url": str(candidate["original_url"] or ""),
-                    "document_ids": sorted(
-                        {
-                            str(link["document_id"])
-                            for link in prewarm_store.links_for_candidate(candidate_id)
-                            if str(link.get("document_id") or "")
-                        }
                     ),
                     "reason": reason,
                     "last_task_name": str((job_row or {}).get("task_name") or ""),
@@ -597,8 +606,43 @@ def failed_customer_link_rows(
                     "redispatch_links_used": used,
                     "owning_day": owning_day,
                 }
-            )
-    rows.sort(key=lambda row: (row["mall"], row["original_url"]))
+            for observation in prewarm_store.observations_for_candidate(
+                business_date, candidate_id
+            ):
+                document_id = str(observation.get("document_id") or "")
+                original_url = str(observation.get("original_url") or "")
+                row_identity = (mall, original_url, document_id)
+                if not document_id or not original_url or row_identity in seen_rows:
+                    continue
+                seen_rows.add(row_identity)
+                customer_evidence = {
+                    "fourCategoryId": str(observation.get("four_category_id") or ""),
+                    "fourCategoryName": str(observation.get("four_category_name") or ""),
+                    "customerTitle": str(observation.get("customer_title") or ""),
+                    "customerPrice": observation.get("customer_price"),
+                    "customerPriceStatus": str(
+                        observation.get("customer_price_status") or ""
+                    ),
+                    "customerPriceSource": str(
+                        observation.get("customer_price_source") or ""
+                    ),
+                    "customerPriceWarning": str(
+                        observation.get("customer_price_warning") or ""
+                    ),
+                    "customerPriceEvidence": str(
+                        observation.get("customer_price_evidence") or ""
+                    ),
+                }
+                rows.append(
+                    {
+                        **base_row,
+                        "original_url": original_url,
+                        "document_id": document_id,
+                        "document_ids": [document_id],
+                        "customer_evidence": customer_evidence,
+                    }
+                )
+    rows.sort(key=lambda row: (row["mall"], row["original_url"], row["document_id"]))
     return rows
 
 

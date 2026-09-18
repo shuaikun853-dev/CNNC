@@ -21,10 +21,30 @@ from typing import Any, Iterator, Mapping, Sequence
 
 from app.services.customer_price_semantics import CUSTOMER_PRICE_RETRYABLE_DETAIL_STATUSES
 from app.services.crawl_url_identity import is_placeholder_code
+from app.services.page_price_semantics import valid_page_price_result
 
 
 DEFAULT_TENANT_ID = 188605
 DEFAULT_POOL_ID = 222
+
+_REQUIRED_FINAL_METRICS = frozenset({
+    "finalized_rows",
+    "final_missing_page_price_rows",
+    "final_frozen_missing_page_price_rows",
+    "final_failed_customer_link_rows",
+    "final_appended_failed_customer_link_rows",
+    "final_page_price_required_rows",
+})
+_REQUIRED_FORCE_FINAL_METRICS = frozenset({
+    "forced", "forced_incomplete_count", "forced_incomplete_item_count",
+    "remote_incomplete_job_count", "blocker_count", "force_finalize",
+    "force_finalize_at", "force_finalize_max_incomplete",
+    "force_finalize_actual_incomplete", "force_finalize_accept_unresolved_crawl",
+    "missing_page_price_rows", "page_price_required_rows",
+    "force_finalize_reason", "frozen_snapshot_id", "frozen_row_count",
+    "blocker_summary_at_force_finalize", "force_finalize_incomplete_tasks",
+})
+FINALIZATION_INTENT_KEY = "_finalization_intent"
 
 
 class LeaseUnavailable(RuntimeError):
@@ -362,6 +382,30 @@ class DailyAuditStore:
                     updated_at TEXT NOT NULL,
                     UNIQUE(run_id, mall_key, source_id, sku_id, exact_url, backend_version)
                 );
+                CREATE TABLE IF NOT EXISTS local_fallback_work (
+                    id INTEGER PRIMARY KEY,
+                    run_id INTEGER NOT NULL REFERENCES daily_runs(id) ON DELETE CASCADE,
+                    crawl_work_id INTEGER NOT NULL REFERENCES crawl_work(id) ON DELETE CASCADE,
+                    mall_key TEXT NOT NULL,
+                    exact_url TEXT NOT NULL,
+                    state TEXT NOT NULL DEFAULT 'PENDING',
+                    eligible_reason TEXT,
+                    last_remote_check_at TEXT,
+                    claim_at TEXT,
+                    claim_tick_id TEXT,
+                    last_attempt_tick_id TEXT,
+                    attempt_count INTEGER NOT NULL DEFAULT 0,
+                    completed_at TEXT,
+                    crawler_revision TEXT,
+                    result_json TEXT,
+                    error_text TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(crawl_work_id)
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS ux_local_fallback_active_url
+                    ON local_fallback_work(run_id, exact_url)
+                    WHERE state='CLAIMED';
                 CREATE TABLE IF NOT EXISTS remote_job_replacements (
                     id INTEGER PRIMARY KEY,
                     run_id INTEGER NOT NULL REFERENCES daily_runs(id) ON DELETE CASCADE,
@@ -2589,6 +2633,267 @@ class DailyAuditStore:
                 rows = connection.execute("SELECT * FROM crawl_work WHERE run_id=? ORDER BY id", (token.run_id,)).fetchall()
             return [self._row(row) for row in rows]  # type: ignore[list-item]
 
+    def observe_local_fallback_remote_checks(
+        self,
+        token: LeaseToken,
+        checked_at: str,
+        supported_malls: set[str] | frozenset[str],
+        *,
+        checked_remote_job_ids: set[int] | frozenset[int],
+    ) -> list[dict[str, Any]]:
+        """Ensure fallback rows and stamp only remote jobs actually checked.
+
+        ``crawl_work.updated_at`` is deliberately not used: it may change for
+        unrelated lifecycle transitions and cannot prove a harvest/reconcile.
+        """
+        checked = self._utc_timestamp(checked_at, field="checked_at")
+        assert checked is not None
+        malls = sorted({str(value).strip() for value in supported_malls if str(value).strip()})
+        checked_job_ids = {int(value) for value in checked_remote_job_ids}
+        if not malls:
+            return []
+        with self._transaction(immediate=True) as connection:
+            self._validate_lease(connection, token)
+            placeholders = ",".join("?" for _ in malls)
+            rows = connection.execute(
+                f"""SELECT c.*, r.created_at AS remote_started_at,
+                            f.id AS fallback_id, f.state AS fallback_state,
+                            f.last_remote_check_at, f.attempt_count,
+                            f.last_attempt_tick_id
+                       FROM crawl_work c
+                       JOIN remote_jobs r ON r.id=c.remote_job_id AND r.run_id=c.run_id
+                       LEFT JOIN local_fallback_work f ON f.crawl_work_id=c.id
+                      WHERE c.run_id=? AND c.mall_key IN ({placeholders})
+                        AND c.state<>'SUCCESS'
+                      ORDER BY c.id""",
+                (token.run_id, *malls),
+            ).fetchall()
+            now = self._utcnow()
+            observed: list[dict[str, Any]] = []
+            for row in rows:
+                previous = self._row(row)
+                assert previous is not None
+                if row["fallback_id"] is None:
+                    connection.execute(
+                        """INSERT INTO local_fallback_work(
+                               run_id, crawl_work_id, mall_key, exact_url,
+                               last_remote_check_at, created_at, updated_at
+                           ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                        (
+                            token.run_id, row["id"], row["mall_key"], row["exact_url"],
+                            checked if int(row["remote_job_id"]) in checked_job_ids else None,
+                            now, now,
+                        ),
+                    )
+                elif int(row["remote_job_id"]) in checked_job_ids:
+                    connection.execute(
+                        "UPDATE local_fallback_work SET last_remote_check_at=?, updated_at=? WHERE id=?",
+                        (checked, now, row["fallback_id"]),
+                    )
+                observed.append(previous)
+            return observed
+
+    def claim_local_fallback(
+        self,
+        token: LeaseToken,
+        crawl_work_id: int,
+        eligible_reason: str,
+        tick_id: str,
+        claimed_at: str,
+        *,
+        max_attempts: int = 2,
+    ) -> dict[str, Any] | None:
+        """Atomically claim one exact URL; a second process receives ``None``."""
+        if eligible_reason not in {"DAYTIME_60M", "PEAK_3M", "AFTER_1800"}:
+            raise ValueError("unknown local fallback eligibility reason")
+        claimed = self._utc_timestamp(claimed_at, field="claimed_at")
+        assert claimed is not None
+        normalized_tick = str(tick_id or "").strip()
+        if not normalized_tick:
+            raise ValueError("local fallback tick_id is required")
+        with self._transaction(immediate=True) as connection:
+            self._validate_crawl_lease(connection, token, crawl_work_id)
+            crawl = connection.execute("SELECT * FROM crawl_work WHERE id=?", (crawl_work_id,)).fetchone()
+            assert crawl is not None
+            if crawl["state"] == "SUCCESS":
+                return None
+            work = connection.execute(
+                "SELECT * FROM local_fallback_work WHERE crawl_work_id=?", (crawl_work_id,)
+            ).fetchone()
+            if work is None:
+                raise RemoteIntentConflict("local fallback requires a persisted remote check")
+            if work["state"] == "CLAIMED":
+                return None
+            if work["state"] in {"SUCCESS", "TERMINAL_FAILED"}:
+                return None
+            if work["last_attempt_tick_id"] == normalized_tick or int(work["attempt_count"]) >= max_attempts:
+                return None
+            try:
+                changed = connection.execute(
+                    """UPDATE local_fallback_work
+                          SET state='CLAIMED', eligible_reason=?, claim_at=?, claim_tick_id=?,
+                              last_attempt_tick_id=?, attempt_count=attempt_count+1,
+                              error_text=NULL, updated_at=?
+                        WHERE id=? AND state IN ('PENDING','RETRYABLE_FAILED')""",
+                    (eligible_reason, claimed, normalized_tick, normalized_tick, self._utcnow(), work["id"]),
+                )
+            except sqlite3.IntegrityError:
+                return None
+            if changed.rowcount != 1:
+                return None
+            row = connection.execute(
+                """SELECT f.*, c.sku_id, c.source_id, c.backend_version, c.remote_job_id
+                     FROM local_fallback_work f JOIN crawl_work c ON c.id=f.crawl_work_id
+                    WHERE f.id=?""",
+                (work["id"],),
+            ).fetchone()
+            return self._row(row)
+
+    def defer_unstarted_local_fallback(
+        self, token: LeaseToken, fallback_id: int, tick_id: str
+    ) -> dict[str, Any]:
+        """Return an unlaunched claim to the next tick without charging an attempt."""
+        with self._transaction(immediate=True) as connection:
+            self._validate_lease(connection, token)
+            work = connection.execute(
+                "SELECT * FROM local_fallback_work WHERE id=? AND run_id=?", (fallback_id, token.run_id)
+            ).fetchone()
+            if work is None or work["state"] != "CLAIMED" or work["claim_tick_id"] != str(tick_id):
+                raise RemoteIntentConflict("budget deferral requires this tick's unstarted claim")
+            prior_attempts = int(work["attempt_count"]) - 1
+            connection.execute(
+                """UPDATE local_fallback_work
+                      SET state=?, attempt_count=?, claim_at=NULL, claim_tick_id=NULL,
+                          error_text='budget deferred before child launch', updated_at=?
+                    WHERE id=?""",
+                (
+                    "PENDING" if prior_attempts == 0 else "RETRYABLE_FAILED",
+                    prior_attempts, self._utcnow(), fallback_id,
+                ),
+            )
+            return self._row(connection.execute("SELECT * FROM local_fallback_work WHERE id=?", (fallback_id,)).fetchone())  # type: ignore[return-value]
+
+    def recover_interrupted_local_fallback_claims(
+        self,
+        token: LeaseToken,
+        tick_id: str,
+        recovered_at: str,
+        *,
+        max_attempts: int = 2,
+    ) -> int:
+        """Release old crashed claims, never claims from the same/current instant."""
+        recovered = self._utc_timestamp(recovered_at, field="recovered_at")
+        assert recovered is not None
+        current = datetime.fromisoformat(recovered)
+        normalized_tick = str(tick_id or "").strip()
+        with self._transaction(immediate=True) as connection:
+            self._validate_lease(connection, token)
+            rows = connection.execute(
+                "SELECT * FROM local_fallback_work WHERE run_id=? AND state='CLAIMED' AND claim_tick_id<>?",
+                (token.run_id, normalized_tick),
+            ).fetchall()
+            count = 0
+            for row in rows:
+                claim_at = datetime.fromisoformat(str(row["claim_at"]))
+                if (current - claim_at).total_seconds() < 1:
+                    continue
+                state = "RETRYABLE_FAILED" if int(row["attempt_count"]) < max_attempts else "TERMINAL_FAILED"
+                connection.execute(
+                    "UPDATE local_fallback_work SET state=?, error_text='interrupted local fallback claim', updated_at=? WHERE id=?",
+                    (state, self._utcnow(), row["id"]),
+                )
+                if state == "TERMINAL_FAILED":
+                    connection.execute(
+                        """UPDATE crawl_work SET state='MANUAL_REQUIRED',
+                                  error_text='local fallback: interrupted claim exhausted retry budget',
+                                  updated_at=?
+                            WHERE id=?
+                              AND state NOT IN ('SUCCESS','NO_RESULT','TERMINAL_FAILED')""",
+                        (self._utcnow(), row["crawl_work_id"]),
+                    )
+                count += 1
+            return count
+
+    def complete_local_fallback(
+        self,
+        token: LeaseToken,
+        fallback_id: int,
+        result: Any,
+        *,
+        crawler_revision: str,
+        completed_at: str,
+    ) -> dict[str, Any]:
+        """Commit local evidence and fan it out to duplicate exact URLs."""
+        completed = self._utc_timestamp(completed_at, field="completed_at")
+        assert completed is not None
+        encoded = self._canonical_json(result)
+        with self._transaction(immediate=True) as connection:
+            self._validate_lease(connection, token)
+            work = connection.execute(
+                "SELECT * FROM local_fallback_work WHERE id=? AND run_id=?", (fallback_id, token.run_id)
+            ).fetchone()
+            if work is None or work["state"] != "CLAIMED":
+                raise RemoteIntentConflict("local fallback completion requires its active claim")
+            connection.execute(
+                """UPDATE crawl_work SET state='SUCCESS', result_json=?, error_text=NULL, updated_at=?
+                    WHERE run_id=? AND mall_key=? AND exact_url=? AND state<>'SUCCESS'""",
+                (encoded, self._utcnow(), token.run_id, work["mall_key"], work["exact_url"]),
+            )
+            connection.execute(
+                """UPDATE local_fallback_work
+                      SET state='SUCCESS', completed_at=?, crawler_revision=?, result_json=?,
+                          error_text=NULL, updated_at=?
+                    WHERE run_id=? AND mall_key=? AND exact_url=?
+                      AND state NOT IN ('SUCCESS','TERMINAL_FAILED')""",
+                (
+                    completed, crawler_revision, encoded, self._utcnow(), token.run_id,
+                    work["mall_key"], work["exact_url"],
+                ),
+            )
+            return self._row(connection.execute("SELECT * FROM local_fallback_work WHERE id=?", (fallback_id,)).fetchone())  # type: ignore[return-value]
+
+    def fail_local_fallback(
+        self,
+        token: LeaseToken,
+        fallback_id: int,
+        error: str,
+        *,
+        retryable: bool,
+        max_attempts: int = 2,
+    ) -> dict[str, Any]:
+        with self._transaction(immediate=True) as connection:
+            self._validate_lease(connection, token)
+            work = connection.execute(
+                "SELECT * FROM local_fallback_work WHERE id=? AND run_id=?", (fallback_id, token.run_id)
+            ).fetchone()
+            if work is None or work["state"] != "CLAIMED":
+                raise RemoteIntentConflict("local fallback failure requires its active claim")
+            state = "RETRYABLE_FAILED" if retryable and int(work["attempt_count"]) < max_attempts else "TERMINAL_FAILED"
+            connection.execute(
+                "UPDATE local_fallback_work SET state=?, error_text=?, updated_at=? WHERE id=?",
+                (state, str(error), self._utcnow(), fallback_id),
+            )
+            if state == "TERMINAL_FAILED":
+                connection.execute(
+                    """UPDATE crawl_work SET state='MANUAL_REQUIRED', error_text=?, updated_at=?
+                        WHERE run_id=? AND mall_key=? AND exact_url=?
+                          AND state NOT IN ('SUCCESS','NO_RESULT','TERMINAL_FAILED')""",
+                    (f"local fallback: {error}", self._utcnow(), token.run_id, work["mall_key"], work["exact_url"]),
+                )
+            return self._row(connection.execute("SELECT * FROM local_fallback_work WHERE id=?", (fallback_id,)).fetchone())  # type: ignore[return-value]
+
+    def list_local_fallback_work(self, token: LeaseToken) -> list[dict[str, Any]]:
+        with self._transaction(immediate=False) as connection:
+            self._validate_lease(connection, token)
+            return [self._row(row) for row in connection.execute(
+                """SELECT f.*, c.state AS crawl_state,
+                           c.result_json AS crawl_result_json, c.remote_job_id
+                      FROM local_fallback_work f
+                      JOIN crawl_work c ON c.id=f.crawl_work_id
+                     WHERE f.run_id=? ORDER BY f.id""",
+                (token.run_id,)
+            ).fetchall()]  # type: ignore[list-item]
+
     def complete_crawl_work(self, token: LeaseToken, crawl_work_id: int, result: Any) -> dict[str, Any]:
         with self._transaction(immediate=True) as connection:
             self._validate_crawl_lease(connection, token, crawl_work_id)
@@ -2602,6 +2907,27 @@ class DailyAuditStore:
             if work["state"] in {"NO_RESULT", "TERMINAL_FAILED"}:
                 raise RemoteIntentConflict("terminal crawl cannot become successful")
             connection.execute("UPDATE crawl_work SET state='SUCCESS', result_json=?, error_text=NULL, updated_at=? WHERE id=?", (encoded, self._utcnow(), crawl_work_id))
+            return self._row(connection.execute("SELECT * FROM crawl_work WHERE id=?", (crawl_work_id,)).fetchone())  # type: ignore[return-value]
+
+    def complete_terminal_crawl_from_final_remote_check(
+        self, token: LeaseToken, crawl_work_id: int, remote_job_id: int, result: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        """A newly checked remote price may resolve an earlier remote terminal result."""
+        if not valid_page_price_result(result) or not str(result.get("page_price_source") or "").startswith("招商局"):
+            raise ValueError("final remote result must be a valid Zhaoshang price")
+        encoded = self._canonical_json(result)
+        with self._transaction(immediate=True) as connection:
+            self._validate_crawl_lease(connection, token, crawl_work_id)
+            work = connection.execute("SELECT * FROM crawl_work WHERE id=?", (crawl_work_id,)).fetchone()
+            assert work is not None
+            if int(work["remote_job_id"] or 0) != int(remote_job_id):
+                raise RemoteIntentConflict("final remote price requires the exact linked job")
+            if work["state"] not in {"NO_RESULT", "TERMINAL_FAILED"}:
+                raise RemoteIntentConflict("final remote terminal supersession requires remote terminal state")
+            connection.execute(
+                "UPDATE crawl_work SET state='SUCCESS', result_json=?, error_text=NULL, updated_at=? WHERE id=?",
+                (encoded, self._utcnow(), crawl_work_id),
+            )
             return self._row(connection.execute("SELECT * FROM crawl_work WHERE id=?", (crawl_work_id,)).fetchone())  # type: ignore[return-value]
 
     def complete_partial_exact_crawl_work(
@@ -3011,6 +3337,11 @@ class DailyAuditStore:
         with self._transaction(immediate=True) as connection:
             run = self._validate_lease(connection, token)
             existing = json.loads(run["metrics_json"] or "{}")
+            if run["state"] == "FINALIZED":
+                immutable = _REQUIRED_FINAL_METRICS | _REQUIRED_FORCE_FINAL_METRICS | {FINALIZATION_INTENT_KEY}
+                if any(key in immutable and (key not in existing or existing[key] != value)
+                       for key, value in metrics.items()):
+                    raise FrozenSnapshotConflict("finalized metrics are immutable")
             existing.update(metrics)
             connection.execute("UPDATE daily_runs SET metrics_json=?, updated_at=? WHERE id=?", (self._canonical_json(existing), self._utcnow(), token.run_id))
             return self._row(connection.execute("SELECT * FROM daily_runs WHERE id=?", (token.run_id,)).fetchone())  # type: ignore[return-value]
@@ -3027,11 +3358,29 @@ class DailyAuditStore:
             connection.execute("UPDATE daily_runs SET state=CASE WHEN state='FINALIZED' THEN state ELSE 'FINALIZING' END, frozen_snapshot_id=?, updated_at=? WHERE id=?", (snapshot_id, self._utcnow(), token.run_id))
             return self._row(connection.execute("SELECT * FROM daily_runs WHERE id=?", (token.run_id,)).fetchone())  # type: ignore[return-value]
 
-    def prepare_finalization(self, token: LeaseToken, output_path: str) -> dict[str, Any]:
+    def prepare_finalization(
+        self,
+        token: LeaseToken,
+        output_path: str,
+        *,
+        input_manifest_hash: str | None = None,
+        metrics: Mapping[str, Any] | None = None,
+        refresh_intent: bool = False,
+    ) -> dict[str, Any]:
         """Durably reserve the one formal output path before publishing it."""
         output_path = str(output_path or "").strip()
         if not output_path:
             raise ValueError("finalization output path must be non-empty")
+        if (input_manifest_hash is None) != (metrics is None):
+            raise ValueError("finalization intent requires both input hash and metrics")
+        intent = None
+        if metrics is not None:
+            if not str(input_manifest_hash or "").strip():
+                raise ValueError("finalization intent requires a non-empty input hash")
+            intent = {
+                "input_manifest_hash": input_manifest_hash,
+                "metrics": json.loads(self._canonical_json(dict(metrics))),
+            }
         with self._transaction(immediate=True) as connection:
             run = self._validate_lease(connection, token)
             if run["frozen_snapshot_id"] is None:
@@ -3043,16 +3392,21 @@ class DailyAuditStore:
                 raise FrozenSnapshotConflict("daily run was already finalized for another output path")
             if prepared_path and prepared_path != output_path:
                 raise FrozenSnapshotConflict("daily run already prepared another final output path")
-            if not prepared_path:
+            existing_metrics = json.loads(run["metrics_json"] or "{}")
+            current_intent = existing_metrics.get(FINALIZATION_INTENT_KEY)
+            if intent is not None and (current_intent is None or refresh_intent):
+                existing_metrics[FINALIZATION_INTENT_KEY] = intent
+            if not prepared_path or existing_metrics.get(FINALIZATION_INTENT_KEY) != current_intent:
                 connection.execute(
-                    "UPDATE daily_runs SET state='FINALIZING', final_output_path=?, updated_at=? WHERE id=?",
-                    (output_path, self._utcnow(), token.run_id),
+                    "UPDATE daily_runs SET state='FINALIZING', final_output_path=?, metrics_json=?, updated_at=? WHERE id=?",
+                    (output_path, self._canonical_json(existing_metrics), self._utcnow(), token.run_id),
                 )
                 run = connection.execute("SELECT * FROM daily_runs WHERE id=?", (token.run_id,)).fetchone()
                 assert run is not None
             return self._row(run)  # type: ignore[return-value]
 
     def mark_finalized(self, token: LeaseToken, output_path: str, manifest_hash: str) -> dict[str, Any]:
+        """Legacy idempotence check; new transitions require commit_finalization."""
         with self._transaction(immediate=True) as connection:
             run = self._validate_lease(connection, token)
             if run["frozen_snapshot_id"] is None:
@@ -3063,7 +3417,54 @@ class DailyAuditStore:
                 raise FrozenSnapshotConflict("finalization output path differs from its prepared intent")
             if run["state"] == "FINALIZED":
                 if run["final_manifest_hash"] == manifest_hash:
-                    return run
+                    return self._row(run)  # type: ignore[return-value]
                 raise FrozenSnapshotConflict("daily run was already finalized with different output evidence")
-            connection.execute("UPDATE daily_runs SET state='FINALIZED', final_manifest_hash=?, updated_at=? WHERE id=?", (manifest_hash, self._utcnow(), token.run_id))
+            raise FrozenSnapshotConflict("new finalization requires commit_finalization with final metrics")
+
+    def commit_finalization(
+        self,
+        token: LeaseToken,
+        output_path: str,
+        manifest_hash: str,
+        metrics: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Commit final evidence and its immutable metrics as one SQLite transition."""
+        with self._transaction(immediate=True) as connection:
+            run = self._validate_lease(connection, token)
+            if run["frozen_snapshot_id"] is None:
+                raise FrozenSnapshotConflict("finalization requires a frozen authoritative snapshot")
+            if not run["final_output_path"]:
+                raise FrozenSnapshotConflict("finalization requires a prepared output path")
+            if run["final_output_path"] != output_path:
+                raise FrozenSnapshotConflict("finalization output path differs from its prepared intent")
+            if not str(manifest_hash or "").strip():
+                raise ValueError("finalization requires a manifest hash")
+            final_metrics = json.loads(self._canonical_json(dict(metrics)))
+            required = _REQUIRED_FINAL_METRICS
+            if "forced" in final_metrics or "force_finalize" in final_metrics:
+                if final_metrics.get("forced") is not True or final_metrics.get("force_finalize") is not True:
+                    raise ValueError("force finalization markers must both be true")
+                required = required | _REQUIRED_FORCE_FINAL_METRICS
+            missing = required - final_metrics.keys()
+            if missing:
+                raise ValueError(f"finalization metrics missing required keys: {', '.join(sorted(missing))}")
+            existing_metrics = json.loads(run["metrics_json"] or "{}")
+            if not isinstance(existing_metrics, dict):
+                raise ValueError("daily metrics must be a JSON object")
+            intent = existing_metrics.get(FINALIZATION_INTENT_KEY)
+            if intent is not None and intent.get("metrics") != final_metrics:
+                raise FrozenSnapshotConflict("final metrics differ from prepared publication intent")
+            if run["state"] == "FINALIZED":
+                if run["final_manifest_hash"] != manifest_hash:
+                    raise FrozenSnapshotConflict("daily run was already finalized with different output evidence")
+                if any(key not in existing_metrics or existing_metrics[key] != value
+                       for key, value in final_metrics.items()):
+                    raise FrozenSnapshotConflict("daily run was already finalized with different final metrics")
+                return self._row(run)  # type: ignore[return-value]
+            existing_metrics.pop(FINALIZATION_INTENT_KEY, None)
+            existing_metrics.update(final_metrics)
+            connection.execute(
+                "UPDATE daily_runs SET state='FINALIZED', final_manifest_hash=?, metrics_json=?, updated_at=? WHERE id=?",
+                (manifest_hash, self._canonical_json(existing_metrics), self._utcnow(), token.run_id),
+            )
             return self._row(connection.execute("SELECT * FROM daily_runs WHERE id=?", (token.run_id,)).fetchone())  # type: ignore[return-value]

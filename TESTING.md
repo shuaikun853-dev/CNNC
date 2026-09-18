@@ -58,13 +58,13 @@ python -m pytest tests\test_context_documents.py -q
 ```
 ### 增量价格审计
 ```powershell
-# Scheduler 路由（白天 15 分钟、17:00-17:50 每 5 分钟 tick、17:55 harvest-only、18:00-20:00 每 5 分钟 closeout、20:35 一次性 safety closeout）、snapshot 180 秒有限重试、公平/post harvest、freeze gate、writer lock、只读 status；simulation 文件另证四 trigger 时间线 + IgnoreNew 重叠丢弃/不堆积/单 writer（2/6/9 分钟 tick、12/20/28/32 分钟 closeout）
+# Scheduler 路由（白天 15 分钟、17:00-17:57 每 3 分钟完整 tick、18:00-20:00 每 5 分钟 closeout、20:35 一次性 safety closeout）、snapshot 180 秒有限重试、公平/post harvest、freeze gate、writer lock、只读 status；simulation 文件另证四 trigger 时间线 + IgnoreNew 重叠丢弃/不堆积/单 writer。相关套件同时覆盖固定 8 站 remote 终态转 local、按站预检及 partial settle、exit 2/3、启动前 live tick 预算与未启动 claim 退还尝试次数，以及最终物化 intent、FINALIZED/manifest/最终 metrics 同事务回滚和幂等、晚到采集重试、prewarm 不漂移；文件与 DB 不具备跨系统 ACID。
 python -m pytest tests\test_incremental_audit_operations.py -k "scheduler or scheduled" -q; python -m pytest tests\test_scheduler_frequency_simulation.py -q
 python -m pytest tests\test_harvest_only.py -q  # 白天 harvest-only：无 discovery/Detail/Model/submit/finalize、本地 NOOP、全量 sweep、幂等
 python -m pytest tests\test_incremental_price_audit.py tests\test_incremental_audit_runtime.py -k "existing_remote_drain or drain_only" -q; python -m pytest tests\test_remote_running_recovery.py -q  # RUNNING 停滞判定/一次性精确重启/RECOVERY_EXHAUSTED 终态（全 fake adapter）
 python -m pytest tests\test_daily_audit_store.py tests\test_incremental_audit_runtime.py tests\test_incremental_audit_operations.py -k "process_lock or writer_lock or lock_conflict or lock_status or active_writer or materialization_remains" -q
 python -m pytest tests\test_daily_audit_store.py tests\test_cnnc_saas_snapshot_adapter.py tests\test_saas_audit_core.py tests\test_title_match_model_retry.py tests\test_incremental_price_audit.py tests\test_incremental_audit_runtime.py tests\test_harvest_only.py `
-  tests\test_incremental_audit_operations.py tests\test_incremental_audit_resilience.py tests\test_incremental_audit_recovery.py tests\test_scheduler_frequency_simulation.py tests\test_partial_exact_harvest.py tests\test_incremental_price_audit_finalize.py tests\test_incremental_production_readiness_audit.py tests\test_incremental_audit_materializer.py tests\test_legacy_zhaoshang_adapter.py tests\test_incremental_price_audit_history.py tests\test_incremental_history_benchmark.py -q
+  tests\test_incremental_audit_operations.py tests\test_incremental_audit_resilience.py tests\test_incremental_audit_recovery.py tests\test_scheduler_frequency_simulation.py tests\test_partial_exact_harvest.py tests\test_incremental_price_audit_finalize.py tests\test_finalize_failed_link_rows.py tests\test_incremental_production_readiness_audit.py tests\test_incremental_audit_materializer.py tests\test_legacy_zhaoshang_adapter.py tests\test_incremental_price_audit_history.py tests\test_incremental_history_benchmark.py tests\test_incremental_local_fallback.py tests\test_customer_prewarm_lifecycle.py tests\test_customer_prewarm_dispatch.py -q
 # Issue #9 客户参考链接预爬旁路:提取等价/发现状态/缓存复用/每日同步幂等/STEP1 隔离/customer-only 恢复/scanner CLI 与 installer 文本门禁
 python -m pytest tests\test_customer_reference_links.py tests\test_customer_prewarm_store.py tests\test_customer_prewarm_discovery.py tests\test_customer_prewarm_daily_sync.py tests\test_customer_prewarm_step1_isolation.py tests\test_customer_prewarm_customer_recovery.py tests\test_customer_prewarm_scan_cli.py -q
 # Issue #11 史泰博本地预爬:URL 识别/失败分类/状态机与 claim 租约/暂缓退避/缓存同步幂等/plan-only 零写与 live 单次有界执行(覆盖 app/services/staples_prewarm.py 与 scripts/staples_prewarm_run.py)
@@ -161,7 +161,7 @@ Get-ChildItem runtime -Recurse -Filter BATCH_STATE.md |
 - 页面价 0 使用 `PRICE_IS_ZERO`/“价格为0”并整行高亮。
 - 任意后补价格都重新计算 `page_vs_customer_check`、`price_changed`、`over_30pct`、`final_decision`。
 - 缺价时先有清单和授权门，未授权不启动本地脚本。
-- multi-site 首轮只生成 review/manifest 并锁定候选数、清单及文件 SHA-256、已审查 Git 提交 `95437150efcf7cae7412d212c1fa49d932a42a80`，设 `WAITING_USER`且零爬取；计划失败只用 review 恢复入口，不重跑第一步；二次授权后的独立续跑不重跑招商局，不继承认证/模型/数据库密钥，并严格对账每站输入输出；初始化/建任务/启用/提优证据异常、exit 2/3、部分/外来/重复输出都不生成 formal final，也不自动重跑。
+- multi-site 首轮只生成 review/manifest 并锁定候选数、清单及文件 SHA-256、已审查 Git 提交 `28870666aeb99a10494ebb91419aadf3bff4c0a8`，设 `WAITING_USER`且零爬取；计划失败只用 review 恢复入口，不重跑第一步；二次授权后的独立续跑不重跑招商局，不继承认证/模型/数据库密钥，并严格对账每站输入输出；初始化/建任务/启用/提优证据异常、exit 2/3、部分/外来/重复输出都不生成 formal final，也不自动重跑。
 - 驳回和通过都不是第一步默认动作；驳回仅限指定最终 Excel，受控通过可用指定最终 Excel，或用户在同一授权消息中明确指定为本轮结果表的 `saas_audit_review_*.xlsx`。两者都必须有候选数、清单 SHA-256、写前待审核对、逐批 `rspCode=0000` 证据和写后目标无遗留；驳回固定使用 `data/sass-bohui.curl`，`--fill-colors yellow-only --require-customer-price` 必须只选 F 列黄色且表头“客户价”非空的行；通过固定使用 `data/sass-tongguo.curl` 并排除 F 列红/黄色行，`--require-customer-price` 必须再排除表头“客户价”的空值和空白字符串，数值 0 视为非空。
 
 重点回归：

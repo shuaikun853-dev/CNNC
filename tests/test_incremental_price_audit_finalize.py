@@ -12,6 +12,7 @@ from app.workflows.incremental_price_audit_finalize import (
     FinalizeBlocked,
     build_frozen_audit_artifact,
     materialize_frozen_review,
+    materialize_forced_frozen_daily_run,
     materialize_frozen_daily_run,
 )
 
@@ -178,6 +179,72 @@ def test_build_artifact_replays_duplicate_frozen_order_and_precomputed_results(t
     assert len(built.artifact.audit_response.record_results) == 2
     assert all(row["__page_price_status"] == "OK" for row in built.artifact.frozen_rows)
     assert built.artifact.frozen_snapshot_id == str(snapshot["id"])
+
+
+def test_stale_submit_unknown_does_not_block_local_success_finalization(tmp_path):
+    store, _snapshot = _seed(tmp_path, rows=[_row()], crawl_pending=True)
+    token = store.acquire_lease("2026-08-11", "local-success", 60)
+    crawl = store.list_crawl_work(token)[0]
+    job = store.prepare_remote_intent(
+        token, "mall:unknown", "daily-unknown", "payload", mall_key="mall"
+    )
+    store.claim_remote_submission(token, int(job["id"]))
+    store.mark_submit_unknown(token, int(job["id"]), "submission uncertain")
+    store.link_crawl_work_to_remote_job(token, int(crawl["id"]), int(job["id"]))
+    store.complete_crawl_work(token, int(crawl["id"]), {
+        "page_price_value": "8.88",
+        "page_price_status": "OK",
+        "page_price_source": "本地兜底:mall",
+    })
+
+    built = build_frozen_audit_artifact(
+        store, token, output_identity="daily-final-20260811"
+    )
+
+    assert store.get_remote_job(int(job["id"]))["state"] == "SUBMIT_UNKNOWN"
+    assert built.readiness.ready is True
+    assert built.readiness.remote_pending == 0
+    store.release_lease(token)
+
+
+def test_mixed_remote_and_local_success_closes_stale_remote_job(tmp_path):
+    rows = [
+        _row(v="v-1", sku="sku-1", url="https://shop.example/item-1"),
+        _row(v="v-2", sku="sku-2", url="https://shop.example/item-2"),
+    ]
+    store, _snapshot = _seed(tmp_path, rows=rows, crawl_pending=True)
+    token = store.acquire_lease("2026-08-11", "mixed-success", 60)
+    first = store.list_crawl_work(token)[0]
+    second = store.ensure_crawl_work(
+        token, "mall", "sku-2", "https://shop.example/item-2", "legacy-v1",
+        "crawl-fp-2", source_id="v-2",
+    )
+    job = store.prepare_remote_intent(
+        token, "mall:mixed", "daily-mixed", "payload", mall_key="mall"
+    )
+    store.claim_remote_submission(token, int(job["id"]))
+    store.mark_submit_unknown(token, int(job["id"]), "submission uncertain")
+    for crawl in (first, second):
+        store.link_crawl_work_to_remote_job(token, int(crawl["id"]), int(job["id"]))
+    store.complete_crawl_work(token, int(first["id"]), {
+        "page_price_value": "9.50", "page_price_status": "OK",
+        "page_price_source": "招商局",
+    })
+    store.complete_crawl_work(token, int(second["id"]), {
+        "page_price_value": "8.88", "page_price_status": "OK",
+        "page_price_source": "本地兜底:mall",
+    })
+
+    built = build_frozen_audit_artifact(
+        store, token, output_identity="daily-final-20260811"
+    )
+
+    assert built.readiness.ready is True
+    assert built.readiness.remote_submit_unknown == 0
+    assert built.artifact is not None
+    assert [row["__page_price_source"] for row in built.artifact.frozen_rows] == [
+        "招商局", "本地兜底:mall",
+    ]
     store.release_lease(token)
 
 
@@ -543,7 +610,23 @@ def test_materialize_marks_run_finalized_and_same_finalize_reuses(tmp_path):
     run = store.get_run("2026-08-11")
     assert run["state"] == "FINALIZED"
     assert run["final_output_path"] == str(output.resolve())
-    assert json.loads(run["metrics_json"])["finalized_rows"] == 1
+    assert run["final_manifest_hash"] == first.materialization.manifest_sha256
+    metrics = json.loads(run["metrics_json"])
+    assert {key: metrics[key] for key in (
+        "finalized_rows",
+        "final_missing_page_price_rows",
+        "final_frozen_missing_page_price_rows",
+        "final_failed_customer_link_rows",
+        "final_appended_failed_customer_link_rows",
+        "final_page_price_required_rows",
+    )} == {
+        "finalized_rows": 1,
+        "final_missing_page_price_rows": 0,
+        "final_frozen_missing_page_price_rows": 0,
+        "final_failed_customer_link_rows": 0,
+        "final_appended_failed_customer_link_rows": 0,
+        "final_page_price_required_rows": 0,
+    }
 
 
 def test_finalized_run_rejects_different_output_before_materializer_writes(tmp_path):
@@ -571,7 +654,7 @@ def test_crash_after_publish_before_store_mark_recovers_idempotently(tmp_path, m
     store, _snapshot = _seed(tmp_path, rows=[_row(url="")])
     output = tmp_path / "formal.xlsx"
     materializer = LegacyWorkbookMaterializer(writer=_writer)
-    original = store.mark_finalized
+    original = getattr(store, "commit_finalization", None)
     calls = 0
 
     def crash_once(*args, **kwargs):
@@ -579,9 +662,10 @@ def test_crash_after_publish_before_store_mark_recovers_idempotently(tmp_path, m
         calls += 1
         if calls == 1:
             raise SystemExit("crash before DB mark")
+        assert original is not None
         return original(*args, **kwargs)
 
-    monkeypatch.setattr(store, "mark_finalized", crash_once)
+    monkeypatch.setattr(store, "commit_finalization", crash_once, raising=False)
     with pytest.raises(SystemExit):
         materialize_frozen_daily_run(
             store, ProcessLock(tmp_path / "finalize.lock"), "2026-08-11", output,
@@ -600,6 +684,66 @@ def test_crash_after_publish_before_store_mark_recovers_idempotently(tmp_path, m
     assert recovered.materialization is not None and recovered.materialization.reused is True
     assert output.read_bytes() == published
     assert store.get_run("2026-08-11")["state"] == "FINALIZED"
+
+
+def test_normal_publish_then_final_commit_failure_recovers_without_rewriting(tmp_path, monkeypatch):
+    store, _snapshot = _seed(tmp_path, rows=[_row(url="")])
+    output = tmp_path / "formal.xlsx"
+    materializer = LegacyWorkbookMaterializer(writer=_writer)
+
+    def crash(*_args, **_kwargs):
+        raise SystemExit("injected final DB failure")
+
+    monkeypatch.setattr(store, "update_daily_metrics", crash)
+    monkeypatch.setattr(store, "commit_finalization", crash, raising=False)
+    with pytest.raises(SystemExit, match="injected final DB failure"):
+        materialize_frozen_daily_run(
+            store, ProcessLock(tmp_path / "finalize.lock"), "2026-08-11", output,
+            materializer=materializer,
+        )
+    published = output.read_bytes()
+    manifest_path = output.with_name(output.name + ".manifest.json")
+    manifest = manifest_path.read_bytes()
+    interrupted = store.get_run("2026-08-11")
+    assert interrupted["state"] == "FINALIZING"
+    assert interrupted["final_manifest_hash"] is None
+    assert "final_missing_page_price_rows" not in json.loads(interrupted["metrics_json"] or "{}")
+
+    monkeypatch.undo()
+    recovered = materialize_frozen_daily_run(
+        store, ProcessLock(tmp_path / "finalize.lock"), "2026-08-11", output,
+        materializer=materializer,
+    )
+    assert recovered.materialization is not None and recovered.materialization.reused is True
+    assert output.read_bytes() == published
+    assert manifest_path.read_bytes() == manifest
+    assert store.get_run("2026-08-11")["state"] == "FINALIZED"
+
+
+def test_force_entry_cannot_commit_normal_publication_intent(tmp_path, monkeypatch):
+    store, _snapshot = _seed(tmp_path, rows=[_row(url="")])
+    output = tmp_path / "formal.xlsx"
+    materializer = LegacyWorkbookMaterializer(writer=_writer)
+
+    def crash(*_args, **_kwargs):
+        raise SystemExit("injected final DB failure")
+
+    monkeypatch.setattr(store, "commit_finalization", crash)
+    with pytest.raises(SystemExit):
+        materialize_frozen_daily_run(
+            store, ProcessLock(tmp_path / "finalize.lock"), "2026-08-11", output,
+            materializer=materializer,
+        )
+    published = output.read_bytes()
+    monkeypatch.undo()
+
+    with pytest.raises(FrozenSnapshotConflict, match="normal publication intent"):
+        materialize_forced_frozen_daily_run(
+            store, ProcessLock(tmp_path / "finalize.lock"), "2026-08-11", output,
+            max_incomplete=0, materializer=materializer,
+        )
+    assert store.get_run("2026-08-11")["state"] == "FINALIZING"
+    assert output.read_bytes() == published
 
 
 def test_blocked_readiness_never_writes_formal_workbook(tmp_path):

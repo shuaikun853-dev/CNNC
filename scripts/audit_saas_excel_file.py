@@ -1148,7 +1148,17 @@ def _write_record_results_sheet(
         )
         for column_index, header in enumerate(final_headers, start=1):
             cell = sheet.cell(row=row_index, column=column_index)
-            cell.value = _format_cell_value(merged.get(header, ""))
+            value = merged.get(header, "")
+            # Prices are numeric workbook evidence, not display text.  Keep
+            # Decimal precision for all calculations above, then hand Excel a
+            # number at the final serialization boundary.
+            if (
+                header == "customerPrice"
+                and isinstance(value, Decimal)
+                and info.get("__numeric_customer_price") is True
+            ):
+                value = float(value)
+            cell.value = _format_cell_value(value)
             if row_is_over:
                 cell.fill = OVER_30_FILL
             elif header in HIGHLIGHTED_RESULT_COLUMNS:
@@ -1798,12 +1808,16 @@ import subprocess as _subprocess  # noqa: E402
 
 DEFAULT_CRAWLER_SCRIPT = Path(r"E:\.A2026\多商城爬取\multi_mall_crawler\main.py")
 DEFAULT_MULTI_SITE_CRAWLER_ROOT = Path(r"E:\.A中核运维\cnnc-mall-crawler")
-EXPECTED_MULTI_SITE_CRAWLER_REVISION = "95437150efcf7cae7412d212c1fa49d932a42a80"
+EXPECTED_MULTI_SITE_CRAWLER_REVISION = "28870666aeb99a10494ebb91419aadf3bff4c0a8"
 MULTI_SITE_MALL_KEY_TO_SITE = {
     "nbdeli": "nbdeli",
     "guangbo": "guangbo",
     "ofs": "officemate",
     "lxwlmall": "lxwlmall",
+    "qstbg": "qstbg",
+    "ycw": "ycw",
+    "comix": "comix",
+    "tima": "tima",
 }
 MULTI_SITE_HOST_TO_SITE = {
     "b2b.nbdeli.com": "nbdeli",
@@ -1811,6 +1825,16 @@ MULTI_SITE_HOST_TO_SITE = {
     "officemate.cn": "officemate",
     "www.officemate.cn": "officemate",
     "www.lxwlmall.com": "lxwlmall",
+    "qstbg.com": "qstbg",
+    "www.qstbg.com": "qstbg",
+    "ycw.cn": "ycw",
+    "www.ycw.cn": "ycw",
+    "qx.com": "comix",
+    "www.qx.com": "comix",
+    "comix.com.cn": "comix",
+    "www.comix.com.cn": "comix",
+    "tima365.com": "tima",
+    "www.tima365.com": "tima",
 }
 MULTI_SITE_FALLBACK_DIRNAME = "multi_site_fallback"
 MULTI_SITE_MANIFEST_FILENAME = "manifest.xlsx"
