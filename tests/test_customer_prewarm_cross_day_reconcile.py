@@ -2021,7 +2021,222 @@ def test_cli_runs_cross_day_after_today_locks_release_before_harvest_with_shared
 
     assert exit_code == 0
     assert order == ["pass", "cross-day", "historical-harvest", "harvest"]
-    assert observed["cross_deadline"] == observed["historical_deadline"] == observed["harvest_deadline"]
+    assert observed["cross_deadline"] < observed["historical_deadline"] < observed["harvest_deadline"]
+
+
+def test_historical_harvest_preflight_error_does_not_skip_today(tmp_path, monkeypatch):
+    runtime_root = tmp_path / "runtime"
+    prewarm = CustomerPrewarmStore(runtime_root / "customer_prewarm.sqlite3")
+    cache = SharedCrawlCache(runtime_root / "shared_crawl_cache.sqlite3")
+    url = "https://qx.com/preflight-error.html"
+    _paths, job_id = seed_remote_work(
+        runtime_root, YESTERDAY, _CountingAdapter(), mapping=COMIX,
+        url=url, job_state="SUBMITTED", remote_identity="comix|old|number",
+    )
+    seed_remote_candidate(prewarm, url, job_id, business_date=YESTERDAY)
+    original = cross_day._linked_cross_day_job_keys
+    calls = 0
+
+    def broken_recheck(*args):
+        nonlocal calls
+        calls += 1
+        if calls > 1:
+            raise sqlite3.OperationalError("transient read error")
+        return original(*args)
+
+    monkeypatch.setattr(cross_day, "_linked_cross_day_job_keys", broken_recheck)
+    summary = _new_summary()
+    run_cross_day_harvest_phase(
+        prewarm_store=prewarm, shared_cache=cache,
+        current_business_date=TODAY, state_runtime_root=runtime_root,
+        get_adapter=lambda: _CountingAdapter(), deadline=1000.0,
+        monotonic_value=lambda: 1.0, summary=summary,
+    )
+    assert any("transient read error" in error for error in summary["phase_errors"])
+
+
+def test_historical_harvest_manual_and_permanent_sync_failure_are_visible(tmp_path, monkeypatch):
+    runtime_root = tmp_path / "runtime"
+    prewarm = CustomerPrewarmStore(runtime_root / "customer_prewarm.sqlite3")
+    cache = SharedCrawlCache(runtime_root / "shared_crawl_cache.sqlite3")
+    url = "https://qx.com/manual-sync-failure.html"
+    old_paths, job_id = seed_remote_work(
+        runtime_root, YESTERDAY, _CountingAdapter(), mapping=COMIX,
+        url=url, job_state="SUBMITTED", remote_identity="comix|old|number",
+    )
+    seed_remote_candidate(prewarm, url, job_id, business_date=YESTERDAY)
+    monkeypatch.setattr(
+        lifecycle, "harvest_existing_customer_prewarm_job",
+        lambda **_kwargs: {"outcome": "REMOTE_EXISTING_HARVEST_MANUAL"},
+    )
+    from app.services import customer_prewarm_discovery as discovery
+    monkeypatch.setattr(
+        discovery, "sync_daily_internet_results",
+        lambda *_args, **_kwargs: {
+            "ok_synced": 0, "errors": 0, "transient_failures": 0,
+            "deterministic_failures": 1, "errored_before": 1,
+        },
+    )
+    summary = _new_summary()
+    run_cross_day_harvest_phase(
+        prewarm_store=prewarm, shared_cache=cache,
+        current_business_date=TODAY, state_runtime_root=runtime_root,
+        get_adapter=lambda: _CountingAdapter(), deadline=1000.0,
+        monotonic_value=lambda: 1.0, summary=summary,
+    )
+    assert any("MANUAL" in error for error in summary["phase_errors"])
+    assert any("cache sync incomplete" in error for error in summary["phase_errors"])
+
+
+def test_a3_rejects_mismatched_latest_link_even_with_job_id_collision(tmp_path):
+    runtime_root = tmp_path / "runtime"
+    prewarm = CustomerPrewarmStore(runtime_root / "customer_prewarm.sqlite3")
+    url = "https://qx.com/mismatched-latest-link.html"
+    today_paths, colliding_job_id = seed_remote_work(
+        runtime_root, TODAY, _CountingAdapter(), mapping=COMIX,
+        url="https://qx.com/unrelated-today-job.html", job_state="SUBMITTED",
+        remote_identity="comix|today|number",
+    )
+    _paths, old_job_id = seed_remote_work(
+        runtime_root, YESTERDAY, _CountingAdapter(), mapping=COMIX,
+        url=url, job_state="SUBMITTED", remote_identity="comix|old|number",
+    )
+    with sqlite3.connect(today_paths.state_path) as connection:
+        connection.execute("UPDATE remote_jobs SET state='TERMINAL_FAILED' WHERE id=?", (colliding_job_id,))
+    with sqlite3.connect(_paths.state_path) as connection:
+        connection.execute("UPDATE remote_jobs SET state='TERMINAL_FAILED' WHERE id=?", (old_job_id,))
+    candidate_id = seed_remote_candidate(prewarm, url, old_job_id, business_date=YESTERDAY)
+    assert colliding_job_id == old_job_id
+    prewarm.record_remote_job_link(TODAY, candidate_id, old_job_id + 1, "customer-prewarm-zhaoshang")
+    plan = plan_lifecycle_actions(
+        today_paths.state_path, prewarm, TODAY, [COMIX],
+        state_runtime_root=runtime_root,
+    )
+    assert plan["redispatch_groups"] == {}
+
+
+def test_historical_manual_after_uncertain_harvest_cannot_auto_redispatch(tmp_path):
+    runtime_root = tmp_path / "runtime"
+    prewarm = CustomerPrewarmStore(runtime_root / "customer_prewarm.sqlite3")
+    today_paths = make_state_db(runtime_root, TODAY)
+    url = "https://qx.com/uncertain-historical-export.html"
+    old_paths, job_id = seed_remote_work(
+        runtime_root, YESTERDAY, _CountingAdapter(), mapping=COMIX,
+        url=url, job_state="SUBMITTED", remote_identity="comix|old|number",
+    )
+    seed_remote_candidate(prewarm, url, job_id, business_date=YESTERDAY)
+    with sqlite3.connect(old_paths.state_path) as connection:
+        connection.execute(
+            "UPDATE remote_jobs SET state='MANUAL_REQUIRED', harvest_attempts=1, "
+            "error_text='exact EXPORTED evidence does not match durable remote identity' WHERE id=?",
+            (job_id,),
+        )
+
+    plan = plan_lifecycle_actions(
+        today_paths.state_path, prewarm, TODAY, [COMIX],
+        state_runtime_root=runtime_root,
+    )
+    assert plan["redispatch_groups"] == {}
+
+
+def test_historical_cache_sync_lock_prevents_overlapping_mirror(tmp_path):
+    runtime_root = tmp_path / "runtime"
+    prewarm = CustomerPrewarmStore(runtime_root / "customer_prewarm.sqlite3")
+    cache = SharedCrawlCache(runtime_root / "shared_crawl_cache.sqlite3")
+    url = "https://qx.com/sync-lock.html"
+    old_paths, job_id = seed_remote_work(
+        runtime_root, YESTERDAY, _CountingAdapter(), mapping=COMIX,
+        url=url, job_state="SUBMITTED", remote_identity="comix|old|number",
+    )
+    seed_remote_candidate(prewarm, url, job_id, business_date=YESTERDAY)
+    with sqlite3.connect(old_paths.state_path) as connection:
+        connection.execute("UPDATE remote_jobs SET state='COMPLETED' WHERE id=?", (job_id,))
+        connection.execute(
+            "UPDATE crawl_work SET state='SUCCESS', result_json=? WHERE remote_job_id=?",
+            (json.dumps({"page_price_status": "OK", "page_price_value": "21"}), job_id),
+        )
+    held = ProcessLock(old_paths.run_dir / f"prewarm-cache-sync-{job_id}.lock")
+    held.acquire()
+    try:
+        summary = _new_summary()
+        run_cross_day_harvest_phase(
+            prewarm_store=prewarm, shared_cache=cache,
+            current_business_date=TODAY, state_runtime_root=runtime_root,
+            get_adapter=lambda: _CountingAdapter(), deadline=1000.0,
+            monotonic_value=lambda: 1.0, summary=summary,
+        )
+    finally:
+        held.release()
+    assert summary["cross_day_harvest_lock_busy"] == 1
+    assert summary["cross_day_harvest_cache_synced"] == 0
+    assert cache.lookup_current("comix", url) is None
+
+
+def test_recovered_historical_job_real_harvest_mirrors_and_absorbs(tmp_path):
+    from app.services.legacy_zhaoshang_adapter import (
+        HarvestStatus, LegacyHarvestOutcome, LegacyPriorityOutcome, PriorityStatus,
+    )
+
+    class HarvestAdapter(_CountingAdapter):
+        def exact_priority_remote_identity(self, _job):
+            return "comix|found-task|found-number"
+
+        def exact_export_remote_identity(self, _job):
+            return "comix|found-task|found-number"
+
+        def harvest(self, job, *, timeout_seconds):
+            self.harvest_calls += 1
+            return LegacyHarvestOutcome(
+                HarvestStatus.EXPORTED,
+                result_by_identity={
+                    (request.sku_id, request.url): {
+                        "page_price_status": "OK", "page_price_value": "21.00"
+                    }
+                    for request in job.requests
+                },
+            )
+
+    runtime_root = tmp_path / "runtime"
+    prewarm = CustomerPrewarmStore(runtime_root / "customer_prewarm.sqlite3")
+    cache = SharedCrawlCache(runtime_root / "shared_crawl_cache.sqlite3")
+    today_paths = make_state_db(runtime_root, TODAY)
+    url = "https://qx.com/recovered-to-cache.html"
+    old_paths, job_id = seed_unknown_job(
+        runtime_root, YESTERDAY, _CountingAdapter(), mapping=COMIX, url=url,
+    )
+    candidate_id = seed_remote_candidate(prewarm, url, job_id, business_date=YESTERDAY)
+    adapter = HarvestAdapter(
+        reconcile_outcome=RECONCILE_FOUND,
+        priority_outcomes=[
+            LegacyPriorityOutcome(PriorityStatus.UNCONFIRMED, weight_type=None),
+            LegacyPriorityOutcome(PriorityStatus.ALREADY_HIGHEST, weight_type=-1),
+        ],
+    )
+    adapter.harvest_calls = 0
+    _run_cross_day(runtime_root, prewarm, adapter)
+    assert _remote_job_row(old_paths.state_path, job_id)["state"] == "PRIORITY_PENDING"
+    _run_cross_day(runtime_root, prewarm, adapter)
+    assert _remote_job_row(old_paths.state_path, job_id)["state"] == "SUBMITTED"
+
+    summary = _new_summary()
+    run_cross_day_harvest_phase(
+        prewarm_store=prewarm, shared_cache=cache,
+        current_business_date=TODAY, state_runtime_root=runtime_root,
+        get_adapter=lambda: adapter, deadline=1000.0,
+        monotonic_value=lambda: 1.0, summary=summary,
+    )
+    assert summary["phase_errors"] == []
+    assert adapter.harvest_calls == 1
+    assert _remote_job_row(old_paths.state_path, job_id)["state"] == "COMPLETED"
+    assert summary["cross_day_harvest_cache_synced"] == 1
+    assert cache.lookup_current("comix", url) is not None
+    pass_summary = run_prewarm_dispatch_pass(
+        prewarm, cache, business_date=TODAY, runtime_root=runtime_root,
+        mappings=[COMIX], adapter=adapter,
+    )
+    assert pass_summary["absorbed"] == 1
+    assert prewarm.candidate_by_id(candidate_id)["cache_status"] == CACHE_STATUS_CACHE_HIT
+    assert adapter.submit_calls == 0
 
 
 def test_cli_no_lifecycle_skips_cross_day_phase(tmp_path, monkeypatch):

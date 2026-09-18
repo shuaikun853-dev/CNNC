@@ -455,6 +455,7 @@ def test_plan_dead_unknown_excluded_and_cap_blocked(tmp_path):
         prewarm.record_remote_job_link(
             TODAY, exhausted_candidate, 9000 + index, PRODUCER
         )
+    prewarm.record_remote_job_link(TODAY, exhausted_candidate, exhausted_job, PRODUCER)
 
     plan = plan_lifecycle_actions(paths.state_path, prewarm, TODAY, [COMIX])
 
@@ -672,6 +673,7 @@ def test_redispatch_daily_cap_blocks_and_notes_last_error(tmp_path):
     candidate_id = seed_remote_candidate(prewarm, "https://qx.com/redispatch-cap.html", dead_job)
     for index in range(REDISPATCH_DAILY_CAP):
         prewarm.record_remote_job_link(TODAY, candidate_id, 8000 + index, PRODUCER)
+    prewarm.record_remote_job_link(TODAY, candidate_id, dead_job, PRODUCER)
     adapter = _CountingAdapter()
 
     summary = run_redispatch(runtime_root, paths, prewarm, adapter)
