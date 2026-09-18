@@ -189,6 +189,36 @@ def is_priority_unconfirmed_manual_family(job: Mapping[str, Any]) -> bool:
     return is_priority_unconfirmed_result_shape(job.get("result_json"))
 
 
+def is_terminal_nonretryable_priority_manual_family(job: Mapping[str, Any]) -> bool:
+    """Recognize the older collapsed MANUAL shape seen in production job #36.
+
+    The old runtime persisted only the generic manual diagnostic and lost
+    result_json after a non-retryable PRIORITY_UNCONFIRMED outcome. This
+    helper is intentionally insufficient on its own: the harvest gate also
+    requires an exact live TERMINAL proof and an exact durable
+    PRIORITY_UNCONFIRMED event identity before any state write or export.
+    """
+    if str(job.get("state") or "") != "MANUAL_REQUIRED":
+        return False
+    try:
+        if int(job.get("post_attempted") or 0) != 1:
+            return False
+    except (TypeError, ValueError):
+        return False
+    if str(job.get("error_text") or "").strip() != "highest priority was not confirmed":
+        return False
+    return job.get("result_json") in (None, "")
+
+
+def _live_identity_proof_is_terminal(
+    proof: LiveIdentityProof | None, expected_identity: str
+) -> bool:
+    return (
+        _live_identity_proof_admits(proof, expected_identity)
+        and str(proof.classification) == RemoteExecutionState.TERMINAL.value
+    )
+
+
 def run_local_remote_harvest_recovery(
     *,
     state_path: Path | str,
@@ -608,12 +638,13 @@ def _existing_remote_harvest_core(
       wrapper passes ``+2`` so a zero-result export followed by one immediate
       operator click stays harvestable instead of cap-flipping straight back
       to MANUAL_REQUIRED.
-    - ``live_identity_proof`` (2026-09-04 hotfix, default ``None``): a
-      factory-built proof from an earlier read-only probe of the exact remote
-      identity.  When present and proven it admits one extra MANUAL_REQUIRED
-      requeue diagnostic (the bare legacy zero-rows family) and re-opens the
-      exact-priority-evidence gate below; with ``None`` or an unproven proof
-      every gate behaves exactly as before.
+    - ``live_identity_proof`` (default ``None``): a factory-built proof from
+      an earlier read-only probe of the exact remote identity.  It preserves
+      the 2026-09-04 strict zero-rows fallback and additionally admits the
+      older collapsed non-retryable priority-MANUAL shape only when the live
+      task is TERMINAL and the durable PRIORITY_UNCONFIRMED event proves the
+      exact same identity.  With ``None`` or an unproven proof every gate
+      behaves exactly as before.
 
     Everything else is kept verbatim from the original single-purpose
     implementation.
@@ -676,13 +707,11 @@ def _existing_remote_harvest_core(
         needs_manual_requeue = False
         if job["state"] not in admissible_states:
             job_error_text = str(job.get("error_text") or "").strip()
-            # Live-proof fallback (2026-09-04 hotfix): a proven read-only probe
-            # of the exact durable identity admits exactly one extra MANUAL
-            # diagnostic -- the bare legacy zero-rows family, i.e. the "remote
-            # task intact, priority never confirmed" shape.  Review round 2:
-            # the strict priority-unconfirmed family is re-verified here
-            # independently of the caller (including the strict result_json
-            # shape), so a proof alone can never widen the admission.
+            # Live-proof fallback: the 2026-09-04 strict zero-rows family stays
+            # unchanged.  A second, older collapsed MANUAL shape is admitted
+            # only for a proven exact TERMINAL task; the later priority gate
+            # independently requires matching non-retryable
+            # PRIORITY_UNCONFIRMED durable identity before any requeue/write.
             # Everything else keeps the original rejection.
             if (
                 allow_manual_requeue
@@ -692,6 +721,12 @@ def _existing_remote_harvest_core(
                     or (
                         is_priority_unconfirmed_manual_family(job)
                         and _live_identity_proof_admits(
+                            live_identity_proof, expected_identity
+                        )
+                    )
+                    or (
+                        is_terminal_nonretryable_priority_manual_family(job)
+                        and _live_identity_proof_is_terminal(
                             live_identity_proof, expected_identity
                         )
                     )
@@ -733,18 +768,25 @@ def _existing_remote_harvest_core(
         ):
             raise RecoveryRejected("durable legacy job evidence is inconsistent")
         if adapter.exact_priority_remote_identity(prepared) != expected_identity:
-            # Historical accepted priority evidence stays mandatory.  The only
-            # fallback (2026-09-04 hotfix) is a factory-built live proof from
-            # an earlier read-only probe of the exact same remote identity --
-            # and (review round 2) only for the exact priority-unconfirmed
-            # MANUAL family, re-verified here independently of the caller, so
-            # a proof can never rescue SUBMITTED/RUNNING/EXPORTED jobs nor a
-            # corrupted historical-evidence shape.  A missing, mismatched, or
-            # unproven proof keeps this rejection.
-            if not (
+            # Historical accepted priority evidence remains the default gate.
+            # Two narrowly proven recovery families may bypass it:
+            # (1) the 2026-09-04 strict PRIORITY_PENDING/null-evidence shape;
+            # (2) an older collapsed MANUAL shape, but only when the live
+            #     exact task is already TERMINAL and CREATED/ENABLED plus a
+            #     non-retryable PRIORITY_UNCONFIRMED event all prove the same
+            #     durable identity. Neither fallback claims priority succeeded.
+            strict_fallback = (
                 _live_identity_proof_admits(live_identity_proof, expected_identity)
                 and is_priority_unconfirmed_manual_family(job)
-            ):
+            )
+            terminal_unconfirmed_fallback = (
+                _live_identity_proof_is_terminal(live_identity_proof, expected_identity)
+                and is_terminal_nonretryable_priority_manual_family(job)
+                and adapter.exact_nonretryable_unconfirmed_priority_remote_identity(
+                    prepared
+                ) == expected_identity
+            )
+            if not (strict_fallback or terminal_unconfirmed_fallback):
                 raise RecoveryRejected("exact accepted priority evidence is required")
 
         if source_scope == "prewarm_payload":
