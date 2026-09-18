@@ -1470,6 +1470,56 @@ class CnncLegacyZhaoshangAdapter:
             return None
         return f"{job.mall_key}|{task_id}|{task_number}"
 
+    def exact_nonretryable_unconfirmed_priority_remote_identity(
+        self, job: PreparedLegacyJob
+    ) -> str | None:
+        """Return the exact identity for the narrow legacy scope-safety incident.
+
+        This is deliberately weaker than accepted priority evidence and must
+        only be consumed together with an exact live TERMINAL proof.  It proves
+        CREATED/ENABLED and the latest exact priority event all refer to the
+        same task, and that the event was the known non-retryable
+        PriorityScopeSafetyError family. Other non-retryable priority failures
+        remain fail-closed.
+        """
+        events = self._read_batch_events(job)
+        try:
+            submitted = self._submission_evidence(job, events)
+            task_id, task_number, evidence, retryable = self._priority_evidence(events)
+        except (PriorityEvidenceConflictError, SubmissionEvidenceConflictError):
+            return None
+        if (
+            not task_id
+            or not task_number
+            or submitted != (task_id, task_number)
+            or evidence != "completed_unconfirmed"
+            or retryable
+        ):
+            return None
+        for event in reversed(events):
+            action = _text(event.get("action"))
+            if action not in {
+                "PRIORITY_UPDATED",
+                "PRIORITY_ALREADY_HIGHEST",
+                "PRIORITY_UNCONFIRMED",
+            }:
+                continue
+            event_identity = (
+                _text(event.get("task_id")),
+                _text(event.get("task_number")),
+            )
+            if event_identity != submitted:
+                return None
+            if (
+                action != "PRIORITY_UNCONFIRMED"
+                or "retryable" not in event
+                or event.get("retryable") is not False
+                or _text(event.get("reason")) != "PriorityScopeSafetyError"
+            ):
+                return None
+            return f"{job.mall_key}|{task_id}|{task_number}"
+        return None
+
     def probe_export_no_price(
         self,
         job: PreparedLegacyJob,

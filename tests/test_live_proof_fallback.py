@@ -7,12 +7,13 @@ export returned priced rows).  Both the re-export and the rebuild gate on
 historical accepted priority evidence and had no live-admission channel, so
 both failed closed with INVALID_REMOTE_STATE.
 
-These tests pin the new narrow live-proof fallback: only the exact
-priority-unconfirmed family, only a proven read-only probe of the exact
-remote identity, zero create/prioritize/stop calls on the re-export path,
-and the rebuild protocol unchanged once the gate is passed.  Everything runs
-against a fake adapter (counting seams) and a temporary SQLite store; no
-real remote and no production database is touched.
+These tests pin the narrow live-proof fallbacks: the original strict
+priority-unconfirmed family plus the 2026-09-18 legacy collapsed MANUAL
+shape, which is re-exportable only for an exact live TERMINAL task with an
+exact non-retryable PRIORITY_UNCONFIRMED durable event. Re-export still makes
+zero create/prioritize/stop calls, and rebuild behavior stays unchanged.
+Everything runs against a fake adapter (counting seams) and a temporary
+SQLite store; no real remote and no production database is touched.
 """
 
 from __future__ import annotations
@@ -464,6 +465,499 @@ def test_reexport_1_live_proof_terminal_admits_priority_unconfirmed_manual(tmp_p
     assert store.get_remote_job(int(job["id"]))["state"] == "COMPLETED"
     crawls = store.crawl_work_for_job(int(job["id"]))
     assert all(crawl["state"] == "SUCCESS" for crawl in crawls)
+
+
+def test_reexport_terminal_exact_unconfirmed_priority_event_allows_existing_export(tmp_path):
+    """A terminal exact task with durable CREATED/ENABLED/PRIORITY_UNCONFIRMED
+    evidence may be re-exported even when the old runtime collapsed result_json
+    to NULL and error_text to the generic non-retryable priority diagnostic.
+    """
+    seed = _Seed(tmp_path)
+    seed.remote_progress = seed.terminal_progress(3)
+    seed.runner = seed.exporting_runner(_priced_rows(3))
+    store, job = seed.seed(
+        3,
+        priority_updated=False,
+        job_state="MANUAL_REQUIRED",
+        error_text="highest priority was not confirmed",
+        result_json=None,
+    )
+    event = {
+        "action": "PRIORITY_UNCONFIRMED",
+        "mall": MALL_KEY,
+        "task_name": seed.prepared_holder["prepared"].task_name,
+        "task_id": TASK_ID,
+        "task_number": TASK_NUMBER,
+        "reason": "PriorityScopeSafetyError",
+        "retryable": False,
+    }
+    with seed.batch_state.open("a", encoding="utf-8") as stream:
+        stream.write(f"- `{json.dumps(event)}`\n")
+
+    result = run_manual_reexport(
+        state_path=seed.state_path,
+        lock_path=seed.lock_path,
+        business_date=BUSINESS_DATE,
+        remote_job_id=int(job["id"]),
+        remote_identity=IDENTITY,
+        adapter=seed.adapter,
+        timeout_seconds=60.0,
+    )
+
+    assert result["outcome"] == "REEXPORT_COMPLETED"
+    assert result["progress_classification"] == "REMOTE_TERMINAL"
+    assert result["create_calls"] == 0
+    assert result["result_count"] == 3
+    assert len(seed.runner_calls) == 1
+    assert "--wait-export-only" in seed.runner_calls[0]
+    assert not any("--create-only" in args for args in seed.runner_calls)
+    assert seed.prioritize_calls == []
+    assert seed.stop_calls == []
+    assert store.get_remote_job(int(job["id"]))["state"] == "COMPLETED"
+
+
+def test_reexport_active_collapsed_priority_manual_stays_rejected(tmp_path):
+    seed = _Seed(tmp_path)
+    seed.remote_progress = seed.active_progress(3)
+    seed.runner = seed.exporting_runner(_priced_rows(3))
+    store, job = seed.seed(
+        3,
+        priority_updated=False,
+        job_state="MANUAL_REQUIRED",
+        error_text="highest priority was not confirmed",
+        result_json=None,
+    )
+    event = {
+        "action": "PRIORITY_UNCONFIRMED",
+        "mall": MALL_KEY,
+        "task_name": seed.prepared_holder["prepared"].task_name,
+        "task_id": TASK_ID,
+        "task_number": TASK_NUMBER,
+        "reason": "PriorityScopeSafetyError",
+        "retryable": False,
+    }
+    with seed.batch_state.open("a", encoding="utf-8") as stream:
+        stream.write(f"- `{json.dumps(event)}`\n")
+
+    result = run_manual_reexport(
+        state_path=seed.state_path,
+        lock_path=seed.lock_path,
+        business_date=BUSINESS_DATE,
+        remote_job_id=int(job["id"]),
+        remote_identity=IDENTITY,
+        adapter=seed.adapter,
+        timeout_seconds=60.0,
+    )
+
+    assert result["outcome"] == "REEXPORT_REJECTED"
+    assert result["error_code"] == "INVALID_REMOTE_STATE"
+    assert result["progress_classification"] == "REMOTE_ACTIVE"
+    assert seed.runner_calls == []
+    assert store.get_remote_job(int(job["id"]))["state"] == "MANUAL_REQUIRED"
+
+
+def test_reexport_terminal_collapsed_priority_manual_requires_exact_unconfirmed_identity(tmp_path):
+    seed = _Seed(tmp_path)
+    seed.remote_progress = seed.terminal_progress(3)
+    seed.runner = seed.exporting_runner(_priced_rows(3))
+    store, job = seed.seed(
+        3,
+        priority_updated=False,
+        job_state="MANUAL_REQUIRED",
+        error_text="highest priority was not confirmed",
+        result_json=None,
+    )
+    event = {
+        "action": "PRIORITY_UNCONFIRMED",
+        "mall": MALL_KEY,
+        "task_name": seed.prepared_holder["prepared"].task_name,
+        "task_id": "foreign-task-id",
+        "task_number": TASK_NUMBER,
+        "reason": "PriorityScopeSafetyError",
+        "retryable": False,
+    }
+    with seed.batch_state.open("a", encoding="utf-8") as stream:
+        stream.write(f"- `{json.dumps(event)}`\n")
+
+    result = run_manual_reexport(
+        state_path=seed.state_path,
+        lock_path=seed.lock_path,
+        business_date=BUSINESS_DATE,
+        remote_job_id=int(job["id"]),
+        remote_identity=IDENTITY,
+        adapter=seed.adapter,
+        timeout_seconds=60.0,
+    )
+
+    assert result["outcome"] == "REEXPORT_REJECTED"
+    assert result["error_code"] == "INVALID_REMOTE_STATE"
+    assert "exact non-retryable PriorityScopeSafetyError evidence is required" in result["reason"]
+    assert seed.runner_calls == []
+    assert store.get_remote_job(int(job["id"]))["state"] == "MANUAL_REQUIRED"
+
+
+def test_reexport_collapsed_priority_manual_requires_durable_unconfirmed_event(tmp_path):
+    seed = _Seed(tmp_path)
+    seed.remote_progress = seed.terminal_progress(3)
+    seed.runner = seed.exporting_runner(_priced_rows(3))
+    store, job = seed.seed(
+        3,
+        priority_updated=False,
+        job_state="MANUAL_REQUIRED",
+        error_text="highest priority was not confirmed",
+        result_json=None,
+    )
+
+    result = run_manual_reexport(
+        state_path=seed.state_path,
+        lock_path=seed.lock_path,
+        business_date=BUSINESS_DATE,
+        remote_job_id=int(job["id"]),
+        remote_identity=IDENTITY,
+        adapter=seed.adapter,
+        timeout_seconds=60.0,
+    )
+
+    assert result["outcome"] == "REEXPORT_REJECTED"
+    assert result["error_code"] == "INVALID_REMOTE_STATE"
+    assert "exact non-retryable PriorityScopeSafetyError evidence is required" in result["reason"]
+    assert seed.runner_calls == []
+    assert store.get_remote_job(int(job["id"]))["state"] == "MANUAL_REQUIRED"
+
+
+def test_reexport_collapsed_priority_manual_rejects_other_nonretryable_reason(tmp_path):
+    seed = _Seed(tmp_path)
+    seed.remote_progress = seed.terminal_progress(3)
+    seed.runner = seed.exporting_runner(_priced_rows(3))
+    store, job = seed.seed(
+        3,
+        priority_updated=False,
+        job_state="MANUAL_REQUIRED",
+        error_text="highest priority was not confirmed",
+        result_json=None,
+    )
+    event = {
+        "action": "PRIORITY_UNCONFIRMED",
+        "mall": MALL_KEY,
+        "task_name": seed.prepared_holder["prepared"].task_name,
+        "task_id": TASK_ID,
+        "task_number": TASK_NUMBER,
+        "reason": "PriorityEvidenceConflictError",
+        "retryable": False,
+    }
+    with seed.batch_state.open("a", encoding="utf-8") as stream:
+        stream.write(f"- `{json.dumps(event)}`\n")
+
+    result = run_manual_reexport(
+        state_path=seed.state_path,
+        lock_path=seed.lock_path,
+        business_date=BUSINESS_DATE,
+        remote_job_id=int(job["id"]),
+        remote_identity=IDENTITY,
+        adapter=seed.adapter,
+        timeout_seconds=60.0,
+    )
+
+    assert result["outcome"] == "REEXPORT_REJECTED"
+    assert result["error_code"] == "INVALID_REMOTE_STATE"
+    assert "exact non-retryable PriorityScopeSafetyError evidence is required" in result["reason"]
+    assert seed.runner_calls == []
+    assert store.get_remote_job(int(job["id"]))["state"] == "MANUAL_REQUIRED"
+
+
+def test_reexport_collapsed_priority_manual_rejects_retryable_unconfirmed_event(tmp_path):
+    seed = _Seed(tmp_path)
+    seed.remote_progress = seed.terminal_progress(3)
+    seed.runner = seed.exporting_runner(_priced_rows(3))
+    store, job = seed.seed(
+        3,
+        priority_updated=False,
+        job_state="MANUAL_REQUIRED",
+        error_text="highest priority was not confirmed",
+        result_json=None,
+    )
+    event = {
+        "action": "PRIORITY_UNCONFIRMED",
+        "mall": MALL_KEY,
+        "task_name": seed.prepared_holder["prepared"].task_name,
+        "task_id": TASK_ID,
+        "task_number": TASK_NUMBER,
+        "reason": "InterfaceError",
+        "retryable": True,
+    }
+    with seed.batch_state.open("a", encoding="utf-8") as stream:
+        stream.write(f"- `{json.dumps(event)}`\n")
+
+    result = run_manual_reexport(
+        state_path=seed.state_path,
+        lock_path=seed.lock_path,
+        business_date=BUSINESS_DATE,
+        remote_job_id=int(job["id"]),
+        remote_identity=IDENTITY,
+        adapter=seed.adapter,
+        timeout_seconds=60.0,
+    )
+
+    assert result["outcome"] == "REEXPORT_REJECTED"
+    assert result["error_code"] == "INVALID_REMOTE_STATE"
+    assert seed.runner_calls == []
+    assert store.get_remote_job(int(job["id"]))["state"] == "MANUAL_REQUIRED"
+
+
+@pytest.mark.parametrize("retryable_value", [None, 0, "false", "MISSING"])
+def test_reexport_collapsed_priority_manual_requires_explicit_false_retryable(
+    tmp_path, retryable_value
+):
+    seed = _Seed(tmp_path)
+    seed.remote_progress = seed.terminal_progress(3)
+    seed.runner = seed.exporting_runner(_priced_rows(3))
+    store, job = seed.seed(
+        3,
+        priority_updated=False,
+        job_state="MANUAL_REQUIRED",
+        error_text="highest priority was not confirmed",
+        result_json=None,
+    )
+    event = {
+        "action": "PRIORITY_UNCONFIRMED",
+        "mall": MALL_KEY,
+        "task_name": seed.prepared_holder["prepared"].task_name,
+        "task_id": TASK_ID,
+        "task_number": TASK_NUMBER,
+        "reason": "PriorityScopeSafetyError",
+    }
+    if retryable_value != "MISSING":
+        event["retryable"] = retryable_value
+    with seed.batch_state.open("a", encoding="utf-8") as stream:
+        stream.write(f"- `{json.dumps(event)}`\n")
+
+    result = run_manual_reexport(
+        state_path=seed.state_path,
+        lock_path=seed.lock_path,
+        business_date=BUSINESS_DATE,
+        remote_job_id=int(job["id"]),
+        remote_identity=IDENTITY,
+        adapter=seed.adapter,
+        timeout_seconds=60.0,
+    )
+
+    assert result["outcome"] == "REEXPORT_REJECTED"
+    assert result["error_code"] == "INVALID_REMOTE_STATE"
+    assert "exact non-retryable PriorityScopeSafetyError evidence is required" in result["reason"]
+    assert seed.runner_calls == []
+    assert store.get_remote_job(int(job["id"]))["state"] == "MANUAL_REQUIRED"
+
+
+def test_reexport_collapsed_priority_manual_requires_exact_terminal_total(tmp_path):
+    seed = _Seed(tmp_path)
+    seed.remote_progress = seed.terminal_progress(4)
+    seed.runner = seed.exporting_runner(_priced_rows(3))
+    store, job = seed.seed(
+        3,
+        priority_updated=False,
+        job_state="MANUAL_REQUIRED",
+        error_text="highest priority was not confirmed",
+        result_json=None,
+    )
+    event = {
+        "action": "PRIORITY_UNCONFIRMED",
+        "mall": MALL_KEY,
+        "task_name": seed.prepared_holder["prepared"].task_name,
+        "task_id": TASK_ID,
+        "task_number": TASK_NUMBER,
+        "reason": "PriorityScopeSafetyError",
+        "retryable": False,
+    }
+    with seed.batch_state.open("a", encoding="utf-8") as stream:
+        stream.write(f"- `{json.dumps(event)}`\n")
+
+    result = run_manual_reexport(
+        state_path=seed.state_path,
+        lock_path=seed.lock_path,
+        business_date=BUSINESS_DATE,
+        remote_job_id=int(job["id"]),
+        remote_identity=IDENTITY,
+        adapter=seed.adapter,
+        timeout_seconds=60.0,
+    )
+
+    assert result["outcome"] == "REEXPORT_REJECTED"
+    assert result["error_code"] == "INVALID_REMOTE_STATE"
+    assert "terminal progress does not exactly match durable request scope" in result["reason"]
+    assert seed.runner_calls == []
+    assert store.get_remote_job(int(job["id"]))["state"] == "MANUAL_REQUIRED"
+
+
+def test_reexport_collapsed_priority_manual_requires_scope_safety_event_even_with_later_priority_acceptance(
+    tmp_path,
+):
+    seed = _Seed(tmp_path)
+    seed.remote_progress = seed.terminal_progress(3)
+    seed.runner = seed.exporting_runner(_priced_rows(3))
+    store, job = seed.seed(
+        3,
+        priority_updated=True,
+        job_state="MANUAL_REQUIRED",
+        error_text="highest priority was not confirmed",
+        result_json=None,
+    )
+
+    result = run_manual_reexport(
+        state_path=seed.state_path,
+        lock_path=seed.lock_path,
+        business_date=BUSINESS_DATE,
+        remote_job_id=int(job["id"]),
+        remote_identity=IDENTITY,
+        adapter=seed.adapter,
+        timeout_seconds=60.0,
+    )
+
+    assert result["outcome"] == "REEXPORT_REJECTED"
+    assert result["error_code"] == "INVALID_REMOTE_STATE"
+    assert "exact non-retryable PriorityScopeSafetyError evidence is required" in result["reason"]
+    assert seed.runner_calls == []
+    assert store.get_remote_job(int(job["id"]))["state"] == "MANUAL_REQUIRED"
+
+
+def test_reexport_collapsed_priority_manual_rejects_when_later_priority_acceptance_supersedes_incident(
+    tmp_path,
+):
+    seed = _Seed(tmp_path)
+    seed.remote_progress = seed.terminal_progress(4)
+    seed.runner = seed.exporting_runner(_priced_rows(3))
+    store, job = seed.seed(
+        3,
+        priority_updated=False,
+        job_state="MANUAL_REQUIRED",
+        error_text="highest priority was not confirmed",
+        result_json=None,
+    )
+    prepared = seed.prepared_holder["prepared"]
+    events = [
+        {
+            "action": "PRIORITY_UNCONFIRMED",
+            "mall": MALL_KEY,
+            "task_name": prepared.task_name,
+            "task_id": TASK_ID,
+            "task_number": TASK_NUMBER,
+            "reason": "PriorityScopeSafetyError",
+            "retryable": False,
+        },
+        {
+            "action": "PRIORITY_UPDATED",
+            "mall": MALL_KEY,
+            "task_name": prepared.task_name,
+            "task_id": TASK_ID,
+            "task_number": TASK_NUMBER,
+            "affected_rows": 3,
+        },
+    ]
+    with seed.batch_state.open("a", encoding="utf-8") as stream:
+        for event in events:
+            stream.write(f"- `{json.dumps(event)}`\n")
+
+    result = run_manual_reexport(
+        state_path=seed.state_path,
+        lock_path=seed.lock_path,
+        business_date=BUSINESS_DATE,
+        remote_job_id=int(job["id"]),
+        remote_identity=IDENTITY,
+        adapter=seed.adapter,
+        timeout_seconds=60.0,
+    )
+
+    assert result["outcome"] == "REEXPORT_REJECTED"
+    assert result["error_code"] == "INVALID_REMOTE_STATE"
+    assert "exact non-retryable PriorityScopeSafetyError evidence is required" in result["reason"]
+    assert seed.runner_calls == []
+    assert store.get_remote_job(int(job["id"]))["state"] == "MANUAL_REQUIRED"
+
+
+def test_reexport_collapsed_priority_manual_requires_zero_remote_failures(tmp_path):
+    seed = _Seed(tmp_path)
+    seed.remote_progress = {
+        "total": 3,
+        "pending": 0,
+        "running": 0,
+        "failed": 1,
+        "waiting_db": 0,
+        "finished": 2,
+    }
+    seed.runner = seed.exporting_runner(_priced_rows(3))
+    store, job = seed.seed(
+        3,
+        priority_updated=False,
+        job_state="MANUAL_REQUIRED",
+        error_text="highest priority was not confirmed",
+        result_json=None,
+    )
+    event = {
+        "action": "PRIORITY_UNCONFIRMED",
+        "mall": MALL_KEY,
+        "task_name": seed.prepared_holder["prepared"].task_name,
+        "task_id": TASK_ID,
+        "task_number": TASK_NUMBER,
+        "reason": "PriorityScopeSafetyError",
+        "retryable": False,
+    }
+    with seed.batch_state.open("a", encoding="utf-8") as stream:
+        stream.write(f"- `{json.dumps(event)}`\n")
+
+    result = run_manual_reexport(
+        state_path=seed.state_path,
+        lock_path=seed.lock_path,
+        business_date=BUSINESS_DATE,
+        remote_job_id=int(job["id"]),
+        remote_identity=IDENTITY,
+        adapter=seed.adapter,
+        timeout_seconds=60.0,
+    )
+
+    assert result["outcome"] == "REEXPORT_REJECTED"
+    assert result["error_code"] == "INVALID_REMOTE_STATE"
+    assert "terminal progress does not exactly match durable request scope" in result["reason"]
+    assert seed.runner_calls == []
+    assert store.get_remote_job(int(job["id"]))["state"] == "MANUAL_REQUIRED"
+
+
+def test_reexport_collapsed_priority_manual_requires_terminal_progress_counters(tmp_path):
+    seed = _Seed(tmp_path)
+    seed.runner = seed.exporting_runner(_priced_rows(3))
+    store, job = seed.seed(
+        3,
+        priority_updated=False,
+        job_state="MANUAL_REQUIRED",
+        error_text="highest priority was not confirmed",
+        result_json=None,
+    )
+    event = {
+        "action": "PRIORITY_UNCONFIRMED",
+        "mall": MALL_KEY,
+        "task_name": seed.prepared_holder["prepared"].task_name,
+        "task_id": TASK_ID,
+        "task_number": TASK_NUMBER,
+        "reason": "PriorityScopeSafetyError",
+        "retryable": False,
+    }
+    with seed.batch_state.open("a", encoding="utf-8") as stream:
+        stream.write(f"- `{json.dumps(event)}`\n")
+
+    result = run_manual_reexport(
+        state_path=seed.state_path,
+        lock_path=seed.lock_path,
+        business_date=BUSINESS_DATE,
+        remote_job_id=int(job["id"]),
+        remote_identity=IDENTITY,
+        adapter=seed.adapter,
+        timeout_seconds=60.0,
+        progress_lookup=lambda _job: "REMOTE_TERMINAL",
+    )
+
+    assert result["outcome"] == "REEXPORT_REJECTED"
+    assert result["error_code"] == "INVALID_REMOTE_STATE"
+    assert "terminal progress does not exactly match durable request scope" in result["reason"]
+    assert seed.runner_calls == []
+    assert store.get_remote_job(int(job["id"]))["state"] == "MANUAL_REQUIRED"
 
 
 def test_reexport_2_live_probe_unknown_still_fails_closed(tmp_path):
