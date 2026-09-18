@@ -929,7 +929,8 @@ def test_redispatch_unposted_intent_resumes_after_not_attempted(tmp_path):
 
 
 @pytest.mark.parametrize("first_outcome", ["budget_floor", "not_attempted"])
-def test_redispatch_unposted_group_shrinks_after_cache_hit(tmp_path, first_outcome):
+@pytest.mark.parametrize("resolved_old_marker", [False, True])
+def test_redispatch_unposted_group_shrinks_after_cache_hit(tmp_path, first_outcome, resolved_old_marker):
     runtime_root = tmp_path / "runtime"
     paths = make_state_db(runtime_root, TODAY)
     prewarm = CustomerPrewarmStore(runtime_root / "customer_prewarm.sqlite3")
@@ -940,6 +941,13 @@ def test_redispatch_unposted_group_shrinks_after_cache_hit(tmp_path, first_outco
     )
     first_id = seed_remote_candidate(prewarm, first_url, dead_job, document="SHRINK-A")
     second_id = seed_remote_candidate(prewarm, second_url, dead_job, document="SHRINK-B")
+    if resolved_old_marker:
+        assert prewarm.record_redispatch_intent_batch(
+            TODAY,
+            [(first_id, TODAY, dead_job), (second_id, TODAY, dead_job)],
+            dead_job,
+            PRODUCER,
+        )
     adapter = _CountingAdapter(
         submit_outcome=LegacySubmitOutcome(SubmitStatus.NOT_ATTEMPTED)
         if first_outcome == "not_attempted" else SUBMITTED_SUCCESS
@@ -972,8 +980,17 @@ def test_redispatch_unposted_group_shrinks_after_cache_hit(tmp_path, first_outco
         old_links = connection.execute(
             "SELECT COUNT(*) FROM crawl_work WHERE remote_job_id=?", (unposted[0],)
         ).fetchone()[0]
+        retired_row = connection.execute(
+            "SELECT state, remote_job_id FROM crawl_work WHERE exact_url=? AND sku_id LIKE 'zhpq-%' AND remote_job_id IS NULL",
+            (first_url,),
+        ).fetchone()
+        orphan_pending = connection.execute(
+            "SELECT COUNT(*) FROM crawl_work WHERE remote_job_id IS NULL AND state='PENDING' AND sku_id LIKE 'zhpq-%'"
+        ).fetchone()[0]
     assert retired == ("SUPERSEDED", 0)
     assert old_links == 0
+    assert retired_row == ("SUPERSEDED", None)
+    assert orphan_pending == 0
 
 
 def test_redispatch_changed_unposted_group_with_nonpending_crawl_fails_closed(tmp_path):
@@ -1012,6 +1029,49 @@ def test_redispatch_changed_unposted_group_with_nonpending_crawl_fails_closed(tm
         assert connection.execute(
             "SELECT COUNT(*) FROM crawl_work WHERE remote_job_id=?", (old_job,)
         ).fetchone()[0] == 2
+
+
+def test_redispatch_survivor_resumes_after_retirement_crash(tmp_path, monkeypatch):
+    runtime_root = tmp_path / "runtime"
+    paths = make_state_db(runtime_root, TODAY)
+    prewarm = CustomerPrewarmStore(runtime_root / "customer_prewarm.sqlite3")
+    first_url = "https://qx.com/unposted-crash-a.html"
+    second_url = "https://qx.com/unposted-crash-b.html"
+    _dead_paths, dead_job = seed_manual_job(
+        runtime_root, TODAY, _CountingAdapter(), mapping=COMIX, url=first_url,
+    )
+    first_id = seed_remote_candidate(prewarm, first_url, dead_job, document="CRASH-A")
+    second_id = seed_remote_candidate(prewarm, second_url, dead_job, document="CRASH-B")
+    adapter = _CountingAdapter()
+    run_redispatch(runtime_root, paths, prewarm, adapter, deadline_seconds=4.0)
+    prewarm.record_candidate_result(first_id, cache_status=CACHE_STATUS_CACHE_HIT)
+    original_prepare = DailyAuditStore.prepare_remote_intent
+    crashed = False
+
+    def interrupt_after_retirement(self, *args, **kwargs):
+        nonlocal crashed
+        if not crashed:
+            crashed = True
+            raise KeyboardInterrupt("stopped after unposted retirement")
+        return original_prepare(self, *args, **kwargs)
+
+    monkeypatch.setattr(DailyAuditStore, "prepare_remote_intent", interrupt_after_retirement)
+    with pytest.raises(KeyboardInterrupt):
+        run_redispatch(runtime_root, paths, prewarm, adapter)
+    assert adapter.submit_calls == 0
+    with sqlite3.connect(paths.state_path) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM crawl_work WHERE exact_url=? AND state='SUPERSEDED' AND remote_job_id IS NULL",
+            (first_url,),
+        ).fetchone()[0] == 1
+        assert connection.execute(
+            "SELECT COUNT(*) FROM crawl_work WHERE exact_url=? AND state='PENDING' AND remote_job_id IS NULL",
+            (second_url,),
+        ).fetchone()[0] == 1
+
+    run_redispatch(runtime_root, paths, prewarm, adapter)
+    assert adapter.submit_calls == 1
+    assert prewarm.candidate_by_id(second_id)["remote_job_id"] != dead_job
 
 
 def test_redispatch_mixed_prior_groups_obey_remote_job_cap(tmp_path):
