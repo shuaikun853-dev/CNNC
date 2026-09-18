@@ -148,6 +148,7 @@ FAILED_LINK_REASON_SUBMIT_UNKNOWN = "提交超时无身份"
 FAILED_LINK_REASON_NO_RESULT = "远端无匹配价格行"
 FAILED_LINK_REASON_TERMINAL = "终端失败"
 FAILED_LINK_REASON_REDISPATCH_EXHAUSTED = "重排超限"
+FAILED_LINK_REASON_REDISPATCH_UNKNOWN = "重排提交结果不明，需人工核对"
 
 
 def redispatch_placeholder_sku(mall_key: str, url: str, attempt_index: int) -> str:
@@ -308,6 +309,23 @@ def _collect_redispatch_candidates(
             if job_row is None:
                 continue
             if not _job_is_dead(job_row, dead_threshold):
+                continue
+            try:
+                prior_intent = prewarm_store.latest_redispatch_intent_for_candidate(candidate_id)
+            except Exception as exc:  # noqa: BLE001 - uncertain prior POST forbids create
+                phase_errors.append(f"candidate {candidate_id}: redispatch intent probe failed: {type(exc).__name__}: {exc}")
+                continue
+            if (
+                prior_intent is not None
+                and str(prior_intent.get("producer") or "") == PRODUCER_CUSTOMER_PREWARM_ZHAOSHANG
+                and str(prior_intent.get("business_date") or "") != business_date
+                and (
+                    str(prior_intent.get("business_date") or "") != owning_day
+                    or int(prior_intent.get("remote_job_id") or 0) != int(raw_job_id)
+                )
+            ):
+                blocked.append({"candidate_id": candidate_id, "reason": "prior redispatch intent unresolved"})
+                phase_errors.append(f"candidate {candidate_id}: prior redispatch intent may have POSTed; create deferred")
                 continue
             if _has_successful_crawl_for_url_readonly(
                 runtime_paths(owning_day, state_runtime_root).state_path,
@@ -529,12 +547,25 @@ def failed_customer_link_rows(
                 runtime_paths(owning_day, state_root).state_path, int(raw_job_id)
             )
             used = prewarm_store.remote_job_link_count(business_date, candidate_id)
-            reason = _failed_link_reason(
-                job_row=job_row,
-                job_is_dead=job_row is not None and _job_is_dead(job_row, dead_threshold),
-                crawl_states=crawl_states,
-                redispatch_links_used=used,
-                daily_cap=redispatch_daily_cap,
+            marker = prewarm_store.latest_redispatch_intent_for_candidate(candidate_id)
+            unresolved_marker = bool(
+                marker is not None
+                and str(marker.get("business_date") or "") < business_date
+                and str(marker.get("producer") or "") == PRODUCER_CUSTOMER_PREWARM_ZHAOSHANG
+                and (
+                    str(marker.get("business_date") or "") != owning_day
+                    or int(marker.get("remote_job_id") or 0) != int(raw_job_id)
+                )
+            )
+            reason = (
+                FAILED_LINK_REASON_REDISPATCH_UNKNOWN if unresolved_marker else
+                _failed_link_reason(
+                    job_row=job_row,
+                    job_is_dead=job_row is not None and _job_is_dead(job_row, dead_threshold),
+                    crawl_states=crawl_states,
+                    redispatch_links_used=used,
+                    daily_cap=redispatch_daily_cap,
+                )
             )
             if reason is None:
                 continue
@@ -775,7 +806,7 @@ def run_redispatch_phase(
     )
     summary["redispatch_blocked"] = len(collected["blocked"])
     for blocked in collected["blocked"]:
-        if blocked["reason"] != "redispatch budget exhausted":
+        if blocked["reason"] not in {"redispatch budget exhausted", "prior redispatch intent unresolved"}:
             continue
         candidate = prewarm_store.candidate_by_id(int(blocked["candidate_id"]))
         if candidate is None:
@@ -786,7 +817,7 @@ def run_redispatch_phase(
             prewarm_store,
             int(candidate["id"]),
             cache_status=str(candidate["cache_status"]),
-            error="redispatch budget exhausted",
+            error=str(blocked["reason"]),
             phase_errors=phase_errors,
         )
     if not collected["groups"]:
@@ -818,17 +849,39 @@ def run_redispatch_phase(
             continue
         try:
             try:
+                fresh_entries: list[Mapping[str, Any]] = []
+                for entry in entries:
+                    candidate_id = int(entry["candidate"]["id"])
+                    try:
+                        current = prewarm_store.candidate_by_id(candidate_id)
+                        latest = prewarm_store.remote_job_link_for_candidate(candidate_id)
+                    except Exception as exc:  # noqa: BLE001 - no proof, no create
+                        phase_errors.append(f"redispatch candidate {candidate_id}: link recheck failed: {type(exc).__name__}: {exc}")
+                        continue
+                    if (
+                        current is not None
+                        and str(current["cache_status"]) == str(entry["candidate"]["cache_status"])
+                        and int(current["remote_job_id"] or 0) == int(entry["candidate"]["remote_job_id"])
+                        and latest is not None
+                        and str(latest["business_date"]) == str(entry["owning_day"])
+                        and int(latest["remote_job_id"]) == int(entry["candidate"]["remote_job_id"])
+                        and str(latest["producer"]) == PRODUCER_CUSTOMER_PREWARM_ZHAOSHANG
+                    ):
+                        fresh_entries.append(entry)
+                if not fresh_entries:
+                    continue
                 _redispatch_mall_group(
                     store=store,
                     token=token,
                     prewarm_store=prewarm_store,
                     paths=paths,
                     mapping=mapping,
-                    entries=entries,
+                    entries=fresh_entries,
                     get_adapter=get_adapter,
                     business_date=business_date,
                     deadline=deadline,
                     monotonic_value=monotonic_value,
+                    max_jobs_per_pass=max_jobs_per_pass,
                     summary=summary,
                 )
             except Exception as exc:  # noqa: BLE001 - per-group isolation
@@ -853,6 +906,7 @@ def _redispatch_mall_group(
     business_date: str,
     deadline: float,
     monotonic_value: Callable[[], float],
+    max_jobs_per_pass: int,
     summary: dict[str, Any],
 ) -> int:
     """One mall's dead-job candidates through the idempotent create chain.
@@ -869,6 +923,8 @@ def _redispatch_mall_group(
     bucket = summary["by_mall"].setdefault(mall_key, {"reused": 0, "created_urls": 0})
 
     crawl_ids: list[int] = []
+    existing_job_ids: set[int] = set()
+    work_job_ids: list[int | None] = []
     requests = [
         dispatch_service.CrawlRequest(
             mall_key=mall_key,
@@ -895,6 +951,90 @@ def _redispatch_mall_group(
             source_id=mapping.source_id,
         )
         crawl_ids.append(int(work["id"]))
+        work_job_ids.append(int(work["remote_job_id"]) if work.get("remote_job_id") is not None else None)
+        if work.get("remote_job_id") is not None:
+            existing_job_ids.add(int(work["remote_job_id"]))
+
+    # A previous POST may have bound this exact crawl intent before a candidate
+    # moved to CACHE_HIT or a prewarm-DB write failed. Reattach surviving
+    # candidates to that durable job rather than fingerprinting a smaller group.
+    if len(set(work_job_ids)) > 1:
+        groups_by_prior: dict[int | None, list[Mapping[str, Any]]] = {}
+        for entry, prior_job_id in zip(entries, work_job_ids):
+            groups_by_prior.setdefault(prior_job_id, []).append(entry)
+        wired = 0
+        for prior_job_id, subgroup in groups_by_prior.items():
+            if prior_job_id is None and monotonic_value() >= deadline:
+                phase_errors.append(f"redispatch mall {mall_key}: new subgroup deferred by budget")
+                continue
+            wired += _redispatch_mall_group(
+                store=store, token=token, prewarm_store=prewarm_store,
+                paths=paths, mapping=mapping, entries=subgroup,
+                get_adapter=get_adapter, business_date=business_date,
+                deadline=deadline, monotonic_value=monotonic_value,
+                max_jobs_per_pass=max_jobs_per_pass,
+                summary=summary,
+            )
+        return wired
+
+    resume_unposted: dict[str, Any] | None = None
+    if existing_job_ids:
+        prior_id = next(iter(existing_job_ids))
+        prior = store.get_remote_job(prior_id)
+        prior_state = str((prior or {}).get("state") or "")
+        prior_payload = (prior or {}).get("payload_json") or "{}"
+        if isinstance(prior_payload, str):
+            prior_payload = json.loads(prior_payload)
+        prior_requests = prior_payload.get("requests", [])
+        request_keys = {(request.mall_key, request.sku_id, request.url) for request in requests}
+        prior_keys = {
+            (str(item.get("mall_key") or ""), str(item.get("sku_id") or ""), str(item.get("url") or ""))
+            for item in prior_requests if isinstance(item, dict)
+        }
+        if prior is None or not request_keys.issubset(prior_keys):
+            phase_errors.append(f"redispatch mall {mall_key}: prior crawl job {prior_id} not proven; manual review")
+            return 0
+        if prior_state == "SUBMIT_INTENT" and not int(prior.get("post_attempted") or 0):
+            if request_keys != prior_keys:
+                phase_errors.append(f"redispatch mall {mall_key}: unposted prior group changed; manual review")
+                return 0
+            resume_unposted = prior
+        else:
+            if prior_state == "SUBMIT_INTENT" and int(prior.get("post_attempted") or 0):
+                store.mark_submit_unknown(token, prior_id, "interrupted after redispatch POST claim")
+                prior_state = "SUBMIT_UNKNOWN"
+            if (
+                not int(prior.get("post_attempted") or 0)
+                or prior_state not in {"SUBMIT_UNKNOWN", "PRIORITY_PENDING", "SUBMITTED", "RUNNING", "EXPORTED", "COMPLETED"}
+                or (prior_state != "SUBMIT_UNKNOWN" and not str(prior.get("remote_identity") or "").strip())
+            ):
+                phase_errors.append(f"redispatch mall {mall_key}: prior crawl job {prior_id} not proven; manual review")
+                return 0
+        if resume_unposted is None:
+            bindings = [
+                (int(entry["candidate"]["id"]), str(entry["owning_day"]), int(entry["candidate"]["remote_job_id"]))
+                for entry in entries
+            ]
+            if prewarm_store.bind_redispatched_remote_job_batch(
+                business_date, bindings, prior_id, PRODUCER_CUSTOMER_PREWARM_ZHAOSHANG,
+                error="submit unknown; reconcile pending" if prior_state == "SUBMIT_UNKNOWN" else None,
+            ):
+                summary["redispatched_urls"] += len(bindings)
+                if prior_state == "PRIORITY_PENDING":
+                    _confirm_pending_priority_job(
+                        prewarm_store=prewarm_store, store=store, token=token,
+                        get_adapter=get_adapter, business_date=business_date,
+                        note_targets=[(int(entry["candidate"]["id"]), str(entry["candidate"]["cache_status"])) for entry in entries],
+                        job_id=prior_id, deadline=deadline, monotonic_value=monotonic_value,
+                        summary=summary,
+                        pre_remote_guard=lambda: prewarm_store.has_current_remote_job_link(
+                            business_date=business_date, remote_job_id=prior_id,
+                            producer=PRODUCER_CUSTOMER_PREWARM_ZHAOSHANG,
+                        ),
+                    )
+            else:
+                phase_errors.append(f"redispatch mall {mall_key}: prior crawl job {prior_id} binding changed")
+            return 0
 
     # Mirror legacy_zhaoshang_bridge.finalize byte for byte (same as the pass).
     task_fingerprint = hashlib.sha256(
@@ -919,13 +1059,17 @@ def _redispatch_mall_group(
         batch_state.parent.mkdir(parents=True, exist_ok=True)
         batch_state.touch()
 
-    job = get_adapter().prepare_job(
-        business_date,
-        requests,
-        job_dir / "input.xlsx",
-        job_dir / "result.xlsx",
-        task_name,
-        batch_state_path=batch_state,
+    job = (
+        _reconstruct_prepared_job(get_adapter(), business_date, resume_unposted)
+        if resume_unposted is not None
+        else get_adapter().prepare_job(
+            business_date,
+            requests,
+            job_dir / "input.xlsx",
+            job_dir / "result.xlsx",
+            task_name,
+            batch_state_path=batch_state,
+        )
     )
     payload_json = {
         "requests": [
@@ -941,7 +1085,7 @@ def _redispatch_mall_group(
         ],
         "batch_state": str(batch_state),
     }
-    job_row = store.prepare_remote_intent(
+    job_row = resume_unposted or store.prepare_remote_intent(
         token,
         job.logical_job_key,
         job.task_name,
@@ -990,14 +1134,22 @@ def _redispatch_mall_group(
         )
 
     def _bind_candidates(*, error: str | None = None) -> list[tuple[int, str]]:
+        current_entries = [
+            entry for entry in entries
+            if _binding_matches(
+                entry, int(entry["candidate"]["remote_job_id"]), str(entry["owning_day"])
+            )
+        ]
         bindings = [
             (
                 int(entry["candidate"]["id"]),
                 str(entry["owning_day"]),
                 int(entry["candidate"]["remote_job_id"]),
             )
-            for entry in entries
+            for entry in current_entries
         ]
+        if not bindings:
+            return []
         try:
             bound = prewarm_store.bind_redispatched_remote_job_batch(
                 business_date, bindings, job_id,
@@ -1013,7 +1165,7 @@ def _redispatch_mall_group(
             return []
         return [
             (int(entry["candidate"]["id"]), str(entry["candidate"]["cache_status"]))
-            for entry in entries
+            for entry in current_entries
         ]
 
     # Pre-send boundary: below the budget floor the intent stays unclaimed so
@@ -1029,6 +1181,20 @@ def _redispatch_mall_group(
     if not _old_bindings_current():
         phase_errors.append(f"redispatch mall {mall_key}: candidate binding changed before submit")
         return 1
+
+    if int(counters.get("jobs_created", 0) or 0) >= max_jobs_per_pass:
+        phase_errors.append(f"redispatch mall {mall_key}: max jobs per pass reached before claim")
+        return 0
+
+    intent_bindings = [
+        (int(entry["candidate"]["id"]), str(entry["owning_day"]), int(entry["candidate"]["remote_job_id"]))
+        for entry in entries
+    ]
+    if not prewarm_store.record_redispatch_intent_batch(
+        business_date, intent_bindings, job_id, PRODUCER_CUSTOMER_PREWARM_ZHAOSHANG,
+    ):
+        phase_errors.append(f"redispatch mall {mall_key}: intent marker binding changed before POST")
+        return 0
 
     claim = store.claim_remote_submission(token, job_id)
     if claim is None:
@@ -1085,6 +1251,14 @@ def _redispatch_mall_group(
             job_id,
             f"prewarm redispatch submit not attempted: {diagnostic}",
         )
+        try:
+            prewarm_store.clear_redispatch_intent_batch(
+                business_date,
+                [int(entry["candidate"]["id"]) for entry in entries],
+                job_id,
+            )
+        except Exception as exc:  # noqa: BLE001 - retained marker is fail-closed
+            phase_errors.append(f"redispatch job {job_id}: clear unattempted marker failed: {type(exc).__name__}: {exc}")
         counters["submit_not_attempted"] += 1
         phase_errors.append(
             f"redispatch mall {mall_key}: submit not attempted (pre-send); retry next pass"

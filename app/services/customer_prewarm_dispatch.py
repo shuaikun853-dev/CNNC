@@ -713,6 +713,20 @@ def _plan_only_report(
             if job_id is None or int(job_id) in seen_priority_job_ids:
                 continue
             candidate_id = int(candidate["id"])
+            if str(candidate.get("business_date") or "") != business_date:
+                try:
+                    latest = prewarm_store.remote_job_link_for_candidate(candidate_id)
+                except Exception as exc:  # noqa: BLE001 - plan must fail closed
+                    phase_errors.append(f"candidate {candidate_id}: link proof unavailable: {type(exc).__name__}: {exc}")
+                    continue
+                if not (
+                    latest is not None
+                    and str(latest.get("business_date") or "") == business_date
+                    and int(latest.get("remote_job_id") or 0) == int(job_id)
+                    and str(latest.get("producer") or "") == PRODUCER_CUSTOMER_PREWARM_ZHAOSHANG
+                ):
+                    phase_errors.append(f"candidate {candidate_id}: no exact current-day remote link; priority omitted")
+                    continue
             link = _cross_day_link(prewarm_store, candidate_id, business_date, phase_errors)
             if link is not None:
                 # D5 (plan-only): never count a cross-day-linked candidate's
@@ -1087,6 +1101,20 @@ def _run_leased_pass(
                     counters["absorbed"] += 1
                 continue
             if candidate.get("remote_job_id") is not None:
+                if str(candidate.get("business_date") or "") != summary["business_date"]:
+                    try:
+                        latest = prewarm_store.remote_job_link_for_candidate(candidate_id)
+                    except Exception as exc:  # noqa: BLE001 - never trust an unproven bare ID
+                        phase_errors.append(f"candidate {candidate_id}: link proof unavailable: {type(exc).__name__}: {exc}")
+                        continue
+                    if not (
+                        latest is not None
+                        and str(latest.get("business_date") or "") == summary["business_date"]
+                        and int(latest.get("remote_job_id") or 0) == int(candidate["remote_job_id"])
+                        and str(latest.get("producer") or "") == PRODUCER_CUSTOMER_PREWARM_ZHAOSHANG
+                    ):
+                        phase_errors.append(f"candidate {candidate_id}: no exact current-day remote link; priority deferred")
+                        continue
                 link = _cross_day_link(
                     prewarm_store, candidate_id, summary["business_date"], phase_errors
                 )
@@ -1130,6 +1158,22 @@ def _run_leased_pass(
                     phase_errors=phase_errors,
                 ):
                     counters["cache_hit_after_recheck"] += 1
+                continue
+            # A prior POST can durably record its job link just before the
+            # candidate-status write fails. On the next day the candidate is
+            # still PENDING, but today's DB cannot prove the old task absent.
+            try:
+                latest_link = prewarm_store.remote_job_link_for_candidate(candidate_id)
+            except Exception as exc:  # noqa: BLE001 - uncertain provenance is not create permission
+                phase_errors.append(
+                    f"candidate {candidate_id}: remote link probe failed; create deferred: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+                continue
+            if latest_link is not None and str(latest_link.get("business_date") or "") != summary["business_date"]:
+                phase_errors.append(
+                    f"candidate {candidate_id}: prior-day remote link present; create deferred"
+                )
                 continue
             counters["mapped_zhaoshang"] += 1
             groups.setdefault(routing.mall_key, []).append(

@@ -114,6 +114,18 @@ CREATE TABLE IF NOT EXISTS prewarm_remote_job_links (
     recorded_at TEXT NOT NULL,
     PRIMARY KEY(business_date, candidate_id, remote_job_id)
 );
+CREATE INDEX IF NOT EXISTS idx_prewarm_remote_job_links_candidate_time
+    ON prewarm_remote_job_links(candidate_id, recorded_at DESC);
+CREATE TABLE IF NOT EXISTS prewarm_redispatch_intents (
+    business_date TEXT NOT NULL,
+    candidate_id INTEGER NOT NULL,
+    remote_job_id INTEGER NOT NULL,
+    producer TEXT NOT NULL,
+    recorded_at TEXT NOT NULL,
+    PRIMARY KEY(business_date, candidate_id, remote_job_id)
+);
+CREATE INDEX IF NOT EXISTS idx_prewarm_redispatch_intents_candidate_time
+    ON prewarm_redispatch_intents(candidate_id, recorded_at DESC);
 CREATE TABLE IF NOT EXISTS prewarm_lifecycle_cursors (
     name TEXT PRIMARY KEY,
     cursor_value TEXT NOT NULL,
@@ -1070,6 +1082,81 @@ class CustomerPrewarmStore:
                 remote_job_id=remote_job_id,
                 producer=producer,
             )
+
+    def latest_redispatch_intent_for_candidate(self, candidate_id: int) -> dict[str, Any] | None:
+        try:
+            with self._reader() as connection:
+                row = connection.execute(
+                    """SELECT business_date, candidate_id, remote_job_id, producer
+                       FROM prewarm_redispatch_intents WHERE candidate_id=?
+                       ORDER BY recorded_at DESC, rowid DESC LIMIT 1""",
+                    (int(candidate_id),),
+                ).fetchone()
+        except sqlite3.OperationalError as exc:
+            if self._read_only and str(exc) == "no such table: prewarm_redispatch_intents":
+                return None
+            raise
+        return dict(row) if row is not None else None
+
+    def record_redispatch_intent_batch(
+        self,
+        business_date: str,
+        bindings: Sequence[tuple[int, str, int]],
+        remote_job_id: int,
+        producer: str,
+    ) -> bool:
+        """Persist the exact candidate-to-intent association before POST claim."""
+        self._assert_writable()
+        day = self._require_text(business_date, "business_date")
+        producer_value = self._require_text(producer, "producer")
+        if not bindings or len({int(item[0]) for item in bindings}) != len(bindings):
+            return False
+        with self._transaction(immediate=True) as connection:
+            for candidate_id, owning_day, expected_job_id in bindings:
+                candidate = connection.execute(
+                    "SELECT cache_status, remote_job_id FROM prewarm_candidates WHERE id=?",
+                    (int(candidate_id),),
+                ).fetchone()
+                latest = connection.execute(
+                    """SELECT business_date, remote_job_id, producer
+                       FROM prewarm_remote_job_links WHERE candidate_id=?
+                       ORDER BY recorded_at DESC, rowid DESC LIMIT 1""",
+                    (int(candidate_id),),
+                ).fetchone()
+                if (
+                    candidate is None
+                    or str(candidate["cache_status"]) not in _REMOTE_JOB_STATUSES
+                    or int(candidate["remote_job_id"] or 0) != int(expected_job_id)
+                    or latest is None
+                    or str(latest["business_date"]) != str(owning_day)
+                    or int(latest["remote_job_id"]) != int(expected_job_id)
+                    or str(latest["producer"]) != producer_value
+                ):
+                    return False
+            now = self._utcnow()
+            for candidate_id, _owning_day, _expected_job_id in bindings:
+                connection.execute(
+                    """INSERT INTO prewarm_redispatch_intents
+                       (business_date, candidate_id, remote_job_id, producer, recorded_at)
+                       VALUES (?, ?, ?, ?, ?)
+                       ON CONFLICT(business_date, candidate_id, remote_job_id) DO NOTHING""",
+                    (day, int(candidate_id), int(remote_job_id), producer_value, now),
+                )
+        return True
+
+    def clear_redispatch_intent_batch(
+        self, business_date: str, candidate_ids: Sequence[int], remote_job_id: int
+    ) -> None:
+        """Forget a pre-send marker only after a proven NOT_ATTEMPTED outcome."""
+        self._assert_writable()
+        day = self._require_text(business_date, "business_date")
+        with self._transaction(immediate=True) as connection:
+            for candidate_id in candidate_ids:
+                connection.execute(
+                    """DELETE FROM prewarm_redispatch_intents
+                       WHERE business_date=? AND candidate_id=? AND remote_job_id=?""",
+                    (day, int(candidate_id), int(remote_job_id)),
+                )
 
     @contextmanager
     def fence_current_remote_job_link(
