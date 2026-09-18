@@ -441,7 +441,7 @@ python -m pytest tests\test_incremental_audit_runtime.py tests\test_incremental_
   `PRIORITY_PENDING`，下一轮只重试 priority confirm，不重复 reconcile、submit 或 create。priority 结果写回前再次验证
   candidate linkage；priority 远程写前还须在 lease 更新后最后检查 linkage。最终 linkage 验证通过 `customer_prewarm.sqlite3` 的短 `BEGIN IMMEDIATE` fence
   一直覆盖到历史 DB commit，失配则丢弃结果；job 与 crawl_work 的 `SUBMITTED` 推进为同一事务。
-  只有无诊断的确切 `NOT_FOUND` 消耗 recovery attempt；诊断为不确定的 NOT_FOUND 保留待重试。`MANUAL`/不完整 FOUND 原子记为带 provenance blocker 的 `MANUAL_REQUIRED`，不进入 A3；无 identity 且已 POST 或已有 harvest attempt 的 MANUAL_REQUIRED 也不得自动重建。A3 必须先确认 candidate 当前 job id 与最新 producer linkage 完全一致，避免跨日同号误判。确切 NOT_FOUND 到 4 次后仍只由既有 A3 创建。历史 harvest 每轮最多 3 job、单 job 90 秒、独立 durable cursor；复用既有 ProcessLock+lease 原语，SUCCESS 按 exact job 在独立 per-job 同步锁内镜像 shared cache，下轮 candidate 吸收 CACHE_HIT。MANUAL 和确定性缓存同步失败都显式报阻断。`--plan-only` 用 `mode=ro` 统计两个跨日阶段，保持四库零写、零锁、零 adapter 和零远程 I/O。
+  只有无诊断的确切 `NOT_FOUND` 消耗 recovery attempt；诊断为不确定的 NOT_FOUND 保留待重试。`MANUAL`/不完整 FOUND 原子记为带 provenance blocker 的 `MANUAL_REQUIRED`，不进入 A3；无 identity 且已 POST 或已有 harvest attempt 的 MANUAL_REQUIRED 也不得自动重建，但仍进入最终失败链接投影。A3 必须先确认 candidate 当前 job id 与最新 producer linkage 完全一致、owning day 是不晚于本轮的规范日期，避免跨日同号误判；重绑时 candidate 与 linkage 同事务提交。确切 NOT_FOUND 到 4 次后仍只由既有 A3 创建。历史 harvest 每轮最多 3 job、单 job 90 秒、独立 durable cursor；复用既有 ProcessLock+lease 原语，SUCCESS 按 exact job 镜像 shared cache，所有 scanner/backfill/harvest 通过同一 prewarm-store 同步锁串行，避免同一事件重复写缓存；下轮 candidate 吸收 CACHE_HIT。MANUAL 和确定性缓存同步失败都显式报阻断。`--plan-only` 用 `mode=ro` 统计两个跨日阶段，保持四库零写、零锁、零 adapter 和零远程 I/O。
 
 ## 启用与回滚门槛
 
