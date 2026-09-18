@@ -996,8 +996,21 @@ def _redispatch_mall_group(
             return 0
         if prior_state == "SUBMIT_INTENT" and not int(prior.get("post_attempted") or 0):
             if request_keys != prior_keys:
-                phase_errors.append(f"redispatch mall {mall_key}: unposted prior group changed; manual review")
-                return 0
+                if any(
+                    prewarm_store.latest_redispatch_intent_for_candidate(int(entry["candidate"]["id"]))
+                    is not None for entry in entries
+                ) or not store.supersede_unposted_prewarm_intent(
+                    token, prior_id, "unposted prewarm group changed before remote submission"
+                ):
+                    phase_errors.append(f"redispatch mall {mall_key}: unposted prior group cannot be retired; manual review")
+                    return 0
+                return _redispatch_mall_group(
+                    store=store, token=token, prewarm_store=prewarm_store,
+                    paths=paths, mapping=mapping, entries=entries,
+                    get_adapter=get_adapter, business_date=business_date,
+                    deadline=deadline, monotonic_value=monotonic_value,
+                    max_jobs_per_pass=max_jobs_per_pass, summary=summary,
+                )
             resume_unposted = prior
         else:
             if prior_state == "SUBMIT_INTENT" and int(prior.get("post_attempted") or 0):

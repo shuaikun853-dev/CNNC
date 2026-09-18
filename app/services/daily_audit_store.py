@@ -1686,6 +1686,67 @@ class DailyAuditStore:
                 )
             return self._row(connection.execute("SELECT * FROM remote_jobs WHERE id=?", (job_id,)).fetchone())
 
+    def supersede_unposted_prewarm_intent(self, token: LeaseToken, job_id: int, reason: str) -> bool:
+        """Retire a never-posted placeholder job and free its exact crawl rows."""
+        with self._transaction(immediate=True) as connection:
+            self._validate_lease(connection, token)
+            job = self._job_for_lease(connection, token, job_id)
+            if (
+                str(job["state"]) != "SUBMIT_INTENT"
+                or int(job["post_attempted"] or 0)
+                or str(job["remote_identity"] or "").strip()
+            ):
+                return False
+            try:
+                payload = json.loads(str(job["payload_json"] or ""))
+                requests = payload["requests"]
+                expected = [
+                    (
+                        str(request["mall_key"]), str(request["sku_id"]),
+                        str(request["url"]), str(request["backend_version"]),
+                    )
+                    for request in requests
+                ]
+            except (KeyError, TypeError, ValueError):
+                return False
+            if not expected or len(expected) != len(set(expected)):
+                return False
+            rows = connection.execute(
+                """SELECT id, mall_key, sku_id, exact_url, backend_version,
+                          state, result_json
+                   FROM crawl_work WHERE run_id=? AND remote_job_id=? ORDER BY id""",
+                (token.run_id, job_id),
+            ).fetchall()
+            actual = [
+                (str(row["mall_key"]), str(row["sku_id"]),
+                 str(row["exact_url"]), str(row["backend_version"]))
+                for row in rows
+            ]
+            if (
+                len(rows) != len(expected)
+                or set(actual) != set(expected)
+                or any(
+                    str(row["state"]) != "PENDING"
+                    or row["result_json"] is not None
+                    or not str(row["sku_id"]).startswith("zhpq-")
+                    or not is_placeholder_code(str(row["sku_id"]))
+                    for row in rows
+                )
+            ):
+                return False
+            now = self._utcnow()
+            detached = connection.execute(
+                "UPDATE crawl_work SET remote_job_id=NULL, updated_at=? WHERE run_id=? AND remote_job_id=?",
+                (now, token.run_id, job_id),
+            )
+            if detached.rowcount != len(rows):
+                raise RemoteIntentConflict("unposted crawl detachment changed during retirement")
+            connection.execute(
+                "UPDATE remote_jobs SET state='SUPERSEDED', error_text=?, updated_at=? WHERE id=?",
+                (str(reason), now, job_id),
+            )
+            return True
+
     def mark_remote_manual(self, token: LeaseToken, job_id: int, error: str) -> dict[str, Any]:
         return self._set_job_state(token, job_id, "MANUAL_REQUIRED", error=error)
 
