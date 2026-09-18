@@ -24,6 +24,11 @@ from pathlib import Path
 import pytest
 from openpyxl import Workbook
 
+from app.services.customer_prewarm_store import (
+    CACHE_STATUS_PENDING_PREWARM,
+    CACHE_STATUS_REMOTE_DISPATCHED,
+    CustomerPrewarmStore,
+)
 from app.services.daily_audit_store import DailyAuditStore
 from app.services.dashboard_manual_ops import (
     read_operator_actions,
@@ -37,6 +42,7 @@ from app.services.legacy_zhaoshang_adapter import (
     CrawlRequest,
     RemoteTaskIdentityConflictError,
 )
+from app.services.shared_crawl_cache import PRODUCER_CUSTOMER_PREWARM_ZHAOSHANG
 
 
 BUSINESS_DATE = "2026-08-28"
@@ -427,6 +433,188 @@ def _seeded_reexport(
         result_json=result_json,
     )
     return seed, store, job
+
+
+def _seed_exact_prewarm_group(
+    seed: _Seed,
+    store: DailyAuditStore,
+    job,
+    *,
+    producer: str = PRODUCER_CUSTOMER_PREWARM_ZHAOSHANG,
+    omit_last: bool = False,
+    add_extra: bool = False,
+) -> CustomerPrewarmStore:
+    prepared = seed.prepared_holder["prepared"]
+    requests = list(prepared.requests)
+    prewarm = CustomerPrewarmStore(seed.run_dir.parent / "customer_prewarm.sqlite3")
+    selected = requests[:-1] if omit_last else requests
+    for index, request in enumerate(selected):
+        linked = prewarm.upsert_link(
+            f"doc-{index}",
+            request.url,
+            mall=request.mall_key,
+            lookup_url=request.url,
+            business_date=BUSINESS_DATE,
+        )
+        candidate_id = int(linked["candidate"]["id"])
+        prewarm.record_candidate_result(
+            candidate_id,
+            cache_status=CACHE_STATUS_PENDING_PREWARM,
+        )
+        prewarm.record_candidate_result(
+            candidate_id,
+            cache_status=CACHE_STATUS_REMOTE_DISPATCHED,
+            remote_job_id=int(job["id"]),
+        )
+        prewarm.record_remote_job_link(
+            BUSINESS_DATE,
+            candidate_id,
+            int(job["id"]),
+            producer,
+        )
+    if add_extra:
+        extra_url = "https://shop.example/extra"
+        linked = prewarm.upsert_link(
+            "doc-extra",
+            extra_url,
+            mall=MALL_KEY,
+            lookup_url=extra_url,
+            business_date=BUSINESS_DATE,
+        )
+        candidate_id = int(linked["candidate"]["id"])
+        prewarm.record_candidate_result(
+            candidate_id,
+            cache_status=CACHE_STATUS_PENDING_PREWARM,
+        )
+        prewarm.record_candidate_result(
+            candidate_id,
+            cache_status=CACHE_STATUS_REMOTE_DISPATCHED,
+            remote_job_id=int(job["id"]),
+        )
+        prewarm.record_remote_job_link(
+            BUSINESS_DATE,
+            candidate_id,
+            int(job["id"]),
+            producer,
+        )
+
+    # Customer-prewarm crawl provenance uses mall_source_id rather than the
+    # normal STEP1 snapshot vCommodityId/documentId scope.
+    import sqlite3
+
+    connection = sqlite3.connect(str(seed.state_path), timeout=5)
+    try:
+        connection.execute(
+            "UPDATE crawl_work SET source_id=? WHERE remote_job_id=?",
+            (requests[0].mall_source_id, int(job["id"])),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    return prewarm
+
+
+def test_reexport_collapsed_priority_manual_uses_exact_prewarm_producer_scope(tmp_path):
+    seed = _Seed(tmp_path)
+    seed.remote_progress = seed.terminal_progress(3)
+    seed.runner = seed.exporting_runner(_priced_rows(3))
+    store, job = seed.seed(
+        3,
+        priority_updated=False,
+        job_state="MANUAL_REQUIRED",
+        error_text="highest priority was not confirmed",
+        result_json=None,
+    )
+    event = {
+        "action": "PRIORITY_UNCONFIRMED",
+        "mall": MALL_KEY,
+        "task_name": seed.prepared_holder["prepared"].task_name,
+        "task_id": TASK_ID,
+        "task_number": TASK_NUMBER,
+        "reason": "PriorityScopeSafetyError",
+        "retryable": False,
+    }
+    with seed.batch_state.open("a", encoding="utf-8") as stream:
+        stream.write(f"- `{json.dumps(event)}`\n")
+    _seed_exact_prewarm_group(seed, store, job)
+
+    result = run_manual_reexport(
+        state_path=seed.state_path,
+        lock_path=seed.lock_path,
+        business_date=BUSINESS_DATE,
+        remote_job_id=int(job["id"]),
+        remote_identity=IDENTITY,
+        adapter=seed.adapter,
+        timeout_seconds=60.0,
+    )
+
+    assert result["outcome"] == "REEXPORT_COMPLETED"
+    assert result["result_count"] == 3
+    assert result["create_calls"] == 0
+    assert len(seed.runner_calls) == 1
+    assert "--wait-export-only" in seed.runner_calls[0]
+    assert all(
+        crawl["state"] == "SUCCESS"
+        for crawl in store.crawl_work_for_job(int(job["id"]))
+    )
+
+
+@pytest.mark.parametrize(
+    "proof_mutation",
+    ["missing_link", "wrong_producer", "extra_candidate"],
+)
+def test_reexport_prewarm_scope_requires_exact_durable_group_proof(
+    tmp_path, proof_mutation
+):
+    seed = _Seed(tmp_path)
+    seed.remote_progress = seed.terminal_progress(3)
+    seed.runner = seed.exporting_runner(_priced_rows(3))
+    store, job = seed.seed(
+        3,
+        priority_updated=False,
+        job_state="MANUAL_REQUIRED",
+        error_text="highest priority was not confirmed",
+        result_json=None,
+    )
+    event = {
+        "action": "PRIORITY_UNCONFIRMED",
+        "mall": MALL_KEY,
+        "task_name": seed.prepared_holder["prepared"].task_name,
+        "task_id": TASK_ID,
+        "task_number": TASK_NUMBER,
+        "reason": "PriorityScopeSafetyError",
+        "retryable": False,
+    }
+    with seed.batch_state.open("a", encoding="utf-8") as stream:
+        stream.write(f"- `{json.dumps(event)}`\n")
+    _seed_exact_prewarm_group(
+        seed,
+        store,
+        job,
+        producer=(
+            "foreign-producer"
+            if proof_mutation == "wrong_producer"
+            else PRODUCER_CUSTOMER_PREWARM_ZHAOSHANG
+        ),
+        omit_last=proof_mutation == "missing_link",
+        add_extra=proof_mutation == "extra_candidate",
+    )
+
+    result = run_manual_reexport(
+        state_path=seed.state_path,
+        lock_path=seed.lock_path,
+        business_date=BUSINESS_DATE,
+        remote_job_id=int(job["id"]),
+        remote_identity=IDENTITY,
+        adapter=seed.adapter,
+        timeout_seconds=60.0,
+    )
+
+    assert result["outcome"] == "REEXPORT_REJECTED"
+    assert result["error_code"] == "NO_SNAPSHOT_SCOPE"
+    assert "outside the frozen snapshot" in result["reason"]
+    assert seed.runner_calls == []
+    assert store.get_remote_job(int(job["id"]))["state"] == "MANUAL_REQUIRED"
 
 
 def test_reexport_1_live_proof_terminal_admits_priority_unconfirmed_manual(tmp_path):

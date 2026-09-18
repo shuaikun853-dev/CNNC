@@ -10,6 +10,7 @@ import hashlib
 import json
 import os
 import re
+import sqlite3
 import threading
 import time
 from datetime import UTC, datetime
@@ -17,6 +18,7 @@ from pathlib import Path
 from typing import Any, Callable, Mapping
 from uuid import uuid4
 
+from app.services.customer_prewarm_store import CustomerPrewarmStore
 from app.services.daily_audit_store import (
     DailyAuditStore,
     LeaseUnavailable,
@@ -35,6 +37,7 @@ from app.services.recovery.common import RecoveryRejected, _acquire_recovery_lea
 from app.services.recovery.harvest import (
     _existing_remote_harvest_core,
     is_priority_unconfirmed_manual_family,
+    is_terminal_nonretryable_priority_manual_family,
     live_identity_proof,
 )
 from app.services.recovery.no_result import EXPORT_NO_PRICE_ACCEPTED_ERRORS
@@ -47,6 +50,7 @@ from app.services.remote_running_recovery import (
     canonical_progress_signature,
     classify_remote_execution_state,
 )
+from app.services.shared_crawl_cache import PRODUCER_CUSTOMER_PREWARM_ZHAOSHANG
 from app.services.zhaoshang_progress_probe import ZhaoshangProgressService
 
 
@@ -217,6 +221,51 @@ def _probe_remote_execution_state(
     )
 
 
+def _manual_reexport_source_scope(
+    state_path: Path | str,
+    *,
+    business_date: str,
+    remote_job_id: int,
+    job: Mapping[str, Any],
+) -> str:
+    """Choose prewarm payload scope only from an exact durable producer proof.
+
+    Missing/corrupt/partial prewarm evidence never authorizes the alternate
+    scope; the caller then keeps the normal STEP1 latest/frozen semantics.
+    Only the collapsed non-retryable priority-MANUAL incident family may use
+    this operator-only alternate scope; ordinary prewarm jobs remain owned by
+    the lifecycle harvester.
+    """
+    if not is_terminal_nonretryable_priority_manual_family(job):
+        return "latest"
+    try:
+        payload = json.loads(str(job.get("payload_json") or ""))
+        requests = tuple(CrawlRequest(**dict(row)) for row in payload["requests"])
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return "latest"
+    if not requests:
+        return "latest"
+    malls = {str(request.mall_key or "").strip() for request in requests}
+    if (
+        len(malls) != 1
+        or next(iter(malls)) != str(job.get("mall_key") or "").strip()
+    ):
+        return "latest"
+    prewarm_path = Path(state_path).resolve().parent.parent / "customer_prewarm.sqlite3"
+    try:
+        prewarm = CustomerPrewarmStore.open_read_only(prewarm_path)
+        proven = prewarm.exact_current_remote_job_group_matches(
+            business_date=business_date,
+            remote_job_id=int(remote_job_id),
+            producer=PRODUCER_CUSTOMER_PREWARM_ZHAOSHANG,
+            mall=next(iter(malls)),
+            lookup_urls=tuple(request.url for request in requests),
+        )
+    except (FileNotFoundError, OSError, ValueError, sqlite3.Error):
+        return "latest"
+    return "prewarm_payload" if proven else "latest"
+
+
 def _is_priority_unconfirmed_manual_job(job: Mapping[str, Any]) -> bool:
     """Strict "priority update never confirmed" durable shape (2026-09-04 hotfix).
 
@@ -358,6 +407,13 @@ def run_manual_reexport(
             "create_calls": 0,
         }
 
+    source_scope = _manual_reexport_source_scope(
+        state_path,
+        business_date=business_date,
+        remote_job_id=int(remote_job_id),
+        job=job,
+    )
+
     if progress_lookup is not None:
         reported = str(progress_lookup(job) or "").strip()
         classification = (
@@ -422,7 +478,7 @@ def run_manual_reexport(
             admissible_states=frozenset({"SUBMITTED", "RUNNING", "EXPORTED"}),
             allow_manual_requeue=True,
             manual_requeue_diagnostics=REEXPORT_MANUAL_REQUEUE_DIAGNOSTICS,
-            source_scope="latest",
+            source_scope=source_scope,
             operation="manual re-export",
             attempt_headroom=2,
             live_identity_proof=proof,
