@@ -599,12 +599,15 @@ def _run_dispatch(args: argparse.Namespace, business_date: str, runtime_root: Pa
                 lifecycle_deadline = _shared_harvest_deadline(
                     pass_started, args.budget_seconds
                 )
+                lifecycle_remaining = max(0.0, lifecycle_deadline - time.monotonic())
+                reconcile_deadline = lifecycle_deadline - 2 * lifecycle_remaining / 3
+                historical_deadline = lifecycle_deadline - lifecycle_remaining / 3
                 run_cross_day_reconcile_phase(
                     prewarm_store=prewarm_store,
                     current_business_date=business_date,
                     state_runtime_root=state_root,
                     get_adapter=lambda: adapter,
-                    deadline=lifecycle_deadline,
+                    deadline=reconcile_deadline,
                     monotonic_value=time.monotonic,
                     summary=summary,
                 )
@@ -614,7 +617,7 @@ def _run_dispatch(args: argparse.Namespace, business_date: str, runtime_root: Pa
                     current_business_date=business_date,
                     state_runtime_root=state_root,
                     get_adapter=lambda: adapter,
-                    deadline=lifecycle_deadline,
+                    deadline=historical_deadline,
                     monotonic_value=time.monotonic,
                     summary=summary,
                 )

@@ -602,26 +602,32 @@ def run_cross_day_harvest_phase(
         if remaining <= 0:
             summary["cross_day_harvest_deferred"] += 1
             continue
-        paths = runtime_paths(owning_day, root)
-        if paths.run_dir.resolve().parent != root.resolve() or not paths.state_path.is_file():
-            summary["cross_day_harvest_deferred"] += 1
-            phase_errors.append(f"cross-day harvest {owning_day}/{job_id}: historical DB unavailable")
-            continue
-        if (owning_day, job_id) not in _linked_cross_day_job_keys(
-            prewarm_store, current_business_date
-        ):
-            summary["cross_day_harvest_deferred"] += 1
-            continue
-        connection = _open_state_db_readonly(paths.state_path)
-        if connection is None:
-            summary["cross_day_harvest_deferred"] += 1
-            continue
         try:
-            row = connection.execute(
-                _HARVEST_ELIGIBLE_JOB_SQL, (job_id, owning_day)
-            ).fetchone()
-        finally:
-            connection.close()
+            paths = runtime_paths(owning_day, root)
+            if paths.run_dir.resolve().parent != root.resolve() or not paths.state_path.is_file():
+                summary["cross_day_harvest_deferred"] += 1
+                phase_errors.append(f"cross-day harvest {owning_day}/{job_id}: historical DB unavailable")
+                continue
+            if (owning_day, job_id) not in _linked_cross_day_job_keys(
+                prewarm_store, current_business_date
+            ):
+                summary["cross_day_harvest_deferred"] += 1
+                continue
+            connection = _open_state_db_readonly(paths.state_path)
+            if connection is None:
+                summary["cross_day_harvest_deferred"] += 1
+                continue
+            try:
+                row = connection.execute(
+                    _HARVEST_ELIGIBLE_JOB_SQL, (job_id, owning_day)
+                ).fetchone()
+            finally:
+                connection.close()
+        except Exception as exc:  # noqa: BLE001 - isolate historical preflight
+            phase_errors.append(
+                f"cross-day harvest {owning_day}/{job_id}: {type(exc).__name__}: {exc}"
+            )
+            continue
         if row is None:
             summary["cross_day_harvest_deferred"] += 1
             continue
@@ -667,7 +673,9 @@ def run_cross_day_harvest_phase(
                 continue
             if outcome == "REMOTE_EXISTING_HARVEST_COMPLETED":
                 summary["cross_day_harvested"] += 1
-            elif outcome != "REMOTE_EXISTING_HARVEST_MANUAL":
+            elif outcome == "REMOTE_EXISTING_HARVEST_MANUAL":
+                phase_errors.append(f"cross-day harvest {owning_day}/{job_id}: MANUAL_REQUIRED")
+            else:
                 phase_errors.append(
                     f"cross-day harvest {owning_day}/{job_id}: {outcome or 'unknown outcome'}"
                 )
@@ -675,21 +683,37 @@ def run_cross_day_harvest_phase(
         if deadline - monotonic_value() <= 0:
             summary["cross_day_harvest_deferred"] += 1
             continue
-        if (owning_day, job_id) not in _linked_cross_day_job_keys(
-            prewarm_store, current_business_date
-        ):
-            summary["cross_day_harvest_deferred"] += 1
-            continue
         try:
-            synced = sync_daily_internet_results(
-                prewarm_store,
-                shared_cache,
-                state_db_path=paths.state_path,
-                business_date=owning_day,
-                remote_job_id=job_id,
-            )
+            if (owning_day, job_id) not in _linked_cross_day_job_keys(
+                prewarm_store, current_business_date
+            ):
+                summary["cross_day_harvest_deferred"] += 1
+                continue
+            sync_lock = ProcessLock(paths.run_dir / f"prewarm-cache-sync-{job_id}.lock")
+            try:
+                sync_lock.acquire()
+            except LeaseUnavailable:
+                summary["cross_day_harvest_lock_busy"] += 1
+                continue
+            try:
+                if (owning_day, job_id) not in _linked_cross_day_job_keys(
+                    prewarm_store, current_business_date
+                ):
+                    summary["cross_day_harvest_deferred"] += 1
+                    continue
+                synced = sync_daily_internet_results(
+                    prewarm_store,
+                    shared_cache,
+                    state_db_path=paths.state_path,
+                    business_date=owning_day,
+                    remote_job_id=job_id,
+                )
+            finally:
+                sync_lock.release()
             summary["cross_day_harvest_cache_synced"] += int(synced["ok_synced"])
-            if synced["errors"] or synced["transient_failures"]:
+            if any(synced.get(key) for key in (
+                "errors", "transient_failures", "deterministic_failures", "errored_before"
+            )):
                 phase_errors.append(
                     f"cross-day harvest {owning_day}/{job_id}: cache sync incomplete"
                 )

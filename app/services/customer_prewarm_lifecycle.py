@@ -183,6 +183,8 @@ def _job_is_dead(job_row: Mapping[str, Any], dead_threshold: int) -> bool:
     if state == "MANUAL_REQUIRED":
         if str(job_row.get("error_text") or "").startswith(_RECONCILE_MANUAL_BLOCKER):
             return False
+        if int(job_row.get("harvest_attempts") or 0):
+            return False  # remote export was attempted but could not be proven safe
         if int(job_row.get("post_attempted") or 0) and not str(
             job_row.get("remote_identity") or ""
         ).strip():
@@ -227,10 +229,15 @@ def _owning_day_job(
             f"candidate {candidate_id}: remote job link probe: {type(exc).__name__}: {exc}"
         )
         return owning_day, None
-    if link is not None:
-        link_date = str(link.get("business_date") or "")
-        if link_date and link_date != business_date:
-            owning_day = link_date
+    if link is None or (
+        int(link.get("remote_job_id") or 0) != int(job_id)
+        or str(link.get("producer") or "") != PRODUCER_CUSTOMER_PREWARM_ZHAOSHANG
+    ):
+        phase_errors.append(f"candidate {candidate_id}: latest remote job link mismatch")
+        return owning_day, None
+    link_date = str(link.get("business_date") or "")
+    if link_date and link_date != business_date:
+        owning_day = link_date
     return owning_day, job_reader(int(job_id), owning_day)
 
 
