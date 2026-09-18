@@ -428,7 +428,7 @@ python -m pytest tests\test_incremental_audit_runtime.py tests\test_incremental_
 
 ### 客户预爬派发生命周期
 
-- `scripts\customer_prewarm_dispatch.py` 的正常 live pass 预留总预算中最多 18 秒（且不超过 40%）给后续生命周期；当天 dispatch lock/lease 完全释放后，依次运行跨日 identity/priority、跨日 historical harvest/cache sync、当天 harvest，三个后续阶段各分约三分之一剩余时间，避免忙碌的当天 pass 或历史长任务持续挤掉其它阶段。严禁持有当天锁时申请历史日锁，也不得在 reconcile 的历史锁内嵌套调用 harvest 原语。
+- `scripts\customer_prewarm_dispatch.py` 的正常 live pass 预留总预算中最多 24 秒（且不超过 60%）给后续生命周期；当天 dispatch lock/lease 完全释放后，依次运行跨日 identity/priority、跨日 historical harvest/cache sync、当天 harvest。剩余至少 20 秒时跨日 reconcile 最多分 10 秒，余量由历史和当天 harvest 平分；小预算按剩余时间动态划分。这样默认 50 秒预算下忙碌 dispatch 后三个阶段仍各有可用时间。严禁持有当天锁时申请历史日锁，也不得在 reconcile 的历史锁内嵌套调用 harvest 原语。
 - discovery 只从 `customer_prewarm.sqlite3` 中仍为 `REMOTE_DISPATCHED`/`REMOTE_REUSED`
   的 durable candidate 出发，并按 `(owning_day, remote_job_id)` 去重。执行前在历史 DB 锁内再次验证：
   job 仍为无 identity 且未到 dead threshold 的 `SUBMIT_UNKNOWN`，或带 exact identity 的
