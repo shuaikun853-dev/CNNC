@@ -2115,6 +2115,26 @@ def test_a3_rejects_mismatched_latest_link_even_with_job_id_collision(tmp_path):
     assert plan["redispatch_groups"] == {}
 
 
+def test_a3_rejects_future_owning_day_even_with_exact_job_id(tmp_path):
+    runtime_root = tmp_path / "runtime"
+    prewarm = CustomerPrewarmStore(runtime_root / "customer_prewarm.sqlite3")
+    today_paths = make_state_db(runtime_root, TODAY)
+    future_day = "2099-01-01"
+    url = "https://qx.com/future-day-collision.html"
+    future_paths, job_id = seed_remote_work(
+        runtime_root, future_day, _CountingAdapter(), mapping=COMIX,
+        url=url, job_state="SUBMITTED", remote_identity="comix|future|number",
+    )
+    with sqlite3.connect(future_paths.state_path) as connection:
+        connection.execute("UPDATE remote_jobs SET state='TERMINAL_FAILED' WHERE id=?", (job_id,))
+    seed_remote_candidate(prewarm, url, job_id, business_date=future_day)
+    plan = plan_lifecycle_actions(
+        today_paths.state_path, prewarm, TODAY, [COMIX],
+        state_runtime_root=runtime_root,
+    )
+    assert plan["redispatch_groups"] == {}
+
+
 def test_historical_manual_after_uncertain_harvest_cannot_auto_redispatch(tmp_path):
     runtime_root = tmp_path / "runtime"
     prewarm = CustomerPrewarmStore(runtime_root / "customer_prewarm.sqlite3")

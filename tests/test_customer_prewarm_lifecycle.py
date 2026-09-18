@@ -662,6 +662,29 @@ def test_redispatch_creates_new_job_and_records_linkage(tmp_path):
     assert all(str(row["sku_id"]).startswith("zhpq-") for row in crawls)
 
 
+def test_redispatch_binding_cannot_crash_between_link_and_candidate(tmp_path, monkeypatch):
+    runtime_root = tmp_path / "runtime"
+    paths = make_state_db(runtime_root, TODAY)
+    prewarm = CustomerPrewarmStore(runtime_root / "customer_prewarm.sqlite3")
+    url = "https://qx.com/atomic-rebind.html"
+    _dead_paths, dead_job = seed_manual_job(
+        runtime_root, TODAY, _CountingAdapter(), mapping=COMIX, url=url,
+    )
+    candidate_id = seed_remote_candidate(prewarm, url, dead_job)
+
+    def crash_on_separate_candidate_write(*_args, **_kwargs):
+        raise RuntimeError("crash between linkage writes")
+
+    monkeypatch.setattr(lifecycle, "_record", crash_on_separate_candidate_write)
+    try:
+        run_redispatch(runtime_root, paths, prewarm, _CountingAdapter())
+    except RuntimeError:
+        pass
+    candidate = prewarm.candidate_by_id(candidate_id)
+    latest = prewarm.remote_job_link_for_candidate(candidate_id)
+    assert latest["remote_job_id"] == candidate["remote_job_id"]
+
+
 def test_redispatch_daily_cap_blocks_and_notes_last_error(tmp_path):
     runtime_root = tmp_path / "runtime"
     paths = make_state_db(runtime_root, TODAY)

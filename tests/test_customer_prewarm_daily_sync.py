@@ -36,7 +36,7 @@ from app.services.crawl_url_identity import (
     SKU_STATUS_URL_PARSED_UNVERIFIED,
     is_placeholder_code,
 )
-from app.services.daily_audit_store import DEFAULT_POOL_ID, DEFAULT_TENANT_ID, DailyAuditStore
+from app.services.daily_audit_store import DEFAULT_POOL_ID, DEFAULT_TENANT_ID, DailyAuditStore, ProcessLock
 from app.services.shared_crawl_cache import AliasConflictError, SharedCrawlCache
 from scripts.zhaoshang_mall_mapping import ZhaoshangMallMapping
 
@@ -206,6 +206,8 @@ def test_case9_daily_sync_then_customer_hit(tmp_path, prewarm_store, shared_cach
     # CONFIRMED),原值同时保留在 payload["request_sku_id"]。
     assert entry["sku_status"] == SKU_STATUS_UPSTREAM_PROVIDED
     assert entry["real_sku_id"] == "SKU-A"
+
+
     assert entry["payload"]["request_sku_id"] == "SKU-A"
     assert entry["payload"]["source_event_key"] == _state_event_key(path, BUSINESS_DATE)
     # 客户 referenceLink 发现当轮即可复用刚同步的条目
@@ -220,6 +222,29 @@ def test_case9_daily_sync_then_customer_hit(tmp_path, prewarm_store, shared_cach
     assert result["detail_ok"] is True
     assert result["hits"] == 1 and result["misses"] == 0
     assert prewarm_store.list_unique_cache_misses() == []
+
+
+def test_sync_uses_one_store_wide_lock_across_entrypoints(tmp_path, prewarm_store, shared_cache):
+    url = "https://b2b.nbdeli.com/goods/sync-race.html"
+    path = make_state_db(
+        tmp_path, BUSINESS_DATE,
+        [_ok_row("nbdeli", "SKU-R", url, "13.5", "2026-09-07T02:00:00+00:00", "race-task")],
+    )
+    lock = ProcessLock(prewarm_store.path.with_name(f"{prewarm_store.path.name}.sync.lock"))
+    lock.acquire()
+    try:
+        deferred = sync_daily_internet_results(
+            prewarm_store, shared_cache, state_db_path=path, business_date=BUSINESS_DATE
+        )
+    finally:
+        lock.release()
+    assert deferred["state_db"] == "deferred"
+    assert deferred["ok_synced"] == 0
+    assert shared_cache.lookup_current("nbdeli", url) is None
+    retry = sync_daily_internet_results(
+        prewarm_store, shared_cache, state_db_path=path, business_date=BUSINESS_DATE
+    )
+    assert retry["ok_synced"] == 1
 
 
 def _detail_fetch(payload_by_document):
