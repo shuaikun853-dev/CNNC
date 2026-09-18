@@ -1028,14 +1028,19 @@ class CustomerPrewarmStore:
 
     def remote_job_link_for_candidate(self, candidate_id: int) -> dict[str, Any] | None:
         """Latest linkage of one candidate (max recorded_at, tie-break max rowid)."""
-        with self._reader() as connection:
-            row = connection.execute(
-                """SELECT * FROM prewarm_remote_job_links
-                   WHERE candidate_id=?
-                   ORDER BY recorded_at DESC, rowid DESC
-                   LIMIT 1""",
-                (int(candidate_id),),
-            ).fetchone()
+        try:
+            with self._reader() as connection:
+                row = connection.execute(
+                    """SELECT * FROM prewarm_remote_job_links
+                       WHERE candidate_id=?
+                       ORDER BY recorded_at DESC, rowid DESC
+                       LIMIT 1""",
+                    (int(candidate_id),),
+                ).fetchone()
+        except sqlite3.OperationalError as exc:
+            if self._read_only and str(exc) == "no such table: prewarm_remote_job_links":
+                return None
+            raise
         return dict(row) if row is not None else None
 
     @staticmethod
