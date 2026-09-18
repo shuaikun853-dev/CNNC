@@ -2024,6 +2024,43 @@ def test_cli_runs_cross_day_after_today_locks_release_before_harvest_with_shared
     assert observed["cross_deadline"] < observed["historical_deadline"] < observed["harvest_deadline"]
 
 
+def test_cli_reserves_usable_cross_day_time_after_busy_dispatch(tmp_path, monkeypatch):
+    runtime_root = tmp_path / "runtime"
+    CustomerPrewarmStore(runtime_root / "customer_prewarm.sqlite3")
+    SharedCrawlCache(runtime_root / "shared_crawl_cache.sqlite3")
+    make_state_db(runtime_root, TODAY)
+    clock = {"now": 0.0}
+    deadlines = {}
+
+    def fake_pass(*_args, **kwargs):
+        clock["now"] += kwargs["budget_seconds"]
+        deadlines["pass_budget"] = kwargs["budget_seconds"]
+        return {"outcome": "OK", "phase_errors": []}
+
+    monkeypatch.setattr(cli.time, "monotonic", lambda: clock["now"])
+    monkeypatch.setattr(cli, "load_zhaoshang_mall_mappings", lambda _path: [COMIX])
+    monkeypatch.setattr(cli, "run_prewarm_dispatch_pass", fake_pass)
+    monkeypatch.setattr(
+        cli, "run_cross_day_reconcile_phase",
+        lambda **kwargs: deadlines.setdefault("reconcile", kwargs["deadline"]),
+    )
+    monkeypatch.setattr(
+        cli, "run_cross_day_harvest_phase",
+        lambda **kwargs: deadlines.setdefault("historical", kwargs["deadline"]),
+    )
+    monkeypatch.setattr(
+        cli, "run_harvest_phase",
+        lambda *_args, **kwargs: deadlines.setdefault("today", kwargs["deadline"]),
+    )
+    assert cli.main([
+        "--business-date", TODAY, "--runtime-root", str(runtime_root),
+        "--budget-seconds", "50",
+    ]) == 0
+    assert deadlines["reconcile"] - clock["now"] >= 5
+    assert deadlines["historical"] - deadlines["reconcile"] >= 5
+    assert deadlines["today"] - deadlines["historical"] >= 5
+
+
 def test_historical_harvest_preflight_error_does_not_skip_today(tmp_path, monkeypatch):
     runtime_root = tmp_path / "runtime"
     prewarm = CustomerPrewarmStore(runtime_root / "customer_prewarm.sqlite3")
@@ -2133,6 +2170,19 @@ def test_a3_rejects_future_owning_day_even_with_exact_job_id(tmp_path):
         state_runtime_root=runtime_root,
     )
     assert plan["redispatch_groups"] == {}
+
+
+def test_atomic_a3_bind_rejects_same_numbered_rebind_on_another_day(tmp_path):
+    runtime_root = tmp_path / "runtime"
+    prewarm = CustomerPrewarmStore(runtime_root / "customer_prewarm.sqlite3")
+    url = "https://qx.com/same-id-day-race.html"
+    candidate_id = seed_remote_candidate(prewarm, url, 1, business_date=YESTERDAY)
+    prewarm.record_remote_job_link(TODAY, candidate_id, 1, "customer-prewarm-zhaoshang")
+    assert not prewarm.bind_redispatched_remote_job(
+        TODAY, candidate_id, YESTERDAY, 1, 2, "customer-prewarm-zhaoshang"
+    )
+    assert prewarm.candidate_by_id(candidate_id)["remote_job_id"] == 1
+    assert prewarm.remote_job_link_for_candidate(candidate_id)["business_date"] == TODAY
 
 
 def test_historical_manual_after_uncertain_harvest_cannot_auto_redispatch(tmp_path):

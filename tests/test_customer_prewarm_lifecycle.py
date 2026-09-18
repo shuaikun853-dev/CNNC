@@ -40,6 +40,7 @@ from app.services.customer_prewarm_dispatch import (
     run_prewarm_dispatch_pass,
 )
 from app.services.customer_prewarm_store import (
+    CACHE_STATUS_CACHE_HIT,
     CACHE_STATUS_PENDING_PREWARM,
     CACHE_STATUS_REMOTE_DISPATCHED,
     CustomerPrewarmStore,
@@ -683,6 +684,104 @@ def test_redispatch_binding_cannot_crash_between_link_and_candidate(tmp_path, mo
     candidate = prewarm.candidate_by_id(candidate_id)
     latest = prewarm.remote_job_link_for_candidate(candidate_id)
     assert latest["remote_job_id"] == candidate["remote_job_id"]
+
+
+def test_redispatch_does_not_submit_after_candidate_becomes_cache_hit(tmp_path):
+    runtime_root = tmp_path / "runtime"
+    paths = make_state_db(runtime_root, TODAY)
+    prewarm = CustomerPrewarmStore(runtime_root / "customer_prewarm.sqlite3")
+    url = "https://qx.com/stale-before-submit.html"
+    _dead_paths, dead_job = seed_manual_job(
+        runtime_root, TODAY, _CountingAdapter(), mapping=COMIX, url=url,
+    )
+    candidate_id = seed_remote_candidate(prewarm, url, dead_job)
+
+    class ScannerRacesBeforeSubmit(_CountingAdapter):
+        def prepare_job(self, *args, **kwargs):
+            prepared = super().prepare_job(*args, **kwargs)
+            prewarm.record_candidate_result(candidate_id, cache_status=CACHE_STATUS_CACHE_HIT)
+            return prepared
+
+    adapter = ScannerRacesBeforeSubmit()
+    run_redispatch(runtime_root, paths, prewarm, adapter)
+    assert adapter.submit_calls == 0
+    assert adapter.prioritize_calls == 0
+
+
+def test_redispatch_defers_while_customer_scan_holds_lock(tmp_path):
+    runtime_root = tmp_path / "runtime"
+    paths = make_state_db(runtime_root, TODAY)
+    prewarm = CustomerPrewarmStore(runtime_root / "customer_prewarm.sqlite3")
+    url = "https://qx.com/scan-lock-busy.html"
+    _dead_paths, dead_job = seed_manual_job(
+        runtime_root, TODAY, _CountingAdapter(), mapping=COMIX, url=url,
+    )
+    seed_remote_candidate(prewarm, url, dead_job)
+    adapter = _CountingAdapter()
+    held = ProcessLock(runtime_root / "customer_prewarm.lock")
+    held.acquire()
+    try:
+        summary = run_redispatch(runtime_root, paths, prewarm, adapter)
+    finally:
+        held.release()
+    assert adapter.submit_calls == adapter.prioritize_calls == 0
+    assert any("scan lock busy" in error for error in summary["phase_errors"])
+
+
+def test_redispatch_post_send_rebind_does_not_prioritize_orphan(tmp_path):
+    runtime_root = tmp_path / "runtime"
+    paths = make_state_db(runtime_root, TODAY)
+    prewarm = CustomerPrewarmStore(runtime_root / "customer_prewarm.sqlite3")
+    url = "https://qx.com/rebind-during-submit.html"
+    _dead_paths, dead_job = seed_manual_job(
+        runtime_root, TODAY, _CountingAdapter(), mapping=COMIX, url=url,
+    )
+    candidate_id = seed_remote_candidate(prewarm, url, dead_job)
+
+    class RebindDuringSubmit(_CountingAdapter):
+        def submit(self, job, *, timeout_seconds):
+            prewarm.record_candidate_result(candidate_id, cache_status=CACHE_STATUS_CACHE_HIT)
+            return super().submit(job, timeout_seconds=timeout_seconds)
+
+    adapter = RebindDuringSubmit()
+    run_redispatch(runtime_root, paths, prewarm, adapter)
+    assert adapter.submit_calls == 1
+    assert adapter.prioritize_calls == 0
+
+
+def test_redispatch_recovers_exact_posted_job_after_binding_failure(tmp_path, monkeypatch):
+    runtime_root = tmp_path / "runtime"
+    paths = make_state_db(runtime_root, TODAY)
+    prewarm = CustomerPrewarmStore(runtime_root / "customer_prewarm.sqlite3")
+    url = "https://qx.com/recover-atomic-binding.html"
+    _dead_paths, dead_job = seed_manual_job(
+        runtime_root, TODAY, _CountingAdapter(), mapping=COMIX, url=url,
+    )
+    candidate_id = seed_remote_candidate(prewarm, url, dead_job)
+    adapter = _CountingAdapter()
+    original_bind = prewarm.bind_redispatched_remote_job
+    calls = 0
+
+    def fail_once(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise sqlite3.OperationalError("transient binding failure")
+        return original_bind(*args, **kwargs)
+
+    monkeypatch.setattr(prewarm, "bind_redispatched_remote_job", fail_once)
+    first = run_redispatch(runtime_root, paths, prewarm, adapter)
+    assert adapter.submit_calls == 1
+    assert adapter.prioritize_calls == 0
+    assert any("transient binding failure" in error for error in first["phase_errors"])
+    second = run_redispatch(runtime_root, paths, prewarm, adapter)
+    assert adapter.submit_calls == 1
+    assert adapter.prioritize_calls == 1
+    candidate = prewarm.candidate_by_id(candidate_id)
+    latest = prewarm.remote_job_link_for_candidate(candidate_id)
+    assert int(candidate["remote_job_id"]) != dead_job
+    assert int(latest["remote_job_id"]) == int(candidate["remote_job_id"])
+    assert second["priority_confirmed"] == 1
 
 
 def test_redispatch_daily_cap_blocks_and_notes_last_error(tmp_path):
