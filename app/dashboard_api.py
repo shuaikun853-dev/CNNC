@@ -49,6 +49,7 @@ from app.services.incremental_audit_runtime import runtime_paths
 from app.services.incremental_audit_status import collect_runtime_status
 from app.services.page_price_semantics import FORCE_CLOSEOUT_MISSING_PRICE_LIMIT
 from app.services.production_identity import get_production_identity_service
+from app.services.remediation_tracker import get_remediation_tracker_service
 from app.services.saas_flow_diagnostic import get_saas_flow_diagnostic
 # 常量单源（2026-09-10）:认证维护锁/cURL 结果工件路径由 scripts.cnnc_auth_refresh
 # 定义,dashboard 只读引用并在下方绑定为模块常量(测试可 monkeypatch 注入 tmp)。
@@ -692,6 +693,43 @@ def dashboard_production_identity(request: Request) -> JSONResponse:
 # 若懒创建到首次请求才初始化,startup SHA 会捕获于首访时刻而非进程启动,
 # 从而掩盖“代码已更新但进程没重启”(git pull 后未重启的真实场景)。
 get_production_identity_service()
+
+
+_REMEDIATION_PAGE_ASSETS = ("shell.css", "remediation.css", "remediation.js")
+
+
+def _remediation_page_html() -> str:
+    html = (_STATIC_DIR / "remediation.html").read_text(encoding="utf-8")
+    for name in _REMEDIATION_PAGE_ASSETS:
+        version = _asset_version(_STATIC_DIR / name)
+        html = html.replace(
+            f"/dashboard/static/{name}",
+            f"/dashboard/static/{name}?v={version}",
+        )
+    return html
+
+
+@router.get("/remediation", include_in_schema=True)
+def remediation_page() -> HTMLResponse:
+    return HTMLResponse(_remediation_page_html(), headers={"Cache-Control": "no-cache"})
+
+
+@router.get("/api/remediation")
+def remediation_snapshot(request: Request) -> JSONResponse:
+    if request.query_params:
+        unknown = sorted(request.query_params.keys())
+        raise HTTPException(status_code=400, detail={
+            "error_code": "UNKNOWN_QUERY_PARAM",
+            "message": "不支持的查询参数:" + ",".join(unknown)
+                       + ";本接口不接受任何查询参数"})
+    try:
+        payload = get_remediation_tracker_service().snapshot()
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail={
+            "error_code": "REMEDIATION_TRACKER_READ_FAILED",
+            "message": "整改追踪状态读取失败,请检查台账或 Git 状态",
+            "type": type(exc).__name__}) from exc
+    return JSONResponse(payload, headers=_NO_STORE)
 
 
 @router.get("/api/actions")

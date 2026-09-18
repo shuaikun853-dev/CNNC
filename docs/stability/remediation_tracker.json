@@ -1,0 +1,594 @@
+{
+  "version": 1,
+  "repository": "shuaikun853-dev/CNNC",
+  "production_branch": "prod/closeout-20260818",
+  "items": [
+    {
+      "id": "F01",
+      "severity": "P0",
+      "title": "强制收口判断与最终交付数据不一致",
+      "chatgpt": {
+        "title": "审计并修复项目 stability",
+        "url": null
+      },
+      "codex": {
+        "title": "收口bug修复",
+        "session_id": "01a0af34-436c-7160-827a-75370b715a72",
+        "url": null
+      },
+      "branch": "fix/step1-closeout-evidence-consistency-20260917",
+      "pr": null,
+      "review": {
+        "status": "PENDING",
+        "note": null
+      },
+      "production_verification": {
+        "status": "NOT_VERIFIED",
+        "note": null
+      },
+      "next_action": "创建 PR 并独立审计最终投影一致性"
+    },
+    {
+      "id": "F02",
+      "severity": "P0",
+      "title": "SUBMIT_UNKNOWN 可能在未证明失败时自动重派",
+      "chatgpt": {
+        "title": "审计并修复项目 stability",
+        "url": null
+      },
+      "codex": {
+        "title": "客户爬价格修复0917",
+        "session_id": "01a0af01-a638-7782-a5a4-b05bd770e6cc",
+        "url": null
+      },
+      "branch": "fix/prewarm-cross-day-submit-unknown-reconcile-20260917",
+      "pr": 26,
+      "review": {
+        "status": "PARTIAL",
+        "note": null
+      },
+      "production_verification": {
+        "status": "NOT_VERIFIED",
+        "note": null
+      },
+      "next_action": "补 PROVEN_NOT_CREATED 门禁后再次审计"
+    },
+    {
+      "id": "F03",
+      "severity": "P1",
+      "title": "失败链接可能混入历史单据",
+      "chatgpt": {
+        "title": "审计并修复项目 stability",
+        "url": null
+      },
+      "codex": {
+        "title": "收口bug修复",
+        "session_id": "01a0af34-436c-7160-827a-75370b715a72",
+        "url": null
+      },
+      "branch": "fix/step1-closeout-evidence-consistency-20260917",
+      "pr": null,
+      "review": {
+        "status": "PENDING",
+        "note": null
+      },
+      "production_verification": {
+        "status": "NOT_VERIFIED",
+        "note": null
+      },
+      "next_action": "验证跨天与同 URL 多单据隔离"
+    },
+    {
+      "id": "F04",
+      "severity": "P1",
+      "title": "失败行可能丢失已有客户证据",
+      "chatgpt": {
+        "title": "审计并修复项目 stability",
+        "url": null
+      },
+      "codex": {
+        "title": "收口bug修复",
+        "session_id": "01a0af34-436c-7160-827a-75370b715a72",
+        "url": null
+      },
+      "branch": "fix/step1-closeout-evidence-consistency-20260917",
+      "pr": null,
+      "review": {
+        "status": "PENDING",
+        "note": null
+      },
+      "production_verification": {
+        "status": "NOT_VERIFIED",
+        "note": null
+      },
+      "next_action": "验证标题/分类/客户价证据保留"
+    },
+    {
+      "id": "F05",
+      "severity": "P1",
+      "title": "任务级 NO_RESULT 可能误伤同任务其他商品",
+      "chatgpt": {
+        "title": "审计并修复项目 stability",
+        "url": null
+      },
+      "codex": {},
+      "branch": null,
+      "pr": null,
+      "review": {
+        "status": "NOT_REVIEWED",
+        "note": null
+      },
+      "production_verification": {
+        "status": "NOT_VERIFIED",
+        "note": null
+      },
+      "next_action": "建立 exact identity 粒度修复任务"
+    },
+    {
+      "id": "F06",
+      "severity": "P1",
+      "title": "最终结果仍可能依赖冻结后变化的辅助数据",
+      "chatgpt": {
+        "title": "审计并修复项目 stability",
+        "url": null
+      },
+      "codex": {
+        "title": "收口bug修复",
+        "session_id": "01a0af34-436c-7160-827a-75370b715a72",
+        "url": null
+      },
+      "branch": "fix/step1-closeout-evidence-consistency-20260917",
+      "pr": null,
+      "review": {
+        "status": "PARTIAL",
+        "note": null
+      },
+      "production_verification": {
+        "status": "NOT_VERIFIED",
+        "note": null
+      },
+      "next_action": "补发布崩溃恢复与不可变证据验证"
+    },
+    {
+      "id": "F07",
+      "severity": "P1",
+      "title": "NaN / Infinity 页面价格可能被当作有效值",
+      "chatgpt": {
+        "title": "审计并修复项目 stability",
+        "url": null
+      },
+      "codex": {},
+      "branch": null,
+      "pr": null,
+      "review": {
+        "status": "NOT_REVIEWED",
+        "note": null
+      },
+      "production_verification": {
+        "status": "NOT_VERIFIED",
+        "note": null
+      },
+      "next_action": "按审计候选补丁做小修并测试"
+    },
+    {
+      "id": "F08",
+      "severity": "P1",
+      "title": "字符串 false 可能被当作恢复成功证明",
+      "chatgpt": {
+        "title": "审计并修复项目 stability",
+        "url": null
+      },
+      "codex": {},
+      "branch": null,
+      "pr": null,
+      "review": {
+        "status": "NOT_REVIEWED",
+        "note": null
+      },
+      "production_verification": {
+        "status": "NOT_VERIFIED",
+        "note": null
+      },
+      "next_action": "严格只接受布尔 True"
+    },
+    {
+      "id": "F09",
+      "severity": "P2",
+      "title": "商品可能显示其他商品的冲突价格原因",
+      "chatgpt": {
+        "title": "审计并修复项目 stability",
+        "url": null
+      },
+      "codex": {},
+      "branch": null,
+      "pr": null,
+      "review": {
+        "status": "NOT_REVIEWED",
+        "note": null
+      },
+      "production_verification": {
+        "status": "NOT_VERIFIED",
+        "note": null
+      },
+      "next_action": "删除跨 identity 回退逻辑"
+    },
+    {
+      "id": "F10",
+      "severity": "P1",
+      "title": "收割只看前几个任务可能长期饥饿",
+      "chatgpt": {
+        "title": "审计并修复项目 stability",
+        "url": null
+      },
+      "codex": {},
+      "branch": null,
+      "pr": null,
+      "review": {
+        "status": "NOT_REVIEWED",
+        "note": null
+      },
+      "production_verification": {
+        "status": "NOT_VERIFIED",
+        "note": null
+      },
+      "next_action": "设计持久化公平轮转"
+    },
+    {
+      "id": "F11",
+      "severity": "P1",
+      "title": "远端任务创建后候选绑定存在崩溃空隙",
+      "chatgpt": {
+        "title": "审计并修复项目 stability",
+        "url": null
+      },
+      "codex": {},
+      "branch": null,
+      "pr": null,
+      "review": {
+        "status": "NOT_REVIEWED",
+        "note": null
+      },
+      "production_verification": {
+        "status": "NOT_VERIFIED",
+        "note": null
+      },
+      "next_action": "先做故障注入再设计恢复意图"
+    },
+    {
+      "id": "F12",
+      "severity": "P1",
+      "title": "看板读取不是同一时间点且坏数据可能静默消失",
+      "chatgpt": {
+        "title": "审计并修复项目 stability",
+        "url": null
+      },
+      "codex": {},
+      "branch": null,
+      "pr": null,
+      "review": {
+        "status": "NOT_REVIEWED",
+        "note": null
+      },
+      "production_verification": {
+        "status": "NOT_VERIFIED",
+        "note": null
+      },
+      "next_action": "统一只读快照并显式 UNKNOWN/INVALID"
+    },
+    {
+      "id": "F13",
+      "severity": "P1",
+      "title": "Excel、manifest 与 DB 完成标记存在崩溃窗口",
+      "chatgpt": {
+        "title": "审计并修复项目 stability",
+        "url": null
+      },
+      "codex": {},
+      "branch": null,
+      "pr": null,
+      "review": {
+        "status": "NOT_REVIEWED",
+        "note": null
+      },
+      "production_verification": {
+        "status": "NOT_VERIFIED",
+        "note": null
+      },
+      "next_action": "增加 publication intent 和故障注入"
+    },
+    {
+      "id": "F14",
+      "severity": "P1",
+      "title": "看板命令超时后子进程树可能继续运行",
+      "chatgpt": {
+        "title": "审计并修复项目 stability",
+        "url": null
+      },
+      "codex": {},
+      "branch": null,
+      "pr": null,
+      "review": {
+        "status": "NOT_REVIEWED",
+        "note": null
+      },
+      "production_verification": {
+        "status": "NOT_VERIFIED",
+        "note": null
+      },
+      "next_action": "补 Windows 进程树终止测试"
+    },
+    {
+      "id": "F15",
+      "severity": "P2",
+      "title": "操作状态可能显示完成但实际动作仍悬挂",
+      "chatgpt": {
+        "title": "审计并修复项目 stability",
+        "url": null
+      },
+      "codex": {},
+      "branch": null,
+      "pr": null,
+      "review": {
+        "status": "NOT_REVIEWED",
+        "note": null
+      },
+      "production_verification": {
+        "status": "NOT_VERIFIED",
+        "note": null
+      },
+      "next_action": "定义 action handle 明确终态"
+    },
+    {
+      "id": "F16",
+      "severity": "P1",
+      "title": "认证与网络子超时可能叠加超过总预算",
+      "chatgpt": {
+        "title": "审计并修复项目 stability",
+        "url": null
+      },
+      "codex": {},
+      "branch": null,
+      "pr": null,
+      "review": {
+        "status": "NOT_REVIEWED",
+        "note": null
+      },
+      "production_verification": {
+        "status": "NOT_VERIFIED",
+        "note": null
+      },
+      "next_action": "统一绝对 deadline"
+    },
+    {
+      "id": "F17",
+      "severity": "P1",
+      "title": "第三步 TLS / 凭证边界存在风险",
+      "chatgpt": {
+        "title": "审计并修复项目 stability",
+        "url": null
+      },
+      "codex": {},
+      "branch": null,
+      "pr": null,
+      "review": {
+        "status": "NOT_REVIEWED",
+        "note": null
+      },
+      "production_verification": {
+        "status": "NOT_VERIFIED",
+        "note": null
+      },
+      "next_action": "单独做 TLS 与日志脱敏整改"
+    },
+    {
+      "id": "F18",
+      "severity": "P1",
+      "title": "第二步重复身份记录会静默被最后一条覆盖",
+      "chatgpt": {
+        "title": "审计并修复项目 stability",
+        "url": null
+      },
+      "codex": {},
+      "branch": null,
+      "pr": null,
+      "review": {
+        "status": "NOT_REVIEWED",
+        "note": null
+      },
+      "production_verification": {
+        "status": "NOT_VERIFIED",
+        "note": null
+      },
+      "next_action": "重复 identity 必须冲突或显式选择"
+    },
+    {
+      "id": "F19",
+      "severity": "P1",
+      "title": "detail 请求失败可能被当成成功但零链接",
+      "chatgpt": {
+        "title": "审计并修复项目 stability",
+        "url": null
+      },
+      "codex": {},
+      "branch": null,
+      "pr": null,
+      "review": {
+        "status": "NOT_REVIEWED",
+        "note": null
+      },
+      "production_verification": {
+        "status": "NOT_VERIFIED",
+        "note": null
+      },
+      "next_action": "拆分成功/权威空/请求失败三态"
+    },
+    {
+      "id": "F20",
+      "severity": "P0",
+      "title": "第三步商品结果可能串到另一个商品",
+      "chatgpt": {
+        "title": "审计并修复项目 stability",
+        "url": null
+      },
+      "codex": {},
+      "branch": null,
+      "pr": null,
+      "review": {
+        "status": "NOT_REVIEWED",
+        "note": null
+      },
+      "production_verification": {
+        "status": "NOT_VERIFIED",
+        "note": null
+      },
+      "next_action": "优先建立独立止血任务：唯一 exact identity"
+    },
+    {
+      "id": "F21",
+      "severity": "P1",
+      "title": "第三步数字边界处理接受异常值或误判 0",
+      "chatgpt": {
+        "title": "审计并修复项目 stability",
+        "url": null
+      },
+      "codex": {},
+      "branch": null,
+      "pr": null,
+      "review": {
+        "status": "NOT_REVIEWED",
+        "note": null
+      },
+      "production_verification": {
+        "status": "NOT_VERIFIED",
+        "note": null
+      },
+      "next_action": "与 F20 同批治理数值语义"
+    },
+    {
+      "id": "F22",
+      "severity": "P0",
+      "title": "旧 Excel 仅因行数相同可能被误复用",
+      "chatgpt": {
+        "title": "审计并修复项目 stability",
+        "url": null
+      },
+      "codex": {},
+      "branch": null,
+      "pr": null,
+      "review": {
+        "status": "NOT_REVIEWED",
+        "note": null
+      },
+      "production_verification": {
+        "status": "NOT_VERIFIED",
+        "note": null
+      },
+      "next_action": "优先建立独立止血任务：内容身份/hash 校验"
+    },
+    {
+      "id": "F23",
+      "severity": "P1",
+      "title": "无法识别的商城链接会被静默跳过",
+      "chatgpt": {
+        "title": "审计并修复项目 stability",
+        "url": null
+      },
+      "codex": {},
+      "branch": null,
+      "pr": null,
+      "review": {
+        "status": "NOT_REVIEWED",
+        "note": null
+      },
+      "production_verification": {
+        "status": "NOT_VERIFIED",
+        "note": null
+      },
+      "next_action": "每条输入必须有明确处置状态"
+    },
+    {
+      "id": "F24",
+      "severity": "P1",
+      "title": "第三步 import 即执行且依赖仓库外代码",
+      "chatgpt": {
+        "title": "审计并修复项目 stability",
+        "url": null
+      },
+      "codex": {},
+      "branch": null,
+      "pr": null,
+      "review": {
+        "status": "NOT_REVIEWED",
+        "note": null
+      },
+      "production_verification": {
+        "status": "NOT_VERIFIED",
+        "note": null
+      },
+      "next_action": "拆 main 与纯函数并固定依赖版本"
+    },
+    {
+      "id": "F25",
+      "severity": "P1",
+      "title": "开发测试入口可能触碰生产 runtime",
+      "chatgpt": {
+        "title": "审计并修复项目 stability",
+        "url": null
+      },
+      "codex": {},
+      "branch": null,
+      "pr": null,
+      "review": {
+        "status": "NOT_REVIEWED",
+        "note": null
+      },
+      "production_verification": {
+        "status": "NOT_VERIFIED",
+        "note": null
+      },
+      "next_action": "统一物理路径门禁"
+    },
+    {
+      "id": "F26",
+      "severity": "P1",
+      "title": "CI 绿灯不能证明高风险测试完整覆盖",
+      "chatgpt": {
+        "title": "审计并修复项目 stability",
+        "url": null
+      },
+      "codex": {},
+      "branch": null,
+      "pr": null,
+      "review": {
+        "status": "NOT_REVIEWED",
+        "note": null
+      },
+      "production_verification": {
+        "status": "NOT_VERIFIED",
+        "note": null
+      },
+      "next_action": "建立受审计的安全测试 manifest"
+    },
+    {
+      "id": "F27",
+      "severity": "P2",
+      "title": "长期运行后 DB、日志与解析成本可能持续增长",
+      "chatgpt": {
+        "title": "审计并修复项目 stability",
+        "url": null
+      },
+      "codex": {},
+      "branch": null,
+      "pr": null,
+      "review": {
+        "status": "NOT_REVIEWED",
+        "note": null
+      },
+      "production_verification": {
+        "status": "NOT_VERIFIED",
+        "note": null
+      },
+      "next_action": "先加指标与 1x/5x/10x 压测"
+    }
+  ]
+}

@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>中核 · 整改追踪</title>
+<link rel="stylesheet" href="/dashboard/static/shell.css">
+<link rel="stylesheet" href="/dashboard/static/remediation.css">
+<script src="/dashboard/static/remediation.js" defer></script>
+</head>
+<body>
+<nav class="app-nav">
+  <div class="wrap nav-inner">
+    <a class="nav-link" href="/dashboard/">每日价格审计</a>
+    <a class="nav-link" href="/dashboard/prewarm">客户链接预爬</a>
+    <a class="nav-link active" href="/dashboard/remediation">整改追踪</a>
+  </div>
+</nav>
+<main class="wrap remediation" id="remediation-app">
+  <header class="page-head">
+    <div>
+      <p class="eyebrow">CNNC · STABILITY</p>
+      <h1>整改追踪</h1>
+      <p class="subtitle">ChatGPT → Codex → Git/PR → 审计 → 生产，一条链看清每个 Bug 到哪一步。</p>
+    </div>
+    <div class="head-actions">
+      <span class="freshness" id="generated-at">正在读取…</span>
+      <button class="btn" id="refresh">刷新</button>
+    </div>
+  </header>
+  <section class="kpis" aria-label="整改摘要">
+    <article><strong id="kpi-total">—</strong><span>总问题</span></article>
+    <article class="danger"><strong id="kpi-p0">—</strong><span>P0</span></article>
+    <article><strong id="kpi-dev">—</strong><span>开发中</span></article>
+    <article><strong id="kpi-review">—</strong><span>待审计</span></article>
+    <article><strong id="kpi-merge">—</strong><span>已合并未部署</span></article>
+    <article class="success"><strong id="kpi-prod">—</strong><span>生产验证完成</span></article>
+  </section>
+  <section class="toolbar">
+    <div class="filters" id="filters">
+      <button class="filter active" data-filter="all">全部</button>
+      <button class="filter" data-filter="p0">P0</button>
+      <button class="filter" data-filter="dev">开发中</button>
+      <button class="filter" data-filter="review">待 ChatGPT 审计</button>
+      <button class="filter" data-filter="merge">已合并未部署</button>
+      <button class="filter" data-filter="prod">生产已验证</button>
+    </div>
+    <label class="search"><span>搜索</span><input id="search" type="search" placeholder="F01 / 收口 / SUBMIT_UNKNOWN"></label>
+  </section>
+  <section class="table-card">
+    <div class="table-scroll">
+      <table>
+        <thead><tr>
+          <th>Bug</th><th>问题</th><th>ChatGPT</th><th>Codex / 开发</th>
+          <th>审计</th><th>PR</th><th>生产</th><th>下一步</th>
+        </tr></thead>
+        <tbody id="rows"><tr><td colspan="8" class="loading">正在加载整改台账…</td></tr></tbody>
+      </table>
+    </div>
+  </section>
+  <p class="error" id="error" hidden></p>
+</main>
+<dialog id="detail">
+  <button class="dialog-close" id="detail-close" aria-label="关闭">×</button>
+  <div id="detail-body"></div>
+</dialog>
+<template id="detail-template">
+  <div class="detail-head">
+    <div><span class="severity"></span><span class="bug-id"></span></div>
+    <h2></h2>
+  </div>
+  <div class="timeline"></div>
+  <section class="detail-section"><h3>ChatGPT</h3><div class="chatgpt"></div></section>
+  <section class="detail-section"><h3>Codex / Git</h3><div class="codex"></div></section>
+  <section class="detail-section"><h3>ChatGPT 审计</h3><div class="review"></div></section>
+  <section class="detail-section"><h3>Production</h3><div class="production"></div></section>
+  <section class="next"><span>下一步</span><strong></strong></section>
+</template>
+</body>
+</html>
