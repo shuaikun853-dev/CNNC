@@ -1247,6 +1247,74 @@ class CustomerPrewarmStore:
                 producer=producer,
             )
 
+    def exact_current_remote_job_group_matches(
+        self,
+        *,
+        business_date: str,
+        remote_job_id: int,
+        producer: str,
+        mall: str,
+        lookup_urls: Sequence[str],
+    ) -> bool:
+        """Prove one active remote group exactly matches immutable request URLs.
+
+        Read-only and fail-closed: every currently active candidate bound to the
+        job must have the exact mall/lookup URL set requested by the caller, and
+        each candidate's latest durable linkage must point to the same business
+        date, remote job and producer. Extra/missing candidates, duplicate
+        expected URLs, stale/latest-link drift, or legacy missing tables reject.
+        """
+        day = self._require_text(business_date, "business_date")
+        producer_value = self._require_text(producer, "producer")
+        mall_value = self._require_text(mall, "mall")
+        expected = tuple(str(value or "").strip() for value in lookup_urls)
+        if not expected or any(not value for value in expected):
+            return False
+        if len(set(expected)) != len(expected):
+            return False
+        expected_set = set(expected)
+        try:
+            with self._reader() as connection:
+                rows = connection.execute(
+                    """SELECT id, mall, original_url, lookup_url, cache_status, remote_job_id
+                       FROM prewarm_candidates
+                       WHERE remote_job_id=?
+                         AND cache_status IN ('REMOTE_DISPATCHED', 'REMOTE_REUSED')
+                       ORDER BY id""",
+                    (int(remote_job_id),),
+                ).fetchall()
+                if len(rows) != len(expected):
+                    return False
+                observed: set[str] = set()
+                for row in rows:
+                    if str(row["mall"] or "").strip() != mall_value:
+                        return False
+                    lookup_url = str(row["lookup_url"] or row["original_url"] or "").strip()
+                    if lookup_url not in expected_set or lookup_url in observed:
+                        return False
+                    latest = connection.execute(
+                        """SELECT business_date, remote_job_id, producer
+                           FROM prewarm_remote_job_links
+                           WHERE candidate_id=?
+                           ORDER BY recorded_at DESC, rowid DESC
+                           LIMIT 1""",
+                        (int(row["id"]),),
+                    ).fetchone()
+                    if (
+                        latest is None
+                        or str(latest["business_date"] or "") != day
+                        or int(latest["remote_job_id"] or 0) != int(remote_job_id)
+                        or str(latest["producer"] or "") != producer_value
+                    ):
+                        return False
+                    observed.add(lookup_url)
+        except sqlite3.OperationalError as exc:
+            if self._read_only and "no such table" in str(exc).lower():
+                return False
+            raise
+        return observed == expected_set
+
+
     def latest_redispatch_intent_for_candidate(self, candidate_id: int) -> dict[str, Any] | None:
         try:
             with self._reader() as connection:
