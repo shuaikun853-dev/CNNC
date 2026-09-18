@@ -121,10 +121,16 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\unregister_dashboard
 | 重新导出 | 任务 Drawer | 对当前已有任务再次执行 wait/export/harvest | 绝不创建新任务;执行前强制 progress 预检(TERMINAL 立即导出/ACTIVE 有界探测并如实提示/UNKNOWN 拒绝并返回 `REMOTE_PROGRESS_UNKNOWN`);此前导出 0 条不阻止再次执行 |
 | 重建任务 | 任务 Drawer(二次确认) | 停用旧任务→迁移未完成采集→创建 replacement | 新 taskName==新 batchNumber(自动生成,≠旧值,`cnnc_current_opt_<商城>_<14位数字>` 形态);旧任务 ACTIVE 时必须先 disable 并确认(否则 `OLD_TASK_STILL_ACTIVE`/`OLD_TASK_STOP_UNCONFIRMED`);SUCCESS/终态采集行绝不迁移;旧任务转 SUPERSEDED 不再阻塞 finalize,证据全部保留;同一动作幂等,绝不双发 create |
 | 立即收口 | 最终收口卡 | 正常生产 closeout(非 force-finalize) | 完全复用 `run_runtime_command("closeout", invocation="manual")`:ProcessLock 冲突→`ALREADY_RUNNING`,已出表→`ALREADY_FINALIZED`,阻塞未清→`BLOCKED`(绝不绕过 blocker);页面显示"收口中…"并轮询结果,不阻塞 HTTP |
-| 强制收口 | 最终收口卡(二次确认) | 按冻结快照生成正式最终表,接受不超过 20 条业务行缺少页面价格 | 页面与执行前都按冻结业务行重算 `missing_page_price_rows`,价格为 0 不算缺价,NO_RESULT/未完成/人工采集行算缺价;请求携带用户确认时看到的精确数量,数量变化或 >20 即拒绝。只放宽采集/远端未决状态,Detail、模型、客户价和无效价格证据仍阻塞;不新建、不重试、不修改招商局任务,原 durable 状态完整保留 |
+| 强制收口 | 最终收口卡(二次确认) | 按冻结快照生成正式最终表,接受不超过 20 条最终业务行缺少页面价格 | 页面与执行前都按同一 final projection 重算 `missing_page_price_rows`:冻结业务行与当日 customer-prewarm 失败行先按 `documentId+互联网链接` 投影/去重,已有 frozen identity 原位标记失败,只有缺席 identity 才追加;价格为 0 不算缺价,NO_RESULT/未完成/人工采集行算缺价。请求携带用户确认时看到的精确数量,数量变化或 >20 即拒绝。只放宽采集/远端未决状态,Detail、模型、客户价和无效价格证据仍阻塞;不新建、不重试、不修改招商局任务,原 durable 状态完整保留 |
 
-最终收口卡的“未爬到价格”是冻结快照中的**业务行数**;“底层采集工作项”来自
-`crawl_work` 状态,可能因历史轮次或重复采集显著大于业务缺价行数,两者不得混用。查看历史批次时用页头业务日期选择器;页面以 `?date=YYYY-MM-DD` 将 summary、操作记录和 POST 目标锁到同一业务日。
+最终收口卡的“未爬到价格”是**同一状态生成最终表后**无有效页面价格的业务行数,由
+`frozen_missing_page_price_rows` 与 day-scoped failed-link projection 统一生成;已 finalized 日优先读取
+finalize 时持久化的 immutable metrics,旧批次仅在 workbook/manifest 哈希一致时从最终表回读,绝不随 mutable prewarm 状态漂移。
+新批次的 `FINALIZED`、manifest hash 与最终缺价分项及 force metrics 同一 SQLite transaction 提交；
+物化前私有 intent 固定最终指标；提交前 workbook/manifest 已落盘但 DB 未 finalized 时，
+校验后按首次物化的指标重试（即使晚到采集改变当前计数）。输入变化导致 manifest 冲突时停下人工核对，
+不覆盖正式表。文件与 DB 不具备跨系统 ACID 原子性。
+“底层采集工作项”来自 `crawl_work` 状态,可能因历史轮次或重复采集显著大于业务缺价行数,两者不得混用。查看历史批次时用页头业务日期选择器;页面以 `?date=YYYY-MM-DD` 将 summary、操作记录和 POST 目标锁到同一业务日。
 
 结果语义(重新导出):`REEXPORT_COMPLETED`(取得有效结果,N 条)/`REEXPORT_COMPLETED_NO_RESULT`
 (任务已结束但导出 0 条,可稍后再点)/`REEXPORT_STILL_RUNNING`(任务仍在执行,本次未取得最终导出)/

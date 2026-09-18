@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -38,7 +39,9 @@ from app.services.customer_prewarm_store import (
     CustomerPrewarmStore,
 )
 from app.services.daily_audit_store import DailyAuditStore, ProcessLock, RemoteIntentConflict
+from app.services.incremental_audit_materializer import LegacyWorkbookMaterializer
 from app.services.incremental_audit_runtime import runtime_paths
+from app.services.incremental_audit_status import collect_runtime_status
 from app.workflows.incremental_price_audit_finalize import (
     build_frozen_audit_artifact,
     materialize_frozen_daily_run,
@@ -106,7 +109,11 @@ def _row(v="v-1", sku="sku-1", url="https://shop.example/item", **extra):
 
 
 def _seed_frozen_day(
-    runtime_root: Path, business_date: str = BD, *, complete_crawl: bool = True,
+    runtime_root: Path,
+    business_date: str = BD,
+    *,
+    customer_price: str = "10",
+    complete_crawl: bool = True,
 ) -> DailyAuditStore:
     """One frozen, finalize-ready day at the standard runtime layout."""
     paths = runtime_paths(business_date, runtime_root)
@@ -130,11 +137,11 @@ def _seed_frozen_day(
         detail = store.ensure_stage_work(token, item["id"], "DETAIL", f"detail-{item['id']}")
         store.claim_stage_work(token, detail["id"], max_attempts=3, max_elapsed_seconds=300)
         store.complete_stage_work(token, detail["id"], {
-            "customerPrice": "10",
+            "customerPrice": customer_price,
             "customerPriceStatus": "FOUND",
             "customerPriceSource": "DETAIL_REFERENCE_INFOS",
             "customerPriceWarning": "",
-            "customerPriceEvidence": "customer=10",
+            "customerPriceEvidence": f"customer={customer_price}",
         })
         model = store.ensure_stage_work(token, item["id"], "MODEL", f"model-{item['id']}")
         store.claim_stage_work(token, model["id"], max_attempts=1, max_elapsed_seconds=300)
@@ -151,6 +158,82 @@ def _seed_frozen_day(
         })
     store.release_lease(token)
     return store
+
+
+def _seed_missing_frozen_rows(runtime_root: Path, count: int) -> DailyAuditStore:
+    """Frozen rows with complete Detail/Model and unresolved page-price work."""
+    paths = runtime_paths(BD, runtime_root)
+    paths.run_dir.mkdir(parents=True, exist_ok=True)
+    store = DailyAuditStore(paths.state_path)
+    store.ensure_run(BD, cutoff_at=f"{BD}T10:00:00+00:00")
+    token = store.acquire_lease(BD, "seed-missing", 60)
+    rows = [
+        _row(
+            f"DOC-FROZEN-{index}",
+            f"sku-frozen-{index}",
+            f"https://shop.example/frozen-{index}",
+        )
+        for index in range(count)
+    ]
+    snapshot = store.ingest_snapshot(
+        token,
+        rows,
+        f"{BD}T10:01:00+00:00",
+        headers=list(LEGACY_HEADERS),
+        evidence={"observed_count": len(rows)},
+    )["snapshot"]
+    store.freeze_snapshot(token, snapshot["id"])
+    for item in store.ordered_snapshot_items(snapshot["id"]):
+        detail = store.ensure_stage_work(token, item["id"], "DETAIL", f"detail-{item['id']}")
+        store.claim_stage_work(token, detail["id"], max_attempts=3, max_elapsed_seconds=300)
+        store.complete_stage_work(token, detail["id"], {
+            "customerPrice": "10",
+            "customerPriceStatus": "FOUND",
+            "customerPriceSource": "DETAIL_REFERENCE_INFOS",
+            "customerPriceWarning": "",
+            "customerPriceEvidence": "customer=10",
+        })
+        model = store.ensure_stage_work(token, item["id"], "MODEL", f"model-{item['id']}")
+        store.claim_stage_work(token, model["id"], max_attempts=1, max_elapsed_seconds=300)
+        store.complete_stage_work(token, model["id"], {
+            "match_result": "SAME",
+            "confidence": 0.95,
+            "model_match": "exact",
+            "reason": "一致",
+        })
+        row = item["row"]
+        store.ensure_crawl_work(
+            token,
+            "mall",
+            row["skuId"],
+            row["extLink"],
+            "legacy-v1",
+            f"crawl-{row['skuId']}",
+            source_id=row["vCommodityId"],
+        )
+    store.release_lease(token)
+    return store
+
+
+def _projected_failure(index: int, *, document_id: str | None = None, url: str | None = None):
+    document = document_id or f"DOC-FAILED-{index}"
+    original_url = url or f"https://comix.example/failed-{index}"
+    return {
+        "mall": "comix",
+        "mall_name": "齐心商城",
+        "original_url": original_url,
+        "document_id": document,
+        "document_ids": [document],
+        "reason": FAILED_LINK_REASON_TERMINAL,
+        "last_task_name": f"task-{index}",
+        "last_time": f"{BD}T10:00:00+00:00",
+        "job_state": "MANUAL_REQUIRED",
+        "remote_job_id": index + 1,
+        "candidate_id": index + 1,
+        "redispatch_links_used": 1,
+        "owning_day": BD,
+        "customer_evidence": {},
+    }
 
 
 def _seed_remote_job(
@@ -286,44 +369,6 @@ def _seed_failure_scenario(runtime_root: Path):
     }
 
 
-def _bind_candidate_to_job(
-    prewarm: CustomerPrewarmStore,
-    store: DailyAuditStore,
-    token,
-    *,
-    url: str,
-    document: str,
-    job_id: int,
-    mall: str = "comix",
-    existing_crawl_id: int | None = None,
-) -> int:
-    candidate = prewarm.upsert_link(document, url, mall=mall, business_date=BD)["candidate"]
-    candidate_id = int(candidate["id"])
-    prewarm.record_candidate_result(candidate_id, cache_status=CACHE_STATUS_PENDING_PREWARM)
-    prewarm.record_candidate_result(
-        candidate_id, cache_status=CACHE_STATUS_REMOTE_DISPATCHED, remote_job_id=job_id,
-    )
-    prewarm.record_remote_job_link(BD, candidate_id, job_id, PRODUCER)
-    if existing_crawl_id is None:
-        crawl = store.ensure_crawl_work(
-            token, mall, f"zhpq-{candidate_id}", url, "legacy-v1", f"fp-{candidate_id}",
-            source_id=document,
-        )
-        crawl_id = int(crawl["id"])
-    else:
-        crawl_id = existing_crawl_id
-    store.link_crawl_work_to_remote_job(token, crawl_id, job_id)
-    return crawl_id
-
-
-def _local_price(value: str = "218.37") -> dict[str, str]:
-    return {
-        "page_price_value": value,
-        "page_price_status": "OK",
-        "page_price_source": "本地兜底:comix",
-    }
-
-
 # ---- failed_customer_link_rows (unit) -----------------------------------------
 
 
@@ -392,6 +437,287 @@ def test_failed_link_rows_unmapped_mall_falls_back_to_mall_key(tmp_path):
     assert rows[0]["mall_name"] == "unknownmall"
 
 
+def test_failed_link_rows_use_only_today_document_evidence(tmp_path):
+    store = _seed_frozen_day(tmp_path)
+    prewarm = CustomerPrewarmStore(tmp_path / "customer_prewarm.sqlite3")
+    token = store.acquire_lease(BD, "seed-cross-day", 60)
+    try:
+        candidate_id, _job_id = _seed_failed_candidate(
+            prewarm,
+            store,
+            token,
+            tmp_path,
+            url="https://comix.example/shared",
+            document="DOC-OLD",
+            job_state="MANUAL_REQUIRED",
+            observe_date=YESTERDAY,
+        )
+        current = prewarm.upsert_link(
+            "DOC-TODAY",
+            "https://comix.example/shared",
+            mall="comix",
+            business_date=BD,
+        )
+        assert int(current["candidate"]["id"]) == candidate_id
+    finally:
+        store.release_lease(token)
+
+    rows = failed_customer_link_rows(BD, tmp_path, [COMIX])
+
+    assert len(rows) == 1
+    assert rows[0]["document_id"] == "DOC-TODAY"
+    assert rows[0]["document_ids"] == ["DOC-TODAY"]
+
+
+def test_failed_link_rows_keep_two_today_documents_for_same_url(tmp_path):
+    store = _seed_frozen_day(tmp_path)
+    prewarm = CustomerPrewarmStore(tmp_path / "customer_prewarm.sqlite3")
+    token = store.acquire_lease(BD, "seed-two-docs", 60)
+    try:
+        _seed_failed_candidate(
+            prewarm,
+            store,
+            token,
+            tmp_path,
+            url="https://comix.example/shared-today",
+            document="DOC-A",
+            job_state="MANUAL_REQUIRED",
+        )
+        prewarm.upsert_link(
+            "DOC-B",
+            "https://comix.example/shared-today",
+            mall="comix",
+            business_date=BD,
+        )
+    finally:
+        store.release_lease(token)
+
+    rows = failed_customer_link_rows(BD, tmp_path, [COMIX])
+
+    assert [(row["document_id"], row["original_url"]) for row in rows] == [
+        ("DOC-A", "https://comix.example/shared-today"),
+        ("DOC-B", "https://comix.example/shared-today"),
+    ]
+
+
+def test_customer_only_failed_row_uses_persisted_title_and_price(tmp_path, monkeypatch):
+    monkeypatch.setattr(mapping_module, "load_zhaoshang_mall_mappings", lambda: [COMIX])
+    store = _seed_frozen_day(tmp_path)
+    prewarm = CustomerPrewarmStore(tmp_path / "customer_prewarm.sqlite3")
+    token = store.acquire_lease(BD, "seed-customer-evidence", 60)
+    try:
+        _seed_failed_candidate(
+            prewarm,
+            store,
+            token,
+            tmp_path,
+            url="https://comix.example/customer-only",
+            document="DOC-CUSTOMER",
+            job_state="MANUAL_REQUIRED",
+        )
+    finally:
+        store.release_lease(token)
+    prewarm.record_daily_document_evidence(
+        BD,
+        "DOC-CUSTOMER",
+        customer_title="世达 SATA 91513 0-300mm",
+        four_category_id="CAT-4",
+        four_category_name="量具",
+        customer_price="1871.52",
+        customer_price_status="FOUND",
+        customer_price_source="DETAIL_REFERENCE_INFOS",
+        customer_price_warning="",
+        customer_price_evidence="customer=1871.52",
+    )
+    output = tmp_path / "customer-only.xlsx"
+
+    publication = materialize_frozen_daily_run(
+        store, ProcessLock(tmp_path / "customer-only.lock"), BD, output,
+    )
+
+    assert publication.materialization is not None
+    headers, rows = _data_rows(output)
+    failed = rows[-1]
+    assert failed[headers.index("客户标题")] == "世达 SATA 91513 0-300mm"
+    assert failed[headers.index("客户价")] == 1871.52
+    assert failed[headers.index("客户价状态")] == "已找到"
+    assert failed[headers.index("页面价格状态")] == "爬取失败"
+
+
+def test_existing_frozen_identity_is_overlaid_not_appended(tmp_path, monkeypatch):
+    monkeypatch.setattr(mapping_module, "load_zhaoshang_mall_mappings", lambda: [COMIX])
+    store = _seed_frozen_day(tmp_path, customer_price="1871.52")
+    failure = _projected_failure(
+        1,
+        document_id="v-1",
+        url="https://shop.example/item",
+    )
+    monkeypatch.setattr(
+        "app.services.customer_prewarm_lifecycle.failed_customer_link_rows",
+        lambda *_args, **_kwargs: [failure],
+    )
+    output = tmp_path / "deduped.xlsx"
+
+    publication = materialize_frozen_daily_run(
+        store, ProcessLock(tmp_path / "dedupe.lock"), BD, output,
+    )
+
+    assert publication.materialization is not None
+    assert publication.materialization.row_count == 2
+    headers, rows = _data_rows(output)
+    matched = rows[0]
+    assert matched[headers.index("客户标题")] == "客户标题"
+    assert matched[headers.index("客户价")] == 1871.52
+    assert matched[headers.index("页面价格状态")] == "爬取失败"
+    assert str(matched[headers.index("原因")]).startswith("爬取失败：")
+
+
+def test_seven_plus_sixty_eight_is_one_authoritative_projection(tmp_path, monkeypatch):
+    store = _seed_missing_frozen_rows(tmp_path, 7)
+    failures = [_projected_failure(index) for index in range(68)]
+    monkeypatch.setattr(
+        "app.services.customer_prewarm_lifecycle.failed_customer_link_rows",
+        lambda *_args, **_kwargs: failures,
+    )
+    monkeypatch.setattr(mapping_module, "load_zhaoshang_mall_mappings", lambda: [COMIX])
+
+    status = collect_runtime_status(business_date=BD, runtime_root=tmp_path)
+    token = store.acquire_lease(BD, "build-75", 60)
+    try:
+        built = build_frozen_audit_artifact(
+            store,
+            token,
+            output_identity="daily-final-75",
+            tolerate_pending=True,
+            include_failed_customer_links=True,
+        )
+    finally:
+        store.release_lease(token)
+    output = tmp_path / "projection-75.xlsx"
+    materialized = LegacyWorkbookMaterializer().materialize(built.artifact, output)
+    headers, rows = _data_rows(output)
+    success = {"成功", "价格为0", "OK", "PRICE_IS_ZERO"}
+    actual_missing = sum(
+        1
+        for row in rows
+        if row[headers.index("互联网链接")]
+        and row[headers.index("页面价格状态")] not in success
+    )
+
+    assert built.readiness.frozen_missing_page_price_rows == 7
+    assert built.readiness.failed_customer_link_rows == 68
+    assert built.readiness.missing_page_price_rows == 75
+    assert status["final"]["missing_page_price_rows"] == 75
+    assert status["final"]["frozen_missing_page_price_rows"] == 7
+    assert status["final"]["failed_customer_link_rows"] == 68
+    assert materialized.row_count == 75
+    assert actual_missing == 75
+    manifest = json.loads(materialized.manifest_path.read_text(encoding="utf-8"))
+    assert manifest["row_count"] == 75
+
+
+def test_finalized_missing_count_is_immutable_after_prewarm_changes(tmp_path, monkeypatch):
+    monkeypatch.setattr(mapping_module, "load_zhaoshang_mall_mappings", lambda: [COMIX])
+    store, _prewarm, _jobs = _seed_failure_scenario(tmp_path)
+    output = tmp_path / "immutable.xlsx"
+
+    publication = materialize_frozen_daily_run(
+        store, ProcessLock(tmp_path / "immutable.lock"), BD, output,
+    )
+    assert publication.readiness.missing_page_price_rows == 3
+    committed_metrics = json.loads(store.get_run(BD)["metrics_json"])
+    assert {key: committed_metrics[key] for key in (
+        "final_missing_page_price_rows", "final_frozen_missing_page_price_rows",
+        "final_failed_customer_link_rows", "final_appended_failed_customer_link_rows",
+    )} == {
+        "final_missing_page_price_rows": 3,
+        "final_frozen_missing_page_price_rows": 0,
+        "final_failed_customer_link_rows": 3,
+        "final_appended_failed_customer_link_rows": 3,
+    }
+    with sqlite3.connect(str(tmp_path / "customer_prewarm.sqlite3")) as connection:
+        connection.execute("DELETE FROM prewarm_daily_observations WHERE business_date=?", (BD,))
+
+    status = collect_runtime_status(business_date=BD, runtime_root=tmp_path)
+
+    assert status["final"]["finalized"] is True
+    assert status["final"]["missing_page_price_rows"] == 3
+    assert status["final"]["frozen_missing_page_price_rows"] == 0
+    assert status["final"]["failed_customer_link_rows"] == 3
+    assert status["final"]["appended_failed_customer_link_rows"] == 3
+    assert json.loads(store.get_run(BD)["metrics_json"]) == committed_metrics
+
+
+def test_legacy_finalized_status_uses_workbook_when_projection_metrics_are_missing(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setattr(mapping_module, "load_zhaoshang_mall_mappings", lambda: [COMIX])
+    store, _prewarm, _jobs = _seed_failure_scenario(tmp_path)
+    output = tmp_path / "legacy-finalized.xlsx"
+    materialize_frozen_daily_run(
+        store, ProcessLock(tmp_path / "legacy-finalized.lock"), BD, output,
+    )
+    state_path = runtime_paths(BD, tmp_path).state_path
+    with sqlite3.connect(str(state_path)) as connection:
+        metrics = json.loads(connection.execute(
+            "SELECT metrics_json FROM daily_runs WHERE business_date=?",
+            (BD,),
+        ).fetchone()[0])
+        for key in (
+            "final_missing_page_price_rows",
+            "final_frozen_missing_page_price_rows",
+            "final_failed_customer_link_rows",
+        ):
+            metrics.pop(key, None)
+        connection.execute(
+            "UPDATE daily_runs SET metrics_json=? WHERE business_date=?",
+            (json.dumps(metrics), BD),
+        )
+    with sqlite3.connect(str(tmp_path / "customer_prewarm.sqlite3")) as connection:
+        connection.execute("DELETE FROM prewarm_daily_observations WHERE business_date=?", (BD,))
+
+    status = collect_runtime_status(business_date=BD, runtime_root=tmp_path)
+
+    assert status["final"]["missing_page_price_rows"] == 3
+
+
+def _bind_candidate_to_job(
+    prewarm: CustomerPrewarmStore,
+    store: DailyAuditStore,
+    token,
+    *,
+    url: str,
+    document: str,
+    job_id: int,
+    mall: str = "comix",
+    existing_crawl_id: int | None = None,
+) -> int:
+    candidate = prewarm.upsert_link(document, url, mall=mall, business_date=BD)["candidate"]
+    candidate_id = int(candidate["id"])
+    prewarm.record_candidate_result(candidate_id, cache_status=CACHE_STATUS_PENDING_PREWARM)
+    prewarm.record_candidate_result(
+        candidate_id, cache_status=CACHE_STATUS_REMOTE_DISPATCHED, remote_job_id=job_id,
+    )
+    prewarm.record_remote_job_link(BD, candidate_id, job_id, PRODUCER)
+    if existing_crawl_id is None:
+        crawl = store.ensure_crawl_work(
+            token, mall, f"zhpq-{candidate_id}", url, "legacy-v1", f"fp-{candidate_id}",
+            source_id=document,
+        )
+        crawl_id = int(crawl["id"])
+    else:
+        crawl_id = existing_crawl_id
+    store.link_crawl_work_to_remote_job(token, crawl_id, job_id)
+    return crawl_id
+
+def _local_price(value: str = "218.37") -> dict[str, str]:
+    return {
+        "page_price_value": value,
+        "page_price_status": "OK",
+        "page_price_source": "本地兜底:comix",
+    }
+
 def test_stale_submit_unknown_local_success_has_one_successful_final_row(tmp_path, monkeypatch):
     monkeypatch.setattr(mapping_module, "load_zhaoshang_mall_mappings", lambda: [COMIX])
     store = _seed_frozen_day(tmp_path, complete_crawl=False)
@@ -428,7 +754,6 @@ def test_stale_submit_unknown_local_success_has_one_successful_final_row(tmp_pat
     assert str(matching[0]["__page_price_value"]) == "218.37"
     assert len(built.artifact.audit_response.record_results) == 2
 
-
 def test_shared_remote_job_suppresses_only_locally_resolved_urls(tmp_path):
     store = _seed_frozen_day(tmp_path)
     prewarm = CustomerPrewarmStore(tmp_path / "customer_prewarm.sqlite3")
@@ -462,7 +787,6 @@ def test_shared_remote_job_suppresses_only_locally_resolved_urls(tmp_path):
     assert by_url["https://comix.example/item-D"]["reason"] == FAILED_LINK_REASON_NO_RESULT
     assert by_url["https://comix.example/item-C"]["reason"] == FAILED_LINK_REASON_TERMINAL
 
-
 def test_late_remote_failure_cannot_replace_local_success_or_project_failure(tmp_path):
     store = _seed_frozen_day(tmp_path)
     prewarm = CustomerPrewarmStore(tmp_path / "customer_prewarm.sqlite3")
@@ -488,7 +812,6 @@ def test_late_remote_failure_cannot_replace_local_success_or_project_failure(tmp
     assert after["result_json"] == before["result_json"]
     assert json.loads(after["result_json"])["page_price_value"] == "218.37"
     assert all(row["original_url"] != url for row in failed_customer_link_rows(BD, tmp_path, [COMIX]))
-
 
 def test_no_result_sibling_does_not_make_local_success_fail(tmp_path):
     store = _seed_frozen_day(tmp_path)
@@ -516,7 +839,6 @@ def test_no_result_sibling_does_not_make_local_success_fail(tmp_path):
     by_url = {row["original_url"]: row for row in failed_customer_link_rows(BD, tmp_path, [COMIX])}
     assert set(by_url) == {no_result_url}
     assert by_url[no_result_url]["reason"] == FAILED_LINK_REASON_NO_RESULT
-
 
 # ---- final workbook projection (integration) ----------------------------------
 
@@ -620,8 +942,13 @@ def test_existing_rows_are_identical_with_and_without_failed_links(tmp_path, mon
 
     n = len(plain.artifact.frozen_rows)
     assert n == 2
-    # readiness / summary semantics zero change.
-    assert with_failures.readiness == plain.readiness
+    # Audit summary stays unchanged; readiness gains only final-projection
+    # diagnostics for the three appended business rows.
+    assert with_failures.readiness.frozen_rows == plain.readiness.frozen_rows
+    assert with_failures.readiness.frozen_missing_page_price_rows == 0
+    assert with_failures.readiness.failed_customer_link_rows == 3
+    assert with_failures.readiness.appended_failed_customer_link_rows == 3
+    assert with_failures.readiness.missing_page_price_rows == 3
     assert with_failures.artifact.audit_response.summary == plain.artifact.audit_response.summary
     # 既有行逐字段零改动（前后哈希对照）。
     assert with_failures.artifact.frozen_rows[:n] == plain.artifact.frozen_rows

@@ -106,6 +106,22 @@ CREATE TABLE IF NOT EXISTS prewarm_daily_observations (
     last_seen_at TEXT NOT NULL,
     PRIMARY KEY(business_date, candidate_id, document_id)
 );
+CREATE TABLE IF NOT EXISTS prewarm_document_evidence (
+    business_date TEXT NOT NULL,
+    document_id TEXT NOT NULL,
+    four_category_id TEXT NOT NULL DEFAULT '',
+    four_category_name TEXT NOT NULL DEFAULT '',
+    customer_title TEXT NOT NULL DEFAULT '',
+    customer_price TEXT,
+    customer_price_status TEXT NOT NULL DEFAULT '',
+    customer_price_source TEXT NOT NULL DEFAULT '',
+    customer_price_warning TEXT NOT NULL DEFAULT '',
+    customer_price_evidence TEXT NOT NULL DEFAULT '',
+    source TEXT NOT NULL DEFAULT '',
+    first_seen_at TEXT NOT NULL,
+    last_seen_at TEXT NOT NULL,
+    PRIMARY KEY(business_date, document_id)
+);
 CREATE TABLE IF NOT EXISTS prewarm_remote_job_links (
     business_date TEXT NOT NULL,
     candidate_id INTEGER NOT NULL,
@@ -334,6 +350,149 @@ class CustomerPrewarmStore:
                 "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
             ).fetchall()
         return {row["name"] for row in rows}
+
+    def record_daily_document_evidence(
+        self,
+        business_date: str,
+        document_id: str,
+        *,
+        four_category_id: Any = None,
+        four_category_name: Any = None,
+        customer_title: Any = None,
+        customer_price: Any = None,
+        customer_price_status: Any = None,
+        customer_price_source: Any = None,
+        customer_price_warning: Any = None,
+        customer_price_evidence: Any = None,
+        source: Any = None,
+    ) -> dict[str, Any]:
+        """Add daily customer evidence without erasing earlier non-empty values."""
+        self._assert_writable()
+        business_date_value = self._require_text(business_date, "business_date")
+        document_value = self._require_text(document_id, "document_id")
+
+        def evidence_text(value: Any) -> str:
+            return "" if value is None else str(value).strip()
+
+        values = {
+            "four_category_id": evidence_text(four_category_id),
+            "four_category_name": evidence_text(four_category_name),
+            "customer_title": evidence_text(customer_title),
+            "customer_price": None if customer_price is None else evidence_text(customer_price),
+            "customer_price_status": evidence_text(customer_price_status),
+            "customer_price_source": evidence_text(customer_price_source),
+            "customer_price_warning": evidence_text(customer_price_warning),
+            "customer_price_evidence": evidence_text(customer_price_evidence),
+            "source": evidence_text(source),
+        }
+        if values["customer_price"] == "":
+            values["customer_price"] = None
+        now = self._utcnow()
+        with self._transaction(immediate=True) as connection:
+            connection.execute(
+                """INSERT INTO prewarm_document_evidence
+                   (business_date, document_id, four_category_id, four_category_name,
+                    customer_title, customer_price, customer_price_status,
+                    customer_price_source, customer_price_warning,
+                    customer_price_evidence, source, first_seen_at, last_seen_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(business_date, document_id) DO UPDATE SET
+                     four_category_id=CASE WHEN excluded.four_category_id != ''
+                       THEN excluded.four_category_id ELSE four_category_id END,
+                     four_category_name=CASE WHEN excluded.four_category_name != ''
+                       THEN excluded.four_category_name ELSE four_category_name END,
+                     customer_title=CASE WHEN excluded.customer_title != ''
+                       THEN excluded.customer_title ELSE customer_title END,
+                     customer_price=COALESCE(excluded.customer_price, customer_price),
+                     customer_price_status=CASE
+                       WHEN excluded.customer_price IS NOT NULL
+                         OR (customer_price IS NULL AND excluded.customer_price_status != '')
+                       THEN excluded.customer_price_status ELSE customer_price_status END,
+                     customer_price_source=CASE
+                       WHEN excluded.customer_price IS NOT NULL
+                         OR (customer_price IS NULL AND excluded.customer_price_status != '')
+                       THEN excluded.customer_price_source ELSE customer_price_source END,
+                     customer_price_warning=CASE
+                       WHEN excluded.customer_price IS NOT NULL
+                         OR (customer_price IS NULL AND excluded.customer_price_status != '')
+                       THEN excluded.customer_price_warning ELSE customer_price_warning END,
+                     customer_price_evidence=CASE
+                       WHEN excluded.customer_price IS NOT NULL
+                         OR (customer_price IS NULL AND excluded.customer_price_status != '')
+                       THEN excluded.customer_price_evidence ELSE customer_price_evidence END,
+                     source=CASE WHEN excluded.source != '' THEN excluded.source ELSE source END,
+                     last_seen_at=excluded.last_seen_at""",
+                (
+                    business_date_value,
+                    document_value,
+                    values["four_category_id"],
+                    values["four_category_name"],
+                    values["customer_title"],
+                    values["customer_price"],
+                    values["customer_price_status"],
+                    values["customer_price_source"],
+                    values["customer_price_warning"],
+                    values["customer_price_evidence"],
+                    values["source"],
+                    now,
+                    now,
+                ),
+            )
+            row = connection.execute(
+                """SELECT * FROM prewarm_document_evidence
+                   WHERE business_date=? AND document_id=?""",
+                (business_date_value, document_value),
+            ).fetchone()
+        return dict(row) if row is not None else {}
+
+    def daily_document_evidence(
+        self, business_date: str, document_id: str
+    ) -> dict[str, Any] | None:
+        business_date_value = self._require_text(business_date, "business_date")
+        document_value = self._require_text(document_id, "document_id")
+        with self._reader() as connection:
+            row = connection.execute(
+                """SELECT * FROM prewarm_document_evidence
+                   WHERE business_date=? AND document_id=?""",
+                (business_date_value, document_value),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def observations_for_candidate(
+        self, business_date: str, candidate_id: int
+    ) -> list[dict[str, Any]]:
+        """Current-day document observations with their same-day evidence."""
+        business_date_value = self._require_text(business_date, "business_date")
+        with self._reader() as connection:
+            try:
+                rows = connection.execute(
+                    """SELECT o.business_date, o.candidate_id, o.document_id,
+                              o.original_url, o.first_seen_at, o.last_seen_at,
+                              e.four_category_id, e.four_category_name,
+                              e.customer_title, e.customer_price,
+                              e.customer_price_status, e.customer_price_source,
+                              e.customer_price_warning, e.customer_price_evidence,
+                              e.source AS evidence_source
+                       FROM prewarm_daily_observations o
+                       LEFT JOIN prewarm_document_evidence e
+                         ON e.business_date=o.business_date
+                        AND e.document_id=o.document_id
+                       WHERE o.business_date=? AND o.candidate_id=?
+                       ORDER BY o.document_id, o.original_url""",
+                    (business_date_value, int(candidate_id)),
+                ).fetchall()
+            except sqlite3.OperationalError as exc:
+                if "no such table: prewarm_document_evidence" not in str(exc).lower():
+                    raise
+                rows = connection.execute(
+                    """SELECT business_date, candidate_id, document_id,
+                              original_url, first_seen_at, last_seen_at
+                       FROM prewarm_daily_observations
+                       WHERE business_date=? AND candidate_id=?
+                       ORDER BY document_id, original_url""",
+                    (business_date_value, int(candidate_id)),
+                ).fetchall()
+        return [dict(row) for row in rows]
 
     # ---- documents -------------------------------------------------------------
 

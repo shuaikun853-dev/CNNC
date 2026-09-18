@@ -1148,7 +1148,17 @@ def _write_record_results_sheet(
         )
         for column_index, header in enumerate(final_headers, start=1):
             cell = sheet.cell(row=row_index, column=column_index)
-            cell.value = _format_cell_value(merged.get(header, ""))
+            value = merged.get(header, "")
+            # Prices are numeric workbook evidence, not display text.  Keep
+            # Decimal precision for all calculations above, then hand Excel a
+            # number at the final serialization boundary.
+            if (
+                header == "customerPrice"
+                and isinstance(value, Decimal)
+                and info.get("__numeric_customer_price") is True
+            ):
+                value = float(value)
+            cell.value = _format_cell_value(value)
             if row_is_over:
                 cell.fill = OVER_30_FILL
             elif header in HIGHLIGHTED_RESULT_COLUMNS:

@@ -205,6 +205,12 @@ mandatory crawl 的 remote job 通常必须全部为 `COMPLETED`；唯一例外�
 任一关联 URL 仍是 `NO_RESULT`、terminal 或 unresolved 时都不能按 job 级别放行。命令总预算至少还剩 60 秒才开始正式物化，
 否则 checkpoint 后交给下一次 `drain-only`。完成后 workbook/manifest 只会复用同一 frozen artifact，
 输出路径 intent 在落盘前已唯一登记，冲突不会先写出第二份正式文件。
+物化前先以私有 intent 固定本次输入 hash 和最终 metrics（不作为 finalized 指标发布）。workbook/manifest
+物化后，正常与强制收口均在同一个 SQLite transaction 中提交 `FINALIZED`、`final_manifest_hash`
+和 intent 中的最终投影/强制收口 metrics，并移除 intent；事务失败则保留 `FINALIZING`。
+重试会校验并复用同一 workbook/manifest、提交首次物化时固定的指标，晚到采集不得改写原正式表或指标。
+若输入变化造成 manifest 冲突，必须停下人工核对，不能静默改写已出版文件。
+文件系统物化与 SQLite 提交不是跨系统 ACID transaction。
 
 只有业务方对指定批次明确接受缺价时，已绑定 exact remote identity、任务已 `COMPLETED`、且本地
 导出结果证据完整但找不到该 crawl identity 返回行的 `TERMINAL_FAILED`，才可受控转为

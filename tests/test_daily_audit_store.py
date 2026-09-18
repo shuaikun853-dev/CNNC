@@ -6,12 +6,14 @@ import json
 import sqlite3
 import subprocess
 import sys
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
 
 from app.services.daily_audit_store import (
     DailyAuditStore,
+    FINALIZATION_INTENT_KEY,
     FrozenSnapshotConflict,
     LeaseUnavailable,
     ProcessLock,
@@ -610,10 +612,156 @@ def test_freeze_and_finalization_are_idempotent_and_conflicts_are_rejected(store
     assert store.prepare_finalization(lease, "C:/out.xlsx")["id"] == prepared["id"]
     with pytest.raises(FrozenSnapshotConflict):
         store.prepare_finalization(lease, "C:/other.xlsx")
-    final = store.mark_finalized(lease, "C:/out.xlsx", "manifest-a")
+    with pytest.raises(FrozenSnapshotConflict, match="commit_finalization"):
+        store.mark_finalized(lease, "C:/out.xlsx", "manifest-a")
+    assert store.get_run("2026-08-11")["state"] == "FINALIZING"
+    final = store.commit_finalization(lease, "C:/out.xlsx", "manifest-a", {
+        "finalized_rows": 1,
+        "final_missing_page_price_rows": 0,
+        "final_frozen_missing_page_price_rows": 0,
+        "final_failed_customer_link_rows": 0,
+        "final_appended_failed_customer_link_rows": 0,
+        "final_page_price_required_rows": 0,
+    })
     assert store.mark_finalized(lease, "C:/out.xlsx", "manifest-a")["id"] == final["id"]
     with pytest.raises(FrozenSnapshotConflict):
         store.mark_finalized(lease, "C:/other.xlsx", "manifest-b")
+
+
+def test_atomic_final_commit_is_idempotent_and_rejects_metric_conflicts(store):
+    lease = _lease(store)
+    snapshot = store.ingest_snapshot(lease, [_row()])["snapshot"]
+    store.freeze_snapshot(lease, snapshot["id"])
+    store.prepare_finalization(lease, "C:/out.xlsx")
+    metrics = {
+        "finalized_rows": 1,
+        "final_missing_page_price_rows": 75,
+        "final_frozen_missing_page_price_rows": 7,
+        "final_failed_customer_link_rows": 68,
+        "final_appended_failed_customer_link_rows": 68,
+        "final_page_price_required_rows": 7,
+    }
+
+    with pytest.raises(ValueError, match="missing required keys"):
+        store.commit_finalization(lease, "C:/out.xlsx", "manifest-a", {"finalized_rows": 1})
+    with pytest.raises(ValueError, match="force finalization markers"):
+        store.commit_finalization(lease, "C:/out.xlsx", "manifest-a", {**metrics, "forced": True})
+    assert store.get_run("2026-08-11")["state"] == "FINALIZING"
+
+    first = store.commit_finalization(lease, "C:/out.xlsx", "manifest-a", metrics)
+    assert first["state"] == "FINALIZED"
+    assert first["final_manifest_hash"] == "manifest-a"
+    assert all(json.loads(first["metrics_json"])[key] == value for key, value in metrics.items())
+    assert store.commit_finalization(lease, "C:/out.xlsx", "manifest-a", metrics) == first
+    with pytest.raises(FrozenSnapshotConflict):
+        store.commit_finalization(lease, "C:/out.xlsx", "manifest-b", metrics)
+    with pytest.raises(FrozenSnapshotConflict):
+        store.commit_finalization(lease, "C:/other.xlsx", "manifest-a", metrics)
+    with pytest.raises(FrozenSnapshotConflict):
+        store.commit_finalization(
+            lease, "C:/out.xlsx", "manifest-a",
+            {**metrics, "final_missing_page_price_rows": 7},
+        )
+    assert json.loads(store.get_run("2026-08-11")["metrics_json"])["final_missing_page_price_rows"] == 75
+    with pytest.raises(FrozenSnapshotConflict, match="immutable"):
+        store.update_daily_metrics(lease, {"final_missing_page_price_rows": 7})
+    with pytest.raises(FrozenSnapshotConflict, match="immutable"):
+        store.update_daily_metrics(lease, {"force_finalize": True})
+    assert json.loads(store.get_run("2026-08-11")["metrics_json"])["final_missing_page_price_rows"] == 75
+
+
+def test_prepared_finalization_intent_survives_retry_and_is_consumed_at_commit(store):
+    lease = _lease(store)
+    snapshot = store.ingest_snapshot(lease, [_row()])["snapshot"]
+    store.freeze_snapshot(lease, snapshot["id"])
+    metrics = {
+        "finalized_rows": 1,
+        "final_missing_page_price_rows": 1,
+        "final_frozen_missing_page_price_rows": 1,
+        "final_failed_customer_link_rows": 0,
+        "final_appended_failed_customer_link_rows": 0,
+        "final_page_price_required_rows": 1,
+    }
+    first = store.prepare_finalization(
+        lease, "C:/out.xlsx", input_manifest_hash="input-a", metrics=metrics,
+    )
+    intent = json.loads(first["metrics_json"])[FINALIZATION_INTENT_KEY]
+    assert intent == {"input_manifest_hash": "input-a", "metrics": metrics}
+    retry = store.prepare_finalization(
+        lease, "C:/out.xlsx", input_manifest_hash="input-a",
+        metrics={**metrics, "final_missing_page_price_rows": 0},
+    )
+    assert json.loads(retry["metrics_json"])[FINALIZATION_INTENT_KEY] == intent
+    with pytest.raises(FrozenSnapshotConflict, match="prepared publication intent"):
+        store.commit_finalization(
+            lease, "C:/out.xlsx", "manifest-a",
+            {**metrics, "final_missing_page_price_rows": 0},
+        )
+    assert store.get_run("2026-08-11")["state"] == "FINALIZING"
+    final = store.commit_finalization(lease, "C:/out.xlsx", "manifest-a", metrics)
+    assert final["state"] == "FINALIZED"
+    assert FINALIZATION_INTENT_KEY not in json.loads(final["metrics_json"])
+
+
+@pytest.mark.parametrize("forced", [False, True])
+def test_atomic_final_commit_rolls_back_state_manifest_and_metrics(store, monkeypatch, forced):
+    lease = _lease(store)
+    snapshot = store.ingest_snapshot(lease, [_row()])["snapshot"]
+    store.freeze_snapshot(lease, snapshot["id"])
+    store.prepare_finalization(lease, "C:/out.xlsx")
+    before = store.get_run("2026-08-11")
+    original_transaction = store._transaction
+    metrics = {
+        "finalized_rows": 1,
+        "final_missing_page_price_rows": 1,
+        "final_frozen_missing_page_price_rows": 1,
+        "final_failed_customer_link_rows": 0,
+        "final_appended_failed_customer_link_rows": 0,
+        "final_page_price_required_rows": 1,
+    }
+    if forced:
+        metrics.update({
+            "forced": True,
+            "forced_incomplete_count": 1,
+            "forced_incomplete_item_count": 1,
+            "remote_incomplete_job_count": 1,
+            "blocker_count": 2,
+            "force_finalize": True,
+            "force_finalize_at": "2026-08-11T12:00:00+00:00",
+            "force_finalize_max_incomplete": 1,
+            "force_finalize_actual_incomplete": 1,
+            "force_finalize_accept_unresolved_crawl": False,
+            "missing_page_price_rows": 1,
+            "page_price_required_rows": 1,
+            "force_finalize_reason": "test",
+            "frozen_snapshot_id": snapshot["id"],
+            "frozen_row_count": 1,
+            "blocker_summary_at_force_finalize": {},
+            "force_finalize_incomplete_tasks": [],
+        })
+
+    @contextmanager
+    def crash_before_commit(*args, **kwargs):
+        with original_transaction(*args, **kwargs) as connection:
+            yield connection
+            pending = connection.execute(
+                "SELECT state, final_manifest_hash, metrics_json FROM daily_runs WHERE id=?",
+                (lease.run_id,),
+            ).fetchone()
+            assert pending["state"] == "FINALIZED"
+            assert pending["final_manifest_hash"] == "manifest-a"
+            assert json.loads(pending["metrics_json"])["final_missing_page_price_rows"] == 1
+            if forced:
+                assert json.loads(pending["metrics_json"])["force_finalize_actual_incomplete"] == 1
+            raise RuntimeError("injected crash inside final transaction")
+
+    monkeypatch.setattr(store, "_transaction", crash_before_commit)
+    with pytest.raises(RuntimeError, match="injected crash"):
+        store.commit_finalization(lease, "C:/out.xlsx", "manifest-a", metrics)
+    after = store.get_run("2026-08-11")
+    assert (after["state"], after["final_manifest_hash"], after["metrics_json"]) == (
+        before["state"], before["final_manifest_hash"], before["metrics_json"],
+    )
 
 
 def test_each_store_operation_opens_its_own_connection(store, monkeypatch):

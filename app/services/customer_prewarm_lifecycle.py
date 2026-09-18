@@ -393,11 +393,12 @@ def failed_customer_link_rows(
     the bound job, or an exhausted redispatch budget (the day's
     ``prewarm_remote_job_links`` count at ``redispatch_daily_cap``).  Only the
     two remote statuses can carry a binding, so they are the only candidates
-    enumerated.  Rows are deduped by ``(mall, original_url)`` (the store's
-    candidate identity) and sorted deterministically.  A candidate with valid
-    local-fallback SUCCESS evidence for that exact ``(mall, original_url)`` is
-    already resolved and is not projected; sibling URLs on the same remote job
-    keep their independent failure disposition.
+    enumerated.  Output granularity is the current-day document observation,
+    not the cross-day candidate: one URL observed by two documents yields two
+    rows, while documents observed only on another day never leak in.  A
+    candidate with valid local-fallback SUCCESS evidence for that exact
+    ``(mall, original_url)`` is already resolved and is not projected; sibling
+    URLs on the same remote job keep their independent failure disposition.
 
     Every probe is ``mode=ro`` (missing state DBs / stores yield fewer rows,
     never a write); a candidate whose linkage probes fail is skipped fail-open,
@@ -420,7 +421,8 @@ def failed_customer_link_rows(
         return _read_job_row_readonly(runtime_paths(owning_day, state_root).state_path, job_id)
 
     rows: list[dict[str, Any]] = []
-    seen: set[tuple[str, str]] = set()
+    seen_candidates: set[tuple[str, str]] = set()
+    seen_rows: set[tuple[str, str, str]] = set()
     probe_errors: list[str] = []
     for status in (CACHE_STATUS_REMOTE_DISPATCHED, CACHE_STATUS_REMOTE_REUSED):
         for candidate in prewarm_store.candidates(status):
@@ -428,7 +430,7 @@ def failed_customer_link_rows(
             if candidate_id not in scoped_ids:
                 continue
             identity = (str(candidate["mall"] or ""), str(candidate["original_url"] or ""))
-            if identity in seen:
+            if identity in seen_candidates:
                 continue
             raw_job_id = candidate.get("remote_job_id")
             if raw_job_id is None:
@@ -454,22 +456,13 @@ def failed_customer_link_rows(
             )
             if reason is None:
                 continue
-            seen.add(identity)
+            seen_candidates.add(identity)
             mall = str(candidate["mall"] or "")
-            rows.append(
-                {
+            base_row = {
                     "mall": mall,
                     "mall_name": next(
                         (m.mall_name for m in mappings if m.mall_key == mall),
                         mall,
-                    ),
-                    "original_url": str(candidate["original_url"] or ""),
-                    "document_ids": sorted(
-                        {
-                            str(link["document_id"])
-                            for link in prewarm_store.links_for_candidate(candidate_id)
-                            if str(link.get("document_id") or "")
-                        }
                     ),
                     "reason": reason,
                     "last_task_name": str((job_row or {}).get("task_name") or ""),
@@ -482,8 +475,43 @@ def failed_customer_link_rows(
                     "redispatch_links_used": used,
                     "owning_day": owning_day,
                 }
-            )
-    rows.sort(key=lambda row: (row["mall"], row["original_url"]))
+            for observation in prewarm_store.observations_for_candidate(
+                business_date, candidate_id
+            ):
+                document_id = str(observation.get("document_id") or "")
+                original_url = str(observation.get("original_url") or "")
+                row_identity = (mall, original_url, document_id)
+                if not document_id or not original_url or row_identity in seen_rows:
+                    continue
+                seen_rows.add(row_identity)
+                customer_evidence = {
+                    "fourCategoryId": str(observation.get("four_category_id") or ""),
+                    "fourCategoryName": str(observation.get("four_category_name") or ""),
+                    "customerTitle": str(observation.get("customer_title") or ""),
+                    "customerPrice": observation.get("customer_price"),
+                    "customerPriceStatus": str(
+                        observation.get("customer_price_status") or ""
+                    ),
+                    "customerPriceSource": str(
+                        observation.get("customer_price_source") or ""
+                    ),
+                    "customerPriceWarning": str(
+                        observation.get("customer_price_warning") or ""
+                    ),
+                    "customerPriceEvidence": str(
+                        observation.get("customer_price_evidence") or ""
+                    ),
+                }
+                rows.append(
+                    {
+                        **base_row,
+                        "original_url": original_url,
+                        "document_id": document_id,
+                        "document_ids": [document_id],
+                        "customer_evidence": customer_evidence,
+                    }
+                )
+    rows.sort(key=lambda row: (row["mall"], row["original_url"], row["document_id"]))
     return rows
 
 
