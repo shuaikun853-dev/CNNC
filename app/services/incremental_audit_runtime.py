@@ -1979,10 +1979,11 @@ def build_default_dependencies(
         dependencies.prewarm_intake = _prewarm_intake_worker(
             paths.run_dir.parent / "customer_prewarm.sqlite3"
         )
-        dependencies.local_fallback = lambda claims, tick_id: execute_pinned_crawler(
+        dependencies.local_fallback = lambda claims, tick_id, timeout_seconds: execute_pinned_crawler(
             claims,
             run_dir=paths.run_dir,
             tick_id=tick_id,
+            timeout_seconds=timeout_seconds,
         )
     if enable_zhaoshang:
         if paths is None or business_date is None:

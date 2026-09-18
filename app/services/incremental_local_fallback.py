@@ -27,6 +27,8 @@ SUPPORTED_MALLS = frozenset({
     "nbdeli", "guangbo", "ofs", "lxwlmall", "qstbg", "ycw", "comix", "tima",
 })
 MAX_ATTEMPTS = 2
+MIN_EXECUTION_WINDOW_SECONDS = 60
+MAX_CHILD_TIMEOUT_SECONDS = 600
 EXPECTED_CRAWLER_REVISION = "28870666aeb99a10494ebb91419aadf3bff4c0a8"
 DEFAULT_CRAWLER_ROOT = Path(r"E:\.A中核运维\cnnc-mall-crawler")
 SITE_ALIASES = {"ofs": "officemate"}
@@ -269,7 +271,7 @@ def execute_pinned_crawler(
     run_dir: Path,
     tick_id: str,
     crawler_root: Path = DEFAULT_CRAWLER_ROOT,
-    timeout_seconds: float = 600,
+    timeout_seconds: float = MAX_CHILD_TIMEOUT_SECONDS,
 ) -> Mapping[int, Mapping[str, Any]]:
     """Run one locked multi-site child with an allowlisted environment."""
     claim_list = [dict(claim) for claim in claims]
@@ -307,31 +309,38 @@ def execute_pinned_crawler(
     manifest_path = (folder / "manifest.xlsx").resolve()
     manifest.save(manifest_path)
     env = _child_env(folder)
+    if timeout_seconds <= 0:
+        return {int(claim["id"]): {"error": "TEMPORARY_TIMEOUT", "retryable": True} for claim in claim_list}
     try:
         completed = subprocess.run(
             [sys.executable, "-m", "mall_crawler.cli", "--manifest", str(manifest_path)],
             cwd=str(Path(crawler_root).resolve()), env=env, check=False,
             capture_output=True, text=True, encoding="utf-8", errors="replace",
-            timeout=max(1, timeout_seconds),
+            timeout=min(MAX_CHILD_TIMEOUT_SECONDS, timeout_seconds),
         )
     except subprocess.TimeoutExpired:
         return {int(claim["id"]): {"error": "TEMPORARY_TIMEOUT", "retryable": True} for claim in claim_list}
-    if completed.returncode != 0:
-        risk = completed.returncode == 3
-        error = "RISK_STOP" if risk else f"PROCESS_FAILED: exit={completed.returncode}"
-        return {int(claim["id"]): {"error": error, "retryable": not risk} for claim in claim_list}
     outcomes: dict[int, Mapping[str, Any]] = {}
-    try:
-        for site, site_claims in by_site.items():
-            expected = [str(claim["exact_url"]) for claim in site_claims]
+    for site, site_claims in by_site.items():
+        expected = [str(claim["exact_url"]) for claim in site_claims]
+        try:
             parsed = read_crawler_output(outputs[site], site, expected)
+        except Exception as exc:
+            if not outputs[site].is_file() and completed.returncode != 0:
+                risk = completed.returncode == 3
+                error = "RISK_STOP" if risk else f"PROCESS_FAILED: exit={completed.returncode}"
+                retryable = not risk
+            else:
+                error = f"MANIFEST_MISMATCH: {exc}"
+                retryable = False
             for claim in site_claims:
-                outcome = dict(parsed[str(claim["exact_url"])])
-                if "result" in outcome:
-                    outcome["crawler_revision"] = revision
-                outcomes[int(claim["id"])] = outcome
-    except (OSError, ValueError) as exc:
-        return {int(claim["id"]): {"error": f"MANIFEST_MISMATCH: {exc}", "retryable": False} for claim in claim_list}
+                outcomes[int(claim["id"])] = {"error": error, "retryable": retryable}
+            continue
+        for claim in site_claims:
+            outcome = dict(parsed[str(claim["exact_url"])])
+            if "result" in outcome:
+                outcome["crawler_revision"] = revision
+            outcomes[int(claim["id"])] = outcome
     return outcomes
 
 
@@ -344,6 +353,7 @@ def run_incremental_local_fallback(
     final_remote_check: Callable[[Sequence[Mapping[str, Any]]], set[int]],
     execute: Callable[[Sequence[Mapping[str, Any]]], Mapping[int, Mapping[str, Any]]],
     checked_remote_job_ids: set[int] | frozenset[int] = frozenset(),
+    execution_budget_seconds: Callable[[], float] | None = None,
 ) -> dict[str, Any]:
     """Observe, final-check, claim, execute and settle exact unresolved URLs."""
     current = _moment(now)
@@ -415,6 +425,8 @@ def run_incremental_local_fallback(
                 SUPPORTED_MALLS,
                 checked_remote_job_ids=final_checked,
             )
+    if execution_budget_seconds is not None and execution_budget_seconds() < MIN_EXECUTION_WINDOW_SECONDS:
+        return _metrics(store, token)
     claims: list[dict[str, Any]] = []
     for row in eligible:
         if int(row["remote_job_id"]) not in final_checked:

@@ -21,6 +21,7 @@ from typing import Any, Iterator, Mapping, Sequence
 
 from app.services.customer_price_semantics import CUSTOMER_PRICE_RETRYABLE_DETAIL_STATUSES
 from app.services.crawl_url_identity import is_placeholder_code
+from app.services.page_price_semantics import valid_page_price_result
 
 
 DEFAULT_TENANT_ID = 188605
@@ -2473,7 +2474,7 @@ class DailyAuditStore:
                        JOIN remote_jobs r ON r.id=c.remote_job_id AND r.run_id=c.run_id
                        LEFT JOIN local_fallback_work f ON f.crawl_work_id=c.id
                       WHERE c.run_id=? AND c.mall_key IN ({placeholders})
-                        AND c.state NOT IN ('SUCCESS','NO_RESULT','TERMINAL_FAILED')
+                        AND c.state<>'SUCCESS'
                       ORDER BY c.id""",
                 (token.run_id, *malls),
             ).fetchall()
@@ -2524,7 +2525,7 @@ class DailyAuditStore:
             self._validate_crawl_lease(connection, token, crawl_work_id)
             crawl = connection.execute("SELECT * FROM crawl_work WHERE id=?", (crawl_work_id,)).fetchone()
             assert crawl is not None
-            if crawl["state"] in {"SUCCESS", "NO_RESULT", "TERMINAL_FAILED"}:
+            if crawl["state"] == "SUCCESS":
                 return None
             work = connection.execute(
                 "SELECT * FROM local_fallback_work WHERE crawl_work_id=?", (crawl_work_id,)
@@ -2692,6 +2693,27 @@ class DailyAuditStore:
             if work["state"] in {"NO_RESULT", "TERMINAL_FAILED"}:
                 raise RemoteIntentConflict("terminal crawl cannot become successful")
             connection.execute("UPDATE crawl_work SET state='SUCCESS', result_json=?, error_text=NULL, updated_at=? WHERE id=?", (encoded, self._utcnow(), crawl_work_id))
+            return self._row(connection.execute("SELECT * FROM crawl_work WHERE id=?", (crawl_work_id,)).fetchone())  # type: ignore[return-value]
+
+    def complete_terminal_crawl_from_final_remote_check(
+        self, token: LeaseToken, crawl_work_id: int, remote_job_id: int, result: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        """A newly checked remote price may resolve an earlier remote terminal result."""
+        if not valid_page_price_result(result) or not str(result.get("page_price_source") or "").startswith("招商局"):
+            raise ValueError("final remote result must be a valid Zhaoshang price")
+        encoded = self._canonical_json(result)
+        with self._transaction(immediate=True) as connection:
+            self._validate_crawl_lease(connection, token, crawl_work_id)
+            work = connection.execute("SELECT * FROM crawl_work WHERE id=?", (crawl_work_id,)).fetchone()
+            assert work is not None
+            if int(work["remote_job_id"] or 0) != int(remote_job_id):
+                raise RemoteIntentConflict("final remote price requires the exact linked job")
+            if work["state"] not in {"NO_RESULT", "TERMINAL_FAILED"}:
+                raise RemoteIntentConflict("final remote terminal supersession requires remote terminal state")
+            connection.execute(
+                "UPDATE crawl_work SET state='SUCCESS', result_json=?, error_text=NULL, updated_at=? WHERE id=?",
+                (encoded, self._utcnow(), crawl_work_id),
+            )
             return self._row(connection.execute("SELECT * FROM crawl_work WHERE id=?", (crawl_work_id,)).fetchone())  # type: ignore[return-value]
 
     def complete_partial_exact_crawl_work(

@@ -3,13 +3,16 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 import json
 import sqlite3
+import subprocess
 from decimal import Decimal
 from zipfile import ZipFile
 
 import pytest
-from openpyxl import Workbook
+from openpyxl import Workbook, load_workbook
 
 from app.services.daily_audit_store import DailyAuditStore
+from app.services import incremental_local_fallback as fallback_module
+from app.workflows import incremental_price_audit as audit_workflow
 from app.services.incremental_local_fallback import (
     AFTER_1800,
     DAYTIME_60M,
@@ -18,6 +21,8 @@ from app.services.incremental_local_fallback import (
     eligibility_reason,
     run_incremental_local_fallback,
     read_crawler_output,
+    execute_pinned_crawler,
+    verify_crawler_revision,
 )
 from app.workflows.incremental_price_audit import (
     TickBudget, TickConfig, TickDependencies, _backlog,
@@ -335,6 +340,30 @@ def test_final_remote_check_rejects_non_query_evidence(tmp_path, evidence):
     assert checked == set()
 
 
+def test_failed_final_remote_check_cannot_persist_embedded_price(tmp_path):
+    store, token, rows, job = setup_work(tmp_path)
+    deps = TickDependencies(
+        discover=lambda _timeout: None,
+        harvest=lambda _jobs, _timeout: {
+            int(job["id"]): {
+                "state": "COMPLETED", "manual_error": "export incomplete",
+                "crawl_results": {
+                    int(rows[0]["id"]): {
+                        "page_price_value": "19.20", "page_price_status": "OK",
+                        "page_price_source": "招商局",
+                    }
+                },
+            }
+        },
+    )
+    checked = _final_remote_check_for_local_fallback(
+        store, token, deps, TickBudget(0, 60, 5, lambda: 0),
+        [store.get_crawl_work(rows[0]["id"])],
+    )
+    assert checked == set()
+    assert store.get_crawl_work(rows[0]["id"])["state"] == "SUBMITTED"
+
+
 @pytest.mark.parametrize("state", ["RUNNING", "EXPORTED", "COMPLETED"])
 def test_final_remote_check_accepts_successful_remote_query_states(tmp_path, state):
     store, token, rows, job = setup_work(tmp_path)
@@ -352,6 +381,35 @@ def test_final_remote_check_accepts_successful_remote_query_states(tmp_path, sta
     )
 
     assert checked == {int(job["id"])}
+
+
+@pytest.mark.parametrize("terminal_state", ["NO_RESULT", "TERMINAL_FAILED"])
+def test_final_remote_price_rescues_terminal_before_local_claim(tmp_path, terminal_state):
+    store, token, rows, job = setup_work(tmp_path)
+    seed_remote_terminal(store, token, rows[0], job, terminal_state)
+    remote_price = {"page_price_value": "19.20", "page_price_status": "OK", "page_price_source": "招商局"}
+    deps = TickDependencies(
+        discover=lambda _timeout: None,
+        harvest=lambda _jobs, _timeout: {
+            int(job["id"]): {
+                "state": "COMPLETED", "remote_identity": "remote-job",
+                "crawl_results": {int(rows[0]["id"]): remote_price},
+            }
+        },
+    )
+
+    run_incremental_local_fallback(
+        store, token, now=at(8, 30), tick_id="remote-rescue",
+        final_remote_check=lambda candidates: _final_remote_check_for_local_fallback(
+            store, token, deps, TickBudget(0, 60, 5, lambda: 0), candidates
+        ),
+        execute=lambda _claims: pytest.fail("valid final remote price must win"),
+    )
+
+    crawl = store.get_crawl_work(rows[0]["id"])
+    assert crawl["state"] == "SUCCESS"
+    assert json.loads(crawl["result_json"]) == remote_price
+    assert store.list_local_fallback_work(token)[0]["attempt_count"] == 0
 
 
 def test_opening_harvest_manual_error_is_not_a_completed_remote_check(tmp_path):
@@ -374,22 +432,108 @@ def test_opening_harvest_manual_error_is_not_a_completed_remote_check(tmp_path):
     assert checked == set()
 
 
+def seed_remote_terminal(store, token, row, job, state):
+    if state == "TERMINAL_FAILED":
+        store.fail_crawl_work(token, row["id"], "remote terminal", retryable=False)
+    else:
+        with sqlite3.connect(store.path) as conn:
+            conn.execute(
+                """UPDATE remote_jobs SET state='COMPLETED', remote_identity='remote-job',
+                          post_attempted=1, result_path='remote.xlsx' WHERE id=?""",
+                (job["id"],),
+            )
+        store.complete_partial_exact_no_result(
+            token, row["id"], remote_job_id=job["id"], remote_identity="remote-job",
+            result_path="remote.xlsx", reason="remote export has no matching row",
+        )
+
+
 @pytest.mark.parametrize("terminal_state", ["NO_RESULT", "TERMINAL_FAILED"])
-def test_terminal_remote_crawl_cannot_be_claimed_for_local_fallback(tmp_path, terminal_state):
+def test_remote_terminal_can_be_claimed_for_local_fallback(tmp_path, terminal_state):
     store, token, rows, job = setup_work(tmp_path)
+    seed_remote_terminal(store, token, rows[0], job, terminal_state)
+    observed = store.observe_local_fallback_remote_checks(
+        token, at(8, 30).isoformat(), SUPPORTED_MALLS,
+        checked_remote_job_ids={int(job["id"])},
+    )
+    assert [row["id"] for row in observed] == [rows[0]["id"]]
+    claim = store.claim_local_fallback(
+        token, rows[0]["id"], DAYTIME_60M, "late-claim", at(8, 31).isoformat()
+    )
+    assert claim is not None and claim["attempt_count"] == 1
+
+
+@pytest.mark.parametrize("terminal_state", ["NO_RESULT", "TERMINAL_FAILED"])
+def test_remote_terminal_local_success_supersedes_exact_price(tmp_path, terminal_state):
+    store, token, rows, job = setup_work(tmp_path)
+    seed_remote_terminal(store, token, rows[0], job, terminal_state)
+    metrics = run_incremental_local_fallback(
+        store, token, now=at(8, 30), tick_id="local",
+        final_remote_check=checked_jobs,
+        execute=lambda claims: {claims[0]["id"]: {"result": success_result("18.80")}},
+    )
+    crawl = store.get_crawl_work(rows[0]["id"])
+    assert metrics["success"] == 1
+    assert crawl["state"] == "SUCCESS"
+    assert json.loads(crawl["result_json"])["page_price_value"] == "18.80"
+    assert json.loads(crawl["result_json"])["page_price_source"].startswith("本地兜底:")
+
+
+@pytest.mark.parametrize("terminal_state", ["NO_RESULT", "TERMINAL_FAILED"])
+def test_remote_terminal_local_failure_preserves_remote_evidence(tmp_path, terminal_state):
+    store, token, rows, job = setup_work(tmp_path)
+    seed_remote_terminal(store, token, rows[0], job, terminal_state)
+    before = store.get_crawl_work(rows[0]["id"])
+    run_incremental_local_fallback(
+        store, token, now=at(8, 30), tick_id="local",
+        final_remote_check=checked_jobs,
+        execute=lambda claims: {claims[0]["id"]: {"error": "RISK_STOP", "retryable": False}},
+    )
+    after = store.get_crawl_work(rows[0]["id"])
+    assert (after["state"], after["result_json"], after["error_text"]) == (
+        before["state"], before["result_json"], before["error_text"]
+    )
+    assert store.list_local_fallback_work(token)[0]["state"] == "TERMINAL_FAILED"
+
+
+@pytest.mark.parametrize("terminal_state", ["NO_RESULT", "TERMINAL_FAILED"])
+def test_remote_terminal_local_crash_preserves_remote_evidence(tmp_path, terminal_state):
+    store, token, rows, job = setup_work(tmp_path)
+    seed_remote_terminal(store, token, rows[0], job, terminal_state)
     store.observe_local_fallback_remote_checks(
         token, at(8, 30).isoformat(), SUPPORTED_MALLS,
         checked_remote_job_ids={int(job["id"])},
     )
-    with sqlite3.connect(store.path) as conn:
-        conn.execute(
-            "UPDATE crawl_work SET state=? WHERE id=?",
-            (terminal_state, rows[0]["id"]),
-        )
+    claim = store.claim_local_fallback(
+        token, rows[0]["id"], DAYTIME_60M, "crashed", at(8, 30).isoformat()
+    )
+    assert claim is not None
+    before = store.get_crawl_work(rows[0]["id"])
+    assert store.recover_interrupted_local_fallback_claims(
+        token, "next", at(8, 30, 2).isoformat(), max_attempts=1
+    ) == 1
+    after = store.get_crawl_work(rows[0]["id"])
+    assert (after["state"], after["result_json"], after["error_text"]) == (
+        before["state"], before["result_json"], before["error_text"]
+    )
 
-    assert store.claim_local_fallback(
-        token, rows[0]["id"], DAYTIME_60M, "late-claim", at(8, 31).isoformat()
-    ) is None
+
+@pytest.mark.parametrize("terminal_state", ["NO_RESULT", "TERMINAL_FAILED"])
+def test_remote_terminal_local_retry_caps_at_two(tmp_path, terminal_state):
+    store, token, rows, job = setup_work(tmp_path)
+    seed_remote_terminal(store, token, rows[0], job, terminal_state)
+    attempts = []
+    for index, when in enumerate((at(8, 30), at(8, 31), at(8, 32))):
+        run_incremental_local_fallback(
+            store, token, now=when, tick_id=f"tick-{index}",
+            final_remote_check=checked_jobs,
+            execute=lambda claims: attempts.append(claims[0]["id"]) or {
+                claims[0]["id"]: {"error": "NETWORK_TIMEOUT", "retryable": True}
+            },
+        )
+    assert len(attempts) == 2
+    assert store.list_local_fallback_work(token)[0]["attempt_count"] == 2
+    assert store.list_local_fallback_work(token)[0]["state"] == "TERMINAL_FAILED"
 
 
 @pytest.mark.parametrize("terminal_state", ["NO_RESULT", "TERMINAL_FAILED"])
@@ -536,6 +680,169 @@ def write_output(path, rows):
     for row in rows:
         sheet.append(row)
     book.save(path)
+
+
+def fake_crawler_run(monkeypatch, *, site_outputs, exit_code):
+    monkeypatch.setattr(fallback_module, "verify_crawler_revision", lambda _root: fallback_module.EXPECTED_CRAWLER_REVISION)
+
+    def run(command, **kwargs):
+        manifest = load_workbook(command[command.index("--manifest") + 1], data_only=True)
+        try:
+            for site, _source, target in list(manifest.active.values)[1:]:
+                rows = site_outputs.get(site)
+                if rows == "MALFORMED":
+                    fallback_module.Path(target).write_bytes(b"not an xlsx")
+                elif rows is not None:
+                    write_output(fallback_module.Path(target), rows)
+        finally:
+            manifest.close()
+        return subprocess.CompletedProcess(command, exit_code, "", "")
+
+    monkeypatch.setattr(fallback_module.subprocess, "run", run)
+
+
+def multi_site_claims():
+    return [
+        {"id": 1, "mall_key": "nbdeli", "exact_url": "https://b2b.nbdeli.com/item/1"},
+        {"id": 2, "mall_key": "nbdeli", "exact_url": "https://b2b.nbdeli.com/item/2"},
+        {"id": 3, "mall_key": "guangbo", "exact_url": "https://btob.guangbo.net/item/3"},
+        {"id": 4, "mall_key": "comix", "exact_url": "https://www.qx.com/item/4"},
+    ]
+
+
+def test_execute_pinned_crawler_exit3_preserves_completed_other_site_success(tmp_path, monkeypatch):
+    claims = multi_site_claims()
+    fake_crawler_run(monkeypatch, exit_code=3, site_outputs={
+        "nbdeli": [
+            ["1", "first", "18.80", claims[0]["exact_url"], "SUCCESS", ""],
+            ["2", "second", "", claims[1]["exact_url"], "SKIPPED_RISK", "RISK_STOP"],
+        ],
+        "guangbo": [["3", "third", "19.20", claims[2]["exact_url"], "SUCCESS", ""]],
+    })
+    result = execute_pinned_crawler(claims, run_dir=tmp_path / "run", tick_id="risk", crawler_root=tmp_path / "crawler")
+    assert result[1]["result"]["page_price_value"] == Decimal("18.80")
+    assert result[3]["result"]["page_price_value"] == Decimal("19.20")
+
+
+def test_execute_pinned_crawler_exit3_marks_only_risk_or_unstarted_urls_as_risk(tmp_path, monkeypatch):
+    claims = multi_site_claims()
+    fake_crawler_run(monkeypatch, exit_code=3, site_outputs={
+        "nbdeli": [
+            ["1", "first", 1, claims[0]["exact_url"], "SUCCESS", ""],
+            ["2", "second", "", claims[1]["exact_url"], "SKIPPED_RISK", "RISK_STOP"],
+        ],
+        "guangbo": [["3", "third", 2, claims[2]["exact_url"], "SUCCESS", ""]],
+    })
+    result = execute_pinned_crawler(claims, run_dir=tmp_path / "run", tick_id="risk", crawler_root=tmp_path / "crawler")
+    assert result[2]["error"].startswith("RISK_STOP")
+    assert result[4]["error"].startswith("RISK_STOP")
+    assert "result" in result[1] and "result" in result[3]
+
+
+def test_execute_pinned_crawler_exit2_preserves_valid_other_site_outputs(tmp_path, monkeypatch):
+    claims = multi_site_claims()
+    fake_crawler_run(monkeypatch, exit_code=2, site_outputs={
+        "nbdeli": [["1", "first", 1, claims[0]["exact_url"], "SUCCESS", ""],
+                   ["2", "second", 2, claims[1]["exact_url"], "SUCCESS", ""]],
+        "comix": [["4", "fourth", 4, claims[3]["exact_url"], "SUCCESS", ""]],
+    })
+    result = execute_pinned_crawler(claims, run_dir=tmp_path / "run", tick_id="error", crawler_root=tmp_path / "crawler")
+    assert {key for key, outcome in result.items() if "result" in outcome} == {1, 2, 4}
+    assert result[3]["error"].startswith("PROCESS_FAILED")
+
+
+@pytest.mark.parametrize("bad_site", ["MISSING", "MALFORMED", "FOREIGN", "DUPLICATE"])
+def test_execute_pinned_crawler_bad_one_site_does_not_poison_others(tmp_path, monkeypatch, bad_site):
+    claims = multi_site_claims()
+    bad_rows = {
+        "MISSING": None,
+        "MALFORMED": "MALFORMED",
+        "FOREIGN": [["3", "third", 3, "https://btob.guangbo.net/foreign", "SUCCESS", ""]],
+        "DUPLICATE": [["3", "third", 3, claims[2]["exact_url"], "SUCCESS", ""],
+                      ["3", "third", 3, claims[2]["exact_url"], "SUCCESS", ""]],
+    }[bad_site]
+    fake_crawler_run(monkeypatch, exit_code=2, site_outputs={
+        "nbdeli": [["1", "first", 1, claims[0]["exact_url"], "SUCCESS", ""],
+                   ["2", "second", 2, claims[1]["exact_url"], "SUCCESS", ""]],
+        "guangbo": bad_rows,
+        "comix": [["4", "fourth", 4, claims[3]["exact_url"], "SUCCESS", ""]],
+    })
+    result = execute_pinned_crawler(claims, run_dir=tmp_path / "run", tick_id="bad", crawler_root=tmp_path / "crawler")
+    assert {key for key, outcome in result.items() if "result" in outcome} == {1, 2, 4}
+    assert result[3]["error"].startswith("PROCESS_FAILED" if bad_site == "MISSING" else "MANIFEST_MISMATCH")
+
+
+@pytest.mark.parametrize("dirty", [False, True])
+def test_verify_crawler_revision_rejects_wrong_sha_or_dirty_worktree(tmp_path, dirty):
+    root = tmp_path / "crawler"
+    (root / "mall_crawler").mkdir(parents=True)
+    (root / "mall_crawler" / "cli.py").write_text("# test fixture\n", encoding="utf-8")
+
+    def runner(command, **_kwargs):
+        output = (fallback_module.EXPECTED_CRAWLER_REVISION if dirty else "0" * 40) if command[1] == "rev-parse" else (" M cli.py" if dirty else "")
+        return subprocess.CompletedProcess(command, 0, output, "")
+
+    with pytest.raises(ValueError, match="工作区不干净" if dirty else "revision 不匹配"):
+        verify_crawler_revision(root, runner=runner)
+
+
+def test_local_fallback_does_not_claim_when_budget_exhausted_after_final_remote_check(tmp_path):
+    store, token, rows, _job = setup_work(tmp_path)
+    available = [90.0]
+    executed = []
+
+    def check(candidates):
+        available[0] = 30.0
+        return checked_jobs(candidates)
+
+    run_incremental_local_fallback(
+        store, token, now=at(8, 30), tick_id="deferred",
+        final_remote_check=check,
+        execute=lambda claims: executed.append(claims) or {},
+        execution_budget_seconds=lambda: available[0],
+    )
+    ledger = store.list_local_fallback_work(token)[0]
+    assert ledger["state"] == "PENDING"
+    assert ledger["attempt_count"] == 0
+    assert executed == []
+    assert store.get_crawl_work(rows[0]["id"])["state"] == "SUBMITTED"
+
+
+def test_budget_defer_does_not_consume_fallback_attempt(tmp_path):
+    store, token, _rows, _job = setup_work(tmp_path)
+    run_incremental_local_fallback(
+        store, token, now=at(8, 30), tick_id="deferred",
+        final_remote_check=checked_jobs,
+        execute=lambda _claims: pytest.fail("budget defer must not execute"),
+        execution_budget_seconds=lambda: 0.0,
+    )
+    assert store.list_local_fallback_work(token)[0]["attempt_count"] == 0
+
+
+def test_next_scheduler_tick_can_claim_after_budget_defer(tmp_path):
+    store, token, rows, _job = setup_work(tmp_path)
+    for tick_id, available in (("deferred", 30.0), ("next", 180.0)):
+        run_incremental_local_fallback(
+            store, token, now=at(8, 30) if tick_id == "deferred" else at(8, 31),
+            tick_id=tick_id, final_remote_check=checked_jobs,
+            execute=lambda claims: {claims[0]["id"]: {"result": success_result("18.80")}},
+            execution_budget_seconds=lambda available=available: available,
+        )
+    assert store.get_crawl_work(rows[0]["id"])["state"] == "SUCCESS"
+    assert store.list_local_fallback_work(token)[0]["attempt_count"] == 1
+
+
+def test_local_fallback_child_timeout_is_bounded_by_live_tick_budget():
+    time_now = [70.0]
+    budget = TickBudget(0.0, 240.0, 120.0, lambda: time_now[0])
+    observed = []
+    deps = TickDependencies(
+        discover=lambda _timeout: None,
+        local_fallback=lambda _claims, _tick_id, timeout: observed.append(timeout) or {},
+    )
+    audit_workflow._execute_local_fallback_with_budget(deps, budget, (), "tick")
+    assert observed == [50.0]
+    assert observed[0] <= budget.remaining() - budget.reserve_seconds
 
 
 @pytest.mark.parametrize("price", ["NaN", "Infinity", "-1"])

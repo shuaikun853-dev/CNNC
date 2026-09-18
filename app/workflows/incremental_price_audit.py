@@ -29,7 +29,10 @@ from app.services.daily_audit_store import (
     ProcessLock,
     RemoteIntentConflict,
 )
-from app.services.incremental_local_fallback import run_incremental_local_fallback
+from app.services.incremental_local_fallback import (
+    MAX_CHILD_TIMEOUT_SECONDS,
+    run_incremental_local_fallback,
+)
 from app.services.page_price_semantics import (
     remote_job_is_closed_by_local_fallback,
     valid_page_price_result,
@@ -228,7 +231,7 @@ class TickDependencies:
     prewarm_intake: Callable[[str, Sequence[Mapping[str, Any]]], None] | None = None
     # Incremental-only automatic recovery. Full STEP_1 keeps its independent
     # count/SHA/manual authorization gate.
-    local_fallback: Callable[[Sequence[Mapping[str, Any]], str], Mapping[int, Mapping[str, Any]]] | None = None
+    local_fallback: Callable[[Sequence[Mapping[str, Any]], str, float], Mapping[int, Mapping[str, Any]]] | None = None
     monotonic: Callable[[], float] = time.monotonic
     wall_clock: Callable[[], datetime] = lambda: datetime.now(UTC)
 
@@ -251,6 +254,17 @@ class TickBudget:
         if stage_remaining is not None:
             values.append(stage_remaining)
         return max(0.0, min(values))
+
+
+def _execute_local_fallback_with_budget(
+    deps: TickDependencies,
+    budget: TickBudget,
+    claims: Sequence[Mapping[str, Any]],
+    tick_id: str,
+) -> Mapping[int, Mapping[str, Any]]:
+    assert deps.local_fallback is not None
+    timeout = min(MAX_CHILD_TIMEOUT_SECONDS, max(0.0, budget.remaining() - budget.reserve_seconds))
+    return deps.local_fallback(claims, tick_id, timeout)
 
 
 @dataclass(frozen=True)
@@ -1277,7 +1291,7 @@ def _final_remote_check_for_local_fallback(
     for job in jobs:
         job_id = int(job["id"])
         evidence = result.get(job_id) if job_id in result else result.get(str(job_id))
-        if not isinstance(evidence, Mapping):
+        if not _is_successful_remote_price_check(evidence):
             continue
         crawl_results = evidence.get("crawl_results")
         if not isinstance(crawl_results, Mapping):
@@ -1293,9 +1307,12 @@ def _final_remote_check_for_local_fallback(
             try:
                 store.complete_crawl_work(token, crawl_id, crawl_result)
             except RemoteIntentConflict:
-                # An already terminal remote no-result remains immutable here;
-                # local fallback has its own audited supersession transition.
-                continue
+                try:
+                    store.complete_terminal_crawl_from_final_remote_check(
+                        token, crawl_id, job_id, crawl_result
+                    )
+                except (RemoteIntentConflict, ValueError):
+                    continue
     return {
         int(job["id"])
         for job in jobs
@@ -1839,8 +1856,11 @@ def run_incremental_tick(
                 final_remote_check=lambda candidates: _final_remote_check_for_local_fallback(
                     store, token, deps, budget, candidates
                 ),
-                execute=lambda claims: deps.local_fallback(claims, fallback_tick_id),
+                execute=lambda claims: _execute_local_fallback_with_budget(
+                    deps, budget, claims, fallback_tick_id
+                ),
                 checked_remote_job_ids=checked_remote_jobs,
+                execution_budget_seconds=lambda: max(0.0, budget.remaining() - budget.reserve_seconds),
             )
             counters["local_fallback_pending"] = int(local_fallback_metrics["pending"])
             counters["local_fallback_running"] = int(local_fallback_metrics["running"])
