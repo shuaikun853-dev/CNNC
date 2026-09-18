@@ -573,6 +573,9 @@ def _run_dispatch(args: argparse.Namespace, business_date: str, runtime_root: Pa
             # One absolute wall-clock anchor for the WHOLE process (pass +
             # harvest): the scheduler's per-run ceiling is budget + grace.
             pass_started = time.monotonic()
+            lifecycle_reserve = (
+                min(18.0, float(args.budget_seconds) * 0.4) if lifecycle_on else 0.0
+            )
             summary = run_prewarm_dispatch_pass(
                 prewarm_store,
                 shared_cache,
@@ -581,7 +584,7 @@ def _run_dispatch(args: argparse.Namespace, business_date: str, runtime_root: Pa
                 state_runtime_root=state_runtime_root,
                 mappings=mappings,
                 adapter=adapter,
-                budget_seconds=args.budget_seconds,
+                budget_seconds=float(args.budget_seconds) - lifecycle_reserve,
                 max_jobs_per_pass=args.max_jobs_per_pass,
                 plan_only=False,
             )

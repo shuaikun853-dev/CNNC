@@ -918,6 +918,7 @@ class CustomerPrewarmStore:
         self,
         business_date: str,
         candidate_id: int,
+        expected_owning_day: str,
         expected_remote_job_id: int,
         remote_job_id: int,
         producer: str,
@@ -927,6 +928,7 @@ class CustomerPrewarmStore:
         """Atomically replace one current binding and its latest linkage."""
         self._assert_writable()
         day = self._require_text(business_date, "business_date")
+        expected_day = self._require_text(expected_owning_day, "expected_owning_day")
         producer_value = self._require_text(producer, "producer")
         now = self._utcnow()
         with self._transaction(immediate=True) as connection:
@@ -935,7 +937,7 @@ class CustomerPrewarmStore:
                 (int(candidate_id),),
             ).fetchone()
             latest = connection.execute(
-                """SELECT remote_job_id, producer FROM prewarm_remote_job_links
+                """SELECT business_date, remote_job_id, producer FROM prewarm_remote_job_links
                    WHERE candidate_id=? ORDER BY recorded_at DESC, rowid DESC LIMIT 1""",
                 (int(candidate_id),),
             ).fetchone()
@@ -944,6 +946,7 @@ class CustomerPrewarmStore:
                 or str(candidate["cache_status"]) not in _REMOTE_JOB_STATUSES
                 or int(candidate["remote_job_id"] or 0) != int(expected_remote_job_id)
                 or latest is None
+                or str(latest["business_date"]) != expected_day
                 or int(latest["remote_job_id"]) != int(expected_remote_job_id)
                 or str(latest["producer"]) != producer_value
             ):
