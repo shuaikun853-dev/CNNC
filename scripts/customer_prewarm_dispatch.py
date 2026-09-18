@@ -574,7 +574,7 @@ def _run_dispatch(args: argparse.Namespace, business_date: str, runtime_root: Pa
             # harvest): the scheduler's per-run ceiling is budget + grace.
             pass_started = time.monotonic()
             lifecycle_reserve = (
-                min(18.0, float(args.budget_seconds) * 0.4) if lifecycle_on else 0.0
+                min(24.0, float(args.budget_seconds) * 0.6) if lifecycle_on else 0.0
             )
             summary = run_prewarm_dispatch_pass(
                 prewarm_store,
@@ -602,9 +602,16 @@ def _run_dispatch(args: argparse.Namespace, business_date: str, runtime_root: Pa
                 lifecycle_deadline = _shared_harvest_deadline(
                     pass_started, args.budget_seconds
                 )
-                lifecycle_remaining = max(0.0, lifecycle_deadline - time.monotonic())
-                reconcile_deadline = lifecycle_deadline - 2 * lifecycle_remaining / 3
-                historical_deadline = lifecycle_deadline - lifecycle_remaining / 3
+                lifecycle_now = time.monotonic()
+                lifecycle_remaining = max(0.0, lifecycle_deadline - lifecycle_now)
+                reconcile_slice = min(
+                    lifecycle_remaining,
+                    10.0 if lifecycle_remaining >= 20.0 else max(5.0, lifecycle_remaining * 0.6),
+                )
+                reconcile_deadline = lifecycle_now + reconcile_slice
+                historical_deadline = reconcile_deadline + max(
+                    0.0, lifecycle_deadline - reconcile_deadline
+                ) / 2
                 run_cross_day_reconcile_phase(
                     prewarm_store=prewarm_store,
                     current_business_date=business_date,

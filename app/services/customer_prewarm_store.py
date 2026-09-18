@@ -34,7 +34,7 @@ import sqlite3
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Iterator, Sequence
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS prewarm_documents (
@@ -926,52 +926,74 @@ class CustomerPrewarmStore:
         error: str | None = None,
     ) -> bool:
         """Atomically replace one current binding and its latest linkage."""
+        return self.bind_redispatched_remote_job_batch(
+            business_date,
+            [(candidate_id, expected_owning_day, expected_remote_job_id)],
+            remote_job_id,
+            producer,
+            error=error,
+        )
+
+    def bind_redispatched_remote_job_batch(
+        self,
+        business_date: str,
+        bindings: Sequence[tuple[int, str, int]],
+        remote_job_id: int,
+        producer: str,
+        *,
+        error: str | None = None,
+    ) -> bool:
+        """All-or-none post-send binding for one immutable remote request group."""
         self._assert_writable()
         day = self._require_text(business_date, "business_date")
-        expected_day = self._require_text(expected_owning_day, "expected_owning_day")
         producer_value = self._require_text(producer, "producer")
         now = self._utcnow()
+        if not bindings or len({int(item[0]) for item in bindings}) != len(bindings):
+            return False
         with self._transaction(immediate=True) as connection:
-            candidate = connection.execute(
-                "SELECT cache_status, remote_job_id FROM prewarm_candidates WHERE id=?",
-                (int(candidate_id),),
-            ).fetchone()
-            latest = connection.execute(
-                """SELECT business_date, remote_job_id, producer FROM prewarm_remote_job_links
-                   WHERE candidate_id=? ORDER BY recorded_at DESC, rowid DESC LIMIT 1""",
-                (int(candidate_id),),
-            ).fetchone()
-            if (
-                candidate is None
-                or str(candidate["cache_status"]) not in _REMOTE_JOB_STATUSES
-                or int(candidate["remote_job_id"] or 0) != int(expected_remote_job_id)
-                or latest is None
-                or str(latest["business_date"]) != expected_day
-                or int(latest["remote_job_id"]) != int(expected_remote_job_id)
-                or str(latest["producer"]) != producer_value
-            ):
-                return False
-            existing = connection.execute(
-                """SELECT producer FROM prewarm_remote_job_links
-                   WHERE business_date=? AND candidate_id=? AND remote_job_id=?""",
-                (day, int(candidate_id), int(remote_job_id)),
-            ).fetchone()
-            if existing is not None and str(existing["producer"]) != producer_value:
-                return False
-            connection.execute(
-                """INSERT INTO prewarm_remote_job_links
-                   (business_date, candidate_id, remote_job_id, producer, recorded_at)
-                   VALUES (?, ?, ?, ?, ?)
-                   ON CONFLICT(business_date, candidate_id, remote_job_id)
-                   DO UPDATE SET recorded_at=excluded.recorded_at""",
-                (day, int(candidate_id), int(remote_job_id), producer_value, now),
-            )
-            connection.execute(
-                """UPDATE prewarm_candidates
-                   SET remote_job_id=?, last_error=COALESCE(?, last_error), last_checked_at=?
-                   WHERE id=?""",
-                (int(remote_job_id), self._optional_text(error), now, int(candidate_id)),
-            )
+            for candidate_id, expected_owning_day, expected_remote_job_id in bindings:
+                expected_day = self._require_text(expected_owning_day, "expected_owning_day")
+                candidate = connection.execute(
+                    "SELECT cache_status, remote_job_id FROM prewarm_candidates WHERE id=?",
+                    (int(candidate_id),),
+                ).fetchone()
+                latest = connection.execute(
+                    """SELECT business_date, remote_job_id, producer FROM prewarm_remote_job_links
+                       WHERE candidate_id=? ORDER BY recorded_at DESC, rowid DESC LIMIT 1""",
+                    (int(candidate_id),),
+                ).fetchone()
+                if (
+                    candidate is None
+                    or str(candidate["cache_status"]) not in _REMOTE_JOB_STATUSES
+                    or int(candidate["remote_job_id"] or 0) != int(expected_remote_job_id)
+                    or latest is None
+                    or str(latest["business_date"]) != expected_day
+                    or int(latest["remote_job_id"]) != int(expected_remote_job_id)
+                    or str(latest["producer"]) != producer_value
+                ):
+                    return False
+                existing = connection.execute(
+                    """SELECT producer FROM prewarm_remote_job_links
+                       WHERE business_date=? AND candidate_id=? AND remote_job_id=?""",
+                    (day, int(candidate_id), int(remote_job_id)),
+                ).fetchone()
+                if existing is not None and str(existing["producer"]) != producer_value:
+                    return False
+            for candidate_id, _expected_day, _expected_job_id in bindings:
+                connection.execute(
+                    """INSERT INTO prewarm_remote_job_links
+                       (business_date, candidate_id, remote_job_id, producer, recorded_at)
+                       VALUES (?, ?, ?, ?, ?)
+                       ON CONFLICT(business_date, candidate_id, remote_job_id)
+                       DO UPDATE SET recorded_at=excluded.recorded_at""",
+                    (day, int(candidate_id), int(remote_job_id), producer_value, now),
+                )
+                connection.execute(
+                    """UPDATE prewarm_candidates
+                       SET remote_job_id=?, last_error=COALESCE(?, last_error), last_checked_at=?
+                       WHERE id=?""",
+                    (int(remote_job_id), self._optional_text(error), now, int(candidate_id)),
+                )
             return True
 
     def candidate_ids_for_business_date(self, business_date: str) -> set[int]:
@@ -1036,6 +1058,18 @@ class CustomerPrewarmStore:
             ):
                 return True
         return False
+
+    def has_current_remote_job_link(
+        self, *, business_date: str, remote_job_id: int, producer: str
+    ) -> bool:
+        """Read the latest active candidate linkage without changing durable state."""
+        with self._reader() as connection:
+            return self._connection_has_current_remote_job_link(
+                connection,
+                business_date=business_date,
+                remote_job_id=remote_job_id,
+                producer=producer,
+            )
 
     @contextmanager
     def fence_current_remote_job_link(

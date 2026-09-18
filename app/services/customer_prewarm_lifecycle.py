@@ -11,13 +11,13 @@ primitive — no second remote-task store is introduced:
   ProcessLock + durable lease — this stage therefore runs OUTSIDE the dispatch
   pass, called by the CLI after the pass released every lock).
 - reconcile (A2): identity-less ``SUBMIT_UNKNOWN`` prewarm jobs of the leased
-  day are rebuilt from durable payload evidence
+  day with a current exact candidate link are rebuilt from durable payload evidence
   (:func:`_reconstruct_prepared_job`) and re-identified through
   ``adapter.reconcile_unknown``.  ``FOUND`` reconciles the identity at
   ``PRIORITY_PENDING`` (then one prioritize confirm; only a PROVEN
-  ``weight_type == -1`` moves the job to ``SUBMITTED``).  ``NOT_FOUND``/
-  ``MANUAL`` bumps ``remote_jobs.recovery_attempts``; at
-  :data:`RECONCILE_DEAD_THRESHOLD` the job is judged dead and handed to A3.
+  ``weight_type == -1`` moves the job to ``SUBMITTED``).  Conclusive
+  ``NOT_FOUND`` bumps ``remote_jobs.recovery_attempts``; identity-conflict
+  ``MANUAL`` and inconclusive lookups cannot authorize A3 redispatch.
 - redispatch (A3): candidates in ``REMOTE_DISPATCHED``/``REMOTE_REUSED`` whose
   bound job is dead (``MANUAL_REQUIRED`` / ``TERMINAL_FAILED`` /
   ``SUBMIT_UNKNOWN`` with ``recovery_attempts >= threshold``) are re-created
@@ -49,6 +49,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from contextlib import nullcontext
 from datetime import date
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
@@ -579,6 +580,7 @@ def run_reconcile_phase(
     get_adapter: Callable[[], Any],
     paths: Any,
     *,
+    prewarm_store: CustomerPrewarmStore | None = None,
     deadline: float,
     monotonic_value: Callable[[], float],
     summary: dict[str, Any],
@@ -588,12 +590,28 @@ def run_reconcile_phase(
 
     Caller owns the daily lease (dispatch pass Phase 5).  ``FOUND`` reconciles
     the identity at ``PRIORITY_PENDING`` and gets one prioritize confirm;
-    anything else bumps ``recovery_attempts`` and, at the threshold, is judged
-    dead with a phase note (the redispatch stage owns it from then on).  A job
-    the tick already pushed to ``MANUAL_REQUIRED`` is dead by state and is
-    never reconciled again.
+    only conclusive ``NOT_FOUND`` bumps ``recovery_attempts`` toward A3.
+    Remote I/O requires a current exact candidate link; the link is fenced
+    through each local transition and rechecked before the remote priority call.
     """
     phase_errors = summary["phase_errors"]
+
+    def linked(job_id: int) -> bool:
+        return prewarm_store is None or prewarm_store.has_current_remote_job_link(
+            business_date=summary["business_date"],
+            remote_job_id=job_id,
+            producer=PRODUCER_CUSTOMER_PREWARM_ZHAOSHANG,
+        )
+
+    def link_fence(job_id: int):
+        if prewarm_store is None:
+            return nullcontext(True)
+        return prewarm_store.fence_current_remote_job_link(
+            business_date=summary["business_date"],
+            remote_job_id=job_id,
+            producer=PRODUCER_CUSTOMER_PREWARM_ZHAOSHANG,
+        )
+
     try:
         unknown_jobs = store.list_remote_jobs(token, states={"SUBMIT_UNKNOWN"})
     except Exception as exc:  # noqa: BLE001 - discovery failure never fails the pass
@@ -611,6 +629,8 @@ def run_reconcile_phase(
             continue
         if not any(str(crawl.get("sku_id") or "").startswith(_ZHPQ_SKU_PREFIX) for crawl in crawls):
             continue  # not prewarm work
+        if not linked(job_id):
+            continue  # an orphan or superseded job cannot own remote recovery
         attempts = int(job_row.get("recovery_attempts") or 0)
         if attempts >= dead_threshold:
             phase_errors.append(
@@ -633,6 +653,8 @@ def run_reconcile_phase(
                 f"budget deadline reached; reconcile of job {job_id} deferred"
             )
             break
+        if not linked(job_id):
+            continue
         attempted += 1
         try:
             prepared = _reconstruct_prepared_job(get_adapter(), summary["business_date"], job_row)
@@ -641,23 +663,29 @@ def run_reconcile_phase(
             )
             status = _status_value(outcome.status)
             if status == "MANUAL":
-                _mark_reconcile_manual(
-                    store, token, job_id, str(getattr(outcome, "diagnostic", "") or "")
-                )
-                phase_errors.append(f"reconcile job {job_id}: manual identity conflict; no auto redispatch")
+                with link_fence(job_id) as owned:
+                    if owned:
+                        _mark_reconcile_manual(
+                            store, token, job_id, str(getattr(outcome, "diagnostic", "") or "")
+                        )
+                        phase_errors.append(f"reconcile job {job_id}: manual identity conflict; no auto redispatch")
             elif status == "FOUND":
                 task_id = getattr(outcome, "task_id", None)
                 task_number = getattr(outcome, "task_number", None)
                 if not task_id or not task_number:
-                    _mark_reconcile_manual(store, token, job_id, "incomplete FOUND identity")
-                    phase_errors.append(f"reconcile job {job_id}: incomplete FOUND identity; no auto redispatch")
+                    with link_fence(job_id) as owned:
+                        if owned:
+                            _mark_reconcile_manual(store, token, job_id, "incomplete FOUND identity")
+                            phase_errors.append(f"reconcile job {job_id}: incomplete FOUND identity; no auto redispatch")
                     continue
                 mall_key = str(job_row.get("mall_key") or prepared.mall_key)
                 remote_identity = f"{mall_key}|{task_id}|{task_number}"
-                store.reconcile_remote_job(
-                    token, job_id, remote_identity=remote_identity, state="PRIORITY_PENDING"
-                )
-                store.advance_crawl_work_for_job(token, job_id, "PRIORITY_PENDING")
+                with link_fence(job_id) as owned:
+                    if not owned:
+                        continue
+                    store.reconcile_remote_job_and_crawl_work(
+                        token, job_id, remote_identity=remote_identity
+                    )
                 summary["reconciled_found"] += 1
                 # One prioritize confirm; only a PROVEN weight_type == -1
                 # reconciles the job to SUBMITTED (note_targets=[]: zero
@@ -674,9 +702,14 @@ def run_reconcile_phase(
                     monotonic_value=monotonic_value,
                     summary=summary,
                     prepared=prepared,
+                    pre_remote_guard=lambda: linked(job_id),
+                    result_commit_fence=lambda: link_fence(job_id),
                 )
             elif status == "NOT_FOUND" and not str(getattr(outcome, "diagnostic", "") or "").strip():
-                new_attempts = store.bump_remote_job_recovery_attempt(token, job_id)
+                with link_fence(job_id) as owned:
+                    if not owned:
+                        continue
+                    new_attempts = store.bump_remote_job_recovery_attempt(token, job_id)
                 summary["reconcile_not_found"] += 1
                 if new_attempts >= dead_threshold:
                     phase_errors.append(
@@ -957,29 +990,31 @@ def _redispatch_mall_group(
         )
 
     def _bind_candidates(*, error: str | None = None) -> list[tuple[int, str]]:
-        bound_targets: list[tuple[int, str]] = []
-        for entry in entries:
-            candidate_id = int(entry["candidate"]["id"])
-            try:
-                bound = prewarm_store.bind_redispatched_remote_job(
-                    business_date,
-                    candidate_id,
-                    str(entry["owning_day"]),
-                    int(entry["candidate"]["remote_job_id"]),
-                    job_id,
-                    PRODUCER_CUSTOMER_PREWARM_ZHAOSHANG,
-                    error=error,
-                )
-            except Exception as exc:  # noqa: BLE001 - remote task may already be sent
-                phase_errors.append(
-                    f"redispatch candidate {candidate_id}: binding failed: {type(exc).__name__}: {exc}"
-                )
-                continue
-            if bound:
-                bound_targets.append((candidate_id, str(entry["candidate"]["cache_status"])))
-            else:
-                phase_errors.append(f"redispatch candidate {candidate_id}: binding changed")
-        return bound_targets
+        bindings = [
+            (
+                int(entry["candidate"]["id"]),
+                str(entry["owning_day"]),
+                int(entry["candidate"]["remote_job_id"]),
+            )
+            for entry in entries
+        ]
+        try:
+            bound = prewarm_store.bind_redispatched_remote_job_batch(
+                business_date, bindings, job_id,
+                PRODUCER_CUSTOMER_PREWARM_ZHAOSHANG, error=error,
+            )
+        except Exception as exc:  # noqa: BLE001 - remote task may already be sent
+            phase_errors.append(
+                f"redispatch job {job_id}: batch binding failed: {type(exc).__name__}: {exc}"
+            )
+            return []
+        if not bound:
+            phase_errors.append(f"redispatch job {job_id}: batch binding changed")
+            return []
+        return [
+            (int(entry["candidate"]["id"]), str(entry["candidate"]["cache_status"]))
+            for entry in entries
+        ]
 
     # Pre-send boundary: below the budget floor the intent stays unclaimed so
     # a real adapter never burns it into a fake SUBMIT_UNKNOWN (same as pass).

@@ -1325,6 +1325,7 @@ def _run_leased_pass(
             run_reconcile_phase(
                 store=store,
                 token=token,
+                prewarm_store=prewarm_store,
                 get_adapter=get_adapter,
                 paths=paths,
                 deadline=deadline,
