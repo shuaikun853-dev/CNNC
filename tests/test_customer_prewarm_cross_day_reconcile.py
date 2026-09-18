@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import sqlite3
+from contextlib import contextmanager
 
 import pytest
 
@@ -44,6 +45,7 @@ from tests.test_customer_prewarm_lifecycle import (
     make_state_db,
     run_redispatch,
     seed_remote_candidate,
+    seed_remote_work,
     seed_unknown_job,
 )
 from app.services.shared_crawl_cache import SharedCrawlCache
@@ -350,6 +352,120 @@ def _run_cross_day(runtime_root, prewarm, adapter, **overrides):
         **overrides,
     )
     return summary
+
+
+def test_manual_reconcile_never_makes_historical_candidate_redispatchable(tmp_path):
+    runtime_root = tmp_path / "runtime"
+    prewarm = CustomerPrewarmStore(runtime_root / "customer_prewarm.sqlite3")
+    old_paths, job_id = seed_unknown_job(
+        runtime_root, YESTERDAY, _CountingAdapter(), mapping=COMIX,
+        url="https://qx.com/manual-conflict.html",
+    )
+    candidate_id = seed_remote_candidate(
+        prewarm, "https://qx.com/manual-conflict.html", job_id,
+        business_date=YESTERDAY,
+    )
+    today_paths = make_state_db(runtime_root, TODAY)
+    adapter = _CountingAdapter(
+        reconcile_outcome=LegacyReconcileOutcome(
+            ReconcileStatus.MANUAL,
+            diagnostic="exact task reconciliation returned multiple or malformed matches",
+        )
+    )
+
+    for _ in range(RECONCILE_DEAD_THRESHOLD):
+        _run_cross_day(runtime_root, prewarm, adapter)
+
+    plan = plan_lifecycle_actions(
+        today_paths.state_path, prewarm, TODAY, [COMIX],
+        state_runtime_root=runtime_root,
+    )
+    assert plan["redispatch_groups"] == {}
+    assert _remote_job_row(old_paths.state_path, job_id)["state"] == "MANUAL_REQUIRED"
+    assert candidate_id not in {
+        int(candidate["id"])
+        for group in plan["redispatch_groups"].values()
+        for candidate in group
+    }
+    assert adapter.submit_calls == 0
+
+
+def test_rebind_after_found_commit_blocks_priority_remote_write(tmp_path, monkeypatch):
+    runtime_root = tmp_path / "runtime"
+    prewarm = CustomerPrewarmStore(runtime_root / "customer_prewarm.sqlite3")
+    old_paths, job_id = seed_unknown_job(
+        runtime_root, YESTERDAY, _CountingAdapter(), mapping=COMIX,
+        url="https://qx.com/rebind-before-priority.html",
+    )
+    candidate_id = seed_remote_candidate(
+        prewarm, "https://qx.com/rebind-before-priority.html", job_id,
+        business_date=YESTERDAY,
+    )
+    adapter = _CountingAdapter(reconcile_outcome=RECONCILE_FOUND)
+    original_fence = prewarm.fence_current_remote_job_link
+    fence_calls = 0
+
+    @contextmanager
+    def rebind_after_first_commit(**kwargs):
+        nonlocal fence_calls
+        with original_fence(**kwargs) as owned:
+            yield owned
+        fence_calls += 1
+        if fence_calls == 1:
+            prewarm.record_candidate_result(
+                candidate_id, cache_status="REMOTE_DISPATCHED", remote_job_id=99
+            )
+            prewarm.record_remote_job_link(TODAY, candidate_id, 99, "customer-prewarm-zhaoshang")
+
+    monkeypatch.setattr(prewarm, "fence_current_remote_job_link", rebind_after_first_commit)
+    _run_cross_day(runtime_root, prewarm, adapter)
+
+    assert _remote_job_row(old_paths.state_path, job_id)["state"] == "PRIORITY_PENDING"
+    assert adapter.prioritize_calls == 0
+    assert adapter.submit_calls == 0
+
+
+def test_cli_harvests_historical_submitted_job_from_owning_day(tmp_path, monkeypatch):
+    runtime_root = tmp_path / "runtime"
+    prewarm = CustomerPrewarmStore(runtime_root / "customer_prewarm.sqlite3")
+    SharedCrawlCache(runtime_root / "shared_crawl_cache.sqlite3")
+    today_paths = make_state_db(runtime_root, TODAY)
+    old_paths, job_id = seed_remote_work(
+        runtime_root, YESTERDAY, _CountingAdapter(), mapping=COMIX,
+        url="https://qx.com/historical-harvest-owner.html",
+        job_state="SUBMITTED", remote_identity="comix|old-task|old-number",
+    )
+    seed_remote_candidate(
+        prewarm, "https://qx.com/historical-harvest-owner.html", job_id,
+        business_date=YESTERDAY,
+    )
+    seen = []
+    monkeypatch.setattr(cli, "load_zhaoshang_mall_mappings", lambda _path: [COMIX])
+    monkeypatch.setattr(
+        cli, "run_prewarm_dispatch_pass",
+        lambda *_args, **_kwargs: {"outcome": "OK", "phase_errors": []},
+    )
+    monkeypatch.setattr(cli, "run_cross_day_reconcile_phase", lambda **_kwargs: None)
+    monkeypatch.setattr(
+        cli, "run_cross_day_harvest_phase",
+        lambda **kwargs: seen.append(("historical", kwargs["current_business_date"])),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        cli, "run_harvest_phase",
+        lambda state_path, _lock_path, business_date, **_kwargs: seen.append(
+            ("today", business_date, state_path)
+        ),
+    )
+
+    assert cli.main([
+        "--business-date", TODAY, "--runtime-root", str(runtime_root),
+        "--budget-seconds", "10",
+    ]) == 0
+    assert seen == [
+        ("historical", TODAY),
+        ("today", TODAY, today_paths.state_path),
+    ]
 
 
 def test_found_updates_only_historical_db_once_and_uses_owning_day(tmp_path):
