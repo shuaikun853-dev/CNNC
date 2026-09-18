@@ -767,6 +767,7 @@ def _plan_only_report(
             "cross_day_reconcile_jobs": len(
                 lifecycle_plan["cross_day_reconcile_jobs"]
             ),
+            "cross_day_harvest_jobs": len(lifecycle_plan["cross_day_harvest_jobs"]),
             "redispatch_urls": sum(
                 len(entries) for entries in lifecycle_plan["redispatch_groups"].values()
             ),
@@ -1771,6 +1772,7 @@ def _confirm_pending_priority_job(
     canary_budget: CanaryLiveBudget | None = None,
     result_commit_guard: Callable[[], bool] | None = None,
     result_commit_fence: Callable[[], Any] | None = None,
+    pre_remote_guard: Callable[[], bool] | None = None,
 ) -> bool | None:
     """One prioritize-only confirm for a job still exactly ``PRIORITY_PENDING``
     with a remote identity (fail-closed; never creates or submits).
@@ -1788,6 +1790,9 @@ def _confirm_pending_priority_job(
     write.  Same-day callers leave it unset and keep their existing behavior.
     ``result_commit_fence`` additionally serializes the ownership check through
     the historical state commit when ownership lives in another database.
+    ``pre_remote_guard`` checks cross-day linkage after lease renewal and
+    immediately before the remote priority write. It does not replace the
+    post-call commit fence.
     """
     if note_targets and prewarm_store is None:
         raise ValueError("prewarm_store is required when candidate notes are requested")
@@ -1836,6 +1841,9 @@ def _confirm_pending_priority_job(
             )
             return False
         store.renew_lease(token, LEASE_TTL_SECONDS)
+        if pre_remote_guard is not None and not pre_remote_guard():
+            summary["priority_unconfirmed"] += 1
+            return False
         priority = get_adapter().prioritize(
             prepared,
             task_id=parts[1],

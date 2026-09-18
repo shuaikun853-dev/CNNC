@@ -102,6 +102,7 @@ HARVEST_PER_JOB_TIMEOUT_SECONDS = 90.0
 # Job states that make a candidate's binding dead for redispatch planning.
 # ``SUBMIT_UNKNOWN`` is dead only once its recovery attempts hit the threshold.
 _DEAD_JOB_STATES = frozenset({"MANUAL_REQUIRED", "TERMINAL_FAILED"})
+_RECONCILE_MANUAL_BLOCKER = "prewarm reconcile identity conflict: "
 
 _ZHPQ_SKU_PREFIX = "zhpq-"
 
@@ -179,11 +180,28 @@ def _read_job_row_readonly(state_db_path: str | Path, job_id: int) -> dict[str, 
 
 def _job_is_dead(job_row: Mapping[str, Any], dead_threshold: int) -> bool:
     state = str(job_row.get("state") or "")
+    if state == "MANUAL_REQUIRED":
+        if str(job_row.get("error_text") or "").startswith(_RECONCILE_MANUAL_BLOCKER):
+            return False
+        if int(job_row.get("post_attempted") or 0) and not str(
+            job_row.get("remote_identity") or ""
+        ).strip():
+            return False
     if state in _DEAD_JOB_STATES:
         return True
     if state == "SUBMIT_UNKNOWN":
         return int(job_row.get("recovery_attempts") or 0) >= dead_threshold
     return False
+
+
+def _mark_reconcile_manual(
+    store: DailyAuditStore, token: LeaseToken, job_id: int, diagnostic: str
+) -> None:
+    store.mark_remote_manual(
+        token,
+        job_id,
+        _RECONCILE_MANUAL_BLOCKER + (diagnostic.strip() or "remote identity cannot be proven"),
+    )
 
 
 def _owning_day_job(
@@ -216,11 +234,37 @@ def _owning_day_job(
     return owning_day, job_reader(int(job_id), owning_day)
 
 
+def _has_successful_crawl_for_url_readonly(
+    state_path: Path, job_id: int, exact_url: str
+) -> bool:
+    connection = _open_state_db_readonly(state_path)
+    if connection is None:
+        return False
+    try:
+        rows = connection.execute(
+            """SELECT result_json FROM crawl_work
+               WHERE remote_job_id=? AND exact_url=? AND state='SUCCESS'
+                 AND sku_id LIKE 'zhpq-%' AND result_json IS NOT NULL""",
+            (job_id, exact_url),
+        ).fetchall()
+    finally:
+        connection.close()
+    for row in rows:
+        try:
+            result = json.loads(str(row["result_json"]))
+        except (TypeError, ValueError):
+            continue
+        if isinstance(result, Mapping) and result.get("page_price_status") == "OK":
+            return True
+    return False
+
+
 def _collect_redispatch_candidates(
     prewarm_store: CustomerPrewarmStore,
     mappings: Sequence[ZhaoshangMallMapping],
     *,
     business_date: str,
+    state_runtime_root: Path,
     job_reader: Callable[[int, str], dict[str, Any] | None],
     dead_threshold: int,
     daily_cap: int,
@@ -241,13 +285,19 @@ def _collect_redispatch_candidates(
             raw_job_id = candidate.get("remote_job_id")
             if raw_job_id is None:
                 continue
-            _owning_day, job_row = _owning_day_job(
+            owning_day, job_row = _owning_day_job(
                 prewarm_store, candidate_id, int(raw_job_id), business_date, job_reader, phase_errors
             )
             if job_row is None:
                 continue
             if not _job_is_dead(job_row, dead_threshold):
                 continue
+            if _has_successful_crawl_for_url_readonly(
+                runtime_paths(owning_day, state_runtime_root).state_path,
+                int(raw_job_id),
+                str(candidate.get("lookup_url") or candidate.get("original_url") or ""),
+            ):
+                continue  # cache mirror/absorb owns an already successful URL
             mall = _candidate_mall(candidate, mappings)
             if not any(m.mall_key == mall for m in mappings):
                 blocked.append({"candidate_id": candidate_id, "reason": "mall_mapping_missing"})
@@ -317,6 +367,7 @@ def plan_lifecycle_actions(
         prewarm_store,
         mappings,
         business_date=business_date,
+        state_runtime_root=state_root,
         job_reader=job_reader,
         dead_threshold=reconcile_dead_threshold,
         daily_cap=redispatch_daily_cap,
@@ -336,10 +387,20 @@ def plan_lifecycle_actions(
         state_runtime_root=state_root,
         dead_threshold=reconcile_dead_threshold,
     )
+    from app.services.customer_prewarm_cross_day_reconcile import (
+        plan_cross_day_harvest_jobs,
+    )
+
+    cross_day_harvest_jobs = plan_cross_day_harvest_jobs(
+        prewarm_store,
+        current_business_date=business_date,
+        state_runtime_root=state_root,
+    )
     return {
         "harvest_job_ids": harvest_job_ids,
         "reconcile_jobs": reconcile_jobs,
         "cross_day_reconcile_jobs": cross_day_reconcile_jobs,
+        "cross_day_harvest_jobs": cross_day_harvest_jobs,
         "redispatch_groups": redispatch_groups,
         "redispatch_blocked": collected["blocked"],
     }
@@ -559,13 +620,18 @@ def run_reconcile_phase(
                 prepared, timeout_seconds=max(0.001, deadline - monotonic_value())
             )
             status = _status_value(outcome.status)
-            if status == "FOUND":
+            if status == "MANUAL":
+                _mark_reconcile_manual(
+                    store, token, job_id, str(getattr(outcome, "diagnostic", "") or "")
+                )
+                phase_errors.append(f"reconcile job {job_id}: manual identity conflict; no auto redispatch")
+            elif status == "FOUND":
                 task_id = getattr(outcome, "task_id", None)
                 task_number = getattr(outcome, "task_number", None)
                 if not task_id or not task_number:
-                    # Fail closed: incomplete identity evidence counts as a
-                    # failed attempt, never as a silent success.
-                    raise ValueError("reconcile returned an incomplete identity")
+                    _mark_reconcile_manual(store, token, job_id, "incomplete FOUND identity")
+                    phase_errors.append(f"reconcile job {job_id}: incomplete FOUND identity; no auto redispatch")
+                    continue
                 mall_key = str(job_row.get("mall_key") or prepared.mall_key)
                 remote_identity = f"{mall_key}|{task_id}|{task_number}"
                 store.reconcile_remote_job(
@@ -589,7 +655,7 @@ def run_reconcile_phase(
                     summary=summary,
                     prepared=prepared,
                 )
-            else:
+            elif status == "NOT_FOUND" and not str(getattr(outcome, "diagnostic", "") or "").strip():
                 new_attempts = store.bump_remote_job_recovery_attempt(token, job_id)
                 summary["reconcile_not_found"] += 1
                 if new_attempts >= dead_threshold:
@@ -597,6 +663,10 @@ def run_reconcile_phase(
                         f"reconcile job {job_id}: judged dead after {new_attempts} "
                         "attempts; redispatch owns it"
                     )
+            else:
+                phase_errors.append(
+                    f"reconcile job {job_id}: inconclusive remote lookup; deferred"
+                )
         except Exception as exc:  # noqa: BLE001 - per-job isolation
             phase_errors.append(f"reconcile job {job_id}: {type(exc).__name__}: {exc}")
 
@@ -644,6 +714,7 @@ def run_redispatch_phase(
         prewarm_store,
         mappings,
         business_date=business_date,
+        state_runtime_root=state_runtime_root,
         job_reader=job_reader,
         dead_threshold=dead_threshold,
         daily_cap=daily_cap,

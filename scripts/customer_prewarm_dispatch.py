@@ -113,6 +113,15 @@ def run_cross_day_reconcile_phase(**kwargs):
     return _run_cross_day_reconcile_phase(**kwargs)
 
 
+def run_cross_day_harvest_phase(**kwargs):
+    """Lazy bridge for the separate historical harvest/cache phase."""
+    from app.services.customer_prewarm_cross_day_reconcile import (
+        run_cross_day_harvest_phase as _run_cross_day_harvest_phase,
+    )
+
+    return _run_cross_day_harvest_phase(**kwargs)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Issue #10 customer prewarm dispatch: one bounded pass over "
@@ -599,6 +608,16 @@ def _run_dispatch(args: argparse.Namespace, business_date: str, runtime_root: Pa
                     monotonic_value=time.monotonic,
                     summary=summary,
                 )
+                run_cross_day_harvest_phase(
+                    prewarm_store=prewarm_store,
+                    shared_cache=shared_cache,
+                    current_business_date=business_date,
+                    state_runtime_root=state_root,
+                    get_adapter=lambda: adapter,
+                    deadline=lifecycle_deadline,
+                    monotonic_value=time.monotonic,
+                    summary=summary,
+                )
                 run_harvest_phase(
                     day_paths.state_path,
                     day_paths.lock_path,
@@ -648,7 +667,9 @@ def _run_dispatch(args: argparse.Namespace, business_date: str, runtime_root: Pa
         f"cross_day_not_found={summary.get('cross_day_reconcile_not_found', 0)} "
         f"cross_day_lock_busy={summary.get('cross_day_reconcile_lock_busy', 0)} "
         f"redispatched={summary.get('redispatched_urls', 0)} "
-        f"harvested={summary.get('harvested', 0)}"
+        f"harvested={summary.get('harvested', 0)} "
+        f"cross_day_harvested={summary.get('cross_day_harvested', 0)} "
+        f"cross_day_cache_synced={summary.get('cross_day_harvest_cache_synced', 0)}"
     )
     if summary.get("lifecycle_planned"):
         planned = summary["lifecycle_planned"]
@@ -656,6 +677,7 @@ def _run_dispatch(args: argparse.Namespace, business_date: str, runtime_root: Pa
             f"lifecycle_planned harvest_jobs={planned.get('harvest_jobs', 0)} "
             f"reconcile_jobs={planned.get('reconcile_jobs', 0)} "
             f"cross_day_reconcile_jobs={planned.get('cross_day_reconcile_jobs', 0)} "
+            f"cross_day_harvest_jobs={planned.get('cross_day_harvest_jobs', 0)} "
             f"redispatch_urls={planned.get('redispatch_urls', 0)} "
             f"redispatch_blocked={planned.get('redispatch_blocked', 0)}"
         )

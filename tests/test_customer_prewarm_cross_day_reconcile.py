@@ -7,6 +7,7 @@ test creates or contacts a real Zhaoshang task.
 from __future__ import annotations
 
 import hashlib
+import json
 import sqlite3
 from contextlib import contextmanager
 
@@ -14,20 +15,25 @@ import pytest
 
 from app.services import customer_prewarm_dispatch as dispatch_service
 from app.services import customer_prewarm_cross_day_reconcile as cross_day
+from app.services import customer_prewarm_lifecycle as lifecycle
 from app.services.customer_prewarm_cross_day_reconcile import (
+    CROSS_DAY_HARVEST_PER_PASS,
     CROSS_DAY_RECONCILE_PER_JOB_TIMEOUT_SECONDS,
     CROSS_DAY_RECONCILE_PER_PASS,
     plan_cross_day_reconcile_jobs,
+    plan_cross_day_harvest_jobs,
     run_cross_day_reconcile_phase,
+    run_cross_day_harvest_phase,
 )
 from app.services.customer_prewarm_lifecycle import (
     RECONCILE_DEAD_THRESHOLD,
     plan_lifecycle_actions,
 )
 from app.services.customer_prewarm_dispatch import run_prewarm_dispatch_pass
-from app.services.customer_prewarm_store import CustomerPrewarmStore
+from app.services.customer_prewarm_store import CACHE_STATUS_CACHE_HIT, CustomerPrewarmStore
 from app.services.daily_audit_store import ProcessLock
 from app.services.legacy_zhaoshang_adapter import (
+    CnncLegacyZhaoshangAdapter,
     LegacyReconcileOutcome,
     ReconcileStatus,
 )
@@ -390,6 +396,82 @@ def test_manual_reconcile_never_makes_historical_candidate_redispatchable(tmp_pa
     assert adapter.submit_calls == 0
 
 
+@pytest.mark.parametrize(
+    "reason",
+    [
+        "multiple", "mall", "task_name", "subtask_count",
+        "incomplete_identity", "evidence_conflict", "not_enabled",
+    ],
+)
+def test_real_adapter_provenance_conflicts_are_manual(tmp_path, reason):
+    seed_adapter = _CountingAdapter()
+    seed_unknown_job(
+        tmp_path / "runtime", YESTERDAY, seed_adapter, mapping=COMIX,
+        url=f"https://qx.com/adapter-manual-{reason}.html",
+    )
+    prepared = seed_adapter.prepared_log[-1]
+    remote = {
+        "taskId": "id-1", "taskNumber": "number-1",
+        "taskName": prepared.task_name, "mallLogo": "comix",
+        "expectedSubtaskCount": 1, "state": "1",
+    }
+    if reason == "multiple":
+        remote = [remote, dict(remote)]
+    elif reason == "mall":
+        remote["mallLogo"] = "other-mall"
+    elif reason == "task_name":
+        remote["taskName"] = "different-task"
+    elif reason == "subtask_count":
+        remote["expectedSubtaskCount"] = 2
+    elif reason == "incomplete_identity":
+        remote["taskNumber"] = ""
+    elif reason == "not_enabled":
+        remote["state"] = "0"
+    else:
+        for action in ("CREATED", "ENABLED"):
+            event = {
+                "action": action, "mall": "comix", "task_name": prepared.task_name,
+                "task_id": "other-id", "task_number": "other-number",
+                "expected_subtask_count": 1,
+            }
+            with prepared.batch_state_path.open("a", encoding="utf-8") as stream:
+                stream.write(f"- `{json.dumps(event)}`\n")
+    adapter = CnncLegacyZhaoshangAdapter(
+        mappings=[COMIX], reconciler=lambda *_args: remote
+    )
+
+    outcome = adapter.reconcile_unknown(prepared, timeout_seconds=12)
+
+    assert outcome.status is ReconcileStatus.MANUAL
+
+
+def test_inconclusive_historical_not_found_cannot_age_into_redispatch(tmp_path):
+    runtime_root = tmp_path / "runtime"
+    prewarm = CustomerPrewarmStore(runtime_root / "customer_prewarm.sqlite3")
+    old_paths, job_id = seed_unknown_job(
+        runtime_root, YESTERDAY, _CountingAdapter(), mapping=COMIX,
+        url="https://qx.com/old-lookup-inconclusive.html",
+    )
+    seed_remote_candidate(
+        prewarm, "https://qx.com/old-lookup-inconclusive.html", job_id,
+        business_date=YESTERDAY,
+    )
+    adapter = _CountingAdapter(
+        reconcile_outcome=LegacyReconcileOutcome(
+            ReconcileStatus.NOT_FOUND,
+            diagnostic="exact task reconciliation is not yet conclusive",
+        )
+    )
+
+    for _ in range(RECONCILE_DEAD_THRESHOLD):
+        _run_cross_day(runtime_root, prewarm, adapter)
+
+    job = _remote_job_row(old_paths.state_path, job_id)
+    assert job["state"] == "SUBMIT_UNKNOWN"
+    assert job["recovery_attempts"] == 0
+    assert adapter.submit_calls == 0
+
+
 def test_rebind_after_found_commit_blocks_priority_remote_write(tmp_path, monkeypatch):
     runtime_root = tmp_path / "runtime"
     prewarm = CustomerPrewarmStore(runtime_root / "customer_prewarm.sqlite3")
@@ -466,6 +548,261 @@ def test_cli_harvests_historical_submitted_job_from_owning_day(tmp_path, monkeyp
         ("historical", TODAY),
         ("today", TODAY, today_paths.state_path),
     ]
+
+
+def test_historical_harvest_success_mirrors_cache_then_candidate_absorbs(tmp_path, monkeypatch):
+    runtime_root = tmp_path / "runtime"
+    prewarm = CustomerPrewarmStore(runtime_root / "customer_prewarm.sqlite3")
+    cache = SharedCrawlCache(runtime_root / "shared_crawl_cache.sqlite3")
+    make_state_db(runtime_root, TODAY)
+    url = "https://qx.com/historical-complete-cache.html"
+    old_paths, job_id = seed_remote_work(
+        runtime_root, YESTERDAY, _CountingAdapter(), mapping=COMIX,
+        url=url, job_state="SUBMITTED", remote_identity="comix|old-task|old-number",
+    )
+    candidate_id = seed_remote_candidate(prewarm, url, job_id, business_date=YESTERDAY)
+    harvest_calls = []
+
+    def fake_primitive(**kwargs):
+        harvest_calls.append((kwargs["business_date"], kwargs["remote_job_id"]))
+        assert kwargs["state_path"] == old_paths.state_path
+        with sqlite3.connect(old_paths.state_path) as connection:
+            connection.execute(
+                "UPDATE remote_jobs SET state='COMPLETED' WHERE id=?", (job_id,)
+            )
+            connection.execute(
+                "UPDATE crawl_work SET state='SUCCESS', result_json=? WHERE remote_job_id=?",
+                (json.dumps({"page_price_status": "OK", "page_price_value": "19.50"}), job_id),
+            )
+        return {"outcome": "REMOTE_EXISTING_HARVEST_COMPLETED", "create_calls": 0}
+
+    monkeypatch.setattr(lifecycle, "harvest_existing_customer_prewarm_job", fake_primitive)
+    monkeypatch.setattr(cli, "load_zhaoshang_mall_mappings", lambda _path: [COMIX])
+    monkeypatch.setattr(
+        cli, "run_prewarm_dispatch_pass",
+        lambda *_args, **_kwargs: {"outcome": "OK", "phase_errors": []},
+    )
+    monkeypatch.setattr(cli, "run_cross_day_reconcile_phase", lambda **_kwargs: None)
+
+    assert cli.main([
+        "--business-date", TODAY, "--runtime-root", str(runtime_root),
+        "--budget-seconds", "30",
+    ]) == 0
+    assert harvest_calls == [(YESTERDAY, job_id)]
+    assert _remote_job_row(old_paths.state_path, job_id)["state"] == "COMPLETED"
+    assert cache.lookup_current("comix", url) is not None
+
+    summary = run_prewarm_dispatch_pass(
+        prewarm, cache, business_date=TODAY, runtime_root=runtime_root,
+        mappings=[COMIX], adapter=_CountingAdapter(),
+    )
+    assert summary["absorbed"] == 1
+    assert prewarm.candidate_by_id(candidate_id)["cache_status"] == CACHE_STATUS_CACHE_HIT
+
+
+@pytest.mark.parametrize("terminal_state", ["COMPLETED", "MANUAL_REQUIRED"])
+def test_historical_terminal_success_retries_cache_mirror_without_remote_call(
+    tmp_path, terminal_state
+):
+    runtime_root = tmp_path / "runtime"
+    prewarm = CustomerPrewarmStore(runtime_root / "customer_prewarm.sqlite3")
+    cache = SharedCrawlCache(runtime_root / "shared_crawl_cache.sqlite3")
+    url = f"https://qx.com/terminal-sync-{terminal_state}.html"
+    old_paths, job_id = seed_remote_work(
+        runtime_root, YESTERDAY, _CountingAdapter(), mapping=COMIX,
+        url=url, job_state="SUBMITTED", remote_identity="comix|old|number",
+    )
+    seed_remote_candidate(prewarm, url, job_id, business_date=YESTERDAY)
+    with sqlite3.connect(old_paths.state_path) as connection:
+        connection.execute(
+            "UPDATE remote_jobs SET state=? WHERE id=?", (terminal_state, job_id)
+        )
+        connection.execute(
+            "UPDATE crawl_work SET state='SUCCESS', result_json=? WHERE remote_job_id=?",
+            (json.dumps({"page_price_status": "OK", "page_price_value": "21"}), job_id),
+        )
+
+    summary = _new_summary()
+    run_cross_day_harvest_phase(
+        prewarm_store=prewarm, shared_cache=cache,
+        current_business_date=TODAY, state_runtime_root=runtime_root,
+        get_adapter=lambda: (_ for _ in ()).throw(AssertionError("remote adapter used")),
+        deadline=1000.0, monotonic_value=lambda: 1.0, summary=summary,
+    )
+
+    assert summary["cross_day_harvest_cache_synced"] == 1
+    assert cache.lookup_current("comix", url) is not None
+
+
+def test_partial_historical_manual_success_cannot_create_before_cache_mirror(tmp_path):
+    runtime_root = tmp_path / "runtime"
+    prewarm = CustomerPrewarmStore(runtime_root / "customer_prewarm.sqlite3")
+    today_paths = make_state_db(runtime_root, TODAY)
+    url = "https://qx.com/partial-old-success.html"
+    old_paths, job_id = seed_remote_work(
+        runtime_root, YESTERDAY, _CountingAdapter(), mapping=COMIX,
+        url=url, job_state="SUBMITTED", remote_identity="comix|old|number",
+    )
+    seed_remote_candidate(prewarm, url, job_id, business_date=YESTERDAY)
+    with sqlite3.connect(old_paths.state_path) as connection:
+        connection.execute(
+            "UPDATE remote_jobs SET state='MANUAL_REQUIRED' WHERE id=?", (job_id,)
+        )
+        connection.execute(
+            "UPDATE crawl_work SET state='SUCCESS', result_json=? WHERE remote_job_id=?",
+            (json.dumps({"page_price_status": "OK", "page_price_value": "21"}), job_id),
+        )
+
+    plan = plan_lifecycle_actions(
+        today_paths.state_path, prewarm, TODAY, [COMIX],
+        state_runtime_root=runtime_root,
+    )
+
+    assert plan["cross_day_harvest_jobs"] == [(YESTERDAY, job_id)]
+    assert plan["redispatch_groups"] == {}
+
+
+def test_historical_harvest_cursor_reaches_later_running_job(tmp_path, monkeypatch):
+    runtime_root = tmp_path / "runtime"
+    prewarm = CustomerPrewarmStore(runtime_root / "customer_prewarm.sqlite3")
+    cache = SharedCrawlCache(runtime_root / "shared_crawl_cache.sqlite3")
+    job_ids = []
+    for index in range(CROSS_DAY_HARVEST_PER_PASS + 1):
+        url = f"https://qx.com/old-running-{index}.html"
+        _paths, job_id = seed_remote_work(
+            runtime_root, YESTERDAY, _CountingAdapter(), mapping=COMIX,
+            url=url, job_state="RUNNING",
+            remote_identity=f"comix|task-{index}|number-{index}",
+        )
+        seed_remote_candidate(
+            prewarm, url, job_id, business_date=YESTERDAY,
+            document=f"RUNNING-{index}",
+        )
+        job_ids.append(job_id)
+    calls = []
+    monkeypatch.setattr(
+        lifecycle, "harvest_existing_customer_prewarm_job",
+        lambda **kwargs: calls.append(kwargs["remote_job_id"])
+        or {"outcome": "REMOTE_EXISTING_HARVEST_RUNNING", "create_calls": 0},
+    )
+    for _ in range(2):
+        run_cross_day_harvest_phase(
+            prewarm_store=prewarm, shared_cache=cache,
+            current_business_date=TODAY, state_runtime_root=runtime_root,
+            get_adapter=lambda: _CountingAdapter(), deadline=1000.0,
+            monotonic_value=lambda: 1.0, summary=_new_summary(),
+        )
+
+    assert calls[:CROSS_DAY_HARVEST_PER_PASS] == job_ids[:CROSS_DAY_HARVEST_PER_PASS]
+    assert job_ids[-1] in calls[CROSS_DAY_HARVEST_PER_PASS:]
+
+
+def test_historical_harvest_dedupes_by_day_and_job_not_bare_id(tmp_path, monkeypatch):
+    runtime_root = tmp_path / "runtime"
+    prewarm = CustomerPrewarmStore(runtime_root / "customer_prewarm.sqlite3")
+    cache = SharedCrawlCache(runtime_root / "shared_crawl_cache.sqlite3")
+    days = ("2026-09-14", YESTERDAY)
+    expected = []
+    for day in days:
+        url = f"https://qx.com/colliding-job-{day}.html"
+        _paths, job_id = seed_remote_work(
+            runtime_root, day, _CountingAdapter(), mapping=COMIX,
+            url=url, job_state="RUNNING",
+            remote_identity=f"comix|task-{day}|number-{day}",
+        )
+        seed_remote_candidate(prewarm, url, job_id, business_date=day, document=day)
+        expected.append((day, job_id))
+    calls = []
+    monkeypatch.setattr(
+        lifecycle, "harvest_existing_customer_prewarm_job",
+        lambda **kwargs: calls.append((kwargs["business_date"], kwargs["remote_job_id"]))
+        or {"outcome": "REMOTE_EXISTING_HARVEST_RUNNING", "create_calls": 0},
+    )
+
+    assert expected[0][1] == expected[1][1]
+    assert plan_cross_day_harvest_jobs(
+        prewarm, current_business_date=TODAY, state_runtime_root=runtime_root
+    ) == expected
+    run_cross_day_harvest_phase(
+        prewarm_store=prewarm, shared_cache=cache,
+        current_business_date=TODAY, state_runtime_root=runtime_root,
+        get_adapter=lambda: _CountingAdapter(), deadline=1000.0,
+        monotonic_value=lambda: 1.0, summary=_new_summary(),
+    )
+    assert calls == expected
+
+
+def test_historical_harvest_lock_busy_and_missing_db_have_zero_remote_calls(tmp_path):
+    runtime_root = tmp_path / "runtime"
+    prewarm = CustomerPrewarmStore(runtime_root / "customer_prewarm.sqlite3")
+    cache = SharedCrawlCache(runtime_root / "shared_crawl_cache.sqlite3")
+    old_paths, job_id = seed_remote_work(
+        runtime_root, YESTERDAY, _CountingAdapter(), mapping=COMIX,
+        url="https://qx.com/old-harvest-lock.html", job_state="SUBMITTED",
+        remote_identity="comix|old-lock|old-number",
+    )
+    seed_remote_candidate(
+        prewarm, "https://qx.com/old-harvest-lock.html", job_id,
+        business_date=YESTERDAY,
+    )
+    missing_day = "2026-09-14"
+    seed_remote_candidate(
+        prewarm, "https://qx.com/old-harvest-missing.html", 404,
+        business_date=missing_day, document="MISSING",
+    )
+    adapter = _CountingAdapter()
+    held = ProcessLock(old_paths.lock_path)
+    held.acquire(owner={"test": "held"})
+    try:
+        summary = _new_summary()
+        run_cross_day_harvest_phase(
+            prewarm_store=prewarm, shared_cache=cache,
+            current_business_date=TODAY, state_runtime_root=runtime_root,
+            get_adapter=lambda: adapter, deadline=1000.0,
+            monotonic_value=lambda: 1.0, summary=summary,
+        )
+    finally:
+        held.release()
+
+    assert summary["cross_day_harvest_lock_busy"] == 1
+    assert adapter.submit_calls == adapter.prioritize_calls == 0
+    assert _remote_job_row(old_paths.state_path, job_id)["state"] == "SUBMITTED"
+    assert not (runtime_root / missing_day / "state.sqlite3").exists()
+
+
+def test_historical_harvest_discards_rebound_link_before_remote_call(tmp_path, monkeypatch):
+    runtime_root = tmp_path / "runtime"
+    prewarm = CustomerPrewarmStore(runtime_root / "customer_prewarm.sqlite3")
+    cache = SharedCrawlCache(runtime_root / "shared_crawl_cache.sqlite3")
+    url = "https://qx.com/harvest-rebound.html"
+    _paths, job_id = seed_remote_work(
+        runtime_root, YESTERDAY, _CountingAdapter(), mapping=COMIX,
+        url=url, job_state="SUBMITTED", remote_identity="comix|old|number",
+    )
+    candidate_id = seed_remote_candidate(prewarm, url, job_id, business_date=YESTERDAY)
+    original_plan = cross_day.plan_cross_day_harvest_jobs
+    calls = []
+
+    def rebind_after_plan(*args, **kwargs):
+        planned = original_plan(*args, **kwargs)
+        prewarm.record_candidate_result(
+            candidate_id, cache_status="REMOTE_DISPATCHED", remote_job_id=99
+        )
+        prewarm.record_remote_job_link(TODAY, candidate_id, 99, "customer-prewarm-zhaoshang")
+        return planned
+
+    monkeypatch.setattr(cross_day, "plan_cross_day_harvest_jobs", rebind_after_plan)
+    monkeypatch.setattr(
+        lifecycle, "harvest_existing_customer_prewarm_job",
+        lambda **_kwargs: calls.append(1),
+    )
+    run_cross_day_harvest_phase(
+        prewarm_store=prewarm, shared_cache=cache,
+        current_business_date=TODAY, state_runtime_root=runtime_root,
+        get_adapter=lambda: _CountingAdapter(), deadline=1000.0,
+        monotonic_value=lambda: 1.0, summary=_new_summary(),
+    )
+    assert calls == []
 
 
 def test_found_updates_only_historical_db_once_and_uses_owning_day(tmp_path):
@@ -812,8 +1149,8 @@ def test_not_found_bumps_historical_attempt_once(tmp_path):
     assert _remote_job_row(old_paths.state_path, job_id)["recovery_attempts"] == 3
 
 
-def test_incomplete_found_identity_counts_as_failed_reconcile_attempt(tmp_path):
-    """An incomplete FOUND must not leave the historical job permanently live."""
+def test_incomplete_found_identity_blocks_auto_redispatch(tmp_path):
+    """A partially found remote identity never proves replacement is safe."""
     runtime_root = tmp_path / "runtime"
     prewarm = CustomerPrewarmStore(runtime_root / "customer_prewarm.sqlite3")
     old_paths, job_id = seed_unknown_job(
@@ -839,8 +1176,15 @@ def test_incomplete_found_identity_counts_as_failed_reconcile_attempt(tmp_path):
         _CountingAdapter(reconcile_outcome=incomplete),
     )
 
-    assert summary["cross_day_reconcile_not_found"] == 1
-    assert _remote_job_row(old_paths.state_path, job_id)["recovery_attempts"] == 1
+    assert summary["cross_day_reconcile_not_found"] == 0
+    job = _remote_job_row(old_paths.state_path, job_id)
+    assert job["state"] == "MANUAL_REQUIRED"
+    assert job["recovery_attempts"] == 0
+    today_paths = make_state_db(runtime_root, TODAY)
+    assert plan_lifecycle_actions(
+        today_paths.state_path, prewarm, TODAY, [COMIX],
+        state_runtime_root=runtime_root,
+    )["redispatch_groups"] == {}
 
 
 def test_fourth_not_found_makes_existing_redispatch_planner_own_candidate(tmp_path):
@@ -1569,6 +1913,7 @@ def test_plan_only_reports_cross_day_jobs_with_zero_write_lock_adapter_or_remote
     cache_path = runtime_root / "shared_crawl_cache.sqlite3"
     prewarm = CustomerPrewarmStore(prewarm_path)
     cache = SharedCrawlCache(cache_path)
+    today_paths = make_state_db(runtime_root, TODAY)
     old_paths, job_id = seed_unknown_job(
         runtime_root,
         YESTERDAY,
@@ -1582,13 +1927,22 @@ def test_plan_only_reports_cross_day_jobs_with_zero_write_lock_adapter_or_remote
         job_id,
         business_date=YESTERDAY,
     )
+    _historical_paths, harvest_job_id = seed_remote_work(
+        runtime_root, YESTERDAY, _CountingAdapter(), mapping=COMIX,
+        url="https://qx.com/plan-only-old-harvest.html",
+        job_state="SUBMITTED", remote_identity="comix|old-harvest|number",
+    )
+    seed_remote_candidate(
+        prewarm, "https://qx.com/plan-only-old-harvest.html", harvest_job_id,
+        business_date=YESTERDAY, document="PLAN-HARVEST",
+    )
 
     def digest(path):
         return hashlib.sha256(path.read_bytes()).hexdigest()
 
     hashes = {
         path: digest(path)
-        for path in (prewarm_path, cache_path, old_paths.state_path)
+        for path in (prewarm_path, cache_path, old_paths.state_path, today_paths.state_path)
     }
 
     class NoLock:
@@ -1603,8 +1957,8 @@ def test_plan_only_reports_cross_day_jobs_with_zero_write_lock_adapter_or_remote
     monkeypatch.setattr(dispatch_service, "CnncLegacyZhaoshangAdapter", NoAdapter)
 
     summary = run_prewarm_dispatch_pass(
-        prewarm,
-        cache,
+        CustomerPrewarmStore.open_read_only(prewarm_path),
+        SharedCrawlCache.open_read_only(cache_path),
         business_date=TODAY,
         runtime_root=runtime_root,
         mappings=[COMIX],
@@ -1612,6 +1966,7 @@ def test_plan_only_reports_cross_day_jobs_with_zero_write_lock_adapter_or_remote
     )
 
     assert summary["lifecycle_planned"]["cross_day_reconcile_jobs"] == 1
+    assert summary["lifecycle_planned"]["cross_day_harvest_jobs"] == 1
     assert all(digest(path) == before for path, before in hashes.items())
     assert not (runtime_root / TODAY / "incremental_audit.lock").exists()
 
@@ -1642,8 +1997,14 @@ def test_cli_runs_cross_day_after_today_locks_release_before_harvest_with_shared
         order.append("harvest")
         observed["harvest_deadline"] = kwargs["deadline"]
 
+    def fake_historical_harvest(**kwargs):
+        order.append("historical-harvest")
+        observed["historical_deadline"] = kwargs["deadline"]
+        assert not ProcessLock.inspect(runtime_root / TODAY / "incremental_audit.lock")["active"]
+
     monkeypatch.setattr(cli, "run_prewarm_dispatch_pass", fake_pass)
     monkeypatch.setattr(cli, "run_cross_day_reconcile_phase", fake_cross_day)
+    monkeypatch.setattr(cli, "run_cross_day_harvest_phase", fake_historical_harvest)
     monkeypatch.setattr(cli, "run_harvest_phase", fake_harvest)
     monkeypatch.setattr(cli, "load_zhaoshang_mall_mappings", lambda _path: [COMIX])
 
@@ -1659,8 +2020,8 @@ def test_cli_runs_cross_day_after_today_locks_release_before_harvest_with_shared
     )
 
     assert exit_code == 0
-    assert order == ["pass", "cross-day", "harvest"]
-    assert observed["cross_deadline"] == observed["harvest_deadline"]
+    assert order == ["pass", "cross-day", "historical-harvest", "harvest"]
+    assert observed["cross_deadline"] == observed["historical_deadline"] == observed["harvest_deadline"]
 
 
 def test_cli_no_lifecycle_skips_cross_day_phase(tmp_path, monkeypatch):
@@ -1675,6 +2036,11 @@ def test_cli_no_lifecycle_skips_cross_day_phase(tmp_path, monkeypatch):
         cli,
         "run_cross_day_reconcile_phase",
         lambda **_kwargs: calls.append("cross-day"),
+    )
+    monkeypatch.setattr(
+        cli,
+        "run_cross_day_harvest_phase",
+        lambda **_kwargs: calls.append("historical-harvest"),
     )
 
     assert cli.main(

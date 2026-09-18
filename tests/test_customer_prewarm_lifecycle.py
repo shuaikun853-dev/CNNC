@@ -419,7 +419,8 @@ def test_plan_classifies_harvest_reconcile_and_redispatch(tmp_path):
     assert set(plan) == {
         "harvest_job_ids",
         "reconcile_jobs",
-        "cross_day_reconcile_jobs",
+            "cross_day_reconcile_jobs",
+            "cross_day_harvest_jobs",
         "redispatch_groups",
         "redispatch_blocked",
     }
@@ -522,6 +523,76 @@ def test_reconcile_not_found_bumps_attempts_until_dead(tmp_path):
     ), dead_summary["phase_errors"]
     plan = plan_lifecycle_actions(paths.state_path, prewarm, TODAY, [COMIX])
     assert plan["reconcile_jobs"] == []
+
+
+def test_today_manual_reconcile_blocks_existing_redispatch_owner(tmp_path):
+    runtime_root = tmp_path / "runtime"
+    paths, job_id = seed_unknown_job(
+        runtime_root, TODAY, _CountingAdapter(), mapping=COMIX,
+        url="https://qx.com/today-manual-conflict.html",
+    )
+    prewarm = CustomerPrewarmStore(runtime_root / "customer_prewarm.sqlite3")
+    seed_remote_candidate(
+        prewarm, "https://qx.com/today-manual-conflict.html", job_id
+    )
+    adapter = _CountingAdapter(
+        reconcile_outcome=LegacyReconcileOutcome(
+            ReconcileStatus.MANUAL, diagnostic="submission evidence conflicts with exact remote identity"
+        )
+    )
+
+    run_reconcile(paths, adapter)
+    run_reconcile(paths, adapter)
+
+    job = _remote_job_row(paths.state_path, job_id)
+    assert job["state"] == "MANUAL_REQUIRED"
+    assert job["recovery_attempts"] == 0
+    assert adapter.reconcile_calls == 1
+    assert plan_lifecycle_actions(paths.state_path, prewarm, TODAY, [COMIX])[
+        "redispatch_groups"
+    ] == {}
+    assert adapter.submit_calls == 0
+
+
+def test_identityless_post_attempt_manual_job_cannot_auto_redispatch(tmp_path):
+    runtime_root = tmp_path / "runtime"
+    paths, job_id = seed_unknown_job(
+        runtime_root, TODAY, _CountingAdapter(), mapping=COMIX,
+        url="https://qx.com/tick-manual-unknown.html",
+    )
+    prewarm = CustomerPrewarmStore(runtime_root / "customer_prewarm.sqlite3")
+    seed_remote_candidate(prewarm, "https://qx.com/tick-manual-unknown.html", job_id)
+    with leased(paths, TODAY) as (store, token):
+        store.mark_remote_manual(token, job_id, "ambiguous submit evidence")
+
+    job = _remote_job_row(paths.state_path, job_id)
+    assert job["post_attempted"] == 1
+    assert not job["remote_identity"]
+    assert plan_lifecycle_actions(paths.state_path, prewarm, TODAY, [COMIX])[
+        "redispatch_groups"
+    ] == {}
+
+
+def test_inconclusive_not_found_does_not_spend_absence_attempts(tmp_path):
+    runtime_root = tmp_path / "runtime"
+    paths, job_id = seed_unknown_job(
+        runtime_root, TODAY, _CountingAdapter(), mapping=COMIX,
+        url="https://qx.com/today-inconclusive.html",
+    )
+    adapter = _CountingAdapter(
+        reconcile_outcome=LegacyReconcileOutcome(
+            ReconcileStatus.NOT_FOUND,
+            diagnostic="exact task reconciliation is not yet conclusive",
+        )
+    )
+
+    for _ in range(RECONCILE_DEAD_THRESHOLD):
+        run_reconcile(paths, adapter)
+
+    job = _remote_job_row(paths.state_path, job_id)
+    assert job["state"] == "SUBMIT_UNKNOWN"
+    assert job["recovery_attempts"] == 0
+    assert adapter.submit_calls == 0
 
 
 def test_reconcile_respects_per_pass_cap(tmp_path):
@@ -843,6 +914,7 @@ def test_plan_only_report_has_lifecycle_planned_and_zero_write(tmp_path, monkeyp
         "harvest_jobs": 1,
         "reconcile_jobs": 1,
         "cross_day_reconcile_jobs": 0,
+        "cross_day_harvest_jobs": 0,
         "redispatch_urls": 1,
         "redispatch_blocked": 0,
     }

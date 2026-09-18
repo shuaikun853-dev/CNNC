@@ -468,6 +468,7 @@ def sync_daily_internet_results(
     state_db_path: str | Path,
     business_date: str,
     source: str = "daily-internet",
+    remote_job_id: int | None = None,
     stale_claim_seconds: int = 600,
     now: datetime | None = None,
 ) -> dict[str, Any]:
@@ -551,7 +552,9 @@ def sync_daily_internet_results(
                       c.updated_at, c.remote_job_id, r.task_name
                FROM crawl_work c LEFT JOIN remote_jobs r ON r.id=c.remote_job_id
                WHERE c.state='SUCCESS' AND c.result_json IS NOT NULL
+                 AND (? IS NULL OR c.remote_job_id=?)
                ORDER BY c.id"""
+            , (remote_job_id, remote_job_id)
         ).fetchall()
     finally:
         connection.close()
