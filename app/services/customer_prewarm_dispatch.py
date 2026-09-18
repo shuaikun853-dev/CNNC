@@ -725,7 +725,15 @@ def _plan_only_report(
                     and int(latest.get("remote_job_id") or 0) == int(job_id)
                     and str(latest.get("producer") or "") == PRODUCER_CUSTOMER_PREWARM_ZHAOSHANG
                 ):
-                    phase_errors.append(f"candidate {candidate_id}: no exact current-day remote link; priority omitted")
+                    if (
+                        latest is not None
+                        and int(latest.get("remote_job_id") or 0) == int(job_id)
+                        and str(latest.get("producer") or "") == PRODUCER_CUSTOMER_PREWARM_ZHAOSHANG
+                        and str(latest.get("business_date") or "") != business_date
+                    ):
+                        phase_errors.append(_cross_day_skip_note(candidate_id, latest))
+                    else:
+                        phase_errors.append(f"candidate {candidate_id}: no exact current-day remote link; priority omitted")
                     continue
             link = _cross_day_link(prewarm_store, candidate_id, business_date, phase_errors)
             if link is not None:
@@ -1113,7 +1121,15 @@ def _run_leased_pass(
                         and int(latest.get("remote_job_id") or 0) == int(candidate["remote_job_id"])
                         and str(latest.get("producer") or "") == PRODUCER_CUSTOMER_PREWARM_ZHAOSHANG
                     ):
-                        phase_errors.append(f"candidate {candidate_id}: no exact current-day remote link; priority deferred")
+                        if (
+                            latest is not None
+                            and int(latest.get("remote_job_id") or 0) == int(candidate["remote_job_id"])
+                            and str(latest.get("producer") or "") == PRODUCER_CUSTOMER_PREWARM_ZHAOSHANG
+                            and str(latest.get("business_date") or "") != summary["business_date"]
+                        ):
+                            phase_errors.append(_cross_day_skip_note(candidate_id, latest))
+                        else:
+                            phase_errors.append(f"candidate {candidate_id}: no exact current-day remote link; priority deferred")
                         continue
                 link = _cross_day_link(
                     prewarm_store, candidate_id, summary["business_date"], phase_errors
@@ -1171,6 +1187,18 @@ def _run_leased_pass(
                 )
                 continue
             if latest_link is not None and str(latest_link.get("business_date") or "") != summary["business_date"]:
+                probe = find_remote_work_for_url(paths.state_path, routing.mall_key, routing.lookup_url)
+                if (probe or {}).get("terminal_success") or (probe or {}).get("terminal_failed"):
+                    _record(
+                        prewarm_store, candidate_id,
+                        cache_status=CACHE_STATUS_REMOTE_DISPATCHED,
+                        error=(
+                            _CACHE_SYNC_PENDING_NOTE if (probe or {}).get("terminal_success")
+                            else _TERMINAL_FAILURE_NOTE
+                        ),
+                        phase_errors=phase_errors,
+                    )
+                    continue
                 phase_errors.append(
                     f"candidate {candidate_id}: prior-day remote link present; create deferred"
                 )
