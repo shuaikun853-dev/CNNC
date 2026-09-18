@@ -447,7 +447,7 @@ python -m pytest tests\test_incremental_audit_runtime.py tests\test_incremental_
 
 ### 客户预爬派发生命周期
 
-- `scripts\customer_prewarm_dispatch.py` 的正常 live pass 预留总预算中最多 24 秒（且不超过 60%）给后续生命周期；当天 dispatch lock/lease 完全释放后，依次运行跨日 identity/priority、跨日 historical harvest/cache sync、当天 harvest。剩余至少 20 秒时跨日 reconcile 最多分 10 秒，余量由历史和当天 harvest 平分；小预算按剩余时间动态划分。这样默认 50 秒预算下忙碌 dispatch 后三个阶段仍各有可用时间。严禁持有当天锁时申请历史日锁，也不得在 reconcile 的历史锁内嵌套调用 harvest 原语。
+- `scripts\customer_prewarm_dispatch.py` 的正常 live pass 从 `--budget-seconds` 中预留最多 24 秒（且不超过 60%）给后续生命周期；当天 dispatch lock/lease 完全释放后，才依次运行跨日 identity/priority、跨日 historical harvest/cache sync、当天 harvest。**预留窗口从 dispatch 实际返回时重新起算**，而不是继续使用进程启动时的绝对 deadline；因此某个临近 dispatch 截止点的远端调用即使拖长，也不能把跨日 reconcile/harvest 的保底时间吃成 0。若当天 STEP1 日锁导致 dispatch 返回 `LOCK_BUSY`，本轮仍运行两个历史阶段（它们只申请各自 owning-day lock），但明确不尝试当天 harvest；若是 `SKIPPED_ALREADY_RUNNING`，说明已有另一 dispatch 实例，整轮 lifecycle 继续跳过，防止双实例。正常无超时时，dispatch 预算 + lifecycle reserve 仍等于原 `--budget-seconds`；只有 dispatch 单次调用自身越过其 deadline 时，超出的部分会占用 Scheduler 的 hard-timeout grace。预留至少 20 秒时跨日 reconcile 最多分 10 秒，余量由历史和当天 harvest 平分；小预算按预留时间动态划分。严禁持有当天锁时申请历史日锁，也不得在 reconcile 的历史锁内嵌套调用 harvest 原语。
 - A3 重排在远端 POST claim 前先于全局预爬库原子记录 candidate→新 daily intent marker；marker 写入失败绝不 POST。预算不足或 max-jobs 限额在 marker 前判断；明确 `NOT_ATTEMPTED` 后清除 marker。若 POST 已可能发生而进程中断、candidate 尚未完成新 job 绑定，次日 marker 会阻断再次创建，并将该候选标记为需人工核对，最终失败行保留这一不确定性，不能猜成 `NOT_FOUND`。同日未发送 intent 复用原有 daily job；若原组员已命中缓存，只有在 `post_attempted=0`、无远端身份且所有原始预爬 crawl 行仍为未提交状态并与 immutable payload 精确一致时，才在单个事务中退役旧 intent、解绑原 crawl 行，将退出组员的 crawl 标为 `SUPERSEDED`（不残留 `PENDING` 阻塞 STEP1），并为剩余候选重排。任何证据不符转人工，不发送旧大组。已发送 intent 只按精确 crawl/payload 证据重新绑定，不另建任务。
 - discovery 只从 `customer_prewarm.sqlite3` 中仍为 `REMOTE_DISPATCHED`/`REMOTE_REUSED`
   的 durable candidate 出发，并按 `(owning_day, remote_job_id)` 去重。执行前在历史 DB 锁内再次验证：
@@ -456,7 +456,7 @@ python -m pytest tests\test_incremental_audit_runtime.py tests\test_incremental_
 - 每个历史 job 使用所属日期自己的 `state.sqlite3`、`ProcessLock` 和 durable lease。
   `LOCK_BUSY` 或历史 DB 缺失只计 deferred，零远程调用、零 attempt 变化；每轮最多 4 job，
   durable fairness cursor 从上一轮最后 attempt 后继续，持续 pending 的前四项不会饿死后续 job；单 job 最多 30 秒，
-  并与 dispatch、harvest 共享同一个绝对 `--budget-seconds` deadline。
+  跨日阶段使用 dispatch 返回后的独立 reserve deadline；因此 dispatch 超时拖长只会消耗 Scheduler grace，不会把跨日阶段饿死。
 - `FOUND` 只恢复历史 DB identity 并沿用既有 priority confirm；若当轮未证明 `weight_type=-1`，job 保持
   `PRIORITY_PENDING`，下一轮只重试 priority confirm，不重复 reconcile、submit 或 create。priority 结果写回前再次验证
   candidate linkage；priority 远程写前还须在 lease 更新后最后检查 linkage。最终 linkage 验证通过 `customer_prewarm.sqlite3` 的短 `BEGIN IMMEDIATE` fence

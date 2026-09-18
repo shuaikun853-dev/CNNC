@@ -1542,38 +1542,31 @@ def _write_mapping_workbook(path: Path) -> Path:
     return path
 
 
-def test_shared_harvest_deadline_is_one_process_one_budget():
-    """regression guard:harvest deadline = pass_started + budget,绝不重起新窗口。
+def test_shared_harvest_deadline_bounds_the_reserved_window():
+    """The deadline helper clamps the reserved lifecycle window."""
 
-    旧行为(pass 返回后 `time.monotonic() + budget`)在 pass 用满预算时把进程
-    总墙钟推到 2×budget,超过调度 runner 的 budget+grace(255s)上限被硬杀
-    (summary JSON 写不出、日志记 TIMEOUT)。
-    """
     from scripts.customer_prewarm_dispatch import _shared_harvest_deadline
 
-    assert _shared_harvest_deadline(1000.0, 50.0) == 1050.0
-    assert _shared_harvest_deadline(1000.0, 50.0) <= 1000.0 + 50.0  # 绝不超出总预算
+    assert _shared_harvest_deadline(1000.0, 24.0) == 1024.0
     assert _shared_harvest_deadline(1000.0, 0.0) == 1000.0
-    assert _shared_harvest_deadline(1000.0, -5.0) == 1000.0  # 负预算夹紧到 pass_started
+    assert _shared_harvest_deadline(1000.0, -5.0) == 1000.0
 
 
-def test_cli_harvest_deadline_shares_pass_budget_not_a_fresh_window(tmp_path, monkeypatch):
-    """CLI 行为级回归:harvest 收到的 deadline ≤ pass 开始时刻 + budget。
+def test_cli_lifecycle_reserve_starts_after_dispatch_returns(tmp_path, monkeypatch):
+    """Lifecycle gets its bounded reserve after dispatch actually returns."""
 
-    fake pass 记录被调时刻并推进真实墙钟 0.25s——旧实现(返回后重起
-    `monotonic()+budget`)的 deadline 距 pass 开始 > budget,此断言必失败;
-    新实现(共享绝对预算)恰好等于 pass_started + budget。
-    """
     import scripts.customer_prewarm_dispatch as cli_module
 
     runtime_root = tmp_path / "runtime"
     runtime_root.mkdir()
-    budget = 2.0
+    budget = 50.0
+    lifecycle_reserve = 24.0
     recorded: dict = {}
 
     def fake_pass(*_args, **_kwargs):
         recorded["pass_entry"] = time.monotonic()
-        time.sleep(0.25)  # pass 消耗一段真实墙钟
+        time.sleep(0.25)
+        recorded["pass_exit"] = time.monotonic()
         return {"outcome": "OK", "phase_errors": []}
 
     def fake_harvest(_state_path, _lock_path, _business_date, **kwargs):
@@ -1581,6 +1574,8 @@ def test_cli_harvest_deadline_shares_pass_budget_not_a_fresh_window(tmp_path, mo
         return None
 
     monkeypatch.setattr(cli_module, "run_prewarm_dispatch_pass", fake_pass)
+    monkeypatch.setattr(cli_module, "run_cross_day_reconcile_phase", lambda **_kwargs: None)
+    monkeypatch.setattr(cli_module, "run_cross_day_harvest_phase", lambda **_kwargs: None)
     monkeypatch.setattr(cli_module, "run_harvest_phase", fake_harvest)
 
     exit_code = cli_module.main(
@@ -1593,11 +1588,9 @@ def test_cli_harvest_deadline_shares_pass_budget_not_a_fresh_window(tmp_path, mo
     )
 
     assert exit_code == 0
-    assert "pass_entry" in recorded and "harvest_deadline" in recorded
-    # 共享同一绝对预算:harvest 窗口从未超过 pass_started + budget(防 2×budget 回归)。
-    assert recorded["harvest_deadline"] - recorded["pass_entry"] <= budget + 0.05
-    # 且几乎拿满剩余窗口(静息 pass 不吞预算):deadline ≈ pass_started + budget。
-    assert recorded["harvest_deadline"] >= recorded["pass_entry"] + budget - 0.05
+    assert {"pass_entry", "pass_exit", "harvest_deadline"} <= recorded.keys()
+    assert recorded["harvest_deadline"] >= recorded["pass_exit"] + lifecycle_reserve - 0.05
+    assert recorded["harvest_deadline"] <= recorded["pass_exit"] + lifecycle_reserve + 0.05
 
 
 def test_cli_no_lifecycle_flag_defaults_to_enabled():
