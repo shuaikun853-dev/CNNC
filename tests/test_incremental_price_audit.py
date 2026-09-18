@@ -34,6 +34,16 @@ from app.workflows.incremental_price_audit import (
 )
 
 
+FINAL_METRICS = {
+    "finalized_rows": 1,
+    "final_missing_page_price_rows": 0,
+    "final_frozen_missing_page_price_rows": 0,
+    "final_failed_customer_link_rows": 0,
+    "final_appended_failed_customer_link_rows": 0,
+    "final_page_price_required_rows": 0,
+}
+
+
 @dataclass
 class Clock:
     value: float = 0
@@ -2245,7 +2255,7 @@ def test_existing_remote_drain_after_formal_final_does_not_touch_completed_job(t
     )
     store.freeze_snapshot(token, int(snapshot["id"]))
     store.prepare_finalization(token, str(tmp_path / "final.xlsx"))
-    store.mark_finalized(token, str(tmp_path / "final.xlsx"), "manifest")
+    store.commit_finalization(token, str(tmp_path / "final.xlsx"), "manifest", FINAL_METRICS)
     store.release_lease(token)
     deps = _deps([], [], Clock())
     deps.harvest = lambda *_args: pytest.fail(
@@ -2318,7 +2328,7 @@ def test_tick_after_formal_final_is_noop_before_any_external_operation(tmp_path)
     )["snapshot"]
     store.freeze_snapshot(token, int(snapshot["id"]))
     store.prepare_finalization(token, str(tmp_path / "final.xlsx"))
-    store.mark_finalized(token, str(tmp_path / "final.xlsx"), "manifest")
+    store.commit_finalization(token, str(tmp_path / "final.xlsx"), "manifest", FINAL_METRICS)
     store.release_lease(token)
     forbidden = lambda *_args, **_kwargs: pytest.fail(
         "an already-finalized tick must not call external operations"
@@ -2968,7 +2978,7 @@ def test_finalized_run_tick_neither_requeues_nor_touches_durable_state(tmp_path)
     _complete_stage(store, seed, item_id, "MODEL", f"model-{item_id}", {"match_result": "SAME"})
     final_output = tmp_path / "final.xlsx"
     store.prepare_finalization(seed, str(final_output))
-    store.mark_finalized(seed, str(final_output), "manifest")
+    store.commit_finalization(seed, str(final_output), "manifest", FINAL_METRICS)
     store.release_lease(seed)
 
     # Poison left behind from the legacy era: an invalid-SUCCESS DETAIL row.

@@ -623,6 +623,16 @@ def test_finalized_missing_count_is_immutable_after_prewarm_changes(tmp_path, mo
         store, ProcessLock(tmp_path / "immutable.lock"), BD, output,
     )
     assert publication.readiness.missing_page_price_rows == 3
+    committed_metrics = json.loads(store.get_run(BD)["metrics_json"])
+    assert {key: committed_metrics[key] for key in (
+        "final_missing_page_price_rows", "final_frozen_missing_page_price_rows",
+        "final_failed_customer_link_rows", "final_appended_failed_customer_link_rows",
+    )} == {
+        "final_missing_page_price_rows": 3,
+        "final_frozen_missing_page_price_rows": 0,
+        "final_failed_customer_link_rows": 3,
+        "final_appended_failed_customer_link_rows": 3,
+    }
     with sqlite3.connect(str(tmp_path / "customer_prewarm.sqlite3")) as connection:
         connection.execute("DELETE FROM prewarm_daily_observations WHERE business_date=?", (BD,))
 
@@ -632,6 +642,8 @@ def test_finalized_missing_count_is_immutable_after_prewarm_changes(tmp_path, mo
     assert status["final"]["missing_page_price_rows"] == 3
     assert status["final"]["frozen_missing_page_price_rows"] == 0
     assert status["final"]["failed_customer_link_rows"] == 3
+    assert status["final"]["appended_failed_customer_link_rows"] == 3
+    assert json.loads(store.get_run(BD)["metrics_json"]) == committed_metrics
 
 
 def test_legacy_finalized_status_uses_workbook_when_projection_metrics_are_missing(

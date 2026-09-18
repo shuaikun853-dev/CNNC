@@ -26,6 +26,25 @@ from app.services.crawl_url_identity import is_placeholder_code
 DEFAULT_TENANT_ID = 188605
 DEFAULT_POOL_ID = 222
 
+_REQUIRED_FINAL_METRICS = frozenset({
+    "finalized_rows",
+    "final_missing_page_price_rows",
+    "final_frozen_missing_page_price_rows",
+    "final_failed_customer_link_rows",
+    "final_appended_failed_customer_link_rows",
+    "final_page_price_required_rows",
+})
+_REQUIRED_FORCE_FINAL_METRICS = frozenset({
+    "forced", "forced_incomplete_count", "forced_incomplete_item_count",
+    "remote_incomplete_job_count", "blocker_count", "force_finalize",
+    "force_finalize_at", "force_finalize_max_incomplete",
+    "force_finalize_actual_incomplete", "force_finalize_accept_unresolved_crawl",
+    "missing_page_price_rows", "page_price_required_rows",
+    "force_finalize_reason", "frozen_snapshot_id", "frozen_row_count",
+    "blocker_summary_at_force_finalize", "force_finalize_incomplete_tasks",
+})
+FINALIZATION_INTENT_KEY = "_finalization_intent"
+
 
 class LeaseUnavailable(RuntimeError):
     """The OS lock or the fenced database lease is held by another tick."""
@@ -2840,6 +2859,11 @@ class DailyAuditStore:
         with self._transaction(immediate=True) as connection:
             run = self._validate_lease(connection, token)
             existing = json.loads(run["metrics_json"] or "{}")
+            if run["state"] == "FINALIZED":
+                immutable = _REQUIRED_FINAL_METRICS | _REQUIRED_FORCE_FINAL_METRICS | {FINALIZATION_INTENT_KEY}
+                if any(key in immutable and (key not in existing or existing[key] != value)
+                       for key, value in metrics.items()):
+                    raise FrozenSnapshotConflict("finalized metrics are immutable")
             existing.update(metrics)
             connection.execute("UPDATE daily_runs SET metrics_json=?, updated_at=? WHERE id=?", (self._canonical_json(existing), self._utcnow(), token.run_id))
             return self._row(connection.execute("SELECT * FROM daily_runs WHERE id=?", (token.run_id,)).fetchone())  # type: ignore[return-value]
@@ -2856,11 +2880,29 @@ class DailyAuditStore:
             connection.execute("UPDATE daily_runs SET state=CASE WHEN state='FINALIZED' THEN state ELSE 'FINALIZING' END, frozen_snapshot_id=?, updated_at=? WHERE id=?", (snapshot_id, self._utcnow(), token.run_id))
             return self._row(connection.execute("SELECT * FROM daily_runs WHERE id=?", (token.run_id,)).fetchone())  # type: ignore[return-value]
 
-    def prepare_finalization(self, token: LeaseToken, output_path: str) -> dict[str, Any]:
+    def prepare_finalization(
+        self,
+        token: LeaseToken,
+        output_path: str,
+        *,
+        input_manifest_hash: str | None = None,
+        metrics: Mapping[str, Any] | None = None,
+        refresh_intent: bool = False,
+    ) -> dict[str, Any]:
         """Durably reserve the one formal output path before publishing it."""
         output_path = str(output_path or "").strip()
         if not output_path:
             raise ValueError("finalization output path must be non-empty")
+        if (input_manifest_hash is None) != (metrics is None):
+            raise ValueError("finalization intent requires both input hash and metrics")
+        intent = None
+        if metrics is not None:
+            if not str(input_manifest_hash or "").strip():
+                raise ValueError("finalization intent requires a non-empty input hash")
+            intent = {
+                "input_manifest_hash": input_manifest_hash,
+                "metrics": json.loads(self._canonical_json(dict(metrics))),
+            }
         with self._transaction(immediate=True) as connection:
             run = self._validate_lease(connection, token)
             if run["frozen_snapshot_id"] is None:
@@ -2872,16 +2914,21 @@ class DailyAuditStore:
                 raise FrozenSnapshotConflict("daily run was already finalized for another output path")
             if prepared_path and prepared_path != output_path:
                 raise FrozenSnapshotConflict("daily run already prepared another final output path")
-            if not prepared_path:
+            existing_metrics = json.loads(run["metrics_json"] or "{}")
+            current_intent = existing_metrics.get(FINALIZATION_INTENT_KEY)
+            if intent is not None and (current_intent is None or refresh_intent):
+                existing_metrics[FINALIZATION_INTENT_KEY] = intent
+            if not prepared_path or existing_metrics.get(FINALIZATION_INTENT_KEY) != current_intent:
                 connection.execute(
-                    "UPDATE daily_runs SET state='FINALIZING', final_output_path=?, updated_at=? WHERE id=?",
-                    (output_path, self._utcnow(), token.run_id),
+                    "UPDATE daily_runs SET state='FINALIZING', final_output_path=?, metrics_json=?, updated_at=? WHERE id=?",
+                    (output_path, self._canonical_json(existing_metrics), self._utcnow(), token.run_id),
                 )
                 run = connection.execute("SELECT * FROM daily_runs WHERE id=?", (token.run_id,)).fetchone()
                 assert run is not None
             return self._row(run)  # type: ignore[return-value]
 
     def mark_finalized(self, token: LeaseToken, output_path: str, manifest_hash: str) -> dict[str, Any]:
+        """Legacy idempotence check; new transitions require commit_finalization."""
         with self._transaction(immediate=True) as connection:
             run = self._validate_lease(connection, token)
             if run["frozen_snapshot_id"] is None:
@@ -2892,7 +2939,54 @@ class DailyAuditStore:
                 raise FrozenSnapshotConflict("finalization output path differs from its prepared intent")
             if run["state"] == "FINALIZED":
                 if run["final_manifest_hash"] == manifest_hash:
-                    return run
+                    return self._row(run)  # type: ignore[return-value]
                 raise FrozenSnapshotConflict("daily run was already finalized with different output evidence")
-            connection.execute("UPDATE daily_runs SET state='FINALIZED', final_manifest_hash=?, updated_at=? WHERE id=?", (manifest_hash, self._utcnow(), token.run_id))
+            raise FrozenSnapshotConflict("new finalization requires commit_finalization with final metrics")
+
+    def commit_finalization(
+        self,
+        token: LeaseToken,
+        output_path: str,
+        manifest_hash: str,
+        metrics: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Commit final evidence and its immutable metrics as one SQLite transition."""
+        with self._transaction(immediate=True) as connection:
+            run = self._validate_lease(connection, token)
+            if run["frozen_snapshot_id"] is None:
+                raise FrozenSnapshotConflict("finalization requires a frozen authoritative snapshot")
+            if not run["final_output_path"]:
+                raise FrozenSnapshotConflict("finalization requires a prepared output path")
+            if run["final_output_path"] != output_path:
+                raise FrozenSnapshotConflict("finalization output path differs from its prepared intent")
+            if not str(manifest_hash or "").strip():
+                raise ValueError("finalization requires a manifest hash")
+            final_metrics = json.loads(self._canonical_json(dict(metrics)))
+            required = _REQUIRED_FINAL_METRICS
+            if "forced" in final_metrics or "force_finalize" in final_metrics:
+                if final_metrics.get("forced") is not True or final_metrics.get("force_finalize") is not True:
+                    raise ValueError("force finalization markers must both be true")
+                required = required | _REQUIRED_FORCE_FINAL_METRICS
+            missing = required - final_metrics.keys()
+            if missing:
+                raise ValueError(f"finalization metrics missing required keys: {', '.join(sorted(missing))}")
+            existing_metrics = json.loads(run["metrics_json"] or "{}")
+            if not isinstance(existing_metrics, dict):
+                raise ValueError("daily metrics must be a JSON object")
+            intent = existing_metrics.get(FINALIZATION_INTENT_KEY)
+            if intent is not None and intent.get("metrics") != final_metrics:
+                raise FrozenSnapshotConflict("final metrics differ from prepared publication intent")
+            if run["state"] == "FINALIZED":
+                if run["final_manifest_hash"] != manifest_hash:
+                    raise FrozenSnapshotConflict("daily run was already finalized with different output evidence")
+                if any(key not in existing_metrics or existing_metrics[key] != value
+                       for key, value in final_metrics.items()):
+                    raise FrozenSnapshotConflict("daily run was already finalized with different final metrics")
+                return self._row(run)  # type: ignore[return-value]
+            existing_metrics.pop(FINALIZATION_INTENT_KEY, None)
+            existing_metrics.update(final_metrics)
+            connection.execute(
+                "UPDATE daily_runs SET state='FINALIZED', final_manifest_hash=?, metrics_json=?, updated_at=? WHERE id=?",
+                (manifest_hash, self._canonical_json(existing_metrics), self._utcnow(), token.run_id),
+            )
             return self._row(connection.execute("SELECT * FROM daily_runs WHERE id=?", (token.run_id,)).fetchone())  # type: ignore[return-value]

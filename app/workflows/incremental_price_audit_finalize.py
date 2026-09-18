@@ -30,6 +30,8 @@ from app.services.customer_price_semantics import (
 )
 from app.services.daily_audit_store import (
     DailyAuditStore,
+    FINALIZATION_INTENT_KEY,
+    FrozenSnapshotConflict,
     LeaseToken,
     LeaseUnavailable,
     ProcessLock,
@@ -1287,29 +1289,44 @@ def materialize_frozen_daily_run(
             raise FinalizeBlocked("frozen snapshot still has mandatory pending or invalid work", built.readiness)
         publisher = materializer or LegacyWorkbookMaterializer()
         resolved_output = Path(output_path).resolve()
-        store.prepare_finalization(token, str(resolved_output))
-        result = publisher.materialize(built.artifact, resolved_output)
-        store.mark_finalized(token, str(resolved_output), result.manifest_sha256)
-        store.update_daily_metrics(
-            token,
-            {
-                "finalized_rows": result.row_count,
-                "final_missing_page_price_rows": built.readiness.missing_page_price_rows,
-                "final_frozen_missing_page_price_rows": (
-                    built.readiness.frozen_missing_page_price_rows
-                ),
-                "final_failed_customer_link_rows": (
-                    built.readiness.failed_customer_link_rows
-                ),
-                "final_appended_failed_customer_link_rows": (
-                    built.readiness.appended_failed_customer_link_rows
-                ),
-                "final_page_price_required_rows": (
-                    built.readiness.page_price_required_rows
-                ),
-            },
+        current_run = store.get_run(business_date)
+        _require_published_intent(current_run, resolved_output)
+        _require_intent_mode(current_run, forced=False)
+        final_metrics = {
+            "finalized_rows": len(built.artifact.frozen_rows),
+            "final_missing_page_price_rows": built.readiness.missing_page_price_rows,
+            "final_frozen_missing_page_price_rows": built.readiness.frozen_missing_page_price_rows,
+            "final_failed_customer_link_rows": built.readiness.failed_customer_link_rows,
+            "final_appended_failed_customer_link_rows": built.readiness.appended_failed_customer_link_rows,
+            "final_page_price_required_rows": built.readiness.page_price_required_rows,
+        }
+        prepared = store.prepare_finalization(
+            token, str(resolved_output),
+            input_manifest_hash=publisher._input_manifest_hash(built.artifact),
+            metrics=final_metrics, refresh_intent=not resolved_output.exists(),
         )
-        return FinalizePublication(built.readiness, result)
+        intent = json.loads(prepared["metrics_json"] or "{}").get(FINALIZATION_INTENT_KEY)
+        result = publisher.materialize(built.artifact, resolved_output)
+        if prepared["state"] == "FINALIZED":
+            if prepared["final_manifest_hash"] != result.manifest_sha256:
+                raise FrozenSnapshotConflict("daily run was already finalized with different output evidence")
+            return FinalizePublication(
+                _published_final_readiness(built.readiness, _run_metrics(prepared)), result,
+            )
+        if intent is None or result.input_manifest_sha256 != intent["input_manifest_hash"]:
+            raise FrozenSnapshotConflict("published workbook differs from prepared finalization intent")
+        if result.row_count != intent["metrics"]["finalized_rows"]:
+            raise FrozenSnapshotConflict("published workbook row count differs from finalization intent")
+        store.commit_finalization(
+            token,
+            str(resolved_output),
+            result.manifest_sha256,
+            intent["metrics"],
+        )
+        published_metrics = intent["metrics"]
+        return FinalizePublication(
+            _published_final_readiness(built.readiness, published_metrics), result,
+        )
     finally:
         if token is not None:
             store.release_lease(token)
@@ -1350,6 +1367,39 @@ def _run_metrics(run: Mapping[str, Any]) -> dict[str, Any]:
     except (TypeError, ValueError):
         return {}
     return decoded if isinstance(decoded, dict) else {}
+
+
+def _published_final_readiness(
+    readiness: FinalizeReadiness, metrics: Mapping[str, Any],
+) -> FinalizeReadiness:
+    fields = {
+        "missing_page_price_rows": "final_missing_page_price_rows",
+        "frozen_missing_page_price_rows": "final_frozen_missing_page_price_rows",
+        "failed_customer_link_rows": "final_failed_customer_link_rows",
+        "appended_failed_customer_link_rows": "final_appended_failed_customer_link_rows",
+        "page_price_required_rows": "final_page_price_required_rows",
+    }
+    if not all(key in metrics for key in fields.values()):
+        return readiness
+    return replace(readiness, **{field: metrics[key] for field, key in fields.items()})
+
+
+def _require_intent_mode(run: Mapping[str, Any] | None, *, forced: bool) -> None:
+    if run is None:
+        return
+    intent = _run_metrics(run).get(FINALIZATION_INTENT_KEY)
+    if intent is None:
+        return
+    intent_forced = intent.get("metrics", {}).get("force_finalize") is True
+    if intent_forced != forced:
+        mode = "force" if intent_forced else "normal"
+        raise FrozenSnapshotConflict(f"{mode} publication intent cannot be committed by the other finalizer")
+
+
+def _require_published_intent(run: Mapping[str, Any] | None, output: Path) -> None:
+    if output.exists() and run is not None and run["state"] != "FINALIZED":
+        if FINALIZATION_INTENT_KEY not in _run_metrics(run):
+            raise FrozenSnapshotConflict("published workbook lacks a prepared finalization intent")
 
 
 def _parse_remote_identity(identity: object) -> tuple[str | None, str | None]:
@@ -1479,6 +1529,14 @@ def materialize_forced_frozen_daily_run(
             )
         if run["state"] == "FINALIZED":
             return _already_finalized_publication(run)
+        _require_published_intent(run, resolved_output)
+        _require_intent_mode(run, forced=True)
+        recovering_published = (
+            run["state"] == "FINALIZING"
+            and run["final_output_path"] == str(resolved_output)
+            and resolved_output.is_file()
+            and FINALIZATION_INTENT_KEY in _run_metrics(run)
+        )
         token = store.acquire_lease(
             business_date,
             f"force-finalize-{os.getpid()}",
@@ -1509,7 +1567,7 @@ def materialize_forced_frozen_daily_run(
                 and name in OPERATOR_FORCE_TOLERABLE_BLOCKERS
             )
         }
-        if expected_missing_page_price_rows is not None and (
+        if not recovering_published and expected_missing_page_price_rows is not None and (
             readiness.missing_page_price_rows != expected_missing_page_price_rows
         ):
             raise ForceFinalizeRejected(
@@ -1517,7 +1575,7 @@ def materialize_forced_frozen_daily_run(
                 "missing page-price row count changed after operator confirmation",
                 readiness,
             )
-        if blockers:
+        if blockers and not recovering_published:
             rendered = ", ".join(f"{name}={value}" for name, value in sorted(blockers.items()))
             raise ForceFinalizeRejected(
                 "FORCE_FINALIZE_BLOCKED",
@@ -1538,7 +1596,7 @@ def materialize_forced_frozen_daily_run(
             else readiness.remote_awaiting_remote
         )
         blocker_count = item_count + remote_job_count
-        if item_count > max_incomplete:
+        if item_count > max_incomplete and not recovering_published:
             raise ForceFinalizeRejected(
                 (
                     "MISSING_PRICE_LIMIT_EXCEEDED"
@@ -1551,50 +1609,53 @@ def materialize_forced_frozen_daily_run(
             )
         incomplete_tasks = _collect_incomplete_tasks(store, token)
         publisher = materializer or LegacyWorkbookMaterializer()
-        store.prepare_finalization(token, str(resolved_output))
+        final_metrics = {
+            "finalized_rows": len(built.artifact.frozen_rows),
+            "forced": True,
+            "forced_incomplete_count": item_count,
+            "forced_incomplete_item_count": item_count,
+            "remote_incomplete_job_count": remote_job_count,
+            "blocker_count": blocker_count,
+            "force_finalize": True,
+            "force_finalize_at": datetime.now(UTC).isoformat(timespec="seconds"),
+            "force_finalize_max_incomplete": max_incomplete,
+            "force_finalize_actual_incomplete": item_count,
+            "force_finalize_accept_unresolved_crawl": accept_unresolved_crawl,
+            "missing_page_price_rows": readiness.missing_page_price_rows,
+            "page_price_required_rows": readiness.page_price_required_rows,
+            "final_missing_page_price_rows": readiness.missing_page_price_rows,
+            "final_frozen_missing_page_price_rows": readiness.frozen_missing_page_price_rows,
+            "final_failed_customer_link_rows": readiness.failed_customer_link_rows,
+            "final_appended_failed_customer_link_rows": readiness.appended_failed_customer_link_rows,
+            "final_page_price_required_rows": readiness.page_price_required_rows,
+            "force_finalize_reason": FORCE_FINALIZE_REASON,
+            "frozen_snapshot_id": int(run["frozen_snapshot_id"]),
+            "frozen_row_count": readiness.frozen_rows,
+            "blocker_summary_at_force_finalize": asdict(readiness),
+            FORCE_FINALIZE_INCOMPLETE_TASKS_KEY: [dict(task) for task in incomplete_tasks],
+        }
+        prepared = store.prepare_finalization(
+            token, str(resolved_output),
+            input_manifest_hash=publisher._input_manifest_hash(built.artifact),
+            metrics=final_metrics, refresh_intent=not resolved_output.exists(),
+        )
+        intent = json.loads(prepared["metrics_json"] or "{}").get(FINALIZATION_INTENT_KEY)
         result = publisher.materialize(built.artifact, resolved_output)
-        store.mark_finalized(token, str(resolved_output), result.manifest_sha256)
-        store.update_daily_metrics(
-            token,
-            {
-                "finalized_rows": result.row_count,
-                "forced": True,
-                "forced_incomplete_count": item_count,
-                "forced_incomplete_item_count": item_count,
-                "remote_incomplete_job_count": remote_job_count,
-                "blocker_count": blocker_count,
-                "force_finalize": True,
-                "force_finalize_at": datetime.now(UTC).isoformat(timespec="seconds"),
-                "force_finalize_max_incomplete": max_incomplete,
-                "force_finalize_actual_incomplete": item_count,
-                "force_finalize_accept_unresolved_crawl": accept_unresolved_crawl,
-                "missing_page_price_rows": readiness.missing_page_price_rows,
-                "page_price_required_rows": readiness.page_price_required_rows,
-                "final_missing_page_price_rows": readiness.missing_page_price_rows,
-                "final_frozen_missing_page_price_rows": (
-                    readiness.frozen_missing_page_price_rows
-                ),
-                "final_failed_customer_link_rows": (
-                    readiness.failed_customer_link_rows
-                ),
-                "final_appended_failed_customer_link_rows": (
-                    readiness.appended_failed_customer_link_rows
-                ),
-                "final_page_price_required_rows": readiness.page_price_required_rows,
-                "force_finalize_reason": FORCE_FINALIZE_REASON,
-                "frozen_snapshot_id": int(run["frozen_snapshot_id"]),
-                "frozen_row_count": readiness.frozen_rows,
-                "blocker_summary_at_force_finalize": asdict(readiness),
-                FORCE_FINALIZE_INCOMPLETE_TASKS_KEY: [dict(task) for task in incomplete_tasks],
-            },
+        if intent is None or result.input_manifest_sha256 != intent["input_manifest_hash"]:
+            raise FrozenSnapshotConflict("published workbook differs from prepared finalization intent")
+        published_metrics = intent["metrics"]
+        if result.row_count != published_metrics["finalized_rows"]:
+            raise FrozenSnapshotConflict("published workbook row count differs from finalization intent")
+        store.commit_finalization(
+            token, str(resolved_output), result.manifest_sha256, published_metrics,
         )
         return ForceFinalizePublication(
-            readiness=readiness,
+            readiness=FinalizeReadiness(**published_metrics["blocker_summary_at_force_finalize"]),
             materialization=result,
-            forced_incomplete_count=item_count,
-            remote_incomplete_job_count=remote_job_count,
-            blocker_count=blocker_count,
-            incomplete_tasks=incomplete_tasks,
+            forced_incomplete_count=published_metrics["forced_incomplete_count"],
+            remote_incomplete_job_count=published_metrics["remote_incomplete_job_count"],
+            blocker_count=published_metrics["blocker_count"],
+            incomplete_tasks=tuple(published_metrics[FORCE_FINALIZE_INCOMPLETE_TASKS_KEY]),
             already_finalized=False,
             frozen_snapshot_id=int(run["frozen_snapshot_id"]),
             output_path=result.output_path,

@@ -125,8 +125,12 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\unregister_dashboard
 
 最终收口卡的“未爬到价格”是**同一状态生成最终表后**无有效页面价格的业务行数,由
 `frozen_missing_page_price_rows` 与 day-scoped failed-link projection 统一生成;已 finalized 日优先读取
-finalize 时持久化的 immutable metrics,旧批次仅在 workbook/manifest 哈希一致时从最终表回读,绝不随 mutable prewarm 状态漂移。“底层采集工作项”来自
-`crawl_work` 状态,可能因历史轮次或重复采集显著大于业务缺价行数,两者不得混用。查看历史批次时用页头业务日期选择器;页面以 `?date=YYYY-MM-DD` 将 summary、操作记录和 POST 目标锁到同一业务日。
+finalize 时持久化的 immutable metrics,旧批次仅在 workbook/manifest 哈希一致时从最终表回读,绝不随 mutable prewarm 状态漂移。
+新批次的 `FINALIZED`、manifest hash 与最终缺价分项及 force metrics 同一 SQLite transaction 提交；
+物化前私有 intent 固定最终指标；提交前 workbook/manifest 已落盘但 DB 未 finalized 时，
+校验后按首次物化的指标重试（即使晚到采集改变当前计数）。输入变化导致 manifest 冲突时停下人工核对，
+不覆盖正式表。文件与 DB 不具备跨系统 ACID 原子性。
+“底层采集工作项”来自 `crawl_work` 状态,可能因历史轮次或重复采集显著大于业务缺价行数,两者不得混用。查看历史批次时用页头业务日期选择器;页面以 `?date=YYYY-MM-DD` 将 summary、操作记录和 POST 目标锁到同一业务日。
 
 结果语义(重新导出):`REEXPORT_COMPLETED`(取得有效结果,N 条)/`REEXPORT_COMPLETED_NO_RESULT`
 (任务已结束但导出 0 条,可稍后再点)/`REEXPORT_STILL_RUNNING`(任务仍在执行,本次未取得最终导出)/

@@ -12,6 +12,7 @@ from app.workflows.incremental_price_audit_finalize import (
     FinalizeBlocked,
     build_frozen_audit_artifact,
     materialize_frozen_review,
+    materialize_forced_frozen_daily_run,
     materialize_frozen_daily_run,
 )
 
@@ -543,7 +544,23 @@ def test_materialize_marks_run_finalized_and_same_finalize_reuses(tmp_path):
     run = store.get_run("2026-08-11")
     assert run["state"] == "FINALIZED"
     assert run["final_output_path"] == str(output.resolve())
-    assert json.loads(run["metrics_json"])["finalized_rows"] == 1
+    assert run["final_manifest_hash"] == first.materialization.manifest_sha256
+    metrics = json.loads(run["metrics_json"])
+    assert {key: metrics[key] for key in (
+        "finalized_rows",
+        "final_missing_page_price_rows",
+        "final_frozen_missing_page_price_rows",
+        "final_failed_customer_link_rows",
+        "final_appended_failed_customer_link_rows",
+        "final_page_price_required_rows",
+    )} == {
+        "finalized_rows": 1,
+        "final_missing_page_price_rows": 0,
+        "final_frozen_missing_page_price_rows": 0,
+        "final_failed_customer_link_rows": 0,
+        "final_appended_failed_customer_link_rows": 0,
+        "final_page_price_required_rows": 0,
+    }
 
 
 def test_finalized_run_rejects_different_output_before_materializer_writes(tmp_path):
@@ -571,7 +588,7 @@ def test_crash_after_publish_before_store_mark_recovers_idempotently(tmp_path, m
     store, _snapshot = _seed(tmp_path, rows=[_row(url="")])
     output = tmp_path / "formal.xlsx"
     materializer = LegacyWorkbookMaterializer(writer=_writer)
-    original = store.mark_finalized
+    original = getattr(store, "commit_finalization", None)
     calls = 0
 
     def crash_once(*args, **kwargs):
@@ -579,9 +596,10 @@ def test_crash_after_publish_before_store_mark_recovers_idempotently(tmp_path, m
         calls += 1
         if calls == 1:
             raise SystemExit("crash before DB mark")
+        assert original is not None
         return original(*args, **kwargs)
 
-    monkeypatch.setattr(store, "mark_finalized", crash_once)
+    monkeypatch.setattr(store, "commit_finalization", crash_once, raising=False)
     with pytest.raises(SystemExit):
         materialize_frozen_daily_run(
             store, ProcessLock(tmp_path / "finalize.lock"), "2026-08-11", output,
@@ -600,6 +618,66 @@ def test_crash_after_publish_before_store_mark_recovers_idempotently(tmp_path, m
     assert recovered.materialization is not None and recovered.materialization.reused is True
     assert output.read_bytes() == published
     assert store.get_run("2026-08-11")["state"] == "FINALIZED"
+
+
+def test_normal_publish_then_final_commit_failure_recovers_without_rewriting(tmp_path, monkeypatch):
+    store, _snapshot = _seed(tmp_path, rows=[_row(url="")])
+    output = tmp_path / "formal.xlsx"
+    materializer = LegacyWorkbookMaterializer(writer=_writer)
+
+    def crash(*_args, **_kwargs):
+        raise SystemExit("injected final DB failure")
+
+    monkeypatch.setattr(store, "update_daily_metrics", crash)
+    monkeypatch.setattr(store, "commit_finalization", crash, raising=False)
+    with pytest.raises(SystemExit, match="injected final DB failure"):
+        materialize_frozen_daily_run(
+            store, ProcessLock(tmp_path / "finalize.lock"), "2026-08-11", output,
+            materializer=materializer,
+        )
+    published = output.read_bytes()
+    manifest_path = output.with_name(output.name + ".manifest.json")
+    manifest = manifest_path.read_bytes()
+    interrupted = store.get_run("2026-08-11")
+    assert interrupted["state"] == "FINALIZING"
+    assert interrupted["final_manifest_hash"] is None
+    assert "final_missing_page_price_rows" not in json.loads(interrupted["metrics_json"] or "{}")
+
+    monkeypatch.undo()
+    recovered = materialize_frozen_daily_run(
+        store, ProcessLock(tmp_path / "finalize.lock"), "2026-08-11", output,
+        materializer=materializer,
+    )
+    assert recovered.materialization is not None and recovered.materialization.reused is True
+    assert output.read_bytes() == published
+    assert manifest_path.read_bytes() == manifest
+    assert store.get_run("2026-08-11")["state"] == "FINALIZED"
+
+
+def test_force_entry_cannot_commit_normal_publication_intent(tmp_path, monkeypatch):
+    store, _snapshot = _seed(tmp_path, rows=[_row(url="")])
+    output = tmp_path / "formal.xlsx"
+    materializer = LegacyWorkbookMaterializer(writer=_writer)
+
+    def crash(*_args, **_kwargs):
+        raise SystemExit("injected final DB failure")
+
+    monkeypatch.setattr(store, "commit_finalization", crash)
+    with pytest.raises(SystemExit):
+        materialize_frozen_daily_run(
+            store, ProcessLock(tmp_path / "finalize.lock"), "2026-08-11", output,
+            materializer=materializer,
+        )
+    published = output.read_bytes()
+    monkeypatch.undo()
+
+    with pytest.raises(FrozenSnapshotConflict, match="normal publication intent"):
+        materialize_forced_frozen_daily_run(
+            store, ProcessLock(tmp_path / "finalize.lock"), "2026-08-11", output,
+            max_incomplete=0, materializer=materializer,
+        )
+    assert store.get_run("2026-08-11")["state"] == "FINALIZING"
+    assert output.read_bytes() == published
 
 
 def test_blocked_readiness_never_writes_formal_workbook(tmp_path):
