@@ -231,7 +231,7 @@ class TickDependencies:
     prewarm_intake: Callable[[str, Sequence[Mapping[str, Any]]], None] | None = None
     # Incremental-only automatic recovery. Full STEP_1 keeps its independent
     # count/SHA/manual authorization gate.
-    local_fallback: Callable[[Sequence[Mapping[str, Any]], str, float], Mapping[int, Mapping[str, Any]]] | None = None
+    local_fallback: Callable[[Sequence[Mapping[str, Any]], str, Callable[[], float]], Mapping[int, Mapping[str, Any]]] | None = None
     monotonic: Callable[[], float] = time.monotonic
     wall_clock: Callable[[], datetime] = lambda: datetime.now(UTC)
 
@@ -263,8 +263,10 @@ def _execute_local_fallback_with_budget(
     tick_id: str,
 ) -> Mapping[int, Mapping[str, Any]]:
     assert deps.local_fallback is not None
-    timeout = min(MAX_CHILD_TIMEOUT_SECONDS, max(0.0, budget.remaining() - budget.reserve_seconds))
-    return deps.local_fallback(claims, tick_id, timeout)
+    return deps.local_fallback(
+        claims, tick_id,
+        lambda: min(MAX_CHILD_TIMEOUT_SECONDS, max(0.0, budget.remaining() - budget.reserve_seconds)),
+    )
 
 
 @dataclass(frozen=True)

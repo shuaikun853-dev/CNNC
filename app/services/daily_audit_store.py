@@ -2559,6 +2559,30 @@ class DailyAuditStore:
             ).fetchone()
             return self._row(row)
 
+    def defer_unstarted_local_fallback(
+        self, token: LeaseToken, fallback_id: int, tick_id: str
+    ) -> dict[str, Any]:
+        """Return an unlaunched claim to the next tick without charging an attempt."""
+        with self._transaction(immediate=True) as connection:
+            self._validate_lease(connection, token)
+            work = connection.execute(
+                "SELECT * FROM local_fallback_work WHERE id=? AND run_id=?", (fallback_id, token.run_id)
+            ).fetchone()
+            if work is None or work["state"] != "CLAIMED" or work["claim_tick_id"] != str(tick_id):
+                raise RemoteIntentConflict("budget deferral requires this tick's unstarted claim")
+            prior_attempts = int(work["attempt_count"]) - 1
+            connection.execute(
+                """UPDATE local_fallback_work
+                      SET state=?, attempt_count=?, claim_at=NULL, claim_tick_id=NULL,
+                          error_text='budget deferred before child launch', updated_at=?
+                    WHERE id=?""",
+                (
+                    "PENDING" if prior_attempts == 0 else "RETRYABLE_FAILED",
+                    prior_attempts, self._utcnow(), fallback_id,
+                ),
+            )
+            return self._row(connection.execute("SELECT * FROM local_fallback_work WHERE id=?", (fallback_id,)).fetchone())  # type: ignore[return-value]
+
     def recover_interrupted_local_fallback_claims(
         self,
         token: LeaseToken,

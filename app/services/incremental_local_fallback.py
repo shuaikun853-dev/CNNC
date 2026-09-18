@@ -271,25 +271,34 @@ def execute_pinned_crawler(
     run_dir: Path,
     tick_id: str,
     crawler_root: Path = DEFAULT_CRAWLER_ROOT,
-    timeout_seconds: float = MAX_CHILD_TIMEOUT_SECONDS,
+    timeout_seconds: float | Callable[[], float] = MAX_CHILD_TIMEOUT_SECONDS,
 ) -> Mapping[int, Mapping[str, Any]]:
     """Run one locked multi-site child with an allowlisted environment."""
     claim_list = [dict(claim) for claim in claims]
     if not claim_list:
         return {}
-    revision = verify_crawler_revision(crawler_root)
-    urls = [str(claim["exact_url"]) for claim in claim_list]
-    if len(urls) != len(set(urls)):
-        return {int(claim["id"]): {"error": "MANIFEST_MISMATCH: duplicate exact URL", "retryable": False} for claim in claim_list}
-    folder = Path(run_dir) / "local_fallback" / re.sub(r"[^A-Za-z0-9_.-]+", "_", tick_id)
-    folder.mkdir(parents=True, exist_ok=True)
-    by_site: dict[str, list[dict[str, Any]]] = {}
+    grouped: dict[str, list[dict[str, Any]]] = {}
     for claim in claim_list:
         site = _normalized_site(str(claim["mall_key"]))
-        url = str(claim["exact_url"])
-        if site not in SITE_HOSTS or not _url_matches_site(url, site):
-            return {int(item["id"]): {"error": "INVALID_SCOPE", "retryable": False} for item in claim_list}
-        by_site.setdefault(site, []).append(claim)
+        grouped.setdefault(site, []).append(claim)
+    outcomes: dict[int, Mapping[str, Any]] = {}
+    by_site: dict[str, list[dict[str, Any]]] = {}
+    for site, site_claims in grouped.items():
+        urls = [str(claim["exact_url"]) for claim in site_claims]
+        if site not in SITE_HOSTS or any(not _url_matches_site(url, site) for url in urls):
+            error = "INVALID_SCOPE"
+        elif len(urls) != len(set(urls)):
+            error = "MANIFEST_MISMATCH: duplicate exact URL"
+        else:
+            by_site[site] = site_claims
+            continue
+        for claim in site_claims:
+            outcomes[int(claim["id"])] = {"error": error, "retryable": False}
+    if not by_site:
+        return outcomes
+    revision = verify_crawler_revision(crawler_root)
+    folder = Path(run_dir) / "local_fallback" / re.sub(r"[^A-Za-z0-9_.-]+", "_", tick_id)
+    folder.mkdir(parents=True, exist_ok=True)
     manifest = Workbook()
     sheet = manifest.active
     sheet.title = "jobs"
@@ -309,18 +318,20 @@ def execute_pinned_crawler(
     manifest_path = (folder / "manifest.xlsx").resolve()
     manifest.save(manifest_path)
     env = _child_env(folder)
-    if timeout_seconds <= 0:
-        return {int(claim["id"]): {"error": "TEMPORARY_TIMEOUT", "retryable": True} for claim in claim_list}
+    live_timeout = timeout_seconds() if callable(timeout_seconds) else timeout_seconds
+    if live_timeout < MIN_EXECUTION_WINDOW_SECONDS:
+        outcomes.update({int(claim["id"]): {"deferred": True} for claims_for_site in by_site.values() for claim in claims_for_site})
+        return outcomes
     try:
         completed = subprocess.run(
             [sys.executable, "-m", "mall_crawler.cli", "--manifest", str(manifest_path)],
             cwd=str(Path(crawler_root).resolve()), env=env, check=False,
             capture_output=True, text=True, encoding="utf-8", errors="replace",
-            timeout=min(MAX_CHILD_TIMEOUT_SECONDS, timeout_seconds),
+            timeout=min(MAX_CHILD_TIMEOUT_SECONDS, live_timeout),
         )
     except subprocess.TimeoutExpired:
-        return {int(claim["id"]): {"error": "TEMPORARY_TIMEOUT", "retryable": True} for claim in claim_list}
-    outcomes: dict[int, Mapping[str, Any]] = {}
+        outcomes.update({int(claim["id"]): {"error": "TEMPORARY_TIMEOUT", "retryable": True} for claims_for_site in by_site.values() for claim in claims_for_site})
+        return outcomes
     for site, site_claims in by_site.items():
         expected = [str(claim["exact_url"]) for claim in site_claims]
         try:
@@ -429,6 +440,10 @@ def run_incremental_local_fallback(
         return _metrics(store, token)
     claims: list[dict[str, Any]] = []
     for row in eligible:
+        if execution_budget_seconds is not None and execution_budget_seconds() < MIN_EXECUTION_WINDOW_SECONDS:
+            for claim in claims:
+                store.defer_unstarted_local_fallback(token, int(claim["id"]), tick_id)
+            return _metrics(store, token)
         if int(row["remote_job_id"]) not in final_checked:
             continue
         current_work = store.get_crawl_work(int(row["id"]))
@@ -456,6 +471,9 @@ def run_incremental_local_fallback(
     for claim in claims:
         fallback_id = int(claim["id"])
         outcome = outcomes.get(fallback_id) or outcomes.get(str(fallback_id))  # type: ignore[arg-type]
+        if isinstance(outcome, Mapping) and outcome.get("deferred") is True:
+            store.defer_unstarted_local_fallback(token, fallback_id, tick_id)
+            continue
         if not isinstance(outcome, Mapping):
             store.fail_local_fallback(
                 token, fallback_id, "PROCESS_FAILED: missing child outcome", retryable=True,
