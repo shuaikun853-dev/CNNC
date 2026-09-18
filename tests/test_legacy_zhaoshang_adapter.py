@@ -1195,12 +1195,13 @@ def test_production_priority_failure_persists_unconfirmed_and_is_not_retried(tmp
         encoding="utf-8",
     )
     calls = []
+    observed = {}
 
     class Connection:
         _read_timeout = 30
 
         def close(self):
-            pass
+            observed["read_timeout_seconds"] = self._read_timeout
 
     class AutoModule:
         @staticmethod
@@ -1255,6 +1256,7 @@ def test_production_priority_failure_persists_unconfirmed_and_is_not_retried(tmp
     assert first.status is PriorityStatus.UNCONFIRMED
     assert second.status is PriorityStatus.UNCONFIRMED
     assert calls == ["priority"]
+    assert observed["read_timeout_seconds"] == 120
     events = adapter._read_batch_events(job)
     evidence = [event for event in events if event.get("action") == "PRIORITY_UNCONFIRMED"]
     assert len(evidence) == 1

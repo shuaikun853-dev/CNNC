@@ -1024,7 +1024,7 @@ class CnncLegacyZhaoshangAdapter:
                     window_end=window_end,
                 )
                 connection = priority_module.connect_from_env()
-                read_timeout_seconds = max(30, min(300, int(timeout_seconds)))
+                read_timeout_seconds = max(120, min(300, int(timeout_seconds)))
                 if not hasattr(connection, "_read_timeout"):
                     raise RuntimeError("legacy priority connection has no bounded read timeout")
                 connection._read_timeout = read_timeout_seconds
