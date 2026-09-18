@@ -996,11 +996,23 @@ def _redispatch_mall_group(
             return 0
         if prior_state == "SUBMIT_INTENT" and not int(prior.get("post_attempted") or 0):
             if request_keys != prior_keys:
+                def unresolved_marker(entry: Mapping[str, Any]) -> bool:
+                    marker = prewarm_store.latest_redispatch_intent_for_candidate(
+                        int(entry["candidate"]["id"])
+                    )
+                    if marker is None:
+                        return False
+                    return not (
+                        str(marker["business_date"]) == str(entry["owning_day"])
+                        and int(marker["remote_job_id"]) == int(entry["candidate"]["remote_job_id"])
+                        and str(marker["producer"]) == PRODUCER_CUSTOMER_PREWARM_ZHAOSHANG
+                    )
+
                 if any(
-                    prewarm_store.latest_redispatch_intent_for_candidate(int(entry["candidate"]["id"]))
-                    is not None for entry in entries
+                    unresolved_marker(entry) for entry in entries
                 ) or not store.supersede_unposted_prewarm_intent(
-                    token, prior_id, "unposted prewarm group changed before remote submission"
+                    token, prior_id, crawl_ids,
+                    "unposted prewarm group changed before remote submission"
                 ):
                     phase_errors.append(f"redispatch mall {mall_key}: unposted prior group cannot be retired; manual review")
                     return 0

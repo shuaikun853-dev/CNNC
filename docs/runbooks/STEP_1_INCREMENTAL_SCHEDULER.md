@@ -429,7 +429,7 @@ python -m pytest tests\test_incremental_audit_runtime.py tests\test_incremental_
 ### 客户预爬派发生命周期
 
 - `scripts\customer_prewarm_dispatch.py` 的正常 live pass 预留总预算中最多 24 秒（且不超过 60%）给后续生命周期；当天 dispatch lock/lease 完全释放后，依次运行跨日 identity/priority、跨日 historical harvest/cache sync、当天 harvest。剩余至少 20 秒时跨日 reconcile 最多分 10 秒，余量由历史和当天 harvest 平分；小预算按剩余时间动态划分。这样默认 50 秒预算下忙碌 dispatch 后三个阶段仍各有可用时间。严禁持有当天锁时申请历史日锁，也不得在 reconcile 的历史锁内嵌套调用 harvest 原语。
-- A3 重排在远端 POST claim 前先于全局预爬库原子记录 candidate→新 daily intent marker；marker 写入失败绝不 POST。预算不足或 max-jobs 限额在 marker 前判断；明确 `NOT_ATTEMPTED` 后清除 marker。若 POST 已可能发生而进程中断、candidate 尚未完成新 job 绑定，次日 marker 会阻断再次创建，并将该候选标记为需人工核对，最终失败行保留这一不确定性，不能猜成 `NOT_FOUND`。同日未发送 intent 复用原有 daily job；若原组员已命中缓存，只有在 `post_attempted=0`、无远端身份且所有原始预爬 crawl 行仍为未提交状态并与 immutable payload 精确一致时，才在单个事务中退役旧 intent、解绑原 crawl 行并为剩余候选重排。任何证据不符转人工，不发送旧大组。已发送 intent 只按精确 crawl/payload 证据重新绑定，不另建任务。
+- A3 重排在远端 POST claim 前先于全局预爬库原子记录 candidate→新 daily intent marker；marker 写入失败绝不 POST。预算不足或 max-jobs 限额在 marker 前判断；明确 `NOT_ATTEMPTED` 后清除 marker。若 POST 已可能发生而进程中断、candidate 尚未完成新 job 绑定，次日 marker 会阻断再次创建，并将该候选标记为需人工核对，最终失败行保留这一不确定性，不能猜成 `NOT_FOUND`。同日未发送 intent 复用原有 daily job；若原组员已命中缓存，只有在 `post_attempted=0`、无远端身份且所有原始预爬 crawl 行仍为未提交状态并与 immutable payload 精确一致时，才在单个事务中退役旧 intent、解绑原 crawl 行，将退出组员的 crawl 标为 `SUPERSEDED`（不残留 `PENDING` 阻塞 STEP1），并为剩余候选重排。任何证据不符转人工，不发送旧大组。已发送 intent 只按精确 crawl/payload 证据重新绑定，不另建任务。
 - discovery 只从 `customer_prewarm.sqlite3` 中仍为 `REMOTE_DISPATCHED`/`REMOTE_REUSED`
   的 durable candidate 出发，并按 `(owning_day, remote_job_id)` 去重。执行前在历史 DB 锁内再次验证：
   job 仍为无 identity 且未到 dead threshold 的 `SUBMIT_UNKNOWN`，或带 exact identity 的

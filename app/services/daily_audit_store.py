@@ -1686,7 +1686,9 @@ class DailyAuditStore:
                 )
             return self._row(connection.execute("SELECT * FROM remote_jobs WHERE id=?", (job_id,)).fetchone())
 
-    def supersede_unposted_prewarm_intent(self, token: LeaseToken, job_id: int, reason: str) -> bool:
+    def supersede_unposted_prewarm_intent(
+        self, token: LeaseToken, job_id: int, survivor_crawl_ids: Sequence[int], reason: str,
+    ) -> bool:
         """Retire a never-posted placeholder job and free its exact crawl rows."""
         with self._transaction(immediate=True) as connection:
             self._validate_lease(connection, token)
@@ -1722,9 +1724,13 @@ class DailyAuditStore:
                  str(row["exact_url"]), str(row["backend_version"]))
                 for row in rows
             ]
+            survivor_ids = {int(work_id) for work_id in survivor_crawl_ids}
+            row_ids = {int(row["id"]) for row in rows}
             if (
                 len(rows) != len(expected)
                 or set(actual) != set(expected)
+                or not survivor_ids
+                or not survivor_ids < row_ids
                 or any(
                     str(row["state"]) != "PENDING"
                     or row["result_json"] is not None
@@ -1741,6 +1747,15 @@ class DailyAuditStore:
             )
             if detached.rowcount != len(rows):
                 raise RemoteIntentConflict("unposted crawl detachment changed during retirement")
+            retired_ids = sorted(row_ids - survivor_ids)
+            placeholders = ",".join("?" for _ in retired_ids)
+            retired = connection.execute(
+                f"UPDATE crawl_work SET state='SUPERSEDED', error_text=?, updated_at=? "
+                f"WHERE id IN ({placeholders}) AND remote_job_id IS NULL AND state='PENDING'",
+                (str(reason), now, *retired_ids),
+            )
+            if retired.rowcount != len(retired_ids):
+                raise RemoteIntentConflict("retired crawl set changed during unposted retirement")
             connection.execute(
                 "UPDATE remote_jobs SET state='SUPERSEDED', error_text=?, updated_at=? WHERE id=?",
                 (str(reason), now, job_id),
@@ -2368,6 +2383,17 @@ class DailyAuditStore:
             if work is None:
                 cursor = connection.execute("INSERT INTO crawl_work(run_id, mall_key, source_id, sku_id, exact_url, backend_version, fingerprint, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", (token.run_id, mall_key, source_id, sku_id, normalized_url, backend_version, fingerprint, now))
                 work = connection.execute("SELECT * FROM crawl_work WHERE id=?", (cursor.lastrowid,)).fetchone()
+            elif (
+                work["remote_job_id"] is None
+                and work["state"] == "SUPERSEDED"
+                and sku_id.startswith("zhpq-")
+                and is_placeholder_code(sku_id)
+            ):
+                connection.execute(
+                    "UPDATE crawl_work SET fingerprint=?, state='PENDING', result_json=NULL, error_text=NULL, updated_at=? WHERE id=?",
+                    (fingerprint, now, work["id"]),
+                )
+                work = connection.execute("SELECT * FROM crawl_work WHERE id=?", (work["id"],)).fetchone()
             elif work["fingerprint"] != fingerprint:
                 if work["remote_job_id"] is None and work["state"] in {"PENDING", "RETRYABLE_FAILED"}:
                     connection.execute("UPDATE crawl_work SET fingerprint=?, state='PENDING', result_json=NULL, error_text=NULL, updated_at=? WHERE id=?", (fingerprint, now, work["id"]))
