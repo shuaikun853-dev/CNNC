@@ -1512,7 +1512,8 @@ class CnncLegacyZhaoshangAdapter:
                 return None
             if (
                 action != "PRIORITY_UNCONFIRMED"
-                or event.get("retryable") is True
+                or "retryable" not in event
+                or event.get("retryable") is not False
                 or _text(event.get("reason")) != "PriorityScopeSafetyError"
             ):
                 return None

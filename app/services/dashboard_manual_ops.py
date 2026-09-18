@@ -44,6 +44,7 @@ from app.services.recovery.wait_export import (
 )
 from app.services.remote_running_recovery import (
     RemoteExecutionState,
+    canonical_progress_signature,
     classify_remote_execution_state,
 )
 from app.services.zhaoshang_progress_probe import ZhaoshangProgressService
@@ -144,6 +145,7 @@ def _reexport_rejection_code(reason: str) -> str:
         or "not harvestable" in text
         or "could not enter harvest" in text
         or "requires durable POST evidence" in text
+        or "terminal progress does not exactly match durable request scope" in text
     ):
         return "INVALID_REMOTE_STATE"
     if (
@@ -162,7 +164,11 @@ def _probe_remote_execution_state(
     adapter: CnncLegacyZhaoshangAdapter,
     identity_parts: list[str],
     timeout_seconds: float,
-) -> tuple[RemoteExecutionState, int]:
+) -> tuple[
+    RemoteExecutionState,
+    int,
+    tuple[int, int, int, int, int, int] | None,
+]:
     """Read-only live classification of the exact remote task, fail-closed.
 
     Rebuilds the prepared job from the durable payload exactly like the
@@ -186,7 +192,7 @@ def _probe_remote_execution_state(
             batch_state,
         )
     except Exception:
-        return RemoteExecutionState.UNKNOWN, 0
+        return RemoteExecutionState.UNKNOWN, 0, None
     try:
         answer = adapter.query_task_progress_for_job(
             prepared,
@@ -195,7 +201,7 @@ def _probe_remote_execution_state(
             min(30.0, timeout_seconds),
         )
     except Exception:
-        return RemoteExecutionState.UNKNOWN, 0
+        return RemoteExecutionState.UNKNOWN, 0, None
     probe_remote_calls = 0
     if isinstance(answer, Mapping):
         try:
@@ -203,12 +209,11 @@ def _probe_remote_execution_state(
         except (TypeError, ValueError):
             probe_remote_calls = 0
     progress = answer.get("progress") if isinstance(answer, Mapping) else None
+    progress_mapping = progress if isinstance(progress, Mapping) else None
     return (
-        classify_remote_execution_state(
-            progress if isinstance(progress, Mapping) else None,
-            "",
-        ),
+        classify_remote_execution_state(progress_mapping, ""),
         probe_remote_calls,
+        canonical_progress_signature(progress_mapping or {}),
     )
 
 
@@ -262,7 +267,7 @@ def _probe_live_identity_classification(
             raw if isinstance(raw, Mapping) else None,
             "",
         )
-    state, _probe_remote_calls = _probe_remote_execution_state(
+    state, _probe_remote_calls, _progress_signature = _probe_remote_execution_state(
         job,
         business_date=business_date,
         adapter=adapter,
@@ -363,8 +368,13 @@ def run_manual_reexport(
             else RemoteExecutionState.UNKNOWN
         )
         preflight_remote_calls = 0
+        progress_signature = None
     else:
-        classification, preflight_remote_calls = _probe_remote_execution_state(
+        (
+            classification,
+            preflight_remote_calls,
+            progress_signature,
+        ) = _probe_remote_execution_state(
             job,
             business_date=business_date,
             adapter=adapter,
@@ -397,6 +407,7 @@ def run_manual_reexport(
     proof = live_identity_proof(
         remote_identity=expected_identity,
         classification=classification,
+        progress_signature=progress_signature,
     )
 
     try:
