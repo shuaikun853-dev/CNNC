@@ -4,9 +4,10 @@ Default mode runs ONE bounded dispatch pass (route → reuse/create → submit �
 priority proof → cache absorb) that reuses the existing STEP1 zhaoshang
 lifecycle; it never invents a second remote-task store.  Overlap is prevented
 twice over: the dispatcher's own instance lock prints
-``SKIPPED_ALREADY_RUNNING``, and STEP1's per-day process lock / durable lease
-prints ``LOCK_BUSY`` — both exit 0 (expected runtime conditions retry on the
-next scheduled pass).
+``SKIPPED_ALREADY_RUNNING`` and skips the whole invocation; STEP1's current-day
+process lock / durable lease prints ``LOCK_BUSY``, skips current-day work, but
+still allows the historical-day reconcile/harvest stages to run under their
+own owning-day locks.
 
 ``--plan-only`` builds the §26 read-only report: zero writes anywhere (no
 candidate status changes, no lock files, no adapter construction, state DB
@@ -22,9 +23,11 @@ re-dispatches dead-job candidates (daily per-candidate budget from
 lock, the CLI first reconciles linked historical-day ``SUBMIT_UNKNOWN`` jobs
 under each owning day's own ProcessLock + lease, then harvests live prewarm
 jobs through the existing ``harvest_existing_customer_prewarm_job`` primitive.
-Both outside-pass stages share the SAME absolute wall-clock budget as the pass
-(one process = ``--budget-seconds``).  ``--no-lifecycle`` skips every lifecycle
-stage.  Canary mode (``--only-mall``) never runs any lifecycle stage.
+The dispatch pass is budgeted at ``--budget-seconds - lifecycle_reserve``;
+after it actually returns, the historical lifecycle receives that bounded
+reserve as a fresh deadline window, so a late remote timeout in dispatch
+cannot starve cross-day reconcile/harvest.  ``--no-lifecycle`` skips every
+lifecycle stage.  Canary mode (``--only-mall``) never runs any lifecycle stage.
 
 The three data sources are independently overridable and default to today's
 layout: ``--state-runtime-root`` locates the STEP1 ``<date>/state.sqlite3``
@@ -239,16 +242,14 @@ def _backfill_dates(business_date: str, days: int) -> list[str]:
     ]
 
 
-def _shared_harvest_deadline(pass_started: float, budget_seconds: float) -> float:
-    """One process, one wall-clock budget: the dispatch pass and the harvest
-    stage share the SAME absolute deadline (``pass_started + budget``), so the
-    whole process stays inside the scheduler's per-run ceiling (budget +
-    grace).  A pass that consumed its full budget yields a harvest deadline at
-    or behind the current time — :func:`run_harvest_phase` then skips with a
-    phase note; a quiet pass (a few seconds) leaves the harvest almost the
-    entire window.  Never below ``pass_started`` (a negative budget clamps).
+def _shared_harvest_deadline(window_started: float, reserve_seconds: float) -> float:
+    """Return a bounded lifecycle deadline from the caller's chosen anchor.
+
+    The live CLI now anchors this helper after the dispatch pass returns and
+    passes only the pre-reserved lifecycle slice.  Negative reserves clamp to
+    the anchor so callers never receive a deadline in the past by arithmetic.
     """
-    return float(pass_started) + max(0.0, float(budget_seconds))
+    return float(window_started) + max(0.0, float(reserve_seconds))
 
 
 def _write_json_output(path: Path, summary: dict) -> None:
@@ -570,9 +571,9 @@ def _run_dispatch(args: argparse.Namespace, business_date: str, runtime_root: Pa
                 if lifecycle_on
                 else None
             )
-            # One absolute wall-clock anchor for the WHOLE process (pass +
-            # harvest): the scheduler's per-run ceiling is budget + grace.
-            pass_started = time.monotonic()
+            # Reserve a bounded lifecycle window from the dispatch budget.
+            # The lifecycle deadline is anchored AFTER the dispatch pass
+            # returns so a late remote timeout cannot consume this reserve.
             lifecycle_reserve = (
                 min(24.0, float(args.budget_seconds) * 0.6) if lifecycle_on else 0.0
             )
@@ -588,19 +589,21 @@ def _run_dispatch(args: argparse.Namespace, business_date: str, runtime_root: Pa
                 max_jobs_per_pass=args.max_jobs_per_pass,
                 plan_only=False,
             )
-            if lifecycle_on and summary.get("outcome") == "OK":
+            pass_outcome = str(summary.get("outcome") or "")
+            if lifecycle_on and pass_outcome in {"OK", "LOCK_BUSY"}:
                 # A1 harvest stage: AFTER the pass returned (it owns its own
                 # ProcessLock + lease, so it must never run under the
-                # dispatcher's day lock).  The harvest shares the pass's
-                # ABSOLUTE wall-clock deadline (one process = one budget): a
-                # fresh window here could double the process runtime past the
-                # scheduler's per-run ceiling and get it hard-killed.
+                # dispatcher's day lock).  Start the already-reserved lifecycle
+                # window NOW instead of anchoring it at process start.  This
+                # preserves the pass -> reconcile -> historical harvest safety
+                # order while preventing a late remote timeout in the pass from
+                # starving all historical work.
                 state_root = (
                     state_runtime_root if state_runtime_root is not None else runtime_root
                 )
                 day_paths = runtime_paths(business_date, state_root)
                 lifecycle_deadline = _shared_harvest_deadline(
-                    pass_started, args.budget_seconds
+                    time.monotonic(), lifecycle_reserve
                 )
                 lifecycle_now = time.monotonic()
                 lifecycle_remaining = max(0.0, lifecycle_deadline - lifecycle_now)
@@ -631,16 +634,17 @@ def _run_dispatch(args: argparse.Namespace, business_date: str, runtime_root: Pa
                     monotonic_value=time.monotonic,
                     summary=summary,
                 )
-                run_harvest_phase(
-                    day_paths.state_path,
-                    day_paths.lock_path,
-                    business_date,
-                    deadline=lifecycle_deadline,
-                    monotonic_value=time.monotonic,
-                    summary=summary,
-                    adapter=adapter,
-                    mappings=mappings,
-                )
+                if pass_outcome == "OK":
+                    run_harvest_phase(
+                        day_paths.state_path,
+                        day_paths.lock_path,
+                        business_date,
+                        deadline=lifecycle_deadline,
+                        monotonic_value=time.monotonic,
+                        summary=summary,
+                        adapter=adapter,
+                        mappings=mappings,
+                    )
     except Exception as exc:  # noqa: BLE001 - scheduler-facing failure
         print(
             json.dumps(

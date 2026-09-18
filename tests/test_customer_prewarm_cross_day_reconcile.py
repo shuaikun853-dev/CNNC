@@ -2024,6 +2024,97 @@ def test_cli_runs_cross_day_after_today_locks_release_before_harvest_with_shared
     assert observed["cross_deadline"] < observed["historical_deadline"] < observed["harvest_deadline"]
 
 
+def test_cli_guarantees_cross_day_work_before_dispatch_can_overrun_budget(
+    tmp_path, monkeypatch
+):
+    runtime_root = tmp_path / "runtime"
+    CustomerPrewarmStore(runtime_root / "customer_prewarm.sqlite3")
+    SharedCrawlCache(runtime_root / "shared_crawl_cache.sqlite3")
+    make_state_db(runtime_root, TODAY)
+    clock = {"now": 0.0}
+    order = []
+    windows = {}
+
+    def fake_cross_day(**kwargs):
+        order.append("cross-day")
+        windows["reconcile"] = kwargs["deadline"] - clock["now"]
+        clock["now"] += 1.0
+
+    def fake_historical_harvest(**kwargs):
+        order.append("historical-harvest")
+        windows["historical"] = kwargs["deadline"] - clock["now"]
+        clock["now"] += 1.0
+
+    def fake_pass(*_args, **kwargs):
+        order.append("pass")
+        # Reproduce the production failure mode: one remote call can run beyond
+        # the dispatcher's nominal budget and consume any reserve left AFTER it.
+        clock["now"] += kwargs["budget_seconds"] + 30.0
+        return {"outcome": "OK", "phase_errors": []}
+
+    monkeypatch.setattr(cli.time, "monotonic", lambda: clock["now"])
+    monkeypatch.setattr(cli, "load_zhaoshang_mall_mappings", lambda _path: [COMIX])
+    monkeypatch.setattr(cli, "run_prewarm_dispatch_pass", fake_pass)
+    monkeypatch.setattr(cli, "run_cross_day_reconcile_phase", fake_cross_day)
+    monkeypatch.setattr(
+        cli, "run_cross_day_harvest_phase", fake_historical_harvest
+    )
+    monkeypatch.setattr(cli, "run_harvest_phase", lambda *_args, **_kwargs: None)
+
+    assert cli.main([
+        "--business-date", TODAY,
+        "--runtime-root", str(runtime_root),
+        "--budget-seconds", "50",
+    ]) == 0
+
+    # Preserve the existing safety order (cross-day reconcile must not make a
+    # newly-dead job eligible for same-pass redispatch), while guaranteeing
+    # that an overrunning dispatch cannot consume the historical-work window.
+    assert order[:3] == ["pass", "cross-day", "historical-harvest"]
+    assert windows["reconcile"] >= 5.0
+    assert windows["historical"] >= 5.0
+
+
+def test_cli_runs_cross_day_lifecycle_when_today_day_lock_is_busy(
+    tmp_path, monkeypatch
+):
+    runtime_root = tmp_path / "runtime"
+    CustomerPrewarmStore(runtime_root / "customer_prewarm.sqlite3")
+    SharedCrawlCache(runtime_root / "shared_crawl_cache.sqlite3")
+    make_state_db(runtime_root, TODAY)
+    calls = []
+
+    monkeypatch.setattr(cli, "load_zhaoshang_mall_mappings", lambda _path: [COMIX])
+    monkeypatch.setattr(
+        cli,
+        "run_prewarm_dispatch_pass",
+        lambda *_args, **_kwargs: {"outcome": "LOCK_BUSY", "phase_errors": []},
+    )
+    monkeypatch.setattr(
+        cli,
+        "run_cross_day_reconcile_phase",
+        lambda **_kwargs: calls.append("cross-day"),
+    )
+    monkeypatch.setattr(
+        cli,
+        "run_cross_day_harvest_phase",
+        lambda **_kwargs: calls.append("historical-harvest"),
+    )
+    monkeypatch.setattr(
+        cli,
+        "run_harvest_phase",
+        lambda *_args, **_kwargs: calls.append("today-harvest"),
+    )
+
+    assert cli.main([
+        "--business-date", TODAY,
+        "--runtime-root", str(runtime_root),
+        "--budget-seconds", "50",
+    ]) == 0
+
+    assert calls == ["cross-day", "historical-harvest"]
+
+
 def test_cli_reserves_usable_cross_day_time_after_busy_dispatch(tmp_path, monkeypatch):
     runtime_root = tmp_path / "runtime"
     CustomerPrewarmStore(runtime_root / "customer_prewarm.sqlite3")
