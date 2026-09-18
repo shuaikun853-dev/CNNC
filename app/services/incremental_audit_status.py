@@ -19,6 +19,7 @@ from app.services.page_price_semantics import (
     FORCE_CLOSEOUT_MISSING_PRICE_LIMIT,
     build_final_page_price_projection,
     crawl_identity,
+    remote_job_is_closed_by_local_fallback,
     valid_page_price_result,
 )
 from app.services.remote_stall_breaker import evaluate_remote_stall
@@ -516,7 +517,7 @@ def collect_runtime_status(
             model = _stage_status(connection, target_snapshot_id, "MODEL", unique_items)
 
         crawl_rows = connection.execute(
-            """SELECT id, source_id, sku_id, exact_url, state, result_json
+            """SELECT id, source_id, sku_id, exact_url, state, result_json, remote_job_id
                FROM crawl_work WHERE run_id=? ORDER BY id""",
             (run_id,),
         ).fetchall()
@@ -586,6 +587,30 @@ def collect_runtime_status(
                 (run_id,),
             ).fetchall()
         )
+        remote_rows = connection.execute(
+            "SELECT id, state FROM remote_jobs WHERE run_id=?",
+            (run_id,),
+        ).fetchall()
+        linked_job_ids = {
+            int(row["remote_job_id"])
+            for row in crawl_rows
+            if row["remote_job_id"] is not None
+        }
+        crawls_by_remote_job: dict[int, list[dict[str, Any]]] = {}
+        for row in crawl_rows:
+            if row["remote_job_id"] is not None:
+                crawls_by_remote_job.setdefault(int(row["remote_job_id"]), []).append(dict(row))
+        local_closed_job_ids = {
+            job_id
+            for job_id, job_crawls in crawls_by_remote_job.items()
+            if remote_job_is_closed_by_local_fallback(job_crawls)
+        }
+        remote_blocking_states: dict[str, int] = {}
+        for row in remote_rows:
+            job_id = int(row["id"])
+            if job_id not in linked_job_ids or job_id not in local_closed_job_ids:
+                state = str(row["state"])
+                remote_blocking_states[state] = remote_blocking_states.get(state, 0) + 1
         remote_health = evaluate_remote_stall(
             [
                 dict(row)
@@ -681,16 +706,16 @@ def collect_runtime_status(
         **crawl_pending_breakdown,
     }
     remote = {
-        "intent": remote_states.get("SUBMIT_INTENT", 0),
-        "pending": remote_states.get("PRIORITY_PENDING", 0) + remote_states.get("SUBMITTED", 0),
-        "running": remote_states.get("RUNNING", 0),
-        "exported": remote_states.get("EXPORTED", 0),
+        "intent": remote_blocking_states.get("SUBMIT_INTENT", 0),
+        "pending": remote_blocking_states.get("PRIORITY_PENDING", 0) + remote_blocking_states.get("SUBMITTED", 0),
+        "running": remote_blocking_states.get("RUNNING", 0),
+        "exported": remote_blocking_states.get("EXPORTED", 0),
         "completed": remote_states.get("COMPLETED", 0),
-        "unknown": remote_states.get("SUBMIT_UNKNOWN", 0),
-        "manual": remote_states.get("MANUAL_REQUIRED", 0),
+        "unknown": remote_blocking_states.get("SUBMIT_UNKNOWN", 0),
+        "manual": remote_blocking_states.get("MANUAL_REQUIRED", 0),
         # Additive sub-views of pending/exported by next required action.
-        "awaiting_priority": remote_states.get("PRIORITY_PENDING", 0),
-        "awaiting_harvest": remote_states.get("SUBMITTED", 0) + remote_states.get("EXPORTED", 0),
+        "awaiting_priority": remote_blocking_states.get("PRIORITY_PENDING", 0),
+        "awaiting_harvest": remote_blocking_states.get("SUBMITTED", 0) + remote_blocking_states.get("EXPORTED", 0),
         # Local give-up terminal: the remote task was never completed; the
         # business decided to stop waiting after one confirmed restart.
         "recovery_exhausted": remote_states.get("RECOVERY_EXHAUSTED", 0),

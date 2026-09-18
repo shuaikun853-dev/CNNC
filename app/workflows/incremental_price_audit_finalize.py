@@ -45,6 +45,7 @@ from app.services.page_price_semantics import (
     FinalPagePriceProjection,
     build_final_page_price_projection,
     crawl_identity,
+    remote_job_is_closed_by_local_fallback,
     valid_page_price_result,
 )
 from app.services.saas_audit_core import build_records, normalize_cell_str, parse_decimal
@@ -741,6 +742,16 @@ def build_frozen_audit_artifact(
         )
         crawls_by_key.setdefault(key, []).append(crawl)
     remote_jobs = {int(job["id"]): job for job in store.list_remote_jobs(token)}
+    crawls_by_remote_job: dict[int, list[Mapping[str, Any]]] = {}
+    for crawl_rows in crawls_by_key.values():
+        for crawl in crawl_rows:
+            if crawl.get("remote_job_id") is not None:
+                crawls_by_remote_job.setdefault(int(crawl["remote_job_id"]), []).append(crawl)
+    local_closed_remote_job_ids = {
+        job_id
+        for job_id, crawl_rows in crawls_by_remote_job.items()
+        if remote_job_is_closed_by_local_fallback(crawl_rows)
+    }
     replacements_by_old = {
         int(replacement["old_remote_job_id"]): replacement
         for replacement in store.list_remote_replacements(token.run_id)
@@ -842,6 +853,7 @@ def build_frozen_audit_artifact(
                 int(crawl["remote_job_id"])
                 for crawl in crawl_candidates
                 if crawl.get("remote_job_id") is not None
+                and int(crawl["remote_job_id"]) not in local_closed_remote_job_ids
             )
         review_selected: Mapping[str, Any] | None = None
         review_status = "NOT_REQUIRED"

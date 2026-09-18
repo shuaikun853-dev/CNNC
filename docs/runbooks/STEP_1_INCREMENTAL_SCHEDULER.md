@@ -29,9 +29,9 @@ terminal、crawl 与远端任务的 pending/running/exported/unknown/manual、fr
 过期 lease 和 finalized artifact；不会显示密钥值。默认只把 shadow 所需依赖当硬要求；带 `--enable-remote-writes` 才把招商局依赖
 计入健康判定，避免一个系统的认证问题无条件阻塞其他阶段。
 
-SQLite 仅有七张 checkpoint 表：`daily_runs`、`snapshots`、`audit_items`、`snapshot_members`、
-`stage_work`、`remote_jobs`、`crawl_work`。不要手改数据库、删除 lock，或把不同调度任务指向
-不同的 runtime root。
+SQLite 仅有十张 checkpoint 表：`daily_runs`、`snapshots`、`audit_items`、`snapshot_members`、
+`stage_work`、`remote_jobs`、`crawl_work`、`local_fallback_work`、`remote_job_replacements` 和
+`remote_job_rebuild_actions`。不要手改数据库、删除 lock，或把不同调度任务指向不同的 runtime root。
 
 ## 推荐的 Scheduler 配置
 
@@ -45,22 +45,31 @@ SQLite 仅有七张 checkpoint 表：`daily_runs`、`snapshots`、`audit_items`�
 | Runner | `scripts\run_incremental_price_audit_scheduled.ps1` |
 | Start in | 仓库根目录 |
 | Principal | 注册时的交互用户,`LogonType Interactive` + `RunLevel Limited`(S4U 需先验证网络/cookie/profile,未验证不切换) |
-| Trigger | 每周一至周五共四个 trigger：09:00 起每 15 分钟唤醒至 16:45；17:00 起每 5 分钟唤醒至 17:55；18:00 起每 5 分钟唤醒至 20:00；另加 20:35 一次性 Safety Closeout（最后一次自动启动 20:35） |
+| Trigger | 每周一至周五共四个 trigger：09:00 起每 15 分钟唤醒至 16:45；17:00 起每 3 分钟唤醒至 17:57；18:00 起每 5 分钟唤醒至 20:00；另加 20:35 一次性 Safety Closeout（最后一次自动启动 20:35） |
 | Multiple instances | **IgnoreNew** |
 | Application budget | tick/harvest-only **720 秒**；closeout **1680 秒** |
 | ExecutionTimeLimit | **32 分钟（1920 秒）** |
 
 runner 是一次性有限进程，不含常驻 daemon。09:00-16:00 整点运行 `tick`；09:15-16:45 的白天非整点
 15 分钟唤醒运行 `harvest-only`（只回收已存在的招商局 remote jobs：不查 SaaS、不跑 Detail/Model、不
-submit、不 finalize；本地无 eligible remote job 时纯本地 NOOP，不请求招商局）。17:00-17:50 每 5 分钟
-运行一次 `tick`（17 点是 SaaS 新数据高峰，提高启动机会；单轮超时不并发，靠 IgnoreNew 丢弃重叠
-trigger）；**17:55 只运行 `harvest-only`**，优先排空 17 点已创建的招商局远端任务，不产生新 discovery、
-新 ADD 或新 remote create。18:00-20:00 每 5 分钟提供一次 `closeout` 启动机会，
+submit、不 finalize；本地无 eligible remote job 时纯本地 NOOP，不请求招商局）。17:00-17:57 每 3 分钟
+运行一次完整 `tick`（harvest、reconcile、local fallback eligibility/execution 均在场；单轮超时不并发，靠
+IgnoreNew 丢弃重叠 trigger）。不再保留 17:55 harvest-only 特例。18:00-20:00 每 5 分钟提供一次 `closeout` 启动机会，
 **20:00 是 5 分钟窗口的最后一次**；20:35 是一次性的 Safety Closeout，也是当天最后一次自动启动：
 19:55 的 closeout 运行超过 5 分钟时 20:00 trigger 会被 IgnoreNew 丢弃，若该轮随后以 WAITING_REMOTE
 结束，当天仍由 20:35 补一次自动 closeout（20:00 起跑的一轮最晚 20:32 被 32 分钟硬上限终止，20:35
 必可启动；当天已 FINALIZED 时按现有幂等语义直接 NOOP，不重写 final.xlsx）。20:36 后不再有任何
 自动调度，即使被人工误调用也会快速空操作退出。
+
+### 增量自动本地兜底
+
+该策略只属于日常 incremental scheduler，与完整 STEP_1 的人工 manifest 授权入口相互独立：
+
+- 09:00-16:59：远端任务开始满 60 分钟后的第一个完整 tick，先做最终招商局查询，仍无有效价格才进入本地兜底。
+- 17:00-17:59：第一次远端检查只落账 `last_remote_check_at`；至少 3 分钟后的下一次完整 tick 再最终查询，无价格才以 `PEAK_3M` 兜底。
+- 18:00 以后：closeout 先最终 harvest，再以 `AFTER_1800` 立即处理受支持的 unresolved URL，然后重新计算 blockers。
+
+自动范围固定为 `nbdeli / guangbo / ofs / lxwlmall / qstbg / ycw / comix / tima`。每个 exact URL 原子 claim，partial job 只发送仍未取得可信价格的 URL；remote `NO_RESULT` / `TERMINAL_FAILED` 是无有效价格的证据，仍可进入本地兜底。最终远端查询若重新取得有效招商局价格则先用远端价格解决该 exact URL，不启动本地爬虫。本地 SUCCESS 可用 `本地兜底:<site>` 价格覆盖该 exact URL 的 remote 终态；本地失败或崩溃保留原 remote 终态及证据，本地 ledger 最多尝试 2 次且耗尽后不再 claim，同一轮不 tight-loop。验证码、登录墙、风控、外来/重复 URL、manifest 不一致和非法价格均 fail-closed，输入预检与输出解析均按站隔离，不把单站错误扩散到其他站。multi-site child 的 exit 2/3 不抹去其他站已严格校验的成功 XLSX；缺失或损坏的站点单独失败/风控停止。最终远端检查后、逐项 claim 时以及真正启动 child 前都重新检查 live tick 预算；扣除 heavy-work reserve 后不足 60 秒不启动 child，未启动的 claim 退还尝试次数、留待下轮，child timeout 不超过启动时剩余可用预算。招商局迟到结果不得覆盖 local SUCCESS；若远端状态仍为 `SUBMIT_UNKNOWN` 或 `MANUAL_REQUIRED`，但其关联 URL 已全部由可信结果解决，该陈旧任务状态不再阻塞 finalization。最终失败链接投影也按 exact `(mall, original_url)` 判定：`SUCCESS`、结果 JSON 可解析、价格语义有效且来源为 `本地兜底:*` 的 URL 不再追加“爬取失败”，同一 remote job 的其他 `NO_RESULT`、terminal 或仍未解决 URL 继续分别输出失败行。
 closeout 在一个进程内持续推进，不为下一个 5 分钟唤醒等待：SaaS 稳定观察最快每 300 秒一次，
 招商局 full sweep 最快每 600 秒一次（单批最多 6 个，一轮覆盖全部 eligible remote jobs）。18:00 后只要
 最近 authoritative 观测的 `row_count` 与 `ordered_hash` 连续 600 秒一致且本次分页完整，即可 freeze
@@ -146,7 +155,7 @@ Arguments,再 `-Apply`,然后用 `status_incremental_price_audit_tasks.ps1` 复�
    退出码 70/74 仅对应启动失败/日志写失败并在日志中有对应诊断行。
 
 脚本固定使用 legacy 招商局 backend、`MultipleInstances=IgnoreNew`、三重复 trigger 加 20:35 一次性
-Safety Closeout（白天 15 分钟、17:00-17:55 与 18:00-20:00 每 5 分钟、20:35 一次）和 32 分钟硬上限。
+Safety Closeout（白天 15 分钟、17:00-17:57 每 3 分钟、18:00-20:00 每 5 分钟、20:35 一次）和 32 分钟硬上限。
 若发现旧的 `-Tick` / `-Finalize` 双任务仍存在，注册会拒绝继续，而不会暗中删除或制造竞争任务。
 注册身份沿用当前项目的交互式低权限用户上下文；机器关机或用户未登录时不会强行改用另一套凭证。
 
@@ -190,8 +199,10 @@ watchdog 和 `max-iterations` 是额外保险。已经 `COMPLETED` 的 job 不�
 
 命令可重复触发：未 drain 时保持 `FINALIZING`，只有 Detail/Model/crawl/remote pending 时按正常等待退出；terminal、未规划 crawl、
 无效价格、remote `MANUAL_REQUIRED`、非法 remote state 或产物冲突才作为可操作阻塞返回非零。关联 frozen
-mandatory crawl 的 remote job 必须全部为 `COMPLETED`；即使 crawl 已写成 `SUCCESS`，remote 仍为
-`RUNNING` 或 `EXPORTED` 也禁止生成 formal artifact。命令总预算至少还剩 60 秒才开始正式物化，
+mandatory crawl 的 remote job 通常必须全部为 `COMPLETED`；唯一例外是
+`remote_job_is_closed_by_local_fallback(...)` 已证明该 job 的每条关联 crawl 均为有效 `SUCCESS`，且至少一条
+来自 `本地兜底:*`。只有这个 exact-link 全量闭合证明成立时，陈旧 remote 状态才不阻塞 formal artifact；
+任一关联 URL 仍是 `NO_RESULT`、terminal 或 unresolved 时都不能按 job 级别放行。命令总预算至少还剩 60 秒才开始正式物化，
 否则 checkpoint 后交给下一次 `drain-only`。完成后 workbook/manifest 只会复用同一 frozen artifact，
 输出路径 intent 在落盘前已唯一登记，冲突不会先写出第二份正式文件。
 物化前先以私有 intent 固定本次输入 hash 和最终 metrics（不作为 finalized 指标发布）。workbook/manifest
@@ -348,6 +359,8 @@ formal output path。`NO_RESULT` 价格留空，真实零价保留为 0，未决
 
 - `--shadow` 是默认模式：runtime 装配 SaaS/中核发现、Detail、模型，以及已记录任务的 legacy
   `wait-export-only` / 精确 unknown-submit 对账，但没有 crawl planner 或 submitter，不能创建招商局任务。
+  它不是本地网络 dry-run：已有 remote job 满足上文时间、最终远端查询成功和 exact URL 原子 claim 门禁时，
+  仍会执行固定 revision 的 8 站本地自动兜底并持久化结果；不得将生产业务日 shadow tick 当作零网络 canary。零本地请求验证只用 fake dependencies / sandbox / fixture。
 - `--enable-remote-writes` 才接通受控 legacy `create-only`；旧名 `--enable-zhaoshang` 暂作兼容别名。
   它先把精确成员、模板和 immutable payload 持久化，
   再发起正式建任务。它是写能力，必须有明确授权；注册预览默认不携带该参数，生产注册必须显式加入。
@@ -400,7 +413,7 @@ task name 使用业务日和 immutable 请求集生成同日稳定、跨日不�
   普通 RUNNING 的 blocker 语义不变。该状态在 `status` 的 `remote.recovery_exhausted` 计数。
 - 每次命令都会安全更新该业务日的 `BATCH_STATE.md`；SQLite 仍是状态权威。重叠实例正常返回 0，
   可恢复 pending/defer 返回 0，`FAILED`、人工项或正式产物阻塞返回非零。
-- 不要在此调度中加入审批、驳回、通过、保存、提交、推送、本地 crawler fallback 或任何 SQL。
+- 不要在此调度中加入审批、驳回、通过、保存、提交、推送、任何 SQL，或内建固定 8 站策略之外的本地 crawler 入口；自动本地兜底只能遵守上文 exact URL、最终远端查询成功、原子 claim 和 fail-closed 门禁。
 
 ## 每日核对
 

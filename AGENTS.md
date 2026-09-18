@@ -46,7 +46,7 @@
 5. 禁止执行任何 SQL,仅两个窄例外:既有招商局工具对本轮当前任务执行的优先级范围查询及 `weight_type=-1` 参数化更新;以及 `STEP_1 Dashboard SaaS Flow Diagnostic`(`app/services/saas_flow_diagnostic.py`)用指定只读数据库账号执行后端预定义、参数化 SELECT,scope 永久固定 `tenant_id=188605`、`commodity_pool_id=222`。浏览器与 API 不得提交或接受任何 SQL 文本、tenant、pool、schema、表名;只允许 SELECT/read-only CTE,禁止 UPDATE/DELETE/INSERT/REPLACE/MERGE/TRUNCATE/DROP/ALTER/CREATE 等一切 DML/DDL,也不提供执行 SQL、priority 调整、审批、驳回、重试、建任务等写入口。该例外不扩散到旧 `/diagnose` API、普通 workflow、STEP_2、STEP_3 或其他 Agent SQL;数据库故障只降级 SaaS Flow 面板,不影响主看板。
 6. 招商局优先级只能通过既有受控工具执行。必须以精确 task_name 取得 taskNumber 和配置 mall code，并传入本次 payload 的有效子任务数；用 mall 索引、marker 时间窗轮询到数量一致的子任务主键，再按主键当前读锁定和更新。不得把 taskNumber 当唯一标识，不得手写临时 SQL、放宽主键范围、改其他字段或试探其他表。
 7. 只有日志存在 `affected_rows>0` 才能报告“已提优”。若主键范围预查已全部为 `weight_type=-1`，只记录“已验证为最高优先级”的幂等状态，不称为本次提优。`task_status` 只表示采集进度，不得用于过滤 priority 查询或更新；无论任务正在执行还是已经完成，全部精确有效子任务都必须回读确认为 `weight_type=-1`。其他实际更新 0 行、回读不一致或异常必须暂停。
-8. 招商局失败、未覆盖、导出无价格或仍有缺价时，先生成清单并暂停。只有用户对本批次明确授权，才允许运行指定本地脚本。
+8. 完整 STEP_1 或人工 multi-site 流程遇到招商局失败、未覆盖、导出无价格或仍有缺价时，先生成清单并暂停；只有用户对本批次明确授权，才允许运行指定本地脚本。唯一例外是 `docs/runbooks/STEP_1_INCREMENTAL_SCHEDULER.md` 定义的固定 8 站增量自动兜底：最终远端查询成功后，仍无有效价格的 exact URL（含 remote `NO_RESULT` / `TERMINAL_FAILED`）可原子 claim，无需逐批二次授权；本地失败不得覆盖原 remote 终态证据。incremental `--shadow` 只关闭招商局建任务/重启写能力，不关闭既有任务的只读 harvest，也不关闭满足门禁后的该内建本地兜底；此例外不得扩散到完整 STEP_1、第三步或其他脚本。
 9. 不绕验证码、不自动登录、不破解权限、不注入 stealth、不轮换 UA、不使用代理池。遇到 403、405、验证码或登录限制时停止并记录。
 10. 不打印、不持久化真实 API Key、Cookie、Token、账号、密码、数据库连接串或登录态 cURL。文档只能写变量名、路径和占位符。
 11. 不覆盖 `data/` 输入或历史 `runtime/` 批次；每次生产运行使用新时间戳目录。不得删除或清理用户文件，除非用户明确要求。
@@ -55,7 +55,7 @@
 
 ## 5. 授权判定
 
-- 用户明确说“跑第一步全流程”，即授权本批次必要的只读查询、模型调用、招商局正式建任务和受控优先级调整；不授权本地脚本兜底。
+- 用户明确说“跑第一步全流程”，即授权本批次必要的只读查询、模型调用、招商局正式建任务和受控优先级调整；不授权人工本地脚本兜底。增量 Scheduler 的固定 8 站自动兜底仅按上一节窄例外执行。
 - 第一步不默认授权驳回或通过。只有用户在审计表生成后再次指定准确 Excel 路径、颜色范围和动作，才授权该文件当次的受控驳回或通过；授权不得沿用到另一动作、其他文件或批次，预览锁定后候选数或清单 SHA-256 改变必须暂停并重新授权。
 - 受控补推不因用户给出 cURL 或文档 ID 清单而自动获得写授权。必须先生成新批次预览；用户随后明确指定该批次目录、`push_candidate_count`、`execution_plan_sha256` 并再次说“执行补推”，才授权当次写入。预览后必须说明执行会在写前原子刷新 `data/auth_state.json`；用户的二次执行授权同时视为同意本批次这一次认证刷新。任何已手工发送、超时或结果不确定的关系 `id` 都不得自动重试。
 - 用户明确说“跑第二步”，只授权中核列表和 SaaS 监控只读查询。

@@ -68,6 +68,7 @@ from app.services.customer_prewarm_store import (
 )
 from app.services.daily_audit_store import DailyAuditStore, LeaseToken
 from app.services.incremental_audit_runtime import runtime_paths
+from app.services.page_price_semantics import is_local_fallback_success
 
 def harvest_existing_customer_prewarm_job(**kwargs: Any) -> dict[str, Any]:
     """Lazy bridge to the recovery primitive.
@@ -121,10 +122,10 @@ WHERE j.state = 'SUBMIT_UNKNOWN'
 ORDER BY j.id
 """
 
-_CRAWL_STATES_FOR_JOB_SQL = """
-SELECT c.state AS state
+_CRAWLS_FOR_EXACT_IDENTITY_SQL = """
+SELECT c.*
 FROM crawl_work c
-WHERE c.remote_job_id = ?
+WHERE c.mall_key = ? AND c.exact_url = ?
 ORDER BY c.id
 """
 
@@ -327,16 +328,23 @@ def plan_lifecycle_actions(
     }
 
 
-def _crawl_states_for_job_readonly(state_db_path: str | Path, job_id: int) -> list[str]:
-    """``mode=ro`` probe: the crawl row states bound to one remote job."""
+def _crawls_for_exact_identity_readonly(
+    state_db_path: str | Path,
+    mall: str,
+    original_url: str,
+) -> list[dict[str, Any]]:
+    """Read crawl evidence for one exact candidate identity without writes."""
     connection = _open_state_db_readonly(state_db_path)
     if connection is None:
         return []
     try:
-        rows = connection.execute(_CRAWL_STATES_FOR_JOB_SQL, (int(job_id),)).fetchall()
+        rows = connection.execute(
+            _CRAWLS_FOR_EXACT_IDENTITY_SQL,
+            (str(mall or ""), str(original_url or "")),
+        ).fetchall()
     finally:
         connection.close()
-    return [str(row["state"] or "") for row in rows]
+    return [dict(row) for row in rows]
 
 
 def _failed_link_reason(
@@ -387,7 +395,10 @@ def failed_customer_link_rows(
     two remote statuses can carry a binding, so they are the only candidates
     enumerated.  Output granularity is the current-day document observation,
     not the cross-day candidate: one URL observed by two documents yields two
-    rows, while documents observed only on another day never leak in.
+    rows, while documents observed only on another day never leak in.  A
+    candidate with valid local-fallback SUCCESS evidence for that exact
+    ``(mall, original_url)`` is already resolved and is not projected; sibling
+    URLs on the same remote job keep their independent failure disposition.
 
     Every probe is ``mode=ro`` (missing state DBs / stores yield fewer rows,
     never a write); a candidate whose linkage probes fail is skipped fail-open,
@@ -427,9 +438,14 @@ def failed_customer_link_rows(
             owning_day, job_row = _owning_day_job(
                 prewarm_store, candidate_id, int(raw_job_id), business_date, job_reader, probe_errors
             )
-            crawl_states = _crawl_states_for_job_readonly(
-                runtime_paths(owning_day, state_root).state_path, int(raw_job_id)
+            exact_crawls = _crawls_for_exact_identity_readonly(
+                runtime_paths(owning_day, state_root).state_path,
+                str(candidate["mall"] or ""),
+                str(candidate["original_url"] or ""),
             )
+            if any(is_local_fallback_success(crawl) for crawl in exact_crawls):
+                continue
+            crawl_states = [str(crawl.get("state") or "") for crawl in exact_crawls]
             used = prewarm_store.remote_job_link_count(business_date, candidate_id)
             reason = _failed_link_reason(
                 job_row=job_row,

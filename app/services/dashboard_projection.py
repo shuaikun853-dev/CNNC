@@ -851,6 +851,7 @@ def build_dashboard_summary(
         "recent_days": project_recent_days(runtime_root, n=14),
         "scheduler": project_scheduler_status(),
         "status": status,
+        "local_fallback": dict((status.get("metrics") or {}).get("local_fallback") or {}),
     }
     payload["fingerprint"] = fingerprint_payload(payload)
     return payload

@@ -49,7 +49,7 @@ const path = require("path");
 // 2026-09-10:#cnnc-auth-login 初始 style 为空(index.html 不再 display:none,
 // 重新登录入口常驻);#cnnc-auth 返回可变 details 对象(自动展开断言)。
 const cnncFakeElements = new Map();
-const cnncKnownSelectors = new Set(["#cnnc-auth", "#cnnc-auth-chips", "#cnnc-auth-meta", "#cnnc-auth-login", "#closeout-btn", "#force-closeout-btn"]);
+const cnncKnownSelectors = new Set(["#cnnc-auth", "#cnnc-auth-chips", "#cnnc-auth-meta", "#cnnc-auth-login", "#closeout-btn", "#force-closeout-btn", "#local-fallback-counts", "#local-fallback-reasons", "#local-fallback-sites", "#local-fallback-links"]);
 global.document = {
   addEventListener() {},
   querySelector(sel) {
@@ -79,7 +79,8 @@ const { createPollController, createSaasFlowPoller, safeProgressText, sfPartialN
         armRebuildDrawerSwitch, resolveRebuildDrawerSwitch,
         rebuildOutcomeAdmitsLocalSupersede,
         cpStatusCn, cpStatusPill, cpRowMatchesFilter, cpSortRows,
-        piStatusText, piStatusWord, piWorkingTreeText } = require(
+        piStatusText, piStatusWord, piWorkingTreeText,
+        localFallbackView, renderLocalFallback } = require(
   path.join(__dirname, "..", "..", "app", "static", "dashboard", "app.js"));
 
 let failed = 0;
@@ -92,6 +93,28 @@ function check(name, cond, detail) {
   }
 }
 const flush = () => new Promise((resolve) => setImmediate(resolve));
+
+function test_local_fallback_visible_metrics() {
+  const html = require("fs").readFileSync(
+    path.join(__dirname, "..", "..", "app", "static", "dashboard", "index.html"), "utf-8");
+  check("本地兜底 DOM hook 存在", html.includes('id="local-fallback-counts"') &&
+    html.includes('id="local-fallback-reasons"') && html.includes('id="local-fallback-sites"') &&
+    html.includes('id="local-fallback-links"'));
+  const data = {
+    pending: 2, running: 1, success: 3, remote_success: 1, failed: 1,
+    reasons: { PEAK_3M: 3, AFTER_1800: 1 },
+    sites: { qstbg: { pending: 1, running: 0, success: 2, remote_success: 1, failed: 0 } },
+    links: [{ mall_key: "qstbg", exact_url: "https://www.qstbg.com/gd/detail.do?goods_id=1", state: "SUCCESS", source: "本地兜底:qstbg" }],
+  };
+  renderLocalFallback(data);
+  check("本地兜底计数可见", cnncFakeElements.get("#local-fallback-counts").textContent ===
+    "待处理 2 · 运行中 1 · 本地成功 3 · 远端抢先 1 · 失败 1");
+  check("本地兜底原因可见", cnncFakeElements.get("#local-fallback-reasons").textContent.includes("PEAK_3M 3"));
+  check("本地兜底商城可见", cnncFakeElements.get("#local-fallback-sites").textContent.includes("qstbg 待处理 1"));
+  check("本地兜底逐链接来源可见", cnncFakeElements.get("#local-fallback-links").textContent.includes("本地兜底:qstbg") &&
+    cnncFakeElements.get("#local-fallback-links").textContent.includes("goods_id=1"));
+  check("本地兜底缺失数据安全", localFallbackView(null).counts.includes("待处理 0"));
+}
 
 function makeClock() {
   const timers = new Map();
@@ -1638,6 +1661,7 @@ function test_production_identity_seams() {
   test_rebuild_local_supersede_gate();
   test_rebuild_drawer_switch_seam();
   test_production_identity_seams();
+  test_local_fallback_visible_metrics();
   if (failed === 0) { console.log("ALL PASS"); process.exit(0); }
   console.error(failed + " failing checks");
   process.exit(1);

@@ -1,8 +1,8 @@
 """Scheduler-frequency contracts: trigger timeline + IgnoreNew overlap model.
 
-The late-day high-frequency windows (17:00-17:50 full ticks, the 17:55
-harvest-only drain, and 18:00-20:00 closeout start opportunities, all every 5
-minutes) must raise idle-response speed without ever producing a second
+The late-day high-frequency windows (17:00-17:57 full ticks every 3 minutes
+and 18:00-20:00 closeout start opportunities every 5 minutes) must raise
+idle-response speed without ever producing a second
 production writer.  These tests derive the real weekday trigger timeline from
 the registration script's preview JSON and simulate Task Scheduler's
 ``MultipleInstances=IgnoreNew`` behaviour for representative run durations.
@@ -110,7 +110,7 @@ def _as_hhmm(moment: datetime) -> str:
     return moment.strftime("%H:%M")
 
 
-PEAK_FULL_TICKS = [f"17:{minute:02d}" for minute in range(0, 55, 5)]  # 17:00-17:50
+PEAK_FULL_TICKS = [f"17:{minute:02d}" for minute in range(0, 60, 3)]
 CLOSEOUT_SLOTS = [f"{hour:02d}:{minute:02d}" for hour in (18, 19) for minute in range(0, 60, 5)] + [
     "20:00"
 ]
@@ -125,13 +125,13 @@ def test_trigger_plan_covers_baseline_peak_and_closeout_windows():
     assert slots[:32] == [
         f"{hour:02d}:{minute:02d}" for hour in range(9, 17) for minute in (0, 15, 30, 45)
     ]
-    # Peak window: every 5 minutes from 17:00 through the 17:55 drain slot.
-    assert slots[32:44] == [f"17:{minute:02d}" for minute in range(0, 60, 5)]
+    # Peak window: every 3 minutes from 17:00 through 17:57, all full ticks.
+    assert slots[32:52] == PEAK_FULL_TICKS
     # Closeout window: every 5 minutes from 18:00 through the last 5-minute
     # start at 20:00, then the one-shot 20:35 safety closeout.
-    assert slots[44:69] == CLOSEOUT_SLOTS
-    assert slots[69:] == ["20:35"]
-    assert len(slots) == 70
+    assert slots[52:77] == CLOSEOUT_SLOTS
+    assert slots[77:] == ["20:35"]
+    assert len(slots) == 78
     assert slots[0] == "09:00" and slots[-1] == "20:35"
     # No trigger fires before 09:00 or after the 20:35 safety closeout.
     assert all("09:00" <= slot <= "20:35" for slot in slots)
@@ -143,7 +143,7 @@ def test_trigger_plan_covers_baseline_peak_and_closeout_windows():
         ]
 
 
-def test_two_minute_peak_ticks_use_every_five_minute_slot():
+def test_two_minute_peak_ticks_use_every_three_minute_slot():
     times = _weekday_trigger_times(_run_register_preview())
     started, skipped = _simulate_ignore_new(
         times, _durations({slot: 2 for slot in PEAK_FULL_TICKS}, _small_default)
@@ -165,13 +165,13 @@ def test_six_and_nine_minute_peak_ticks_skip_overlaps_without_pileup():
         peak_started = [
             _as_hhmm(moment) for moment, _ in started if _as_hhmm(moment) in PEAK_FULL_TICKS
         ]
-        # A run longer than the 5-minute grid naturally skips the slots it
+        # A run longer than the 3-minute grid naturally skips the slots it
         # overlaps; the next free grid point always starts, so skipped
         # triggers are dropped (never queued) and nothing accumulates.  Both
-        # 6- and 9-minute ticks land on a stable every-10-minute cadence.
-        assert peak_started == [f"17:{minute:02d}" for minute in range(0, 55, 10)]
+        # 6- and 9-minute ticks land on stable matching cadences.
+        assert peak_started == [f"17:{minute:02d}" for minute in range(0, 60, minutes)]
         if minutes == 6:
-            assert "17:05" in [_as_hhmm(moment) for moment in skipped]
+            assert "17:03" in [_as_hhmm(moment) for moment in skipped]
         # Every skip is attributable to a still-running instance: no trigger
         # is skipped while the system is idle.
         running = [end for _, end in started]
@@ -187,32 +187,29 @@ def test_six_and_nine_minute_peak_ticks_skip_overlaps_without_pileup():
         assert all(end - start >= timedelta(minutes=minutes) for start, end in started if _as_hhmm(start) in PEAK_FULL_TICKS)
 
 
-def test_nine_minute_1730_tick_drops_1735_and_1740_starts():
-    # Section 9 Case 1: the 17:30 full tick runs 9 minutes; the 17:35 trigger
-    # cannot create a second production writer, and after the 17:39 exit the
-    # 17:40 trigger starts a new tick normally.
+def test_nine_minute_1730_tick_drops_1733_and_1736_starts_1739():
+    # A 17:30 full tick runs 9 minutes; 17:33/17:36 are dropped, then 17:39 starts.
     times = _weekday_trigger_times(_run_register_preview())
     started, skipped = _simulate_ignore_new(times, _durations({"17:30": 9}, _small_default))
 
     slots_started = [_as_hhmm(moment) for moment, _ in started]
-    assert "17:30" in slots_started and "17:40" in slots_started
-    assert "17:35" in [_as_hhmm(moment) for moment in skipped]
+    assert "17:30" in slots_started and "17:39" in slots_started
+    assert {"17:33", "17:36"}.issubset({_as_hhmm(moment) for moment in skipped})
     seventeen_thirty = next(end for moment, end in started if _as_hhmm(moment) == "17:30")
     assert seventeen_thirty.strftime("%H:%M") == "17:39"
 
 
-def test_1750_tick_blocks_1755_drain_but_not_the_1800_closeout():
-    # Section 9 Case 2: a 17:50 full tick still running at 17:55 drops that
-    # harvest-only trigger via IgnoreNew; once it exits, the 18:00 closeout
-    # starts on time.
+def test_1751_tick_blocks_1754_and_1757_but_not_1800_closeout():
+    # A 17:51 full tick runs 9 minutes, dropping the final two peak ticks;
+    # it exits exactly at 18:00 so closeout starts on time.
     times = _weekday_trigger_times(_run_register_preview())
-    started, skipped = _simulate_ignore_new(times, _durations({"17:50": 9}, _small_default))
+    started, skipped = _simulate_ignore_new(times, _durations({"17:51": 9}, _small_default))
 
     slots_started = [_as_hhmm(moment) for moment, _ in started]
-    assert "17:55" in [_as_hhmm(moment) for moment in skipped]
+    assert {"17:54", "17:57"}.issubset({_as_hhmm(moment) for moment in skipped})
     assert "18:00" in slots_started
-    seventeen_fifty = next(end for moment, end in started if _as_hhmm(moment) == "17:50")
-    assert seventeen_fifty.strftime("%H:%M") == "17:59"
+    seventeen_fifty_one = next(end for moment, end in started if _as_hhmm(moment) == "17:51")
+    assert seventeen_fifty_one.strftime("%H:%M") == "18:00"
 
 
 def test_twelve_minute_closeout_drops_two_triggers_and_1815_restarts():
@@ -287,7 +284,7 @@ def test_never_more_than_one_production_writer_in_any_scenario():
         {slot: 2 for slot in PEAK_FULL_TICKS},   # fast ticks
         {slot: 6 for slot in PEAK_FULL_TICKS},   # medium ticks
         {slot: 9 for slot in PEAK_FULL_TICKS},   # slow ticks
-        {"17:50": 9},                             # peak drain collision
+        {"17:51": 9},                             # final peak collision
         {"18:00": 12},                            # closeout overlap
         {"18:00": 20},                            # long closeout
         {"18:00": 28},                            # closeout at full budget
@@ -302,10 +299,10 @@ def test_never_more_than_one_production_writer_in_any_scenario():
             assert next_start >= end
 
 
-def test_five_minute_batches_wait_at_most_one_slot_under_fast_ticks():
-    # Section 12 throughput: with new SaaS batches landing every 5 minutes
+def test_peak_batches_wait_at_most_one_three_minute_slot_under_fast_ticks():
+    # With new SaaS batches landing on the peak grid
     # during the peak and full ticks finishing in 2 minutes, each batch is
-    # discovered by the slot it arrived on — at most ~5 minutes of wait for
+    # discovered by the slot it arrived on — at most 3 minutes of wait for
     # discovery plus the tick itself, versus up to 15 minutes of extra wait
     # under the old quarter-hour peak grid.
     times = _weekday_trigger_times(_run_register_preview())
@@ -318,4 +315,4 @@ def test_five_minute_batches_wait_at_most_one_slot_under_fast_ticks():
     for index in range(len(PEAK_FULL_TICKS)):
         arrival = WEEKDAY + _parse_clock(PEAK_FULL_TICKS[index])
         pickup = next(moment for moment in tick_starts if moment >= arrival)
-        assert pickup - arrival <= timedelta(minutes=5)
+        assert pickup - arrival <= timedelta(minutes=3)
