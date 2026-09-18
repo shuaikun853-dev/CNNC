@@ -470,7 +470,8 @@ def test_routing_blocked_candidate_reclassified_after_mapping_available(tmp_path
 
 
 
-def test_posted_link_with_pending_candidate_cannot_create_again_next_day(tmp_path, monkeypatch):
+@pytest.mark.parametrize("terminal_probe", [False, True])
+def test_posted_link_with_pending_candidate_cannot_create_again_next_day(tmp_path, monkeypatch, terminal_probe):
     runtime_root = tmp_path / "runtime"
     make_state_db(runtime_root, BUSINESS_DATE)
     prewarm = CustomerPrewarmStore(runtime_root / "customer_prewarm.sqlite3")
@@ -494,12 +495,30 @@ def test_posted_link_with_pending_candidate_cannot_create_again_next_day(tmp_pat
     assert prewarm.remote_job_link_for_candidate(candidate_id)["business_date"] == BUSINESS_DATE
 
     next_day = "2026-09-08"
-    make_state_db(runtime_root, next_day)
+    next_paths = make_state_db(runtime_root, next_day)
+    if terminal_probe:
+        with sqlite3.connect(next_paths.state_path) as connection:
+            run_id = connection.execute("SELECT id FROM daily_runs LIMIT 1").fetchone()[0]
+            connection.execute(
+                """INSERT INTO crawl_work
+                   (run_id, mall_key, source_id, sku_id, exact_url, backend_version,
+                    fingerprint, state, updated_at)
+                   VALUES (?, 'comix', 'SRC-COMIX', ?, ?, ?, 'terminal-probe',
+                           'TERMINAL_FAILED', '2026-09-08T00:00:00+00:00')""",
+                (run_id, prewarm_placeholder_sku("comix", "https://qx.com/post-link-crash.html"),
+                 "https://qx.com/post-link-crash.html", BACKEND_VERSION),
+            )
+    planned = run_prewarm_dispatch_pass(
+        prewarm, cache, business_date=next_day, runtime_root=runtime_root,
+        mappings=[COMIX], adapter=adapter, plan_only=True,
+    )
+    assert planned["new_remote_urls"] == 0
     run_prewarm_dispatch_pass(
         prewarm, cache, business_date=next_day, runtime_root=runtime_root,
         mappings=[COMIX], adapter=adapter,
     )
     assert adapter.submit_calls == 1
+    assert prewarm.candidate_by_id(candidate_id)["cache_status"] == CACHE_STATUS_PENDING_PREWARM
 
 
 def test_missing_link_cannot_prioritize_same_numbered_job_next_day(tmp_path):

@@ -658,6 +658,14 @@ def _plan_only_report(
             if hit is not None:
                 summary["cache_hit_after_recheck"] += 1
                 continue
+            try:
+                latest_link = prewarm_store.remote_job_link_for_candidate(candidate_id)
+            except Exception as exc:  # noqa: BLE001 - uncertain link cannot authorize create
+                phase_errors.append(f"candidate {candidate_id}: remote link probe failed; create omitted: {type(exc).__name__}: {exc}")
+                continue
+            if latest_link is not None and str(latest_link.get("business_date") or "") != business_date:
+                phase_errors.append(f"candidate {candidate_id}: prior-day remote link present; create omitted")
+                continue
             summary["mapped_zhaoshang"] += 1
             if routing.mall_key == "comix" and routing.host.endswith("qx.com"):
                 summary["comix_qx_count"] += 1
@@ -1188,7 +1196,12 @@ def _run_leased_pass(
                 continue
             if latest_link is not None and str(latest_link.get("business_date") or "") != summary["business_date"]:
                 probe = find_remote_work_for_url(paths.state_path, routing.mall_key, routing.lookup_url)
-                if (probe or {}).get("terminal_success") or (probe or {}).get("terminal_failed"):
+                exact_old_binding = (
+                    candidate.get("remote_job_id") is not None
+                    and int(latest_link.get("remote_job_id") or 0) == int(candidate["remote_job_id"])
+                    and str(latest_link.get("producer") or "") == PRODUCER_CUSTOMER_PREWARM_ZHAOSHANG
+                )
+                if exact_old_binding and ((probe or {}).get("terminal_success") or (probe or {}).get("terminal_failed")):
                     _record(
                         prewarm_store, candidate_id,
                         cache_status=CACHE_STATUS_REMOTE_DISPATCHED,
@@ -1201,6 +1214,12 @@ def _run_leased_pass(
                     continue
                 phase_errors.append(
                     f"candidate {candidate_id}: prior-day remote link present; create deferred"
+                )
+                _record(
+                    prewarm_store, candidate_id,
+                    cache_status=str(candidate["cache_status"]),
+                    error="prior-day remote link unresolved; manual review",
+                    phase_errors=phase_errors,
                 )
                 continue
             counters["mapped_zhaoshang"] += 1
