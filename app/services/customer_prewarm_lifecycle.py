@@ -49,6 +49,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from datetime import date
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
@@ -62,7 +63,6 @@ from app.services.customer_prewarm_dispatch import (
     _confirm_pending_priority_job,
     _reconstruct_prepared_job,
     _record,
-    _record_remote_job_link,
     _status_value,
     prewarm_crawl_fingerprint,
     prewarm_placeholder_sku,
@@ -236,6 +236,15 @@ def _owning_day_job(
         phase_errors.append(f"candidate {candidate_id}: latest remote job link mismatch")
         return owning_day, None
     link_date = str(link.get("business_date") or "")
+    try:
+        if (
+            date.fromisoformat(link_date).isoformat() != link_date
+            or date.fromisoformat(link_date) > date.fromisoformat(business_date)
+        ):
+            raise ValueError("noncanonical or future owning day")
+    except ValueError:
+        phase_errors.append(f"candidate {candidate_id}: invalid remote job owning day")
+        return owning_day, None
     if link_date and link_date != business_date:
         owning_day = link_date
     return owning_day, job_reader(int(job_id), owning_day)
@@ -444,6 +453,8 @@ def _failed_link_reason(
         return FAILED_LINK_REASON_REDISPATCH_EXHAUSTED
     if "NO_RESULT" in crawl_states:
         return FAILED_LINK_REASON_NO_RESULT
+    if str((job_row or {}).get("state") or "") == "MANUAL_REQUIRED":
+        return FAILED_LINK_REASON_TERMINAL
     if job_is_dead:
         if str((job_row or {}).get("state") or "") == "SUBMIT_UNKNOWN":
             return FAILED_LINK_REASON_SUBMIT_UNKNOWN
@@ -511,6 +522,8 @@ def failed_customer_link_rows(
             owning_day, job_row = _owning_day_job(
                 prewarm_store, candidate_id, int(raw_job_id), business_date, job_reader, probe_errors
             )
+            if job_row is None:
+                continue
             crawl_states = _crawl_states_for_job_readonly(
                 runtime_paths(owning_day, state_root).state_path, int(raw_job_id)
             )
@@ -927,22 +940,22 @@ def _redispatch_mall_group(
     def _bind_candidates(*, error: str | None = None) -> None:
         for entry in entries:
             candidate_id = int(entry["candidate"]["id"])
-            _record_remote_job_link(
-                prewarm_store,
-                business_date,
-                candidate_id,
-                job_id,
-                PRODUCER_CUSTOMER_PREWARM_ZHAOSHANG,
-                phase_errors,
-            )
-            _record(
-                prewarm_store,
-                candidate_id,
-                cache_status=str(entry["candidate"]["cache_status"]),
-                remote_job_id=job_id,
-                error=error,
-                phase_errors=phase_errors,
-            )
+            try:
+                bound = prewarm_store.bind_redispatched_remote_job(
+                    business_date,
+                    candidate_id,
+                    int(entry["candidate"]["remote_job_id"]),
+                    job_id,
+                    PRODUCER_CUSTOMER_PREWARM_ZHAOSHANG,
+                    error=error,
+                )
+            except Exception as exc:  # noqa: BLE001 - remote task already sent
+                phase_errors.append(
+                    f"redispatch candidate {candidate_id}: binding failed: {type(exc).__name__}: {exc}"
+                )
+                continue
+            if not bound:
+                phase_errors.append(f"redispatch candidate {candidate_id}: binding changed")
 
     if status == dispatch_service.SubmitStatus.SUBMIT_UNKNOWN.value:
         store.mark_submit_unknown(
