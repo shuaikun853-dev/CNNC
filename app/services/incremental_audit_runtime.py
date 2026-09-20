@@ -11,6 +11,7 @@ import json
 import hashlib
 import os
 import sqlite3
+import sys
 import time as monotonic_time
 import time as time_module
 from contextlib import contextmanager
@@ -152,6 +153,9 @@ _MODEL_RUNTIME_TUNING_KEYS = (
 )
 _BATCH_STATE_START = "<!-- incremental-runtime-state:start -->"
 _BATCH_STATE_END = "<!-- incremental-runtime-state:end -->"
+_BATCH_STATE_SNAPSHOT_DIR = "batch_state_snapshots"
+_BATCH_STATE_SNAPSHOT_GLOB = "BATCH_STATE_*.md"
+_BATCH_STATE_ALIAS_RETRY_DELAYS = (0.0, 0.05, 0.15)
 FINALIZE_MATERIALIZE_RESERVE_SECONDS = 60.0
 
 # CNNC 认证 provider 进程级单例（懒加载）。生产安静运行：logger=None。
@@ -913,6 +917,82 @@ def _is_recoverable_finalize_wait(readiness: FinalizeReadiness | None) -> bool:
     return is_recoverable_finalize_wait(readiness)
 
 
+def latest_batch_state_snapshot_path(paths: RuntimePaths) -> Path | None:
+    """Return the newest immutable human-status snapshot, if one exists."""
+    snapshot_dir = paths.run_dir / _BATCH_STATE_SNAPSHOT_DIR
+    if not snapshot_dir.is_dir():
+        return None
+    return max(snapshot_dir.glob(_BATCH_STATE_SNAPSHOT_GLOB), key=lambda item: item.name, default=None)
+
+
+def _write_batch_state_snapshot(
+    path: Path,
+    *,
+    managed_block: str,
+    event_line: str,
+    alias_status: str,
+) -> Path:
+    """Write one immutable status snapshot without replacing an existing file."""
+    snapshot_dir = path.parent / _BATCH_STATE_SNAPSHOT_DIR
+    snapshot_dir.mkdir(parents=True, exist_ok=True)
+    content = "\n".join((
+        "# Incremental price audit batch status snapshot",
+        f"legacy_batch_state: {path.name}",
+        f"legacy_alias_refresh: {alias_status}",
+        managed_block,
+        "",
+        "## Runtime event",
+        event_line.rstrip("\n"),
+        "",
+    ))
+    for attempt in range(4):
+        stamp = int(time_module.time_ns())
+        snapshot = snapshot_dir / (
+            f"BATCH_STATE_{stamp:020d}_{os.getpid()}_{attempt}.md"
+        )
+        try:
+            with snapshot.open("x", encoding="utf-8", newline="\n") as stream:
+                stream.write(content)
+                stream.flush()
+                os.fsync(stream.fileno())
+            return snapshot
+        except FileExistsError:
+            continue
+    raise FileExistsError("could not allocate a unique BATCH_STATE snapshot")
+
+
+def _refresh_legacy_batch_state_alias(path: Path, updated: str) -> str:
+    """Best-effort compatibility refresh; the immutable snapshot is the fallback."""
+    last_error: OSError | None = None
+    for delay in _BATCH_STATE_ALIAS_RETRY_DELAYS:
+        if delay > 0:
+            time_module.sleep(delay)
+        temporary = path.with_name(
+            f".{path.name}.{os.getpid()}.{time_module.time_ns()}.tmp"
+        )
+        try:
+            with temporary.open("x", encoding="utf-8", newline="\n") as stream:
+                stream.write(updated)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, path)
+            return "updated"
+        except OSError as exc:
+            last_error = exc
+        finally:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                # Best effort only: metadata temp cleanup must not reverse an
+                # already checkpointed business command on Windows.
+                pass
+    if last_error is None:
+        return "blocked"
+    winerror = getattr(last_error, "winerror", None)
+    suffix = f" winerror={winerror}" if winerror is not None else ""
+    return f"blocked {type(last_error).__name__}{suffix}"
+
+
 def _record_batch_result(
     paths: RuntimePaths,
     result: RuntimeResult,
@@ -954,27 +1034,42 @@ def _record_batch_result(
         safe_event["publication_blocked"] = blocker
         safe_event["error_type"] = result.publication_error_type or "FinalizeBlocked"
     event_line = f"- event: {json.dumps(safe_event, ensure_ascii=True, sort_keys=True)}\n"
+
+    def write_snapshot(alias_status: str) -> None:
+        try:
+            _write_batch_state_snapshot(
+                path,
+                managed_block=managed_block,
+                event_line=event_line,
+                alias_status=alias_status,
+            )
+        except OSError as exc:
+            # SQLite and remote-job checkpoints are authoritative.  Human
+            # handoff files must never turn an already checkpointed command
+            # into a false production failure.
+            print(
+                f"[batch-state] snapshot write skipped: {type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
+
     try:
         with _batch_state_update_lock(path):
-            existing = path.read_text(encoding="utf-8")
-            updated = _replace_batch_state_block(existing, managed_block)
-            if not updated.endswith("\n"):
-                updated += "\n"
-            updated += event_line
-            temporary = path.with_name(f".{path.name}.{os.getpid()}.{time_module.time_ns()}.tmp")
+            alias_status = "skipped unreadable legacy alias"
             try:
-                with temporary.open("x", encoding="utf-8", newline="\n") as stream:
-                    stream.write(updated)
-                    stream.flush()
-                    os.fsync(stream.fileno())
-                os.replace(temporary, path)
-            finally:
-                temporary.unlink(missing_ok=True)
+                existing = path.read_text(encoding="utf-8")
+            except OSError as exc:
+                alias_status = f"skipped unreadable {type(exc).__name__}"
+            else:
+                updated = _replace_batch_state_block(existing, managed_block)
+                if not updated.endswith("\n"):
+                    updated += "\n"
+                updated += event_line
+                alias_status = _refresh_legacy_batch_state_alias(path, updated)
+            write_snapshot(alias_status)
     except TimeoutError:
-        # SQLite and remote-job checkpoints are authoritative. Metadata lock
-        # contention must not turn an already checkpointed command into a
-        # false production failure; the next tick can refresh the handoff file.
-        return
+        # A unique snapshot does not need the compatibility lock.  Preserve the
+        # newest human-readable status even when another metadata writer owns it.
+        write_snapshot("skipped batch-state lock timeout")
 
 
 def _customer_index(rows: tuple[dict[str, Any], ...]) -> dict[str, dict[str, Any]]:
