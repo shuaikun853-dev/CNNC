@@ -465,14 +465,14 @@ python -m pytest tests\test_incremental_audit_runtime.py tests\test_incremental_
   `is_valid` 和提交后 `weight_type=-1` 回读仍是硬门。只有 durable nonretryable
   `PriorityScopeSafetyError`、exact customer-prewarm producer/link/payload identity、live terminal 六计数严格证明
   `total=finished=request count` 且其余计数全为 0 时，生命周期才可对原任务直接 harvest；该恢复路径不 `/add`、不提优、
-  不 disable/enable。任一证据缺失、冲突或失败继续保留 `MANUAL_REQUIRED`，但临时 probe 失败下轮仍可重试；同日正常 `SUBMITTED`/`RUNNING`/`EXPORTED` 队列保留每轮 3 个 slot，MANUAL 恢复使用独立每轮 1 个 slot 和 durable cursor，既不抢占正常 harvest，也不会让后续 MANUAL 永久饥饿。跨日恢复复用完全相同的 proof primitive 和 harvest core。
+  不 disable/enable。任一证据缺失、冲突或失败继续保留 `MANUAL_REQUIRED`，但临时 probe 失败下轮仍可重试；同日正常 `SUBMITTED`/`RUNNING`/`EXPORTED` 队列保留每轮 3 个 slot，并用独立 durable cursor 轮转，MANUAL 恢复使用独立每轮 1 个 slot、durable cursor 和预留时间片，既不抢占正常 harvest，也不会因正常 remote call 耗尽 deadline 而永久饥饿。跨日恢复复用完全相同的 proof primitive 和 harvest core。
   只有无诊断的确切 `NOT_FOUND` 消耗 recovery attempt；诊断为不确定的 NOT_FOUND 保留待重试。`MANUAL`/不完整 FOUND 原子记为带 provenance blocker 的 `MANUAL_REQUIRED`，不进入 A3；无 identity 且已 POST 或已有 harvest attempt 的 MANUAL_REQUIRED 也不得自动重建，但仍进入最终失败链接投影。A3 必须先确认 candidate 当前 job id 与最新 producer linkage 完全一致、owning day 是不晚于本轮的规范日期，避免跨日同号误判；重绑时 candidate 与 linkage 同事务提交，POST 前与客户扫描互斥且再次确认候选未变；POST 后绑定失败只按同一 durable intent 的既有远端身份重接，不重发。确切 NOT_FOUND 到 4 次后仍只由既有 A3 创建。历史 harvest 每轮最多 3 job、单 job 90 秒、独立 durable cursor；复用既有 ProcessLock+lease 原语，SUCCESS 按 exact job 镜像 shared cache，所有 scanner/backfill/harvest 通过同一 prewarm-store 同步锁串行，避免同一事件重复写缓存；下轮 candidate 吸收 CACHE_HIT。MANUAL 和确定性缓存同步失败都显式报阻断。`--plan-only` 用 `mode=ro` 统计两个跨日阶段，保持四库零写、零锁、零 adapter 和零远程 I/O。
 - 新产生的 `SUBMIT_UNKNOWN` 在持久化和 phase summary 中保留经脱敏的 submit diagnostic；无新事实的 generic
   harvest 不清空原诊断，FOUND 后才按既有状态迁移清除。每次 exact reconcile 将最近状态、脱敏原因、时间和
   recovery attempts 原子写入 recovery evidence；不确定结果不消耗 attempt，确切无诊断 `NOT_FOUND` 才计数。
   Dashboard drawer 展示错误阶段、分类、具体原因、更新时间、实时远端进度、自动对账次数/最近结果和下一步；
   历史诊断确已丢失时明确显示“原始提交诊断不可恢复”，不得猜测。投影层对 Token/Cookie/Authorization/API Key、
-  密码、camel/snake token/secret 字段、JWT、Windows（含空格）与 `/home`、`/tmp` 绝对路径做脱敏，不向浏览器新增 payload/input/result path。collapsed MANUAL 只有行内通用诊断而无可供看板验证的 durable priority reason 时，显示“提优确认 / 优先级未确认”，不得猜成 `PriorityScopeSafetyError`。
+  密码、camel/snake token/secret 字段、JWT、多值 Cookie、非 Bearer Authorization、Windows（含空格或无扩展名）与 `/home`、`/tmp` 绝对路径做脱敏；`SUBMIT_UNKNOWN` 在 durable 写边界即脱敏，不向 SQLite 或浏览器新增原始 secret/path。collapsed MANUAL 只有行内通用诊断而无可供看板验证的 durable priority reason 时，显示“提优确认 / 优先级未确认”，不得猜成 `PriorityScopeSafetyError`。
 
 ## 启用与回滚门槛
 

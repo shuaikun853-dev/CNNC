@@ -12,10 +12,18 @@ _SENSITIVE_KEY = (
     r"api(?:_|-)?key|authorization|cookie|password|secret|token"
 )
 _QUOTED_KEY_VALUE_RE = re.compile(
-    rf"(?i)(?P<key_quote>[\"'])(?P<key>{_SENSITIVE_KEY})(?P=key_quote)"
+    rf'(?i)(?:"(?P<double_key>{_SENSITIVE_KEY})"|\'(?P<single_key>{_SENSITIVE_KEY})\')'
     r"\s*[:=]\s*"
-    r"(?:(?P<value_quote>[\"'])[^\r\n]*?(?P=value_quote)|"
+    r'(?:(?:"(?:\\.|[^"\\])*")|(?:\'(?:\\.|[^\'\\])*\')|'
     r"(?:Bearer\s+)?[^\s,;]+)"
+)
+_AUTHORIZATION_RE = re.compile(
+    r"(?i)(?<![\w\"'-])(?P<key>authorization)\s*[:=]\s*"
+    r"(?:[A-Za-z][A-Za-z0-9_-]*\s+)?[^\s,;]+"
+)
+_COOKIE_RE = re.compile(
+    r"(?i)(?<![\w\"'-])(?P<key>cookie)\s*[:=]\s*"
+    r"(?:[^;\s,]+=[^;\s,]+(?:\s*;\s*[^;\s,]+=[^;\s,]+)*|[^\s,;]+)"
 )
 _KEY_VALUE_RE = re.compile(
     rf"(?i)(?<![\w-])(?P<key>{_SENSITIVE_KEY})\b"
@@ -26,6 +34,7 @@ _WINDOWS_PATH_RE = re.compile(
     r"(?i)(?<![\w])(?:[A-Z]:\\)(?:[^\\\r\n<>:\"|?*]+\\)+"
     r"[^\\\r\n<>:\"|?*]*?\.[A-Za-z0-9]{1,16}(?=$|[\s,;)\]])"
 )
+_WINDOWS_SIMPLE_PATH_RE = re.compile(r"(?i)(?<![\w])[A-Z]:\\[^\s,;\r\n)\]]+")
 _UNIX_PRIVATE_PATH_RE = re.compile(r"(?<![\w])/(?:home|tmp)/[^\s,;]+")
 
 
@@ -35,14 +44,18 @@ def sanitize_remote_diagnostic(value: object, *, max_length: int = 2000) -> str:
         text = str(value or "")
     except Exception:  # noqa: BLE001 - diagnostics must never break the caller
         text = "[UNPRINTABLE]"
-    text = _CONTROL_RE.sub(" ", text)
     text = _QUOTED_KEY_VALUE_RE.sub(
-        lambda match: f"{match.group('key')}=[REDACTED]", text
+        lambda match: f"{match.group('double_key') or match.group('single_key')}=[REDACTED]",
+        text,
     )
+    text = _AUTHORIZATION_RE.sub(lambda match: f"{match.group('key')}=[REDACTED]", text)
+    text = _COOKIE_RE.sub(lambda match: f"{match.group('key')}=[REDACTED]", text)
+    text = _CONTROL_RE.sub(" ", text)
     text = _KEY_VALUE_RE.sub(lambda match: f"{match.group('key')}=[REDACTED]", text)
     text = _BEARER_RE.sub("Bearer [REDACTED]", text)
     text = _JWT_RE.sub("[REDACTED]", text)
     text = _WINDOWS_PATH_RE.sub("[REDACTED_PATH]", text)
+    text = _WINDOWS_SIMPLE_PATH_RE.sub("[REDACTED_PATH]", text)
     text = _UNIX_PRIVATE_PATH_RE.sub("[REDACTED_PATH]", text)
     text = " ".join(text.split())
     if max_length <= 0:

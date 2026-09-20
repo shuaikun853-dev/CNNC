@@ -88,6 +88,7 @@ class _RemoteWorld:
         self.batch_state = run_dir / "BATCH_STATE.md"
         self.runner_calls: list[list[str]] = []
         self.priority_calls = 0
+        self.restart_calls = 0
         self.expected_subtask_count = 1
         self.export_steps: list = []
         self.progress_steps: list[dict[str, int]] = []
@@ -226,6 +227,10 @@ class _RemoteWorld:
             "finished": total,
         }
 
+    def restart_runner(self, *_args, **_kwargs):
+        self.restart_calls += 1
+        raise AssertionError("manual recovery must not restart/disable/enable the remote task")
+
     def adapter(self) -> CnncLegacyZhaoshangAdapter:
         return CnncLegacyZhaoshangAdapter(
             mappings=[],
@@ -233,6 +238,7 @@ class _RemoteWorld:
             runner=self.runner,
             priority_runner=self.priority_runner,
             progress_probe=self.progress_probe,
+            restart_runner=self.restart_runner,
         )
 
 
@@ -657,6 +663,7 @@ def test_automatic_lifecycle_harvests_exact_terminal_priority_manual_job(tmp_pat
     assert summary["harvest_attempted"] == 1
     assert summary["harvested"] == 1
     assert world.priority_calls == priority_calls_before
+    assert world.restart_calls == 0
     assert len([args for args in world.runner_calls if "--create-only" in args]) == 1
     assert len([args for args in world.runner_calls if "--wait-export-only" in args]) == 1
 
@@ -758,6 +765,7 @@ def test_cross_day_lifecycle_harvests_exact_terminal_priority_manual_job(tmp_pat
     assert summary["cross_day_harvested"] == 1
     assert summary["cross_day_harvest_cache_synced"] == 14
     assert world.priority_calls == priority_calls_before
+    assert world.restart_calls == 0
     assert len([args for args in world.runner_calls if "--create-only" in args]) == create_calls_before
     assert len([args for args in world.runner_calls if "--wait-export-only" in args]) == 1
 
@@ -769,7 +777,7 @@ def test_cross_day_lifecycle_harvests_exact_terminal_priority_manual_job(tmp_pat
         (
             "13_of_14",
             {"total": 14, "pending": 1, "running": 0, "failed": 0, "waiting_db": 0, "finished": 13},
-            "",
+            False,
             "PriorityScopeSafetyError",
             TASK_ID,
             "",
@@ -918,5 +926,6 @@ def test_automatic_lifecycle_keeps_unproven_priority_manual_fail_closed(
     )[0]
     assert refreshed["state"] == "MANUAL_REQUIRED", summary
     assert world.priority_calls == priority_calls_before
+    assert world.restart_calls == 0
     assert len([args for args in world.runner_calls if "--create-only" in args]) == create_calls_before
     assert not [args for args in world.runner_calls if "--wait-export-only" in args]

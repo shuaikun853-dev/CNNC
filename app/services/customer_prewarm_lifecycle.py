@@ -110,6 +110,7 @@ _DEAD_JOB_STATES = frozenset({"MANUAL_REQUIRED", "TERMINAL_FAILED"})
 _RECONCILE_MANUAL_BLOCKER = "prewarm reconcile identity conflict: "
 
 _ZHPQ_SKU_PREFIX = "zhpq-"
+_NORMAL_HARVEST_CURSOR = "same-day-normal-harvest"
 _MANUAL_HARVEST_CURSOR = "same-day-manual-harvest"
 
 _HARVEST_JOBS_SQL = """
@@ -133,7 +134,7 @@ def _harvest_row_is_candidate(job_row: Mapping[str, Any]) -> bool:
     return is_terminal_nonretryable_priority_manual_family(job_row)
 
 
-def _rotate_manual_targets(
+def _rotate_harvest_targets(
     targets: list[tuple[int, dict[str, Any]]], cursor_value: str | None
 ) -> list[tuple[int, dict[str, Any]]]:
     if not targets or not cursor_value:
@@ -1559,38 +1560,61 @@ def run_harvest_phase(
         if str(row.get("state") or "") == "MANUAL_REQUIRED"
     ]
     prewarm_store: CustomerPrewarmStore | None = None
-    if manual_targets:
+    if normal_targets or manual_targets:
         try:
             prewarm_path = Path(state_path).resolve().parent.parent / PREWARM_STORE_FILENAME
             if prewarm_path.is_file():
                 prewarm_store = CustomerPrewarmStore(prewarm_path)
-                manual_targets = _rotate_manual_targets(
+                normal_targets = _rotate_harvest_targets(
+                    normal_targets,
+                    prewarm_store.lifecycle_cursor(_NORMAL_HARVEST_CURSOR),
+                )
+                manual_targets = _rotate_harvest_targets(
                     manual_targets,
                     prewarm_store.lifecycle_cursor(_MANUAL_HARVEST_CURSOR),
                 )
-            else:
+            elif manual_targets:
                 phase_errors.append("manual harvest cursor unavailable: prewarm store missing")
         except Exception as exc:  # noqa: BLE001 - normal harvest must still run
             phase_errors.append(f"manual harvest cursor unavailable: {type(exc).__name__}: {exc}")
 
-    def attempt_target(job_id: int, job_row: dict[str, Any], *, manual: bool) -> bool:
-        if monotonic_value() >= deadline:
-            phase_errors.append(
-                f"budget deadline reached; harvest of job {job_id} deferred"
+    manual_reserve_seconds = 0.0
+    if manual_targets and int(manual_recovery_max_jobs) > 0:
+        remaining_budget = max(0.0, deadline - monotonic_value())
+        manual_reserve_seconds = min(
+            float(per_job_timeout_seconds), remaining_budget / 2
+        )
+
+    def attempt_target(
+        job_id: int,
+        job_row: dict[str, Any],
+        *,
+        manual: bool,
+        reserved_seconds: float = 0.0,
+    ) -> bool:
+        remaining = deadline - monotonic_value()
+        if remaining <= reserved_seconds:
+            reason = (
+                "manual recovery time reserved"
+                if remaining > 0 and reserved_seconds > 0
+                else "budget deadline reached"
             )
+            phase_errors.append(f"{reason}; harvest of job {job_id} deferred")
             return False
         summary["harvest_attempted"] += 1
         identity = str(job_row.get("remote_identity") or "")
         proof = None
+        if prewarm_store is not None:
+            cursor_name = _MANUAL_HARVEST_CURSOR if manual else _NORMAL_HARVEST_CURSOR
+            try:
+                prewarm_store.set_lifecycle_cursor(cursor_name, str(job_id))
+            except Exception as exc:  # noqa: BLE001 - isolate cursor persistence
+                phase_errors.append(
+                    f"{'manual' if manual else 'normal'} harvest cursor update: "
+                    f"{type(exc).__name__}: {exc}"
+                )
         if manual:
             summary["manual_recovery_attempted"] += 1
-            if prewarm_store is not None:
-                try:
-                    prewarm_store.set_lifecycle_cursor(_MANUAL_HARVEST_CURSOR, str(job_id))
-                except Exception as exc:  # noqa: BLE001 - isolate cursor persistence
-                    phase_errors.append(
-                        f"manual harvest cursor update: {type(exc).__name__}: {exc}"
-                    )
             proof = _terminal_priority_manual_live_proof(
                 state_path=state_path,
                 business_date=business_date,
@@ -1598,7 +1622,10 @@ def run_harvest_phase(
                 adapter=get_adapter(),
                 timeout_seconds=max(
                     0.001,
-                    min(float(per_job_timeout_seconds), deadline - monotonic_value()),
+                    min(
+                        float(per_job_timeout_seconds),
+                        deadline - monotonic_value() - reserved_seconds,
+                    ),
                 ),
             )
             if proof is None:
@@ -1616,7 +1643,10 @@ def run_harvest_phase(
                 adapter=get_adapter(),
                 timeout_seconds=max(
                     0.001,
-                    min(float(per_job_timeout_seconds), deadline - monotonic_value()),
+                    min(
+                        float(per_job_timeout_seconds),
+                        deadline - monotonic_value() - reserved_seconds,
+                    ),
                 ),
                 live_identity_proof=proof,
             )
@@ -1641,7 +1671,12 @@ def run_harvest_phase(
                 f"harvest cap {max_jobs} reached; job {job_id} deferred to next pass"
             )
             break
-        if not attempt_target(job_id, job_row, manual=False):
+        if not attempt_target(
+            job_id,
+            job_row,
+            manual=False,
+            reserved_seconds=manual_reserve_seconds,
+        ):
             break
         attempted += 1
 

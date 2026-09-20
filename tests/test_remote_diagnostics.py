@@ -24,8 +24,23 @@ from app.services.remote_diagnostics import sanitize_remote_diagnostic
         ("Authorization=Bearer x", "x", "Authorization=[REDACTED]"),
         ("Cookie=x", "x", "Cookie=[REDACTED]"),
         ("cookie: x", "x", "cookie=[REDACTED]"),
+        (
+            "Cookie: sessionid=alpha; csrftoken=beta",
+            "beta",
+            "Cookie=[REDACTED]",
+        ),
+        (
+            "Authorization: Basic dXNlcjpwYXNz",
+            "dXNlcjpwYXNz",
+            "Authorization=[REDACTED]",
+        ),
         ("password=x", "x", "password=[REDACTED]"),
         ("secret=x", "x", "secret=[REDACTED]"),
+        (
+            r'"password":"alpha\"bravo"',
+            "bravo",
+            "password=[REDACTED]",
+        ),
         (
             "JWT eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.signature123",
             "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.signature123",
@@ -38,6 +53,7 @@ from app.services.remote_diagnostics import sanitize_remote_diagnostic
             "[REDACTED_PATH]",
         ),
         (r"read C:\Users\xxx\secret.txt failed", "secret.txt", "[REDACTED_PATH]"),
+        (r"read E:\private_dir failed", "private_dir", "[REDACTED_PATH]"),
         ("read /home/user/private/file.txt failed", "file.txt", "[REDACTED_PATH]"),
         ("read /tmp/private/token.json failed", "token.json", "[REDACTED_PATH]"),
     ],

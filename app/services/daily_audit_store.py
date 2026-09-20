@@ -1684,7 +1684,15 @@ class DailyAuditStore:
             return self._row(connection.execute("SELECT * FROM remote_jobs WHERE id=?", (job_id,)).fetchone())
 
     def mark_submit_unknown(self, token: LeaseToken, job_id: int, error: str) -> dict[str, Any]:
-        return self._set_job_state(token, job_id, "SUBMIT_UNKNOWN", error=error, require_post_attempted=True)
+        from app.services.remote_diagnostics import sanitize_remote_diagnostic
+
+        return self._set_job_state(
+            token,
+            job_id,
+            "SUBMIT_UNKNOWN",
+            error=sanitize_remote_diagnostic(error),
+            require_post_attempted=True,
+        )
 
     def bump_remote_job_recovery_attempt(
         self,

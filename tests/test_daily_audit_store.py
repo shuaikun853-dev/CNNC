@@ -435,6 +435,30 @@ def test_submit_reconcile_diagnostic_redacts_credentials_and_private_paths(store
     assert durable["last_diagnostic"].count("[REDACTED_PATH]") == 2
 
 
+def test_submit_unknown_redacts_diagnostic_at_durable_write_boundary(store):
+    lease = _lease(store)
+    job = store.prepare_remote_intent(
+        lease,
+        "mall-submit-unknown-redaction:hash",
+        "daily-submit-unknown-redaction",
+        "payload-submit-unknown-redaction",
+    )
+    store.claim_remote_submission(lease, int(job["id"]))
+
+    recorded = store.mark_submit_unknown(
+        lease,
+        int(job["id"]),
+        r"HTTP 503 Authorization: Basic dXNlcjpwYXNz from E:\private_dir",
+    )
+
+    assert recorded["state"] == "SUBMIT_UNKNOWN"
+    assert "HTTP 503" in recorded["error_text"]
+    assert "dXNlcjpwYXNz" not in recorded["error_text"]
+    assert "private_dir" not in recorded["error_text"]
+    assert "Authorization=[REDACTED]" in recorded["error_text"]
+    assert "[REDACTED_PATH]" in recorded["error_text"]
+
+
 def test_confirmed_submit_waits_in_priority_pending_before_remote_progress(store):
     lease = _lease(store)
     job = store.prepare_remote_intent(lease, "mall-A:hash", "daily-20260811-mall-A", "payload-a")
