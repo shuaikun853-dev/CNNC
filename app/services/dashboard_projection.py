@@ -448,6 +448,32 @@ def project_remote_jobs(state_path: Path, business_date: str) -> list[dict]:
         con.close()
 
 
+def _load_remote_jobs_for_progress(state_path: Path, business_date: str) -> list[dict]:
+    """Load full durable remote-job rows for server-side progress probing only.
+
+    This is intentionally separate from the browser-facing projection so
+    payload_json and local file paths stay internal while the progress resolver
+    can reconstruct the exact PreparedLegacyJob before a read-only remote query.
+    """
+    uri = f"file:{Path(state_path).resolve().as_posix()}?mode=ro"
+    con = sqlite3.connect(uri, uri=True)
+    con.row_factory = sqlite3.Row
+    try:
+        run = con.execute(
+            "SELECT id FROM daily_runs WHERE business_date=?",
+            (business_date,),
+        ).fetchone()
+        if run is None:
+            return []
+        rows = con.execute(
+            "SELECT * FROM remote_jobs WHERE run_id=? ORDER BY id",
+            (int(run["id"]),),
+        ).fetchall()
+        return [dict(row) for row in rows]
+    finally:
+        con.close()
+
+
 def _has_restart_evidence(job: Mapping) -> bool:
     """任务是否携带 restart 协议证据(任一非空 phase,含零写撤退 DECLINED 等)。"""
     restart = decode_recovery_evidence(job.get("recovery_evidence_json")).get("restart")
@@ -832,9 +858,7 @@ def build_dashboard_summary(
     if progress_service is not None:
         try:
             progress_map = progress_service.snapshot(
-                [{"id": j["id"], "task_name": j["task_name"],
-                  "remote_identity": j["remote_identity"], "state": j["state"]}
-                 for j in jobs]
+                _load_remote_jobs_for_progress(paths.state_path, business_date)
             ) or {}
         except Exception:
             progress_map = {}

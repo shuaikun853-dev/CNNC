@@ -5,6 +5,8 @@
 """
 from __future__ import annotations
 
+import json
+import sqlite3
 from types import SimpleNamespace
 
 import pytest
@@ -413,6 +415,9 @@ def _fake_runtime(monkeypatch, tmp_path, jobs):
     monkeypatch.setattr(dp, "runtime_paths", lambda bd, root=None: SimpleNamespace(
         state_path=state, run_dir=tmp_path))
     monkeypatch.setattr(dp, "project_remote_jobs", lambda sp, bd: [dict(j) for j in jobs])
+    monkeypatch.setattr(
+        dp, "_load_remote_jobs_for_progress", lambda sp, bd: [dict(j) for j in jobs]
+    )
     monkeypatch.setattr(dp, "collect_runtime_status", lambda **kw: {"state": "MISSING"})
     monkeypatch.setattr(dp, "project_recent_days", lambda root, n=14, **kw: [])
     monkeypatch.setattr(dp, "project_scheduler_status", lambda: {"available": False})
@@ -433,6 +438,105 @@ def test_summary_live_progress_passthrough(monkeypatch, tmp_path):
     payload = build_dashboard_summary(BUSINESS_DATE, tmp_path,
                                       progress_service=SimpleNamespace(snapshot=lambda jobs: {"7": live}))
     assert payload["jobs"][0]["live_progress"] == live
+
+
+
+def test_summary_live_progress_reconstructs_from_durable_job_without_leaking_internal_fields(monkeypatch, tmp_path):
+    from app.services import dashboard_projection as dp
+    from app.services.daily_audit_store import DailyAuditStore
+    from app.services.dashboard_manual_ops import reconstruct_prepared_job
+    from app.services.zhaoshang_progress_probe import ZhaoshangProgressService
+
+    state = tmp_path / "state.sqlite3"
+    DailyAuditStore(state)
+    batch_state = tmp_path / "BATCH_STATE.md"
+    batch_state.write_text("# test batch\n", encoding="utf-8")
+    input_path = tmp_path / "input.xlsx"
+    result_path = tmp_path / "result.xlsx"
+    payload = {
+        "batch_state": str(batch_state),
+        "requests": [{
+            "mall_key": "zjmi",
+            "mall_source_id": "40",
+            "mall_name": "浙江物产商城",
+            "sku_id": "A100586863",
+            "url": "https://www.zjmi-mall.com/pages/goods/goods-detail/index?id=A100586863",
+            "backend_version": "legacy-v1",
+        }],
+    }
+    now = "2026-09-20T03:03:42+00:00"
+    with sqlite3.connect(state) as connection:
+        run_id = connection.execute(
+            """INSERT INTO daily_runs(
+                   business_date, tenant_id, pool_id, state, metrics_json, created_at, updated_at
+               ) VALUES (?, ?, ?, 'OPEN', '{}', ?, ?)""",
+            ("2026-09-20", 188605, 222, now, now),
+        ).lastrowid
+        connection.execute(
+            """INSERT INTO remote_jobs(
+                   run_id, logical_key, task_name, payload_hash, mall_key,
+                   input_path, result_path, payload_json, state, post_attempted,
+                   remote_identity, harvest_attempts, created_at, updated_at
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'SUBMITTED', 1, ?, 1, ?, ?)""",
+            (
+                run_id,
+                "logical-zjmi-1",
+                "cnnc_current_opt_浙江物产商城_78045444081648",
+                "payload-zjmi-1",
+                "zjmi",
+                str(input_path),
+                str(result_path),
+                json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+                "zjmi|1397571|RW-20260920110352",
+                now,
+                now,
+            ),
+        )
+
+    monkeypatch.setattr(
+        dp,
+        "runtime_paths",
+        lambda bd, root=None: SimpleNamespace(state_path=state, run_dir=tmp_path),
+    )
+    monkeypatch.setattr(dp, "collect_runtime_status", lambda **kw: {"state": "MISSING"})
+    monkeypatch.setattr(dp, "project_recent_days", lambda root, n=14, **kw: [])
+    monkeypatch.setattr(dp, "project_scheduler_status", lambda: {"available": False})
+
+    class _Adapter:
+        def query_task_progress_for_job(self, prepared, task_id, task_number, timeout_seconds):
+            assert prepared.mall_key == "zjmi"
+            assert len(prepared.requests) == 1
+            assert task_id == "1397571"
+            assert task_number == "RW-20260920110352"
+            return {
+                "batch_number": prepared.task_name,
+                "progress": {
+                    "total": 1,
+                    "pending": 0,
+                    "running": 0,
+                    "failed": 0,
+                    "waiting_db": 0,
+                    "finished": 1,
+                },
+                "rsp_desc": "",
+            }
+
+    service = ZhaoshangProgressService(
+        adapter_factory=lambda: _Adapter(),
+        prepared_resolver=lambda job: reconstruct_prepared_job(state, job),
+        background_refresh=False,
+    )
+    payload_out = dp.build_dashboard_summary(
+        "2026-09-20", tmp_path, progress_service=service
+    )
+
+    live = payload_out["jobs"][0]["live_progress"]
+    assert live["available"] is True
+    assert live["classification"] == "REMOTE_TERMINAL"
+    assert live["progress"]["finished"] == 1
+    assert "payload_json" not in payload_out["jobs"][0]
+    assert "input_path" not in payload_out["jobs"][0]
+    assert "result_path" not in payload_out["jobs"][0]
 
 
 def test_summary_progress_disabled_default(monkeypatch, tmp_path):
