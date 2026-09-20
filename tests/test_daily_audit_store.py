@@ -459,6 +459,28 @@ def test_submit_unknown_redacts_diagnostic_at_durable_write_boundary(store):
     assert "[REDACTED_PATH]" in recorded["error_text"]
 
 
+def test_submit_unknown_redacts_generic_token_and_set_cookie_headers(store):
+    lease = _lease(store)
+    job = store.prepare_remote_intent(
+        lease,
+        "mall-submit-generic-redaction:hash",
+        "daily-submit-generic-redaction",
+        "payload-submit-generic-redaction",
+    )
+    store.claim_remote_submission(lease, int(job["id"]))
+
+    recorded = store.mark_submit_unknown(
+        lease,
+        int(job["id"]),
+        "HTTP 503 authToken=opaque-secret\nSet-Cookie: session=session-secret; Path=/",
+    )
+
+    assert "opaque-secret" not in recorded["error_text"]
+    assert "session-secret" not in recorded["error_text"]
+    assert "authToken=[REDACTED]" in recorded["error_text"]
+    assert "Set-Cookie=[REDACTED]" in recorded["error_text"]
+
+
 def test_confirmed_submit_waits_in_priority_pending_before_remote_progress(store):
     lease = _lease(store)
     job = store.prepare_remote_intent(lease, "mall-A:hash", "daily-20260811-mall-A", "payload-a")

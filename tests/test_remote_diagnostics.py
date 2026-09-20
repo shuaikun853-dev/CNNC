@@ -16,6 +16,13 @@ from app.services.remote_diagnostics import sanitize_remote_diagnostic
         ("access_token=x", "x", "access_token=[REDACTED]"),
         ("refreshToken=x", "x", "refreshToken=[REDACTED]"),
         ("refresh_token=x", "x", "refresh_token=[REDACTED]"),
+        ("authToken=opaque-secret", "opaque-secret", "authToken=[REDACTED]"),
+        (
+            "x-access-token=opaque-secret",
+            "opaque-secret",
+            "x-access-token=[REDACTED]",
+        ),
+        ("csrfToken=opaque-secret", "opaque-secret", "csrfToken=[REDACTED]"),
         ("clientSecret=x", "x", "clientSecret=[REDACTED]"),
         ("client_secret=x", "x", "client_secret=[REDACTED]"),
         ("apiKey=x", "x", "apiKey=[REDACTED]"),
@@ -28,6 +35,11 @@ from app.services.remote_diagnostics import sanitize_remote_diagnostic
             "Cookie: sessionid=alpha; csrftoken=beta",
             "beta",
             "Cookie=[REDACTED]",
+        ),
+        (
+            "Set-Cookie: session=opaque-secret; Path=/",
+            "opaque-secret",
+            "Set-Cookie=[REDACTED]",
         ),
         (
             "Authorization: Basic dXNlcjpwYXNz",

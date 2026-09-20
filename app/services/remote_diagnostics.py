@@ -8,8 +8,9 @@ import re
 _CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]+")
 _BEARER_RE = re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]+")
 _SENSITIVE_KEY = (
-    r"access(?:_|-)?token|refresh(?:_|-)?token|client(?:_|-)?secret|"
-    r"api(?:_|-)?key|authorization|cookie|password|secret|token"
+    r"[A-Za-z0-9_-]*token|"
+    r"[A-Za-z0-9_-]*secret|"
+    r"api(?:_|-)?key|authorization|(?:set-)?cookie|password"
 )
 _QUOTED_KEY_VALUE_RE = re.compile(
     rf'(?i)(?:"(?P<double_key>{_SENSITIVE_KEY})"|\'(?P<single_key>{_SENSITIVE_KEY})\')'
@@ -22,7 +23,7 @@ _AUTHORIZATION_RE = re.compile(
     r"(?:[A-Za-z][A-Za-z0-9_-]*\s+)?[^\s,;]+"
 )
 _COOKIE_RE = re.compile(
-    r"(?i)(?<![\w\"'-])(?P<key>cookie)\s*[:=]\s*"
+    r"(?i)(?<![\w\"'-])(?P<key>(?:set-)?cookie)\s*[:=]\s*"
     r"(?:[^;\s,]+=[^;\s,]+(?:\s*;\s*[^;\s,]+=[^;\s,]+)*|[^\s,;]+)"
 )
 _KEY_VALUE_RE = re.compile(
