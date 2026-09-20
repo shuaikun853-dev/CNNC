@@ -10,7 +10,8 @@ _BEARER_RE = re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]+")
 _SENSITIVE_KEY = (
     r"[A-Za-z0-9_-]*token|"
     r"[A-Za-z0-9_-]*secret|"
-    r"api(?:_|-)?key|authorization|(?:set-)?cookie|password"
+    r"[A-Za-z0-9_-]*api(?:_|-)?key|"
+    r"[A-Za-z0-9_-]*authorization|(?:set-)?cookie|password"
 )
 _QUOTED_KEY_VALUE_RE = re.compile(
     rf'(?i)(?:"(?P<double_key>{_SENSITIVE_KEY})"|\'(?P<single_key>{_SENSITIVE_KEY})\')'
@@ -19,7 +20,7 @@ _QUOTED_KEY_VALUE_RE = re.compile(
     r"(?:Bearer\s+)?[^\s,;]+)"
 )
 _AUTHORIZATION_RE = re.compile(
-    r"(?i)(?<![\w\"'-])(?P<key>authorization)\s*[:=]\s*"
+    r"(?i)(?<![\w\"'-])(?P<key>[A-Za-z0-9_-]*authorization)\s*[:=]\s*"
     r"(?:[A-Za-z][A-Za-z0-9_-]*\s+)?[^\s,;]+"
 )
 _COOKIE_RE = re.compile(

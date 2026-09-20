@@ -472,7 +472,7 @@ python -m pytest tests\test_incremental_audit_runtime.py tests\test_incremental_
   recovery attempts 原子写入 recovery evidence；不确定结果不消耗 attempt，确切无诊断 `NOT_FOUND` 才计数。
   Dashboard drawer 展示错误阶段、分类、具体原因、更新时间、实时远端进度、自动对账次数/最近结果和下一步；
   历史诊断确已丢失时明确显示“原始提交诊断不可恢复”，不得猜测。投影层对 Token/Cookie/Authorization/API Key、
-  密码、任意 token/secret 后缀字段（含 camel/snake/hyphen）、JWT、多值 Cookie/Set-Cookie、非 Bearer Authorization、Windows（含空格或无扩展名）与 `/home`、`/tmp` 绝对路径做脱敏；`SUBMIT_UNKNOWN` 在 durable 写边界即脱敏，不向 SQLite 或浏览器新增原始 secret/path。collapsed MANUAL 只有行内通用诊断而无可供看板验证的 durable priority reason 时，显示“提优确认 / 优先级未确认”，不得猜成 `PriorityScopeSafetyError`。
+  密码、任意 token/secret/API-key/Authorization 后缀字段（含 camel/snake/hyphen 与常见前缀）、JWT、多值 Cookie/Set-Cookie、非 Bearer Authorization、Windows（含空格或无扩展名）与 `/home`、`/tmp` 绝对路径做脱敏；`SUBMIT_UNKNOWN` 在 durable 写边界即脱敏，不向 SQLite 或浏览器新增原始 secret/path。collapsed MANUAL 只有行内通用诊断而无可供看板验证的 durable priority reason 时，显示“提优确认 / 优先级未确认”，不得猜成 `PriorityScopeSafetyError`。
 
 ## 启用与回滚门槛
 

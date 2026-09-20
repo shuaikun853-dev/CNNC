@@ -472,13 +472,20 @@ def test_submit_unknown_redacts_generic_token_and_set_cookie_headers(store):
     recorded = store.mark_submit_unknown(
         lease,
         int(job["id"]),
-        "HTTP 503 authToken=opaque-secret\nSet-Cookie: session=session-secret; Path=/",
+        "HTTP 503 authToken=opaque-secret\n"
+        "Set-Cookie: session=session-secret; Path=/\n"
+        "X-API-Key: api-secret\n"
+        "Proxy-Authorization: Basic proxy-secret",
     )
 
     assert "opaque-secret" not in recorded["error_text"]
     assert "session-secret" not in recorded["error_text"]
+    assert "api-secret" not in recorded["error_text"]
+    assert "proxy-secret" not in recorded["error_text"]
     assert "authToken=[REDACTED]" in recorded["error_text"]
     assert "Set-Cookie=[REDACTED]" in recorded["error_text"]
+    assert "X-API-Key=[REDACTED]" in recorded["error_text"]
+    assert "Proxy-Authorization=[REDACTED]" in recorded["error_text"]
 
 
 def test_confirmed_submit_waits_in_priority_pending_before_remote_progress(store):
