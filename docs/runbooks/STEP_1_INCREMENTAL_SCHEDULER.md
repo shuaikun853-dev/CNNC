@@ -411,7 +411,12 @@ task name 使用业务日和 immutable 请求集生成同日稳定、跨日不�
   COMPLETED），linked crawl 以 `REMOTE_STALL_RECOVERY_EXHAUSTED` 证据收口为 `NO_RESULT`
   （价格留空），ordinary final 视为可接受终态收敛，`SUBMIT_UNKNOWN`/`MANUAL_REQUIRED`/
   普通 RUNNING 的 blocker 语义不变。该状态在 `status` 的 `remote.recovery_exhausted` 计数。
-- 每次命令都会安全更新该业务日的 `BATCH_STATE.md`；SQLite 仍是状态权威。重叠实例正常返回 0，
+- SQLite 始终是状态权威。每次命令另外在该业务日的
+  `batch_state_snapshots/BATCH_STATE_<time_ns>_<pid>_<n>.md` 写一份不可变的人类可读状态快照；
+  `BATCH_STATE.md` 继续保留给既有招商局事件证据和旧读取方，并做 best-effort 兼容刷新。Windows
+  上若外部只读工具长期占用固定文件、导致 `os.replace` 返回 `PermissionError/WinError 5`，
+  新快照仍可用且不得把已写入 SQLite/remote checkpoint 的命令反转成失败；查看当前 managed 状态时
+  优先读最新快照，核对 ADD/启用/提优等历史证据仍读固定 `BATCH_STATE.md`。重叠实例正常返回 0，
   可恢复 pending/defer 返回 0，`FAILED`、人工项或正式产物阻塞返回非零。
 - 不要在此调度中加入审批、驳回、通过、保存、提交、推送、任何 SQL，或内建固定 8 站策略之外的本地 crawler 入口；自动本地兜底只能遵守上文 exact URL、最终远端查询成功、原子 claim 和 fail-closed 门禁。
 

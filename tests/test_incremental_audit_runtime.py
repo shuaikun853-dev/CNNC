@@ -1163,6 +1163,116 @@ def test_batch_state_exclusive_create_never_overwrites_a_racing_writer(tmp_path,
     assert batch_state.read_text(encoding="utf-8") == "external writer won\n"
 
 
+def test_batch_result_locked_legacy_alias_writes_versioned_snapshot_without_failing(
+    tmp_path, monkeypatch
+):
+    root = tmp_path / "runtime"
+    paths = runtime_paths("2026-08-11", root)
+    paths.run_dir.mkdir(parents=True)
+    legacy = _ensure_batch_state(paths, enable_zhaoshang=False)
+    legacy_before = legacy.read_text(encoding="utf-8")
+    result = RuntimeResult(
+        TickSummary(
+            "MANUAL_REVIEW_REQUIRED",
+            (),
+            {"processed": 1},
+            {"remote_manual": 1},
+            23,
+            "manual blocker",
+        )
+    )
+    real_replace = runtime_module.os.replace
+
+    def locked_replace(source, destination):
+        if Path(destination) == legacy:
+            raise PermissionError(5, "legacy BATCH_STATE is held by a reader")
+        return real_replace(source, destination)
+
+    monkeypatch.setattr(runtime_module.os, "replace", locked_replace)
+
+    try:
+        runtime_module._record_batch_result(
+            paths,
+            result,
+            command="closeout",
+            enable_zhaoshang=True,
+            output_path=paths.final_output_path,
+        )
+    except PermissionError as exc:
+        pytest.fail(f"non-authoritative handoff alias lock escaped: {exc}")
+
+    assert legacy.read_text(encoding="utf-8") == legacy_before
+    snapshots = sorted((paths.run_dir / "batch_state_snapshots").glob("BATCH_STATE_*.md"))
+    assert len(snapshots) == 1
+    snapshot = snapshots[0].read_text(encoding="utf-8")
+    assert "status: WAITING_USER" in snapshot
+    assert '"command": "closeout"' in snapshot
+    assert "legacy_alias_refresh: blocked" in snapshot
+
+
+def test_batch_state_temp_cleanup_lock_does_not_escape_after_alias_replace_failure(
+    tmp_path, monkeypatch
+):
+    root = tmp_path / "runtime"
+    paths = runtime_paths("2026-08-11", root)
+    paths.run_dir.mkdir(parents=True)
+    legacy = _ensure_batch_state(paths, enable_zhaoshang=False)
+    real_replace = runtime_module.os.replace
+    real_unlink = Path.unlink
+
+    def locked_replace(source, destination):
+        if Path(destination) == legacy:
+            raise PermissionError(5, "legacy alias locked")
+        return real_replace(source, destination)
+
+    def locked_temp_unlink(path, *args, **kwargs):
+        if path.name.startswith(".BATCH_STATE.md."):
+            raise PermissionError(5, "temporary cleanup locked")
+        return real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(runtime_module.os, "replace", locked_replace)
+    monkeypatch.setattr(Path, "unlink", locked_temp_unlink)
+
+    try:
+        runtime_module._record_batch_result(
+            paths,
+            RuntimeResult(TickSummary("COMPLETED", (), {}, {}, 1)),
+            command="tick",
+            enable_zhaoshang=False,
+            output_path=paths.final_output_path,
+        )
+    except PermissionError as exc:
+        pytest.fail(f"metadata temp cleanup lock escaped: {exc}")
+
+
+def test_latest_batch_state_snapshot_path_returns_newest_versioned_snapshot(tmp_path):
+    root = tmp_path / "runtime"
+    paths = runtime_paths("2026-08-11", root)
+    paths.run_dir.mkdir(parents=True)
+    _ensure_batch_state(paths, enable_zhaoshang=False)
+
+    runtime_module._record_batch_result(
+        paths,
+        RuntimeResult(TickSummary("WAITING_REMOTE", (), {}, {"remote_pending": 1}, 1)),
+        command="tick",
+        enable_zhaoshang=False,
+        output_path=paths.final_output_path,
+    )
+    runtime_module._record_batch_result(
+        paths,
+        RuntimeResult(TickSummary("MANUAL_REVIEW_REQUIRED", (), {}, {"remote_manual": 1}, 1, "manual")),
+        command="closeout",
+        enable_zhaoshang=False,
+        output_path=paths.final_output_path,
+    )
+
+    latest = runtime_module.latest_batch_state_snapshot_path(paths)
+    assert latest is not None
+    assert latest.name.startswith("BATCH_STATE_")
+    assert "status: WAITING_USER" in latest.read_text(encoding="utf-8")
+    assert len(list((paths.run_dir / "batch_state_snapshots").glob("BATCH_STATE_*.md"))) == 2
+
+
 def test_finalize_updates_batch_state_and_preserves_external_events(tmp_path):
     root = tmp_path / "runtime"
     events: list[str] = []
