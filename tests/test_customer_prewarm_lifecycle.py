@@ -520,6 +520,11 @@ def test_reconcile_not_found_bumps_attempts_until_dead(tmp_path):
 
     job = _remote_job_row(paths.state_path, job_id)
     assert job["recovery_attempts"] == RECONCILE_DEAD_THRESHOLD
+    recovery = json.loads(job["recovery_evidence_json"])
+    assert recovery["submit_reconcile"]["status"] == "NOT_FOUND"
+    assert recovery["submit_reconcile"]["recovery_attempts"] == RECONCILE_DEAD_THRESHOLD
+    assert recovery["submit_reconcile"]["last_diagnostic"] == "exact remote task not found"
+    assert recovery["submit_reconcile"]["last_reconcile_at"]
     assert adapter.reconcile_calls == RECONCILE_DEAD_THRESHOLD
     # 第 4 次后判死:phase note 记录,且不再进 reconcile 集。
     dead_summary = run_reconcile(paths, adapter)
@@ -599,6 +604,14 @@ def test_inconclusive_not_found_does_not_spend_absence_attempts(tmp_path):
     job = _remote_job_row(paths.state_path, job_id)
     assert job["state"] == "SUBMIT_UNKNOWN"
     assert job["recovery_attempts"] == 0
+    recovery = json.loads(job["recovery_evidence_json"])
+    assert recovery["submit_reconcile"]["status"] == "NOT_FOUND"
+    assert recovery["submit_reconcile"]["recovery_attempts"] == 0
+    assert (
+        recovery["submit_reconcile"]["last_diagnostic"]
+        == "exact task reconciliation is not yet conclusive"
+    )
+    assert recovery["submit_reconcile"]["last_reconcile_at"]
     assert adapter.submit_calls == 0
 
 

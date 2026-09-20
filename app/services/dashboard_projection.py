@@ -342,6 +342,7 @@ from app.services.remote_running_recovery import (
     PENDING_RESTART_PHASES, RUNNING_PROBE_MIN_HARVEST_ATTEMPTS, RUNNING_PROBE_MIN_WALL_SECONDS,
     decode_recovery_evidence,
 )
+from app.services.remote_diagnostics import sanitize_remote_diagnostic
 # 生产语义权威:finalize 对 RECOVERY_EXHAUSTED durable proof 的接受判定唯一来源
 # (app/workflows/incremental_price_audit_finalize.py::_valid_recovery_exhausted_evidence)。
 # Dashboard 只读复用同一判定,不在投影层重写第二套业务规则。
@@ -354,6 +355,70 @@ _STATE_CN = {
     "MANUAL_REQUIRED": ("需要人工检查", "err"), "RECOVERY_EXHAUSTED": ("自动恢复已用尽", "err"),
     "SUPERSEDED": ("已被人工重建替代", "warn"),
 }
+
+_SUBMIT_RECONCILE_DEAD_THRESHOLD = 4
+
+
+def _remote_job_diagnostic(row: Mapping, evidence: Mapping) -> dict:
+    state = str(row.get("state") or "")
+    reason = sanitize_remote_diagnostic(row.get("error_text"))
+    reconcile = evidence.get("submit_reconcile")
+    reconcile = reconcile if isinstance(reconcile, Mapping) else {}
+    last_reconcile = sanitize_remote_diagnostic(reconcile.get("last_diagnostic"))
+    attempts = int(row.get("recovery_attempts") or 0)
+    if state == "SUBMIT_UNKNOWN":
+        return {
+            "stage": "远端提交",
+            "classification": "提交结果待确认",
+            "reason": reason or "原始提交诊断不可恢复",
+            "updated_at": row.get("updated_at"),
+            "reconcile_attempts": attempts,
+            "reconcile_threshold": _SUBMIT_RECONCILE_DEAD_THRESHOLD,
+            "last_reconcile_status": sanitize_remote_diagnostic(reconcile.get("status"), max_length=80),
+            "last_reconcile_diagnostic": last_reconcile or "尚无自动对账诊断",
+            "last_reconcile_at": reconcile.get("last_reconcile_at"),
+            "next_action": (
+                "继续按 task_name + mall 做 exact reconcile；只有达到安全 dead threshold "
+                "且能证明任务不存在后，redispatch 才能接管。"
+            ),
+            "note": "远端创建请求已进入可能发送边界，但尚未取得 exact taskId/taskNumber。",
+        }
+    priority_scope = "PriorityScopeSafetyError" in reason
+    if state == "MANUAL_REQUIRED":
+        return {
+            "stage": "提优确认" if priority_scope else "远端任务处理",
+            "classification": "PriorityScopeSafetyError" if priority_scope else "需要人工检查",
+            "reason": reason or "具体诊断不可恢复",
+            "updated_at": row.get("updated_at"),
+            "reconcile_attempts": attempts,
+            "reconcile_threshold": _SUBMIT_RECONCILE_DEAD_THRESHOLD,
+            "last_reconcile_status": "",
+            "last_reconcile_diagnostic": "",
+            "last_reconcile_at": None,
+            "next_action": (
+                "系统将仅在 exact identity、terminal 和完整成功进度均被严格证明后自动回收结果；"
+                "否则保持人工检查。"
+            ),
+            "note": (
+                "该异常来自 priority 确认阶段，不代表远端爬虫失败。"
+                if priority_scope else "保持 fail-closed，等待新的严格证据或人工处理。"
+            ),
+        }
+    if reason:
+        return {
+            "stage": "远端任务处理",
+            "classification": state or "远端异常",
+            "reason": reason,
+            "updated_at": row.get("updated_at"),
+            "reconcile_attempts": attempts,
+            "reconcile_threshold": _SUBMIT_RECONCILE_DEAD_THRESHOLD,
+            "last_reconcile_status": "",
+            "last_reconcile_diagnostic": "",
+            "last_reconcile_at": None,
+            "next_action": "按当前状态机继续处理。",
+            "note": "",
+        }
+    return {}
 
 
 def _parse_ts(value) -> datetime | None:
@@ -410,6 +475,7 @@ def project_remote_jobs(state_path: Path, business_date: str) -> list[dict]:
         jobs = []
         for row in con.execute("SELECT * FROM remote_jobs WHERE run_id=? ORDER BY id", (run_id,)):
             evidence = decode_recovery_evidence(row["recovery_evidence_json"])
+            row_dict = dict(row)
             restart = evidence.get("restart")
             recovering = str(row["state"]) == "RUNNING" and isinstance(restart, dict) \
                 and str(restart.get("phase")) == "ENABLE_CONFIRMED"
@@ -439,7 +505,9 @@ def project_remote_jobs(state_path: Path, business_date: str) -> list[dict]:
                 "recovery_exhausted_valid": exhausted_valid,
                 "crawl_total": counts.get(int(row["id"]), (0, 0))[0],
                 "crawl_success": counts.get(int(row["id"]), (0, 0))[1],
-                "error_text": row["error_text"], "remote_identity": row["remote_identity"],
+                "error_text": sanitize_remote_diagnostic(row["error_text"]),
+                "diagnostic": _remote_job_diagnostic(row_dict, evidence),
+                "remote_identity": row["remote_identity"],
                 "recovery_evidence_json": row["recovery_evidence_json"],
                 "superseded_by": _replacement_summary(con, int(row["id"])),
             })

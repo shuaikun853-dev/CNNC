@@ -351,6 +351,60 @@ def test_remote_intent_is_durable_conflict_and_unknown_submit_never_reclaims(sto
     assert store.get_remote_job(job["id"])["remote_identity"] == "remote-99"
 
 
+def test_submit_unknown_harvest_without_new_error_preserves_original_diagnostic(store):
+    lease = _lease(store)
+    job = store.prepare_remote_intent(
+        lease,
+        "mall-submit-unknown:hash",
+        "daily-submit-unknown",
+        "payload-submit-unknown",
+    )
+    store.claim_remote_submission(lease, int(job["id"]))
+    store.mark_submit_unknown(
+        lease,
+        int(job["id"]),
+        "prewarm dispatch submit unknown: ORIGINAL_REASON",
+    )
+
+    recorded = store.record_harvest(
+        lease,
+        int(job["id"]),
+        elapsed_seconds=1.0,
+        max_attempts=4,
+        max_elapsed_seconds=300.0,
+        error=None,
+    )
+
+    assert recorded["state"] == "SUBMIT_UNKNOWN"
+    assert recorded["error_text"] == "prewarm dispatch submit unknown: ORIGINAL_REASON"
+
+
+def test_submit_unknown_found_reconciliation_clears_stale_submit_diagnostic(store):
+    lease = _lease(store)
+    job = store.prepare_remote_intent(
+        lease,
+        "mall-submit-found:hash",
+        "daily-submit-found",
+        "payload-submit-found",
+    )
+    store.claim_remote_submission(lease, int(job["id"]))
+    store.mark_submit_unknown(
+        lease,
+        int(job["id"]),
+        "prewarm dispatch submit unknown: ORIGINAL_REASON",
+    )
+
+    reconciled = store.reconcile_remote_job(
+        lease,
+        int(job["id"]),
+        remote_identity="mall-submit-found|task-id|task-number",
+        state="PRIORITY_PENDING",
+    )
+
+    assert reconciled["state"] == "PRIORITY_PENDING"
+    assert reconciled["error_text"] is None
+
+
 def test_confirmed_submit_waits_in_priority_pending_before_remote_progress(store):
     lease = _lease(store)
     job = store.prepare_remote_intent(lease, "mall-A:hash", "daily-20260811-mall-A", "payload-a")

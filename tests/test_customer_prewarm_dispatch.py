@@ -742,19 +742,32 @@ def test_case11_submit_unknown_never_recreated(tmp_path):
     url = "https://qx.com/product-11.html"
     candidate_id = make_candidate(prewarm, url)
     adapter = _CountingAdapter(
-        submit_outcome=LegacySubmitOutcome(SubmitStatus.SUBMIT_UNKNOWN, diagnostic="timeout")
+        submit_outcome=LegacySubmitOutcome(
+            SubmitStatus.SUBMIT_UNKNOWN,
+            diagnostic="timeout Authorization: Bearer TEST_TOKEN_VALUE",
+        )
     )
 
     first = run_pass(runtime_root, prewarm, cache, adapter=adapter)
     assert first["submit_unknown"] == 1
+    submit_notes = [note for note in first["phase_errors"] if "SUBMIT_UNKNOWN" in note]
+    assert len(submit_notes) == 1
+    assert "job=1" in submit_notes[0]
+    assert "mall=comix" in submit_notes[0]
+    assert "task_name=" in submit_notes[0]
+    assert "timeout" in submit_notes[0]
+    assert "TEST_TOKEN_VALUE" not in submit_notes[0]
+    assert "[REDACTED]" in submit_notes[0]
     assert adapter.submit_calls == 1
     candidate = candidate_by_id(prewarm, candidate_id)
     assert candidate["cache_status"] == CACHE_STATUS_REMOTE_DISPATCHED
     assert "submit unknown" in (candidate["last_error"] or "")
     job = _state_rows(
-        paths.state_path, "SELECT state, remote_identity FROM remote_jobs"
+        paths.state_path, "SELECT state, remote_identity, error_text FROM remote_jobs"
     )[0]
     assert job["state"] == "SUBMIT_UNKNOWN"
+    assert "timeout" in job["error_text"]
+    assert "TEST_TOKEN_VALUE" not in job["error_text"]
 
     # 第二轮:SUBMIT_UNKNOWN 是未完成绑定 → 复用,不重建、不重复提交。
     second = run_pass(runtime_root, prewarm, cache, adapter=adapter)

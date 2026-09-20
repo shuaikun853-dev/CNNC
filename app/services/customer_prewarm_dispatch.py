@@ -102,6 +102,7 @@ from app.services.incremental_audit_runtime import (
     _logical_key_matches_rebuild,
     runtime_paths,
 )
+from app.services.remote_diagnostics import sanitize_remote_diagnostic
 from app.services.legacy_zhaoshang_adapter import (
     CnncLegacyZhaoshangAdapter,
     CrawlRequest,
@@ -1713,10 +1714,15 @@ def _dispatch_mall_group(
     remaining = deadline - monotonic_value()
     outcome = get_adapter().submit(job, timeout_seconds=max(0.001, remaining))
     status = _status_value(outcome.status)
-    diagnostic = str(getattr(outcome, "diagnostic", "") or "")
+    diagnostic = sanitize_remote_diagnostic(getattr(outcome, "diagnostic", ""))
     if status == SubmitStatus.SUBMIT_UNKNOWN.value:
         store.mark_submit_unknown(
             token, int(job_row["id"]), f"prewarm dispatch submit unknown: {diagnostic}"
+        )
+        phase_errors.append(
+            "SUBMIT_UNKNOWN "
+            f"job={int(job_row['id'])} mall={mall_key} task_name={job.task_name} "
+            f"diagnostic={diagnostic or 'original submit diagnostic unavailable'}"
         )
         for entry in batch_entries:
             _record_remote_job_link(
@@ -1759,6 +1765,11 @@ def _dispatch_mall_group(
             # outcome is unknown, reconcile-only, never a silent success.
             store.mark_submit_unknown(
                 token, int(job_row["id"]), "prewarm dispatch submit returned incomplete identity"
+            )
+            phase_errors.append(
+                "SUBMIT_UNKNOWN "
+                f"job={int(job_row['id'])} mall={mall_key} task_name={job.task_name} "
+                "diagnostic=incomplete submitted identity"
             )
             for entry in batch_entries:
                 _record_remote_job_link(
@@ -2590,7 +2601,7 @@ def _dispatch_exact_leased(
     remaining = deadline - monotonic_value()
     outcome = get_adapter().submit(job, timeout_seconds=max(0.001, remaining))
     status = _status_value(outcome.status)
-    diagnostic = str(getattr(outcome, "diagnostic", "") or "")
+    diagnostic = sanitize_remote_diagnostic(getattr(outcome, "diagnostic", ""))
     task_id = getattr(outcome, "task_id", None)
     task_number = getattr(outcome, "task_number", None)
     if status == SubmitStatus.SUBMIT_UNKNOWN.value or (
@@ -2603,6 +2614,11 @@ def _dispatch_exact_leased(
             note = "manual recrawl submit returned incomplete identity"
             diagnostic = diagnostic or "incomplete identity"
         store.mark_submit_unknown(token, job_id, note)
+        phase_errors.append(
+            "SUBMIT_UNKNOWN "
+            f"job={job_id} mall={mall_key} task_name={job.task_name} "
+            f"diagnostic={diagnostic or 'original submit diagnostic unavailable'}"
+        )
         # The job exists (POST may have landed): record the linkage either way.
         _record_remote_job_link(
             prewarm_store,

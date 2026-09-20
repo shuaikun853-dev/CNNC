@@ -1686,7 +1686,13 @@ class DailyAuditStore:
     def mark_submit_unknown(self, token: LeaseToken, job_id: int, error: str) -> dict[str, Any]:
         return self._set_job_state(token, job_id, "SUBMIT_UNKNOWN", error=error, require_post_attempted=True)
 
-    def bump_remote_job_recovery_attempt(self, token: LeaseToken, job_id: int) -> int:
+    def bump_remote_job_recovery_attempt(
+        self,
+        token: LeaseToken,
+        job_id: int,
+        *,
+        diagnostic: str | None = None,
+    ) -> int:
         """Count one failed SUBMIT_UNKNOWN reconciliation attempt (narrow).
 
         Returns the new durable ``recovery_attempts`` value.  Legal only while
@@ -1699,14 +1705,69 @@ class DailyAuditStore:
             job = self._job_for_lease(connection, token, job_id)
             if str(job["state"]) != "SUBMIT_UNKNOWN":
                 raise RemoteIntentConflict("recovery attempt bump requires the SUBMIT_UNKNOWN state")
-            connection.execute(
-                "UPDATE remote_jobs SET recovery_attempts=recovery_attempts+1, updated_at=? WHERE id=?",
-                (self._utcnow(), job_id),
-            )
+            now = self._utcnow()
+            if diagnostic is None:
+                connection.execute(
+                    "UPDATE remote_jobs SET recovery_attempts=recovery_attempts+1, updated_at=? WHERE id=?",
+                    (now, job_id),
+                )
+            else:
+                from app.services.remote_diagnostics import sanitize_remote_diagnostic
+                from app.services.remote_running_recovery import (
+                    decode_recovery_evidence,
+                    encode_recovery_evidence,
+                )
+
+                new_attempts = int(job["recovery_attempts"] or 0) + 1
+                evidence = decode_recovery_evidence(job["recovery_evidence_json"])
+                evidence["submit_reconcile"] = {
+                    "status": "NOT_FOUND",
+                    "last_diagnostic": sanitize_remote_diagnostic(diagnostic),
+                    "last_reconcile_at": now,
+                    "recovery_attempts": new_attempts,
+                }
+                connection.execute(
+                    "UPDATE remote_jobs SET recovery_attempts=?, recovery_evidence_json=?, updated_at=? WHERE id=?",
+                    (new_attempts, encode_recovery_evidence(evidence), now, job_id),
+                )
             refreshed = connection.execute(
                 "SELECT recovery_attempts FROM remote_jobs WHERE id=?", (job_id,)
             ).fetchone()
             return int(refreshed["recovery_attempts"] or 0)
+
+    def record_submit_reconcile_diagnostic(
+        self,
+        token: LeaseToken,
+        job_id: int,
+        *,
+        status: str,
+        diagnostic: str,
+    ) -> dict[str, Any]:
+        """Persist one sanitized read-only reconcile observation atomically."""
+        from app.services.remote_diagnostics import sanitize_remote_diagnostic
+        from app.services.remote_running_recovery import (
+            decode_recovery_evidence,
+            encode_recovery_evidence,
+        )
+
+        with self._transaction(immediate=True) as connection:
+            self._validate_lease(connection, token)
+            job = self._job_for_lease(connection, token, job_id)
+            if str(job["state"]) != "SUBMIT_UNKNOWN":
+                raise RemoteIntentConflict("submit reconcile diagnostic requires the SUBMIT_UNKNOWN state")
+            now = self._utcnow()
+            evidence = decode_recovery_evidence(job["recovery_evidence_json"])
+            evidence["submit_reconcile"] = {
+                "status": sanitize_remote_diagnostic(status, max_length=80),
+                "last_diagnostic": sanitize_remote_diagnostic(diagnostic),
+                "last_reconcile_at": now,
+                "recovery_attempts": int(job["recovery_attempts"] or 0),
+            }
+            connection.execute(
+                "UPDATE remote_jobs SET recovery_evidence_json=?, updated_at=? WHERE id=?",
+                (encode_recovery_evidence(evidence), now, job_id),
+            )
+            return self._row(connection.execute("SELECT * FROM remote_jobs WHERE id=?", (job_id,)).fetchone())  # type: ignore[return-value]
 
     def release_remote_submission_claim(self, token: LeaseToken, job_id: int, error: str) -> dict[str, Any]:
         """Retreat a burned claim only with proof the POST never started.
@@ -2094,7 +2155,10 @@ class DailyAuditStore:
                 attempts >= max_attempts or elapsed >= max_elapsed_seconds
             )
             state = "MANUAL_REQUIRED" if manual else str(job["state"])
-            connection.execute("UPDATE remote_jobs SET state=?, harvest_elapsed_seconds=?, error_text=?, updated_at=? WHERE id=?", (state, elapsed, error, self._utcnow(), job_id))
+            stored_error = error
+            if state == "SUBMIT_UNKNOWN" and error is None:
+                stored_error = job["error_text"]
+            connection.execute("UPDATE remote_jobs SET state=?, harvest_elapsed_seconds=?, error_text=?, updated_at=? WHERE id=?", (state, elapsed, stored_error, self._utcnow(), job_id))
             return self._row(connection.execute("SELECT * FROM remote_jobs WHERE id=?", (job_id,)).fetchone())  # type: ignore[return-value]
 
     def update_remote_recovery_evidence(self, token: LeaseToken, job_id: int, evidence: Mapping[str, Any]) -> dict[str, Any]:

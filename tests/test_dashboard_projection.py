@@ -179,6 +179,81 @@ def test_project_remote_jobs_recovers_and_subtasks(tmp_path):
     assert j["crawl_total"] == 2 and j["crawl_success"] == 1
 
 
+def test_project_remote_jobs_exposes_sanitized_submit_diagnostic(tmp_path):
+    db = _make_db(tmp_path)
+    con = sqlite3.connect(db)
+    evidence = {
+        "version": 1,
+        "observations": [],
+        "restart": None,
+        "probe_health": None,
+        "submit_reconcile": {
+            "status": "NOT_FOUND",
+            "last_diagnostic": "lookup Cookie=session-secret still inconclusive",
+            "last_reconcile_at": "2026-08-26T03:10:00+00:00",
+            "recovery_attempts": 1,
+        },
+    }
+    con.execute(
+        "UPDATE remote_jobs SET state='SUBMIT_UNKNOWN', remote_identity=NULL, "
+        "error_text=?, recovery_attempts=1, recovery_evidence_json=? WHERE id=12",
+        (
+            "timeout Authorization: Bearer TOP_SECRET at E:\\private\\payload.xlsx",
+            json.dumps(evidence),
+        ),
+    )
+    con.commit()
+    con.close()
+
+    job = project_remote_jobs(db, "2026-08-26")[0]
+    diagnostic = job["diagnostic"]
+    assert diagnostic["stage"] == "远端提交"
+    assert diagnostic["classification"] == "提交结果待确认"
+    assert diagnostic["reason"].startswith("timeout Authorization=[REDACTED]")
+    browser_fields = json.dumps(
+        {"error_text": job["error_text"], "diagnostic": diagnostic}, ensure_ascii=False
+    )
+    assert "TOP_SECRET" not in browser_fields
+    assert "session-secret" not in browser_fields
+    assert "E:\\private" not in browser_fields
+    assert diagnostic["reconcile_attempts"] == 1
+    assert diagnostic["reconcile_threshold"] == 4
+    assert diagnostic["last_reconcile_diagnostic"] == "lookup Cookie=[REDACTED] still inconclusive"
+    assert "exact reconcile" in diagnostic["next_action"]
+
+
+def test_project_remote_jobs_is_honest_when_submit_diagnostic_was_lost(tmp_path):
+    db = _make_db(tmp_path)
+    con = sqlite3.connect(db)
+    con.execute(
+        "UPDATE remote_jobs SET state='SUBMIT_UNKNOWN', remote_identity=NULL, error_text=NULL, "
+        "recovery_evidence_json=NULL WHERE id=12"
+    )
+    con.commit()
+    con.close()
+
+    diagnostic = project_remote_jobs(db, "2026-08-26")[0]["diagnostic"]
+    assert diagnostic["reason"] == "原始提交诊断不可恢复"
+    assert diagnostic["last_reconcile_diagnostic"] == "尚无自动对账诊断"
+
+
+def test_project_remote_jobs_classifies_priority_scope_manual(tmp_path):
+    db = _make_db(tmp_path)
+    con = sqlite3.connect(db)
+    con.execute(
+        "UPDATE remote_jobs SET state='MANUAL_REQUIRED', error_text=? WHERE id=12",
+        ("PriorityScopeSafetyError: task_status changed during priority update",),
+    )
+    con.commit()
+    con.close()
+
+    diagnostic = project_remote_jobs(db, "2026-08-26")[0]["diagnostic"]
+    assert diagnostic["stage"] == "提优确认"
+    assert diagnostic["classification"] == "PriorityScopeSafetyError"
+    assert "task_status changed" in diagnostic["reason"]
+    assert "不代表远端爬虫失败" in diagnostic["note"]
+
+
 def test_recovery_timeline_phase_and_observations(tmp_path):
     jobs = project_remote_jobs(_make_db(tmp_path), "2026-08-26")
     tl = project_recovery_timeline(jobs[0])

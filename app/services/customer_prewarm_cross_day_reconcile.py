@@ -25,6 +25,7 @@ from app.services.customer_prewarm_store import (
 from app.services.incremental_audit_runtime import runtime_paths
 from app.services.daily_audit_store import DailyAuditStore, LeaseUnavailable, ProcessLock
 from app.services.shared_crawl_cache import PRODUCER_CUSTOMER_PREWARM_ZHAOSHANG
+from app.services.remote_diagnostics import sanitize_remote_diagnostic
 
 CROSS_DAY_RECONCILE_PER_PASS = 4
 CROSS_DAY_RECONCILE_PER_JOB_TIMEOUT_SECONDS = 30.0
@@ -475,6 +476,9 @@ def run_cross_day_reconcile_phase(
                     )
                     continue
                 status = _status_value(outcome.status)
+                outcome_diagnostic = sanitize_remote_diagnostic(
+                    getattr(outcome, "diagnostic", "")
+                )
                 task_id = getattr(outcome, "task_id", None)
                 task_number = getattr(outcome, "task_number", None)
                 if status == "FOUND" and task_id and task_number:
@@ -507,7 +511,7 @@ def run_cross_day_reconcile_phase(
                     )
                 elif status == "MANUAL" or status == "FOUND":
                     diagnostic = (
-                        str(getattr(outcome, "diagnostic", "") or "")
+                        outcome_diagnostic
                         if status == "MANUAL"
                         else "incomplete FOUND identity"
                     )
@@ -519,13 +523,15 @@ def run_cross_day_reconcile_phase(
                         f"cross-day job {owning_day}/{job_id}: manual identity conflict; "
                         "no auto redispatch"
                     )
-                elif status == "NOT_FOUND" and not str(
-                    getattr(outcome, "diagnostic", "") or ""
-                ).strip():
+                elif status == "NOT_FOUND" and not outcome_diagnostic:
                     with historical_link_commit_fence() as commit_allowed:
                         if not commit_allowed:
                             continue
-                        new_attempts = store.bump_remote_job_recovery_attempt(token, job_id)
+                        new_attempts = store.bump_remote_job_recovery_attempt(
+                            token,
+                            job_id,
+                            diagnostic="exact remote task not found",
+                        )
                     summary["cross_day_reconcile_not_found"] += 1
                     if new_attempts >= effective_dead_threshold:
                         summary["cross_day_reconcile_dead"] += 1
@@ -534,8 +540,18 @@ def run_cross_day_reconcile_phase(
                             f"{new_attempts} attempts; next dispatch owns redispatch"
                         )
                 else:
+                    with historical_link_commit_fence() as commit_allowed:
+                        if not commit_allowed:
+                            continue
+                        store.record_submit_reconcile_diagnostic(
+                            token,
+                            job_id,
+                            status=status,
+                            diagnostic=outcome_diagnostic or "inconclusive remote lookup",
+                        )
                     phase_errors.append(
                         f"cross-day job {owning_day}/{job_id}: inconclusive remote lookup; deferred"
+                        + (f" ({outcome_diagnostic})" if outcome_diagnostic else "")
                     )
             finally:
                 store.release_lease(token)

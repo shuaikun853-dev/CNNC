@@ -6,7 +6,8 @@ They reuse the EXISTING STEP1 remote-task store and the existing recovery
 primitive — no second remote-task store is introduced:
 
 - harvest (A1): ``sku_id LIKE 'zhpq-%'`` bound jobs in ``SUBMITTED``/``RUNNING``/
-  ``EXPORTED`` with a remote identity are handed one by one to the existing
+  ``EXPORTED`` with a remote identity, plus the exact nonretryable priority
+  manual family after strict live terminal proof, are handed one by one to the existing
   :func:`harvest_existing_customer_prewarm_job` primitive (which owns its own
   ProcessLock + durable lease — this stage therefore runs OUTSIDE the dispatch
   pass, called by the CLI after the pass released every lock).
@@ -76,6 +77,7 @@ from app.services.customer_prewarm_store import (
 from app.services.daily_audit_store import DailyAuditStore, LeaseToken, LeaseUnavailable, ProcessLock
 from app.services.incremental_audit_runtime import runtime_paths
 from app.services.page_price_semantics import is_local_fallback_success
+from app.services.remote_diagnostics import sanitize_remote_diagnostic
 
 def harvest_existing_customer_prewarm_job(**kwargs: Any) -> dict[str, Any]:
     """Lazy bridge to the recovery primitive.
@@ -109,14 +111,89 @@ _RECONCILE_MANUAL_BLOCKER = "prewarm reconcile identity conflict: "
 _ZHPQ_SKU_PREFIX = "zhpq-"
 
 _HARVEST_JOBS_SQL = """
-SELECT j.id AS job_id, j.remote_identity AS remote_identity
+SELECT DISTINCT j.id AS job_id, j.*
 FROM remote_jobs j
 JOIN crawl_work c ON c.remote_job_id = j.id
 WHERE c.sku_id LIKE 'zhpq-%'
-  AND j.state IN ('SUBMITTED', 'RUNNING', 'EXPORTED')
+  AND j.state IN ('SUBMITTED', 'RUNNING', 'EXPORTED', 'MANUAL_REQUIRED')
   AND TRIM(COALESCE(j.remote_identity, '')) <> ''
 ORDER BY j.id
 """
+
+
+def _harvest_row_is_candidate(job_row: Mapping[str, Any]) -> bool:
+    if str(job_row.get("state") or "") != "MANUAL_REQUIRED":
+        return True
+    from app.services.recovery.harvest import (
+        is_terminal_nonretryable_priority_manual_family,
+    )
+
+    return is_terminal_nonretryable_priority_manual_family(job_row)
+
+
+def _terminal_priority_manual_live_proof(
+    *,
+    state_path: str | Path,
+    business_date: str,
+    job_row: Mapping[str, Any],
+    adapter: Any,
+    timeout_seconds: float,
+) -> Any | None:
+    """Build proof only for the exact customer-prewarm scope-safety incident."""
+    from app.services.recovery.harvest import (
+        is_terminal_nonretryable_priority_manual_family,
+        live_identity_proof,
+    )
+    from app.services.remote_running_recovery import (
+        RemoteExecutionState,
+        canonical_progress_signature,
+        classify_remote_execution_state,
+    )
+
+    if not is_terminal_nonretryable_priority_manual_family(job_row):
+        return None
+    identity = str(job_row.get("remote_identity") or "").strip()
+    identity_parts = identity.split("|")
+    if len(identity_parts) != 3 or not all(identity_parts):
+        return None
+    try:
+        prepared = _reconstruct_prepared_job(adapter, business_date, job_row)
+        if (
+            adapter.exact_nonretryable_unconfirmed_priority_remote_identity(prepared)
+            != identity
+        ):
+            return None
+        prewarm_path = Path(state_path).resolve().parent.parent / "customer_prewarm.sqlite3"
+        prewarm = CustomerPrewarmStore.open_read_only(prewarm_path)
+        if not prewarm.exact_current_remote_job_group_matches(
+            business_date=business_date,
+            remote_job_id=int(job_row["id"]),
+            producer=PRODUCER_CUSTOMER_PREWARM_ZHAOSHANG,
+            mall=str(job_row.get("mall_key") or "").strip(),
+            lookup_urls=tuple(request.url for request in prepared.requests),
+        ):
+            return None
+        answer = adapter.query_task_progress_for_job(
+            prepared,
+            identity_parts[1],
+            identity_parts[2],
+            min(30.0, timeout_seconds),
+        )
+    except Exception:
+        return None
+    progress = answer.get("progress") if isinstance(answer, Mapping) else None
+    progress_mapping = progress if isinstance(progress, Mapping) else None
+    classification = classify_remote_execution_state(progress_mapping, "")
+    if classification is not RemoteExecutionState.TERMINAL:
+        return None
+    signature = canonical_progress_signature(progress_mapping or {})
+    if signature is None:
+        return None
+    return live_identity_proof(
+        remote_identity=identity,
+        classification=classification,
+        progress_signature=signature,
+    )
 
 _RECONCILE_JOBS_SQL = """
 SELECT j.id AS job_id, COALESCE(j.recovery_attempts, 0) AS recovery_attempts
@@ -379,7 +456,9 @@ def plan_lifecycle_actions(
     if connection is not None:
         try:
             harvest_job_ids = [
-                int(row["job_id"]) for row in connection.execute(_HARVEST_JOBS_SQL).fetchall()
+                int(item["job_id"])
+                for row in connection.execute(_HARVEST_JOBS_SQL).fetchall()
+                if _harvest_row_is_candidate(item := dict(row))
             ]
             for row in connection.execute(_RECONCILE_JOBS_SQL).fetchall():
                 attempts = int(row["recovery_attempts"] or 0)
@@ -737,11 +816,12 @@ def run_reconcile_phase(
                 prepared, timeout_seconds=max(0.001, deadline - monotonic_value())
             )
             status = _status_value(outcome.status)
+            diagnostic = sanitize_remote_diagnostic(getattr(outcome, "diagnostic", ""))
             if status == "MANUAL":
                 with link_fence(job_id) as owned:
                     if owned:
                         _mark_reconcile_manual(
-                            store, token, job_id, str(getattr(outcome, "diagnostic", "") or "")
+                            store, token, job_id, diagnostic
                         )
                         phase_errors.append(f"reconcile job {job_id}: manual identity conflict; no auto redispatch")
             elif status == "FOUND":
@@ -780,11 +860,15 @@ def run_reconcile_phase(
                     pre_remote_guard=lambda: linked(job_id),
                     result_commit_fence=lambda: link_fence(job_id),
                 )
-            elif status == "NOT_FOUND" and not str(getattr(outcome, "diagnostic", "") or "").strip():
+            elif status == "NOT_FOUND" and not diagnostic:
                 with link_fence(job_id) as owned:
                     if not owned:
                         continue
-                    new_attempts = store.bump_remote_job_recovery_attempt(token, job_id)
+                    new_attempts = store.bump_remote_job_recovery_attempt(
+                        token,
+                        job_id,
+                        diagnostic="exact remote task not found",
+                    )
                 summary["reconcile_not_found"] += 1
                 if new_attempts >= dead_threshold:
                     phase_errors.append(
@@ -792,8 +876,17 @@ def run_reconcile_phase(
                         "attempts; redispatch owns it"
                     )
             else:
+                with link_fence(job_id) as owned:
+                    if owned:
+                        store.record_submit_reconcile_diagnostic(
+                            token,
+                            job_id,
+                            status=status,
+                            diagnostic=diagnostic or "inconclusive remote lookup",
+                        )
                 phase_errors.append(
                     f"reconcile job {job_id}: inconclusive remote lookup; deferred"
+                    + (f" ({diagnostic})" if diagnostic else "")
                 )
         except Exception as exc:  # noqa: BLE001 - per-job isolation
             phase_errors.append(f"reconcile job {job_id}: {type(exc).__name__}: {exc}")
@@ -1413,9 +1506,12 @@ def run_harvest_phase(
         rows = connection.execute(_HARVEST_JOBS_SQL).fetchall()
     finally:
         connection.close()
-    targets: dict[int, str] = {}
+    targets: dict[int, dict[str, Any]] = {}
     for row in rows:
-        targets.setdefault(int(row["job_id"]), str(row["remote_identity"] or ""))
+        item = dict(row)
+        if not _harvest_row_is_candidate(item):
+            continue
+        targets.setdefault(int(item["id"]), item)
 
     adapter_holder: list[Any] = []
 
@@ -1433,7 +1529,7 @@ def run_harvest_phase(
         return adapter_holder[0]
 
     attempted = 0
-    for job_id, identity in targets.items():
+    for job_id, job_row in targets.items():
         if attempted >= int(max_jobs):
             phase_errors.append(
                 f"harvest cap {max_jobs} reached; job {job_id} deferred to next pass"
@@ -1446,6 +1542,24 @@ def run_harvest_phase(
             break
         attempted += 1
         summary["harvest_attempted"] += 1
+        identity = str(job_row.get("remote_identity") or "")
+        proof = None
+        if str(job_row.get("state") or "") == "MANUAL_REQUIRED":
+            proof = _terminal_priority_manual_live_proof(
+                state_path=state_path,
+                business_date=business_date,
+                job_row=job_row,
+                adapter=get_adapter(),
+                timeout_seconds=max(
+                    0.001,
+                    min(float(per_job_timeout_seconds), deadline - monotonic_value()),
+                ),
+            )
+            if proof is None:
+                phase_errors.append(
+                    f"harvest job {job_id}: manual recovery proof unavailable; state preserved"
+                )
+                continue
         try:
             result = harvest_existing_customer_prewarm_job(
                 state_path=state_path,
@@ -1458,6 +1572,7 @@ def run_harvest_phase(
                     0.001,
                     min(float(per_job_timeout_seconds), deadline - monotonic_value()),
                 ),
+                live_identity_proof=proof,
             )
         except Exception as exc:  # noqa: BLE001 - per-job isolation
             phase_errors.append(f"harvest job {job_id}: {type(exc).__name__}: {exc}")
