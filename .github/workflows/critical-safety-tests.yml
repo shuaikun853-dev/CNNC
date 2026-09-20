@@ -140,6 +140,7 @@ jobs:
           tests/test_remote_job_supersede_store.py
           tests/test_live_proof_fallback.py
           tests/test_dashboard_projection.py
+          tests/test_remote_diagnostics.py
           tests/test_dashboard_api.py
           tests/test_dashboard_actions_api.py
           tests/test_safety_guard.py

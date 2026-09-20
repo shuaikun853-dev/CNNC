@@ -100,6 +100,7 @@ from scripts.zhaoshang_mall_mapping import ZhaoshangMallMapping
 RECONCILE_DEAD_THRESHOLD = 4
 REDISPATCH_DAILY_CAP = 2
 HARVEST_PER_PASS = 3
+MANUAL_RECOVERY_PER_PASS = 1
 RECONCILE_PER_PASS = 6
 HARVEST_PER_JOB_TIMEOUT_SECONDS = 90.0
 
@@ -109,6 +110,7 @@ _DEAD_JOB_STATES = frozenset({"MANUAL_REQUIRED", "TERMINAL_FAILED"})
 _RECONCILE_MANUAL_BLOCKER = "prewarm reconcile identity conflict: "
 
 _ZHPQ_SKU_PREFIX = "zhpq-"
+_MANUAL_HARVEST_CURSOR = "same-day-manual-harvest"
 
 _HARVEST_JOBS_SQL = """
 SELECT DISTINCT j.id AS job_id, j.*
@@ -129,6 +131,22 @@ def _harvest_row_is_candidate(job_row: Mapping[str, Any]) -> bool:
     )
 
     return is_terminal_nonretryable_priority_manual_family(job_row)
+
+
+def _rotate_manual_targets(
+    targets: list[tuple[int, dict[str, Any]]], cursor_value: str | None
+) -> list[tuple[int, dict[str, Any]]]:
+    if not targets or not cursor_value:
+        return targets
+    try:
+        cursor = int(cursor_value)
+    except (TypeError, ValueError):
+        return targets
+    split_at = next(
+        (index for index, (job_id, _row) in enumerate(targets) if job_id > cursor),
+        0,
+    )
+    return targets[split_at:] + targets[:split_at]
 
 
 def _terminal_priority_manual_live_proof(
@@ -1486,6 +1504,7 @@ def run_harvest_phase(
     summary: dict[str, Any],
     per_job_timeout_seconds: float = HARVEST_PER_JOB_TIMEOUT_SECONDS,
     max_jobs: int = HARVEST_PER_PASS,
+    manual_recovery_max_jobs: int = MANUAL_RECOVERY_PER_PASS,
     adapter: Any | None = None,
     mappings: Sequence[ZhaoshangMallMapping] | None = None,
 ) -> None:
@@ -1499,6 +1518,7 @@ def run_harvest_phase(
     phase_errors = summary["phase_errors"]
     summary.setdefault("harvest_attempted", 0)
     summary.setdefault("harvested", 0)
+    summary.setdefault("manual_recovery_attempted", 0)
     connection = _open_state_db_readonly(state_path)
     if connection is None:
         return
@@ -1528,23 +1548,49 @@ def run_harvest_phase(
             )
         return adapter_holder[0]
 
-    attempted = 0
-    for job_id, job_row in targets.items():
-        if attempted >= int(max_jobs):
-            phase_errors.append(
-                f"harvest cap {max_jobs} reached; job {job_id} deferred to next pass"
-            )
-            break
+    normal_targets = [
+        (job_id, row)
+        for job_id, row in targets.items()
+        if str(row.get("state") or "") != "MANUAL_REQUIRED"
+    ]
+    manual_targets = [
+        (job_id, row)
+        for job_id, row in targets.items()
+        if str(row.get("state") or "") == "MANUAL_REQUIRED"
+    ]
+    prewarm_store: CustomerPrewarmStore | None = None
+    if manual_targets:
+        try:
+            prewarm_path = Path(state_path).resolve().parent.parent / PREWARM_STORE_FILENAME
+            if prewarm_path.is_file():
+                prewarm_store = CustomerPrewarmStore(prewarm_path)
+                manual_targets = _rotate_manual_targets(
+                    manual_targets,
+                    prewarm_store.lifecycle_cursor(_MANUAL_HARVEST_CURSOR),
+                )
+            else:
+                phase_errors.append("manual harvest cursor unavailable: prewarm store missing")
+        except Exception as exc:  # noqa: BLE001 - normal harvest must still run
+            phase_errors.append(f"manual harvest cursor unavailable: {type(exc).__name__}: {exc}")
+
+    def attempt_target(job_id: int, job_row: dict[str, Any], *, manual: bool) -> bool:
         if monotonic_value() >= deadline:
             phase_errors.append(
                 f"budget deadline reached; harvest of job {job_id} deferred"
             )
-            break
-        attempted += 1
+            return False
         summary["harvest_attempted"] += 1
         identity = str(job_row.get("remote_identity") or "")
         proof = None
-        if str(job_row.get("state") or "") == "MANUAL_REQUIRED":
+        if manual:
+            summary["manual_recovery_attempted"] += 1
+            if prewarm_store is not None:
+                try:
+                    prewarm_store.set_lifecycle_cursor(_MANUAL_HARVEST_CURSOR, str(job_id))
+                except Exception as exc:  # noqa: BLE001 - isolate cursor persistence
+                    phase_errors.append(
+                        f"manual harvest cursor update: {type(exc).__name__}: {exc}"
+                    )
             proof = _terminal_priority_manual_live_proof(
                 state_path=state_path,
                 business_date=business_date,
@@ -1559,7 +1605,7 @@ def run_harvest_phase(
                 phase_errors.append(
                     f"harvest job {job_id}: manual recovery proof unavailable; state preserved"
                 )
-                continue
+                return True
         try:
             result = harvest_existing_customer_prewarm_job(
                 state_path=state_path,
@@ -1576,7 +1622,7 @@ def run_harvest_phase(
             )
         except Exception as exc:  # noqa: BLE001 - per-job isolation
             phase_errors.append(f"harvest job {job_id}: {type(exc).__name__}: {exc}")
-            continue
+            return True
         outcome = str(result.get("outcome") or "")
         if outcome == "REMOTE_EXISTING_HARVEST_COMPLETED":
             summary["harvested"] += 1
@@ -1586,3 +1632,23 @@ def run_harvest_phase(
             )
         else:
             phase_errors.append(f"harvest job {job_id}: {outcome or 'unknown outcome'}")
+        return True
+
+    attempted = 0
+    for job_id, job_row in normal_targets:
+        if attempted >= int(max_jobs):
+            phase_errors.append(
+                f"harvest cap {max_jobs} reached; job {job_id} deferred to next pass"
+            )
+            break
+        if not attempt_target(job_id, job_row, manual=False):
+            break
+        attempted += 1
+
+    manual_attempted = 0
+    for job_id, job_row in manual_targets:
+        if manual_attempted >= int(manual_recovery_max_jobs):
+            break
+        if not attempt_target(job_id, job_row, manual=True):
+            break
+        manual_attempted += 1

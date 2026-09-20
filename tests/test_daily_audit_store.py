@@ -405,6 +405,36 @@ def test_submit_unknown_found_reconciliation_clears_stale_submit_diagnostic(stor
     assert reconciled["error_text"] is None
 
 
+def test_submit_reconcile_diagnostic_redacts_credentials_and_private_paths(store):
+    lease = _lease(store)
+    job = store.prepare_remote_intent(
+        lease,
+        "mall-submit-redaction:hash",
+        "daily-submit-redaction",
+        "payload-submit-redaction",
+    )
+    store.claim_remote_submission(lease, int(job["id"]))
+    store.mark_submit_unknown(lease, int(job["id"]), "submit outcome unknown")
+
+    recorded = store.record_submit_reconcile_diagnostic(
+        lease,
+        int(job["id"]),
+        status="NOT_FOUND",
+        diagnostic=(
+            "HTTP 503 accessToken=top-secret from "
+            r"E:\folder with spaces\payload.xlsx and /home/user/private/file.txt"
+        ),
+    )
+
+    durable = json.loads(recorded["recovery_evidence_json"])["submit_reconcile"]
+    assert durable["status"] == "NOT_FOUND"
+    assert "HTTP 503" in durable["last_diagnostic"]
+    assert "top-secret" not in durable["last_diagnostic"]
+    assert "payload.xlsx" not in durable["last_diagnostic"]
+    assert "file.txt" not in durable["last_diagnostic"]
+    assert durable["last_diagnostic"].count("[REDACTED_PATH]") == 2
+
+
 def test_confirmed_submit_waits_in_priority_pending_before_remote_progress(store):
     lease = _lease(store)
     job = store.prepare_remote_intent(lease, "mall-A:hash", "daily-20260811-mall-A", "payload-a")

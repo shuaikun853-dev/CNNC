@@ -56,15 +56,21 @@ WHERE j.id = ?
 """
 
 _HARVEST_ELIGIBLE_JOB_SQL = """
-SELECT j.state, j.remote_identity, j.mall_key
+SELECT j.*,
+       EXISTS (
+           SELECT 1 FROM crawl_work successful
+           WHERE successful.remote_job_id = j.id
+             AND successful.state = 'SUCCESS'
+             AND successful.sku_id LIKE 'zhpq-%'
+       ) AS has_success
 FROM remote_jobs j
 JOIN daily_runs r ON r.id = j.run_id
 WHERE j.id = ? AND r.business_date = ?
   AND TRIM(COALESCE(j.remote_identity, '')) <> ''
   AND (
-      j.state IN ('SUBMITTED', 'RUNNING', 'EXPORTED')
+      j.state IN ('SUBMITTED', 'RUNNING', 'EXPORTED', 'MANUAL_REQUIRED')
       OR (
-          j.state IN ('COMPLETED', 'MANUAL_REQUIRED', 'TERMINAL_FAILED')
+          j.state IN ('COMPLETED', 'TERMINAL_FAILED')
           AND EXISTS (
               SELECT 1 FROM crawl_work c
               WHERE c.remote_job_id = j.id AND c.state = 'SUCCESS'
@@ -200,8 +206,19 @@ def plan_cross_day_harvest_jobs(
             ).fetchone()
         finally:
             connection.close()
-        if row is not None:
-            planned.append((owning_day, job_id))
+        if row is None:
+            continue
+        item = dict(row)
+        if str(item.get("state") or "") == "MANUAL_REQUIRED" and not int(
+            item.get("has_success") or 0
+        ):
+            from app.services.recovery.harvest import (
+                is_terminal_nonretryable_priority_manual_family,
+            )
+
+            if not is_terminal_nonretryable_priority_manual_family(item):
+                continue
+        planned.append((owning_day, job_id))
     return planned
 
 
@@ -661,7 +678,33 @@ def run_cross_day_harvest_phase(
             )
         except Exception as exc:  # noqa: BLE001 - failure cannot block safe harvest
             phase_errors.append(f"cross-day harvest cursor: {type(exc).__name__}: {exc}")
-        if str(row["state"]) not in {"COMPLETED", "MANUAL_REQUIRED", "TERMINAL_FAILED"}:
+        job_row = dict(row)
+        state = str(job_row.get("state") or "")
+        has_success = bool(int(job_row.get("has_success") or 0))
+        proof = None
+        should_harvest = state not in {"COMPLETED", "TERMINAL_FAILED"} and not (
+            state == "MANUAL_REQUIRED" and has_success
+        )
+        if state == "MANUAL_REQUIRED" and should_harvest:
+            proof_remaining = deadline - monotonic_value()
+            if proof_remaining <= 0:
+                summary["cross_day_harvest_deferred"] += 1
+                continue
+            proof = lifecycle._terminal_priority_manual_live_proof(
+                state_path=paths.state_path,
+                business_date=owning_day,
+                job_row=job_row,
+                adapter=get_adapter(),
+                timeout_seconds=min(float(per_job_timeout_seconds), proof_remaining),
+            )
+            if proof is None:
+                summary["cross_day_harvest_deferred"] += 1
+                phase_errors.append(
+                    f"cross-day harvest {owning_day}/{job_id}: "
+                    "manual recovery proof unavailable; state preserved"
+                )
+                continue
+        if should_harvest:
             remaining = deadline - monotonic_value()
             if remaining <= 0:
                 summary["cross_day_harvest_deferred"] += 1
@@ -675,6 +718,7 @@ def run_cross_day_harvest_phase(
                     remote_identity=identity,
                     adapter=get_adapter(),
                     timeout_seconds=min(float(per_job_timeout_seconds), remaining),
+                    live_identity_proof=proof,
                 )
             except LeaseUnavailable:
                 summary["cross_day_harvest_lock_busy"] += 1

@@ -1412,6 +1412,65 @@ def test_harvest_phase_budget_truncates_and_running_is_in_flight(tmp_path, monke
     assert not any("Traceback" in note for note in summary["phase_errors"])
 
 
+def test_manual_recovery_cannot_starve_normal_harvest_and_rotates(tmp_path, monkeypatch):
+    runtime_root = tmp_path / "runtime"
+    CustomerPrewarmStore(runtime_root / "customer_prewarm.sqlite3")
+    manual_job_ids = []
+    paths = None
+    for index in range(3):
+        paths, job_id = seed_manual_job(
+            runtime_root,
+            TODAY,
+            _CountingAdapter(),
+            mapping=COMIX,
+            url=f"https://qx.com/manual-fairness-{index}.html",
+        )
+        manual_job_ids.append(job_id)
+        with sqlite3.connect(paths.state_path) as connection:
+            connection.execute(
+                "UPDATE remote_jobs SET error_text='highest priority was not confirmed', "
+                "result_json=NULL WHERE id=?",
+                (job_id,),
+            )
+    paths, normal_job_id = seed_remote_work(
+        runtime_root,
+        TODAY,
+        _CountingAdapter(),
+        mapping=COMIX,
+        url="https://qx.com/normal-after-manuals.html",
+        job_state="SUBMITTED",
+        remote_identity="comix|normal-task|normal-number",
+    )
+
+    manual_probes = []
+    normal_harvests = []
+
+    def no_manual_proof(**kwargs):
+        manual_probes.append(int(kwargs["job_row"]["id"]))
+        return None
+
+    def fake_primitive(**kwargs):
+        normal_harvests.append(int(kwargs["remote_job_id"]))
+        return {"outcome": "REMOTE_EXISTING_HARVEST_RUNNING"}
+
+    monkeypatch.setattr(lifecycle, "_terminal_priority_manual_live_proof", no_manual_proof)
+    monkeypatch.setattr(lifecycle, "harvest_existing_customer_prewarm_job", fake_primitive)
+
+    for _ in range(3):
+        run_harvest_phase(
+            paths.state_path,
+            paths.lock_path,
+            TODAY,
+            deadline=time.monotonic() + 60.0,
+            monotonic_value=time.monotonic,
+            summary=_new_summary(),
+            max_jobs=3,
+        )
+
+    assert normal_harvests == [normal_job_id, normal_job_id, normal_job_id]
+    assert manual_probes == manual_job_ids
+
+
 # ---- 6. canary 模式:三阶段全部跳过,summary 键集合不变 --------------------------------
 
 

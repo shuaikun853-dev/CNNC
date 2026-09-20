@@ -254,6 +254,24 @@ def test_project_remote_jobs_classifies_priority_scope_manual(tmp_path):
     assert "不代表远端爬虫失败" in diagnostic["note"]
 
 
+def test_project_remote_jobs_classifies_collapsed_priority_manual_without_inventing_reason(tmp_path):
+    db = _make_db(tmp_path)
+    con = sqlite3.connect(db)
+    con.execute(
+        "UPDATE remote_jobs SET state='MANUAL_REQUIRED', post_attempted=1, "
+        "result_json=NULL, error_text=? WHERE id=12",
+        ("highest priority was not confirmed",),
+    )
+    con.commit()
+    con.close()
+
+    diagnostic = project_remote_jobs(db, "2026-08-26")[0]["diagnostic"]
+    assert diagnostic["stage"] == "提优确认"
+    assert diagnostic["classification"] == "优先级未确认"
+    assert diagnostic["reason"] == "highest priority was not confirmed"
+    assert "PriorityScopeSafetyError" not in json.dumps(diagnostic, ensure_ascii=False)
+
+
 def test_recovery_timeline_phase_and_observations(tmp_path):
     jobs = project_remote_jobs(_make_db(tmp_path), "2026-08-26")
     tl = project_recovery_timeline(jobs[0])

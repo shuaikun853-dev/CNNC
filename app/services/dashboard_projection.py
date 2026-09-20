@@ -343,6 +343,7 @@ from app.services.remote_running_recovery import (
     decode_recovery_evidence,
 )
 from app.services.remote_diagnostics import sanitize_remote_diagnostic
+from app.services.recovery.harvest import is_terminal_nonretryable_priority_manual_family
 # 生产语义权威:finalize 对 RECOVERY_EXHAUSTED durable proof 的接受判定唯一来源
 # (app/workflows/incremental_price_audit_finalize.py::_valid_recovery_exhausted_evidence)。
 # Dashboard 只读复用同一判定,不在投影层重写第二套业务规则。
@@ -384,10 +385,17 @@ def _remote_job_diagnostic(row: Mapping, evidence: Mapping) -> dict:
             "note": "远端创建请求已进入可能发送边界，但尚未取得 exact taskId/taskNumber。",
         }
     priority_scope = "PriorityScopeSafetyError" in reason
+    collapsed_priority_unconfirmed = is_terminal_nonretryable_priority_manual_family(row)
     if state == "MANUAL_REQUIRED":
         return {
-            "stage": "提优确认" if priority_scope else "远端任务处理",
-            "classification": "PriorityScopeSafetyError" if priority_scope else "需要人工检查",
+            "stage": "提优确认" if priority_scope or collapsed_priority_unconfirmed else "远端任务处理",
+            "classification": (
+                "PriorityScopeSafetyError"
+                if priority_scope
+                else "优先级未确认"
+                if collapsed_priority_unconfirmed
+                else "需要人工检查"
+            ),
             "reason": reason or "具体诊断不可恢复",
             "updated_at": row.get("updated_at"),
             "reconcile_attempts": attempts,
@@ -401,7 +409,8 @@ def _remote_job_diagnostic(row: Mapping, evidence: Mapping) -> dict:
             ),
             "note": (
                 "该异常来自 priority 确认阶段，不代表远端爬虫失败。"
-                if priority_scope else "保持 fail-closed，等待新的严格证据或人工处理。"
+                if priority_scope or collapsed_priority_unconfirmed
+                else "保持 fail-closed，等待新的严格证据或人工处理。"
             ),
         }
     if reason:
