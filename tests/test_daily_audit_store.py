@@ -351,6 +351,143 @@ def test_remote_intent_is_durable_conflict_and_unknown_submit_never_reclaims(sto
     assert store.get_remote_job(job["id"])["remote_identity"] == "remote-99"
 
 
+def test_submit_unknown_harvest_without_new_error_preserves_original_diagnostic(store):
+    lease = _lease(store)
+    job = store.prepare_remote_intent(
+        lease,
+        "mall-submit-unknown:hash",
+        "daily-submit-unknown",
+        "payload-submit-unknown",
+    )
+    store.claim_remote_submission(lease, int(job["id"]))
+    store.mark_submit_unknown(
+        lease,
+        int(job["id"]),
+        "prewarm dispatch submit unknown: ORIGINAL_REASON",
+    )
+
+    recorded = store.record_harvest(
+        lease,
+        int(job["id"]),
+        elapsed_seconds=1.0,
+        max_attempts=4,
+        max_elapsed_seconds=300.0,
+        error=None,
+    )
+
+    assert recorded["state"] == "SUBMIT_UNKNOWN"
+    assert recorded["error_text"] == "prewarm dispatch submit unknown: ORIGINAL_REASON"
+
+
+def test_submit_unknown_found_reconciliation_clears_stale_submit_diagnostic(store):
+    lease = _lease(store)
+    job = store.prepare_remote_intent(
+        lease,
+        "mall-submit-found:hash",
+        "daily-submit-found",
+        "payload-submit-found",
+    )
+    store.claim_remote_submission(lease, int(job["id"]))
+    store.mark_submit_unknown(
+        lease,
+        int(job["id"]),
+        "prewarm dispatch submit unknown: ORIGINAL_REASON",
+    )
+
+    reconciled = store.reconcile_remote_job(
+        lease,
+        int(job["id"]),
+        remote_identity="mall-submit-found|task-id|task-number",
+        state="PRIORITY_PENDING",
+    )
+
+    assert reconciled["state"] == "PRIORITY_PENDING"
+    assert reconciled["error_text"] is None
+
+
+def test_submit_reconcile_diagnostic_redacts_credentials_and_private_paths(store):
+    lease = _lease(store)
+    job = store.prepare_remote_intent(
+        lease,
+        "mall-submit-redaction:hash",
+        "daily-submit-redaction",
+        "payload-submit-redaction",
+    )
+    store.claim_remote_submission(lease, int(job["id"]))
+    store.mark_submit_unknown(lease, int(job["id"]), "submit outcome unknown")
+
+    recorded = store.record_submit_reconcile_diagnostic(
+        lease,
+        int(job["id"]),
+        status="NOT_FOUND",
+        diagnostic=(
+            "HTTP 503 accessToken=top-secret from "
+            r"E:\folder with spaces\payload.xlsx and /home/user/private/file.txt"
+        ),
+    )
+
+    durable = json.loads(recorded["recovery_evidence_json"])["submit_reconcile"]
+    assert durable["status"] == "NOT_FOUND"
+    assert "HTTP 503" in durable["last_diagnostic"]
+    assert "top-secret" not in durable["last_diagnostic"]
+    assert "payload.xlsx" not in durable["last_diagnostic"]
+    assert "file.txt" not in durable["last_diagnostic"]
+    assert durable["last_diagnostic"].count("[REDACTED_PATH]") == 2
+
+
+def test_submit_unknown_redacts_diagnostic_at_durable_write_boundary(store):
+    lease = _lease(store)
+    job = store.prepare_remote_intent(
+        lease,
+        "mall-submit-unknown-redaction:hash",
+        "daily-submit-unknown-redaction",
+        "payload-submit-unknown-redaction",
+    )
+    store.claim_remote_submission(lease, int(job["id"]))
+
+    recorded = store.mark_submit_unknown(
+        lease,
+        int(job["id"]),
+        r"HTTP 503 Authorization: Basic dXNlcjpwYXNz from E:\private_dir",
+    )
+
+    assert recorded["state"] == "SUBMIT_UNKNOWN"
+    assert "HTTP 503" in recorded["error_text"]
+    assert "dXNlcjpwYXNz" not in recorded["error_text"]
+    assert "private_dir" not in recorded["error_text"]
+    assert "Authorization=[REDACTED]" in recorded["error_text"]
+    assert "[REDACTED_PATH]" in recorded["error_text"]
+
+
+def test_submit_unknown_redacts_generic_token_and_set_cookie_headers(store):
+    lease = _lease(store)
+    job = store.prepare_remote_intent(
+        lease,
+        "mall-submit-generic-redaction:hash",
+        "daily-submit-generic-redaction",
+        "payload-submit-generic-redaction",
+    )
+    store.claim_remote_submission(lease, int(job["id"]))
+
+    recorded = store.mark_submit_unknown(
+        lease,
+        int(job["id"]),
+        "HTTP 503 authToken=opaque-secret\n"
+        "Set-Cookie: session=session-secret; Path=/\n"
+        "X-API-Key: api-secret\n"
+        "Proxy-Authorization: Basic proxy-secret",
+    )
+
+    assert "opaque-secret" not in recorded["error_text"]
+    assert "session-secret" not in recorded["error_text"]
+    assert "api-secret" not in recorded["error_text"]
+    assert "proxy-secret" not in recorded["error_text"]
+    assert "authToken=[REDACTED]" in recorded["error_text"]
+    assert "Set-Cookie=[REDACTED]" in recorded["error_text"]
+    assert "X-API-Key=[REDACTED]" in recorded["error_text"]
+    assert "Proxy-Authorization=[REDACTED]" in recorded["error_text"]
+
+
 def test_confirmed_submit_waits_in_priority_pending_before_remote_progress(store):
     lease = _lease(store)
     job = store.prepare_remote_intent(lease, "mall-A:hash", "daily-20260811-mall-A", "payload-a")

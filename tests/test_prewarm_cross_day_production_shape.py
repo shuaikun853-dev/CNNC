@@ -30,6 +30,7 @@ import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
 
+import pytest
 from openpyxl import Workbook
 
 from app.services.customer_prewarm_dispatch import (
@@ -37,6 +38,8 @@ from app.services.customer_prewarm_dispatch import (
     prewarm_placeholder_sku,
     run_prewarm_dispatch_pass,
 )
+from app.services.customer_prewarm_cross_day_reconcile import run_cross_day_harvest_phase
+from app.services.customer_prewarm_lifecycle import run_harvest_phase
 from app.services.customer_prewarm_store import (
     CACHE_STATUS_PENDING_PREWARM,
     CustomerPrewarmStore,
@@ -84,6 +87,9 @@ class _RemoteWorld:
         self.run_dir = run_dir
         self.batch_state = run_dir / "BATCH_STATE.md"
         self.runner_calls: list[list[str]] = []
+        self.priority_calls = 0
+        self.restart_calls = 0
+        self.expected_subtask_count = 1
         self.export_steps: list = []
         self.progress_steps: list[dict[str, int]] = []
 
@@ -129,7 +135,7 @@ class _RemoteWorld:
                         "task_name": task_name,
                         "task_id": TASK_ID,
                         "task_number": TASK_NUMBER,
-                        "expected_subtask_count": 1,
+                        "expected_subtask_count": self.expected_subtask_count,
                     },
                     {
                         "action": "ENABLED",
@@ -175,6 +181,7 @@ class _RemoteWorld:
         return Result()
 
     def priority_runner(self, _job, _task_id, _task_number, _timeout_seconds):
+        self.priority_calls += 1
         self._append_events(
             [
                 {
@@ -210,15 +217,19 @@ class _RemoteWorld:
         }
 
     @staticmethod
-    def terminal_progress() -> dict[str, int]:
+    def terminal_progress(total: int = 1) -> dict[str, int]:
         return {
-            "total": 1,
+            "total": total,
             "pending": 0,
             "running": 0,
             "failed": 0,
             "waiting_db": 0,
-            "finished": 1,
+            "finished": total,
         }
+
+    def restart_runner(self, *_args, **_kwargs):
+        self.restart_calls += 1
+        raise AssertionError("manual recovery must not restart/disable/enable the remote task")
 
     def adapter(self) -> CnncLegacyZhaoshangAdapter:
         return CnncLegacyZhaoshangAdapter(
@@ -227,6 +238,7 @@ class _RemoteWorld:
             runner=self.runner,
             priority_runner=self.priority_runner,
             progress_probe=self.progress_probe,
+            restart_runner=self.restart_runner,
         )
 
 
@@ -547,3 +559,373 @@ def test_production_shape_cross_day_unrelated_snapshot_prewarm_harvest_and_step1
         runtime_root / DAY_2 / "state.sqlite3", "SELECT * FROM remote_jobs"
     )
     assert d2_jobs == []
+
+
+def test_automatic_lifecycle_harvests_exact_terminal_priority_manual_job(tmp_path):
+    runtime_root = tmp_path / "runtime"
+    prewarm = CustomerPrewarmStore(runtime_root / PREWARM_STORE_NAME)
+    cache = SharedCrawlCache(runtime_root / SHARED_CACHE_NAME)
+    paths = _make_run_db(runtime_root, DAY_1)
+    world = _RemoteWorld(paths.run_dir)
+    urls = [f"https://qx.com/priority-manual-{index}.html" for index in range(14)]
+    world.expected_subtask_count = len(urls)
+    for index, url in enumerate(urls):
+        candidate_id = _pending_candidate(prewarm, url)
+        assert candidate_id > 0
+
+    dispatch_summary = run_prewarm_dispatch_pass(
+        prewarm,
+        cache,
+        business_date=DAY_1,
+        runtime_root=runtime_root,
+        mappings=[COMIX],
+        adapter=world.adapter(),
+        budget_seconds=120.0,
+    )
+    assert dispatch_summary["jobs_created"] == 1
+    priority_calls_before = world.priority_calls
+
+    jobs = _state_rows(paths.state_path, "SELECT * FROM remote_jobs")
+    assert len(jobs) == 1
+    job = jobs[0]
+    job_id = int(job["id"])
+    identity = str(job["remote_identity"])
+    assert len(json.loads(job["payload_json"])["requests"]) == 14
+
+    retained_lines = [
+        line
+        for line in world.batch_state.read_text(encoding="utf-8").splitlines()
+        if '"action": "PRIORITY_UPDATED"' not in line
+    ]
+    world.batch_state.write_text("\n".join(retained_lines) + "\n", encoding="utf-8")
+    world._append_events(
+        [
+            {
+                "action": "PRIORITY_UNCONFIRMED",
+                "mall": COMIX.mall_key,
+                "task_name": str(job["task_name"]),
+                "task_id": TASK_ID,
+                "task_number": TASK_NUMBER,
+                "reason": "PriorityScopeSafetyError",
+                "retryable": False,
+            }
+        ]
+    )
+    connection = sqlite3.connect(str(paths.state_path), timeout=5)
+    try:
+        connection.execute(
+            """UPDATE remote_jobs
+               SET state='MANUAL_REQUIRED', error_text='highest priority was not confirmed',
+                   result_json=NULL, harvest_attempts=1
+               WHERE id=?""",
+            (job_id,),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    world.progress_steps = [world.terminal_progress(14)]
+    world.export_steps = [
+        [
+            [
+                f"code-{index}",
+                prewarm_placeholder_sku(COMIX.mall_key, url),
+                url,
+                float(index),
+            ]
+            for index, url in enumerate(urls, start=1)
+        ]
+    ]
+    summary = {"phase_errors": []}
+
+    run_harvest_phase(
+        paths.state_path,
+        paths.lock_path,
+        DAY_1,
+        deadline=100.0,
+        monotonic_value=lambda: 0.0,
+        summary=summary,
+        adapter=world.adapter(),
+        mappings=[COMIX],
+    )
+
+    refreshed = _state_rows(
+        paths.state_path, "SELECT state, remote_identity FROM remote_jobs WHERE id=?", (job_id,)
+    )[0]
+    assert refreshed == {"state": "COMPLETED", "remote_identity": identity}, summary
+    crawl_states = _state_rows(
+        paths.state_path,
+        "SELECT state FROM crawl_work WHERE remote_job_id=? ORDER BY id",
+        (job_id,),
+    )
+    assert len(crawl_states) == 14
+    assert {row["state"] for row in crawl_states} == {"SUCCESS"}
+    assert summary["harvest_attempted"] == 1
+    assert summary["harvested"] == 1
+    assert world.priority_calls == priority_calls_before
+    assert world.restart_calls == 0
+    assert len([args for args in world.runner_calls if "--create-only" in args]) == 1
+    assert len([args for args in world.runner_calls if "--wait-export-only" in args]) == 1
+
+
+def test_cross_day_lifecycle_harvests_exact_terminal_priority_manual_job(tmp_path):
+    """D1 false-MANUAL must remain harvestable by the real D2 lifecycle seam."""
+    runtime_root = tmp_path / "runtime"
+    prewarm = CustomerPrewarmStore(runtime_root / PREWARM_STORE_NAME)
+    cache = SharedCrawlCache(runtime_root / SHARED_CACHE_NAME)
+    paths = _make_run_db(runtime_root, DAY_1)
+    world = _RemoteWorld(paths.run_dir)
+    urls = [f"https://qx.com/cross-day-priority-manual-{index}.html" for index in range(14)]
+    world.expected_subtask_count = len(urls)
+    for url in urls:
+        _pending_candidate(prewarm, url)
+
+    dispatch_summary = run_prewarm_dispatch_pass(
+        prewarm,
+        cache,
+        business_date=DAY_1,
+        runtime_root=runtime_root,
+        mappings=[COMIX],
+        adapter=world.adapter(),
+        budget_seconds=120.0,
+    )
+    assert dispatch_summary["jobs_created"] == 1
+    job = _state_rows(paths.state_path, "SELECT * FROM remote_jobs")[0]
+    job_id = int(job["id"])
+    identity = str(job["remote_identity"])
+    priority_calls_before = world.priority_calls
+    create_calls_before = len([args for args in world.runner_calls if "--create-only" in args])
+
+    retained_lines = [
+        line
+        for line in world.batch_state.read_text(encoding="utf-8").splitlines()
+        if '"action": "PRIORITY_UPDATED"' not in line
+    ]
+    world.batch_state.write_text("\n".join(retained_lines) + "\n", encoding="utf-8")
+    world._append_events(
+        [
+            {
+                "action": "PRIORITY_UNCONFIRMED",
+                "mall": COMIX.mall_key,
+                "task_name": str(job["task_name"]),
+                "task_id": TASK_ID,
+                "task_number": TASK_NUMBER,
+                "reason": "PriorityScopeSafetyError",
+                "retryable": False,
+            }
+        ]
+    )
+    with sqlite3.connect(str(paths.state_path), timeout=5) as connection:
+        connection.execute(
+            """UPDATE remote_jobs
+               SET state='MANUAL_REQUIRED', error_text='highest priority was not confirmed',
+                   result_json=NULL, harvest_attempts=1
+               WHERE id=?""",
+            (job_id,),
+        )
+
+    world.progress_steps = [world.terminal_progress(14)]
+    world.export_steps = [
+        [
+            [
+                f"code-{index}",
+                prewarm_placeholder_sku(COMIX.mall_key, url),
+                url,
+                float(index),
+            ]
+            for index, url in enumerate(urls, start=1)
+        ]
+    ]
+    summary = {"phase_errors": []}
+
+    run_cross_day_harvest_phase(
+        prewarm_store=prewarm,
+        shared_cache=cache,
+        current_business_date=DAY_2,
+        state_runtime_root=runtime_root,
+        get_adapter=world.adapter,
+        deadline=100.0,
+        monotonic_value=lambda: 0.0,
+        summary=summary,
+    )
+
+    refreshed = _state_rows(
+        paths.state_path,
+        "SELECT state, remote_identity FROM remote_jobs WHERE id=?",
+        (job_id,),
+    )[0]
+    assert refreshed == {"state": "COMPLETED", "remote_identity": identity}, summary
+    crawl_states = _state_rows(
+        paths.state_path,
+        "SELECT state FROM crawl_work WHERE remote_job_id=? ORDER BY id",
+        (job_id,),
+    )
+    assert len(crawl_states) == 14
+    assert {row["state"] for row in crawl_states} == {"SUCCESS"}
+    assert summary["cross_day_harvested"] == 1
+    assert summary["cross_day_harvest_cache_synced"] == 14
+    assert world.priority_calls == priority_calls_before
+    assert world.restart_calls == 0
+    assert len([args for args in world.runner_calls if "--create-only" in args]) == create_calls_before
+    assert len([args for args in world.runner_calls if "--wait-export-only" in args]) == 1
+
+
+@pytest.mark.parametrize("phase", ["same_day", "cross_day"])
+@pytest.mark.parametrize(
+    ("variant", "progress", "retryable", "reason", "event_task_id", "mutation"),
+    [
+        (
+            "13_of_14",
+            {"total": 14, "pending": 1, "running": 0, "failed": 0, "waiting_db": 0, "finished": 13},
+            False,
+            "PriorityScopeSafetyError",
+            TASK_ID,
+            "",
+        ),
+        (
+            "failed_one",
+            {"total": 14, "pending": 0, "running": 0, "failed": 1, "waiting_db": 0, "finished": 13},
+            False,
+            "PriorityScopeSafetyError",
+            TASK_ID,
+            False,
+        ),
+        (
+            "remote_total_mismatch",
+            {"total": 13, "pending": 0, "running": 0, "failed": 0, "waiting_db": 0, "finished": 13},
+            False,
+            "PriorityScopeSafetyError",
+            TASK_ID,
+            "",
+        ),
+        ("retryable", _RemoteWorld.terminal_progress(14), True, "PriorityScopeSafetyError", TASK_ID, ""),
+        ("wrong_reason", _RemoteWorld.terminal_progress(14), False, "PriorityEvidenceConflictError", TASK_ID, ""),
+        ("identity_conflict", _RemoteWorld.terminal_progress(14), False, "PriorityScopeSafetyError", "foreign-task", ""),
+        ("wrong_producer", _RemoteWorld.terminal_progress(14), False, "PriorityScopeSafetyError", TASK_ID, "producer"),
+        ("url_group_mismatch", _RemoteWorld.terminal_progress(14), False, "PriorityScopeSafetyError", TASK_ID, "url_group"),
+        ("payload_mismatch", _RemoteWorld.terminal_progress(14), False, "PriorityScopeSafetyError", TASK_ID, "payload"),
+        ("missing_event", _RemoteWorld.terminal_progress(14), False, None, TASK_ID, ""),
+        ("remote_unknown", {}, False, "PriorityScopeSafetyError", TASK_ID, ""),
+    ],
+)
+def test_automatic_lifecycle_keeps_unproven_priority_manual_fail_closed(
+    tmp_path,
+    phase,
+    variant,
+    progress,
+    retryable,
+    reason,
+    event_task_id,
+    mutation,
+):
+    runtime_root = tmp_path / phase / variant
+    prewarm = CustomerPrewarmStore(runtime_root / PREWARM_STORE_NAME)
+    cache = SharedCrawlCache(runtime_root / SHARED_CACHE_NAME)
+    paths = _make_run_db(runtime_root, DAY_1)
+    world = _RemoteWorld(paths.run_dir)
+    urls = [f"https://qx.com/{variant}-{index}.html" for index in range(14)]
+    world.expected_subtask_count = len(urls)
+    for url in urls:
+        _pending_candidate(prewarm, url)
+    run_prewarm_dispatch_pass(
+        prewarm,
+        cache,
+        business_date=DAY_1,
+        runtime_root=runtime_root,
+        mappings=[COMIX],
+        adapter=world.adapter(),
+        budget_seconds=120.0,
+    )
+    job = _state_rows(paths.state_path, "SELECT * FROM remote_jobs")[0]
+    job_id = int(job["id"])
+    retained_lines = [
+        line
+        for line in world.batch_state.read_text(encoding="utf-8").splitlines()
+        if '"action": "PRIORITY_UPDATED"' not in line
+    ]
+    world.batch_state.write_text("\n".join(retained_lines) + "\n", encoding="utf-8")
+    if reason is not None:
+        world._append_events(
+            [
+                {
+                    "action": "PRIORITY_UNCONFIRMED",
+                    "mall": COMIX.mall_key,
+                    "task_name": str(job["task_name"]),
+                    "task_id": event_task_id,
+                    "task_number": TASK_NUMBER,
+                    "reason": reason,
+                    "retryable": retryable,
+                }
+            ]
+        )
+    connection = sqlite3.connect(str(paths.state_path), timeout=5)
+    try:
+        connection.execute(
+            """UPDATE remote_jobs
+               SET state='MANUAL_REQUIRED', error_text='highest priority was not confirmed',
+                   result_json=NULL, harvest_attempts=1
+               WHERE id=?""",
+            (job_id,),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    if mutation == "producer":
+        connection = sqlite3.connect(str(prewarm.path), timeout=5)
+        try:
+            connection.execute(
+                "UPDATE prewarm_remote_job_links SET producer='foreign-producer' WHERE remote_job_id=?",
+                (job_id,),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+    elif mutation == "url_group":
+        with sqlite3.connect(str(prewarm.path), timeout=5) as connection:
+            connection.execute(
+                "UPDATE prewarm_candidates SET lookup_url='https://foreign.example/item' "
+                "WHERE remote_job_id=? AND id=(SELECT MIN(id) FROM prewarm_candidates WHERE remote_job_id=?)",
+                (job_id, job_id),
+            )
+    elif mutation == "payload":
+        with sqlite3.connect(str(paths.state_path), timeout=5) as connection:
+            connection.execute(
+                "UPDATE remote_jobs SET payload_hash='foreign-payload-hash' WHERE id=?",
+                (job_id,),
+            )
+
+    create_calls_before = len([args for args in world.runner_calls if "--create-only" in args])
+    priority_calls_before = world.priority_calls
+    world.progress_steps = [dict(progress)]
+    summary = {"phase_errors": []}
+    if phase == "same_day":
+        run_harvest_phase(
+            paths.state_path,
+            paths.lock_path,
+            DAY_1,
+            deadline=100.0,
+            monotonic_value=lambda: 0.0,
+            summary=summary,
+            adapter=world.adapter(),
+            mappings=[COMIX],
+        )
+    else:
+        run_cross_day_harvest_phase(
+            prewarm_store=prewarm,
+            shared_cache=cache,
+            current_business_date=DAY_2,
+            state_runtime_root=runtime_root,
+            get_adapter=world.adapter,
+            deadline=100.0,
+            monotonic_value=lambda: 0.0,
+            summary=summary,
+        )
+
+    refreshed = _state_rows(
+        paths.state_path, "SELECT state FROM remote_jobs WHERE id=?", (job_id,)
+    )[0]
+    assert refreshed["state"] == "MANUAL_REQUIRED", summary
+    assert world.priority_calls == priority_calls_before
+    assert world.restart_calls == 0
+    assert len([args for args in world.runner_calls if "--create-only" in args]) == create_calls_before
+    assert not [args for args in world.runner_calls if "--wait-export-only" in args]

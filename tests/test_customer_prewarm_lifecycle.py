@@ -520,6 +520,11 @@ def test_reconcile_not_found_bumps_attempts_until_dead(tmp_path):
 
     job = _remote_job_row(paths.state_path, job_id)
     assert job["recovery_attempts"] == RECONCILE_DEAD_THRESHOLD
+    recovery = json.loads(job["recovery_evidence_json"])
+    assert recovery["submit_reconcile"]["status"] == "NOT_FOUND"
+    assert recovery["submit_reconcile"]["recovery_attempts"] == RECONCILE_DEAD_THRESHOLD
+    assert recovery["submit_reconcile"]["last_diagnostic"] == "exact remote task not found"
+    assert recovery["submit_reconcile"]["last_reconcile_at"]
     assert adapter.reconcile_calls == RECONCILE_DEAD_THRESHOLD
     # 第 4 次后判死:phase note 记录,且不再进 reconcile 集。
     dead_summary = run_reconcile(paths, adapter)
@@ -599,6 +604,14 @@ def test_inconclusive_not_found_does_not_spend_absence_attempts(tmp_path):
     job = _remote_job_row(paths.state_path, job_id)
     assert job["state"] == "SUBMIT_UNKNOWN"
     assert job["recovery_attempts"] == 0
+    recovery = json.loads(job["recovery_evidence_json"])
+    assert recovery["submit_reconcile"]["status"] == "NOT_FOUND"
+    assert recovery["submit_reconcile"]["recovery_attempts"] == 0
+    assert (
+        recovery["submit_reconcile"]["last_diagnostic"]
+        == "exact task reconciliation is not yet conclusive"
+    )
+    assert recovery["submit_reconcile"]["last_reconcile_at"]
     assert adapter.submit_calls == 0
 
 
@@ -1397,6 +1410,168 @@ def test_harvest_phase_budget_truncates_and_running_is_in_flight(tmp_path, monke
     assert summary["harvested"] == 0
     assert any("running" in note.lower() for note in summary["phase_errors"])
     assert not any("Traceback" in note for note in summary["phase_errors"])
+
+
+def test_manual_recovery_cannot_starve_normal_harvest_and_rotates(tmp_path, monkeypatch):
+    runtime_root = tmp_path / "runtime"
+    CustomerPrewarmStore(runtime_root / "customer_prewarm.sqlite3")
+    manual_job_ids = []
+    paths = None
+    for index in range(3):
+        paths, job_id = seed_manual_job(
+            runtime_root,
+            TODAY,
+            _CountingAdapter(),
+            mapping=COMIX,
+            url=f"https://qx.com/manual-fairness-{index}.html",
+        )
+        manual_job_ids.append(job_id)
+        with sqlite3.connect(paths.state_path) as connection:
+            connection.execute(
+                "UPDATE remote_jobs SET error_text='highest priority was not confirmed', "
+                "result_json=NULL WHERE id=?",
+                (job_id,),
+            )
+    paths, normal_job_id = seed_remote_work(
+        runtime_root,
+        TODAY,
+        _CountingAdapter(),
+        mapping=COMIX,
+        url="https://qx.com/normal-after-manuals.html",
+        job_state="SUBMITTED",
+        remote_identity="comix|normal-task|normal-number",
+    )
+
+    manual_probes = []
+    normal_harvests = []
+
+    def no_manual_proof(**kwargs):
+        manual_probes.append(int(kwargs["job_row"]["id"]))
+        return None
+
+    def fake_primitive(**kwargs):
+        normal_harvests.append(int(kwargs["remote_job_id"]))
+        return {"outcome": "REMOTE_EXISTING_HARVEST_RUNNING"}
+
+    monkeypatch.setattr(lifecycle, "_terminal_priority_manual_live_proof", no_manual_proof)
+    monkeypatch.setattr(lifecycle, "harvest_existing_customer_prewarm_job", fake_primitive)
+
+    for _ in range(3):
+        run_harvest_phase(
+            paths.state_path,
+            paths.lock_path,
+            TODAY,
+            deadline=time.monotonic() + 60.0,
+            monotonic_value=time.monotonic,
+            summary=_new_summary(),
+            max_jobs=3,
+        )
+
+    assert normal_harvests == [normal_job_id, normal_job_id, normal_job_id]
+    assert manual_probes == manual_job_ids
+
+
+def test_normal_harvest_cursor_prevents_later_job_starvation(tmp_path, monkeypatch):
+    runtime_root = tmp_path / "runtime"
+    CustomerPrewarmStore(runtime_root / "customer_prewarm.sqlite3")
+    paths = None
+    job_ids = []
+    for index in range(4):
+        paths, job_id = seed_remote_work(
+            runtime_root,
+            TODAY,
+            _CountingAdapter(),
+            mapping=COMIX,
+            url=f"https://qx.com/normal-fairness-{index}.html",
+            job_state="RUNNING",
+            remote_identity=f"comix|normal-task-{index}|normal-number-{index}",
+        )
+        job_ids.append(job_id)
+
+    calls = []
+
+    def fake_primitive(**kwargs):
+        calls.append(int(kwargs["remote_job_id"]))
+        return {"outcome": "REMOTE_EXISTING_HARVEST_RUNNING"}
+
+    monkeypatch.setattr(lifecycle, "harvest_existing_customer_prewarm_job", fake_primitive)
+    for _ in range(2):
+        run_harvest_phase(
+            paths.state_path,
+            paths.lock_path,
+            TODAY,
+            deadline=time.monotonic() + 60.0,
+            monotonic_value=time.monotonic,
+            summary=_new_summary(),
+            max_jobs=3,
+        )
+
+    assert calls[:3] == job_ids[:3]
+    assert job_ids[3] in calls[3:]
+
+
+def test_normal_harvest_reserves_bounded_time_for_manual_probe(tmp_path, monkeypatch):
+    runtime_root = tmp_path / "runtime"
+    CustomerPrewarmStore(runtime_root / "customer_prewarm.sqlite3")
+    paths, normal_job_id = seed_remote_work(
+        runtime_root,
+        TODAY,
+        _CountingAdapter(),
+        mapping=COMIX,
+        url="https://qx.com/normal-before-manual-reserve.html",
+        job_state="RUNNING",
+        remote_identity="comix|normal-reserve|normal-reserve-number",
+    )
+    paths, manual_job_id = seed_manual_job(
+        runtime_root,
+        TODAY,
+        _CountingAdapter(),
+        mapping=COMIX,
+        url="https://qx.com/manual-reserve.html",
+    )
+    with sqlite3.connect(paths.state_path) as connection:
+        connection.execute(
+            "UPDATE remote_jobs SET error_text='highest priority was not confirmed', "
+            "result_json=NULL WHERE id=?",
+            (manual_job_id,),
+        )
+
+    class Clock:
+        now = 0.0
+
+        def __call__(self):
+            return self.now
+
+    clock = Clock()
+    normal_calls = []
+    manual_probes = []
+
+    def consume_timeout(**kwargs):
+        normal_calls.append(int(kwargs["remote_job_id"]))
+        clock.now += float(kwargs["timeout_seconds"])
+        return {"outcome": "REMOTE_EXISTING_HARVEST_RUNNING"}
+
+    def no_manual_proof(**kwargs):
+        manual_probes.append(int(kwargs["job_row"]["id"]))
+        return None
+
+    monkeypatch.setattr(lifecycle, "harvest_existing_customer_prewarm_job", consume_timeout)
+    monkeypatch.setattr(lifecycle, "_terminal_priority_manual_live_proof", no_manual_proof)
+
+    run_harvest_phase(
+        paths.state_path,
+        paths.lock_path,
+        TODAY,
+        deadline=10.0,
+        monotonic_value=clock,
+        summary=_new_summary(),
+        max_jobs=3,
+        per_job_timeout_seconds=90.0,
+    )
+
+    assert normal_calls == [normal_job_id]
+    assert manual_probes == [manual_job_id]
+    assert clock.now < 10.0
 
 
 # ---- 6. canary 模式:三阶段全部跳过,summary 键集合不变 --------------------------------

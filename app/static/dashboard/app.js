@@ -766,6 +766,28 @@
       <p class="lp-note">${esc(d.summary)}</p>`;
   }
 
+  function remoteJobDiagnosticView(job) {
+    const d = (job && job.diagnostic) || {};
+    const state = String((job && job.state) || "");
+    if (!d.stage && state !== "SUBMIT_UNKNOWN") return { html: "", note: "" };
+    const reason = d.reason || (state === "SUBMIT_UNKNOWN"
+      ? "原始提交诊断不可恢复" : "具体诊断不可恢复");
+    let html = `
+      <b>错误阶段</b><span>${esc(d.stage || "远端提交")}</span>
+      <b>错误分类</b><span>${esc(d.classification || (state === "SUBMIT_UNKNOWN" ? "提交结果待确认" : "远端异常"))}</span>
+      <b>具体原因</b><span>${esc(reason)}</span>
+      <b>发生/最后更新时间</b><span>${esc(d.updated_at || (job && job.updated_at) || "—")}</span>`;
+    if (state === "SUBMIT_UNKNOWN") {
+      html += `
+        <b>已确认事实</b><span>${esc(d.note || "远端创建请求已进入可能发送边界，但尚未取得 exact taskId/taskNumber。")}</span>
+        <b>自动对账</b><span>${Number(d.reconcile_attempts || 0)} / ${Number(d.reconcile_threshold || 4)}</span>
+        <b>最近对账结果</b><span>${esc(d.last_reconcile_diagnostic || "尚无自动对账诊断")}</span>
+        <b>最近对账时间</b><span>${esc(d.last_reconcile_at || "—")}</span>`;
+    }
+    html += `<b>下一步系统动作</b><span>${esc(d.next_action || "保持 fail-closed，等待新的严格证据。")}</span>`;
+    return { html, note: d.note || "" };
+  }
+
   // ---- 操作按钮可用性(与后端门完全一致;不可用时禁用而非隐藏) ----
   const REEXPORT_ALLOWED_STATES = ["SUBMITTED", "RUNNING", "EXPORTED", "MANUAL_REQUIRED", "RECOVERY_EXHAUSTED"];
   const REBUILD_ALLOWED_STATES = ["SUBMITTED", "RUNNING", "EXPORTED", "RECOVERY_EXHAUSTED", "MANUAL_REQUIRED"];
@@ -795,6 +817,7 @@
     drawerJob = j;
     const tl = (window._timelines || {})[String(id)] || {};
     $("#drawer").classList.add("show");
+    const diagnostic = remoteJobDiagnosticView(j);
     $("#drawer .kv").innerHTML = `
       <b>任务编号</b><span class="mono">#${j.id}</span>
       <b>任务名称</b><span class="mono">${esc(j.task_name)}</span>
@@ -803,6 +826,7 @@
       <b>当前状态</b><span>${esc(j.state_cn)}</span>
       <b>采集轮次</b><span>harvest ${Number(j.harvest_attempts)} 次</span>
       <b>恢复阶段</b><span>${esc(tl.phase || "—")}${tl.recovery_attempts > 0 ? " · 已执行 " + tl.recovery_attempts + " 次自动恢复" : ""}</span>` +
+      diagnostic.html +
       (j.superseded_by
         ? `<b>替代任务</b><span class="mono">已被人工重建替代 → 新任务 ${esc(j.superseded_by.new_task_name)}(新批次 ${esc(j.superseded_by.new_batch_number)})</span>`
         : "");
@@ -813,7 +837,7 @@
     updateDrawerButtons();
     $("#drawer .tl").innerHTML = (tl.observations || []).slice(-8).map((o) => `
       <li><time>${(() => { const d = new Date(o.observed_at); return isNaN(d) ? "—" : d.toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit", timeZone: "Asia/Shanghai" }); })()}</time>进度 ${safeProgressText(o.signature)} · 导出 ${o.export_count === 0 ? "无结果" : "有结果"}</li>`).join("");
-    $("#drawer .note").textContent = "观察与探测不代表异常;“需要人工检查”需要人工介入;“自动恢复已用尽”已按无采集结果安全收口,无需人工处理。";
+    $("#drawer .note").textContent = diagnostic.note || "观察与探测不代表异常；系统按当前严格证据继续处理。";
     loadOpLog(j.id);
   }
 
@@ -1862,7 +1886,7 @@
     rebuildOutcomeAdmitsLocalSupersede,
     businessDateFromSearch, datedApiPath,
     cpStatusCn, cpStatusPill, cpRowMatchesFilter, cpSortRows,
-    localFallbackView, renderLocalFallback };
+    localFallbackView, renderLocalFallback, remoteJobDiagnosticView };
   if (typeof window !== "undefined") { window.Dashboards = api; }
   if (typeof module !== "undefined" && module.exports) { module.exports = api; }
   if (typeof document !== "undefined") { document.addEventListener("DOMContentLoaded", start); }

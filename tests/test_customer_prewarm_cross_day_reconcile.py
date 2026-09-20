@@ -1867,7 +1867,7 @@ def test_not_found_commit_holds_linkage_fence_until_attempt_write(
     writer_threads = []
     writer_finished_before_commit = []
 
-    def fenced_commit(store, token, job_id):
+    def fenced_commit(store, token, job_id, **kwargs):
         def rebind():
             writer_started.set()
             prewarm.record_candidate_result(
@@ -1883,7 +1883,7 @@ def test_not_found_commit_holds_linkage_fence_until_attempt_write(
         writer.start()
         assert writer_started.wait(1.0)
         writer_finished_before_commit.append(writer_finished.wait(0.1))
-        return original(store, token, job_id)
+        return original(store, token, job_id, **kwargs)
 
     monkeypatch.setattr(
         DailyAuditStore,

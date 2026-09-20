@@ -246,13 +246,13 @@ def decode_recovery_evidence(value: object) -> dict[str, Any]:
     """
     raw = _text(value)
     if not raw:
-        return {"version": 1, "observations": [], "restart": None, "probe_health": None}
+        return {"version": 1, "observations": [], "restart": None, "probe_health": None, "submit_reconcile": None}
     try:
         decoded = json.loads(raw)
     except (TypeError, ValueError, json.JSONDecodeError):
-        return {"version": 1, "observations": [], "restart": None, "probe_health": None}
+        return {"version": 1, "observations": [], "restart": None, "probe_health": None, "submit_reconcile": None}
     if not isinstance(decoded, dict):
-        return {"version": 1, "observations": [], "restart": None, "probe_health": None}
+        return {"version": 1, "observations": [], "restart": None, "probe_health": None, "submit_reconcile": None}
     observations = decoded.get("observations")
     if not isinstance(observations, list):
         observations = []
@@ -262,11 +262,15 @@ def decode_recovery_evidence(value: object) -> dict[str, Any]:
     probe_health = decoded.get("probe_health")
     if not isinstance(probe_health, dict):
         probe_health = None
+    submit_reconcile = decoded.get("submit_reconcile")
+    if not isinstance(submit_reconcile, dict):
+        submit_reconcile = None
     return {
         "version": 1,
         "observations": [row for row in observations if isinstance(row, dict)],
         "restart": restart,
         "probe_health": probe_health,
+        "submit_reconcile": submit_reconcile,
     }
 
 

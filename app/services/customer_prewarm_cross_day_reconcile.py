@@ -25,6 +25,7 @@ from app.services.customer_prewarm_store import (
 from app.services.incremental_audit_runtime import runtime_paths
 from app.services.daily_audit_store import DailyAuditStore, LeaseUnavailable, ProcessLock
 from app.services.shared_crawl_cache import PRODUCER_CUSTOMER_PREWARM_ZHAOSHANG
+from app.services.remote_diagnostics import sanitize_remote_diagnostic
 
 CROSS_DAY_RECONCILE_PER_PASS = 4
 CROSS_DAY_RECONCILE_PER_JOB_TIMEOUT_SECONDS = 30.0
@@ -55,15 +56,21 @@ WHERE j.id = ?
 """
 
 _HARVEST_ELIGIBLE_JOB_SQL = """
-SELECT j.state, j.remote_identity, j.mall_key
+SELECT j.*,
+       EXISTS (
+           SELECT 1 FROM crawl_work successful
+           WHERE successful.remote_job_id = j.id
+             AND successful.state = 'SUCCESS'
+             AND successful.sku_id LIKE 'zhpq-%'
+       ) AS has_success
 FROM remote_jobs j
 JOIN daily_runs r ON r.id = j.run_id
 WHERE j.id = ? AND r.business_date = ?
   AND TRIM(COALESCE(j.remote_identity, '')) <> ''
   AND (
-      j.state IN ('SUBMITTED', 'RUNNING', 'EXPORTED')
+      j.state IN ('SUBMITTED', 'RUNNING', 'EXPORTED', 'MANUAL_REQUIRED')
       OR (
-          j.state IN ('COMPLETED', 'MANUAL_REQUIRED', 'TERMINAL_FAILED')
+          j.state IN ('COMPLETED', 'TERMINAL_FAILED')
           AND EXISTS (
               SELECT 1 FROM crawl_work c
               WHERE c.remote_job_id = j.id AND c.state = 'SUCCESS'
@@ -199,8 +206,19 @@ def plan_cross_day_harvest_jobs(
             ).fetchone()
         finally:
             connection.close()
-        if row is not None:
-            planned.append((owning_day, job_id))
+        if row is None:
+            continue
+        item = dict(row)
+        if str(item.get("state") or "") == "MANUAL_REQUIRED" and not int(
+            item.get("has_success") or 0
+        ):
+            from app.services.recovery.harvest import (
+                is_terminal_nonretryable_priority_manual_family,
+            )
+
+            if not is_terminal_nonretryable_priority_manual_family(item):
+                continue
+        planned.append((owning_day, job_id))
     return planned
 
 
@@ -475,6 +493,9 @@ def run_cross_day_reconcile_phase(
                     )
                     continue
                 status = _status_value(outcome.status)
+                outcome_diagnostic = sanitize_remote_diagnostic(
+                    getattr(outcome, "diagnostic", "")
+                )
                 task_id = getattr(outcome, "task_id", None)
                 task_number = getattr(outcome, "task_number", None)
                 if status == "FOUND" and task_id and task_number:
@@ -507,7 +528,7 @@ def run_cross_day_reconcile_phase(
                     )
                 elif status == "MANUAL" or status == "FOUND":
                     diagnostic = (
-                        str(getattr(outcome, "diagnostic", "") or "")
+                        outcome_diagnostic
                         if status == "MANUAL"
                         else "incomplete FOUND identity"
                     )
@@ -519,13 +540,15 @@ def run_cross_day_reconcile_phase(
                         f"cross-day job {owning_day}/{job_id}: manual identity conflict; "
                         "no auto redispatch"
                     )
-                elif status == "NOT_FOUND" and not str(
-                    getattr(outcome, "diagnostic", "") or ""
-                ).strip():
+                elif status == "NOT_FOUND" and not outcome_diagnostic:
                     with historical_link_commit_fence() as commit_allowed:
                         if not commit_allowed:
                             continue
-                        new_attempts = store.bump_remote_job_recovery_attempt(token, job_id)
+                        new_attempts = store.bump_remote_job_recovery_attempt(
+                            token,
+                            job_id,
+                            diagnostic="exact remote task not found",
+                        )
                     summary["cross_day_reconcile_not_found"] += 1
                     if new_attempts >= effective_dead_threshold:
                         summary["cross_day_reconcile_dead"] += 1
@@ -534,8 +557,18 @@ def run_cross_day_reconcile_phase(
                             f"{new_attempts} attempts; next dispatch owns redispatch"
                         )
                 else:
+                    with historical_link_commit_fence() as commit_allowed:
+                        if not commit_allowed:
+                            continue
+                        store.record_submit_reconcile_diagnostic(
+                            token,
+                            job_id,
+                            status=status,
+                            diagnostic=outcome_diagnostic or "inconclusive remote lookup",
+                        )
                     phase_errors.append(
                         f"cross-day job {owning_day}/{job_id}: inconclusive remote lookup; deferred"
+                        + (f" ({outcome_diagnostic})" if outcome_diagnostic else "")
                     )
             finally:
                 store.release_lease(token)
@@ -645,7 +678,33 @@ def run_cross_day_harvest_phase(
             )
         except Exception as exc:  # noqa: BLE001 - failure cannot block safe harvest
             phase_errors.append(f"cross-day harvest cursor: {type(exc).__name__}: {exc}")
-        if str(row["state"]) not in {"COMPLETED", "MANUAL_REQUIRED", "TERMINAL_FAILED"}:
+        job_row = dict(row)
+        state = str(job_row.get("state") or "")
+        has_success = bool(int(job_row.get("has_success") or 0))
+        proof = None
+        should_harvest = state not in {"COMPLETED", "TERMINAL_FAILED"} and not (
+            state == "MANUAL_REQUIRED" and has_success
+        )
+        if state == "MANUAL_REQUIRED" and should_harvest:
+            proof_remaining = deadline - monotonic_value()
+            if proof_remaining <= 0:
+                summary["cross_day_harvest_deferred"] += 1
+                continue
+            proof = lifecycle._terminal_priority_manual_live_proof(
+                state_path=paths.state_path,
+                business_date=owning_day,
+                job_row=job_row,
+                adapter=get_adapter(),
+                timeout_seconds=min(float(per_job_timeout_seconds), proof_remaining),
+            )
+            if proof is None:
+                summary["cross_day_harvest_deferred"] += 1
+                phase_errors.append(
+                    f"cross-day harvest {owning_day}/{job_id}: "
+                    "manual recovery proof unavailable; state preserved"
+                )
+                continue
+        if should_harvest:
             remaining = deadline - monotonic_value()
             if remaining <= 0:
                 summary["cross_day_harvest_deferred"] += 1
@@ -659,6 +718,7 @@ def run_cross_day_harvest_phase(
                     remote_identity=identity,
                     adapter=get_adapter(),
                     timeout_seconds=min(float(per_job_timeout_seconds), remaining),
+                    live_identity_proof=proof,
                 )
             except LeaseUnavailable:
                 summary["cross_day_harvest_lock_busy"] += 1

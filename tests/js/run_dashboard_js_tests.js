@@ -78,6 +78,7 @@ const { createPollController, createSaasFlowPoller, safeProgressText, sfPartialN
         businessDateFromSearch, datedApiPath,
         armRebuildDrawerSwitch, resolveRebuildDrawerSwitch,
         rebuildOutcomeAdmitsLocalSupersede,
+        remoteJobDiagnosticView,
         cpStatusCn, cpStatusPill, cpRowMatchesFilter, cpSortRows,
         piStatusText, piStatusWord, piWorkingTreeText,
         localFallbackView, renderLocalFallback } = require(
@@ -93,6 +94,41 @@ function check(name, cond, detail) {
   }
 }
 const flush = () => new Promise((resolve) => setImmediate(resolve));
+
+function test_remote_job_diagnostic_view() {
+  const manual = remoteJobDiagnosticView({
+    state: "MANUAL_REQUIRED",
+    updated_at: "2026-09-20T05:00:00+00:00",
+    diagnostic: {
+      stage: "提优确认", classification: "PriorityScopeSafetyError",
+      reason: "task_status changed during priority update",
+      note: "该异常来自 priority 确认阶段，不代表远端爬虫失败。",
+      next_action: "等待 exact terminal proof",
+    },
+  });
+  check("drawer diagnostic:MANUAL 展示具体 priority 原因",
+    manual.html.includes("错误阶段") && manual.html.includes("PriorityScopeSafetyError") &&
+    manual.html.includes("task_status changed during priority update") &&
+    manual.note.includes("不代表远端爬虫失败"));
+
+  const unknown = remoteJobDiagnosticView({
+    state: "SUBMIT_UNKNOWN",
+    diagnostic: {
+      stage: "远端提交", classification: "提交结果待确认", reason: "socket timeout",
+      reconcile_attempts: 1, reconcile_threshold: 4,
+      last_reconcile_diagnostic: "exact task not found yet",
+      last_reconcile_at: "2026-09-20T05:10:00+00:00",
+      next_action: "继续 exact reconcile",
+    },
+  });
+  check("drawer diagnostic:SUBMIT_UNKNOWN 展示原因、1/4 与最近对账",
+    unknown.html.includes("socket timeout") && unknown.html.includes("1 / 4") &&
+    unknown.html.includes("exact task not found yet") && unknown.html.includes("继续 exact reconcile"));
+
+  const lost = remoteJobDiagnosticView({ state: "SUBMIT_UNKNOWN", diagnostic: {} });
+  check("drawer diagnostic:历史缺失不编造原因",
+    lost.html.includes("原始提交诊断不可恢复"));
+}
 
 function test_local_fallback_visible_metrics() {
   const html = require("fs").readFileSync(
@@ -1629,6 +1665,7 @@ function test_production_identity_seams() {
   test_r2_review_p1_3_parent_label_no_contradiction();
   test_job_progress_cell();
   test_progress_detail();
+  test_remote_job_diagnostic_view();
   test_output_display_name();
   await test_action_client_post_dedup_and_poll();
   await test_action_client_error_and_timeout();

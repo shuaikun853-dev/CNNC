@@ -31,6 +31,14 @@ def priority_module(request):
     return _load_module(path, f"priority_{request.node.name}_{request.param.stem}")
 
 
+@pytest.fixture
+def integration_priority_module(request):
+    return _load_module(
+        INTEGRATION_HELPER,
+        f"priority_{request.node.name}_{INTEGRATION_HELPER.stem}",
+    )
+
+
 def row(
     task_id,
     *,
@@ -139,11 +147,13 @@ class MemoryConnection:
         snapshots=None,
         forced_lookup_rows=None,
         pk_lock_rows=None,
+        post_commit_rows=None,
     ):
         self.rows = [dict(item) for item in rows]
         self.snapshots = snapshots
         self.forced_lookup_rows = forced_lookup_rows
         self.pk_lock_rows = pk_lock_rows
+        self.post_commit_rows = post_commit_rows
         self.pk_lock_applied = False
         self.executions = []
         self.updated_ids = []
@@ -162,6 +172,8 @@ class MemoryConnection:
 
     def commit(self):
         self.committed = True
+        if self.post_commit_rows is not None:
+            self.rows = [dict(item) for item in self.post_commit_rows]
 
 
 def make_target(module, *, task_number="RW-20260811181227", mall_code="guangbo"):
@@ -393,6 +405,75 @@ def test_primary_key_current_read_updates_mixed_execution_states(priority_module
     assert result["task_status_distribution_after"] == {"00": 1, "01": 1, "02": 1}
     assert [item["task_status"] for item in connection.rows] == ["00", "01", "02"]
     assert {item["weight_type"] for item in connection.rows} == {-1}
+
+
+def test_post_commit_execution_status_drift_keeps_proven_priority_success(
+    integration_priority_module,
+):
+    before = [
+        row(1000 + index, task_status="02" if index <= 10 else "00", weight_type=0)
+        for index in range(1, 15)
+    ]
+    after = [
+        row(
+            1000 + index,
+            task_status="02" if index <= 10 or index >= 13 else "01",
+            weight_type=-1,
+        )
+        for index in range(1, 15)
+    ]
+    connection = MemoryConnection(before, post_commit_rows=after)
+
+    result = boost(
+        integration_priority_module,
+        connection,
+        expected_subtask_count=14,
+    )
+
+    assert result["priority_state"] == "updated"
+    assert result["affected_rows"] == 14
+    assert result["task_status_distribution_before"] == {"02": 10, "00": 4}
+    assert result["task_status_distribution_after"] == {"02": 12, "01": 2}
+    assert result["is_valid_distribution_after"] == {"1": 14}
+    assert result["weight_type_distribution_after"] == {"-1": 14}
+
+
+def test_post_commit_task_id_drift_still_fails_closed(integration_priority_module):
+    before = [row(1101, weight_type=0), row(1102, weight_type=0)]
+    after = [row(1101, weight_type=-1), row(1199, weight_type=-1)]
+    connection = MemoryConnection(before, post_commit_rows=after)
+
+    with pytest.raises(
+        integration_priority_module.PriorityScopeSafetyError,
+        match="post-commit task_id verification mismatch",
+    ):
+        boost(integration_priority_module, connection, expected_subtask_count=2)
+
+
+def test_post_commit_is_valid_drift_still_fails_closed(integration_priority_module):
+    connection = MemoryConnection(
+        [row(1201, weight_type=0)],
+        post_commit_rows=[row(1201, weight_type=-1, is_valid="0")],
+    )
+
+    with pytest.raises(
+        integration_priority_module.PriorityScopeSafetyError,
+        match="is_valid mismatch",
+    ):
+        boost(integration_priority_module, connection)
+
+
+def test_post_commit_weight_readback_still_fails_closed(integration_priority_module):
+    connection = MemoryConnection(
+        [row(1301, weight_type=0)],
+        post_commit_rows=[row(1301, weight_type=0)],
+    )
+
+    with pytest.raises(
+        integration_priority_module.PriorityUpdateZeroRowsError,
+        match="exact target rows are not -1",
+    ):
+        boost(integration_priority_module, connection)
 
 
 def test_partial_highest_priority_updates_only_remaining_exact_rows(priority_module):

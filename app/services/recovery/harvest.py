@@ -1110,6 +1110,7 @@ def harvest_existing_customer_prewarm_job(
     remote_identity: str,
     adapter: CnncLegacyZhaoshangAdapter,
     timeout_seconds: float = 180.0,
+    live_identity_proof: LiveIdentityProof | None = None,
 ) -> dict[str, Any]:
     """Harvest ONE exact existing customer-prewarm remote job (Issue #13).
 
@@ -1134,12 +1135,12 @@ def harvest_existing_customer_prewarm_job(
             adapter=adapter,
             timeout_seconds=timeout_seconds,
             admissible_states=frozenset({"SUBMITTED", "RUNNING", "EXPORTED"}),
-            allow_manual_requeue=False,
+            allow_manual_requeue=live_identity_proof is not None,
             manual_requeue_diagnostics=frozenset(),
             source_scope="prewarm_payload",
             operation="customer prewarm harvest",
             attempt_headroom=2,
-            live_identity_proof=None,
+            live_identity_proof=live_identity_proof,
         ),
         "create_calls": 0,
     }
