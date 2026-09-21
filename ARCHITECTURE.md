@@ -21,7 +21,7 @@ CNNC 不是一条自动跑到底的流水线。STEP1 持续取得待审数据、
 | Recovery | 对已有 durable identity 做对账、回收、有限恢复；核心目标是避免重复创建和猜测远端结果。 | `app/services/recovery/`、`remote_running_recovery.py` |
 | Local Fallback | 只对满足时间、站点、exact URL、最终远端检查和预算门禁的缺价链接运行固定 8 站兜底。 | `app/services/incremental_local_fallback.py` |
 | Finalize | 冻结权威 snapshot，构造最终行，写 Excel 和 manifest，再原子登记最终证据。 | `incremental_audit_closeout.py`、`incremental_price_audit_finalize.py`、`incremental_audit_materializer.py` |
-| Shared Crawl Cache | 跨业务日保存 URL 身份和 append-only 成功爬取证据，供 STEP1/Prewarm/STEP3 复用。 | `app/services/shared_crawl_cache.py`、`shared_crawl_cache.sqlite3` |
+| Shared Crawl Cache | 跨业务日保存 URL 身份和 append-only 成功爬取证据；日常 crawl 成功结果可同步写入，主要供 Prewarm / STEP3 复用。 | `app/services/shared_crawl_cache.py`、`shared_crawl_cache.sqlite3` |
 | STEP2 | 只读查询中核待处理和 SaaS 监控，生成状态工作簿；不会自动进入 STEP3。 | `scripts/export_current_monitor_status.py` |
 | STEP3 | 处理用户指定监控表中不能直接推送的数据，先读缓存，再按授权走招商局或窄 fallback。 | `scripts/process_monitor_no_push_zhaoshang.py`、`step3_prewarm_cache.py` |
 | Dashboard | 从 SQLite、便利快照、Task Scheduler 和只读远端观测生成页面；它是 projection，不是业务状态权威。 | `app/dashboard_api.py`、`dashboard_projection.py`、`prewarm_dashboard_projection.py` |
@@ -40,7 +40,7 @@ flowchart LR
     P1[Prewarm 扫描] --> P2[Prewarm lifecycle]
     P2 --> D
     P2 --> CACHE[(Shared Crawl Cache)]
-    CACHE --> B
+    B -. crawl SUCCESS 经 Prewarm sync 镜像 .-> CACHE
 
     S2[STEP2 只读状态表] -. 用户指定输出 .-> S3[STEP3 不能推送处理]
     CACHE --> S3
@@ -53,7 +53,7 @@ flowchart LR
     P2 --> PDB
 ```
 
-虚线表示用户明确选择后才进入下一步，不是自动调用。Prewarm 与 STEP1 共用远端能力和缓存，但各自有身份与生命周期门禁。
+虚线表示用户明确选择后才进入下一步，或表示成功 crawl 证据的异步镜像，不是自动调用。`sync_daily_internet_results` 把日常 crawl SUCCESS 镜像到 Shared Crawl Cache；STEP1 不从 Shared Crawl Cache 读取业务数据，缓存主要供 Prewarm / STEP3 复用。
 
 ## 图 2：谁可以调用谁
 
