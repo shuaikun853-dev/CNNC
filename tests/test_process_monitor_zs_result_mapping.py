@@ -38,6 +38,12 @@ def test_cli_exposes_detail_price_preference_before_zhaoshang():
 
     assert result.returncode == 0
     assert "--prefer-detail-price" in result.stdout
+    assert "--shared-cache-path" in result.stdout
+
+
+def test_step3_consumes_prewarm_cache_before_building_zhaoshang_queue():
+    source = SCRIPT.read_text(encoding="utf-8")
+    assert source.index("apply_cached_customer_results(") < source.index('print("[5] 招商局-only...")')
 
 
 def load_read_zs_result():
@@ -114,6 +120,52 @@ class ReadZhaoshangResultTests(unittest.TestCase):
         self.assertIn(original_url, records)
         self.assertNotIn(exported_url, records)
         self.assertEqual(12.5, records[original_url]["price"])
+
+
+    def test_prefers_page_sku_and_keeps_comment_and_channel(self):
+        read_zs_result = load_read_zs_result()
+        url = "https://item.jd.com/100311804305.html"
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "result.xlsx"
+            workbook = openpyxl.Workbook()
+            sheet = workbook.active
+            sheet.append([
+                "商品编码", "商品最小品类单元id", "商品标题/名称",
+                "商品价格", "商品详情地址", "评论", "商城标识",
+            ])
+            sheet.append([
+                "zhpq-placeholder", "100311804305", "亿联 MeetingEye 500",
+                63420.5, url, 321, "jd",
+            ])
+            workbook.save(path)
+
+            record = read_zs_result(path, {"zhpq-placeholder": url})[url]
+
+        self.assertEqual("100311804305", record["code"])
+        self.assertEqual("321", record["comment"])
+        self.assertEqual("jd", record["channel"])
+
+    def test_keeps_numeric_zero_comment_as_real_comment_evidence(self):
+        read_zs_result = load_read_zs_result()
+        url = "https://item.jd.com/100311804305.html"
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "result.xlsx"
+            workbook = openpyxl.Workbook()
+            sheet = workbook.active
+            sheet.append([
+                "商品编码", "商品最小品类单元id", "商品标题/名称",
+                "商品价格", "商品详情地址", "评论", "商城标识",
+            ])
+            sheet.append([
+                "zhpq-placeholder", "100311804305", "亿联 MeetingEye 500",
+                63420.5, url, 0, "jd",
+            ])
+            workbook.save(path)
+
+            record = read_zs_result(path, {"zhpq-placeholder": url})[url]
+
+        self.assertEqual("0", record["comment"])
+
 
     def test_result_validation_uses_input_rows_when_product_codes_collide(self):
         is_reusable = load_is_reusable_zs_result()

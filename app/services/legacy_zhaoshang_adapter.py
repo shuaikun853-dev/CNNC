@@ -95,9 +95,24 @@ RESULT_CODE_HEADERS = frozenset({
     "sku_id",
     "code",
 })
+RESULT_PAGE_SKU_HEADERS = frozenset({"商品最小品类单元Id", "商品最小品类单元id"})
+RESULT_TITLE_HEADERS = frozenset({"商品标题/名称", "商品标题", "商品名称", "title", "product_title"})
+RESULT_COMMENT_HEADERS = frozenset({"评论", "评论数", "销量/评论数", "comment", "comment_count"})
 RESULT_EXECUTION_HEADERS = frozenset({"执行编号", "executionNumber", "execution_number"})
 RESULT_BATCH_HEADERS = frozenset({"批次号", "batchNumber", "batch_number", "BATCH_NUMBER"})
 RESULT_MALL_HEADERS = frozenset({"商城标识", "mall", "mallLogo", "mall_key", "MALL_LOGO"})
+
+
+def _parse_export_comment_count(value: Any) -> int | None:
+    raw = _text(value).replace(",", "").strip()
+    if not raw or raw in {"未识别", "N/A", "NA", "None", "null"}:
+        return None
+    parsed = parse_decimal(raw)
+    if parsed is None or parsed < 0 or parsed != parsed.to_integral_value():
+        return None
+    return int(parsed)
+
+
 RETRYABLE_PRIORITY_ERROR_DIAGNOSTICS = frozenset(
     {"TimeoutError", "ConnectionError", "InterfaceError"}
     | {
@@ -2960,6 +2975,9 @@ class CnncLegacyZhaoshangAdapter:
         price_index = cls._result_column_index(
             headers, frozenset({"商品价格", "价格", "采集价格", "page_price"})
         )
+        page_sku_index = cls._result_column_index(headers, RESULT_PAGE_SKU_HEADERS)
+        title_index = cls._result_column_index(headers, RESULT_TITLE_HEADERS)
+        comment_index = cls._result_column_index(headers, RESULT_COMMENT_HEADERS)
         status_index = cls._result_column_index(headers, frozenset({"status", "crawl_status"}))
         reason_index = cls._result_column_index(headers, frozenset({"reason", "failure_reason"}))
         exact_matches: dict[tuple[str, str], Mapping[str, Any]] = {}
@@ -2986,6 +3004,19 @@ class CnncLegacyZhaoshangAdapter:
                     if 0 <= primary_code_index < len(row)
                     else identity[0]
                 ),
+                "page_sku_id": _text(
+                    row[page_sku_index] if 0 <= page_sku_index < len(row) else ""
+                ),
+                "page_title": _text(
+                    row[title_index] if 0 <= title_index < len(row) else ""
+                ),
+                "comment_count": _parse_export_comment_count(
+                    row[comment_index] if 0 <= comment_index < len(row) else None
+                ),
+                "comment_count_raw": _text(
+                    row[comment_index] if 0 <= comment_index < len(row) else ""
+                ),
+                "channel": job.mall_key,
                 "page_price_value": price,
                 "page_price_status": page_status,
                 "page_price_source": source,
@@ -3053,6 +3084,9 @@ class CnncLegacyZhaoshangAdapter:
             headers,
             frozenset({"\u5546\u54c1\u4ef7\u683c", "\u4ef7\u683c", "\u91c7\u96c6\u4ef7\u683c", "page_price"}),
         )
+        page_sku_index = self._result_column_index(headers, RESULT_PAGE_SKU_HEADERS)
+        title_index = self._result_column_index(headers, RESULT_TITLE_HEADERS)
+        comment_index = self._result_column_index(headers, RESULT_COMMENT_HEADERS)
         status_index = self._result_column_index(
             headers, frozenset({"status", "crawl_status"})
         )
@@ -3163,6 +3197,19 @@ class CnncLegacyZhaoshangAdapter:
                 ),
                 "exported_sku_candidates": sorted(exported_codes),
                 "exported_url": exported_url,
+                "page_sku_id": _text(
+                    row[page_sku_index] if 0 <= page_sku_index < len(row) else ""
+                ),
+                "page_title": _text(
+                    row[title_index] if 0 <= title_index < len(row) else ""
+                ),
+                "comment_count": _parse_export_comment_count(
+                    row[comment_index] if 0 <= comment_index < len(row) else None
+                ),
+                "comment_count_raw": _text(
+                    row[comment_index] if 0 <= comment_index < len(row) else ""
+                ),
+                "channel": job.mall_key,
                 "page_price_value": price,
                 "page_price_status": page_status,
                 "page_price_source": source,

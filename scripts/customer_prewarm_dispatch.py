@@ -308,6 +308,11 @@ def _run_backfill(args: argparse.Namespace, business_date: str, runtime_root: Pa
         f"customer_prewarm_dispatch backfill-zhaoshang-history business_date={business_date} "
         f"dates={len(dates)}"
     )
+    if summary.get("deferred"):
+        print("HISTORICAL_BACKFILL_DEFERRED shared cache sync lock busy; zero writes")
+        if args.json_output is not None:
+            _write_json_output(args.json_output, summary)
+        return 0
     print(
         f"dates_scanned={summary['dates_scanned']} "
         f"dates_missing={len(summary['dates_missing'])} "
@@ -315,6 +320,7 @@ def _run_backfill(args: argparse.Namespace, business_date: str, runtime_root: Pa
         f"jobs_validated={summary['jobs_validated']} "
         f"rows_examined={summary['rows_examined']} "
         f"rows_recorded={summary['rows_recorded']} "
+        f"rows_enriched={summary['rows_enriched']} "
         f"already_ingested_cross_source={summary['already_ingested_cross_source']} "
         f"skipped_no_workbook_match={summary['skipped_no_workbook_match']} "
         f"skipped_price_not_ok={summary['skipped_price_not_ok']} "

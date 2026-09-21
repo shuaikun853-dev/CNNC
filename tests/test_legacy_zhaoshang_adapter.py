@@ -1732,6 +1732,27 @@ def test_harvest_rejects_duplicate_execution_inside_current_batch(tmp_path):
     assert outcome.status is HarvestStatus.FAILED
 
 
+def test_partial_export_preserves_page_product_fields_for_customer_prewarm(tmp_path):
+    url = "https://item.jd.com/100311804305.html"
+    placeholder = "zhpq-8c63a56daa7ac188"
+    job = _prepare(tmp_path, requests=(_request(placeholder, url),))
+    _append_submission(job.batch_state_path, expected_subtask_count=1)
+    _write_result_with_headers(
+        job.result_path,
+        ["商品编码", "商品最小品类单元id", "商品标题/名称", "商品价格", "评论", "商品详情地址"],
+        [[placeholder, "100311804305", "亿联 MeetingEye 500", 63420.5, 321, url]],
+    )
+
+    outcome = _adapter().classify_existing_export_partial(job)
+
+    result = outcome.exact_matches[(placeholder, url)]
+    assert result["page_sku_id"] == "100311804305"
+    assert result["page_title"] == "亿联 MeetingEye 500"
+    assert result["comment_count"] == 321
+    assert result["comment_count_raw"] == "321"
+    assert result["channel"] == "jd"
+
+
 def test_harvest_selects_the_only_sku_column_matching_durable_identities(tmp_path):
     job = _prepare(tmp_path, requests=(_request("11858822"),))
     _write_result_with_headers(

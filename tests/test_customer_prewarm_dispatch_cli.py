@@ -27,6 +27,7 @@ from app.services.daily_audit_store import (
     DEFAULT_POOL_ID,
     DEFAULT_TENANT_ID,
     DailyAuditStore,
+    ProcessLock,
 )
 from app.services import customer_prewarm_dispatch as dispatch_service
 from app.services.shared_crawl_cache import SharedCrawlCache
@@ -276,6 +277,43 @@ def test_case18_backfill_zhaoshang_history_is_evidence_based_and_idempotent(tmp_
     assert summary2["rows_recorded"] == 0
     assert summary2["already_ingested_cross_source"] == 2
     assert _cache_row_count(runtime_root / "shared_crawl_cache.sqlite3") == rows_after_first
+
+
+def test_backfill_lock_busy_prints_deferred_and_does_not_mutate_cache(tmp_path, capsys):
+    runtime_root = tmp_path / "runtime"
+    runtime_root.mkdir()
+    seed_exported_zhaoshang_job(
+        runtime_root,
+        BUSINESS_DATE,
+        sku_id="SKU-LOCK",
+        url="https://item.jd.com/lock.html",
+        task_name=make_task_name(9),
+    )
+    prewarm = CustomerPrewarmStore(runtime_root / "customer_prewarm.sqlite3")
+    cache = SharedCrawlCache(runtime_root / "shared_crawl_cache.sqlite3")
+    before_rows = _cache_row_count(cache.path)
+    lock = ProcessLock(prewarm.path.with_name(f"{prewarm.path.name}.sync.lock"))
+    lock.acquire()
+    json_output = tmp_path / "backfill-lock-busy.json"
+    try:
+        exit_code = _run_cli(
+            runtime_root,
+            _write_mapping_workbook(tmp_path / "mapping-lock.xlsx"),
+            "--backfill-zhaoshang-history",
+            "1",
+            json_output=json_output,
+        )
+    finally:
+        lock.release()
+
+    assert exit_code == 0
+    stdout = capsys.readouterr().out
+    assert "HISTORICAL_BACKFILL_DEFERRED" in stdout
+    summary = json.loads(json_output.read_text(encoding="utf-8"))
+    assert summary["deferred"] is True
+    assert summary["rows_recorded"] == 0
+    assert summary["rows_enriched"] == 0
+    assert _cache_row_count(cache.path) == before_rows
 
 
 def test_backfill_partial_job_prints_marker_and_exits_zero(tmp_path, capsys):

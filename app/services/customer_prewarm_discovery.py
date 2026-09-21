@@ -19,14 +19,15 @@ Cache (:mod:`app.services.shared_crawl_cache`, Issue #7):
   (``crawl_work.state='SUCCESS'`` AND ``result_json.page_price_status=='OK'``,
   the authoritative per-row semantics of
   ``read_zhaoshang_result_xlsx_by_identity``) into the shared cache through an
-  idempotent ledger with crash recovery.  The crawl row's ``sku_id`` is the
-  SaaS/upstream authoritative input (not independently re-confirmed by this
-  crawl), so usable values are honestly encoded ``UPSTREAM_PROVIDED``
-  (explicitly NOT ``CONFIRMED``) while temporary codes (``zhpq-*``
-  placeholders, the STEP3 ``ROW<n>`` template fallback shape, or an echo of
-  the crawl/task id) degrade to ``UNRESOLVED``; the original value is always
-  kept as ``payload["request_sku_id"]`` (Round 3 Finding B, resolved by user
-  decision 2026-09-07).
+  idempotent ledger with crash recovery.  When the validated export carries
+  ``page_sku_id`` from ``商品最小品类单元id``, that independent page/crawler
+  evidence is stored as ``CONFIRMED``.  Only when page SKU evidence is absent
+  may a non-temporary request-side ``sku_id`` fall back to
+  ``UPSTREAM_PROVIDED``; temporary codes (``zhpq-*``, STEP3 ``ROW<n>``,
+  or crawl/task-id echoes) remain ``UNRESOLVED``.  The request-side value is
+  always preserved as ``payload["request_sku_id"]``.  Title, price and
+  comment evidence from the same validated export are mirrored at the same
+  time.
 - :func:`upgrade_upstream_sku_evidence` deterministically converts R3-era
   rows (``UNRESOLVED`` with a usable ``payload["request_sku_id"]``) into
   appended ``UPSTREAM_PROVIDED`` rows - append-only history preserved,
@@ -63,6 +64,7 @@ from typing import Any, Callable, Iterable, Mapping, Sequence
 from urllib.parse import urlparse
 
 from app.services.crawl_url_identity import (
+    SKU_STATUS_CONFIRMED,
     SKU_STATUS_UNRESOLVED,
     SKU_STATUS_UPSTREAM_PROVIDED,
     is_placeholder_code,
@@ -553,18 +555,15 @@ def _sync_daily_internet_results_unlocked(
     the next scan retries.  A missing state db returns ``state_db='missing'``
     without raising.
 
-    SKU evidence note (Issue #9 Round 3 Finding B, RESOLVED by user decision
-    2026-09-07): the crawl row's ``sku_id`` is the SaaS/upstream authoritative
-    input echoed back by the export result workbook (app-side mapping keys by
-    (code, url), so any successfully mapped row's code equals the submitted
-    SKU by construction).  It is upstream evidence, NOT independently
-    re-confirmed page/crawler evidence, so a usable value is honestly encoded
-    ``UPSTREAM_PROVIDED`` (explicitly NOT ``CONFIRMED``) while temporary codes
-    (``zhpq-*`` placeholders, the STEP3 ``ROW<n>`` template fallback shape, or
-    an echo of the crawl/remote task id) degrade to ``UNRESOLVED``.  Either
-    way the original value is preserved verbatim as
-    ``payload["request_sku_id"]`` - a valid price result is never lost because
-    of a placeholder rejection.
+    SKU evidence note: the request-side ``crawl_work.sku_id`` remains
+    upstream evidence only.  A validated export may additionally carry
+    ``page_sku_id`` from ``商品最小品类单元id``; when present and non-temporary,
+    that page/crawler evidence is stronger and is stored as ``CONFIRMED``.
+    Without page evidence, a usable request SKU remains
+    ``UPSTREAM_PROVIDED``; placeholders / ROW fallbacks / crawl-id echoes
+    remain ``UNRESOLVED``.  The request value is preserved in
+    ``payload["request_sku_id"]``, while validated title and comment evidence
+    are mirrored alongside price.
     """
     now_value = now if now is not None else datetime.now(UTC)
     summary: dict[str, Any] = {
@@ -691,17 +690,19 @@ def _sync_daily_internet_results_unlocked(
         if succeeded_at is None:
             payload["raw_updated_at"] = updated_at_raw
 
-        # Finding B (RESOLVED 2026-09-07): the row's sku_id is upstream
-        # (SaaS/request-side) evidence, never independently re-confirmed page
-        # evidence.  A usable value is honestly encoded UPSTREAM_PROVIDED
-        # (explicitly not CONFIRMED); temporary codes (zhpq-*, ROW<n>,
-        # crawl-id echo) degrade to UNRESOLVED.  Either way the original
-        # value is preserved verbatim as payload evidence, and a valid price
-        # result is never lost because of a placeholder rejection.
+        # Prefer independent page/crawler SKU evidence from the validated
+        # export.  The request-side sku_id remains provenance only and is used
+        # as UPSTREAM_PROVIDED fallback when page_sku_id is absent.  Temporary
+        # request codes never become real SKU evidence.  Price/title/comment
+        # stay valid even when the request SKU itself is only a placeholder.
         sku_value = str(row["sku_id"] or "").strip()
         crawl_label = task_name or None
-        if sku_value and not is_temporary_request_code(sku_value, crawl_id=crawl_label):
-            real_sku_id: str | None = sku_value
+        page_sku = str(result.get("page_sku_id") or "").strip()
+        if page_sku and not is_temporary_request_code(page_sku, crawl_id=crawl_label):
+            real_sku_id: str | None = page_sku
+            sku_status = SKU_STATUS_CONFIRMED
+        elif sku_value and not is_temporary_request_code(sku_value, crawl_id=crawl_label):
+            real_sku_id = sku_value
             sku_status = SKU_STATUS_UPSTREAM_PROVIDED
         else:
             real_sku_id = None
@@ -723,7 +724,9 @@ def _sync_daily_internet_results_unlocked(
                 crawl_id=crawl_label,
                 real_sku_id=real_sku_id,
                 sku_status=sku_status,
+                title=result.get("page_title"),
                 price=result.get("page_price_value"),
+                comment_count=result.get("comment_count"),
                 source=source,
                 succeeded_at=succeeded_at,
                 payload=payload,
