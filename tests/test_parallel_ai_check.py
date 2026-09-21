@@ -211,6 +211,122 @@ def test_scope_overlap_with_other_worktree_stops_for_review(tmp_path: Path) -> N
     assert "fix/prewarm-bug" in result.stdout
 
 
+def test_uncommitted_scope_overlap_with_other_worktree_stops_for_review(
+    tmp_path: Path,
+) -> None:
+    repo, base_sha = _make_repository(tmp_path)
+    other = tmp_path / "dirty-overlap-worktree"
+    _run_git(repo, "worktree", "add", "-b", "fix/dirty-overlap", str(other), base_sha)
+    target = other / "app" / "prewarm.py"
+    target.parent.mkdir(parents=True)
+    target.write_text("# uncommitted competing change\n", encoding="utf-8")
+
+    result = _run_tool(
+        repo,
+        "--base-sha",
+        base_sha,
+        "--scope",
+        "app/prewarm.py",
+        "--no-github",
+    )
+
+    assert result.returncode == 2, result.stdout + result.stderr
+    assert "STATUS: STOP_AND_REVIEW" in result.stdout
+    assert "REASON: FILE_OVERLAP_UNCOMMITTED" in result.stdout
+    assert "app/prewarm.py" in result.stdout
+    assert "fix/dirty-overlap" in result.stdout
+
+
+def test_uncommitted_nonoverlap_in_other_worktree_does_not_block(
+    tmp_path: Path,
+) -> None:
+    repo, base_sha = _make_repository(tmp_path)
+    other = tmp_path / "dirty-nonoverlap-worktree"
+    _run_git(repo, "worktree", "add", "-b", "fix/unrelated", str(other), base_sha)
+    (other / "unrelated.txt").write_text("unrelated\n", encoding="utf-8")
+
+    result = _run_tool(
+        repo,
+        "--base-sha",
+        base_sha,
+        "--scope",
+        "app/prewarm.py",
+        "--no-github",
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "STATUS: SAFE_TO_START" in result.stdout
+    assert "FILE_OVERLAP_UNCOMMITTED" not in result.stdout
+
+
+def test_inaccessible_worktree_records_status_unavailable_and_continues(
+    tmp_path: Path,
+) -> None:
+    repo, base_sha = _make_repository(tmp_path)
+    other = tmp_path / "removed-worktree"
+    _run_git(repo, "worktree", "add", "-b", "fix/removed", str(other), base_sha)
+    shutil.rmtree(other)
+
+    result = _run_tool(
+        repo,
+        "--base-sha",
+        base_sha,
+        "--scope",
+        "app/prewarm.py",
+        "--no-github",
+    )
+
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert "STATUS: WARNING" in result.stdout
+    assert "REASON: WORKTREE_STATUS_UNAVAILABLE" in result.stdout
+    assert "WORKTREE_STATUS_UNAVAILABLE:" in result.stdout
+    assert str(other.resolve()) in result.stdout
+
+
+def test_missing_declared_scope_warns_even_when_task_paths_are_observed(
+    tmp_path: Path,
+) -> None:
+    repo, base_sha = _make_repository(tmp_path)
+    (repo / "observed.txt").write_text("observed\n", encoding="utf-8")
+    _run_git(repo, "add", "observed.txt")
+    _run_git(repo, "commit", "-m", "observed task change")
+
+    result = _run_tool(repo, "--base-sha", base_sha, "--no-github")
+
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert "STATUS: WARNING" in result.stdout
+    assert "REASON: SCOPE_NOT_DECLARED" in result.stdout
+    assert "DECLARED_SCOPE:\n  (not declared)" in result.stdout
+    assert "OBSERVED_TASK_PATHS:\n  observed.txt" in result.stdout
+
+
+def test_remote_prod_unavailable_keeps_local_and_cached_facts(tmp_path: Path) -> None:
+    repo, base_sha = _make_repository(tmp_path)
+    missing_remote = tmp_path / "missing-remote.git"
+    _run_git(repo, "remote", "set-url", "origin", str(missing_remote))
+
+    result = _run_tool(
+        repo,
+        "--base-sha",
+        base_sha,
+        "--scope",
+        "app/prewarm.py",
+        "--no-github",
+    )
+
+    assert result.returncode == 2, result.stdout + result.stderr
+    assert "STATUS: STOP_AND_REVIEW" in result.stdout
+    assert "REMOTE_PROD_STATUS: UNAVAILABLE" in result.stdout
+    assert f"CACHED_PROD_SHA: {base_sha}" in result.stdout
+    assert "REASON: REMOTE_PROD_UNAVAILABLE" in result.stdout
+    assert "CURRENT_WORKTREE:" in result.stdout
+    assert f"PATH: {repo.resolve()}" in result.stdout
+    assert "BRANCH: chore/test-task" in result.stdout
+    assert "CLEAN: YES" in result.stdout
+    assert "OTHER_WORKTREES: 0" in result.stdout
+    assert "STATUS: SAFE_TO_START" not in result.stdout
+
+
 def test_chinese_worktree_path_is_reported_without_replacement_characters(
     tmp_path: Path,
 ) -> None:
