@@ -18,7 +18,7 @@ python scripts\incremental_price_audit.py doctor --business-date 2026-08-11
 
 默认 runtime root 是 `runtime/incremental_price_audit`；每个业务日在各自目录保存
 `state.sqlite3`、`incremental_price_audit.lock`、`BATCH_STATE.md`、`daily_status.json` 和正式 Excel。
-SQLite 是唯一状态权威；`daily_status.json` 只是每次有限命令结束后的原子便利快照。`status` 和
+SQLite 是唯一状态权威；`daily_status.json` 只是每次有限命令结束后的原子便利快照。显式传入的 `--runtime-root` 必须保留调用者路径（包括 Windows Junction 别名），不得通过 `resolve()` 静默改写到另一个 worktree。Windows reader 短暂占用 `daily_status.json` 时先有界重试原子替换；重试耗尽只记录 `DAILY_STATUS_PUBLISH_FAILED`，不得反向把已经完成的 PriceAudit 业务命令改成失败。`status` 和
 `doctor` 都只读，缺失状态返回 `MISSING`，不会创建目录、数据库、发网络请求或修改 Scheduler。
 `lock-status` 只探测该业务日的 OS writer lock；writer 活跃时报告
 `production run currently active` 以及能够可靠读取的 PID、命令、启动时间和调用来源，不等待、不写 SQLite。

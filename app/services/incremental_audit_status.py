@@ -827,6 +827,9 @@ def collect_runtime_status(
     return status
 
 
+_DAILY_STATUS_REPLACE_RETRY_DELAYS_SECONDS = (0.05, 0.1, 0.2, 0.4, 0.8, 1.0)
+
+
 def write_daily_status(
     status: dict[str, Any], *, business_date: str, runtime_root: Path | str = DEFAULT_RUNTIME_ROOT
 ) -> Path:
@@ -841,7 +844,14 @@ def write_daily_status(
             stream.write("\n")
             stream.flush()
             os.fsync(stream.fileno())
-        os.replace(temporary, output)
+        for attempt in range(len(_DAILY_STATUS_REPLACE_RETRY_DELAYS_SECONDS) + 1):
+            try:
+                os.replace(temporary, output)
+                break
+            except PermissionError:
+                if attempt >= len(_DAILY_STATUS_REPLACE_RETRY_DELAYS_SECONDS):
+                    raise
+                time.sleep(_DAILY_STATUS_REPLACE_RETRY_DELAYS_SECONDS[attempt])
     finally:
         temporary.unlink(missing_ok=True)
     return output

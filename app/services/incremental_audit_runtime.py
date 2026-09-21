@@ -221,7 +221,10 @@ def cutoff_for_business_date(business_date: str) -> datetime:
 
 
 def runtime_paths(business_date: str, root: Path | str = DEFAULT_RUNTIME_ROOT) -> RuntimePaths:
-    root_path = Path(root).resolve()
+    # Preserve an explicitly supplied worktree/Junction alias. Path.resolve()
+    # follows Windows Junctions and can silently move runtime I/O into another
+    # worktree even though the scheduler passed a different production root.
+    root_path = Path(root).absolute()
     run_dir = root_path / business_date
     return RuntimePaths(
         business_date=business_date,
