@@ -577,11 +577,23 @@ def main(argv: list[str] | None = None) -> int:
             "outcome": result.tick.outcome,
             "elapsed_seconds": elapsed_seconds,
         }
-        status_path = write_daily_status(
-            status,
-            business_date=business_date,
-            runtime_root=args.runtime_root,
-        )
+        try:
+            status_path = write_daily_status(
+                status,
+                business_date=business_date,
+                runtime_root=args.runtime_root,
+            )
+        except PermissionError as exc:
+            # daily_status.json is a non-authoritative convenience snapshot.
+            # A Windows reader can briefly block atomic replacement; the
+            # business command must not become a failed production tick after
+            # write_daily_status exhausts its bounded retry window.
+            print(
+                "DAILY_STATUS_PUBLISH_FAILED "
+                f"error=PermissionError errno={getattr(exc, 'errno', None)}",
+                file=sys.stderr,
+            )
+            status_path = None
     print(json.dumps({
         "business_date": business_date,
         "run_id": status.get("run_id") if status is not None else None,

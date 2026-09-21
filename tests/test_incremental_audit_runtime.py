@@ -94,6 +94,23 @@ def test_detail_lock_is_shared_across_business_dates(tmp_path):
     assert first.detail_lock_path.parent == (tmp_path / "runtime").resolve()
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows junction regression")
+def test_runtime_paths_preserves_explicit_junction_alias(tmp_path):
+    target = tmp_path / "physical-runtime"
+    target.mkdir()
+    alias = tmp_path / "runtime-alias"
+    subprocess.run(
+        ["cmd", "/c", "mklink", "/J", str(alias), str(target)],
+        check=True,
+        capture_output=True,
+    )
+
+    paths = runtime_paths("2026-08-11", alias)
+
+    assert paths.run_dir == alias.absolute() / "2026-08-11"
+    assert paths.run_dir != target.resolve() / "2026-08-11"
+
+
 def test_project_resources_and_default_runtime_root_do_not_depend_on_cwd(
     tmp_path, monkeypatch
 ):

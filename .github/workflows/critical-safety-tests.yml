@@ -118,6 +118,9 @@ jobs:
           tests/test_incremental_audit_resilience.py
           tests/test_incremental_price_audit.py
           tests/test_incremental_audit_status.py
+          tests/test_incremental_audit_runtime.py::test_runtime_paths_preserves_explicit_junction_alias
+          tests/test_incremental_audit_operations.py::test_daily_status_retries_transient_windows_replace_lock
+          tests/test_incremental_audit_operations.py::test_tick_cli_status_publish_permission_error_is_nonfatal
           tests/test_harvest_only.py
           tests/test_partial_exact_harvest.py
           tests/test_snapshot_consistency_drift.py

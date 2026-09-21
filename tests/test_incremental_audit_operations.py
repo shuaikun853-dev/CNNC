@@ -9,6 +9,7 @@ import time
 from datetime import UTC, datetime
 from pathlib import Path
 
+import app.services.incremental_audit_status as status_module
 from app.services.customer_price_semantics import DetailBusinessRetryRequired
 from app.services.daily_audit_store import DailyAuditStore, ProcessLock
 from app.services.incremental_audit_runtime import RuntimeResult, run_runtime_command, runtime_paths
@@ -738,6 +739,62 @@ def test_daily_status_is_atomic_convenience_snapshot(tmp_path):
     assert output == runtime_paths(BUSINESS_DATE, root).run_dir / "daily_status.json"
     assert json.loads(output.read_text(encoding="utf-8"))["state"] == "MISSING"
     assert not list(output.parent.glob(".daily_status.json.*.tmp"))
+
+
+def test_daily_status_retries_transient_windows_replace_lock(tmp_path, monkeypatch):
+    root = tmp_path / "runtime"
+    status = collect_runtime_status(business_date=BUSINESS_DATE, runtime_root=root)
+    real_replace = status_module.os.replace
+    attempts = []
+    sleeps = []
+
+    def flaky_replace(source, destination):
+        attempts.append((source, destination))
+        if len(attempts) < 3:
+            raise PermissionError(5, "destination temporarily locked", str(destination))
+        return real_replace(source, destination)
+
+    monkeypatch.setattr(status_module.os, "replace", flaky_replace)
+    monkeypatch.setattr(status_module.time, "sleep", lambda seconds: sleeps.append(seconds))
+
+    output = write_daily_status(status, business_date=BUSINESS_DATE, runtime_root=root)
+
+    assert output.is_file()
+    assert len(attempts) == 3
+    assert len(sleeps) == 2
+    assert all(delay > 0 for delay in sleeps)
+    assert not list(output.parent.glob(".daily_status.json.*.tmp"))
+
+
+def test_tick_cli_status_publish_permission_error_is_nonfatal(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(
+        cli,
+        "run_runtime_command",
+        lambda *_args, **_kwargs: RuntimeResult(
+            TickSummary("COMPLETED", (), {}, {}, None)
+        ),
+    )
+    monkeypatch.setattr(cli, "collect_runtime_status", lambda **_kwargs: {"run_id": 7})
+    monkeypatch.setattr(
+        cli,
+        "write_daily_status",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            PermissionError(5, "destination locked", "daily_status.json")
+        ),
+    )
+
+    exit_code = cli.main([
+        "tick",
+        "--business-date", BUSINESS_DATE,
+        "--runtime-root", str(tmp_path / "runtime"),
+    ])
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+
+    assert exit_code == 0
+    assert payload["daily_status"] is None
+    assert payload["outcome"] == "COMPLETED"
+    assert "DAILY_STATUS_PUBLISH_FAILED" in captured.err
 
 
 def test_tick_cli_is_shadow_with_720_second_budget_by_default(tmp_path, monkeypatch, capsys):
