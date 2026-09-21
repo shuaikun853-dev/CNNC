@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 import json
 from pathlib import Path
@@ -40,6 +41,14 @@ class PullRequestInfo:
 class OverlapInfo:
     source: str
     path: str
+    reason: str
+
+
+@dataclass(frozen=True)
+class WorktreeStatusInfo:
+    worktree: WorktreeInfo
+    paths: tuple[str, ...] = ()
+    available: bool = True
 
 
 def _run(command: list[str], *, cwd: Path, timeout: float) -> str:
@@ -79,6 +88,19 @@ def _current_prod_sha(repo: Path, prod_branch: str, timeout: float) -> str:
     if len(fields) < 2:
         raise CheckError(f"origin branch not found: {prod_branch}")
     return fields[0]
+
+
+def _cached_prod_sha(repo: Path, prod_branch: str, timeout: float) -> str | None:
+    try:
+        return _git(
+            repo,
+            "rev-parse",
+            "--verify",
+            f"refs/remotes/origin/{prod_branch}^{{commit}}",
+            timeout=timeout,
+        ).strip()
+    except CheckError:
+        return None
 
 
 def _parse_worktrees(output: str) -> list[WorktreeInfo]:
@@ -167,11 +189,11 @@ def _status_paths(repo: Path, timeout: float) -> tuple[str, ...]:
         if len(line) < 4:
             continue
         value = line[3:]
-        if " -> " in value:
-            value = value.split(" -> ", 1)[1]
-        normalized = _normalized_repo_path(value.strip('"'))
-        if normalized:
-            paths.append(normalized)
+        values = value.split(" -> ", 1) if " -> " in value else [value]
+        for changed_path in values:
+            normalized = _normalized_repo_path(changed_path.strip().strip('"'))
+            if normalized:
+                paths.append(normalized)
     return tuple(sorted(set(paths)))
 
 
@@ -195,6 +217,26 @@ def _committed_paths(repo: Path, base: str, head: str, timeout: float) -> tuple[
     )
 
 
+def _worktree_statuses(
+    worktrees: list[WorktreeInfo], timeout: float
+) -> tuple[WorktreeStatusInfo, ...]:
+    def inspect(worktree: WorktreeInfo) -> WorktreeStatusInfo:
+        try:
+            if not worktree.path.is_dir():
+                return WorktreeStatusInfo(worktree=worktree, available=False)
+            return WorktreeStatusInfo(
+                worktree=worktree,
+                paths=_status_paths(worktree.path, timeout),
+            )
+        except (CheckError, OSError):
+            return WorktreeStatusInfo(worktree=worktree, available=False)
+
+    if not worktrees:
+        return ()
+    with ThreadPoolExecutor(max_workers=min(8, len(worktrees))) as executor:
+        return tuple(executor.map(inspect, worktrees))
+
+
 def _scope_matches(scope: str, changed_path: str) -> bool:
     return changed_path == scope or changed_path.startswith(f"{scope}/")
 
@@ -205,12 +247,15 @@ def _find_overlaps(
     fallback_base_sha: str,
     current_branch: str,
     task_paths: tuple[str, ...],
-    other_worktrees: list[WorktreeInfo],
+    worktree_statuses: tuple[WorktreeStatusInfo, ...],
     pull_requests: tuple[PullRequestInfo, ...],
     timeout: float,
 ) -> tuple[OverlapInfo, ...]:
-    overlaps: set[tuple[str, str]] = set()
-    for worktree in other_worktrees:
+    overlaps: set[tuple[str, str, str]] = set()
+    for status_info in worktree_statuses:
+        worktree = status_info.worktree
+        committed_source = f"worktree {worktree.branch} ({worktree.path})"
+        uncommitted_source = f"dirty worktree {worktree.branch} ({worktree.path})"
         try:
             committed = _committed_paths(repo, current_prod_sha, worktree.head, timeout)
         except CheckError:
@@ -220,7 +265,12 @@ def _find_overlaps(
                 committed = ()
         for changed_path in committed:
             if any(_scope_matches(scope, changed_path) for scope in task_paths):
-                overlaps.add((f"worktree {worktree.branch} ({worktree.path})", changed_path))
+                overlaps.add(("FILE_OVERLAP", committed_source, changed_path))
+        for changed_path in status_info.paths:
+            if any(_scope_matches(scope, changed_path) for scope in task_paths):
+                overlaps.add(
+                    ("FILE_OVERLAP_UNCOMMITTED", uncommitted_source, changed_path)
+                )
 
     for pull_request in pull_requests:
         if pull_request.branch == current_branch:
@@ -228,8 +278,13 @@ def _find_overlaps(
         for changed_path in pull_request.files:
             normalized = _normalized_repo_path(changed_path)
             if any(_scope_matches(scope, normalized) for scope in task_paths):
-                overlaps.add((f"PR #{pull_request.number} {pull_request.branch}", normalized))
-    return tuple(OverlapInfo(source=source, path=path) for source, path in sorted(overlaps))
+                overlaps.add(
+                    ("FILE_OVERLAP", f"PR #{pull_request.number} {pull_request.branch}", normalized)
+                )
+    return tuple(
+        OverlapInfo(reason=reason, source=source, path=path)
+        for reason, source, path in sorted(overlaps)
+    )
 
 
 def _configure_console() -> None:
@@ -262,7 +317,6 @@ def main(argv: list[str] | None = None) -> int:
     try:
         repo = Path(_git(repo, "rev-parse", "--show-toplevel", timeout=args.timeout).strip()).resolve()
         base_sha = _git(repo, "rev-parse", f"{args.base_sha}^{{commit}}", timeout=args.timeout).strip()
-        current_prod_sha = _current_prod_sha(repo, args.prod_branch, args.timeout)
         head = _git(repo, "rev-parse", "HEAD", timeout=args.timeout).strip()
         branch = _git(repo, "branch", "--show-current", timeout=args.timeout).strip() or "DETACHED"
         current_dirty_paths = _status_paths(repo, args.timeout)
@@ -276,6 +330,16 @@ def main(argv: list[str] | None = None) -> int:
         print("READ_ONLY: no changes were made")
         return 2
 
+    cached_prod_sha = _cached_prod_sha(repo, args.prod_branch, args.timeout)
+    try:
+        current_prod_sha: str | None = _current_prod_sha(
+            repo, args.prod_branch, args.timeout
+        )
+        remote_prod_status = "AVAILABLE"
+    except CheckError:
+        current_prod_sha = None
+        remote_prod_status = "UNAVAILABLE"
+
     if args.no_github:
         github_state = "SKIPPED"
         pull_requests: tuple[PullRequestInfo, ...] = ()
@@ -288,45 +352,66 @@ def main(argv: list[str] | None = None) -> int:
             github_state = "UNAVAILABLE"
 
     other_worktrees = [item for item in worktrees if item.path != repo]
+    worktree_statuses = _worktree_statuses(other_worktrees, args.timeout)
+    unavailable_worktrees = tuple(
+        item.worktree for item in worktree_statuses if not item.available
+    )
     declared_scope = tuple(
         normalized
         for value in args.scope
         if (normalized := _normalized_repo_path(value))
     )
-    if declared_scope:
-        task_paths = tuple(sorted(set(declared_scope)))
-    else:
-        try:
-            committed_task_paths = _committed_paths(repo, current_prod_sha, head, args.timeout)
-        except CheckError:
-            committed_task_paths = _committed_paths(repo, base_sha, head, args.timeout)
-        task_paths = tuple(sorted(set(committed_task_paths) | set(current_dirty_paths)))
+    comparison_prod_sha = current_prod_sha or cached_prod_sha or base_sha
+    try:
+        committed_task_paths = _committed_paths(
+            repo, comparison_prod_sha, head, args.timeout
+        )
+    except CheckError:
+        committed_task_paths = _committed_paths(repo, base_sha, head, args.timeout)
+    observed_task_paths = tuple(
+        sorted(set(committed_task_paths) | set(current_dirty_paths))
+    )
+    task_paths = tuple(sorted(set(declared_scope) | set(observed_task_paths)))
     overlaps = _find_overlaps(
         repo,
-        current_prod_sha,
+        comparison_prod_sha,
         base_sha,
         branch,
         task_paths,
-        other_worktrees,
+        worktree_statuses,
         pull_requests,
         args.timeout,
     )
 
-    prod_same = base_sha == current_prod_sha
+    prod_same = current_prod_sha is not None and base_sha == current_prod_sha
     reasons: list[str] = []
-    if not prod_same:
+    if current_prod_sha is None:
+        reasons.append("REMOTE_PROD_UNAVAILABLE")
+    elif not prod_same:
         reasons.append("PRODUCTION_MOVED")
     if dirty:
         reasons.append("CURRENT_WORKTREE_DIRTY")
-    if not task_paths:
+    if not declared_scope:
         reasons.append("SCOPE_NOT_DECLARED")
+    if unavailable_worktrees:
+        reasons.append("WORKTREE_STATUS_UNAVAILABLE")
     if github_state == "UNAVAILABLE":
         reasons.append("GITHUB_UNAVAILABLE")
-    if overlaps:
+    if any(item.reason == "FILE_OVERLAP" for item in overlaps):
         reasons.append("FILE_OVERLAP")
+    if any(item.reason == "FILE_OVERLAP_UNCOMMITTED" for item in overlaps):
+        reasons.append("FILE_OVERLAP_UNCOMMITTED")
     status = (
         "STOP_AND_REVIEW"
-        if "PRODUCTION_MOVED" in reasons or "FILE_OVERLAP" in reasons
+        if any(
+            reason in reasons
+            for reason in (
+                "REMOTE_PROD_UNAVAILABLE",
+                "PRODUCTION_MOVED",
+                "FILE_OVERLAP",
+                "FILE_OVERLAP_UNCOMMITTED",
+            )
+        )
         else "WARNING"
         if reasons
         else "SAFE_TO_START"
@@ -334,8 +419,13 @@ def main(argv: list[str] | None = None) -> int:
     print("PARALLEL_AI_CHECK")
     print(f"STATUS: {status}")
     print(f"BASE_SHA: {base_sha}")
-    print(f"CURRENT_PROD_SHA: {current_prod_sha}")
-    print(f"PROD_STATUS: {'SAME' if prod_same else 'PRODUCTION_MOVED'}")
+    print(f"REMOTE_PROD_STATUS: {remote_prod_status}")
+    print(f"CURRENT_PROD_SHA: {current_prod_sha or 'UNAVAILABLE'}")
+    print(f"CACHED_PROD_SHA: {cached_prod_sha or 'UNAVAILABLE'}")
+    print(
+        "PROD_STATUS: "
+        + ("UNKNOWN" if current_prod_sha is None else "SAME" if prod_same else "PRODUCTION_MOVED")
+    )
     print("CURRENT_WORKTREE:")
     print(f"  PATH: {repo}")
     print(f"  BRANCH: {branch}")
@@ -343,19 +433,25 @@ def main(argv: list[str] | None = None) -> int:
     print(f"  CLEAN: {'NO' if dirty else 'YES'}")
     for reason in reasons:
         print(f"REASON: {reason}")
-    print("TASK_SCOPE:")
-    for scope in task_paths or ["(not declared)"]:
+    print("DECLARED_SCOPE:")
+    for scope in declared_scope or ["(not declared)"]:
         print(f"  {scope}")
+    print("OBSERVED_TASK_PATHS:")
+    for path in observed_task_paths or ["(none)"]:
+        print(f"  {path}")
     print(f"OTHER_WORKTREES: {len(other_worktrees)}")
-    for item in other_worktrees:
+    for status_info in worktree_statuses:
+        item = status_info.worktree
         print(f"  PATH: {item.path}")
         print(f"  BRANCH: {item.branch}")
         print(f"  HEAD: {item.head}")
+        if not status_info.available:
+            print(f"  WORKTREE_STATUS_UNAVAILABLE: {item.path}")
         for annotation in item.annotations:
             print(f"  NOTE: {annotation}")
     print(f"FILE_OVERLAPS: {len(overlaps)}")
     for overlap in overlaps:
-        print(f"  {overlap.path} <- {overlap.source}")
+        print(f"  {overlap.path} <- {overlap.source} [{overlap.reason}]")
     print(f"GITHUB: {github_state}")
     if github_state == "AVAILABLE":
         print(f"OPEN_PULL_REQUESTS: {len(pull_requests)}")
@@ -364,7 +460,7 @@ def main(argv: list[str] | None = None) -> int:
                 f"  #{pull_request.number} {pull_request.branch} "
                 f"({len(pull_request.files)} files) {pull_request.url}"
             )
-    if not prod_same:
+    if current_prod_sha is not None and not prod_same:
         try:
             new_commits = _git(
                 repo,

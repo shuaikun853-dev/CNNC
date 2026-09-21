@@ -15,15 +15,17 @@ python tools\parallel_ai_check.py `
   --scope tests\test_prewarm.py
 ```
 
-`BASE_SHA` 的意思是“本任务开始时，正式 prod 指向哪个 commit”。它不能在任务中途悄悄改成新值。工具使用只读 Git 命令读取远端 prod、当前 branch/HEAD/dirty 状态和本机 worktree；安装并可用 `gh` 时，还读取 open PR 的文件列表。`gh` 失败不会丢失本地 Git 结果，但整体状态会降为 `WARNING`。
+`BASE_SHA` 的意思是“本任务开始时，正式 prod 指向哪个 commit”。它不能在任务中途悄悄改成新值。`--scope` 必须显式声明；即使工具从 branch diff 或当前 dirty 文件推断出 `OBSERVED_TASK_PATHS`，缺少声明仍会输出 `SCOPE_NOT_DECLARED` 并至少降为 `WARNING`。输出中的 `DECLARED_SCOPE` 和 `OBSERVED_TASK_PATHS` 分开，不能用观察结果冒充计划范围。
+
+工具使用只读 Git 命令读取远端 prod、当前 branch/HEAD/dirty 状态和本机 worktree；安装并可用 `gh` 时，还读取 open PR 的文件列表。`gh` 失败不会丢失本地 Git 结果，但整体状态会降为 `WARNING`。远端 prod 查询失败时，本地 branch、HEAD、dirty、worktree 和缓存的 `refs/remotes/origin/prod/closeout-20260818` 仍会展示；结果标记 `REMOTE_PROD_STATUS: UNAVAILABLE`、`CACHED_PROD_SHA` 和 `REMOTE_PROD_UNAVAILABLE`，并返回 `STOP_AND_REVIEW`，缓存值不会被冒充成实时 prod。
 
 ## 看懂结果
 
 - `SAFE_TO_START`（退出码 0）：`BASE_SHA` 等于当前 prod、当前 worktree clean、已声明 scope，且没有发现同文件重叠。
 - `WARNING`（退出码 1）：例如当前 worktree dirty、未声明 scope，或 GitHub 信息不可用。原因会逐条打印。
-- `STOP_AND_REVIEW`（退出码 2）：prod 已移动、发现其他 worktree branch 或 open PR 修改同一文件，或必要 Git 事实无法取得。
+- `STOP_AND_REVIEW`（退出码 2）：prod 已移动、远端 prod 不可确认、发现其他 worktree 或 open PR 修改同一文件，或必要 Git 事实无法取得。
 
-工具只把“同一个文件”判为 `FILE_OVERLAP`。不同文件但同属 Prewarm 等业务区域时，只能由 AI 标记为 `POSSIBLE_OVERLAP` 并向任务负责人确认。为了让 100 个以上历史 worktree 仍能快速检查，工具不会逐个扫描其他 worktree 的未提交文件；它会列出其 path、branch、HEAD，并比较 branch 已提交文件。当前 worktree 的 dirty 状态始终检查。
+工具只把“同一个文件”判为冲突：其他 branch 或 open PR 的已提交改动输出 `FILE_OVERLAP`；其他可访问 worktree 的未提交同文件改动输出 `FILE_OVERLAP_UNCOMMITTED`，两者都返回 `STOP_AND_REVIEW`。每个可访问 worktree 只执行一次只读 `git status --porcelain --untracked-files=all`；未提交的不同文件不算重叠。不可访问或 prunable worktree 不会中断其余检查，而是记录 `WORKTREE_STATUS_UNAVAILABLE` 并把结果降为 `WARNING`。不同文件但同属 Prewarm 等业务区域时，仍需由 AI 标记为 `POSSIBLE_OVERLAP` 并向任务负责人确认。
 
 ## 提交前
 
