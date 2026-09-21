@@ -69,3 +69,5 @@ def test_architecture_mermaid_maps_have_parseable_entrypoints():
 
     assert len(diagrams) >= 2
     assert all(diagram.lstrip().startswith("flowchart") for diagram in diagrams)
+    assert "CACHE --> B" not in architecture
+    assert "STEP1 不从 Shared Crawl Cache 读取业务数据" in architecture
