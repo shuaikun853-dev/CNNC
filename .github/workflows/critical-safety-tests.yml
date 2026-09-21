@@ -92,6 +92,7 @@ jobs:
           PYTHONUTF8: "1"  # JS harness 输出 UTF-8，避免 cp1252 Runner 上 subprocess 文本解码崩溃
         run: >
           python -m pytest
+          tests/test_architecture_contract.py
           tests/test_canary_scope_gate.py
           tests/test_customer_price_semantics.py
           tests/test_customer_price_projection.py
