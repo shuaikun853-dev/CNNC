@@ -4,7 +4,7 @@
 
 ## 目标
 
-按每条记录的 `documentId + fourCategoryId` 查询中核 detail、提取参考链接、按链接数分流；对可处理链接优先走招商局；经用户确认后才运行指定脚本或 detail 参考补全；最终生成三类固定文件和缺价清单。
+按每条记录的 `documentId + fourCategoryId` 查询中核 detail、提取参考链接、按链接数分流；对可处理链接先只读复用 Shared Crawl Cache 中已经爬好的客户链接结果，未形成完整可用证据的链接才进入招商局；经用户确认后才运行指定脚本或 detail 参考补全；最终生成三类固定文件和缺价清单。第三步需要的商城实采字段固定为商品标题、页面真实 SKU ID、价格和渠道；京东、苏宁还必须有评论数。
 
 ## 必需输入
 
@@ -18,6 +18,7 @@
 | 招商局运行时认证 | `data/auth_state.json`；存在后是唯一 Token 来源 |
 | 招商局 DB 配置 | `data/ZHAOSHANG_DB.env`，仅通过 `--zhaoshang-db-env` 加载到本进程 |
 | 商城映射 | `商城sourceId映射表/` |
+| 客户链接预爬缓存 | 默认 `runtime/incremental_price_audit/shared_crawl_cache.sqlite3`；第三步仅只读，可用 `--shared-cache-path` 显式覆盖 |
 | 固定入口 | `scripts/process_monitor_no_push_zhaoshang.py` |
 
 若目录中有多个 Excel，只选择文件名严格匹配当前批次的监控状态表，不猜最新、不拿历史模板当输入。
@@ -41,14 +42,15 @@
 4. 同时检查 detail 参考数组和顶层链接字段，保留原始查询参数，按完整 URL 去重。接口失败或解析异常必须进入日志。
 5. 有效链接 `>=2` 的记录进入 zhimport 范围；0 或 1 条进入“直接推送失败”。两侧记录数必须与监控表否行数对账。
 6. 优先使用现有 `SKUID`、商品编码、uid；缺失时才从 URL 的 `itemId`、`skuId`、`id` 或详情路径提取。创建任务前按“商城 + 商品编码/URL”去重；仍无法提取的写待确认清单。
-7. 除 `--skip-zhaoshang` 外，先刷新招商局 Token、原子保存新 Token 并注入 Cookie 与 `Blade-Auth`。第一阶段按商城顺序创建、启用和受控提优全部可建任务；每个任务的至少14位纯数字 marker 必须在其正式创建前生成。任一异常立即停止后续 `/add`，未知响应不得重试。已有导出直接跳过，已有任务不得重复 add、启用或提优。
-8. 全部创建明确成功后，第二阶段才以 `--zs-wait-concurrency` 有界并发等待和导出；并发 worker 只能执行 `query/wait/exportTask`，禁止调用 add、启用或 SQL。`/add` 发出前先向 `BATCH_STATE.md` fsync 写入 `ADD_INTENT`，其后逐次记录接受、taskId/taskNumber、启用、提优、完成和导出。精确 task_name 必须唯一映射到 taskNumber 和配置中的 mall code；提优还必须传入 add payload 的有效子任务数，以 `mall` 索引结合 taskNumber 与 create_time 窗口轮询到数量一致的主键集合，再用主键当前读锁定并只按主键更新。禁止把 taskNumber 当唯一标识或回退到宽范围 SQL。只有 `affected_rows>0` 可称本次已提优；预查已全为 `-1` 时记录幂等状态，任务已完成但未命中更新时记录“完成、未确认提优”；已有活动任务却没有本次证据时记录 `ACTIVE_UNCONFIRMED` 并失败暂停。状态已有 add 事件但接口查无精确任务时必须暂停，不得再次创建。
-9. 导出先写临时文件并验证为 XLSX 后原子替换；断点复用还要核对必需表头及输入/结果行数。随后按完整 URL 或 SKUID 精确回填。只有同一次有效采集同时得到价格时才回填商城标题；没有价格不得用客户标题、历史标题或推测标题填“商城商品标题”。
-10. 招商局阶段后先生成各商城成功/缺价/失败清单。没有脚本授权时把本批次 `BATCH_STATE.md` 设为 `WAITING_USER` 并暂停当前批次；用户授权后可以在原任务继续，其他批次不受影响。
-11. 已授权史泰博时，先读外部 `AGENT_STBCHINA_FAST.md`，只使用 `scripts/stbchina_fast_crawler.py`，且只传本批次仍缺价的 `stbchina.cn` URL。遇到限制立即停止。
-12. 已授权 detail 参考补全时，只补价格和互联网标题同时为空、且本次 detail 中同 `documentId + 完整 URL` 精确命中的行。来源标记 `中核detail参考回填`，不得称为商城实采价。
-13. 每个补价阶段都另存新文件并重新生成处理日志和剩余清单，不覆盖招商局阶段文件。
-14. 最终核对否行数、detail 状态、分流、商城任务、提优、回填和缺价数；完成后把本批次 `BATCH_STATE.md` 改为 `COMPLETE`，不得修改其他批次状态。
+7. 在任何招商局创建动作之前，以“商城标识 + 完整 URL”只读查询 Shared Crawl Cache。缓存命中只有同时具备有效正价格、非空商城商品标题和 `real_sku_id` 才可直接用于第三步；缓存中的 mall 是渠道边界，必须与当前 URL 映射商城一致。京东 `jd`、苏宁 `suning` 还必须存在评论数；整数评论使用 `comment_count`，招商局返回 `1万+` 等非整数原文时从证据 payload 的 `comment_count_raw` 原样复用。完整命中后回填 `SKUID / 互联网标题 / 价格 / 销量或评论数`，保持供应商编码/名称作为渠道，并把该 URL 从本批招商局待爬集合剔除。缓存缺失、不完整、渠道冲突，或京东/苏宁缺评论时不得伪装命中，继续原招商局流程。
+8. 除 `--skip-zhaoshang` 外，先刷新招商局 Token、原子保存新 Token 并注入 Cookie 与 `Blade-Auth`。第一阶段按商城顺序创建、启用和受控提优全部可建任务；每个任务的至少14位纯数字 marker 必须在其正式创建前生成。任一异常立即停止后续 `/add`，未知响应不得重试。已有导出直接跳过，已有任务不得重复 add、启用或提优。
+9. 全部创建明确成功后，第二阶段才以 `--zs-wait-concurrency` 有界并发等待和导出；并发 worker 只能执行 `query/wait/exportTask`，禁止调用 add、启用或 SQL。`/add` 发出前先向 `BATCH_STATE.md` fsync 写入 `ADD_INTENT`，其后逐次记录接受、taskId/taskNumber、启用、提优、完成和导出。精确 task_name 必须唯一映射到 taskNumber 和配置中的 mall code；提优还必须传入 add payload 的有效子任务数，以 `mall` 索引结合 taskNumber 与 create_time 窗口轮询到数量一致的主键集合，再用主键当前读锁定并只按主键更新。禁止把 taskNumber 当唯一标识或回退到宽范围 SQL。只有 `affected_rows>0` 可称本次已提优；预查已全为 `-1` 时记录幂等状态，任务已完成但未命中更新时记录“完成、未确认提优”；已有活动任务却没有本次证据时记录 `ACTIVE_UNCONFIRMED` 并失败暂停。状态已有 add 事件但接口查无精确任务时必须暂停，不得再次创建。
+10. 导出先写临时文件并验证为 XLSX 后原子替换；断点复用还要核对必需表头及输入/结果行数。随后按完整 URL 或 SKUID 精确回填。招商局导出的 `商品最小品类单元id` 是页面真实 SKU 证据，优先于任务输入中的 `zhpq-*` 等占位编码；同时保留 `商品标题/名称`、价格、商城标识和评论字段。只有同一次有效采集同时得到价格时才回填商城标题；没有价格不得用客户标题、历史标题或推测标题填“商城商品标题”。京东/苏宁有价格但无评论数时必须标记“评论数缺失”，**不得写入可导入 zhImport 的完整结果模板**，而应进入待确认清单保留已取得的价格、标题和 SKU 证据；评论数补齐后才可作为第三步完整结果。
+11. 招商局阶段后先生成各商城成功/缺价/失败清单。没有脚本授权时把本批次 `BATCH_STATE.md` 设为 `WAITING_USER` 并暂停当前批次；用户授权后可以在原任务继续，其他批次不受影响。
+12. 已授权史泰博时，先读外部 `AGENT_STBCHINA_FAST.md`，只使用 `scripts/stbchina_fast_crawler.py`，且只传本批次仍缺价的 `stbchina.cn` URL。遇到限制立即停止。
+13. 已授权 detail 参考补全时，只补价格和互联网标题同时为空、且本次 detail 中同 `documentId + 完整 URL` 精确命中的行。来源标记 `中核detail参考回填`，不得称为商城实采价。
+14. 每个补价阶段都另存新文件并重新生成处理日志和剩余清单，不覆盖招商局阶段文件。
+15. 最终核对否行数、detail 状态、预爬缓存复用数、分流、商城任务、提优、回填、京东/苏宁缺评论数和缺价数；完成后把本批次 `BATCH_STATE.md` 改为 `COMPLETE`，不得修改其他批次状态。
 
 ## 固定命令
 

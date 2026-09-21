@@ -26,7 +26,9 @@ from openpyxl import Workbook
 
 from app.services.customer_prewarm_discovery import sync_daily_internet_results
 from app.services.customer_prewarm_store import CustomerPrewarmStore
+from app.services.daily_audit_store import ProcessLock
 from app.services.crawl_url_identity import (
+    SKU_STATUS_CONFIRMED,
     SKU_STATUS_UNRESOLVED,
     SKU_STATUS_UPSTREAM_PROVIDED,
 )
@@ -77,6 +79,31 @@ def _write_provenance_result(
     for index, row in enumerate(rows):
         code, url_value, price_value = row
         sheet.append([code, url_value, price_value, f"exec-{index}", task_name, mall_key])
+    workbook.save(path)
+
+
+def _write_rich_provenance_result(
+    path: Path,
+    *,
+    request_code: str,
+    page_sku: str,
+    title: str,
+    url: str,
+    price: str,
+    comment: int,
+    task_name: str,
+    mall_key: str,
+) -> None:
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.append([
+        "商品编码", "商品最小品类单元id", "商品标题/名称", "原始链接",
+        "商品价格", "评论", "执行编号", "批次号", "商城标识",
+    ])
+    sheet.append([
+        request_code, page_sku, title, url, price, comment,
+        "exec-0", task_name, mall_key,
+    ])
     workbook.save(path)
 
 
@@ -299,7 +326,97 @@ def test_case3_cross_source_dedupe_with_daily_sync(tmp_path):
     assert _cache_row_count(runtime_root / "shared_crawl_cache.sqlite3") == rows_after_sync
 
 
+def test_backfill_enriches_existing_daily_cache_from_rich_export(tmp_path):
+    runtime_root = tmp_path / "runtime"
+    runtime_root.mkdir()
+    placeholder = "zhpq-old-placeholder"
+    page_sku = "100311804305"
+    title = "亿联 MeetingEye 500"
+    seeded = seed_exported_zhaoshang_job(
+        runtime_root, BUSINESS_DATE, sku_id=placeholder, url=URL,
+    )
+    _write_rich_provenance_result(
+        seeded["result_path"], request_code=placeholder, page_sku=page_sku,
+        title=title, url=URL, price=PRICE, comment=321,
+        task_name=seeded["task_name"], mall_key=MALL,
+    )
+    prewarm = CustomerPrewarmStore(runtime_root / "customer_prewarm.sqlite3")
+    cache = SharedCrawlCache(runtime_root / "shared_crawl_cache.sqlite3")
+    sync = sync_daily_internet_results(
+        prewarm, cache, state_db_path=seeded["state_path"], business_date=BUSINESS_DATE,
+    )
+    assert sync["ok_synced"] == 1
+    before = cache.lookup_current(MALL, URL)["entry"]
+    assert before["sku_status"] == SKU_STATUS_UNRESOLVED
+    assert before["title"] is None
+
+    summary = run_backfill(runtime_root, [BUSINESS_DATE])
+
+    assert summary["rows_enriched"] == 1, summary
+    entry = cache.lookup_current(MALL, URL)["entry"]
+    assert entry["sku_status"] == SKU_STATUS_CONFIRMED
+    assert entry["real_sku_id"] == page_sku
+    assert entry["title"] == title
+    assert entry["comment_count"] == 321
+    rows_after_enrichment = _cache_row_count(runtime_root / "shared_crawl_cache.sqlite3")
+
+    second = run_backfill(runtime_root, [BUSINESS_DATE])
+
+    assert second["rows_enriched"] == 0
+    assert second["already_ingested_cross_source"] >= 1
+    assert _cache_row_count(runtime_root / "shared_crawl_cache.sqlite3") == rows_after_enrichment
+
+
 # ---- Case 4:导出工作簿缺失 → partial(隔离,绝不崩溃、绝不入缓存)--------------------
+
+
+def test_backfill_promotes_existing_upstream_sku_to_confirmed_page_evidence(tmp_path):
+    runtime_root = tmp_path / "runtime"
+    runtime_root.mkdir()
+    sku = "100311804305"
+    title = "亿联 MeetingEye 500"
+    seeded = seed_exported_zhaoshang_job(
+        runtime_root, BUSINESS_DATE, sku_id=sku, url=URL,
+    )
+    _write_rich_provenance_result(
+        seeded["result_path"], request_code=sku, page_sku=sku,
+        title=title, url=URL, price=PRICE, comment=321,
+        task_name=seeded["task_name"], mall_key=MALL,
+    )
+    prewarm = CustomerPrewarmStore(runtime_root / "customer_prewarm.sqlite3")
+    cache = SharedCrawlCache(runtime_root / "shared_crawl_cache.sqlite3")
+    sync = sync_daily_internet_results(
+        prewarm, cache, state_db_path=seeded["state_path"], business_date=BUSINESS_DATE,
+    )
+    assert sync["ok_synced"] == 1
+    assert cache.lookup_current(MALL, URL)["entry"]["sku_status"] == SKU_STATUS_UPSTREAM_PROVIDED
+
+    summary = run_backfill(runtime_root, [BUSINESS_DATE])
+
+    assert summary["rows_enriched"] == 1, summary
+    entry = cache.lookup_current(MALL, URL)["entry"]
+    assert entry["real_sku_id"] == sku
+    assert entry["sku_status"] == SKU_STATUS_CONFIRMED
+
+
+def test_backfill_defers_without_writes_when_store_wide_sync_lock_is_busy(tmp_path):
+    runtime_root = tmp_path / "runtime"
+    runtime_root.mkdir()
+    seed_exported_zhaoshang_job(runtime_root, BUSINESS_DATE)
+    prewarm = CustomerPrewarmStore(runtime_root / "customer_prewarm.sqlite3")
+    cache = SharedCrawlCache(runtime_root / "shared_crawl_cache.sqlite3")
+    before = _cache_row_count(cache.path)
+    lock = ProcessLock(prewarm.path.with_name(f"{prewarm.path.name}.sync.lock"))
+    lock.acquire()
+    try:
+        summary = run_backfill(runtime_root, [BUSINESS_DATE])
+    finally:
+        lock.release()
+
+    assert summary["deferred"] is True
+    assert summary["rows_recorded"] == 0
+    assert summary["rows_enriched"] == 0
+    assert _cache_row_count(cache.path) == before
 
 
 def test_case4_missing_export_workbook_is_isolated_partial(tmp_path):

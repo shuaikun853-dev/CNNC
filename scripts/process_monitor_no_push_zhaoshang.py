@@ -28,7 +28,13 @@ except ModuleNotFoundError:
     from monitor_stb_fallback import apply_detail_price_results, apply_detail_reference_results, apply_stbchina_results, classify_priority_output, extract_detail_reference_records, find_header, is_stbchina_url, load_zhaoshang_db_env, run_stbchina_fallback, save_or_reuse_locked_workbook
     from zhaoshang_task_phases import CreatePhaseError, MallJob, build_zhaoshang_task_name, run_create_phase, run_wait_export_phase
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 sys.path.insert(0, r"E:\.A中核运维")
+
+from app.services.shared_crawl_cache import SharedCrawlCache
+from app.services.step3_prewarm_cache import apply_cached_customer_results, missing_required_comment
 from cnnc_same_product_import import config
 from cnnc_same_product_import.link_parser import extract_jd_sku
 from cnnc_same_product_import.mall_mapper import MallMapper
@@ -57,6 +63,11 @@ def parse_args():
     parser.add_argument("--zhaoshang-db-env", help="招商局优先级数据库环境变量文件，仅在当前进程加载")
     parser.add_argument("--auto-stbchina-fallback", action="store_true", help="招商局后自动运行史泰博专用脚本回填仍缺价的 stbchina.cn 链接")
     parser.add_argument("--prefer-detail-price", action="store_true", help="中核 detail 有有效 URL 参考价时直接回填价格，并跳过该链接的招商局任务")
+    parser.add_argument(
+        "--shared-cache-path",
+        default=str(Path(__file__).resolve().parents[1] / "runtime" / "incremental_price_audit" / "shared_crawl_cache.sqlite3"),
+        help="客户链接预爬共享缓存；命中完整结果时第三步直接复用，京东/苏宁额外要求评论数",
+    )
     parser.add_argument("--leave-internet-title-blank", action="store_true", help="只回填价格，所有互联网标题保留为空")
     parser.add_argument("--detail-reference-fallback", action="store_true", help="经用户明确授权后，以同单据同URL的中核detail参考价和商品标题补全仍同时缺少价格、标题的行，并另存模板")
     parser.add_argument("--skip-zhaoshang", action="store_true", help="不创建招商局任务；仅生成当前可处理的三类文件和缺价清单")
@@ -90,6 +101,7 @@ MALL_CN_NAME = {
     "jd": "京东", "zkh": "震坤行商城", "zjmi": "浙江物产商城", "tima": "浙江宏伟商城",
     "xfs": "鑫方盛商城", "ycw": "阳采集团", "nbdeli": "得力商城", "mymro": "固安捷",
     "lxwl": "领先未来商城", "colipu": "科力普商城", "comix": "齐心商城",
+    "suning": "苏宁商城",
     "qstbg": "企事通商城", "ofs": "欧菲斯办公用品", "epec": "易派客",
     "ehsy": "西域", "haoxiny": "云中鹤商城", "guangbo": "广博商城",
     "xhgj": "咸亨国际商城", "lxwlmall": "领先未来新商城", "jslink": "得力集实采",
@@ -215,11 +227,21 @@ def read_zs_result(path, code_to_url):
     ci = {k: col(v) for k, v in {
         "code": config.ZS_COL_CODE, "title": config.ZS_COL_TITLE,
         "price": config.ZS_COL_PRICE, "url": config.ZS_COL_URL,
-        "comment": config.ZS_COL_COMMENT,
+        "comment": config.ZS_COL_COMMENT, "channel": "商城标识",
     }.items()}
+    ci["page_sku"] = col("商品最小品类单元id")
+    if ci["page_sku"] < 0:
+        ci["page_sku"] = col("商品最小品类单元Id")
     for r in range(2, ws.max_row + 1):
-        def gv(k):
-            return str(ws.cell(r, ci[k]).value or "").strip() if ci[k] > 0 else ""
+        def gv(k, *, preserve_zero=False):
+            if ci[k] <= 0:
+                return ""
+            value = ws.cell(r, ci[k]).value
+            if value is None:
+                return ""
+            if not preserve_zero and not value:
+                return ""
+            return str(value).strip()
         raw_code = gv("code")
         code = raw_code[5:] if raw_code.startswith("code-") else raw_code
         url = code_to_url.get(raw_code) or code_to_url.get(code) or gv("url")
@@ -230,11 +252,13 @@ def read_zs_result(path, code_to_url):
         except Exception:
             price = ""
         title = gv("title")
+        page_sku = gv("page_sku")
         records[url] = {
-            "code": code,
+            "code": page_sku or code,
             "title": "" if is_bad_title(title) else title,
             "price": price,
-            "comment": gv("comment"),
+            "comment": gv("comment", preserve_zero=True),
+            "channel": gv("channel"),
         }
     return records
 
@@ -414,6 +438,36 @@ for nd in no_rows:
         single_rows.append({"doc": doc_id, "code": nd["code"], "name": nd["name"], "links": links,
                             "reason": "只有{}个链接".format(len(links)) if links else "未查到链接"})
 print("    导入:{}条 推送失败:{}条".format(len(all_import_rows), len(single_rows)))
+
+prewarm_cache_summary = {
+    "scanned": 0, "cache_miss": 0, "applied": 0, "incomplete": 0,
+    "missing_required_comment": 0, "channel_mismatch": 0,
+}
+shared_cache_path = Path(ARGS.shared_cache_path).resolve()
+if shared_cache_path.is_file():
+    try:
+        prewarm_cache_summary = apply_cached_customer_results(
+            all_import_rows,
+            shared_cache=SharedCrawlCache.open_read_only(shared_cache_path),
+            mall_resolver=config.get_zhaoshang_mall_key,
+        )
+        print(
+            "    客户预爬缓存复用:{}条；不完整:{}；京东/苏宁缺评论:{}；未命中:{}".format(
+                prewarm_cache_summary["applied"],
+                prewarm_cache_summary["incomplete"],
+                prewarm_cache_summary["missing_required_comment"],
+                prewarm_cache_summary["cache_miss"],
+            )
+        )
+        if ARGS.leave_internet_title_blank:
+            for cached_row in all_import_rows:
+                cached_row.互联网标题 = ""
+    except Exception as exc:
+        prewarm_cache_summary["error"] = str(exc)
+        print("    客户预爬缓存不可用，保持原招商局流程: {}".format(exc))
+else:
+    prewarm_cache_summary["error"] = "shared cache missing"
+    print("    客户预爬缓存不存在，保持原招商局流程: {}".format(shared_cache_path))
 
 detail_direct_backfilled = 0
 if ARGS.prefer_detail_price:
@@ -636,7 +690,25 @@ for ir in all_import_rows:
             ir.销量_评论数 = ""
     if ir.价格 in ("", None):
         missing_rows.append(ir)
-print("    有价格:{} 有标题:{} 有评论:{} 无价格:{}".format(price_count, title_count, comment_count, len(missing_rows)))
+
+price_count = sum(1 for row in all_import_rows if row.价格 not in ("", None))
+title_count = sum(1 for row in all_import_rows if str(row.互联网标题 or "").strip())
+comment_count = sum(1 for row in all_import_rows if str(row.销量_评论数 or "").strip())
+missing_rows = [row for row in all_import_rows if row.价格 in ("", None)]
+required_comment_missing = [
+    row for row in all_import_rows
+    if config.get_zhaoshang_mall_key(row.URL) in {"jd", "suning"}
+    and row.价格 not in ("", None)
+    and not str(row.销量_评论数 or "").strip()
+]
+for row in required_comment_missing:
+    row.爬取状态 = "评论数缺失"
+    row.爬取失败原因 = "京东/苏宁要求评论数，但招商局结果未返回可用评论数"
+print(
+    "    有价格:{} 有标题:{} 有评论:{} 无价格:{} 京东/苏宁缺评论:{}".format(
+        price_count, title_count, comment_count, len(missing_rows), len(required_comment_missing)
+    )
+)
 
 print("[7] 写文件...")
 old_validate = tw.validate_row
@@ -648,14 +720,20 @@ def relaxed_validate(row):
 
 
 def write_relaxed_template(output_path, rows):
+    importable_rows = [
+        row for row in rows
+        if not missing_required_comment(
+            row, mall_resolver=config.get_zhaoshang_mall_key
+        )
+    ]
     tw.validate_row = relaxed_validate
     try:
         try:
-            return write_template(config.DEFAULT_TEMPLATE, output_path, rows)
+            return write_template(config.DEFAULT_TEMPLATE, output_path, importable_rows)
         except PermissionError:
             existing = openpyxl.load_workbook(output_path, read_only=True, data_only=True)
             try:
-                expected_rows = len({(row.单据id, row.URL) for row in rows}) + 1
+                expected_rows = len({(row.单据id, row.URL) for row in importable_rows}) + 1
                 if existing.active.max_row != expected_rows:
                     raise
             finally:
@@ -699,9 +777,18 @@ wb_r = openpyxl.Workbook()
 ws_r = wb_r.active
 ws_r.title = "待确认脚本兜底"
 ws_r.append(["单据id", "商品名称", "SKUID", "供应商编码", "供应商名称", "URL", "原因"])
-for ir in missing_rows:
+review_rows = list(missing_rows)
+review_keys = {(row.单据id, row.URL) for row in review_rows}
+for row in required_comment_missing:
+    if (row.单据id, row.URL) not in review_keys:
+        review_rows.append(row)
+        review_keys.add((row.单据id, row.URL))
+for ir in review_rows:
     mall = config.get_zhaoshang_mall_key(ir.URL)
-    reason = "招商局未返回有效价格" if mall else "非招商局URL，需确认是否跑脚本"
+    if missing_required_comment(ir, mall_resolver=config.get_zhaoshang_mall_key):
+        reason = "京东/苏宁缺少评论数，不能作为第三步完整结果"
+    else:
+        reason = "招商局未返回有效价格" if mall else "非招商局URL，需确认是否跑脚本"
     ws_r.append([ir.单据id, ir.商品名称, ir.SKUID, ir.供应商编码, ir.供应商名称, ir.URL, reason])
 wb_r.save(review_path)
 
@@ -781,7 +868,9 @@ summary = {
     "fail": str(fail_path), "review": str(review_path), "import_rows": len(all_import_rows),
     "single_rows": len(single_rows), "zs_urls": len(zs_urls), "non_zs_urls": len(non_zs_urls),
     "detail_direct_backfilled": detail_direct_backfilled,
+    "prewarm_cache": prewarm_cache_summary,
     "price_count": price_count, "missing_count": len(missing_rows),
+    "required_comment_missing_count": len(required_comment_missing),
     "priority_failures": priority_failures, "priority_unconfirmed": priority_unconfirmed,
     "priority_idempotent": priority_idempotent,
     "task_failures": task_failures,

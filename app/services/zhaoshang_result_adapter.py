@@ -15,6 +15,16 @@ def normalize_result_url(value: Any) -> str:
     return normalize_cell_str(value)
 
 
+def _parse_comment_count(value: Any) -> int | None:
+    raw = normalize_cell_str(value).replace(",", "")
+    if not raw or raw in {"未识别", "N/A", "NA", "None", "null"}:
+        return None
+    parsed = parse_decimal(raw)
+    if parsed is None or parsed < 0 or parsed != parsed.to_integral_value():
+        return None
+    return int(parsed)
+
+
 def read_template_code_url_map(template_path: Path | str | None) -> dict[str, str]:
     if not template_path:
         return {}
@@ -132,6 +142,10 @@ def read_zhaoshang_result_xlsx_by_identity(
             else find("\u5546\u54c1\u7f16\u7801", "\u5546\u54c1\u6700\u5c0f\u54c1\u7c7b\u5355\u5143id", "skuId", "sku_id", "code")
         )
         price_index = find("\u5546\u54c1\u4ef7\u683c", "\u4ef7\u683c", "\u91c7\u96c6\u4ef7\u683c", "page_price")
+        page_sku_index = find("商品最小品类单元id", "商品最小品类单元Id")
+        title_index = find("商品标题/名称", "商品标题", "商品名称", "title", "product_title")
+        comment_index = find("评论", "评论数", "销量/评论数", "comment", "comment_count")
+        channel_index = find("商城标识", "mall", "mallLogo", "mall_key", "MALL_LOGO")
         status_index = find("status", "crawl_status")
         reason_index = find("reason", "failure_reason")
         if url_index < 0 and (selected_code_index < 0 or not code_to_urls):
@@ -173,8 +187,32 @@ def read_zhaoshang_result_xlsx_by_identity(
                 page_status, source = "FAILED", "鎷涘晢灞€-" + (reason or status or "鏈煡")
             if identity in results:
                 raise ValueError("result workbook contains duplicate crawl identity")
+            comment_raw = (
+                normalize_cell_str(row[comment_index])
+                if 0 <= comment_index < len(row)
+                else ""
+            )
             results[identity] = {
                 "product_code": code,
+                "page_sku_id": (
+                    normalize_cell_str(row[page_sku_index])
+                    if 0 <= page_sku_index < len(row)
+                    else ""
+                ),
+                "page_title": (
+                    normalize_cell_str(row[title_index])
+                    if 0 <= title_index < len(row)
+                    else ""
+                ),
+                "comment_count": _parse_comment_count(
+                    row[comment_index] if 0 <= comment_index < len(row) else None
+                ),
+                "comment_count_raw": comment_raw,
+                "channel": (
+                    normalize_cell_str(row[channel_index])
+                    if 0 <= channel_index < len(row)
+                    else ""
+                ),
                 "page_price_value": price,
                 "page_price_status": page_status,
                 "page_price_source": source,
@@ -217,6 +255,10 @@ def read_zhaoshang_result_xlsx(
             else find("商品编码", "商品最小品类单元id", "skuId", "sku_id", "code")
         )
         price_index = find("商品价格", "价格", "采集价格", "page_price")
+        page_sku_index = find("商品最小品类单元id", "商品最小品类单元Id")
+        title_index = find("商品标题/名称", "商品标题", "商品名称", "title", "product_title")
+        comment_index = find("评论", "评论数", "销量/评论数", "comment", "comment_count")
+        channel_index = find("商城标识", "mall", "mallLogo", "mall_key", "MALL_LOGO")
         status_index = find("status", "crawl_status")
         reason_index = find("reason", "failure_reason")
         if url_index < 0 and (selected_code_index < 0 or not code_to_url):
@@ -249,7 +291,36 @@ def read_zhaoshang_result_xlsx(
                 page_status, source = "PRICE_MISSING", "招商局-价格不可见"
             else:
                 page_status, source = "FAILED", "招商局-" + (reason or status or "未知")
-            results[url] = {"product_code": code, "page_price_value": price, "page_price_status": page_status, "page_price_source": source}
+            comment_raw = (
+                normalize_cell_str(row[comment_index])
+                if 0 <= comment_index < len(row)
+                else ""
+            )
+            results[url] = {
+                "product_code": code,
+                "page_sku_id": (
+                    normalize_cell_str(row[page_sku_index])
+                    if 0 <= page_sku_index < len(row)
+                    else ""
+                ),
+                "page_title": (
+                    normalize_cell_str(row[title_index])
+                    if 0 <= title_index < len(row)
+                    else ""
+                ),
+                "comment_count": _parse_comment_count(
+                    row[comment_index] if 0 <= comment_index < len(row) else None
+                ),
+                "comment_count_raw": comment_raw,
+                "channel": (
+                    normalize_cell_str(row[channel_index])
+                    if 0 <= channel_index < len(row)
+                    else ""
+                ),
+                "page_price_value": price,
+                "page_price_status": page_status,
+                "page_price_source": source,
+            }
         return results
     finally:
         workbook.close()

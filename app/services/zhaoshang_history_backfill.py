@@ -14,12 +14,15 @@ agree —
    ``SUCCESS`` crawl row of that very job whose ``result_json`` reports
    ``page_price_status == 'OK'`` (the per-row semantics the daily sync uses).
 
-Everything else mirrors ``sync_daily_internet_results`` byte for byte: the
-producer event key format (so the same real export success dedupes across
-ingest sources), the ledger claim/complete flow with crash-recovery pre-pass,
-the honest SKU encoding (usable → ``UPSTREAM_PROVIDED``, temporary codes →
-``UNRESOLVED`` with the original value preserved as ``payload
-["request_sku_id"]``), and the transient/deterministic failure split.
+Everything else follows the same evidence contract as
+``sync_daily_internet_results``: the request-side SKU stays provenance; a
+validated ``page_sku_id`` is independent crawler evidence and therefore
+``CONFIRMED``; only when page evidence is absent may a usable request SKU be
+``UPSTREAM_PROVIDED``, while temporary codes remain ``UNRESOLVED``.  The
+validated export also carries title and comment evidence into the cache.  If
+the same producer event was already mirrored with only price / weaker fields,
+the backfill appends an idempotent enrichment row instead of re-crawling or
+rewriting history.
 
 Unbound SUCCESS crawl rows (``remote_job_id IS NULL``) are structurally
 invisible to this backfill: without a validated export workbook there is no
@@ -47,9 +50,11 @@ from app.services.customer_prewarm_discovery import (
 )
 from app.services.customer_prewarm_dispatch import _reconstruct_prepared_job
 from app.services.crawl_url_identity import (
+    SKU_STATUS_CONFIRMED,
     SKU_STATUS_UNRESOLVED,
     SKU_STATUS_UPSTREAM_PROVIDED,
 )
+from app.services.daily_audit_store import LeaseUnavailable, ProcessLock
 from app.services.legacy_zhaoshang_adapter import (
     CnncLegacyZhaoshangAdapter,
     HarvestStatus,
@@ -67,6 +72,7 @@ _BACKFILL_COUNTER_KEYS = (
     "jobs_validated",
     "rows_examined",
     "rows_recorded",
+    "rows_enriched",
     "already_ingested_cross_source",
     "skipped_no_workbook_match",
     "skipped_price_not_ok",
@@ -110,6 +116,29 @@ def _recover_stale_claims(
         except Exception as exc:  # noqa: BLE001 - recovery failure keeps scanning
             errors.append(f"crash recovery {key}: {exc}")
     return recovered, dropped, errors
+
+
+def _resolved_cache_fields(
+    crawl_row: Mapping[str, Any],
+    workbook_row: Mapping[str, Any],
+    *,
+    task_name: str,
+) -> tuple[str | None, str, str | None, int | None]:
+    request_sku = str(crawl_row["sku_id"] or "").strip()
+    page_sku = str(workbook_row.get("page_sku_id") or "").strip()
+    crawl_label = task_name or None
+    if page_sku and not is_temporary_request_code(page_sku, crawl_id=crawl_label):
+        real_sku_id: str | None = page_sku
+        sku_status = SKU_STATUS_CONFIRMED
+    elif request_sku and not is_temporary_request_code(request_sku, crawl_id=crawl_label):
+        real_sku_id = request_sku
+        sku_status = SKU_STATUS_UPSTREAM_PROVIDED
+    else:
+        real_sku_id = None
+        sku_status = SKU_STATUS_UNRESOLVED
+    title = str(workbook_row.get("page_title") or "").strip() or None
+    comment_count = workbook_row.get("comment_count")
+    return real_sku_id, sku_status, title, comment_count
 
 
 def _record_row(
@@ -165,20 +194,34 @@ def _record_row(
         detail["skipped_price_not_ok"] += 1
         return
 
+    real_sku_id, sku_status, title, comment_count = _resolved_cache_fields(
+        crawl_row, workbook_row, task_name=task_name
+    )
+    request_sku = str(crawl_row["sku_id"] or "").strip()
+    merged_result = dict(result)
+    for field in (
+        "page_sku_id", "page_title", "comment_count", "comment_count_raw",
+        "channel", "page_price_value", "page_price_status", "page_price_source",
+    ):
+        if field in workbook_row:
+            merged_result[field] = workbook_row.get(field)
+
     # Cross-source dedupe BEFORE claiming: a completed ledger entry under any
     # ingest source proves the cache already holds this producer event.
     own_ledger = None
+    existing_result_id: int | None = None
     for source in _CROSS_SOURCE_LEDGER_KEYS:
         ledger = prewarm_store.ledger_get(source, event_key)
         if source == BACKFILL_SOURCE:
             own_ledger = ledger
         if ledger is not None and ledger.get("cache_result_id") is not None:
-            detail["already_ingested_cross_source"] += 1
+            existing_result_id = int(ledger["cache_result_id"])
+            break
+    if existing_result_id is None:
+        if own_ledger is not None and own_ledger.get("error") is not None:
+            detail["errored_before"] += 1
             return
-    if own_ledger is not None and own_ledger.get("error") is not None:
-        detail["errored_before"] += 1
-        return
-    prewarm_store.ledger_claim(BACKFILL_SOURCE, event_key)
+        prewarm_store.ledger_claim(BACKFILL_SOURCE, event_key)
 
     # succeeded_at = crawl_work.updated_at(真实成功时序);无效时间戳降级为
     # None(cache 取当前时刻)并把原文保留进 payload。
@@ -196,27 +239,119 @@ def _record_row(
         "business_date": business_date,
         "crawl_work_id": crawl_id,
         "remote_job_id": job_id,
-        "result": result,
+        "result": merged_result,
+        "request_sku_id": request_sku,
     }
     if succeeded_at is None:
         payload["raw_updated_at"] = updated_at_raw
-
-    # The row's sku_id is upstream (SaaS/request-side) evidence re-proven by
-    # the validated workbook identity, never independently re-confirmed page
-    # evidence: usable values are honestly encoded UPSTREAM_PROVIDED while
-    # temporary codes (zhpq-*, ROW<n>, task/crawl-id echo) degrade to
-    # UNRESOLVED.  Either way the original value is preserved verbatim as
-    # payload["request_sku_id"] - a valid price result is never lost because
-    # of a placeholder rejection.
-    sku_value = str(crawl_row["sku_id"] or "").strip()
     crawl_label = task_name or None
-    if sku_value and not is_temporary_request_code(sku_value, crawl_id=crawl_label):
-        real_sku_id: str | None = sku_value
-        sku_status = SKU_STATUS_UPSTREAM_PROVIDED
-    else:
-        real_sku_id = None
-        sku_status = SKU_STATUS_UNRESOLVED
-    payload["request_sku_id"] = sku_value
+
+    if existing_result_id is not None:
+        existing = shared_cache.get_result(existing_result_id)
+        if existing is None:
+            hit = shared_cache.lookup_current(mall_key, exact_url)
+            existing = (hit or {}).get("entry")
+        if existing is None:
+            detail["already_ingested_cross_source"] += 1
+            return
+        existing_sku = str(existing.get("real_sku_id") or "").strip()
+        existing_status = str(existing.get("sku_status") or "").strip()
+        if sku_status == SKU_STATUS_CONFIRMED and real_sku_id:
+            if (
+                existing_status == SKU_STATUS_CONFIRMED
+                and existing_sku
+                and existing_sku != real_sku_id
+            ):
+                detail["deterministic_failures"] += 1
+                return
+            final_sku = real_sku_id
+            final_status = SKU_STATUS_CONFIRMED
+        else:
+            final_sku = existing_sku or real_sku_id
+            final_status = existing_status if existing_sku else sku_status
+        final_title = str(existing.get("title") or "").strip() or title
+        final_comment = (
+            existing.get("comment_count")
+            if existing.get("comment_count") is not None
+            else comment_count
+        )
+        existing_payload = existing.get("payload") or {}
+        existing_result = (
+            existing_payload.get("result")
+            if isinstance(existing_payload, Mapping)
+            and isinstance(existing_payload.get("result"), Mapping)
+            else {}
+        )
+        existing_comment_raw = str(existing_result.get("comment_count_raw") or "").strip()
+        workbook_comment_raw = str(workbook_row.get("comment_count_raw") or "").strip()
+        needs_enrichment = (
+            existing_sku != str(final_sku or "")
+            or existing_status != str(final_status or "")
+            or (not str(existing.get("title") or "").strip() and final_title is not None)
+            or (existing.get("comment_count") is None and final_comment is not None)
+            or (not existing_comment_raw and bool(workbook_comment_raw))
+        )
+        if not needs_enrichment:
+            detail["already_ingested_cross_source"] += 1
+            return
+        enrichment_fingerprint = hashlib.sha256(
+            json.dumps(
+                {
+                    "real_sku_id": final_sku,
+                    "sku_status": final_status,
+                    "title": final_title,
+                    "comment_count": final_comment,
+                    "page_sku_id": workbook_row.get("page_sku_id"),
+                    "comment_count_raw": workbook_row.get("comment_count_raw"),
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            ).encode("utf-8")
+        ).hexdigest()[:12]
+        enrichment_key = f"enrich:{event_key}:{enrichment_fingerprint}"
+        enrichment_ledger = prewarm_store.ledger_get(BACKFILL_SOURCE, enrichment_key)
+        if enrichment_ledger is not None and enrichment_ledger.get("cache_result_id") is not None:
+            detail["already_ingested_cross_source"] += 1
+            return
+        prewarm_store.ledger_claim(BACKFILL_SOURCE, enrichment_key)
+        enrichment_payload = {
+            **(existing.get("payload") or {}),
+            **payload,
+            "source_event_key": enrichment_key,
+            "enriched_from_event_key": event_key,
+        }
+        try:
+            enriched = shared_cache.record_success(
+                mall=mall_key,
+                submitted_url=str(existing.get("submitted_url") or exact_url),
+                original_url=str(existing.get("original_url") or exact_url),
+                returned_url=existing.get("returned_url"),
+                canonical_url=existing.get("canonical_url"),
+                crawl_id=str(existing.get("crawl_id") or crawl_label or "") or None,
+                real_sku_id=final_sku,
+                sku_status=final_status,
+                title=final_title,
+                price=existing.get("price") or workbook_row.get("page_price_value"),
+                comment_count=final_comment,
+                source=BACKFILL_SOURCE,
+                succeeded_at=str(existing.get("succeeded_at") or succeeded_at or "") or None,
+                payload=enrichment_payload,
+                producer=existing.get("producer"),
+            )
+        except sqlite3.OperationalError:
+            prewarm_store.ledger_drop_claim(BACKFILL_SOURCE, enrichment_key)
+            detail["transient_failures"] += 1
+            return
+        except Exception as exc:
+            prewarm_store.ledger_complete(BACKFILL_SOURCE, enrichment_key, error=str(exc))
+            detail["deterministic_failures"] += 1
+            return
+        prewarm_store.ledger_complete(
+            BACKFILL_SOURCE, enrichment_key, cache_result_id=int(enriched["id"])
+        )
+        detail["rows_enriched"] += 1
+        return
+
     try:
         row_out = shared_cache.record_success(
             mall=mall_key,
@@ -224,7 +359,9 @@ def _record_row(
             crawl_id=crawl_label,
             real_sku_id=real_sku_id,
             sku_status=sku_status,
+            title=title,
             price=workbook_row.get("page_price_value"),
+            comment_count=comment_count,
             source=BACKFILL_SOURCE,
             succeeded_at=succeeded_at,
             payload=payload,
@@ -243,6 +380,58 @@ def _record_row(
 
 
 def backfill_zhaoshang_history(
+    prewarm_store: Any,
+    shared_cache: Any,
+    *,
+    runtime_root: str | Path,
+    business_dates: Sequence[str],
+    adapter: Any | None = None,
+    stale_claim_seconds: int = 600,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Serialize historical cache enrichment against every other cache mirror."""
+    lock = ProcessLock(
+        Path(prewarm_store.path).with_name(f"{Path(prewarm_store.path).name}.sync.lock")
+    )
+    try:
+        lock.acquire(
+            owner={
+                "command": "backfill_zhaoshang_history",
+                "business_dates": [str(value) for value in business_dates],
+            }
+        )
+    except LeaseUnavailable:
+        summary: dict[str, Any] = {
+            "dates_scanned": 0,
+            "dates_missing": [],
+            "jobs_partial": [],
+            "errors": ["shared cache sync lock busy; retry later"],
+            "per_date": {},
+            "recovered_claims": 0,
+            "dropped_claims": 0,
+            "partial": False,
+            "deferred": True,
+        }
+        for key in _BACKFILL_COUNTER_KEYS:
+            summary[key] = 0
+        return summary
+    try:
+        summary = _backfill_zhaoshang_history_unlocked(
+            prewarm_store,
+            shared_cache,
+            runtime_root=runtime_root,
+            business_dates=business_dates,
+            adapter=adapter,
+            stale_claim_seconds=stale_claim_seconds,
+            now=now,
+        )
+        summary["deferred"] = False
+        return summary
+    finally:
+        lock.release()
+
+
+def _backfill_zhaoshang_history_unlocked(
     prewarm_store: Any,
     shared_cache: Any,
     *,

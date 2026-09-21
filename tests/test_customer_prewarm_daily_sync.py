@@ -224,6 +224,34 @@ def test_case9_daily_sync_then_customer_hit(tmp_path, prewarm_store, shared_cach
     assert prewarm_store.list_unique_cache_misses() == []
 
 
+def test_daily_sync_persists_page_title_confirmed_sku_and_comment(tmp_path, prewarm_store, shared_cache):
+    url = "https://item.jd.com/100311804305.html"
+    row = _ok_row(
+        "jd", "zhpq-placeholder", url, "63420.5",
+        "2026-09-07T02:00:00+00:00", "zhaoshang-jd-01",
+    )
+    row["result"].update({
+        "page_sku_id": "100311804305",
+        "page_title": "亿联 MeetingEye 500",
+        "comment_count": 321,
+        "comment_count_raw": "321",
+        "channel": "jd",
+    })
+    path = make_state_db(tmp_path, BUSINESS_DATE, [row])
+
+    summary = sync_daily_internet_results(
+        prewarm_store, shared_cache, state_db_path=path, business_date=BUSINESS_DATE
+    )
+
+    assert summary["ok_synced"] == 1
+    entry = shared_cache.lookup_current("jd", url)["entry"]
+    assert entry["sku_status"] == SKU_STATUS_CONFIRMED
+    assert entry["real_sku_id"] == "100311804305"
+    assert entry["title"] == "亿联 MeetingEye 500"
+    assert entry["price"] == "63420.5"
+    assert entry["comment_count"] == 321
+
+
 def test_sync_uses_one_store_wide_lock_across_entrypoints(tmp_path, prewarm_store, shared_cache):
     url = "https://b2b.nbdeli.com/goods/sync-race.html"
     path = make_state_db(
