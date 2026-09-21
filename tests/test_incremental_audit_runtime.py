@@ -103,7 +103,6 @@ def test_runtime_paths_preserves_explicit_junction_alias(tmp_path):
         ["cmd", "/c", "mklink", "/J", str(alias), str(target)],
         check=True,
         capture_output=True,
-        text=True,
     )
 
     paths = runtime_paths("2026-08-11", alias)
