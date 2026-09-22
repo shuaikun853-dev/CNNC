@@ -19,11 +19,13 @@ from openpyxl.utils import get_column_letter
 
 try:
     from scripts.auth_manager import AuthManager
+    from scripts.comment_count import normalize_comment_count
     from scripts.curl_utils import apply_curl_headers, internal_direct_opener, internal_subprocess_env, parse_curl_command
     from scripts.monitor_stb_fallback import apply_detail_price_results, apply_detail_reference_results, apply_stbchina_results, classify_priority_output, extract_detail_reference_records, find_header, is_stbchina_url, load_zhaoshang_db_env, run_stbchina_fallback, save_or_reuse_locked_workbook
     from scripts.zhaoshang_task_phases import CreatePhaseError, MallJob, build_zhaoshang_task_name, run_create_phase, run_wait_export_phase
 except ModuleNotFoundError:
     from auth_manager import AuthManager
+    from comment_count import normalize_comment_count
     from curl_utils import apply_curl_headers, internal_direct_opener, internal_subprocess_env, parse_curl_command
     from monitor_stb_fallback import apply_detail_price_results, apply_detail_reference_results, apply_stbchina_results, classify_priority_output, extract_detail_reference_records, find_header, is_stbchina_url, load_zhaoshang_db_env, run_stbchina_fallback, save_or_reuse_locked_workbook
     from zhaoshang_task_phases import CreatePhaseError, MallJob, build_zhaoshang_task_name, run_create_phase, run_wait_export_phase
@@ -676,8 +678,9 @@ for ir in all_import_rows:
         else:
             ir.价格 = ""
             ir.互联网标题 = ""
-        if rec.get("comment") not in ("", None, "未识别"):
-            ir.销量_评论数 = str(rec["comment"])
+        comment = normalize_comment_count(rec.get("comment"))
+        if comment is not None:
+            ir.销量_评论数 = comment
             comment_count += 1
         else:
             ir.销量_评论数 = ""
@@ -690,6 +693,10 @@ for ir in all_import_rows:
             ir.销量_评论数 = ""
     if ir.价格 in ("", None):
         missing_rows.append(ir)
+
+for ir in all_import_rows:
+    comment = normalize_comment_count(ir.销量_评论数)
+    ir.销量_评论数 = "" if comment is None else comment
 
 price_count = sum(1 for row in all_import_rows if row.价格 not in ("", None))
 title_count = sum(1 for row in all_import_rows if str(row.互联网标题 or "").strip())

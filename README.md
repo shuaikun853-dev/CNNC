@@ -39,7 +39,7 @@
 - 不自动审批、驳回、保存、提交或推送；指定审计表的受控通过/驳回及指定文档 ID 的受控补推必须分别按 runbook 预览、锁定并二次授权。
 - 除既有工具对本轮招商局当前任务执行的受控优先级操作外，不执行任何 SQL。
 - 招商局 `/add` 是真实写接口，不能用于认证或连通性探测。
-- 招商局后仍缺价时先暂停；本地脚本和 detail 参考补全都需要本批次单独授权。
+- 招商局后仍缺价时先暂停；本地脚本和 detail 参考补全都需要本批次单独授权。授权本地脚本后，用 `scripts/apply_step3_local_fallback.py` 按完整 URL 回填到新模板；评论数只允许数值或空白。
 - cURL 统一由 `scripts/curl_utils.py` 解析，内网请求绕过系统代理。
 - SaaS 和招商局运行时认证由 `scripts/auth_manager.py` 管理；首次从 cURL 初始化，之后只读取被忽略的 `data/auth_state.json`。
 - 密钥、Cookie、Token、数据库值和登录态文件不写入日志、文档或 Git。

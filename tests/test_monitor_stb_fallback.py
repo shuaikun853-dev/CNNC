@@ -195,6 +195,36 @@ def test_apply_stbchina_results_can_leave_internet_title_blank():
     assert row.互联网标题 == ""
 
 
+def test_apply_stbchina_results_keeps_only_numeric_comment_counts():
+    invalid = SimpleNamespace(
+        URL="https://www.stbchina.cn/product?itemId=1",
+        价格="",
+        互联网标题="",
+        SKUID="",
+        销量_评论数="旧值",
+    )
+    numeric = SimpleNamespace(
+        URL="https://www.stbchina.cn/product?itemId=2",
+        价格="",
+        互联网标题="",
+        SKUID="",
+        销量_评论数="",
+    )
+
+    changed = apply_stbchina_results(
+        [invalid, numeric],
+        {
+            invalid.URL: {"price": 12.5, "title": "标题1", "uid": "1", "comment": "未识别"},
+            numeric.URL: {"price": 13.5, "title": "标题2", "uid": "2", "comment": "1,234+"},
+        },
+    )
+
+    assert changed == 2
+    assert invalid.销量_评论数 == ""
+    assert numeric.销量_评论数 == 1234
+    assert isinstance(numeric.销量_评论数, int)
+
+
 def test_fixed_entrypoint_exposes_opt_in_stb_and_db_env_options():
     result = subprocess.run(
         [sys.executable, "scripts/process_monitor_no_push_zhaoshang.py", "--help"],

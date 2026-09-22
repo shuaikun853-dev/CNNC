@@ -44,7 +44,7 @@ python -m pytest tests\test_push_saas_commodity_price.py -q --basetemp=.pytest_t
 python -m pytest tests\test_export_current_monitor_status.py -q
 
 # 第三步授权开关、分阶段并行、恢复模式、回填和任务结果映射
-python -m pytest tests\test_monitor_stb_fallback.py tests\test_process_monitor_zs_result_mapping.py tests\test_step3_prewarm_cache.py tests\test_zhaoshang_task_phases.py tests\test_zhaoshang_resume_modes.py -q
+python -m pytest tests\test_comment_count.py tests\test_apply_step3_local_fallback.py tests\test_monitor_stb_fallback.py tests\test_process_monitor_zs_result_mapping.py tests\test_step3_prewarm_cache.py tests\test_zhaoshang_task_phases.py tests\test_zhaoshang_resume_modes.py -q
 
 # 招商局当前任务优先级保护（含 commit 期间 task_status 漂移仅观测、task-id/is_valid/weight 回读继续 fail-closed）
 python -m pytest tests\test_zhaoshang_priority_boost.py tests\test_zhaoshang_resume_modes.py -q
@@ -209,10 +209,11 @@ python scripts\export_current_monitor_status.py
 - `BATCH_STATE.md` 在 `/add` 前已有 `ADD_INTENT`，并逐次记录 taskId、启用、提优和导出；已有 add 事件但查无任务时 fail-closed。
 - 导出使用临时 XLSX 原子替换；复用前表头有效且输入/结果行数一致，重复商品编码不造成误判。
 - 招商局结果解析必须保留页面真实 `商品最小品类单元id`、`商品标题/名称`、价格、商城标识和评论；页面 SKU 合法时写为 `CONFIRMED`，不得继续把 `zhpq-*` 占位码当真实 SKU。
-- Shared Crawl Cache 命中必须发生在招商局建任务之前；只有价格、标题、真实 SKU 齐全才直接复用。京东/苏宁还必须有评论证据；整数走 `comment_count`，`1万+` 等原文可走 payload `comment_count_raw`。完整命中的 URL 不得再次进入招商局待爬集合。
+- Shared Crawl Cache 命中必须发生在招商局建任务之前；只有价格、标题、真实 SKU 齐全才直接复用。京东/苏宁还必须有评论证据；整数走 `comment_count`，`1万+` 等原文可走 payload `comment_count_raw`，写模板前换算为数字。完整命中的 URL 不得再次进入招商局待爬集合。
 - 没有价格的行不填商城标题；京东/苏宁有价格但缺评论数必须显式标记并从可导入 zhImport 的完整结果模板排除，同时进入待确认清单保留已有证据，不得静默当完整结果。
 - `--skip-zhaoshang` 模式没有 add、启用、SQL 或脚本日志。
 - `--auto-stbchina-fallback` 只处理仍缺价的 `stbchina.cn` URL，且必须有本批次授权。
+- 用户明确改走多商城本地脚本后，`apply_step3_local_fallback.py` 只按完整 URL 消费 `采集状态=成功` 且价格为有限正数的结果，另存模板、日志和剩余清单，保持单据 ID、SKUID 为文本。所有输出模板的评论数只能是非负数值或空白；`未识别`、其他非数字、布尔值和非有限数不得写入评论数列。
 - `--detail-reference-fallback` 只补同 `documentId + 完整 URL` 且价格、标题同时为空的行，来源标记 `中核detail参考回填`。
 
 ## 7. SaaS 受控价格补推验收

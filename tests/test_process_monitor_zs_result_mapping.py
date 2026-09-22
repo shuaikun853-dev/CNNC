@@ -46,6 +46,16 @@ def test_step3_consumes_prewarm_cache_before_building_zhaoshang_queue():
     assert source.index("apply_cached_customer_results(") < source.index('print("[5] 招商局-only...")')
 
 
+def test_step3_normalizes_all_comment_counts_before_import_filtering():
+    source = SCRIPT.read_text(encoding="utf-8")
+
+    normalize = source.index("normalize_comment_count(ir.销量_评论数)")
+    required_filter = source.index("required_comment_missing = [")
+    write_template = source.index("write_relaxed_template(out_template")
+
+    assert normalize < required_filter < write_template
+
+
 def load_read_zs_result():
     tree = ast.parse(SCRIPT.read_text(encoding="utf-8"))
     function = next(
