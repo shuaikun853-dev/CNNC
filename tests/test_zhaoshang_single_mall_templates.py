@@ -62,7 +62,13 @@ def test_single_mall_template_rejects_url_without_product_code(tmp_path):
         module.read_subtasks_from_excel(template, "haoxiny")
 
 
-def test_lxwl_templates_prefer_url_domain_over_shared_vendor_keyword(tmp_path):
+def test_lxwl_templates_prefer_url_domain_over_shared_vendor_keyword(tmp_path, monkeypatch):
+    from scripts import export_excluded_malls as exporter
+    from scripts.zhaoshang_mall_mapping import ZhaoshangMallMapping
+    monkeypatch.setattr(exporter, "EXCLUDED_MALLS", [
+        ZhaoshangMallMapping("领先未来商城", "fixture-old", "lxwl", ("66123123.com",), ("领先未来",)),
+        ZhaoshangMallMapping("领先未来新商城", "fixture-new", "lxwlmall", ("lxwlmall.com",), ("领先未来",)),
+    ])
     source = tmp_path / "saas.json"
     source.write_text(
         json.dumps(

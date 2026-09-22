@@ -1,5 +1,7 @@
 # CNNC 系统地图
 
+> 本文描述当前代码分支，不证明生产已经更新。治理候选禁止自动合并或部署；先核对正式 SHA。
+
 > 这是一张优先导航图，不是真理。先用它缩小范围，再用当前代码、SQLite、外部系统回读和测试确认根因；地图解释不了时，可以扩大搜索范围。
 
 主要读者是第一次接触 CNNC 的用户和 AI。遇到故障先去 [Bug 排查说明书](docs/debug/BUG_ROUTING.md)，遇到“哪个状态可信”先去 [状态归属说明](docs/debug/STATE_OWNERSHIP.md)。具体生产步骤仍以 `AGENTS.md` 和对应 runbook 为准。
@@ -14,10 +16,10 @@ CNNC 不是一条自动跑到底的流水线。STEP1 持续取得待审数据、
 |---|---|---|
 | Scheduler / CLI | Windows 计划任务按时唤醒有限命令；CLI 只负责解析参数和接线。 | `scripts/run_incremental_price_audit_scheduled.ps1`、`scripts/incremental_price_audit.py` |
 | STEP1 增量价格审计 | 取得 SaaS/中核快照，推进 Detail、模型、爬价、冻结和最终交付。 | `app/workflows/incremental_price_audit.py` |
-| Runtime 接线 | 组装依赖、命令预算、writer lock、BATCH_STATE 兼容投影和各恢复入口。它当前仍较宽，是已知历史债务，不是本任务要重构的对象。 | `app/services/incremental_audit_runtime.py` |
-| Daily Audit Store | 保存某一业务日可恢复的 STEP1 checkpoint、远端任务、crawl、freeze/finalize 证据。 | `app/services/daily_audit_store.py`、每日 `state.sqlite3` |
-| Prewarm | 提前发现客户参考链接，复用缓存或派发有限远端任务，减少后续等待；跨天 lifecycle 继续对账和回收旧任务。 | `customer_prewarm_*` modules、`customer_prewarm.sqlite3` |
-| Remote Execution / 招商局 | 把不可控的外部建任务、进度、导出和 Priority 契约包在 adapter 后；所有写入都受身份和授权门禁约束。 | `app/services/legacy_zhaoshang_adapter.py`、`batch_zhaoshang_adapter.py` |
+| Runtime 接线 | 组装依赖、命令预算、writer lock、BATCH_STATE 兼容投影和各恢复入口。公共日期、路径与异常已归 `runtime_context.py`；底层不再反向依赖 Runtime。为保持旧行为，命令装配与部分业务桥接暂仍在此入口。 | `app/services/incremental_audit_runtime.py` |
+| Daily Audit Store | 保存某一业务日可恢复的 STEP1 checkpoint、远端任务、crawl、freeze/finalize 证据。 | 兼容入口 `daily_audit_store.py`；审计/最终收口看 `audit_run_store.py`，远端任务看 `remote_execution_store.py`，共同事务与锁看 `audit_state_kernel.py`；仍为每日同一个 `state.sqlite3` |
+| Prewarm | 提前发现客户参考链接，复用缓存或派发有限远端任务，减少后续等待；跨天 lifecycle 继续对账和回收旧任务。 | 派发入口 `customer_prewarm_dispatch.py`，生命周期 `customer_prewarm_lifecycle.py`，共用执行规则 `customer_prewarm_execution.py`，跨日 `customer_prewarm_cross_day_reconcile.py` |
+| Remote Execution / 招商局 | 把不可控的外部建任务、进度、导出和 Priority 契约包在 adapter 后；所有写入都受身份和授权门禁约束。 | 兼容入口 `legacy_zhaoshang_adapter.py`；进度 `zhaoshang_read_operations.py`、控制 `zhaoshang_control_operations.py`、提交 `zhaoshang_submission_operations.py`、导出 `zhaoshang_export_operations.py` |
 | Recovery | 对已有 durable identity 做对账、回收、有限恢复；核心目标是避免重复创建和猜测远端结果。 | `app/services/recovery/`、`remote_running_recovery.py` |
 | Local Fallback | 只对满足时间、站点、exact URL、最终远端检查和预算门禁的缺价链接运行固定 8 站兜底。 | `app/services/incremental_local_fallback.py` |
 | Finalize | 冻结权威 snapshot，构造最终行，写 Excel 和 manifest，再原子登记最终证据。 | `incremental_audit_closeout.py`、`incremental_price_audit_finalize.py`、`incremental_audit_materializer.py` |
@@ -83,6 +85,7 @@ flowchart TB
       SNAP[SaaS / 中核只读快照]
       ZS[招商局 adapter]
       LOCAL[固定 8 站 crawler]
+      AUTH[app.integrations 认证 / 映射 / 详情]
       TASKS[Windows Task Scheduler]
     end
 
@@ -108,11 +111,13 @@ flowchart TB
     PROJ --> TASKS
     PROJ -. 只读 live progress .-> ZS
 
-    WF -. 历史债务：复用 scripts 中认证/映射/旧 helper .-> LEGACY
-    PRE -. 历史债务：复用 scripts 中映射/runner .-> LEGACY
+    SNAP --> AUTH
+    ZS --> AUTH
+    PRE --> AUTH
+    LEGACY --> AUTH
 ```
 
-调用方向的目标是“入口 -> 业务 module -> 状态 module / 外部 adapter”。当前 `app -> scripts` 和 Runtime 承担过多接线属于已知历史债务；本图只诚实标注，不在 ARCH-02A 里改动。
+调用方向的目标是“入口 -> 业务 module -> 状态 module / 外部 adapter”。本轮已消除静态可见的 `app -> scripts`、底层 -> Runtime 与模块循环；动态导入的覆盖边界仍须看架构检查输出。旧公开入口保留兼容，不把“拆文件”当作缩小全部公共接口。
 
 ## 高风险区域
 
@@ -133,7 +138,7 @@ flowchart TB
 
 ## 多个 AI 同时开发
 
-1. 每个任务使用独立 worktree 和 branch，不在 `cnnc-prod-runtime` 开发。
+1. 先读 [并行开发检查](docs/development/PARALLEL_AI_DEVELOPMENT.md)，每个任务使用独立 worktree 和 branch，不在 `cnnc-prod-runtime` 开发。
 2. 开始前 `git fetch origin`，记录 `BASE_SHA=origin/prod/closeout-20260818`。
 3. 提交前再次 fetch；若正式 prod moved，必须阅读新增 commits，复核本任务引用的事实并重新测试。
 4. 同一区域冲突时生产 Bug 优先，架构治理让路。
@@ -146,3 +151,7 @@ flowchart TB
 - `STATE_OWNERSHIP.md` 回答“信息冲突时谁是 System of Record”。
 
 通过 deletion test：删除任一份都会把对应知识重新散回大量 runbook、代码和测试；三份文档没有复制同一张明细表，因此各自提供独立 leverage 和 locality。
+
+## 运行环境与恢复
+
+独立 Python、固定依赖、完整运行身份和备份恢复见 [运行环境与恢复说明](docs/development/SAFE_RELEASE_AND_RECOVERY.md)。备份恢复只到新目录，不自动切生产；代码回退不能撤销已发生的远端任务。

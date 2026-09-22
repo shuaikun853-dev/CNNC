@@ -105,6 +105,9 @@
 
 ## 7. 修改代码和文档
 
+- 开工与提交前运行 `tools/parallel_ai_check.py`，显式传任务原始 `BASE_SHA` 和计划 `--scope`；规则见 `docs/development/PARALLEL_AI_DEVELOPMENT.md`。未知或冲突不能冒充安全，工具不会替你合并。
+- 架构改动必须运行 `tests/test_architecture_contract.py` 和对应回归；系统地图与 Bug 路由随代码更新。审计通过不自动授权生产合并或部署。
+
 - 先读目标文件和邻近测试，沿用现有结构；保留原始字段和中文 Excel 列名。
 - 核心逻辑改动必须增加或更新回归测试。测试范围按 `TESTING.md` 选择。
 - 业务流程、安全边界、输入输出、参数或验证方式发生变化时，同步更新对应 runbook 和 `TESTING.md`。

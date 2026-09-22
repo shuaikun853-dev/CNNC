@@ -153,8 +153,18 @@ def test_os_releases_process_lock_after_forced_process_termination(tmp_path):
         assert child.stdout.readline().strip() == "READY"
         assert ProcessLock.inspect(path)["active"] is True
     finally:
-        child.terminate()
+        if sys.platform == "win32":
+            # A Windows venv python.exe can be a redirector with a real child.
+            # Terminate only this test's process tree, not merely the redirector.
+            subprocess.run(["taskkill", "/PID", str(child.pid), "/T", "/F"],
+                           check=True, capture_output=True, timeout=10)
+        else:
+            child.terminate()
         child.wait(timeout=10)
+        if child.stdout is not None:
+            child.stdout.close()
+        if child.stderr is not None:
+            child.stderr.close()
 
     ProcessLock(path).acquire(owner={"pid": 2, "command": "next"}).release()
 

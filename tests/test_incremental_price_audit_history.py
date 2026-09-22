@@ -356,14 +356,15 @@ def test_real_history_multitick_incremental_materializes_like_legacy_writer(tmp_
     rows = join_saas_with_customer(saas_rows, customer)
     source_fps = [source_fingerprint(row) for row in saas_rows]
     customer_fps = [customer_fingerprint(customer.get(row["vCommodityId"], {})) for row in saas_rows]
-    prefixes = (rows[:20], rows[:45], rows[:65], rows)
-    prefix_source_fps = (source_fps[:20], source_fps[:45], source_fps[:65], source_fps)
-    prefix_customer_fps = (customer_fps[:20], customer_fps[:45], customer_fps[:65], customer_fps)
+    prefixes = (rows[:20], rows[:45], rows[:65], rows, rows)
+    prefix_source_fps = (source_fps[:20], source_fps[:45], source_fps[:65], source_fps, source_fps)
+    prefix_customer_fps = (customer_fps[:20], customer_fps[:45], customer_fps[:65], customer_fps, customer_fps)
     observed = iter((
         datetime(2026, 8, 11, 8, 0, tzinfo=UTC),
         datetime(2026, 8, 11, 11, 0, tzinfo=UTC),
         datetime(2026, 8, 11, 14, 0, tzinfo=UTC),
         datetime(2026, 8, 11, 18, 1, tzinfo=UTC),
+        datetime(2026, 8, 11, 18, 11, tzinfo=UTC),
     ))
     snapshots = iter(zip(prefixes, prefix_source_fps, prefix_customer_fps, strict=True))
     detail_calls: list[str] = []
@@ -382,10 +383,12 @@ def test_real_history_multitick_incremental_materializes_like_legacy_writer(tmp_
                 },
         )
 
+    # The input snapshots are real history; Detail is an explicit test double.
+    # Use the real success enum, not a made-up state rejected by current gates.
     def detail(row, _timeout):
         detail_calls.append(str(row["vCommodityId"]))
         return {
-            "customerPrice": "10", "customerPriceStatus": "FIXTURE",
+            "customerPrice": "10", "customerPriceStatus": "FOUND",
             "customerPriceSource": "history-fixture", "customerPriceWarning": "", "customerPriceEvidence": "fixture",
         }
 
@@ -439,10 +442,15 @@ def test_real_history_multitick_incremental_materializes_like_legacy_writer(tmp_
     deps = TickDependencies(
         discover=discover, harvest=harvest, detail=detail, model_batch=model_batch,
         plan_crawl=plan, finalize_crawl_plan=finalize, submit_crawl=submit,
-        wall_clock=lambda: datetime(2026, 8, 11, 18, 1, tzinfo=UTC),
+        wall_clock=lambda: datetime(2026, 8, 11, 18, 11, tzinfo=UTC),
     )
     for _ in range(3):
         run_incremental_tick(store, lock, config, deps)
+    # Current production requires a repeated authoritative observation, not
+    # an immediate freeze on the first post-cutoff delta. Preserve that gate.
+    waiting_tick = run_incremental_tick(store, lock, config, deps, finalize=True)
+    assert waiting_tick.outcome == "WAITING_SOURCE_COUNT"
+    assert waiting_tick.frozen_snapshot_id is None
     frozen_tick = run_incremental_tick(store, lock, config, deps, finalize=True)
     assert frozen_tick.frozen_snapshot_id is not None
     # The final cutoff delta is harvested by the next finite scheduler tick.

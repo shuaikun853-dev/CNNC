@@ -2479,7 +2479,7 @@ class TestRunMainSaasJsonE2E:
 
     def test_run_main_dual_mode_jd_link_marks_skipped_jd(self, tmp_path, monkeypatch):
         monkeypatch.setattr(
-            "scripts.audit_saas_excel_file.is_zhaoshang_domain",
+            "app.services.audit_workbook.is_zhaoshang_domain",
             lambda url: "jd.com" in url,
         )
         saas_row = dict(SAMPLE_SAAS_PENDING_ROW)
@@ -2753,7 +2753,7 @@ def _make_crawler_output_xlsx(tmp_path, records):
 class TestCollectUrlsForCrawl:
     def test_collect_pending_only_and_dedupe(self, tmp_path, monkeypatch):
         monkeypatch.setattr(
-            "scripts.audit_saas_excel_file.is_zhaoshang_domain",
+            "app.services.audit_workbook.is_zhaoshang_domain",
             lambda url: bool(url),
         )
         rows = [
@@ -3780,6 +3780,13 @@ class TestApplyCrawlResults:
 class TestExcludedTemplateAutoExport:
     def test_dual_json_mode_auto_exports_excluded_templates(self, tmp_path, monkeypatch):
         """双 JSON 模式 run_main 会在解析前自动生成京东+震坤行模板。"""
+        # The export contract must not depend on an untracked private mall workbook.
+        from scripts import export_excluded_malls as exporter
+        from scripts.zhaoshang_mall_mapping import ZhaoshangMallMapping
+        monkeypatch.setattr(exporter, "EXCLUDED_MALLS", [
+            ZhaoshangMallMapping("京东", "fixture-jd", "jd", ("jd.com",), ("jd",)),
+            ZhaoshangMallMapping("震坤行商城", "fixture-zkh", "zkh", ("zkh.com",), ("zkh",)),
+        ])
         # 该用例需启用导出
         monkeypatch.delenv("AUDIT_SUPPRESS_EXCLUDED_EXPORT", raising=False)
         # 准备含京东 + 震坤行的 saas 行

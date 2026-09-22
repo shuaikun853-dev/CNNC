@@ -520,135 +520,6 @@ def run_audit(
     )
 
 
-def _run_batch_model_audit(
-    records: list[SaasSameProductApprovalItem],
-    max_workers: int = 5,
-    batch_size: int = 20,
-) -> Any:
-    """批量模型校验（使用 call_title_match_model_batch 一次请求多条）。
-
-    策略：
-    1. 先按 (queryStr, skuName) 去重，减少调用量
-    2. 按 batch_size 分批，每批一次 API 请求
-    3. 多批之间用 ThreadPoolExecutor 并发
-    """
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-    from app.services.title_match_model_adapter import (
-        TitleMatchModelRequest,
-        TitleMatchModelResult,
-        call_title_match_model_batch,
-    )
-    from app.workflows.work_01_saas_approval_json_audit import (
-        audit_saas_approval_item,
-        enforce_saas_audit_recommendation_only,
-        SaasSameProductApprovalAuditResponse,
-        WorkflowAction,
-    )
-
-    print(f"[model] 批量校验 {len(records)} 条，batch_size={batch_size}")
-
-    # 去重：同一 (queryStr, skuName) 只调一次
-    unique_pairs: list[tuple[str, str, str, str]] = []
-    seen: set[tuple[str, str]] = set()
-    for rec in records:
-        key = (rec.queryStr or "", rec.skuName or "")
-        if key in seen:
-            continue
-        seen.add(key)
-        unique_pairs.append((rec.queryStr or "", rec.skuName or "", rec.modelAuditResult or "", rec.isMatch or ""))
-
-    print(f"[model] 去重后 {len(unique_pairs)} 个唯一 (queryStr, skuName) 对")
-
-    # 分批
-    batches: list[list[TitleMatchModelRequest]] = []
-    for i in range(0, len(unique_pairs), batch_size):
-        chunk = unique_pairs[i:i + batch_size]
-        batches.append([
-            TitleMatchModelRequest(query_str=q, sku_name=s, model_audit_result=m, is_match=im)
-            for q, s, m, im in chunk
-        ])
-
-    print(f"[model] 分成 {len(batches)} 批，每批最多 {batch_size} 条，{min(max_workers, len(batches))} 并发")
-
-    # 并发调批量接口
-    pair_to_result: dict[tuple[str, str], TitleMatchModelResult] = {}
-
-    def _call_batch(batch_idx: int, batch: list[TitleMatchModelRequest]):
-        results = call_title_match_model_batch(batch)
-        return batch_idx, batch, results
-
-    with ThreadPoolExecutor(max_workers=min(max_workers, len(batches))) as pool:
-        futures = {pool.submit(_call_batch, i, b): i for i, b in enumerate(batches)}
-        done_count = 0
-        for future in as_completed(futures):
-            batch_idx, batch, results = future.result()
-            for idx, req in enumerate(batch):
-                key = (req.query_str, req.sku_name)
-                if idx not in results:
-                    raise RuntimeError(f"批量模型未返回该条结果 batch={batch_idx} index={idx}")
-                pair_to_result[key] = results[idx]
-            done_count += 1
-            print(f"[model] 批次 {done_count}/{len(batches)} 完成")
-
-    print(f"[model] 全部完成，{len(pair_to_result)} 个结果")
-
-    # 用模型结果跑 audit
-    results_list: list = []
-    for rec in records:
-        key = (rec.queryStr or "", rec.skuName or "")
-        model_result = pair_to_result.get(key)
-        result = audit_saas_approval_item(
-            rec,
-            use_model=False,
-            use_link_audit=False,
-            title_model_result=model_result,
-            crawl_results=[],
-            use_crawl_result=False,
-        )
-        results_list.append(result)
-
-    # 构建 summary
-    groups: dict[str, list] = {}
-    for result in results_list:
-        groups.setdefault(result.vCommodityId, []).append(result)
-
-    summary: dict[str, int | str | float | bool] = {
-        "total_records": len(results_list),
-        "total_v_commodities": len(groups),
-        "approve_suggestion_count": len([r for r in results_list if r.primary_action == WorkflowAction.APPROVE]),
-        "manual_check_count": len([r for r in results_list if r.primary_action == WorkflowAction.MANUAL_CHECK]),
-        "reject_suggestion_count": len([r for r in results if r.primary_action == WorkflowAction.REJECT]),
-        "wait_page_price_check_count": len([r for r in results if r.price_check == "WAIT_PAGE_PRICE_CHECK"]),
-        "price_mismatch_count": len([r for r in results if r.price_check == "MISMATCH"]),
-        "sku_mismatch_count": len([r for r in results if r.sku_link_check == "MISMATCH"]),
-        "higher_than_customer_price_30_count": len([r for r in results if r.price_vs_customer_check == "HIGHER_THAN_CUSTOMER_PRICE_30"]),
-        "customer_price_missing_count": len([r for r in results if r.price_vs_customer_check == "CUSTOMER_PRICE_MISSING"]),
-        "crawl_result_matched_count": len([r for r in results if r.crawl_matched]),
-        "crawl_result_missing_count": len([r for r in results if not r.crawl_matched]),
-        "crawl_off_shelf_count": 0,
-        "crawl_sold_out_count": 0,
-        "crawl_price_missing_count": 0,
-        "crawl_failed_count": 0,
-        "crawl_price_mismatch_count": 0,
-        "model_unavailable_count": len([r for r in results if r.title_match_result == "MODEL_UNAVAILABLE"]),
-    }
-    for v_commodity_id, group_results in groups.items():
-        prefix = f"group.{v_commodity_id}"
-        summary[f"{prefix}.candidate_count"] = len(group_results)
-        summary[f"{prefix}.approve_suggestion_count"] = len([r for r in group_results if r.primary_action == WorkflowAction.APPROVE])
-        summary[f"{prefix}.manual_check_count"] = len([r for r in group_results if r.primary_action == WorkflowAction.MANUAL_CHECK])
-        summary[f"{prefix}.reject_suggestion_count"] = len([r for r in group_results if r.primary_action == WorkflowAction.REJECT])
-        summary[f"{prefix}.valid_mall_count"] = len({normalize_mall_name(r.shopName or r.vendorName) for r in group_results if normalize_mall_name(r.shopName or r.vendorName)})
-
-    return enforce_saas_audit_recommendation_only(
-        SaasSameProductApprovalAuditResponse(
-            total_records=len(results),
-            summary=summary,
-            record_results=results,
-            execution_allowed=False,
-            executed=False,
-        )
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -2336,7 +2207,7 @@ def run_stbchina_crawler(urls: list[str], runtime_dir: Path) -> dict[str, dict[s
     try:
         proc = _subprocess.run(cmd, capture_output=True, text=True, timeout=600,
                                encoding="utf-8", errors="replace",
-                               env={**_os.environ, "PYTHONIOENCODING": "utf-8"})
+                               env={**__import__("os").environ, "PYTHONIOENCODING": "utf-8"})
         if proc.returncode != 0:
             print(f"[stbchina] 脚本失败 (exit={proc.returncode})")
             if proc.stderr:

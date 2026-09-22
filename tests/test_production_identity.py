@@ -136,7 +136,7 @@ def test_case3_ls_remote_failure_degrades_remote_only():
     snap = svc.snapshot()
     assert snap["remote"]["status"] == "UNKNOWN"
     assert snap["remote"]["git_sha"] is None
-    assert "fatal" in snap["remote"]["error_code"]
+    assert snap["remote"]["error_code"] == "GIT_REMOTE_EXIT_128"
     assert len(snap["remote"]["error_code"]) <= 200
     assert snap["remote"]["branch"] == DEFAULT_PROD_BRANCH
     # 其余块不受拖垮
@@ -358,7 +358,7 @@ def test_build_comparison_pure_function_without_runner():
     cmp = build_comparison(startup, local, remote,
                            is_ancestor=lambda a, b: a == SHA_A and b == SHA_B)
     assert cmp == {"process_vs_local": "MATCH", "local_vs_remote": "BEHIND",
-                   "version_status": "BEHIND", "alerts": []}
+                   "version_status": "BEHIND", "version_scope": "repository_git_only", "alerts": []}
 
 
 # ---- TTL 缓存:窗口内二次 snapshot 不再触发 git/ls-remote/powershell ----
@@ -431,7 +431,7 @@ def test_snapshot_structure_keys_complete():
     svc, _ = make_service(base_scripts(SHA_A, remote_sha=SHA_B))
     snap = svc.snapshot()
     assert set(snap.keys()) == {"generated_at", "startup", "local", "remote",
-                                "scheduler", "comparison"}
+                                "scheduler", "comparison", "runtime_identity"}
     assert set(snap["startup"].keys()) == {"status", "git_sha", "git_branch",
                                            "captured_at", "python", "process"}
     assert set(snap["startup"]["python"].keys()) == {"version", "executable", "virtualenv"}
@@ -444,7 +444,7 @@ def test_snapshot_structure_keys_complete():
                                           "checked_at", "error_code"}
     assert set(snap["scheduler"].keys()) == {"status", "checked_at", "tasks"}
     assert set(snap["comparison"].keys()) == {"process_vs_local", "local_vs_remote",
-                                              "version_status", "alerts"}
+                                              "version_status", "version_scope", "alerts"}
     assert snap["startup"]["process"]["pid"] > 0
     assert snap["startup"]["python"]["virtualenv"] in (True, False)
     assert snap["generated_at"].endswith("+08:00")

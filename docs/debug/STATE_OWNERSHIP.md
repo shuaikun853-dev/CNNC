@@ -110,3 +110,11 @@
 2. 找到对应 System of Record，再用 exact identity 串证据。
 3. projection 可以提示异常，不能反向创造事实。
 4. 跨库或发送结果不确定时 fail-closed，保留原始证据，不靠人工改库消除矛盾。
+
+## 本轮治理没有改变哪些事实
+
+`DailyAuditStore` 的兼容入口现在由审计状态、远端执行状态和共同事务内核组成，但没有把一个数据库拆成多个数据库，也没有更换表字段含义。身份门禁、租约 fencing、UNKNOWN 对账和最终收口事务仍以原契约为准。
+
+备份工具的三个 SQLite 是分别一致的快照，不是跨库同一瞬间；可选附件是逐文件校验过的复制，也不保证跨文件事务。恢复后仍要对账，不得自动重建远端任务。`CURRENTLY AMBIGUOUS` 所列事实边界没有因为架构图变干净而自动消失。
+
+Git `MATCH` 只表示仓库版本关系，完整运行核验单独见 `runtime_identity`。未配置或未批准运行清单必须显示 `UNCONFIGURED` / `UNAPPROVED`，不能当成完整运行一致。

@@ -148,7 +148,8 @@ def test_mapping_parses_each_row_url_once_and_caches_repeated_host(monkeypatch):
         calls.append(value)
         return original(value)
 
-    monkeypatch.setattr(legacy_module, "urlparse", counted)
+    from app.services import zhaoshang_adapter_base
+    monkeypatch.setattr(zhaoshang_adapter_base, "urlparse", counted)
     adapter = _adapter()
 
     assert adapter.request_from_saas_row(

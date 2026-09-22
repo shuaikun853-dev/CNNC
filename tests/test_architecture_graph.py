@@ -53,3 +53,13 @@ def test_new_cycle_edge_is_detectable_inside_existing_members():
     old = module.build_graph({'app/a.py':'import app.b\n','app/b.py':'import app.c\n','app/c.py':'import app.a\n'})
     new = module.build_graph({'app/a.py':'import app.b\nimport app.c\n','app/b.py':'import app.c\n','app/c.py':'import app.a\n'})
     assert module.cyclic_edges(new) - module.cyclic_edges(old) == {('app.a','app.c')}
+
+
+def test_missing_script_module_is_not_hidden_from_policy_checks():
+    graph = graph_module().build_graph({'app/a.py': 'def hidden():\n import scripts.future_helper\n'})
+    assert ('app.a', 'scripts.future_helper') in graph.declared_imports
+
+
+def test_import_above_package_root_is_reported():
+    graph = graph_module().build_graph({'app/a.py': 'from .. import missing\n'})
+    assert any('exceeds package' in warning for warning in graph.warnings)

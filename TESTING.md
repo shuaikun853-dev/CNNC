@@ -1,12 +1,14 @@
 # TESTING.md - 验证指南
 
+架构治理候选验证：先执行 `python -m pytest tests -q`（历史数据缺失必须如实报告），再看 `docs/development/SAFE_RELEASE_AND_RECOVERY.md`；CI 关键测试不是全量验证的替代，任何通过都不自动授权部署。
+
 > 增量 tick、SQLite checkpoint、finalize/materializer 与历史 identity 回归命令见 [第一步增量调度手册](docs/runbooks/STEP_1_INCREMENTAL_SCHEDULER.md)。
 
 > 自动化测试与生产验收分开。测试不能调用真实 `/add`、审批、推送、SQL 或本地爬虫；只有用户明确要求执行某一步时，才按对应 runbook 做生产验收。
 
 ## 1. 环境
 
-- Python 3.11+；当前机器使用 Python 3.14。
+- 治理候选使用 `.python-version` 固定的 Python 补丁版本；不能沿用旧的 Python 3.11+ 假设。
 - 安装：`python -m pip install -r requirements.txt`
 - 项目内主要依赖：FastAPI、Pydantic、PyYAML、pytest、httpx、openpyxl。
 - 敏感输入位于被忽略的 `data/*.curl`、`data/*.env`、`data/*.json` 或当前进程环境变量；不得打印其值。
@@ -245,5 +247,4 @@ python -m pytest tests\test_diagnose_integration.py tests\test_workflow_api.py -
 健康检查：`GET http://127.0.0.1:8000/health`。旧 `/diagnose` 只返回模板，不执行 SQL。
 
 ## 10. 生产就绪只读检查
-
 一行命令：`python scripts\production_readiness_check.py --json`（退出码 0=READY、1=NOT READY、2=意外错误）；只读不注册任务/不连库/不刷新认证/不发网络请求，详见 [docs/runbooks/PRODUCTION_READINESS.md](docs/runbooks/PRODUCTION_READINESS.md)，测试 `tests\test_production_readiness.py`。

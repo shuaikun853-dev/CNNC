@@ -13,6 +13,19 @@
 
 状态冲突时先看 [状态归属说明](STATE_OWNERSHIP.md)，系统全景见 [ARCHITECTURE.md](../../ARCHITECTURE.md)。所有生产红线仍以 [AGENTS.md](../../AGENTS.md) 为准。
 
+## 当前实现入口（旧名字仍兼容）
+
+| 要查的事情 | 先读实际实现，不在兼容外壳里兜圈 |
+|---|---|
+| 日期、运行目录、配置错误 | `app/services/runtime_context.py` |
+| 当日快照、阶段工作和最终收口落库 | `app/services/audit_run_store.py`；锁和事务看 `audit_state_kernel.py` |
+| 远端任务和爬取结果落库 | `app/services/remote_execution_store.py`；纯状态/证据解释看 `remote_execution_policy.py` |
+| 招商局进度、停止/恢复、提交、导出 | 分别看 `zhaoshang_read_operations.py`、`zhaoshang_control_operations.py`、`zhaoshang_submission_operations.py`、`zhaoshang_export_operations.py` |
+| 预爬共用执行规则、身份重建、Priority证明 | `app/services/customer_prewarm_execution.py`；调度顺序仍从 dispatch/lifecycle 入口看 |
+| 认证、商城映射、详情调用 | `app/integrations/` 中同名模块；旧 `scripts/` 只保留必要兼容入口 |
+| Excel 格式和字段显示 | `app/services/audit_workbook.py`，而非旧脚本内复制另一套逻辑 |
+| 运行版本看似一致但行为不一致 | `production_identity.py` 的 Git 对比和 `runtime_identity` 分开看；后者实现是 `runtime_fingerprint.py` |
+
 ## 按现象路由
 
 | 用户看到的现象 | 第一检查区域 | 先看什么证据 | 如果正常再查哪里 | 不要直接做什么 |
@@ -46,4 +59,4 @@ Dashboard 页面可能刚刷新，但某些区块来自便利快照或有 TTL �
 
 ## 证据来源
 
-本路由由当前正式代码、`STEP_1_INCREMENTAL_SCHEDULER.md`、`STEP_1_DASHBOARD.md`、三步 runbook、`CNNC_BUG_HOTSPOT_AUDIT_20260823.md`、近期已合并修复 PR #26、#29-#35 及对应回归测试交叉确认。8 月 hotspot audit 只作为历史线索；当前 ownership 和入口以本次正式 SHA 的代码为准。
+本路由由本分支代码与治理时的正式基线、`STEP_1_INCREMENTAL_SCHEDULER.md`、`STEP_1_DASHBOARD.md`、三步 runbook、`CNNC_BUG_HOTSPOT_AUDIT_20260823.md`、近期已合并修复 PR #26、#29-#35 及对应回归测试交叉确认。8 月 hotspot audit 只作为历史线索；当前 ownership 和入口以实际运行分支的代码为准；本候选的地图更新不代表生产已经部署。

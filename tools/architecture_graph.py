@@ -11,6 +11,7 @@ class ImportGraph:
     edges: frozenset[tuple[str, str]]
     sites: Mapping[tuple[str, str], tuple[tuple[str, int], ...]]
     warnings: tuple[str, ...] = ()
+    declared_imports: frozenset[tuple[str, str]] = frozenset()
 
 
 def _module_name(path: str) -> str:
@@ -25,16 +26,29 @@ def build_graph(sources: Mapping[str, str]) -> ImportGraph:
     if len(modules) != len(sources):
         raise ValueError('Ambiguous module paths in static source map')
     edges: set[tuple[str, str]] = set()
+    declared_imports: set[tuple[str, str]] = set()
     sites: dict[tuple[str, str], list[tuple[str, int]]] = {}
     warnings: list[str] = []
     def add(source: str, raw_target: str, path: str, line: int) -> None:
+        declared_imports.add((source, raw_target))
         target = raw_target
         while target and target not in modules:
             target = target.rpartition('.')[0]
-        if target and target != source:
-            edge = (source, target)
-            edges.add(edge)
-            sites.setdefault(edge, []).append((path, line))
+        if target:
+            targets = {target}
+            parts = target.split('.')
+            for index in range(1, len(parts)):
+                parent = '.'.join(parts[:index])
+                # Own ancestors have already begun initialization before this
+                # module can execute. Do not invent cycles for normal reexports.
+                if parent == source or source.startswith(parent + '.'):
+                    continue
+                if modules.get(parent, '').endswith('/__init__.py'):
+                    targets.add(parent)
+            for dependency in targets:
+                edge = (source, dependency)
+                edges.add(edge)
+                sites.setdefault(edge, []).append((path, line))
 
     for path, content in sorted(sources.items()):
         current = _module_name(path)
@@ -52,17 +66,44 @@ def build_graph(sources: Mapping[str, str]) -> ImportGraph:
                         importlib_names.add(alias.asname or alias.name)
             elif isinstance(node, ast.ImportFrom) and node.module == 'importlib':
                 dynamic_names.update(a.asname or a.name for a in node.names if a.name == 'import_module')
+        # Follow simple aliases to a fixed point. An imported dynamic loader
+        # cannot become invisible merely because a caller renames it locally.
+        changed = True
+        while changed:
+            changed = False
+            for assignment in ast.walk(tree):
+                if isinstance(assignment, ast.Assign):
+                    targets, value = assignment.targets, assignment.value
+                elif isinstance(assignment, ast.AnnAssign):
+                    targets, value = [assignment.target], assignment.value
+                else:
+                    continue
+                module_alias = isinstance(value, ast.Name) and value.id in importlib_names
+                loader_alias = isinstance(value, ast.Name) and value.id in dynamic_names
+                loader_alias |= (isinstance(value, ast.Attribute) and value.attr == 'import_module'
+                                 and isinstance(value.value, ast.Name) and value.value.id in importlib_names)
+                if not (module_alias or loader_alias):
+                    continue
+                for target in targets:
+                    if not isinstance(target, ast.Name):
+                        warnings.append(f'{path}:{assignment.lineno}: dynamic importer escapes simple alias analysis')
+                        continue
+                    names = importlib_names if module_alias else dynamic_names
+                    if target.id not in names:
+                        names.add(target.id); changed = True
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):
                 for alias in node.names:
                     add(current, alias.name, path, node.lineno)
             elif isinstance(node, ast.ImportFrom):
-                if node.level > len(package) + 1:
+                if node.level > len(package):
                     warnings.append(f'{path}:{node.lineno}: relative import exceeds package')
                     continue
                 prefix = package[:len(package)-node.level+1] if node.level else []
                 base = '.'.join(prefix + (node.module.split('.') if node.module else []))
-                if base:
+                # Re-exporting a child from a package's own __init__ is not
+                # a recursive self import; the child below is the real edge.
+                if base and not (base == current and PurePosixPath(path).name == '__init__.py'):
                     add(current, base, path, node.lineno)
                 for alias in node.names:
                     child = base + '.' + alias.name if base else alias.name
@@ -82,7 +123,7 @@ def build_graph(sources: Mapping[str, str]) -> ImportGraph:
                         add(current, name, path, node.lineno)
                 else:
                     warnings.append(f'{path}:{node.lineno}: computed dynamic import needs review')
-    return ImportGraph(modules, frozenset(edges), {k: tuple(sorted(set(v))) for k,v in sites.items()}, tuple(sorted(set(warnings))))
+    return ImportGraph(modules, frozenset(edges), {k: tuple(sorted(set(v))) for k,v in sites.items()}, tuple(sorted(set(warnings))), frozenset(declared_imports))
 
 
 def strongly_connected_components(graph: ImportGraph) -> tuple[frozenset[str], ...]:
@@ -119,7 +160,7 @@ def strongly_connected_components(graph: ImportGraph) -> tuple[frozenset[str], .
             visited.add(node)
             component.add(node)
             stack.extend(reverse[node] - visited)
-        if len(component) > 1:
+        if len(component) > 1 or any((node, node) in graph.edges for node in component):
             components.append(frozenset(component))
     return tuple(sorted(components, key=lambda item: (-len(item), sorted(item))))
 

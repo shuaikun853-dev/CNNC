@@ -21,8 +21,18 @@ try {
     if ($info.LastRunTime) { $lastRun = $info.LastRunTime.ToString("yyyy-MM-ddTHH:mm:ss") }
     $nextRun = $null
     if ($info.NextRunTime) { $nextRun = $info.NextRunTime.ToString("yyyy-MM-ddTHH:mm:ss") }
+    $definitionHash = $null
+    try {
+        $definitionXml = Export-ScheduledTask -TaskName $TaskName -ErrorAction Stop
+        $hashAlgorithm = [System.Security.Cryptography.SHA256]::Create()
+        try {
+            $bytes = [System.Text.Encoding]::UTF8.GetBytes([string]$definitionXml)
+            $definitionHash = ([System.BitConverter]::ToString($hashAlgorithm.ComputeHash($bytes))).Replace("-", "").ToLowerInvariant()
+        } finally { $hashAlgorithm.Dispose() }
+    } catch { $definitionHash = $null }
     $obj = [pscustomobject]@{
         task_name        = [string]$task.TaskName
+        definition_sha256 = $definitionHash
         state            = [string]$task.State
         last_run_time    = $lastRun
         next_run_time    = $nextRun
