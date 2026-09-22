@@ -95,8 +95,9 @@ def _candidate(store):
 # ---- route_url 单元 ------------------------------------------------------------
 
 
-def test_route_url_jslink_rewrite_is_the_deterministic_rule():
-    routed = route_url("https://www.jslink.com/goods/400.html", MAPPINGS)
+@pytest.mark.parametrize("host", ["www.jslink.com", "b.jslink.com"])
+def test_route_url_jslink_rewrite_is_the_deterministic_rule(host):
+    routed = route_url(f"https://{host}/goods/400.html", MAPPINGS)
     assert routed.mall == "nbdeli"
     assert routed.lookup_url == "https://b2b.nbdeli.com/goods/400.html"
     assert routed.routing_url == "https://b2b.nbdeli.com/goods/400.html"

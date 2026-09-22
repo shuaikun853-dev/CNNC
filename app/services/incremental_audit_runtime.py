@@ -35,7 +35,27 @@ from app.services.batch_zhaoshang_adapter import (
     BatchReconcileStatus,
     BatchSubmitStatus,
     CnncBatchZhaoshangAdapter,
+    CONTRACT_VERSION as BATCH_CONTRACT_VERSION,
 )
+from app.services.batch_zhaoshang_priority import (
+    BatchMaterializationProbe,
+    BatchMaterializationStatus,
+    BatchMaterializationTarget,
+    BatchPriorityAttempt,
+    BatchPriorityAttemptStatus,
+    connect_batch_priority_from_env_file,
+    ensure_batch_priority,
+    probe_batch_materialization,
+)
+from app.services.batch_sql_result_adapter import (
+    ALLOWED_MALLS,
+    BatchResultEvidence,
+    BatchResultStatus,
+    BatchResultTarget,
+    BatchSqlResultAdapter,
+    batch_sql_result_to_crawl_result,
+)
+from app.services.zhaoshang_url_identity import is_absolute_http_url
 from app.services.daily_audit_store import (
     DailyAuditStore,
     FrozenSnapshotConflict,
@@ -1504,6 +1524,239 @@ def _logical_key_matches_rebuild(logical_key: str, natural_key: str) -> bool:
     return logical_key == natural_key or logical_key.startswith(f"{natural_key}#rebuild#")
 
 
+def _remote_job_backend(job: Mapping[str, Any]) -> str | None:
+    """Recover the creator backend from immutable persisted payload evidence."""
+
+    raw = job.get("payload_json") or "{}"
+    try:
+        payload = json.loads(raw) if isinstance(raw, str) else dict(raw)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(payload, Mapping):
+        return None
+    if payload.get("contract_version") == BATCH_CONTRACT_VERSION:
+        return "batch"
+    requests = payload.get("requests")
+    if not isinstance(requests, list) or not requests:
+        return None
+    if any(not isinstance(request, Mapping) for request in requests):
+        return None
+    versions = {
+        normalize_cell_str(request.get("backend_version"))
+        for request in requests
+    }
+    if versions and "" not in versions and all(
+        version.startswith("legacy-") for version in versions
+    ):
+        return "legacy"
+    return None
+
+
+def _remote_job_disposition(
+    job: Mapping[str, Any],
+    *,
+    selected_backend: str,
+    batch_priority_enabled: bool,
+) -> str:
+    backend = _remote_job_backend(job)
+    if backend is None:
+        return "invalid"
+    if (
+        backend == "batch"
+        and str(job.get("state")) == "PRIORITY_PENDING"
+        and not batch_priority_enabled
+    ):
+        return "deferred"
+    return "accept"
+
+
+def _route_zhaoshang_harvest(
+    legacy_harvest: Callable[[list[Mapping[str, Any]], float], Mapping[int, Mapping[str, Any]]],
+    batch_harvest: Callable[[list[Mapping[str, Any]], float], Mapping[int, Mapping[str, Any]]],
+) -> Callable[[list[Mapping[str, Any]], float], Mapping[int, Mapping[str, Any]]]:
+    """Route persisted jobs by immutable payload, never by current CLI choice."""
+
+    def harvest(
+        jobs: list[Mapping[str, Any]], timeout: float
+    ) -> Mapping[int, Mapping[str, Any]]:
+        grouped = {
+            "legacy": [job for job in jobs if _remote_job_backend(job) == "legacy"],
+            "batch": [job for job in jobs if _remote_job_backend(job) == "batch"],
+        }
+        total = sum(len(values) for values in grouped.values())
+        results: dict[int, Mapping[str, Any]] = {}
+        for backend, callback in (("legacy", legacy_harvest), ("batch", batch_harvest)):
+            selected = grouped[backend]
+            if not selected:
+                continue
+            share = max(0.001, float(timeout) * len(selected) / max(1, total))
+            results.update(callback(selected, share) or {})
+        return results
+
+    return harvest
+
+
+def _zhaoshang_backend_version_for_mall(
+    mall_key: str, *, url: str, selected_backend: str
+) -> str:
+    if selected_backend not in {"legacy", "batch"}:
+        raise RuntimeConfigurationError(
+            "Zhaoshang backend must be legacy or batch"
+        )
+    if (
+        selected_backend == "batch"
+        and mall_key in ALLOWED_MALLS
+        and is_absolute_http_url(url)
+    ):
+        return "batch-url-v1"
+    return "legacy-v1"
+
+
+def _route_zhaoshang_creation(
+    legacy_plan: Callable[[list[Mapping[str, Any]], float], list[CrawlPlan]],
+    legacy_finalize: Callable[[CrawlPlan, tuple[CrawlMember, ...], float], CrawlPlan],
+    legacy_submit: Callable[
+        [Mapping[str, Any], list[Mapping[str, Any]], float], Mapping[str, Any]
+    ],
+    batch_plan: Callable[[list[Mapping[str, Any]], float], list[CrawlPlan]],
+    batch_finalize: Callable[[CrawlPlan, tuple[CrawlMember, ...], float], CrawlPlan],
+    batch_submit: Callable[
+        [Mapping[str, Any], list[Mapping[str, Any]], float], Mapping[str, Any]
+    ],
+) -> tuple[
+    Callable[[list[Mapping[str, Any]], float], list[CrawlPlan]],
+    Callable[[CrawlPlan, tuple[CrawlMember, ...], float], CrawlPlan],
+    Callable[
+        [Mapping[str, Any], list[Mapping[str, Any]], float], Mapping[str, Any]
+    ],
+]:
+    """Route new work by frozen policy and resumed intent by durable payload."""
+
+    def backend_for_version(value: object) -> str:
+        version = normalize_cell_str(value)
+        if version == "batch-url-v1":
+            return "batch"
+        if version.startswith("legacy-"):
+            return "legacy"
+        raise RuntimeConfigurationError(
+            "crawl creation has no valid durable backend version"
+        )
+
+    def plan(
+        items: list[Mapping[str, Any]], timeout: float
+    ) -> list[CrawlPlan]:
+        grouped: dict[str, list[Mapping[str, Any]]] = {
+            "legacy": [],
+            "batch": [],
+        }
+        for item in items:
+            row = item.get("row")
+            if not isinstance(row, Mapping):
+                raise RuntimeConfigurationError("crawl planning item has no row")
+            if "__crawl_required" in row and not bool(row.get("__crawl_required")):
+                continue
+            grouped[
+                backend_for_version(row.get("__crawl_backend_version"))
+            ].append(item)
+        plans: list[CrawlPlan] = []
+        for backend, callback in (
+            ("legacy", legacy_plan),
+            ("batch", batch_plan),
+        ):
+            selected = grouped[backend]
+            if not selected:
+                continue
+            produced = list(callback(selected, timeout))
+            for proposal in produced:
+                proposal_backends = {
+                    backend_for_version(member.backend_version)
+                    for member in proposal.members
+                }
+                if proposal_backends != {backend}:
+                    raise RuntimeConfigurationError(
+                        "crawl planner crossed durable backend boundaries"
+                    )
+            plans.extend(produced)
+        return plans
+
+    def finalize(
+        proposal: CrawlPlan,
+        members: tuple[CrawlMember, ...],
+        timeout: float,
+    ) -> CrawlPlan:
+        backends = {
+            backend_for_version(member.backend_version) for member in members
+        }
+        if len(backends) != 1:
+            raise RuntimeConfigurationError(
+                "crawl plan must contain a single durable backend"
+            )
+        backend = next(iter(backends))
+        callback = legacy_finalize if backend == "legacy" else batch_finalize
+        return callback(proposal, members, timeout)
+
+    def submit(
+        job: Mapping[str, Any],
+        crawls: list[Mapping[str, Any]],
+        timeout: float,
+    ) -> Mapping[str, Any]:
+        backend = _remote_job_backend(job)
+        if backend == "legacy":
+            return legacy_submit(job, crawls, timeout)
+        if backend == "batch":
+            return batch_submit(job, crawls, timeout)
+        raise RuntimeConfigurationError(
+            "remote intent has no valid durable backend"
+        )
+
+    return plan, finalize, submit
+
+
+def _exact_batch_crawl_mapping(
+    prepared_job: Any,
+    crawl_work: Sequence[Mapping[str, Any]],
+) -> dict[str, Mapping[str, Any]]:
+    mapping: dict[str, Mapping[str, Any]] = {}
+    source_ids = tuple(
+        getattr(prepared_job, "source_ids", ())
+        or ("" for _request in prepared_job.requests)
+    )
+    for request, source_id, execute_number in zip(
+        prepared_job.requests,
+        source_ids,
+        prepared_job.execute_numbers,
+        strict=True,
+    ):
+        matches = [
+            crawl
+            for crawl in crawl_work
+            if normalize_cell_str(crawl.get("mall_key")) == request.mall_key
+            and normalize_cell_str(crawl.get("sku_id")) == request.sku_id
+            and normalize_cell_str(crawl.get("exact_url")) == request.url.strip()
+            and normalize_cell_str(crawl.get("backend_version"))
+            == request.backend_version
+            and (
+                not source_id
+                or normalize_cell_str(crawl.get("source_id")) == source_id
+            )
+        ]
+        if len(matches) != 1:
+            raise RuntimeConfigurationError(
+                "batch executeNumber must map to exactly one linked crawl_work"
+            )
+        mapping[execute_number] = matches[0]
+    if len(mapping) != len(prepared_job.execute_numbers):
+        raise RuntimeConfigurationError(
+            "batch executeNumber mapping is incomplete"
+        )
+    mapped_ids = {int(crawl["id"]) for crawl in mapping.values()}
+    if len(mapped_ids) != len(mapping) or len(crawl_work) != len(mapping):
+        raise RuntimeConfigurationError(
+            "batch executeNumber must map to exactly one linked crawl_work"
+        )
+    return mapping
+
+
 def legacy_zhaoshang_bridge(
     adapter: CnncLegacyZhaoshangAdapter,
     *,
@@ -1532,7 +1785,17 @@ def legacy_zhaoshang_bridge(
         )
         if has_persisted_policy and not backend_version:
             raise RuntimeConfigurationError("frozen crawl policy has no backend version")
-        request = adapter.request_from_saas_row(row, backend_version=backend_version)
+        expected_mall = normalize_cell_str(row.get("__crawl_mall_key"))
+        if has_persisted_policy and expected_mall == "jslink":
+            request = adapter.request_from_saas_row(
+                row,
+                backend_version=backend_version,
+                preserve_historical_identity=True,
+            )
+        else:
+            request = adapter.request_from_saas_row(
+                row, backend_version=backend_version
+            )
         if not has_persisted_policy:
             return request
         if request is None:
@@ -1904,13 +2167,15 @@ def batch_zhaoshang_bridge(
     *,
     paths: RuntimePaths,
     business_date: str,
+    priority_runner: Callable[[Any, float], BatchPriorityAttempt] | None = None,
+    result_adapter: BatchSqlResultAdapter | None = None,
+    materialization_probe_runner: Callable[
+        [Any, float], BatchMaterializationProbe
+    ]
+    | None = None,
+    monotonic: Callable[[], float] = monotonic_time.monotonic,
 ) -> tuple[Callable[[list[Mapping[str, Any]], float], list[CrawlPlan]], Callable[[CrawlPlan, tuple[CrawlMember, ...], float], CrawlPlan], Callable[[Mapping[str, Any], list[Mapping[str, Any]], float], Mapping[str, Any]], Callable[[list[Mapping[str, Any]], float], Mapping[int, Mapping[str, Any]]]]:
-    """Wire the evidenced batch create/progress contract into durable jobs.
-
-    The local company skill does not specify a batch export API. Completed
-    jobs therefore become manual export items instead of guessing or mixing a
-    legacy task identity with a batch task identity.
-    """
+    """Wire batch create/progress plus the evidenced exact SQL result path."""
     prepared: dict[str, Any] = {}
 
     def resolve(row: Mapping[str, Any]) -> CrawlRequest | None:
@@ -1921,26 +2186,37 @@ def batch_zhaoshang_bridge(
 
     def propose(items: list[Mapping[str, Any]], _timeout: float) -> list[CrawlPlan]:
         requests: list[CrawlRequest] = []
-        members_by_identity: dict[tuple[str, str, str, str, str], list[CrawlMember]] = {}
+        source_ids: list[str] = []
+        members_by_identity: dict[
+            tuple[tuple[str, str, str, str, str], str], CrawlMember
+        ] = {}
         for item in items:
             request = resolve(item["row"])
             if request is None:
                 continue
             source_id = normalize_cell_str(item["row"].get("vCommodityId") or item["row"].get("documentId"))
+            if not source_id:
+                raise RuntimeConfigurationError(
+                    "eligible batch crawl member has no SaaS source identity"
+                )
             member = CrawlMember(
                 request.mall_key, source_id, request.sku_id, request.url,
                 request.backend_version, item["row"],
             )
             requests.append(request)
-            members_by_identity.setdefault(request.identity, []).append(member)
+            source_ids.append(source_id)
+            members_by_identity.setdefault((request.identity, source_id), member)
         if not requests:
             return []
         plans = []
-        for job in adapter.prepare_jobs(business_date, requests).jobs:
+        for job in adapter.prepare_jobs(
+            business_date, requests, source_ids=source_ids
+        ).jobs:
             members = tuple(
-                member
-                for request in job.requests
-                for member in members_by_identity.get(request.identity, ())
+                members_by_identity[(request.identity, source_id)]
+                for request, source_id in zip(
+                    job.requests, job.source_ids, strict=True
+                )
             )
             prepared[job.logical_job_key] = job
             plans.append(CrawlPlan(
@@ -1950,9 +2226,68 @@ def batch_zhaoshang_bridge(
         return plans
 
     def finalize(plan: CrawlPlan, members: tuple[CrawlMember, ...], _timeout: float) -> CrawlPlan:
-        if tuple(plan.members) != members:
-            raise RuntimeConfigurationError("batch plan membership changed before durable intent")
-        return plan
+        if not members:
+            raise RuntimeConfigurationError(
+                "batch plan requires at least one durable crawl member"
+            )
+        proposal_index = 0
+        for member in members:
+            while (
+                proposal_index < len(plan.members)
+                and plan.members[proposal_index] != member
+            ):
+                proposal_index += 1
+            if proposal_index >= len(plan.members):
+                raise RuntimeConfigurationError(
+                    "batch plan members must be an ordered subset of the proposal"
+                )
+            proposal_index += 1
+        if tuple(plan.members) == members:
+            return plan
+
+        requests: list[CrawlRequest] = []
+        source_ids: list[str] = []
+        for member in members:
+            request = resolve(member.row)
+            source_id = normalize_cell_str(
+                member.row.get("vCommodityId")
+                or member.row.get("documentId")
+            )
+            if request is None or (
+                request.mall_key,
+                request.sku_id,
+                request.url.strip(),
+                request.backend_version,
+                source_id,
+            ) != (
+                member.mall_key,
+                member.sku_id,
+                member.exact_url.strip(),
+                member.backend_version,
+                member.source_id,
+            ):
+                raise RuntimeConfigurationError(
+                    "batch mapping changed for durable crawl member"
+                )
+            requests.append(request)
+            source_ids.append(source_id)
+        finalized_jobs = adapter.prepare_jobs(
+            business_date, requests, source_ids=source_ids
+        ).jobs
+        if len(finalized_jobs) != 1:
+            raise RuntimeConfigurationError(
+                "batch pending subset no longer belongs to one slice"
+            )
+        job = finalized_jobs[0]
+        prepared[job.logical_job_key] = job
+        return CrawlPlan(
+            job.mall_key,
+            job.logical_job_key,
+            job.task_name,
+            job.payload_sha256,
+            payload_json=job.durable_payload(),
+            members=members,
+        )
 
     def reconstruct(job: Mapping[str, Any]) -> Any:
         logical_key = str(job["logical_key"])
@@ -1973,7 +2308,10 @@ def batch_zhaoshang_bridge(
         prepared_job = reconstruct(job)
         outcome = adapter.submit(prepared_job, timeout_seconds=max(0.001, timeout))
         if outcome.status is BatchSubmitStatus.SUBMITTED and outcome.remote_identity is not None:
-            return {"remote_identity": outcome.remote_identity.durable_value(), "state": "SUBMITTED"}
+            return {
+                "remote_identity": outcome.remote_identity.durable_value(),
+                "state": "PRIORITY_PENDING",
+            }
         if outcome.status is BatchSubmitStatus.REJECTED:
             raise RuntimeConfigurationError("batch create was deterministically rejected")
         if outcome.status is BatchSubmitStatus.NOT_ATTEMPTED:
@@ -1982,35 +2320,321 @@ def batch_zhaoshang_bridge(
 
     def harvest(jobs: list[Mapping[str, Any]], timeout: float) -> Mapping[int, Mapping[str, Any]]:
         results: dict[int, Mapping[str, Any]] = {}
-        per_job_timeout = max(0.001, timeout / max(1, len(jobs)))
-        for job in jobs:
+        deadline = monotonic() + max(0.0, timeout)
+        for index, job in enumerate(jobs):
+            remaining = deadline - monotonic()
+            if remaining <= 0:
+                for deferred in jobs[index:]:
+                    results[int(deferred["id"])] = {"deferred": True}
+                break
+            job_deadline = monotonic() + (
+                remaining / max(1, len(jobs) - index)
+            )
+
+            def remaining_timeout() -> float:
+                available = min(deadline, job_deadline) - monotonic()
+                if available <= 0:
+                    raise TimeoutError("batch harvest deadline is exhausted")
+                return max(0.001, available)
+
             try:
                 prepared_job = reconstruct(job)
+            except Exception:
+                results[int(job["id"])] = {
+                    "manual_error": "exact batch job reconstruction is unavailable"
+                }
+                continue
+            try:
                 if str(job.get("state")) == "SUBMIT_UNKNOWN":
-                    reconciliation = adapter.reconcile_unknown(prepared_job, timeout_seconds=per_job_timeout)
+                    reconciliation = adapter.reconcile_unknown(
+                        prepared_job, timeout_seconds=remaining_timeout()
+                    )
                     if reconciliation.status is BatchReconcileStatus.MANUAL:
                         results[int(job["id"])] = {"manual_error": reconciliation.diagnostic or "batch identity conflict"}
                     elif reconciliation.status is BatchReconcileStatus.FOUND and reconciliation.remote_identity is not None:
                         results[int(job["id"])] = {
-                            "state": "SUBMITTED",
+                            "state": "PRIORITY_PENDING",
                             "remote_identity": reconciliation.remote_identity.durable_value(),
                         }
                     continue
-                _response, progress = adapter.query_progress(prepared_job, timeout_seconds=per_job_timeout)
-                identity = str(job.get("remote_identity") or prepared_job.remote_identity.durable_value())
-                if progress.status is BatchProgressStatus.COMPLETED:
+                if str(job.get("state")) == "PRIORITY_PENDING":
+                    identity = str(job.get("remote_identity") or "").strip()
+                    try:
+                        adapter.validate_remote_identity(prepared_job, identity)
+                        if str(job.get("mall_key") or "") != prepared_job.mall_key:
+                            raise ValueError("persisted mall differs from durable batch job")
+                    except ValueError:
+                        results[int(job["id"])] = {
+                            "manual_error": "batch priority identity conflict"
+                        }
+                        continue
+                    if priority_runner is None:
+                        results[int(job["id"])] = {
+                            "state": "PRIORITY_PENDING",
+                            "remote_identity": identity,
+                            "retryable_error": "batch priority writes are disabled",
+                            "result": {
+                                "state": "PRIORITY_PENDING",
+                                "priority_status": "PENDING",
+                                "diagnostic": "batch priority writes are disabled",
+                            },
+                        }
+                        continue
+                    priority = priority_runner(
+                        prepared_job, remaining_timeout()
+                    )
+                    if priority.status is BatchPriorityAttemptStatus.CONFLICT:
+                        results[int(job["id"])] = {
+                            "manual_error": priority.diagnostic
+                            or "batch priority identity conflict"
+                        }
+                    elif priority.status is BatchPriorityAttemptStatus.PENDING:
+                        results[int(job["id"])] = {
+                            "state": "PRIORITY_PENDING",
+                            "remote_identity": identity,
+                            "retryable_error": priority.diagnostic
+                            or "batch rows are not fully materialized",
+                            "result": {
+                                "state": "PRIORITY_PENDING",
+                                "priority_status": "PENDING",
+                                "materialization_status": (
+                                    priority.materialization.value
+                                    if priority.materialization is not None
+                                    else None
+                                ),
+                                "diagnostic": priority.diagnostic,
+                            },
+                        }
+                    elif priority.priority is None:
+                        results[int(job["id"])] = {
+                            "manual_error": "batch priority confirmation has no readback evidence"
+                        }
+                    else:
+                        evidence = priority.priority
+                        results[int(job["id"])] = {
+                            "state": "SUBMITTED",
+                            "remote_identity": identity,
+                            "result": {
+                                "priority_status": evidence.status.value,
+                                "schema": evidence.schema,
+                                "expected_count": evidence.expected_count,
+                                "affected_rows": evidence.affected_rows,
+                                "priority_updated": evidence.priority_updated,
+                                "already_highest": evidence.already_highest,
+                                "already_completed": evidence.already_completed,
+                                "already_failed": evidence.already_failed,
+                            },
+                        }
+                    continue
+                identity = str(
+                    job.get("remote_identity")
+                    or prepared_job.remote_identity.durable_value()
+                )
+                try:
+                    adapter.validate_remote_identity(prepared_job, identity)
+                    if str(job.get("mall_key") or "") != prepared_job.mall_key:
+                        raise ValueError("persisted mall differs from durable batch job")
+                except ValueError:
                     results[int(job["id"])] = {
-                        "manual_error": "batch task completed but no locally evidenced export contract is available"
+                        "manual_error": "batch result identity conflict"
                     }
-                elif progress.status is BatchProgressStatus.FAILED:
-                    results[int(job["id"])] = {"manual_error": "batch task reported failed subtasks"}
-                else:
-                    results[int(job["id"])] = {"state": "RUNNING", "remote_identity": identity}
-            except Exception:
-                continue
+                    continue
+                _response, progress = adapter.query_progress(
+                    prepared_job, timeout_seconds=remaining_timeout()
+                )
+                if result_adapter is None or materialization_probe_runner is None:
+                    if progress.status is BatchProgressStatus.FAILED:
+                        results[int(job["id"])] = {
+                            "manual_error": "batch task reported failed subtasks"
+                        }
+                    elif progress.status is BatchProgressStatus.COMPLETED:
+                        results[int(job["id"])] = {
+                            "manual_error": "batch SQL result reader is not configured"
+                        }
+                    else:
+                        results[int(job["id"])] = {
+                            "state": "RUNNING",
+                            "remote_identity": identity,
+                        }
+                    continue
+                try:
+                    crawl_by_execute = _exact_batch_crawl_mapping(
+                        prepared_job, tuple(job.get("crawl_work") or ())
+                    )
+                except RuntimeConfigurationError as exc:
+                    results[int(job["id"])] = {"manual_error": str(exc)}
+                    continue
+                probe = materialization_probe_runner(
+                    prepared_job, remaining_timeout()
+                )
+                if probe.status in {
+                    BatchMaterializationStatus.IDENTITY_CONFLICT,
+                    BatchMaterializationStatus.SCHEMA_CONFLICT,
+                }:
+                    results[int(job["id"])] = {
+                        "manual_error": probe.diagnostic
+                        or "batch materialization identity conflict"
+                    }
+                    continue
+                if probe.status is not BatchMaterializationStatus.MATERIALIZED:
+                    results[int(job["id"])] = {
+                        "state": "RUNNING",
+                        "remote_identity": identity,
+                    }
+                    continue
+                rows_by_execute: dict[str, Mapping[str, Any]] = {}
+                for row in probe.rows:
+                    execute_number = normalize_cell_str(row.get("exec_num"))
+                    if not execute_number or execute_number in rows_by_execute:
+                        rows_by_execute = {}
+                        break
+                    rows_by_execute[execute_number] = row
+                if set(rows_by_execute) != set(prepared_job.execute_numbers):
+                    results[int(job["id"])] = {
+                        "manual_error": "batch materialization rows are not an exact executeNumber set"
+                    }
+                    continue
+                targets = tuple(
+                    BatchResultTarget(
+                        execute_number=execute_number,
+                        expected_sku=request.sku_id,
+                        expected_url=request.url,
+                        evidence=BatchResultEvidence(
+                            task_status=normalize_cell_str(
+                                rows_by_execute[execute_number].get("task_status")
+                            ),
+                            query_progress=progress.status.value,
+                        ),
+                    )
+                    for request, execute_number in zip(
+                        prepared_job.requests,
+                        prepared_job.execute_numbers,
+                        strict=True,
+                    )
+                )
+                sql_results = result_adapter.fetch_batch_results(
+                    prepared_job.mall_key,
+                    targets,
+                    timeout_seconds=remaining_timeout(),
+                )
+                if (
+                    len(sql_results) != len(targets)
+                    or {value.execute_number for value in sql_results}
+                    != set(prepared_job.execute_numbers)
+                ):
+                    results[int(job["id"])] = {
+                        "manual_error": "batch SQL results are not an exact executeNumber set"
+                    }
+                    continue
+                crawl_results: dict[int, Mapping[str, Any]] = {}
+                pending = False
+                manual = False
+                for sql_result in sql_results:
+                    crawl_id = int(crawl_by_execute[sql_result.execute_number]["id"])
+                    if sql_result.status is BatchResultStatus.FOUND:
+                        crawl_results[crawl_id] = batch_sql_result_to_crawl_result(
+                            prepared_job.mall_key, sql_result
+                        )
+                    elif sql_result.status is BatchResultStatus.NOT_YET_VISIBLE:
+                        pending = True
+                    elif sql_result.status is BatchResultStatus.CRAWLER_FAILED:
+                        crawl_results[crawl_id] = {
+                            "terminal": True,
+                            "error": sql_result.diagnostic
+                            or "crawler task failed before an exact SQL result was found",
+                        }
+                    elif sql_result.status is BatchResultStatus.TERMINAL_NO_RESULT:
+                        crawl_results[crawl_id] = {
+                            "no_result": True,
+                            "reason": sql_result.diagnostic
+                            or "terminal no-result evidence was supplied",
+                        }
+                    else:
+                        manual = True
+                        fallback = (
+                            "task_status 02 with zero rows requires spider-log or equivalent terminal evidence"
+                            if sql_result.status
+                            is BatchResultStatus.EVIDENCE_INCOMPLETE
+                            else "batch SQL result evidence is incomplete"
+                        )
+                        crawl_results[crawl_id] = {
+                            "manual": True,
+                            "error": sql_result.diagnostic
+                            or fallback,
+                        }
+                state = "EXPORTED" if manual else "RUNNING" if pending else "COMPLETED"
+                results[int(job["id"])] = {
+                    "state": state,
+                    "remote_identity": identity,
+                    "crawl_results": crawl_results,
+                }
+            except Exception as exc:
+                retryable: dict[str, Any] = {
+                    "state": str(job.get("state") or "RUNNING"),
+                    "retryable_error": (
+                        "batch harvest read failed: " + type(exc).__name__
+                    ),
+                }
+                identity = str(job.get("remote_identity") or "").strip()
+                if identity:
+                    retryable["remote_identity"] = identity
+                results[int(job["id"])] = retryable
         return results
 
     return propose, finalize, submit, harvest
+
+
+def _batch_sql_runtime_components(
+    *,
+    monotonic: Callable[[], float] = monotonic_time.monotonic,
+) -> tuple[
+    BatchSqlResultAdapter,
+    Callable[[Any, float], BatchMaterializationProbe],
+]:
+    env_path = PROJECT_DATA_ROOT / "ZHAOSHANG_DB.env"
+
+    def connect_for_results() -> Any:
+        return connect_batch_priority_from_env_file(
+            env_path, timeout_seconds=20.0
+        )
+
+    def connect_for_results_with_timeout(timeout_seconds: float) -> Any:
+        return connect_batch_priority_from_env_file(
+            env_path, timeout_seconds=max(0.001, timeout_seconds)
+        )
+
+    def materialization_probe_runner(
+        prepared_job: Any, timeout_seconds: float
+    ) -> BatchMaterializationProbe:
+        deadline = monotonic() + max(0.0, timeout_seconds)
+        connection = connect_batch_priority_from_env_file(
+            env_path, timeout_seconds=max(0.001, timeout_seconds)
+        )
+        try:
+            return probe_batch_materialization(
+                connection,
+                BatchMaterializationTarget(
+                    execute_numbers=prepared_job.execute_numbers,
+                    expected_mall=prepared_job.mall_key,
+                ),
+                deadline=deadline,
+                monotonic=monotonic,
+            )
+        finally:
+            try:
+                if monotonic() < deadline:
+                    connection.rollback()
+            finally:
+                connection.close()
+
+    return (
+        BatchSqlResultAdapter(
+            connect_for_results,
+            timed_connection_factory=connect_for_results_with_timeout,
+            monotonic=monotonic,
+        ),
+        materialization_probe_runner,
+    )
 
 
 def build_default_dependencies(
@@ -2039,8 +2663,28 @@ def build_default_dependencies(
     resolver: Callable[[Mapping[str, Any]], CrawlRequest | None] | None = None
     if paths is not None and business_date is not None:
         legacy_adapter = CnncLegacyZhaoshangAdapter()
-        backend_version = "legacy-v1" if zhaoshang_backend == "legacy" else "batch-url-v1"
-        resolver = lambda row: legacy_adapter.request_from_saas_row(row, backend_version=backend_version)
+
+        def resolver(row: Mapping[str, Any]) -> CrawlRequest | None:
+            legacy_request = legacy_adapter.request_from_saas_row(
+                row, backend_version="legacy-v1"
+            )
+            if legacy_request is None:
+                return None
+            backend_version = _zhaoshang_backend_version_for_mall(
+                legacy_request.mall_key,
+                url=legacy_request.url,
+                selected_backend=zhaoshang_backend,
+            )
+            if backend_version == legacy_request.backend_version:
+                return legacy_request
+            return CrawlRequest(
+                mall_key=legacy_request.mall_key,
+                mall_source_id=legacy_request.mall_source_id,
+                mall_name=legacy_request.mall_name,
+                sku_id=legacy_request.sku_id,
+                url=legacy_request.url,
+                backend_version=backend_version,
+            )
     dependencies = TickDependencies(
         discover=snapshot_discoverer(snapshot_adapter, crawl_request_resolver=resolver),
         detail=_detail_worker(
@@ -2053,24 +2697,88 @@ def build_default_dependencies(
     )
     if paths is not None and business_date is not None:
         assert legacy_adapter is not None
+        (
+            legacy_planner,
+            legacy_finalizer,
+            legacy_submitter,
+            legacy_harvester,
+            recovery_probe,
+            recovery_restart,
+        ) = legacy_zhaoshang_bridge(
+            legacy_adapter, paths=paths, business_date=business_date
+        )
+        batch_priority_runner = None
+        if enable_zhaoshang:
+            def batch_priority_runner(
+                prepared_job: Any, timeout_seconds: float
+            ) -> BatchPriorityAttempt:
+                target = BatchMaterializationTarget(
+                    execute_numbers=prepared_job.execute_numbers,
+                    expected_mall=prepared_job.mall_key,
+                )
+                return ensure_batch_priority(
+                    lambda remaining: connect_batch_priority_from_env_file(
+                        PROJECT_DATA_ROOT / "ZHAOSHANG_DB.env",
+                        timeout_seconds=remaining,
+                    ),
+                    target,
+                    timeout_seconds=timeout_seconds,
+                )
+
+        result_adapter, probe_runner = _batch_sql_runtime_components()
+        (
+            batch_planner,
+            batch_finalizer,
+            batch_submitter,
+            batch_harvester,
+        ) = batch_zhaoshang_bridge(
+            CnncBatchZhaoshangAdapter(
+                write_enabled=enable_zhaoshang and zhaoshang_backend == "batch"
+            ),
+            legacy_adapter,
+            paths=paths,
+            business_date=business_date,
+            priority_runner=batch_priority_runner,
+            result_adapter=result_adapter,
+            materialization_probe_runner=probe_runner,
+        )
         if zhaoshang_backend == "batch":
-            planner, finalizer, submitter, harvester = batch_zhaoshang_bridge(
-                CnncBatchZhaoshangAdapter(write_enabled=enable_zhaoshang),
-                legacy_adapter,
-                paths=paths,
-                business_date=business_date,
+            planner, finalizer, submitter = _route_zhaoshang_creation(
+                legacy_planner,
+                legacy_finalizer,
+                legacy_submitter,
+                batch_planner,
+                batch_finalizer,
+                batch_submitter,
             )
         else:
-            planner, finalizer, submitter, harvester, recovery_probe, recovery_restart = legacy_zhaoshang_bridge(legacy_adapter, paths=paths, business_date=business_date)
-            # The RUNNING-stall probe is read-only and safe for every tick;
-            # the single exact restart is a remote write and stays gated by
-            # the explicit remote-write authorization below.
-            dependencies.remote_recovery_probe = recovery_probe
-            if enable_zhaoshang:
-                dependencies.remote_recovery_restart = recovery_restart
+            planner, finalizer, submitter = (
+                legacy_planner,
+                legacy_finalizer,
+                legacy_submitter,
+            )
+        harvester = _route_zhaoshang_harvest(
+            legacy_harvester, batch_harvester
+        )
+        # Legacy RUNNING restart remains isolated from batch progress recovery.
+        dependencies.remote_recovery_probe = recovery_probe
+        if enable_zhaoshang:
+            dependencies.remote_recovery_restart = recovery_restart
+        dependencies.remote_recovery_accepts = (
+            lambda job: _remote_job_backend(job) == "legacy"
+        )
         # Read-only wait/export and exact unknown-submit reconciliation remain
         # available on ordinary ticks. Only planner+submit are write-capable.
         dependencies.harvest = harvester
+        def job_disposition(job: Mapping[str, Any]) -> str:
+            return _remote_job_disposition(
+                job,
+                selected_backend=zhaoshang_backend,
+                batch_priority_enabled=enable_zhaoshang,
+            )
+
+        dependencies.remote_job_disposition = job_disposition
+        dependencies.harvest_accepts = lambda job: job_disposition(job) == "accept"
         # Issue #9 sidecar: best-effort enqueue of discovered documents into
         # the prewarm inbox. The tick hook catches every exception and only
         # counts it; drain-only dependencies stay without it on purpose.
@@ -2100,19 +2808,59 @@ def build_drain_dependencies(
     business_date: str,
 ) -> TickDependencies:
     """Compose only the existing-remote lifecycle; no create surface exists."""
-    if zhaoshang_backend != "legacy":
-        raise RuntimeConfigurationError("drain-only requires the evidenced legacy export backend")
+    if zhaoshang_backend not in {"legacy", "batch"}:
+        raise RuntimeConfigurationError("Zhaoshang backend must be legacy or batch")
     adapter = CnncLegacyZhaoshangAdapter()
-    _planner, _finalizer, _submitter, harvester, _probe, _restart = legacy_zhaoshang_bridge(
+    _planner, _finalizer, _submitter, legacy_harvester, _probe, _restart = legacy_zhaoshang_bridge(
         adapter,
         paths=paths,
         business_date=business_date,
+    )
+    result_adapter, probe_runner = _batch_sql_runtime_components()
+
+    def batch_priority_runner(
+        prepared_job: Any, timeout_seconds: float
+    ) -> BatchPriorityAttempt:
+        return ensure_batch_priority(
+            lambda remaining: connect_batch_priority_from_env_file(
+                PROJECT_DATA_ROOT / "ZHAOSHANG_DB.env",
+                timeout_seconds=remaining,
+            ),
+            BatchMaterializationTarget(
+                execute_numbers=prepared_job.execute_numbers,
+                expected_mall=prepared_job.mall_key,
+            ),
+            timeout_seconds=timeout_seconds,
+        )
+
+    _batch_planner, _batch_finalizer, _batch_submitter, batch_harvester = batch_zhaoshang_bridge(
+        CnncBatchZhaoshangAdapter(write_enabled=False),
+        adapter,
+        paths=paths,
+        business_date=business_date,
+        priority_runner=batch_priority_runner,
+        result_adapter=result_adapter,
+        materialization_probe_runner=probe_runner,
+    )
+    harvester = _route_zhaoshang_harvest(
+        legacy_harvester, batch_harvester
     )
 
     def discover_forbidden(_timeout: float) -> DiscoveredState:
         raise RuntimeConfigurationError("drain-only cannot discover new business work")
 
-    return TickDependencies(discover=discover_forbidden, harvest=harvester)
+    def disposition(job: Mapping[str, Any]) -> str:
+        return _remote_job_disposition(
+            job,
+            selected_backend=zhaoshang_backend,
+            batch_priority_enabled=True,
+        )
+    return TickDependencies(
+        discover=discover_forbidden,
+        harvest=harvester,
+        harvest_accepts=lambda job: disposition(job) == "accept",
+        remote_job_disposition=disposition,
+    )
 
 
 def run_runtime_command(

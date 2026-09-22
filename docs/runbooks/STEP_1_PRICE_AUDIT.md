@@ -55,6 +55,12 @@
 12. **缺价门与 multi-site 兜底**：汇总招商局未覆盖、采集等待失败、导出无价格和未回填 URL。脚本先生成不得当作 formal final 的 review Excel 和 `multi_site_fallback/manifest.xlsx`，锁定候选数、清单 SHA-256、manifest/review SHA-256、规范化的批次目录和唯一预定 final 路径；计划生成时验证已审查爬虫提交 `28870666aeb99a10494ebb91419aadf3bff4c0a8` 且其工作区干净，把 `BATCH_STATE.md` 设为 `WAITING_USER` 后暂停，零本地爬取。用户对该批次准确数量、SHA-256 和 manifest 二次授权后，只能用 `--resume-multi-site-manifest` + `--resume-review-xlsx` + `--expected-fallback-count` + `--expected-fallback-sha256` 独立续跑；该入口不重跑快照、模型或招商局 add/启用/提优。候选计划准备若失败，只能对已有 review 使用 `--recover-multi-site-plan-from-review`，不得重跑原第一步命令，也不得更改原预定 final。兜底只处理 `nbdeli / guangbo / ofs / lxwlmall / qstbg / ycw / comix / tima` 的严格 host allowlist；续跑再次验证 manifest/review/hash、固定 crawler revision、干净工作区、站点/链接、final 路径和批次状态。全部预检通过后以独占创建 `execution.claim.json` 取得一次性执行权，并从已验证的内存计划和 review 字节生成只供本次 worker/backfill 使用的执行快照；claim 一经创建即视为可能已发送请求，崩溃或 worker 启动失败也不得自动删除或重跑。子进程只继承 Windows/Playwright 运行所需白名单环境变量，不继承认证、模型或数据库密钥。输出必须与锁定输入逐项一致；`SUCCESS` 价格必须是有限且非负 Decimal，0 为 `PRICE_IS_ZERO`。exit 2、全局风控 exit 3、部分/外来/重复输出均停止并保留证据，不生成 formal final，也不自动重跑。回填后必须从整张 final 的 `record_results` 检查未决状态，`PENDING_CRAWL`、`FAILED`、`CRAWLER_PROCESS_FAILED` 等不能标记批次 `COMPLETE`；既有 `NO_RESULT` 仍按原终态语义保留。完整 STEP_1 的 `WAITING_USER + count + SHA-256` 人工授权门不因增量自动兜底而改变。
 13. **最终验收**：最终 Excel 行数必须等于本轮 SaaS 总数，文件可打开，所有阶段均有状态证据。完成后把本批次 `BATCH_STATE.md` 改为 `COMPLETE`；不得修改其他批次状态。
 
+## Batch SQL 结果契约
+
+`app/services/batch_sql_result_adapter.py` 只覆盖已经用生产只读证据验证的 allowlist。CNNC 当前 18 个生产商城中，`mymro / ofs` 继续逐商城回退 legacy，其余 16 个可走 batch；`qstbg / lxwlmall` 只接受已由历史样本证明的严格 URL 变体，新建 `jslink.com` URL 统一规范到 `nbdeli`。adapter 按实际商城分组，以最多 100 个 exact `executeNumber` 查询 `<mall>_price.exe_number`，再按 `sku_id` 关联 `<mall>_goods`，并同时校验 durable expected SKU 与 URL；不运行 26 商城 `UNION ALL`，也不依赖不存在的 HTTP export API。商城、executeNumber、SKU 或 URL 不能精确验证时必须 fail closed。
+
+结果为零不能直接记为 `NO_RESULT`：`task_status=00/01` 是 `NOT_YET_VISIBLE`，`03` 是 `CRAWLER_FAILED`；`02` 只有存在独立 spider-log 等终态无结果证据时才是 `TERMINAL_NO_RESULT`，否则保持 `EVIDENCE_INCOMPLETE`。该 adapter 已接入 `incremental_audit_runtime.py`；production 默认仍为 legacy，显式选择 batch 时使用上述逐商城混合路由，已有任务始终按 durable payload 恢复。
+
 ## 审计入口
 
 先取得本轮快照，再运行。首次运行不要带任何本地脚本参数：

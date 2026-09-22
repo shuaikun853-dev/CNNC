@@ -201,6 +201,14 @@ class CrawlMember:
 class TickDependencies:
     discover: Callable[[float], DiscoveredState]
     harvest: Callable[[Sequence[Mapping[str, Any]], float], Mapping[int, Mapping[str, Any]] | None] | None = None
+    # A persisted remote job may outlive the CLI backend selection that
+    # created it. Filter before claiming so a foreign backend cannot consume
+    # attempts or reinterpret the durable payload.
+    harvest_accepts: Callable[[Mapping[str, Any]], bool] | None = None
+    # Classifies persisted jobs before any backend callback. "invalid" is a
+    # backend-neutral terminal safety result; "foreign" and "deferred" are
+    # left untouched without consuming harvest attempts.
+    remote_job_disposition: Callable[[Mapping[str, Any]], str] | None = None
     detail: Callable[[Mapping[str, Any], float], Any] | None = None
     model: Callable[[Mapping[str, Any], float], Any] | None = None
     # Optional durable batching seam. The callback returns one result for every
@@ -224,6 +232,7 @@ class TickDependencies:
     # pass is a no-op.
     remote_recovery_probe: Callable[[Mapping[str, Any], float], Mapping[str, Any] | None] | None = None
     remote_recovery_restart: Callable[[Mapping[str, Any], str | None, float], Mapping[str, Any]] | None = None
+    remote_recovery_accepts: Callable[[Mapping[str, Any]], bool] | None = None
     # Issue #9 customer-prewarm sidecar: best-effort enqueue of discovered
     # documents into the prewarm inbox. Optional and None by default; any
     # exception is caught below and only counted - it can never change the
@@ -369,13 +378,19 @@ def _harvest_limits(
 ) -> tuple[int, float]:
     if str(state) == "PRIORITY_PENDING":
         return (
-            min(config.harvest_max_attempts, config.priority_retry_max_attempts),
-            min(
-                config.harvest_max_elapsed_seconds,
-                config.priority_retry_max_elapsed_seconds,
-            ),
+            config.priority_retry_max_attempts,
+            config.priority_retry_max_elapsed_seconds,
         )
     return config.harvest_max_attempts, config.harvest_max_elapsed_seconds
+
+
+def _is_batch_remote_job(job: Mapping[str, Any]) -> bool:
+    try:
+        raw = job.get("payload_json") or "{}"
+        payload = json.loads(raw) if isinstance(raw, str) else dict(raw)
+    except (TypeError, ValueError):
+        return False
+    return payload.get("contract_version") == "zhaoshang-batch-url-v1"
 
 
 def _harvest(
@@ -400,16 +415,41 @@ def _harvest(
     """
     if deps.harvest is None:
         return set()
-    snapshot = [
+    manualized_invalid = 0
+    if deps.remote_job_disposition is not None:
+        for job in store.list_remote_jobs(token):
+            if deps.remote_job_disposition(job) == "invalid" and str(
+                job.get("state")
+            ) not in {"MANUAL_REQUIRED", "COMPLETED", "SUPERSEDED"}:
+                store.mark_remote_manual(
+                    token,
+                    int(job["id"]),
+                    "remote job backend payload is invalid",
+                )
+                manualized_invalid += 1
+    eligible = [
         job
         for job in sorted(
             store.list_remote_jobs(token, states=_HARVESTABLE_REMOTE_STATES),
-            key=lambda job: (int(job["harvest_attempts"]), int(job["id"])),
+            key=lambda job: (
+                int(
+                    job["priority_attempts"]
+                    if str(job["state"]) == "PRIORITY_PENDING"
+                    else job["harvest_attempts"]
+                ),
+                int(job["id"]),
+            ),
         )
         if int(job["id"]) not in skip_job_ids
     ]
+    snapshot = [
+        job
+        for job in eligible
+        if deps.harvest_accepts is None or deps.harvest_accepts(job)
+    ]
     if not snapshot:
-        deps.harvest((), budget.callback_timeout(config.external_timeout_seconds))
+        if not eligible and not manualized_invalid:
+            deps.harvest((), budget.callback_timeout(config.external_timeout_seconds))
         return set()
     swept: set[int] = set()
     for start in range(0, len(snapshot), config.harvest_batch_size):
@@ -444,7 +484,7 @@ def _harvest_batch(
     checked_job_ids: set[int] | None = None,
 ) -> set[int]:
     claimed = []
-    claim_limits: dict[int, tuple[int, float]] = {}
+    claim_limits: dict[int, tuple[int, float, str]] = {}
     for job in jobs:
         max_attempts, max_elapsed_seconds = _harvest_limits(job["state"], config)
         claim = store.claim_harvest(
@@ -455,7 +495,11 @@ def _harvest_batch(
         )
         if claim is not None:
             claimed.append(claim)
-            claim_limits[int(claim["id"])] = (max_attempts, max_elapsed_seconds)
+            claim_limits[int(claim["id"])] = (
+                max_attempts,
+                max_elapsed_seconds,
+                "priority" if str(job["state"]) == "PRIORITY_PENDING" else "harvest",
+            )
     if not claimed:
         return set()
     counters["harvest_batches"] = counters.get("harvest_batches", 0) + 1
@@ -471,8 +515,8 @@ def _harvest_batch(
     except Exception as exc:
         elapsed = budget.monotonic() - started
         for job in claimed:
-            max_attempts, max_elapsed_seconds = claim_limits[int(job["id"])]
-            store.record_harvest(token, int(job["id"]), elapsed_seconds=elapsed, max_attempts=max_attempts, max_elapsed_seconds=max_elapsed_seconds, error=_safe_error(exc))
+            max_attempts, max_elapsed_seconds, phase = claim_limits[int(job["id"])]
+            store.record_harvest(token, int(job["id"]), elapsed_seconds=elapsed, max_attempts=max_attempts, max_elapsed_seconds=max_elapsed_seconds, error=_safe_error(exc), phase=phase)
         return set()
     elapsed = budget.monotonic() - started
     for job in claimed:
@@ -487,8 +531,19 @@ def _harvest_batch(
             if math.isfinite(candidate) and candidate >= 0:
                 evidence_elapsed = candidate
         if not isinstance(evidence, Mapping):
-            max_attempts, max_elapsed_seconds = claim_limits[job_id]
-            store.record_harvest(token, job_id, elapsed_seconds=elapsed, max_attempts=max_attempts, max_elapsed_seconds=max_elapsed_seconds)
+            max_attempts, max_elapsed_seconds, phase = claim_limits[job_id]
+            store.record_harvest(
+                token,
+                job_id,
+                elapsed_seconds=elapsed,
+                max_attempts=max_attempts,
+                max_elapsed_seconds=max_elapsed_seconds,
+                phase=phase,
+            )
+            continue
+        if evidence.get("deferred") is True:
+            _max_attempts, _max_elapsed_seconds, phase = claim_limits[job_id]
+            store.release_harvest_claim(token, job_id, phase=phase)
             continue
         if checked_job_ids is not None and _is_successful_remote_price_check(evidence):
             checked_job_ids.add(job_id)
@@ -562,13 +617,46 @@ def _harvest_batch(
         state = str(evidence.get("state", "RUNNING"))
         remote_identity = str(evidence.get("remote_identity") or store.get_remote_job(job_id).get("remote_identity") or "")
         if not remote_identity:
-            max_attempts, max_elapsed_seconds = claim_limits[job_id]
-            store.record_harvest(token, job_id, elapsed_seconds=evidence_elapsed, max_attempts=max_attempts, max_elapsed_seconds=max_elapsed_seconds)
+            max_attempts, max_elapsed_seconds, phase = claim_limits[job_id]
+            store.record_harvest(token, job_id, elapsed_seconds=evidence_elapsed, max_attempts=max_attempts, max_elapsed_seconds=max_elapsed_seconds, phase=phase)
             continue
-        store.reconcile_remote_job(
-            token, job_id, remote_identity=remote_identity, state=state,
-            export_path=evidence.get("export_path"), result=evidence.get("result"),
-        )
+        original_state = str(job["state"])
+        atomic_crawl_transition = False
+        if original_state == "SUBMIT_UNKNOWN" and state == "PRIORITY_PENDING":
+            if _is_batch_remote_job(job):
+                store.reconcile_batch_remote_job_and_crawl_work(
+                    token,
+                    job_id,
+                    remote_identity=remote_identity,
+                    result=evidence.get("result"),
+                )
+            else:
+                store.reconcile_remote_job_and_crawl_work(
+                    token,
+                    job_id,
+                    remote_identity=remote_identity,
+                )
+            atomic_crawl_transition = True
+        elif original_state == "PRIORITY_PENDING" and state == "SUBMITTED":
+            if _is_batch_remote_job(job):
+                store.confirm_batch_remote_job_priority_and_crawl_work(
+                    token,
+                    job_id,
+                    remote_identity=remote_identity,
+                    result=evidence.get("result"),
+                )
+            else:
+                store.confirm_remote_job_priority_and_crawl_work(
+                    token,
+                    job_id,
+                    remote_identity=remote_identity,
+                )
+            atomic_crawl_transition = True
+        else:
+            store.reconcile_remote_job(
+                token, job_id, remote_identity=remote_identity, state=state,
+                export_path=evidence.get("export_path"), result=evidence.get("result"),
+            )
         if manual_crawl_results:
             store.mark_remote_manual(
                 token, job_id, "harvest has unresolved provenance mappings"
@@ -581,18 +669,14 @@ def _harvest_batch(
                     remote_identity=remote_identity,
                     error=error,
                 )
-        elif state != "PRIORITY_PENDING":
+        elif state != "PRIORITY_PENDING" and not atomic_crawl_transition:
             store.advance_crawl_work_for_job(token, job_id, state)
         retryable_error = (
             str(evidence["retryable_error"])
-            if state == "PRIORITY_PENDING" and evidence.get("retryable_error")
+            if evidence.get("retryable_error")
             else None
         )
-        max_attempts, max_elapsed_seconds = (
-            claim_limits[job_id]
-            if state == "PRIORITY_PENDING"
-            else _harvest_limits(state, config)
-        )
+        max_attempts, max_elapsed_seconds, phase = claim_limits[job_id]
         store.record_harvest(
             token,
             job_id,
@@ -600,6 +684,8 @@ def _harvest_batch(
             max_attempts=max_attempts,
             max_elapsed_seconds=max_elapsed_seconds,
             error=retryable_error,
+            phase=phase,
+            phase_succeeded=atomic_crawl_transition,
         )
     return {int(job["id"]) for job in claimed}
 
@@ -1285,7 +1371,9 @@ def _final_remote_check_for_local_fallback(
     jobs: list[dict[str, Any]] = []
     for job_id in job_ids:
         job = store.get_remote_job(job_id)
-        if job is not None:
+        if job is not None and (
+            deps.harvest_accepts is None or deps.harvest_accepts(job)
+        ):
             jobs.append({**job, "crawl_work": store.crawl_work_for_job(job_id)})
     if not jobs:
         return set()
@@ -1838,6 +1926,7 @@ def run_incremental_tick(
                 ),
                 now=deps.wall_clock(),
                 can_start=lambda: budget.can_start_heavy(),
+                accept_job=deps.remote_recovery_accepts or deps.harvest_accepts,
             )
             for key, value in recovery_counters.items():
                 counters[key] = counters.get(key, 0) + int(value)

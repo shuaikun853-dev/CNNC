@@ -76,6 +76,44 @@ def test_prepare_deduplicates_exact_identity_and_rejects_blank_url():
         )
 
 
+@pytest.mark.parametrize(
+    "url",
+    ["hostless-value", "//www.qstbg.com/gd/detail.do?goods_id=1"],
+)
+def test_prepare_rejects_non_absolute_http_urls(url):
+    request = CrawlRequest(
+        mall_key="qstbg",
+        mall_source_id="28",
+        mall_name="齐心商城",
+        sku_id="sku-1",
+        url=url,
+        backend_version="batch-url-v1",
+    )
+
+    with pytest.raises(ValueError, match="absolute HTTP"):
+        CnncBatchZhaoshangAdapter.prepare_jobs("2026-09-21", [request])
+
+
+def test_source_scoped_requests_keep_one_execute_number_per_crawl_work():
+    request = _request(1)
+
+    plan = CnncBatchZhaoshangAdapter.prepare_jobs(
+        "2026-08-12",
+        [request, request],
+        source_ids=["document-a", "document-b"],
+    )
+
+    assert len(plan.jobs) == 1
+    job = plan.jobs[0]
+    assert job.requests == (request, request)
+    assert job.source_ids == ("document-a", "document-b")
+    assert len(job.execute_numbers) == 2
+    assert len(set(job.execute_numbers)) == 2
+    restored = CnncBatchZhaoshangAdapter.restore_job(job.durable_payload())
+    assert restored.source_ids == job.source_ids
+    assert restored.execute_numbers == job.execute_numbers
+
+
 def test_durable_envelope_round_trips_and_rejects_tampering():
     original = CnncBatchZhaoshangAdapter.prepare_jobs("2026-08-12", [_request(1), _request(2)]).jobs[0]
 
@@ -200,6 +238,32 @@ def test_reconcile_fails_closed_on_count_or_identity_collision():
 
     assert outcome.status is BatchReconcileStatus.MANUAL
     assert "total" in outcome.diagnostic
+
+
+def test_reconcile_rejects_conflicting_optional_remote_execute_number_evidence():
+    job = CnncBatchZhaoshangAdapter.prepare_jobs(
+        "2026-08-12", [_request(1), _request(2)]
+    ).jobs[0]
+    adapter = CnncBatchZhaoshangAdapter(
+        get_json=lambda *_args: (
+            200,
+            {
+                "rspCode": "0000",
+                "success": True,
+                "data": {
+                    "batchNumber": job.batch_number,
+                    "mallLogo": "jd",
+                    "executeNumbers": ["wrong-one", "wrong-two"],
+                    "totalCount": 2,
+                },
+            },
+        )
+    )
+
+    outcome = adapter.reconcile_unknown(job, timeout_seconds=10)
+
+    assert outcome.status is BatchReconcileStatus.MANUAL
+    assert "identity" in outcome.diagnostic
 
 
 def test_parse_progress_supports_documented_rspdesc_and_structured_shape():

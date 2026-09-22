@@ -2,9 +2,9 @@
 
 A Priority failure the adapter explicitly marks ``retryable=True`` (transient
 transport, rows not yet materialized) must keep the durable job in
-PRIORITY_PENDING across scheduler probes — aligned with the ordinary harvest
-budget — instead of flipping to MANUAL_REQUIRED after three sweeps while the
-remote is merely slow.  Non-retryable failures stay immediately manual.
+PRIORITY_PENDING across scheduler probes using its own durable priority
+budget, without consuming later crawler-result harvest capacity. Non-retryable
+failures stay immediately manual.
 """
 
 from __future__ import annotations
@@ -111,7 +111,8 @@ def test_ten_retryable_priority_stalls_stay_pending(tmp_path):
             assert pending["state"] == "PRIORITY_PENDING", (
                 f"probe {expected_attempts} must stay recoverable"
             )
-            assert pending["harvest_attempts"] == expected_attempts
+            assert pending["priority_attempts"] == expected_attempts
+            assert pending["harvest_attempts"] == 0
             assert pending["remote_identity"] == IDENTITY
     finally:
         store.release_lease(token)
@@ -177,7 +178,8 @@ def test_eleventh_probe_recovers_without_any_remote_create(tmp_path):
     assert probes == 11
     assert recovered["state"] == "SUBMITTED"
     assert recovered["remote_identity"] == IDENTITY
-    assert recovered["harvest_attempts"] == 11
+    assert recovered["priority_attempts"] == 11
+    assert recovered["harvest_attempts"] == 0
     assert recovered["error_text"] is None
     assert final.outcome != "MANUAL_REVIEW_REQUIRED"
 
@@ -205,5 +207,6 @@ def test_non_retryable_priority_error_is_manual_immediately(tmp_path):
         store.release_lease(token)
 
     assert failed["state"] == "MANUAL_REQUIRED"
-    assert failed["harvest_attempts"] == 1
+    assert failed["priority_attempts"] == 1
+    assert failed["harvest_attempts"] == 0
     assert failed["remote_identity"] == IDENTITY

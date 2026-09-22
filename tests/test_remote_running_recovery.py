@@ -1304,6 +1304,30 @@ def test_case_c1_all_failing_probes_stop_at_the_attempt_cap(tmp_path) -> None:
     assert counters["recovery_probes"] == 0
 
 
+def test_running_recovery_skips_foreign_backend_before_probe(tmp_path) -> None:
+    store = DailyAuditStore(tmp_path / "state.sqlite3")
+    job_ids = _seed_candidate_jobs(store, 1)
+    calls: list[int] = []
+    token = store.acquire_lease(BUSINESS_DATE, "backend-filter", ttl_seconds=300)
+    try:
+        counters = run_running_recovery_pass(
+            store,
+            token,
+            probe_remote=lambda job: calls.append(int(job["id"])) or None,
+            restart_remote=None,
+            now=NOW,
+            can_start=lambda: True,
+            accept_job=lambda _job: False,
+        )
+    finally:
+        store.release_lease(token)
+
+    refreshed = store.get_remote_job(job_ids[0])
+    assert calls == []
+    assert counters["recovery_probe_attempts"] == 0
+    assert refreshed["recovery_evidence_json"] is None
+
+
 def test_case_c2_failed_probes_share_the_allowance_with_successful_ones(tmp_path) -> None:
     store = DailyAuditStore(tmp_path / "state.sqlite3")
     job_ids = _seed_candidate_jobs(store, 10)

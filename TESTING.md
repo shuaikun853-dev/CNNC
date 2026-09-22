@@ -49,6 +49,7 @@ python -m pytest tests\test_monitor_stb_fallback.py tests\test_process_monitor_z
 # 招商局当前任务优先级保护（含 commit 期间 task_status 漂移仅观测、task-id/is_valid/weight 回读继续 fail-closed）
 python -m pytest tests\test_zhaoshang_priority_boost.py tests\test_zhaoshang_resume_modes.py -q
 
+# 招商局 batch fast path（exact executeNumber/PK、单 schema、02/03 终态竞态、priority/harvest 独立预算、旧 SQLite migration、事务回滚、SQL 价格/title 语义、nbdeli-only 数字 `PCS` 等价、qstbg/lxwlmall 严格 URL 变体、jslink→nbdeli 新建规范化、逐商城 batch/legacy 混合路由、source_id scoped executeNumber→唯一 crawl_work、progress/probe/SQL 共用绝对 deadline、durable mixed harvest 和跨 tick/崩溃恢复；全 fake DB/HTTP/本地 SQLite）：`python -m pytest tests\test_batch_zhaoshang_priority.py tests\test_batch_zhaoshang_adapter.py tests\test_batch_sql_result_adapter.py tests\test_daily_audit_store.py tests\test_incremental_price_audit.py tests\test_incremental_audit_runtime.py tests\test_legacy_zhaoshang_adapter.py tests\test_customer_prewarm_discovery.py -k "batch or priority or submit_unknown or sql_result or jslink or hybrid" -q`
 # 旧诊断和工作流安全边界
 python -m pytest tests\test_safety_guard.py tests\test_scope_guard.py tests\test_workflow_scope_guard.py -q
 python -m pytest tests\test_cnnc_auth_browser_harvest.py tests\test_cnnc_auth_browser_login_autofill.py tests\test_cnnc_auth_browser_tmp_root.py -q  # CNNC 认证浏览器一次性临时 Profile 落仓库 runtime/browser_tmp（生产 checkout 在 E 盘；runtime 根不可用时回退系统 TEMP 保认证）+ 启动清扫陈旧残留（2026-09-15 C 盘满事故回归）

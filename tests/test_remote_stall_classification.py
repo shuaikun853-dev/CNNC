@@ -157,8 +157,9 @@ def test_verification_priority_outcome_stays_non_retryable(tmp_path):
 def test_stall_retry_keeps_priority_pending_until_bounded_budget(tmp_path):
     """First not-materialized evidence must stay PRIORITY_PENDING, not MANUAL.
 
-    With the production defaults the retryable Priority budget now matches the
-    harvest budget, so a slow remote keeps probing.  The bounded-budget
+    With the production defaults the retryable Priority limits match the
+    harvest limits but use independent durable counters, so a slow remote keeps
+    probing without consuming later harvest capacity. The bounded-budget
     terminal cap still exists: an explicitly narrowed budget turns the third
     failed sweep into MANUAL_REQUIRED with the precise stall diagnostic as
     durable error evidence.
@@ -218,7 +219,8 @@ def test_stall_retry_keeps_priority_pending_until_bounded_budget(tmp_path):
     pending_job = store.get_remote_job(int(job["id"]))
     assert all(summary.outcome != "MANUAL_REVIEW_REQUIRED" for summary in summaries)
     assert pending_job["state"] == "PRIORITY_PENDING"
-    assert pending_job["harvest_attempts"] == 3
+    assert pending_job["priority_attempts"] == 3
+    assert pending_job["harvest_attempts"] == 0
     assert pending_job["error_text"] == "PriorityRowsNotMaterialized"
 
     narrowed_config = TickConfig(
@@ -232,4 +234,5 @@ def test_stall_retry_keeps_priority_pending_until_bounded_budget(tmp_path):
     assert final_job["state"] == "MANUAL_REQUIRED"
     assert final_job["error_text"] == "PriorityRowsNotMaterialized"
     assert final_job["error_text"] == "PriorityRowsNotMaterialized"
-    assert int(final_job["harvest_attempts"]) == 3
+    assert int(final_job["priority_attempts"]) == 3
+    assert int(final_job["harvest_attempts"]) == 0

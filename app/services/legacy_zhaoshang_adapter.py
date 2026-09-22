@@ -21,7 +21,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping
 from urllib import error
-from urllib.parse import parse_qsl, urlparse
+from urllib.parse import urlparse
 
 from openpyxl import Workbook, load_workbook
 
@@ -65,6 +65,10 @@ from app.services.zhaoshang_remote_task import (
     SubmissionEvidenceConflictError,
     TemplateConflictError,
     remote_task_is_enabled,
+)
+from app.services.zhaoshang_url_identity import (
+    canonicalize_new_zhaoshang_url,
+    strict_legacy_export_url_match,
 )
 from app.services.zhaoshang_result_adapter import (
     read_zhaoshang_result_xlsx,
@@ -536,8 +540,19 @@ class CnncLegacyZhaoshangAdapter:
             )
         return self._host_mapping_cache[normalized]
 
-    def request_from_saas_row(self, row: Mapping[str, Any], *, backend_version: str) -> CrawlRequest | None:
-        url = _text(row.get("extLink"))
+    def request_from_saas_row(
+        self,
+        row: Mapping[str, Any],
+        *,
+        backend_version: str,
+        preserve_historical_identity: bool = False,
+    ) -> CrawlRequest | None:
+        original_url = _text(row.get("extLink"))
+        url = (
+            original_url
+            if preserve_historical_identity
+            else canonicalize_new_zhaoshang_url(original_url)
+        )
         vendor = _text(row.get("vendorName")).lower()
         mapping: ZhaoshangMallMapping | None = None
         host = (urlparse(url).hostname or "").lower().lstrip(".")
@@ -550,6 +565,22 @@ class CnncLegacyZhaoshangAdapter:
                     for item in self._mappings
                     if any(keyword.lower() in vendor for keyword in item.vendor_keywords)
                 ),
+                None,
+            )
+        if (
+            mapping is not None
+            and mapping.mall_key == "jslink"
+            and not preserve_historical_identity
+            and host
+        ):
+            return None
+        if (
+            mapping is not None
+            and mapping.mall_key == "jslink"
+            and not preserve_historical_identity
+        ):
+            mapping = next(
+                (item for item in self._mappings if item.mall_key == "nbdeli"),
                 None,
             )
         if mapping is None:
@@ -1397,53 +1428,7 @@ class CnncLegacyZhaoshangAdapter:
     @staticmethod
     def _matches_legacy_export_url(durable_url: str, exported_url: str) -> bool:
         """Match exact URLs plus strict, allowlisted legacy export rewrites."""
-        if durable_url == exported_url:
-            return True
-        if not durable_url or not exported_url:
-            return False
-        durable = urlparse(durable_url)
-        exported = urlparse(exported_url)
-        durable_query = parse_qsl(durable.query, keep_blank_values=True)
-        exported_query = parse_qsl(exported.query, keep_blank_values=True)
-        if (
-            durable.scheme == exported.scheme == "https"
-            and durable.netloc == exported.netloc == "www.qstbg.com"
-            and durable.path == "/gd/detail.do"
-            and exported.path == "/gd/initParameter.do"
-            and not durable.fragment
-            and exported.fragment == "title_detail"
-            and len({key for key, _value in durable_query}) == len(durable_query)
-            and len({key for key, _value in exported_query}) == len(exported_query)
-        ):
-            durable_params = dict(durable_query)
-            exported_params = dict(exported_query)
-            goods_id = durable_params.get("goods_id", "")
-            if (
-                goods_id
-                and set(durable_params).issubset({"goods_id", "formid"})
-                and durable_params.get("formid", "searchform") == "searchform"
-                and exported_params == {"goods_id": goods_id, "formid": "form1"}
-            ):
-                return True
-        jd_hosts = {"i-item.jd.com", "item.jd.com"}
-        durable_jd_product = re.fullmatch(r"/([0-9]+)\.html", durable.path)
-        exported_jd_product = re.fullmatch(r"/([0-9]+)\.html", exported.path)
-        if (
-            durable.scheme == exported.scheme == "https"
-            and {durable.netloc, exported.netloc} == jd_hosts
-            and not durable.query
-            and not exported.query
-            and not durable.fragment
-            and not exported.fragment
-            and durable_jd_product is not None
-            and exported_jd_product is not None
-            and durable_jd_product.group(1) == exported_jd_product.group(1)
-        ):
-            return True
-        if not durable.path.endswith("/detail/inner"):
-            return False
-        canonical_path = durable.path[: -len("/inner")]
-        return exported == durable._replace(path=canonical_path)
+        return strict_legacy_export_url_match(durable_url, exported_url)
 
     def exact_export_remote_identity(self, job: PreparedLegacyJob) -> str | None:
         """Return the exact exported remote identity, or ``None`` on any conflict."""

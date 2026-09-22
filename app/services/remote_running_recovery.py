@@ -792,6 +792,7 @@ def run_running_recovery_pass(
     restart_remote: Callable[[Mapping[str, Any], str | None], Mapping[str, Any]] | None = None,
     now: datetime,
     can_start: Callable[[], bool],
+    accept_job: Callable[[Mapping[str, Any]], bool] | None = None,
     max_probe_candidates: int = RECOVERY_MAX_PROBE_CANDIDATES_PER_TICK,
 ) -> dict[str, int]:
     """One bounded recovery sweep over the durable RUNNING jobs.
@@ -815,6 +816,8 @@ def run_running_recovery_pass(
         "recovery_identity_manual": 0,
     }
     for job in store.list_remote_jobs(token):
+        if accept_job is not None and not accept_job(job):
+            continue
         if not can_start():
             break
         if str(job.get("state")) == "RECOVERY_EXHAUSTED":

@@ -386,13 +386,43 @@ task name 使用业务日和 immutable 请求集生成同日稳定、跨日不�
   成败只由 Python 的真实退出码决定。runner 使用 .NET `Process` 并发 drain 两个流，并把进程放入
   kill-on-close Windows Job Object；内部 deadline 小于注册的 ExecutionTimeLimit（默认 PT32M），
   超时返回 124 并终止 child/grandchild，外层 ExecutionTimeLimit 继续作为第二道外部保险。wrapper 被强制终止时，Job Object 关闭也会清理整个进程树。
-- `--zhaoshang-backend legacy|batch` 选择 Adapter，默认 `legacy`。`batch` 使用公司 Skill 已证实的
-  `/batch/autoAddTask` 与 `queryTaskProgress`，按商城和最多 100 条稳定分片；create 阶段不生成
+- `--zhaoshang-backend legacy|batch` 选择新任务策略，默认 `legacy`。`legacy` 保持全量 legacy；`batch`
+  仅对 SQL result allowlist 内商城使用公司 Skill 已证实的 `/batch/autoAddTask` 与
+  `queryTaskProgress`，其余商城逐商城回退 legacy。batch 按商城和最多 100 条稳定分片；create 阶段不生成
   临时 Excel、不开每商城子进程，也不依赖 Cookie/cURL。它仍必须显式传 `--enable-remote-writes`。
-  当前 Skill 没有 batch 结果 export/download 契约，因此该 backend 只用于受控 canary；任务完成
-  后会进入人工 export 项，不会猜测接口。正式日常运行在 canary 前保持 `legacy`。
-- 公司 Skill 只证明 `taskWeight=0`，没有证明它映射数据库 `weight_type=-1`；batch Adapter 不猜测
-  `-1`，也没有修改现有受控 priority 核心。
+  当前 Skill 没有 batch 结果 export/download HTTP 契约；runtime 改用已验证的只读 SQL 路径，按
+  exact `executeNumber` 查询同商城 price/goods，并要求唯一 source_id/mall/SKU/URL/backend 对应唯一 linked
+  `crawl_work`；相同 SKU/URL 的不同 SaaS 来源文档分别生成 executeNumber，不能结果扇出。后到的新 source
+  不跟随或复制既有 batch job/result，只为仍 pending 的 source 重建精确分片；旧 durable payload仍按旧 identity
+  恢复。progress、物化 probe、结果 SQL 共用同一个 callback 绝对 deadline，每次数据库阻塞操作前重算剩余
+  timeout；deadline 前未开始的 job 退还 harvest claim，不消耗 retry budget 或清除旧诊断。`price>0` 必须有
+  title；`price=0` 固定写 `PRICE_IS_ZERO + 已下架`；无效价格 fail closed。
+  `task_status=02` 且 SQL 零行仍需 spider-log 等终态证据，不能直接 `NO_RESULT`。
+- batch create 成功或 `SUBMIT_UNKNOWN` 经 exact `batchNumber` 找回后，job 先进入 durable
+  `PRIORITY_PENDING`，不得直接 query progress。priority service 只在
+  `central_control_sub` / `central_control_sub_zsz` allowlist 内按本 slice 持久化的 exact
+  `executeNumber`（每片最多 100 条）查询；每次 SQL/commit 都重算同一个 callback deadline，
+  0/N、partial N/M 和明确 transient DB 错误才有界重试，其他异常立即 fail-closed。
+- 只有 exact set 在单一 schema 全部物化后才冻结真实 `task_id` 集；写事务内会对两个 schema
+  再做 exact `exec_num FOR UPDATE` 重验，随后 UPDATE 只按这些 PK，且限定
+  `task_status IN ('00','01') AND is_valid='1' AND weight_type<>'-1'`。事务内与 commit 后都回读
+  exact identity；仍活跃的行必须为 `-1`，已为 `-1` 视为幂等成功，竞态变成 `02`（完成）或
+  `03`（失败）的终态行均不强改，分别计入 `already_completed` / `already_failed`。
+  确认后才从 `PRIORITY_PENDING` 进入 `SUBMITTED` 并在后续 sweep 查询 progress。重启只从 SQLite
+  immutable payload 恢复 backend 与 `execute_numbers`。CLI backend 只决定新任务的 planner/submitter；
+  当前 18 个生产商城中 `mymro / ofs` 固定回退 legacy；其余 16 个走 batch。新建 `jslink.com`
+  及其子域 URL 先规范为 `b2b.nbdeli.com` 并按 `nbdeli` 路由；vendor-only、空 URL、hostless URL
+  一律保留 legacy，Batch adapter 只接受绝对 HTTP(S) URL。历史 frozen `jslink` policy 按原 mall/source/URL
+  恢复，不改写旧 SQLite。已有 legacy 与 batch job 在同一 SQLite
+  内按各自 durable payload 路由到对应 harvester，损坏 payload
+  立即转人工。未启用 remote writes 的 batch priority 不 claim、不烧重试次数；已有 SUBMITTED/RUNNING
+  batch 仍继续只读 SQL harvest，绝不重复 POST。
+- `PRIORITY_PENDING` 独占 `priority_attempts/priority_elapsed_seconds`；`SUBMIT_UNKNOWN` 仍属于普通
+  harvest 对账预算，`SUBMITTED/RUNNING/EXPORTED` 使用 `harvest_attempts/harvest_elapsed_seconds`。
+  旧 SQLite 打开时原位补列且默认 0，不得要求清库。batch 的 `SUBMIT_UNKNOWN -> PRIORITY_PENDING`
+  和 `PRIORITY_PENDING -> SUBMITTED` 都在一个 SQLite transaction 内同时推进 `remote_jobs` 与 linked
+  `crawl_work`；identity 必须由 durable payload 与 JSON remote identity 联合验证 exact contract、
+  logical key、payload hash、batch、mall 和无重复 executeNumber 集，任一漂移 fail closed。
 - 增量 Tick 的模型批次基线是 10、并发为 1，与第一步生产稳定口径一致；不要把
   `.env.example` 中的 30 当作本项目生产基线。adapter 的默认上限是 3 attempts / 300 秒，
   但 tick 传入单次 callback 的 external cap 默认 60 秒，故每个批次实际最多 3 次 HTTP，

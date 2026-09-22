@@ -11,6 +11,7 @@ from pathlib import Path
 
 import pytest
 
+from app.services.batch_zhaoshang_adapter import CnncBatchZhaoshangAdapter
 from app.services.daily_audit_store import (
     DailyAuditStore,
     FINALIZATION_INTENT_KEY,
@@ -20,6 +21,7 @@ from app.services.daily_audit_store import (
     RemoteIntentConflict,
     StaleLease,
 )
+from app.services.legacy_zhaoshang_adapter import CrawlRequest
 
 
 @pytest.fixture
@@ -267,6 +269,15 @@ def test_legacy_store_adds_recovery_and_local_fallback_schema_idempotently(tmp_p
         connection.execute("DROP TABLE local_fallback_work")
         connection.execute("ALTER TABLE remote_jobs DROP COLUMN recovery_evidence_json")
         connection.execute("ALTER TABLE remote_jobs DROP COLUMN recovery_attempts")
+        remote_columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(remote_jobs)")
+        }
+        if "priority_elapsed_seconds" in remote_columns:
+            connection.execute(
+                "ALTER TABLE remote_jobs DROP COLUMN priority_elapsed_seconds"
+            )
+        if "priority_attempts" in remote_columns:
+            connection.execute("ALTER TABLE remote_jobs DROP COLUMN priority_attempts")
 
     migrated = DailyAuditStore(path)
     reopened = DailyAuditStore(path)
@@ -287,15 +298,209 @@ def test_legacy_store_adds_recovery_and_local_fallback_schema_idempotently(tmp_p
             )
         }
         retained = connection.execute(
-            "SELECT logical_key, recovery_attempts FROM remote_jobs WHERE id=?",
+            """SELECT logical_key, recovery_attempts, priority_attempts,
+                      priority_elapsed_seconds
+               FROM remote_jobs WHERE id=?""",
             (int(job["id"]),),
         ).fetchone()
 
     assert migrated.path == reopened.path == path
-    assert {"recovery_attempts", "recovery_evidence_json"} <= remote_columns
+    assert {
+        "recovery_attempts",
+        "recovery_evidence_json",
+        "priority_attempts",
+        "priority_elapsed_seconds",
+    } <= remote_columns
     assert "local_fallback_work" in tables
     assert "ux_local_fallback_active_url" in indexes
-    assert retained == ("legacy-job", 0)
+    assert retained == ("legacy-job", 0, 0, 0.0)
+
+
+def _seed_batch_remote_job(store, lease, *, state, mall_key="jd"):
+    request = CrawlRequest(
+        mall_key,
+        "3",
+        "京东",
+        "sku-1",
+        "https://item.jd.com/1.html",
+        "batch-url-v1",
+    )
+    prepared = CnncBatchZhaoshangAdapter.prepare_jobs(
+        "2026-08-11", [request]
+    ).jobs[0]
+    job = store.prepare_remote_intent(
+        lease,
+        prepared.logical_job_key,
+        prepared.task_name,
+        prepared.payload_sha256,
+        mall_key=prepared.mall_key,
+        payload_json=prepared.durable_payload(),
+    )
+    crawl = store.ensure_crawl_work(
+        lease,
+        request.mall_key,
+        request.sku_id,
+        request.url,
+        request.backend_version,
+        "batch-crawl-fingerprint",
+    )
+    store.link_crawl_work_to_remote_job(lease, int(crawl["id"]), int(job["id"]))
+    store.claim_remote_submission(lease, int(job["id"]))
+    identity = prepared.remote_identity.durable_value()
+    if state == "SUBMIT_UNKNOWN":
+        store.mark_submit_unknown(lease, int(job["id"]), "simulated crash")
+    elif state == "PRIORITY_PENDING":
+        store.reconcile_remote_job(
+            lease,
+            int(job["id"]),
+            remote_identity=identity,
+            state="PRIORITY_PENDING",
+        )
+        store.advance_crawl_work_for_job(lease, int(job["id"]), "PRIORITY_PENDING")
+    else:
+        raise AssertionError(state)
+    return prepared, store.get_remote_job(int(job["id"])), store.get_crawl_work(int(crawl["id"]))
+
+
+def test_batch_unknown_reconcile_rolls_back_remote_and_crawl_on_sqlite_failure(tmp_path):
+    store = DailyAuditStore(tmp_path / "batch-unknown-atomic.sqlite3")
+    lease = _lease(store)
+    prepared, job, crawl = _seed_batch_remote_job(store, lease, state="SUBMIT_UNKNOWN")
+    with store._transaction(immediate=True) as connection:
+        connection.execute(
+            """CREATE TRIGGER fail_batch_unknown_crawl_update
+               BEFORE UPDATE ON crawl_work
+               BEGIN
+                   SELECT RAISE(ABORT, 'injected failure');
+               END"""
+        )
+
+    with pytest.raises(sqlite3.IntegrityError, match="injected failure"):
+        store.reconcile_batch_remote_job_and_crawl_work(
+            lease,
+            int(job["id"]),
+            remote_identity=prepared.remote_identity.durable_value(),
+        )
+
+    assert store.get_remote_job(int(job["id"]))["state"] == "SUBMIT_UNKNOWN"
+    assert store.get_remote_job(int(job["id"]))["remote_identity"] is None
+    assert store.get_crawl_work(int(crawl["id"]))["state"] == "PENDING"
+
+
+def test_batch_priority_confirmation_rolls_back_remote_and_crawl_on_sqlite_failure(tmp_path):
+    store = DailyAuditStore(tmp_path / "batch-priority-atomic.sqlite3")
+    lease = _lease(store)
+    prepared, job, crawl = _seed_batch_remote_job(store, lease, state="PRIORITY_PENDING")
+    with store._transaction(immediate=True) as connection:
+        connection.execute(
+            """CREATE TRIGGER fail_batch_priority_crawl_update
+               BEFORE UPDATE ON crawl_work
+               BEGIN
+                   SELECT RAISE(ABORT, 'injected failure');
+               END"""
+        )
+
+    with pytest.raises(sqlite3.IntegrityError, match="injected failure"):
+        store.confirm_batch_remote_job_priority_and_crawl_work(
+            lease,
+            int(job["id"]),
+            remote_identity=prepared.remote_identity.durable_value(),
+        )
+
+    assert store.get_remote_job(int(job["id"]))["state"] == "PRIORITY_PENDING"
+    assert store.get_crawl_work(int(crawl["id"]))["state"] == "PRIORITY_PENDING"
+
+
+@pytest.mark.parametrize(
+    "identity_mutation",
+    [
+        lambda identity: {**identity, "batchNumber": "wrong-batch"},
+        lambda identity: {**identity, "mallLogo": "wrong-mall"},
+        lambda identity: {**identity, "executeNumbers": []},
+        lambda identity: {
+            **identity,
+            "executeNumbers": [
+                *identity["executeNumbers"],
+                identity["executeNumbers"][0],
+            ],
+        },
+        lambda identity: {**identity, "executeNumbers": ["wrong-exec"]},
+    ],
+)
+def test_batch_atomic_reconcile_rejects_typed_identity_drift(tmp_path, identity_mutation):
+    store = DailyAuditStore(tmp_path / "batch-identity.sqlite3")
+    lease = _lease(store)
+    prepared, job, crawl = _seed_batch_remote_job(store, lease, state="SUBMIT_UNKNOWN")
+    identity = json.loads(prepared.remote_identity.durable_value())
+
+    with pytest.raises(RemoteIntentConflict):
+        store.reconcile_batch_remote_job_and_crawl_work(
+            lease,
+            int(job["id"]),
+            remote_identity=json.dumps(identity_mutation(identity)),
+        )
+
+    assert store.get_remote_job(int(job["id"]))["state"] == "SUBMIT_UNKNOWN"
+    assert store.get_crawl_work(int(crawl["id"]))["state"] == "PENDING"
+
+
+@pytest.mark.parametrize("drift", ["contract", "logical_key", "payload_hash"])
+def test_batch_atomic_reconcile_rejects_durable_payload_drift(tmp_path, drift):
+    store = DailyAuditStore(tmp_path / "batch-payload-drift.sqlite3")
+    lease = _lease(store)
+    prepared, job, crawl = _seed_batch_remote_job(store, lease, state="SUBMIT_UNKNOWN")
+    with store._transaction(immediate=True) as connection:
+        row = connection.execute(
+            "SELECT payload_json FROM remote_jobs WHERE id=?", (int(job["id"]),)
+        ).fetchone()
+        payload = json.loads(row["payload_json"])
+        if drift == "contract":
+            payload["contract_version"] = "unsupported"
+            connection.execute(
+                "UPDATE remote_jobs SET payload_json=? WHERE id=?",
+                (json.dumps(payload), int(job["id"])),
+            )
+        elif drift == "logical_key":
+            payload["logical_job_key"] = "wrong-logical-key"
+            connection.execute(
+                "UPDATE remote_jobs SET payload_json=? WHERE id=?",
+                (json.dumps(payload), int(job["id"])),
+            )
+        else:
+            connection.execute(
+                "UPDATE remote_jobs SET payload_hash='wrong-hash' WHERE id=?",
+                (int(job["id"]),),
+            )
+
+    with pytest.raises(RemoteIntentConflict):
+        store.reconcile_batch_remote_job_and_crawl_work(
+            lease,
+            int(job["id"]),
+            remote_identity=prepared.remote_identity.durable_value(),
+        )
+
+    assert store.get_remote_job(int(job["id"]))["state"] == "SUBMIT_UNKNOWN"
+    assert store.get_crawl_work(int(crawl["id"]))["state"] == "PENDING"
+
+
+def test_batch_atomic_reconcile_rejects_non_string_identity_scalars(tmp_path):
+    store = DailyAuditStore(tmp_path / "batch-identity-types.sqlite3")
+    lease = _lease(store)
+    prepared, job, crawl = _seed_batch_remote_job(
+        store, lease, state="SUBMIT_UNKNOWN", mall_key="3"
+    )
+    identity = json.loads(prepared.remote_identity.durable_value())
+    identity["mallLogo"] = 3
+
+    with pytest.raises(RemoteIntentConflict):
+        store.reconcile_batch_remote_job_and_crawl_work(
+            lease,
+            int(job["id"]),
+            remote_identity=json.dumps(identity),
+        )
+
+    assert store.get_remote_job(int(job["id"]))["state"] == "SUBMIT_UNKNOWN"
+    assert store.get_crawl_work(int(crawl["id"]))["state"] == "PENDING"
 
 
 def test_customer_fingerprint_is_part_of_audit_version_and_same_snapshot_is_unchanged(store):
@@ -648,6 +853,63 @@ def test_new_source_inherits_terminal_exact_backend_pair_without_resubmit(store)
     assert reused["state"] == "TERMINAL_FAILED"
     assert reused["error_text"] == "export missing exact pair"
     assert reused["remote_job_id"] is None
+
+
+def test_batch_source_never_reuses_another_sources_active_or_terminal_result(store):
+    lease = _lease(store)
+    active_job = store.prepare_remote_intent(
+        lease, "batch-active", "batch-active", "payload-active"
+    )
+    active = store.ensure_crawl_work(
+        lease,
+        "jd",
+        "SKU-1",
+        "https://example/p1",
+        "batch-url-v1",
+        "crawl-a",
+        source_id="source-a",
+    )
+    store.link_crawl_work_to_remote_job(
+        lease, int(active["id"]), int(active_job["id"])
+    )
+    late_active = store.ensure_crawl_work(
+        lease,
+        "jd",
+        "SKU-1",
+        "https://example/p1",
+        "batch-url-v1",
+        "crawl-b",
+        source_id="source-b",
+    )
+
+    terminal = store.ensure_crawl_work(
+        lease,
+        "jd",
+        "SKU-2",
+        "https://example/p2",
+        "batch-url-v1",
+        "crawl-c",
+        source_id="source-c",
+    )
+    store.complete_crawl_work(lease, int(terminal["id"]), {"price": "10"})
+    late_terminal = store.ensure_crawl_work(
+        lease,
+        "jd",
+        "SKU-2",
+        "https://example/p2",
+        "batch-url-v1",
+        "crawl-d",
+        source_id="source-d",
+    )
+
+    assert store.reuse_successful_crawl_work(
+        lease, int(late_active["id"])
+    ) is None
+    assert store.reuse_successful_crawl_work(
+        lease, int(late_terminal["id"])
+    ) is None
+    assert store.get_crawl_work(int(late_active["id"]))["remote_job_id"] is None
+    assert store.get_crawl_work(int(late_terminal["id"]))["state"] == "PENDING"
 
 
 def test_completed_export_can_resolve_exact_terminal_crawl_as_no_result(store):
