@@ -55,7 +55,7 @@ from app.services.batch_sql_result_adapter import (
     BatchSqlResultAdapter,
     batch_sql_result_to_crawl_result,
 )
-from app.services.zhaoshang_url_identity import is_absolute_http_url
+from app.services.zhaoshang_url_identity import is_batch_submitted_url_supported
 from app.services.daily_audit_store import (
     DailyAuditStore,
     FrozenSnapshotConflict,
@@ -1606,7 +1606,7 @@ def _zhaoshang_backend_version_for_mall(
     if (
         selected_backend == "batch"
         and mall_key in ALLOWED_MALLS
-        and is_absolute_http_url(url)
+        and is_batch_submitted_url_supported(mall_key, url)
     ):
         return "batch-url-v1"
     return "legacy-v1"

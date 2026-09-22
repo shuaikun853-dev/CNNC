@@ -15,6 +15,7 @@ from app.services.batch_sql_result_adapter import (
     batch_sql_result_to_crawl_result,
 )
 from app.services.page_price_semantics import valid_page_price_result
+from app.services import zhaoshang_url_identity
 
 
 class _Cursor:
@@ -160,7 +161,9 @@ PROVEN_BATCH_RESULT_MALLS = {
     "jd",
     "lxwl",
     "lxwlmall",
+    "mymro",
     "nbdeli",
+    "ofs",
     "qstbg",
     "suning",
     "tima",
@@ -178,10 +181,14 @@ def test_allowlist_contains_only_proven_batch_result_malls():
 
 @pytest.mark.parametrize("mall", sorted(PROVEN_BATCH_RESULT_MALLS))
 def test_fetches_exact_identity_from_the_allowlisted_mall(mall):
-    factory = _Factory(lambda _sql, _params: [_row()])
+    expected_url = {
+        "mymro": "https://www.mymro.cn/u-98S6010.html",
+        "ofs": "https://www.ofs.cn/product-3975210.html",
+    }.get(mall, "https://example.test/product/1")
+    factory = _Factory(lambda _sql, _params: [_row(url=expected_url)])
     adapter = BatchSqlResultAdapter(factory)
 
-    result = adapter.fetch_batch_results(mall, [_target()])
+    result = adapter.fetch_batch_results(mall, [_target(url=expected_url)])
 
     assert result[0].status == BatchResultStatus.FOUND
     assert result[0].execute_number == "mrwang-0000000000000001"
@@ -203,8 +210,6 @@ def test_fetches_exact_identity_from_the_allowlisted_mall(mall):
         "dezhi",
         "eascs",
         "epec",
-        "mymro",
-        "ofs",
         "synthware",
         "tansoole",
         "xinminghui",
@@ -311,6 +316,121 @@ def test_one_exact_row_among_multiple_join_candidates_is_still_ambiguous():
 
     assert result[0].status is BatchResultStatus.IDENTITY_CONFLICT
     assert "candidate" in result[0].diagnostic
+
+
+@pytest.mark.parametrize(
+    ("mall", "submitted_url", "expected_code"),
+    [
+        ("mymro", "https://www.mymro.cn/u-98S6010.html", "98S6010"),
+        ("ofs", "https://www.ofs.cn/product-3975210.html", "3975210"),
+        (
+            "ofs",
+            "https://www.officemate.cn/gallery.html?scontent=n,6258398",
+            "6258398",
+        ),
+    ],
+)
+def test_submitted_url_product_code_uses_only_proven_mymro_and_ofs_formats(
+    mall, submitted_url, expected_code
+):
+    assert zhaoshang_url_identity.submitted_url_product_code(
+        mall, submitted_url
+    ) == expected_code
+
+
+@pytest.mark.parametrize(
+    ("mall", "submitted_url"),
+    [
+        ("mymro", "https://evil.example/u-98S6010.html"),
+        ("mymro", "https://www.mymro.cn/p/98S6010"),
+        ("mymro", "https://www.mymro.cn/u-98S6010.html?ref=1"),
+        ("ofs", "https://evil.example/product-3975210.html"),
+        ("ofs", "https://www.ofs.cn/p/3975210"),
+        ("ofs", "https://www.officemate.cn/gallery.html?scontent=6258398"),
+        ("jd", "https://www.ofs.cn/product-3975210.html"),
+    ],
+)
+def test_submitted_url_product_code_rejects_unproven_formats(mall, submitted_url):
+    assert zhaoshang_url_identity.submitted_url_product_code(
+        mall, submitted_url
+    ) is None
+
+
+def test_mymro_unique_execute_result_accepts_changed_result_identity():
+    result = BatchSqlResultAdapter(
+        _Factory(
+            lambda _sql, _params: [
+                _row(
+                    price_goods_no="result-B",
+                    price_sku_id="result-B",
+                    goods_no="result-B",
+                    sku_id="result-B",
+                    url="https://www.mymro.cn/u-resultC.html",
+                )
+            ]
+        )
+    ).fetch_batch_results(
+        "mymro",
+        [
+            _target(
+                sku="submitted-A",
+                url="https://www.mymro.cn/u-98S6010.html",
+            )
+        ],
+    )[0]
+
+    assert result.status is BatchResultStatus.FOUND
+    assert result.sku_id == "result-B"
+
+
+def test_ofs_unique_execute_result_accepts_changed_result_identity():
+    result = BatchSqlResultAdapter(
+        _Factory(
+            lambda _sql, _params: [
+                _row(
+                    price_goods_no="6258398",
+                    price_sku_id="6258398",
+                    goods_no="6258398",
+                    sku_id="6258398",
+                    url=(
+                        "https://www.officemate.cn/gallery.html?"
+                        "scontent=n,6258398"
+                    ),
+                )
+            ]
+        )
+    ).fetch_batch_results(
+        "ofs",
+        [
+            _target(
+                sku="submitted-sku",
+                url="https://www.ofs.cn/product-3975210.html",
+            )
+        ],
+    )[0]
+
+    assert result.status is BatchResultStatus.FOUND
+    assert result.sku_id == "6258398"
+
+
+@pytest.mark.parametrize(
+    ("mall", "url"),
+    [
+        ("mymro", "https://www.mymro.cn/u-98S6010.html"),
+        ("ofs", "https://www.ofs.cn/product-3975210.html"),
+    ],
+)
+def test_submitted_code_authoritative_malls_still_reject_multiple_execute_results(
+    mall, url
+):
+    rows = [_row(), _row(sku_id="second", goods_no="second")]
+
+    result = BatchSqlResultAdapter(
+        _Factory(lambda _sql, _params: rows)
+    ).fetch_batch_results(mall, [_target(url=url)])[0]
+
+    assert result.status is BatchResultStatus.IDENTITY_CONFLICT
+    assert "2 candidate rows" in result.diagnostic
 
 
 def test_positive_price_and_title_convert_to_valid_normal_crawl_result():

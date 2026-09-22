@@ -6,6 +6,9 @@ import re
 from urllib.parse import parse_qsl, urlparse
 
 
+SUBMITTED_CODE_AUTHORITATIVE_MALLS = frozenset({"mymro", "ofs"})
+
+
 def canonicalize_new_zhaoshang_url(value: object) -> str:
     """Map the retired jslink host to the canonical nbdeli host for new work."""
     text = str(value or "").strip()
@@ -46,6 +49,42 @@ def is_absolute_http_url(value: object) -> bool:
         )
     except ValueError:
         return False
+
+
+def submitted_url_product_code(mall: str, value: object) -> str | None:
+    """Extract a product code only from evidenced mymro/ofs submit URLs."""
+    mall_key = str(mall or "").strip()
+    text = str(value or "").strip()
+    if mall_key not in SUBMITTED_CODE_AUTHORITATIVE_MALLS or not text:
+        return None
+    try:
+        parsed = urlparse(text)
+    except ValueError:
+        return None
+    if parsed.scheme != "https" or parsed.fragment or parsed.params:
+        return None
+    if mall_key == "mymro":
+        if parsed.netloc != "www.mymro.cn" or parsed.query:
+            return None
+        match = re.fullmatch(r"/u-([A-Za-z0-9]+)\.html", parsed.path)
+        return match.group(1) if match is not None else None
+    if parsed.netloc == "www.ofs.cn" and not parsed.query:
+        match = re.fullmatch(r"/product-([0-9]+)\.html", parsed.path)
+        return match.group(1) if match is not None else None
+    if parsed.netloc == "www.officemate.cn" and parsed.path == "/gallery.html":
+        match = re.fullmatch(r"scontent=n,([0-9]+)", parsed.query)
+        return match.group(1) if match is not None else None
+    return None
+
+
+def is_batch_submitted_url_supported(mall: str, value: object) -> bool:
+    """Require strict submitted-code parsing only for mymro and ofs."""
+    mall_key = str(mall or "").strip()
+    if not is_absolute_http_url(value):
+        return False
+    if mall_key in SUBMITTED_CODE_AUTHORITATIVE_MALLS:
+        return submitted_url_product_code(mall_key, value) is not None
+    return True
 
 
 def _strict_qstbg_legacy_rewrite(

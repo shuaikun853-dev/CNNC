@@ -13,7 +13,11 @@ from typing import Any, Callable, Iterator, Mapping, Protocol, Sequence
 from urllib.parse import urlsplit
 
 from app.services.page_price_semantics import valid_page_price_result
-from app.services.zhaoshang_url_identity import strict_batch_result_url_match
+from app.services.zhaoshang_url_identity import (
+    SUBMITTED_CODE_AUTHORITATIVE_MALLS,
+    strict_batch_result_url_match,
+    submitted_url_product_code,
+)
 
 
 MAX_QUERY_EXECUTE_NUMBERS = 100
@@ -28,7 +32,9 @@ ALLOWED_MALLS = frozenset(
         "jd",
         "lxwl",
         "lxwlmall",
+        "mymro",
         "nbdeli",
+        "ofs",
         "qstbg",
         "suning",
         "tima",
@@ -213,6 +219,8 @@ def _urls_match(mall: str, left: Any, right: Any) -> bool:
 
 
 def _matches_identity(mall: str, row: Mapping[str, Any], target: BatchResultTarget) -> bool:
+    if mall in SUBMITTED_CODE_AUTHORITATIVE_MALLS:
+        return submitted_url_product_code(mall, target.expected_url) is not None
     sku_values = {
         _canonical_sku(mall, row.get("price_goods_no")),
         _canonical_sku(mall, row.get("price_sku_id")),

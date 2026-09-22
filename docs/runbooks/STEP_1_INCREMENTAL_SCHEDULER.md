@@ -410,7 +410,7 @@ task name 使用业务日和 immutable 请求集生成同日稳定、跨日不�
   `03`（失败）的终态行均不强改，分别计入 `already_completed` / `already_failed`。
   确认后才从 `PRIORITY_PENDING` 进入 `SUBMITTED` 并在后续 sweep 查询 progress。重启只从 SQLite
   immutable payload 恢复 backend 与 `execute_numbers`。CLI backend 只决定新任务的 planner/submitter；
-  当前 18 个生产商城中 `mymro / ofs` 固定回退 legacy；其余 16 个走 batch。新建 `jslink.com`
+  当前 18 个生产商城均可逐链接走 batch；`mymro / ofs` 只有在提交 URL 能按已证明的严格格式解析 product code 时才标记 `batch-url-v1`，否则该链接自动回退 `legacy-v1`。这两个商城以 exact executeNumber 加 submitted URL product code 作为请求身份，唯一 SQL result 允许后续 SKU/goods_no/result URL code 变化，多条 result 仍 fail closed。新建 `jslink.com`
   及其子域 URL 先规范为 `b2b.nbdeli.com` 并按 `nbdeli` 路由；vendor-only、空 URL、hostless URL
   一律保留 legacy，Batch adapter 只接受绝对 HTTP(S) URL。历史 frozen `jslink` policy 按原 mall/source/URL
   恢复，不改写旧 SQLite。已有 legacy 与 batch job 在同一 SQLite

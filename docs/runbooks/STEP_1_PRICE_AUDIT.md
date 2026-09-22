@@ -57,7 +57,7 @@
 
 ## Batch SQL 结果契约
 
-`app/services/batch_sql_result_adapter.py` 只覆盖已经用生产只读证据验证的 allowlist。CNNC 当前 18 个生产商城中，`mymro / ofs` 继续逐商城回退 legacy，其余 16 个可走 batch；`qstbg / lxwlmall` 只接受已由历史样本证明的严格 URL 变体，新建 `jslink.com` URL 统一规范到 `nbdeli`。adapter 按实际商城分组，以最多 100 个 exact `executeNumber` 查询 `<mall>_price.exe_number`，再按 `sku_id` 关联 `<mall>_goods`，并同时校验 durable expected SKU 与 URL；不运行 26 商城 `UNION ALL`，也不依赖不存在的 HTTP export API。商城、executeNumber、SKU 或 URL 不能精确验证时必须 fail closed。
+`app/services/batch_sql_result_adapter.py` 只覆盖已经用生产只读证据验证的 allowlist。CNNC 当前 18 个生产商城均可逐链接走 batch；`mymro / ofs` 只有在提交 URL 可按严格已证明格式解析 product code 时才走 batch，否则该链接自动回退 legacy。adapter 按实际商城分组，以最多 100 个 exact `executeNumber` 查询 `<mall>_price.exe_number`，再按 `sku_id` 关联 `<mall>_goods`。`mymro / ofs` 以 exact executeNumber 加 submitted URL product code 作为请求身份：恰好一条 SQL result 即归属该请求，允许 result SKU、goods_no 和 URL code 变化；多条仍为 identity conflict。其他商城继续同时校验 durable expected SKU 与 URL，`qstbg / lxwlmall` 只接受已由历史样本证明的严格 URL 变体。新建 `jslink.com` URL 统一规范到 `nbdeli`；不运行 26 商城 `UNION ALL`，也不依赖不存在的 HTTP export API。商城或 executeNumber 不能精确验证时必须 fail closed。
 
 结果为零不能直接记为 `NO_RESULT`：`task_status=00/01` 是 `NOT_YET_VISIBLE`，`03` 是 `CRAWLER_FAILED`；`02` 只有存在独立 spider-log 等终态无结果证据时才是 `TERMINAL_NO_RESULT`，否则保持 `EVIDENCE_INCOMPLETE`。该 adapter 已接入 `incremental_audit_runtime.py`；production 默认仍为 legacy，显式选择 batch 时使用上述逐商城混合路由，已有任务始终按 durable payload 恢复。
 
