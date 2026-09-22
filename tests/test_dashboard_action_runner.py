@@ -272,3 +272,33 @@ def test_list_recent_running_first(tmp_path):
     listed = runner.list_recent()
     assert listed[0].action_id == running.action_id
     assert running.status == "RUNNING" and done.status == "SUCCEEDED"
+
+
+def test_fake_supervisor_threads_do_not_leak_into_later_tests():
+    import threading
+    leaked = [thread.name for thread in threading.enumerate()
+              if thread.name.startswith('dashboard-action-')]
+    assert not leaked, f'Previous test left fake action workers alive: {leaked}'
+
+
+@pytest.fixture(autouse=True)
+def _finish_only_this_tests_fake_processes(monkeypatch):
+    """Do not let fake worker threads see the next test's global time patches."""
+    import threading
+    previous_threads = set(threading.enumerate())
+    processes = []
+    original_init = _FakeProcess.__init__
+
+    def tracked_init(self, *args, **kwargs):
+        original_init(self, *args, **kwargs)
+        processes.append(self)
+
+    monkeypatch.setattr(_FakeProcess, '__init__', tracked_init)
+    yield
+    for process in processes:
+        process.terminate()
+    own_threads = [thread for thread in threading.enumerate()
+                   if thread not in previous_threads and thread.name.startswith('dashboard-action-')]
+    for thread in own_threads:
+        thread.join(timeout=5)
+    assert not any(thread.is_alive() for thread in own_threads), 'Fake worker cleanup failed'

@@ -136,19 +136,19 @@ from app.services.customer_reference_routing import (
     classify_reference_url,
 )
 from app.services.daily_audit_store import LeaseUnavailable, ProcessLock
-from app.services.incremental_audit_runtime import DEFAULT_RUNTIME_ROOT
+from app.services.runtime_context import DEFAULT_RUNTIME_ROOT
 from app.services.staples_prewarm import (
     STAPLES_CACHE_MALL_KEY,
     STAPLES_OUTCOME_SUCCESS,
     StaplesLocalCrawler,
 )
-from scripts.staples_prewarm_run import (
+from app.services.runtime_context import (
     DEFAULT_WORK_DIR_NAME,
     PREWARM_STORE_NAME,
     SHARED_CACHE_NAME,
     STAPLES_LOCK_NAME,
 )
-from scripts.zhaoshang_mall_mapping import load_zhaoshang_mall_mappings
+from app.integrations.zhaoshang_mall_mapping import load_zhaoshang_mall_mappings
 
 MANUAL_RECRAWL_SOURCE_STAPLES = "manual-recrawl-staples"
 
@@ -522,7 +522,7 @@ class ManualRecrawlRunner:
 
         # Lazy imports stay INSIDE the cross-day path: the worker still never
         # imports any closeout / STEP2 / STEP3 / push module (§44 isolation).
-        from app.services.incremental_audit_runtime import runtime_paths
+        from app.services.runtime_context import runtime_paths
 
         paths = runtime_paths(job_business_date, self.runtime_root)
         prewarm_db = Path(self.runtime_root) / PREWARM_STORE_NAME

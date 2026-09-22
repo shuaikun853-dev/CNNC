@@ -27,7 +27,7 @@ from typing import Sequence
 from urllib.parse import urlparse
 
 from app.services.customer_prewarm_discovery import route_url
-from scripts.zhaoshang_mall_mapping import ZhaoshangMallMapping
+from app.integrations.zhaoshang_mall_mapping import ZhaoshangMallMapping
 
 OUTCOME_ZHAOSHANG = "ZHAOSHANG"
 OUTCOME_STAPLES = "STAPLES"

@@ -1758,10 +1758,18 @@
     const local = p.local || {}, startup = p.startup || {};
     const remote = p.remote || {}, cmp = p.comparison || {};
     const schedOk = p.scheduler && p.scheduler.status === "OK";
-    chips.textContent = "版本 " + piStatusWord(cmp.version_status) +
+    const tasks = (p.scheduler && Array.isArray(p.scheduler.tasks)) ? p.scheduler.tasks : [];
+    const registered = tasks.filter((t) => t.registered === true).length;
+    const schedulerWord = !schedOk ? "未知" : !registered ? "未注册"
+      : registered === tasks.length ? "已注册" : "部分注册";
+    const runtime = p.runtime_identity;
+    const runtimeWords = { MATCH: "批准清单项一致（不等于业务验收）", MISMATCH: "与批准清单不一致",
+      UNCONFIGURED: "尚未配置运行清单", UNAPPROVED: "运行清单尚未批准", UNKNOWN: "证据不足" };
+    const runtimeText = runtime ? (runtimeWords[runtime.status] || "证据不足") : "未提供（旧版本接口）";
+    chips.textContent = "代码版本 " + piStatusWord(cmp.version_status) +
       " · " + (local.git_branch || remote.branch || "—") +
       " · " + (local.git_sha || startup.git_sha || "").slice(0, 8) +
-      " · 调度器 " + (schedOk ? "已注册" : "未知");
+      " · 调度器 " + schedulerWord + " · 环境 " + runtimeText;
     const statusEl = $("#pi-status");
     if (statusEl) {
       const color = cmp.version_status === "MATCH" ? "var(--ok)"
@@ -1772,6 +1780,11 @@
         esc(piStatusText(cmp.version_status)) + "</div>";
       (cmp.alerts || []).forEach((a) => {
         html += '<div style="color:var(--warn)">⚠ ' + esc(a) + "</div>";
+      });
+      html += '<div style="color:' + (runtime && runtime.status === "MATCH" ? "var(--muted)" : "var(--warn)") +
+        '">运行环境核验：' + esc(runtimeText) + "</div>";
+      if (runtime && Array.isArray(runtime.issues)) runtime.issues.slice(0, 5).forEach((issue) => {
+        html += '<div style="color:var(--warn)">' + esc(String(issue)) + "</div>";
       });
       statusEl.innerHTML = html;
     }
@@ -1784,13 +1797,14 @@
         ["GitHub 生产分支 HEAD", piShaText(remote.git_sha)],
         ["生产分支", remote.branch || "—"],
         ["工作区", piWorkingTreeText(local)],
+        ["运行环境核验", runtimeText],
         ["进程启动时间", (proc.started_at || "—") +
           (proc.started_at_source ? "(" + proc.started_at_source + ")" : "")],
         ["Python", (py.version || "—") + (py.virtualenv ? " · venv" : " · 系统")],
       ];
       ((p.scheduler && p.scheduler.tasks) || []).forEach((t) => {
         rows.push(["计划任务 " + (t.name || "—"),
-          (t.registered ? "已注册" : "未注册") +
+          (t.registered === true ? "已注册" : schedOk ? "未注册" : "未确认") +
           " · " + (t.state || "—") +
           " · LastRun " + (t.last_run_time || "—") +
           " · Result " + (t.last_task_result == null ? "—" : t.last_task_result)]);

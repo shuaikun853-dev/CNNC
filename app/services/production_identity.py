@@ -18,15 +18,19 @@ scheduler(计划任务注册状态)/ comparison(三者关系结论 + 中文 aler
 from __future__ import annotations
 
 import json
+from copy import deepcopy
 import os
+import re
 import subprocess
 import sys
 import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from zoneinfo import ZoneInfo
+
+from app.services.runtime_fingerprint import verify_manifest as verify_runtime_manifest
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 
@@ -75,17 +79,17 @@ def _make_default_command_runner(cwd: str):
 
 
 def _is_artifact_path(path: str) -> bool:
-    """运行产物判定:__pycache__ / .pyc/.pyo / _run/ / runtime/ / .pytest* /
-    data/ 下的 .bak 备份;其余一律算代码改动。"""
-    if "__pycache__" in path:
+    value = path.replace(chr(92), '/')
+    parsed = PurePosixPath(value)
+    suffix = parsed.suffix.lower()
+    if suffix in {'.py','.pyw','.ps1','.bat','.cmd','.exe','.dll','.pyd','.sh','.js'}:
+        return False
+    if '__pycache__' in parsed.parts or suffix in {'.pyc','.pyo'}:
         return True
-    if path.endswith((".pyc", ".pyo")):
+    if value.startswith(('_run/', 'runtime/', '.pytest')):
         return True
-    if path.startswith(("_run/", "runtime/", ".pytest")):
-        return True
-    if path.startswith("data/") and ".bak" in path:
-        return True
-    return False
+    return value.startswith('data/') and suffix == '.bak'
+
 
 
 def _classify_dirty(paths: list[str]) -> dict:
@@ -156,7 +160,7 @@ def build_comparison(startup: dict, local: dict, remote: dict, is_ancestor=None)
     version_status = (
         "CODE_CHANGED_AFTER_PROCESS_START"
         if process_vs_local == "CODE_CHANGED_AFTER_PROCESS_START"
-        else local_vs_remote)
+        else "UNKNOWN" if process_vs_local == "UNKNOWN" else local_vs_remote)
 
     alerts: list[str] = []
     if process_vs_local == "CODE_CHANGED_AFTER_PROCESS_START":
@@ -171,6 +175,7 @@ def build_comparison(startup: dict, local: dict, remote: dict, is_ancestor=None)
         "process_vs_local": process_vs_local,
         "local_vs_remote": local_vs_remote,
         "version_status": version_status,
+        "version_scope": "repository_git_only",
         "alerts": alerts,
     }
 
@@ -205,6 +210,8 @@ class ProductionIdentityService:
         self._local_lock = threading.Lock()
         self._remote_lock = threading.Lock()
         self._scheduler_lock = threading.Lock()
+        self._runtime_identity_lock = threading.Lock()
+        self._runtime_identity_cache: tuple[float, dict] | None = None
         # startup 身份在服务初始化时一次性捕获(进程启动快照语义)
         self._startup = self._capture_startup()
 
@@ -257,7 +264,7 @@ class ProductionIdentityService:
     def _refresh_local(self) -> dict:
         block = {"status": "UNKNOWN", "git_sha": None, "git_branch": None,
                  "detached_head": False, "working_tree": "UNKNOWN",
-                 "dirty": _classify_dirty([])}
+                 "dirty": {**_classify_dirty([]), "classification": "UNKNOWN"}}
         try:
             res = self._git("rev-parse", "HEAD")
             if res.returncode == 0 and res.stdout.strip():
@@ -284,10 +291,10 @@ class ProductionIdentityService:
         with self._local_lock:
             if (self._local_cache is not None
                     and time.monotonic() - self._local_cache[0] <= self._local_ttl):
-                return dict(self._local_cache[1])
+                return deepcopy(self._local_cache[1])
             value = self._refresh_local()
-            self._local_cache = (time.monotonic(), value)
-            return dict(value)
+            self._local_cache = (time.monotonic(), deepcopy(value))
+            return deepcopy(value)
 
     # ---- remote(GitHub 生产分支 HEAD,TTL 缓存)----
 
@@ -302,14 +309,19 @@ class ProductionIdentityService:
                 timeout=self._remote_timeout)
             if res.returncode == 0:
                 lines = [line for line in res.stdout.splitlines() if line.strip()]
-                if lines:
+                fields = lines[0].split() if len(lines) == 1 else []
+                if (len(fields) == 2 and fields[1] == f"refs/heads/{self._prod_branch}"
+                        and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", fields[0])):
                     block["status"] = "OK"
-                    block["git_sha"] = lines[0].split()[0]
+                    block["git_sha"] = fields[0]
                 else:
-                    block["error_code"] = "REMOTE_REF_NOT_FOUND"
+                    block["error_code"] = "REMOTE_REF_NOT_FOUND" if not lines else "REMOTE_REF_INVALID"
             else:
-                block["error_code"] = ((res.stderr or "").strip()
-                                       or f"EXIT_{res.returncode}")[:_MAX_ERROR_CODE_CHARS]
+                # Git stderr can embed credentials from a configured remote URL.
+                # Return only a fixed diagnostic, never raw process output.
+                safe_transport_errors = {"<FileNotFoundError>", "<TimeoutExpired>", "<PermissionError>"}
+                block["error_code"] = (res.stderr if res.returncode == -1 and res.stderr in safe_transport_errors
+                                       else f"GIT_REMOTE_EXIT_{int(res.returncode)}")
         except Exception as exc:
             block["error_code"] = f"<{type(exc).__name__}>"
         return block
@@ -318,10 +330,10 @@ class ProductionIdentityService:
         with self._remote_lock:
             if (self._remote_cache is not None
                     and time.monotonic() - self._remote_cache[0] <= self._remote_ttl):
-                return dict(self._remote_cache[1])
+                return deepcopy(self._remote_cache[1])
             value = self._refresh_remote()
-            self._remote_cache = (time.monotonic(), value)
-            return dict(value)
+            self._remote_cache = (time.monotonic(), deepcopy(value))
+            return deepcopy(value)
 
     # ---- scheduler(计划任务注册状态,TTL 缓存;ps1 只读查询)----
 
@@ -343,11 +355,14 @@ class ProductionIdentityService:
                 if res.returncode == 0:
                     text = res.stdout.strip()
                     # "null" 或 JSON null → 任务未注册(registered False)
-                    data = None if text in ("", "null") else json.loads(text)
+                    data = None if text == "null" else json.loads(text)
                 else:
                     all_queries_ok = False
                 if isinstance(data, dict):
-                    if "error" in data:
+                    if ("error" in data or data.get("task_name") != name
+                            or not isinstance(data.get("state"), str)
+                            or not isinstance(data.get("action"), str)
+                            or type(data.get("last_task_result")) is not int):
                         entry["state"] = "UNKNOWN"   # error payload = 查询失败 → 整块降级
                         all_queries_ok = False
                     else:
@@ -358,7 +373,10 @@ class ProductionIdentityService:
                             "next_run_time": data.get("next_run_time"),
                             "last_task_result": data.get("last_task_result"),
                             "action": data.get("action"),
+                            "definition_sha256": data.get("definition_sha256"),
                         })
+                elif data is not None:
+                    all_queries_ok = False
             except Exception:
                 all_queries_ok = False
             block["tasks"].append(entry)
@@ -369,16 +387,41 @@ class ProductionIdentityService:
         with self._scheduler_lock:
             if (self._scheduler_cache is not None
                     and time.monotonic() - self._scheduler_cache[0] <= self._scheduler_ttl):
-                return dict(self._scheduler_cache[1])
+                return deepcopy(self._scheduler_cache[1])
             value = self._refresh_scheduler()
-            self._scheduler_cache = (time.monotonic(), value)
-            return dict(value)
+            self._scheduler_cache = (time.monotonic(), deepcopy(value))
+            return deepcopy(value)
+
+    def _runtime_identity_snapshot(self, scheduler: dict) -> dict:
+        """Additional read-only evidence; never turns Git MATCH into full approval."""
+        with self._runtime_identity_lock:
+            if self._runtime_identity_cache is not None:
+                recorded_at, cached = self._runtime_identity_cache
+                if time.monotonic() - recorded_at <= self._local_ttl:
+                    return deepcopy(cached)
+            manifest_path = self._repo_root / "data" / "production_manifest.json"
+            try:
+                if not manifest_path.is_file():
+                    value = {"status": "UNCONFIGURED", "issues": ["RUNTIME_MANIFEST_NOT_CONFIGURED"]}
+                else:
+                    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                    definitions = {task["name"]: task.get("definition_sha256")
+                                   for task in scheduler.get("tasks", [])
+                                   if task.get("name")}
+                    value = verify_runtime_manifest(self._repo_root, manifest,
+                                                    scheduler_definitions=definitions)
+            except (OSError, ValueError):
+                value = {"status": "UNKNOWN", "issues": ["RUNTIME_MANIFEST_READ_FAILED"]}
+            except Exception:
+                value = {"status": "UNKNOWN", "issues": ["RUNTIME_IDENTITY_VERIFICATION_FAILED"]}
+            self._runtime_identity_cache = (time.monotonic(), value)
+            return deepcopy(value)
 
     # ---- 对外唯一接口:绝不抛异常 ----
 
     def snapshot(self) -> dict:
         try:
-            startup = dict(self._startup)
+            startup = deepcopy(self._startup)
             local = self._local_snapshot()
             remote = self._remote_snapshot()
             scheduler = self._scheduler_snapshot()
@@ -386,10 +429,11 @@ class ProductionIdentityService:
                 startup, local, remote, is_ancestor=self._is_ancestor)
             return {"generated_at": _now_iso(), "startup": startup,
                     "local": local, "remote": remote,
-                    "scheduler": scheduler, "comparison": comparison}
+                    "scheduler": scheduler, "comparison": comparison,
+                    "runtime_identity": self._runtime_identity_snapshot(scheduler)}
         except Exception:
             # 契约兜底:任何意外都返回结构完整的全 UNKNOWN 快照
-            startup = dict(self._startup) if isinstance(self._startup, dict) else {
+            startup = deepcopy(self._startup) if isinstance(self._startup, dict) else {
                 "status": "UNKNOWN", "git_sha": None, "git_branch": None,
                 "captured_at": _now_iso(),
                 "python": {"version": sys.version.split()[0],
@@ -399,7 +443,7 @@ class ProductionIdentityService:
             degraded = {
                 "local": {"status": "UNKNOWN", "git_sha": None, "git_branch": None,
                           "detached_head": False, "working_tree": "UNKNOWN",
-                          "dirty": _classify_dirty([])},
+                          "dirty": {**_classify_dirty([]), "classification": "UNKNOWN"}},
                 "remote": {"status": "UNKNOWN", "git_sha": None,
                            "branch": self._prod_branch, "checked_at": _now_iso(),
                            "error_code": "SNAPSHOT_FAILED"},
@@ -408,6 +452,7 @@ class ProductionIdentityService:
             }
             return {"generated_at": _now_iso(), "startup": startup,
                     **degraded,
+                    "runtime_identity": {"status": "UNKNOWN", "issues": ["SNAPSHOT_FAILED"]},
                     "comparison": build_comparison(startup, degraded["local"],
                                                    degraded["remote"])}
 

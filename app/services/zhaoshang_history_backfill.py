@@ -48,7 +48,7 @@ from app.services.customer_prewarm_discovery import (
     _open_state_db_readonly,
     is_temporary_request_code,
 )
-from app.services.customer_prewarm_dispatch import _reconstruct_prepared_job
+from app.services.customer_prewarm_execution import _reconstruct_prepared_job
 from app.services.crawl_url_identity import (
     SKU_STATUS_CONFIRMED,
     SKU_STATUS_UNRESOLVED,

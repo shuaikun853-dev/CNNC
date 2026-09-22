@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Callable, Mapping, Sequence
 
-from app.services.remote_running_recovery import (
+from app.services.remote_execution_policy import (
     RemoteExecutionState,
     canonical_progress_signature,
     classify_remote_execution_state,

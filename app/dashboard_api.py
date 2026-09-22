@@ -45,14 +45,14 @@ from app.services.prewarm_manual_recrawl import (
     ManualRecrawlError,
     get_manual_recrawl_runner,
 )
-from app.services.incremental_audit_runtime import runtime_paths
+from app.services.runtime_context import runtime_paths
 from app.services.incremental_audit_status import collect_runtime_status
 from app.services.page_price_semantics import FORCE_CLOSEOUT_MISSING_PRICE_LIMIT
 from app.services.production_identity import get_production_identity_service
 from app.services.saas_flow_diagnostic import get_saas_flow_diagnostic
 # 常量单源（2026-09-10）:认证维护锁/cURL 结果工件路径由 scripts.cnnc_auth_refresh
 # 定义,dashboard 只读引用并在下方绑定为模块常量(测试可 monkeypatch 注入 tmp)。
-from scripts.cnnc_auth_refresh import (
+from app.integrations.cnnc_auth_refresh import (
     AUTH_MAINTENANCE_LOCK_PATH,
     CURL_REFRESH_RESULT_PATH,
 )
@@ -89,7 +89,7 @@ def _valid_business_date(value: str) -> bool:
 
 
 def _today() -> str:
-    from app.services.incremental_audit_runtime import business_date_in_shanghai
+    from app.services.runtime_context import business_date_in_shanghai
     return business_date_in_shanghai()
 
 
@@ -537,7 +537,7 @@ def _load_curl_refresh_result() -> dict | None:
 @router.get("/api/cnnc-auth/status")
 def dashboard_cnnc_auth_status() -> JSONResponse:
     """CNNC 认证只读状态;get_status 纯本地读(state/cURL 文件),无网络副作用。"""
-    from scripts.cnnc_auth_core import CnncAuthProvider
+    from app.integrations.cnnc_auth_core import CnncAuthProvider
     try:
         payload = CnncAuthProvider().get_status()
     except Exception as exc:  # 读取失败只降级本面板,不暴露堆栈
@@ -569,7 +569,7 @@ def dashboard_cnnc_auth_login(request: Request) -> JSONResponse:
     # 变运行状态；stale 残留（锁文件在、锁未被持有）不影响启动。锁路径经
     # scripts.cnnc_auth_refresh 模块属性解析，测试可注入 tmp。
     from app.services.daily_audit_store import ProcessLock
-    from scripts.cnnc_auth_refresh import LOGIN_RECOVERY_LOCK_PATH
+    from app.integrations.cnnc_auth_refresh import LOGIN_RECOVERY_LOCK_PATH
     lock_info = ProcessLock.inspect(LOGIN_RECOVERY_LOCK_PATH)
     if lock_info["active"]:
         # 持有者语义区分文案（owner metadata command 可读回）:cURL 刷新持有

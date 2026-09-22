@@ -10,7 +10,7 @@ capability.  This module intentionally imports only: ``json`` / ``re`` /
 ``app.services.crawl_url_identity``,
 ``app.services.customer_prewarm_store``, ``app.services.shared_crawl_cache``
 and - lazily, inside a method so importing this module never costs openpyxl -
-``scripts.monitor_stb_fallback`` (the existing, single stbchina wrapper that
+``app.integrations.monitor_stb_fallback`` (the existing, single stbchina wrapper that
 must be reused instead of writing a second crawler).
 
 Responsibilities (library code never prints):
@@ -264,7 +264,7 @@ class StaplesLocalCrawler:
             # importlib.import_module resolves via sys.modules FIRST (unlike
             # ``from scripts import ...``, which prefers an attribute already
             # bound on the package), so test injection is deterministic.
-            self._monitor_module = importlib.import_module("scripts.monitor_stb_fallback")
+            self._monitor_module = importlib.import_module("app.integrations.monitor_stb_fallback")
         return self._monitor_module.run_stbchina_fallback
 
     def _default_failure_reader(self) -> Callable[[Path], dict[str, str]]:
@@ -1204,7 +1204,7 @@ def _resolve_crawler_availability(crawler_available: bool | None) -> dict[str, A
         try:
             # Same sys.modules-first resolution as _default_executor: makes
             # monkeypatch.setitem injection deterministic; still lazy.
-            module = importlib.import_module("scripts.monitor_stb_fallback")
+            module = importlib.import_module("app.integrations.monitor_stb_fallback")
         except Exception:  # noqa: BLE001 - plan mode must never crash on this
             module = None
     report: dict[str, Any] = {

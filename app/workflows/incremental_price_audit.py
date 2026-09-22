@@ -242,6 +242,12 @@ class TickBudget:
     total_seconds: float
     reserve_seconds: float
     monotonic: Callable[[], float]
+    lease_ttl_seconds: float = 0.0
+
+    def renewal_ttl_seconds(self) -> float:
+        # Budget exhaustion stops new work; it must not prematurely expire
+        # the lease needed to settle already-dispatched callbacks.
+        return max(1.0, self.lease_ttl_seconds, self.remaining() + self.reserve_seconds)
 
     def remaining(self) -> float:
         return max(0.0, self.total_seconds - (self.monotonic() - self.started_at))
@@ -460,7 +466,8 @@ def _harvest_batch(
         return set()
     counters["harvest_batches"] = counters.get("harvest_batches", 0) + 1
     counters["harvest_swept"] = counters.get("harvest_swept", 0) + len(claimed)
-    store.renew_lease(token, max(1, budget.remaining() + budget.reserve_seconds))
+    # Renewal must not shrink the configured fencing window while results settle.
+    store.renew_lease(token, budget.renewal_ttl_seconds())
     started = budget.monotonic()
     try:
         enriched_claimed = [
@@ -644,7 +651,7 @@ def _stage(
         external_timeout_seconds,
         max_elapsed_seconds - float(claimed["elapsed_seconds"]),
     )
-    store.renew_lease(token, max(1, budget.remaining() + budget.reserve_seconds))
+    store.renew_lease(token, budget.renewal_ttl_seconds())
     try:
         result = callback(item["row"], timeout)
     except Exception as exc:
@@ -702,7 +709,7 @@ def _is_retryable_detail_failure(exc: BaseException) -> bool:
       ...) stays retryable.  No backoff: ticks are paced by the scheduler and
       ``detail_max_attempts`` bounds the durable replay budget.
     """
-    from app.services.incremental_audit_runtime import RuntimeConfigurationError
+    from app.services.runtime_context import RuntimeConfigurationError
 
     if isinstance(exc, customer_price_semantics.DetailRequestError):
         return bool(exc.retryable)
@@ -912,7 +919,7 @@ def _stage_model_batches(
             )
             timeout = budget.callback_timeout(config.external_timeout_seconds, stage_remaining)
             started = budget.monotonic()
-            store.renew_lease(token, max(1, budget.remaining() + budget.reserve_seconds))
+            store.renew_lease(token, budget.renewal_ttl_seconds())
             outcome = dispatch_callback(claimed_groups, timeout)
             elapsed = budget.monotonic() - started
             settle_batch(claimed_groups, elapsed, outcome)
@@ -973,7 +980,7 @@ def _stage_model_batches(
                 )
                 timeout = budget.callback_timeout(config.external_timeout_seconds, stage_remaining)
                 started = budget.monotonic()
-                store.renew_lease(token, max(1, budget.remaining() + budget.reserve_seconds))
+                store.renew_lease(token, budget.renewal_ttl_seconds())
                 work_queue.put((sequence, claimed_groups, timeout))
                 inflight[sequence] = (claimed_groups, started)
                 sequence += 1
@@ -1033,7 +1040,7 @@ def _submit(
         claim = store.claim_remote_submission(token, int(job["id"]))
         if claim is None:
             return
-        store.renew_lease(token, max(1, budget.remaining() + budget.reserve_seconds))
+        store.renew_lease(token, budget.renewal_ttl_seconds())
         try:
             result = deps.submit_crawl(claim, crawls, budget.callback_timeout(config.external_timeout_seconds))
         except SubmitNotAttemptedError as exc:
@@ -1068,7 +1075,7 @@ def _submit(
             dispatch(pending_intent, bound)
     if deps.plan_crawl is None or not budget.can_start_heavy():
         return True
-    store.renew_lease(token, max(1, budget.remaining() + budget.reserve_seconds))
+    store.renew_lease(token, budget.renewal_ttl_seconds())
     plans = deps.plan_crawl(eligible_items, budget.callback_timeout(config.external_timeout_seconds))
     for plan in plans:
         if not budget.can_start_heavy():
@@ -1431,8 +1438,7 @@ def run_existing_remote_drain(
             deps.monotonic(),
             config.runtime_budget_seconds,
             config.heavy_work_reserve_seconds,
-            deps.monotonic,
-        )
+            deps.monotonic, lease_ttl_seconds=config.lease_ttl_seconds)
         trace.append("recover_submit_unknown")
         counters["recovered_submit_unknown"] = store.recover_ambiguous_remote_submissions(
             token
@@ -1452,8 +1458,7 @@ def run_existing_remote_drain(
                 stop_reason = "deadline"
                 break
             iteration_budget = TickBudget(
-                deps.monotonic(), available, 0, deps.monotonic
-            )
+                deps.monotonic(), available, 0, deps.monotonic, lease_ttl_seconds=config.lease_ttl_seconds)
             trace.append("drain_batch")
             _harvest(store, token, deps, iteration_budget, counters, config)
             counters["drain_iterations"] += 1
@@ -1581,8 +1586,7 @@ def run_harvest_only(
             deps.monotonic(),
             config.runtime_budget_seconds,
             config.heavy_work_reserve_seconds,
-            deps.monotonic,
-        )
+            deps.monotonic, lease_ttl_seconds=config.lease_ttl_seconds)
         trace.append("harvest")
         _harvest(store, token, deps, budget, counters, config)
         trace.append("checkpoint")
@@ -1673,7 +1677,7 @@ def run_incremental_tick(
                 {},
                 run["frozen_snapshot_id"],
             )
-        budget = TickBudget(deps.monotonic(), config.runtime_budget_seconds, config.heavy_work_reserve_seconds, deps.monotonic)
+        budget = TickBudget(deps.monotonic(), config.runtime_budget_seconds, config.heavy_work_reserve_seconds, deps.monotonic, lease_ttl_seconds=config.lease_ttl_seconds)
         trace.append("recover")
         counters["recovered_stage_claims"] = store.recover_claimed_stage_work(token)
         counters["recovered_submit_unknown"] = store.recover_ambiguous_remote_submissions(token)

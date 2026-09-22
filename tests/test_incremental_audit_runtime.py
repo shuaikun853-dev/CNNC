@@ -128,6 +128,19 @@ def test_project_resources_and_default_runtime_root_do_not_depend_on_cwd(
         "TITLE_MATCH_MODEL_NAME=cwd-model\n",
         encoding="utf-8",
     )
+    project_model_env = tmp_path / "isolated-project-model.env"
+    project_model_env.write_text(
+        "TITLE_MATCH_MODEL_API_KEY=fixture-not-a-secret\n"
+        "TITLE_MATCH_MODEL_BASE_URL=https://project-fixture.invalid/v1\n"
+        "TITLE_MATCH_MODEL_NAME=project-fixture-model\n", encoding="utf-8"
+    )
+    read_configuration = runtime_module._parse_env_file
+
+    def read_project_fixture(path):
+        assert Path(path) == runtime_module.PROJECT_DATA_ROOT / "model.env"
+        return read_configuration(project_model_env)
+
+    monkeypatch.setattr(runtime_module, "_parse_env_file", read_project_fixture)
     for key in runtime_module._MODEL_CONFIGURATION_KEYS:
         monkeypatch.delenv(key, raising=False)
     monkeypatch.chdir(tmp_path)
@@ -176,6 +189,17 @@ def test_project_resources_and_default_runtime_root_do_not_depend_on_cwd(
 def test_finalize_dependency_construction_from_non_project_cwd_is_offline(
     tmp_path, monkeypatch
 ):
+    project_data = tmp_path / "isolated-project-data"
+    project_data.mkdir()
+    for name in (
+        "latest_saas_sameAudit_queryAll.curl",
+        "latest_cnnc_query.curl",
+        "detail_request.curl",
+    ):
+        (project_data / name).write_text(
+            "curl https://project-fixture.invalid/read-only", encoding="utf-8"
+        )
+    monkeypatch.setattr(runtime_module, "PROJECT_DATA_ROOT", project_data)
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(
         runtime_module,

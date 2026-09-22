@@ -675,7 +675,7 @@ def _append_failed_customer_link_rows(
         projection = build_final_page_price_projection(rows, [])
         return rows, enriched, audit_response, projection
     from app.services.customer_prewarm_lifecycle import failed_customer_link_rows
-    from scripts import zhaoshang_mall_mapping as mapping_module
+    from app.integrations import zhaoshang_mall_mapping as mapping_module
 
     failures = failed_customer_link_rows(
         business_date,
@@ -1103,7 +1103,7 @@ def _file_sha256(path: Path) -> str:
 
 
 def _write_review_workbook(path: Path, artifact: FrozenAuditArtifact) -> None:
-    from scripts.audit_saas_excel_file import write_audit_workbook
+    from app.services.audit_workbook import write_audit_workbook
 
     write_audit_workbook(
         path,

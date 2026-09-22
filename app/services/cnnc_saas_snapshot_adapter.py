@@ -15,8 +15,8 @@ from typing import Any, Callable, Collection, Mapping
 from urllib import error, request
 from urllib.parse import urlparse
 
-from scripts.auth_manager import AuthManager
-from scripts.curl_utils import apply_curl_headers, internal_direct_opener, load_curl_command
+from app.integrations.auth_manager import AuthManager
+from app.integrations.curl_utils import apply_curl_headers, internal_direct_opener, load_curl_command
 
 
 TENANT_ID = "188605"

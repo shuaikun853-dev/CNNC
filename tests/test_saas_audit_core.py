@@ -137,15 +137,19 @@ def test_strict_customer_index_rejects_duplicate_document_ids(tmp_path):
 
 
 def test_legacy_module_has_one_effective_duplicate_prone_definition():
-    path = Path("scripts/audit_saas_excel_file.py")
+    path = Path(__file__).resolve().parents[1] / "scripts/audit_saas_excel_file.py"
     source = path.read_text(encoding="utf-8")
     tree = ast.parse(source)
     for name in ("run_zhaoshang_tasks", "read_zhaoshang_result_xlsx", "apply_zhaoshang_results_to_rows"):
         assert sum(isinstance(node, ast.FunctionDef) and node.name == name for node in tree.body) == 1
+    from app.services import audit_workbook
+    from scripts import audit_saas_excel_file as legacy
+    assert legacy.VALUE_DISPLAY_NAMES is audit_workbook.VALUE_DISPLAY_NAMES
+    workbook_tree = ast.parse(Path(audit_workbook.__file__).read_text(encoding="utf-8"))
     assert sum(
         isinstance(node, (ast.Assign, ast.AnnAssign))
         and any(isinstance(target, ast.Name) and target.id == "VALUE_DISPLAY_NAMES" for target in (node.targets if isinstance(node, ast.Assign) else [node.target]))
-        for node in tree.body
+        for node in workbook_tree.body
     ) == 1
     assert "_shadowed_" not in source
     assert "_LEGACY_VALUE_DISPLAY_NAMES_SHADOWED" not in source

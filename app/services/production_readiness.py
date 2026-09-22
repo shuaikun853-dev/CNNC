@@ -426,7 +426,7 @@ def check_timezone(repo_root: Path, ctx: _CheckContext) -> CheckResult:
 
     # 上海业务日期（业务权威）与本地钟表日期（Scheduler 触发依据）比对：
     # 两者不一致意味着调度器与 Python 的"业务日"语义分裂。
-    from app.services.incremental_audit_runtime import business_date_in_shanghai
+    from app.services.runtime_context import business_date_in_shanghai
 
     shanghai_date = business_date_in_shanghai()
     local_date = datetime.now().date().isoformat()

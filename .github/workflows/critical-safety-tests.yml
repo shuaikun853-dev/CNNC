@@ -1,12 +1,6 @@
-# CNNC 关键安全测试 CI（只读、只测）。
-# 说明：
-# 1. 测试清单 = CI_SAFE 纯逻辑安全测试（审计 2026-09-04）。
-# 2. --deselect 排除的 tests/test_remote_running_recovery.py::test_default_dependencies_wire_probe_and_write_gated_restart
-#    依赖生产机上 gitignored data/ 目录下的 curl 文件（环境差异，非代码 bug）。
-# 3. 本 workflow 只读只测：无 Secret、无部署、无生产写。
-# 4. 触发契约：开发分支(feat/fix/hotfix/refactor/integration)重要文件 push 自动测试；
-#    任何 → prod 的 PR 必定产生 Check；workflow_dispatch 已移除
-#    （默认分支 main 无本文件，入口不可用）。
+# CNNC 关键安全测试：只读、只测，不部署、不使用生产认证。
+# 环境与候选共用 .python-version 和 requirements.lock。
+# 原缺少生产 cURL 的恢复接线测试已改用临时 fixture，不再排除。
 name: CNNC Critical Safety Tests
 
 on:
@@ -27,6 +21,10 @@ on:
       - scripts/**
       - tests/**
       - requirements.txt
+      - requirements.lock
+      - requirements.in
+      - .python-version
+      - tools/**
       - .github/workflows/critical-safety-tests.yml
       - .github/constraints-ci.txt
   # 契约 2：任何指向生产的 PR 必定产生本 Check（不设 paths——
@@ -49,12 +47,11 @@ jobs:
       - name: Setup Python 3.14
         uses: actions/setup-python@v5
         with:
-          python-version: "3.14"
+          python-version-file: ".python-version"
       - name: Install dependencies
         run: |
-          python -m pip install --upgrade pip
           python -m pip install -r requirements.txt --constraint .github/constraints-ci.txt
-          # tzdata：ZoneInfo("Asia/Shanghai") 在 Windows 必需（requirements.txt 未声明，见 constraints 注释）
+          # tzdata 和 pytest-timeout 由统一 requirements.lock 固定；保留兼容安装入口。
           python -m pip install --constraint .github/constraints-ci.txt pytest-timeout tzdata
       # 部分安全测试与生产机绝对路径耦合：适配器对招商局外部工具做 is_file()
       # 存在性预检（测试自身已 monkeypatch _load_module 注入假工具，桩文件永不执行）；
@@ -80,18 +77,41 @@ jobs:
       # 2026-09-09 Issue #10 canary 安全门禁 +1（57 个；--only-mall 硬 scope：
       # other-mall 零写 / URL 超限零写 / 错 mall submit+priority tripwire /
       # 显式路径与路径策略 / 老 schema 无迁移）；本地干净 worktree 实测
-      # 1376 收集 / 1375 通过 / 1 失败（唯一失败即下方 --deselect 的那个，
+      # 1376 收集 / 1375 通过 / 1 失败（唯一失败是旧版曾排除的那个，
       # 因生产机 gitignored data/ 的 curl 文件在 CI 不存在）。
       # 2026-09-14 Issue #13 新增 7 个文件（预爬看板 projection/手动重爬/
       # 精确派发/API+页面 smoke/Round-2 基础设施/跨日生命周期）。注意：本块是 run: >
       # 折叠标量，注释必须写在块外——块内 # 会被折叠进命令行，把后续清单
-      # 和 --deselect 全部注释掉（CI run 34813428733 实测踩坑）。
+      # 和后续参数全部注释掉（CI run 34813428733 实测踩坑）。
       - name: Run critical safety tests
         env:
           PYTHONIOENCODING: utf-8
           PYTHONUTF8: "1"  # JS harness 输出 UTF-8，避免 cp1252 Runner 上 subprocess 文本解码崩溃
         run: >
           python -m pytest
+          tests/test_architecture_contract.py
+          tests/test_architecture_graph.py
+          tests/test_parallel_ai_check.py
+          tests/test_parallel_ai_edge_cases.py
+          tests/test_runtime_recovery.py
+          tests/test_runtime_manifest_cli.py
+          tests/test_runtime_fingerprint.py
+          tests/test_runtime_fingerprint_alias.py
+          tests/test_production_runtime_identity.py
+          tests/test_runtime_identity_display.py
+          tests/test_dependency_lock.py
+          tests/test_second_review_regressions.py
+          tests/test_third_review_regressions.py
+          tests/test_final_review_regressions.py
+          tests/test_backup_policy_review.py
+          tests/test_tick_lease_window.py
+          tests/test_static_audit_regressions.py
+          tests/test_governance_delivery_contract.py
+          tests/test_audit_state_boundaries.py
+          tests/test_zhaoshang_capability_boundaries.py
+          tests/test_runtime_seams.py
+          tests/test_context_documents.py
+          tests/test_ai_navigation_docs.py
           tests/test_canary_scope_gate.py
           tests/test_customer_price_semantics.py
           tests/test_customer_price_projection.py
@@ -177,5 +197,4 @@ jobs:
           tests/test_prewarm_round2_infra.py
           tests/test_prewarm_cross_day_lifecycle.py
           tests/test_prewarm_cross_day_production_shape.py
-          --deselect "tests/test_remote_running_recovery.py::test_default_dependencies_wire_probe_and_write_gated_restart"
           -q -l --timeout=600 --timeout-method=thread

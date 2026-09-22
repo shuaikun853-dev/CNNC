@@ -779,11 +779,12 @@ def test_cnnc_auth_login_cross_process_lock_holder_blocks(
         "lock = ProcessLock(sys.argv[1]).acquire("
         "owner={'pid': 'child-holder', 'command': 'test'})\n"
         "print('HELD', flush=True)\n"
-        "time.sleep(60)\n",
+        "sys.stdin.buffer.readline()\n"
+        "lock.release()\n",
         encoding="utf-8")
     child = subprocess.Popen(
         [sys.executable, str(holder_src), str(lock_path), str(root)],
-        cwd=str(root), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        cwd=str(root), stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     try:
         deadline = time.monotonic() + 10.0
         while time.monotonic() < deadline:
@@ -804,12 +805,10 @@ def test_cnnc_auth_login_cross_process_lock_holder_blocks(
         assert r.json()["error_code"] == "CNNC_LOGIN_ALREADY_RUNNING"
         assert launched == []
     finally:
-        child.terminate()
-        try:
-            child.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            child.kill()
-            child.wait(timeout=10)
+        # Windows venv python is a launcher. Terminating just that launcher
+        # leaves its actual interpreter holding the OS lock. Release through
+        # stdin and wait for the real holder's normal exit instead.
+        child.communicate(input=b"release\n", timeout=10)
     # 子进程退出后 OS 锁自动释放（探活即可验证，无需子进程显式清理）
     assert ProcessLock.inspect(lock_path)["active"] is False
 

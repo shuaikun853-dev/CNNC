@@ -29,7 +29,7 @@ from app.services.recovery.common import (
 from app.services.recovery.validation import (
     validate_linked_crawls_against_remote_payload,
 )
-from app.services.remote_running_recovery import RemoteExecutionState
+from app.services.remote_execution_policy import RemoteExecutionState
 
 
 # ---------------------------------------------------------------------------

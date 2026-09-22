@@ -1464,7 +1464,7 @@ def _patch_fake_monitor(tmp_path, monkeypatch, script_exists=False):
         script.parent.mkdir(parents=True, exist_ok=True)
         script.write_text("# fake stb crawler", encoding="utf-8")
     monkeypatch.setitem(
-        sys.modules, "scripts.monitor_stb_fallback", types.SimpleNamespace(STB_SCRIPT=script)
+        sys.modules, "app.integrations.monitor_stb_fallback", types.SimpleNamespace(STB_SCRIPT=script)
     )
     return script
 
@@ -1565,7 +1565,7 @@ def _patch_cli_monitor(tmp_path, monkeypatch):
 
     monkeypatch.setitem(
         sys.modules,
-        "scripts.monitor_stb_fallback",
+        "app.integrations.monitor_stb_fallback",
         types.SimpleNamespace(STB_SCRIPT=script, run_stbchina_fallback=_poison_executor),
     )
     return calls
