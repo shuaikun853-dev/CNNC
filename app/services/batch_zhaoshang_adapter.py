@@ -29,7 +29,16 @@ CONTRACT_VERSION = "zhaoshang-batch-url-v1"
 MAX_SLICE_SIZE = 100
 PURPOSE_PRICE_AUDIT = "price-audit"
 PURPOSE_CUSTOMER_PREWARM = "customer-prewarm"
-_SUPPORTED_PURPOSES = frozenset({PURPOSE_PRICE_AUDIT, PURPOSE_CUSTOMER_PREWARM})
+PURPOSE_LEGACY_STEP1_MANUAL = "legacy-step1-manual"
+PURPOSE_STEP3_NO_PUSH = "step3-no-push"
+_SUPPORTED_PURPOSES = frozenset(
+    {
+        PURPOSE_PRICE_AUDIT,
+        PURPOSE_CUSTOMER_PREWARM,
+        PURPOSE_LEGACY_STEP1_MANUAL,
+        PURPOSE_STEP3_NO_PUSH,
+    }
+)
 
 
 class BatchSubmitStatus(str, Enum):

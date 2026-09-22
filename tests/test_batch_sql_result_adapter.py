@@ -134,6 +134,34 @@ def _target(
     )
 
 
+def test_manual_entrypoint_purposes_keep_the_normal_strict_result_contract():
+    for purpose in ("legacy-step1-manual", "step3-no-push"):
+        target = BatchResultTarget(
+            execute_number="exec-1",
+            expected_sku="sku-1",
+            expected_url="https://item.jd.com/1.html",
+            evidence=BatchResultEvidence(task_status="02", query_progress="COMPLETED"),
+            purpose=purpose,
+        )
+
+        assert target.purpose == purpose
+
+
+def test_manual_entrypoint_results_preserve_real_sku_and_returned_url():
+    for purpose in ("legacy-step1-manual", "step3-no-push"):
+        result = BatchSqlResultAdapter(
+            _Factory(lambda _sql, _params: [_row()])
+        ).fetch_batch_results("jd", [_target(purpose=purpose)])[0]
+
+        crawl_result = batch_sql_result_to_crawl_result(
+            "jd", result, purpose=purpose
+        )
+
+        assert crawl_result["page_sku_id"] == "sku-1"
+        assert crawl_result["page_goods_no"] == "sku-1"
+        assert crawl_result["returned_url"] == "https://example.test/product/1"
+
+
 def test_customer_prewarm_unique_execute_number_ignores_placeholder_sku_and_returned_url():
     result = BatchSqlResultAdapter(
         _Factory(

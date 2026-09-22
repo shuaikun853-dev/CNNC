@@ -94,6 +94,19 @@ def test_prepare_rejects_non_absolute_http_urls(url):
         CnncBatchZhaoshangAdapter.prepare_jobs("2026-09-21", [request])
 
 
+def test_manual_entrypoint_purposes_are_durable_and_restore_exactly():
+    requests = [_request(1)]
+
+    for purpose in ("legacy-step1-manual", "step3-no-push"):
+        job = CnncBatchZhaoshangAdapter.prepare_jobs(
+            "2026-09-22", requests, purpose=purpose
+        ).jobs[0]
+        restored = CnncBatchZhaoshangAdapter.restore_job(job.durable_payload())
+
+        assert restored.purpose == purpose
+        assert restored.logical_job_key == job.logical_job_key
+
+
 def test_source_scoped_requests_keep_one_execute_number_per_crawl_work():
     request = _request(1)
 

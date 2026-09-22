@@ -2605,11 +2605,16 @@ def batch_zhaoshang_bridge(
 def _batch_sql_runtime_components(
     *,
     monotonic: Callable[[], float] = monotonic_time.monotonic,
+    env_path: Path | str | None = None,
 ) -> tuple[
     BatchSqlResultAdapter,
     Callable[[Any, float], BatchMaterializationProbe],
 ]:
-    env_path = PROJECT_DATA_ROOT / "ZHAOSHANG_DB.env"
+    env_path = (
+        Path(env_path)
+        if env_path is not None
+        else PROJECT_DATA_ROOT / "ZHAOSHANG_DB.env"
+    )
 
     def connect_for_results() -> Any:
         return connect_batch_priority_from_env_file(

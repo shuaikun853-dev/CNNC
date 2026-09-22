@@ -22,7 +22,16 @@ from app.services.zhaoshang_url_identity import (
 
 PURPOSE_PRICE_AUDIT = "price-audit"
 PURPOSE_CUSTOMER_PREWARM = "customer-prewarm"
-_SUPPORTED_PURPOSES = frozenset({PURPOSE_PRICE_AUDIT, PURPOSE_CUSTOMER_PREWARM})
+PURPOSE_LEGACY_STEP1_MANUAL = "legacy-step1-manual"
+PURPOSE_STEP3_NO_PUSH = "step3-no-push"
+_SUPPORTED_PURPOSES = frozenset(
+    {
+        PURPOSE_PRICE_AUDIT,
+        PURPOSE_CUSTOMER_PREWARM,
+        PURPOSE_LEGACY_STEP1_MANUAL,
+        PURPOSE_STEP3_NO_PUSH,
+    }
+)
 
 
 MAX_QUERY_EXECUTE_NUMBERS = 100
@@ -301,7 +310,11 @@ def batch_sql_result_to_crawl_result(
         "comment_count": result.comment,
         "page_price_source": f"batch_sql:{mall}",
     }
-    if purpose == PURPOSE_CUSTOMER_PREWARM:
+    if purpose in {
+        PURPOSE_CUSTOMER_PREWARM,
+        PURPOSE_LEGACY_STEP1_MANUAL,
+        PURPOSE_STEP3_NO_PUSH,
+    }:
         crawl_result.update(
             {
                 "page_sku_id": str(result.sku_id or "").strip() or None,
