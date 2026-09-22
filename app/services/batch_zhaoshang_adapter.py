@@ -27,6 +27,9 @@ CREATE_URL = "http://zhaosj.iioprod.com/improxy/iio/crawl/crawlTaskManage/batch/
 PROGRESS_URL = "http://zsz.iio.com/improxy/iio/crawl/crawlTaskManage/queryTaskProgress"
 CONTRACT_VERSION = "zhaoshang-batch-url-v1"
 MAX_SLICE_SIZE = 100
+PURPOSE_PRICE_AUDIT = "price-audit"
+PURPOSE_CUSTOMER_PREWARM = "customer-prewarm"
+_SUPPORTED_PURPOSES = frozenset({PURPOSE_PRICE_AUDIT, PURPOSE_CUSTOMER_PREWARM})
 
 
 class BatchSubmitStatus(str, Enum):
@@ -89,6 +92,7 @@ class PreparedBatchJob:
     execute_numbers: tuple[str, ...]
     payload: Mapping[str, Any]
     payload_sha256: str
+    purpose: str = PURPOSE_PRICE_AUDIT
 
     @property
     def expected_count(self) -> int:
@@ -106,6 +110,7 @@ class PreparedBatchJob:
         """Return the complete immutable envelope needed after a crash."""
         value = {
             "contract_version": CONTRACT_VERSION,
+            "purpose": self.purpose,
             "business_date": self.business_date,
             "parent_job_key": self.parent_job_key,
             "logical_job_key": self.logical_job_key,
@@ -301,12 +306,16 @@ class CnncBatchZhaoshangAdapter:
         *,
         batch_size: int = MAX_SLICE_SIZE,
         source_ids: Sequence[str] | None = None,
+        purpose: str = PURPOSE_PRICE_AUDIT,
     ) -> PreparedBatchPlan:
         business_date = _text(business_date)
         if not business_date:
             raise ValueError("business_date is required")
         if batch_size <= 0 or batch_size > MAX_SLICE_SIZE:
             raise ValueError("batch_size must be between 1 and 100")
+        purpose = _text(purpose)
+        if purpose not in _SUPPORTED_PURPOSES:
+            raise ValueError("unsupported Zhaoshang batch purpose")
         raw_requests = tuple(requests)
         source_scoped = source_ids is not None
         if source_ids is None:
@@ -335,6 +344,7 @@ class CnncBatchZhaoshangAdapter:
         parent_payload = {
             "business_date": business_date,
             "contract_version": CONTRACT_VERSION,
+            "purpose": purpose,
             "requests": [request.__dict__ for request in canonical],
         }
         if source_scoped:
@@ -360,6 +370,7 @@ class CnncBatchZhaoshangAdapter:
                 )
                 slice_seed = {
                     "parent_job_key": parent_key,
+                    "purpose": purpose,
                     "mall_key": mall_key,
                     "slice_index": offset,
                     "requests": [request.__dict__ for request in chunk],
@@ -426,6 +437,7 @@ class CnncBatchZhaoshangAdapter:
                         execute_numbers=execute_numbers,
                         payload=payload,
                         payload_sha256=_canonical_hash(payload),
+                        purpose=purpose,
                     )
                 )
         return PreparedBatchPlan(parent_key, tuple(jobs))
@@ -441,6 +453,10 @@ class CnncBatchZhaoshangAdapter:
         """Rebuild and verify one exact slice from SQLite ``payload_json``."""
         if value.get("contract_version") != CONTRACT_VERSION:
             raise ValueError("unsupported Zhaoshang batch contract version")
+        purpose_present = "purpose" in value
+        purpose = _text(value.get("purpose") or PURPOSE_PRICE_AUDIT)
+        if purpose not in _SUPPORTED_PURPOSES:
+            raise ValueError("unsupported Zhaoshang batch purpose")
         try:
             requests = tuple(CrawlRequest(**dict(item)) for item in value["requests"])
             execute_numbers = tuple(_text(item) for item in value["execute_numbers"])
@@ -467,6 +483,7 @@ class CnncBatchZhaoshangAdapter:
                 execute_numbers=execute_numbers,
                 payload=post_body,
                 payload_sha256=_canonical_hash(post_body),
+                purpose=purpose,
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise ValueError("invalid durable Zhaoshang batch envelope") from exc
@@ -510,6 +527,8 @@ class CnncBatchZhaoshangAdapter:
             "slice_index": job.slice_index,
             "requests": [request.__dict__ for request in job.requests],
         }
+        if purpose_present:
+            seed["purpose"] = job.purpose
         if source_scoped:
             seed["source_ids"] = list(job.source_ids)
         logical_key = _canonical_hash(seed)

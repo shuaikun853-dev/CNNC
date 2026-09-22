@@ -213,7 +213,14 @@ def runtime(tmp_path):
     )
 
 
-def _make_runner(runtime, *, crawler_factory=None, dispatch_exact=None):
+def _make_runner(
+    runtime,
+    *,
+    crawler_factory=None,
+    dispatch_exact=None,
+    zhaoshang_backend="legacy",
+    **kwargs,
+):
     from app.services.prewarm_manual_recrawl import ManualRecrawlRunner
 
     return ManualRecrawlRunner(
@@ -221,7 +228,158 @@ def _make_runner(runtime, *, crawler_factory=None, dispatch_exact=None):
         crawler_factory=crawler_factory,
         dispatch_exact=dispatch_exact,
         mappings_loader=lambda: [COMIX],
+        zhaoshang_backend=zhaoshang_backend,
+        **kwargs,
     )
+
+
+def test_cross_day_batch_job_uses_batch_harvest_not_legacy(runtime):
+    candidate_id = _seed_candidate(runtime.prewarm, COMIX_URL_1, "BATCH-X", mall="comix")
+    day_dir = runtime.runtime_root / BUSINESS_DATE
+    day_dir.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(str(day_dir / "state.sqlite3"))
+    try:
+        connection.execute(
+            "CREATE TABLE remote_jobs (id INTEGER PRIMARY KEY, state TEXT NOT NULL, payload_json TEXT)"
+        )
+        connection.execute(
+            "INSERT INTO remote_jobs (id, state, payload_json) VALUES (?, ?, ?)",
+            (77, "RUNNING", json.dumps({"contract_version": "zhaoshang-batch-url-v1", "purpose": "customer-prewarm"})),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    dispatch = RecordingDispatch(
+        results={candidate_id: {
+            "outcome": "REUSED",
+            "remote_job_id": 77,
+            "remote_identity": "batch-77",
+            "priority_proven": True,
+            "cross_day": True,
+            "job_business_date": BUSINESS_DATE,
+        }}
+    )
+    batch_calls = []
+
+    def batch_reexport(**kwargs):
+        batch_calls.append(kwargs)
+        return {"outcome": "REMOTE_EXISTING_HARVEST_RUNNING"}
+
+    runner = _make_runner(
+        runtime,
+        crawler_factory=_poison_crawler_factory,
+        dispatch_exact=dispatch,
+        reexport=lambda **_kwargs: pytest.fail("Batch job must not use legacy harvest"),
+        batch_reexport=batch_reexport,
+        batch_facade_factory=lambda *_args: object(),
+        sleeper=lambda _seconds: None,
+        cross_day_max_attempts=1,
+    )
+    handle = runner.start("2026-09-15", candidate_id=candidate_id)
+    runner._join_for_tests(handle["action_id"])
+
+    assert len(batch_calls) == 1
+    assert "facade" in batch_calls[0]
+    assert runner.get(handle["action_id"])["status"] == "WAITING_REMOTE"
+
+
+def test_identityless_claimed_cross_day_batch_enters_batch_reconcile(runtime):
+    candidate_id = _seed_candidate(runtime.prewarm, COMIX_URL_1, "BATCH-CLAIM", mall="comix")
+    runtime.prewarm.record_remote_job_link(
+        BUSINESS_DATE,
+        candidate_id,
+        78,
+        PRODUCER_CUSTOMER_PREWARM_ZHAOSHANG,
+    )
+    day_dir = runtime.runtime_root / BUSINESS_DATE
+    day_dir.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(str(day_dir / "state.sqlite3"))
+    try:
+        connection.execute(
+            "CREATE TABLE remote_jobs (id INTEGER PRIMARY KEY, state TEXT NOT NULL, "
+            "payload_json TEXT, remote_identity TEXT)"
+        )
+        connection.execute(
+            "INSERT INTO remote_jobs (id, state, payload_json, remote_identity) "
+            "VALUES (?, ?, ?, NULL)",
+            (
+                78,
+                "SUBMIT_INTENT",
+                json.dumps(
+                    {
+                        "contract_version": "zhaoshang-batch-url-v1",
+                        "purpose": "customer-prewarm",
+                    }
+                ),
+            ),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    dispatch = RecordingDispatch(
+        results={candidate_id: {
+            "outcome": "REUSED",
+            "remote_job_id": 78,
+            "remote_identity": "",
+            "priority_proven": None,
+            "batch_reconcile_pending": True,
+            "cross_day": True,
+            "job_business_date": BUSINESS_DATE,
+        }}
+    )
+    batch_calls = []
+
+    def batch_reexport(**kwargs):
+        batch_calls.append(kwargs)
+        assert kwargs["pre_remote_guard"]() is True
+        with kwargs["result_commit_fence"]() as owned:
+            assert owned is True
+        return {"outcome": "REMOTE_EXISTING_HARVEST_RUNNING"}
+
+    runner = _make_runner(
+        runtime,
+        crawler_factory=_poison_crawler_factory,
+        dispatch_exact=dispatch,
+        reexport=lambda **_kwargs: pytest.fail("Batch claim must not use legacy harvest"),
+        batch_reexport=batch_reexport,
+        batch_facade_factory=lambda *_args: object(),
+        sleeper=lambda _seconds: None,
+        cross_day_max_attempts=1,
+    )
+    handle = runner.start("2026-09-15", candidate_id=candidate_id)
+    runner._join_for_tests(handle["action_id"])
+
+    assert len(batch_calls) == 1
+    assert batch_calls[0]["pre_remote_guard"]() is True
+    with batch_calls[0]["result_commit_fence"]() as owned:
+        assert owned is True
+    runtime.prewarm.record_candidate_result(
+        candidate_id,
+        cache_status=CACHE_STATUS_CACHE_HIT,
+    )
+    assert batch_calls[0]["pre_remote_guard"]() is False
+    with batch_calls[0]["result_commit_fence"]() as owned:
+        assert owned is False
+    assert runner.get(handle["action_id"])["status"] == "WAITING_REMOTE"
+
+
+def test_production_singleton_prefers_batch_for_new_manual_work(monkeypatch):
+    from app.services import prewarm_manual_recrawl as module
+
+    captured = []
+
+    class RecordingRunner:
+        def __init__(self, **kwargs):
+            captured.append(dict(kwargs))
+
+    monkeypatch.setattr(module, "ManualRecrawlRunner", RecordingRunner)
+    monkeypatch.setattr(module, "_RUNNER_SINGLETON", None)
+    runner = module.get_manual_recrawl_runner()
+
+    assert isinstance(runner, RecordingRunner)
+    assert captured == [{"zhaoshang_backend": "batch"}]
 
 
 def _seed_candidate(prewarm, url, document_id, *, mall, cache_status=CACHE_STATUS_PENDING_PREWARM):
@@ -488,6 +646,32 @@ def test_staples_lock_busy_reports_lock_busy_honestly(runtime, monkeypatch):
 
 
 # ---- zhaoshang honest lifecycle (Round 2 Blocker 4) --------------------------------
+
+
+def test_zhaoshang_manual_recrawl_forwards_batch_policy(runtime):
+    candidate_id = _seed_candidate(runtime.prewarm, COMIX_URL_1, "D1", mall="comix")
+    dispatch = RecordingDispatch(
+        results={
+            candidate_id: {
+                "outcome": "CREATED",
+                "remote_job_id": 7,
+                "priority_confirmed": True,
+            }
+        }
+    )
+    runner = _make_runner(
+        runtime,
+        crawler_factory=_poison_crawler_factory,
+        dispatch_exact=dispatch,
+        zhaoshang_backend="batch",
+    )
+
+    handle = runner.start(BUSINESS_DATE, candidate_id=candidate_id)
+    runner._join_for_tests(handle["action_id"])
+
+    assert dispatch.calls == 1
+    assert dispatch.seen_kwargs[0]["selected_backend"] == "batch"
+    assert runner.get(handle["action_id"])["status"] == "WAITING_REMOTE"
 
 
 def _cache_snapshot(cache, mall, url):

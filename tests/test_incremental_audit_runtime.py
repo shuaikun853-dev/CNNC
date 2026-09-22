@@ -10,7 +10,11 @@ from pathlib import Path
 import pytest
 
 import app.services.incremental_audit_runtime as runtime_module
-from app.services.batch_zhaoshang_adapter import CnncBatchZhaoshangAdapter
+from app.services.batch_zhaoshang_adapter import (
+    BatchReconcileOutcome,
+    BatchReconcileStatus,
+    CnncBatchZhaoshangAdapter,
+)
 from app.services.batch_sql_result_adapter import (
     BatchResultStatus,
     BatchSqlResult,
@@ -358,6 +362,48 @@ def test_batch_bridge_manualizes_unclassifiable_durable_payload(tmp_path) -> Non
     assert result[99]["manual_error"] == "exact batch job reconstruction is unavailable"
 
 
+def test_batch_bridge_surfaces_conclusive_submit_not_found(tmp_path) -> None:
+    paths = runtime_paths("2026-08-11", tmp_path / "runtime")
+    paths.run_dir.mkdir(parents=True)
+    adapter = CnncBatchZhaoshangAdapter(write_enabled=False)
+    adapter.reconcile_unknown = lambda _job, *, timeout_seconds: BatchReconcileOutcome(
+        BatchReconcileStatus.NOT_FOUND
+    )
+    propose, finalize, _submit, harvest = runtime_module.batch_zhaoshang_bridge(
+        adapter,
+        _JdBridgeAdapter(),
+        paths=paths,
+        business_date="2026-08-11",
+    )
+    row = {
+        "vCommodityId": "v-not-found",
+        "skuId": "sku-not-found",
+        "extLink": "https://item.jd.com/sku-not-found.html",
+    }
+    proposed = propose([{"row": row}], 10)[0]
+    plan = finalize(proposed, tuple(proposed.members), 10)
+
+    result = harvest(
+        [{
+            "id": 101,
+            "logical_key": plan.logical_key,
+            "mall_key": plan.mall_key,
+            "task_name": plan.task_name,
+            "payload_hash": plan.payload_hash,
+            "payload_json": json.dumps(plan.payload_json),
+            "state": "SUBMIT_UNKNOWN",
+            "remote_identity": "",
+        }],
+        10,
+    )
+
+    assert result[101] == {
+        "state": "SUBMIT_UNKNOWN",
+        "reconcile_status": "NOT_FOUND",
+        "reconcile_diagnostic": "",
+    }
+
+
 class _JdBridgeAdapter:
     def request_from_saas_row(self, row, *, backend_version):
         return CrawlRequest(
@@ -371,10 +417,12 @@ class _JdBridgeAdapter:
 
 
 class _ScriptedBatchSqlAdapter:
-    def __init__(self, result_status, *, price=None, title=None):
+    def __init__(self, result_status, *, price=None, title=None, sku_id=None, url=None):
         self.result_status = result_status
         self.price = price
         self.title = title
+        self.sku_id = sku_id
+        self.url = url
         self.targets = []
         self.timeouts = []
 
@@ -388,6 +436,9 @@ class _ScriptedBatchSqlAdapter:
                 price=self.price,
                 title=self.title,
                 comment="9",
+                sku_id=self.sku_id,
+                goods_no=self.sku_id,
+                url=self.url,
             )
             for target in targets
         )
@@ -401,6 +452,7 @@ def _batch_result_harvest(
     price=None,
     title=None,
     crawl_work_count=1,
+    purpose="price-audit",
 ):
     paths = runtime_paths("2026-08-11", tmp_path / "runtime")
     paths.run_dir.mkdir(parents=True, exist_ok=True)
@@ -424,7 +476,15 @@ def _batch_result_harvest(
         ),
     )
     sql_adapter = _ScriptedBatchSqlAdapter(
-        result_status, price=price, title=title
+        result_status,
+        price=price,
+        title=title,
+        sku_id="REAL-123" if purpose == "customer-prewarm" else None,
+        url=(
+            "https://item.jd.com/REAL-123.html"
+            if purpose == "customer-prewarm"
+            else None
+        ),
     )
 
     def probe(prepared_job, _timeout):
@@ -451,6 +511,7 @@ def _batch_result_harvest(
         business_date="2026-08-11",
         result_adapter=sql_adapter,
         materialization_probe_runner=probe,
+        purpose=purpose,
     )
     row = {
         "vCommodityId": "v-a",
@@ -569,6 +630,24 @@ def test_batch_harvest_converts_found_sql_result_to_exact_crawl_result(
     }
     assert len(adapter.targets) == 1
     assert adapter.targets[0].execute_number.startswith("mrwang-")
+
+
+def test_customer_prewarm_batch_harvest_preserves_real_sku_and_returned_url(tmp_path):
+    outcome, adapter = _batch_result_harvest(
+        tmp_path,
+        result_status=BatchResultStatus.FOUND,
+        task_status="02",
+        price="12.30",
+        title="Exact title",
+        purpose="customer-prewarm",
+    )
+
+    assert outcome["state"] == "COMPLETED"
+    result = outcome["crawl_results"][101]
+    assert result["page_sku_id"] == "REAL-123"
+    assert result["page_goods_no"] == "REAL-123"
+    assert result["returned_url"] == "https://item.jd.com/REAL-123.html"
+    assert adapter.targets[0].purpose == "customer-prewarm"
 
 
 @pytest.mark.parametrize("crawl_work_count", [0, 2])

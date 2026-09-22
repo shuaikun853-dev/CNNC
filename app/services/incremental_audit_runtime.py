@@ -2173,16 +2173,28 @@ def batch_zhaoshang_bridge(
         [Any, float], BatchMaterializationProbe
     ]
     | None = None,
+    request_resolver: Callable[[Mapping[str, Any]], CrawlRequest | None] | None = None,
+    source_id_resolver: Callable[[Mapping[str, Any]], str] | None = None,
+    purpose: str = "price-audit",
     monotonic: Callable[[], float] = monotonic_time.monotonic,
 ) -> tuple[Callable[[list[Mapping[str, Any]], float], list[CrawlPlan]], Callable[[CrawlPlan, tuple[CrawlMember, ...], float], CrawlPlan], Callable[[Mapping[str, Any], list[Mapping[str, Any]], float], Mapping[str, Any]], Callable[[list[Mapping[str, Any]], float], Mapping[int, Mapping[str, Any]]]]:
     """Wire batch create/progress plus the evidenced exact SQL result path."""
     prepared: dict[str, Any] = {}
 
     def resolve(row: Mapping[str, Any]) -> CrawlRequest | None:
-        request = legacy_adapter.request_from_saas_row(row, backend_version="batch-url-v1")
+        request = (
+            request_resolver(row)
+            if request_resolver is not None
+            else legacy_adapter.request_from_saas_row(row, backend_version="batch-url-v1")
+        )
         if request is not None and not request.url:
             return None
         return request
+
+    def resolve_source_id(row: Mapping[str, Any]) -> str:
+        if source_id_resolver is not None:
+            return normalize_cell_str(source_id_resolver(row))
+        return normalize_cell_str(row.get("vCommodityId") or row.get("documentId"))
 
     def propose(items: list[Mapping[str, Any]], _timeout: float) -> list[CrawlPlan]:
         requests: list[CrawlRequest] = []
@@ -2194,7 +2206,7 @@ def batch_zhaoshang_bridge(
             request = resolve(item["row"])
             if request is None:
                 continue
-            source_id = normalize_cell_str(item["row"].get("vCommodityId") or item["row"].get("documentId"))
+            source_id = resolve_source_id(item["row"])
             if not source_id:
                 raise RuntimeConfigurationError(
                     "eligible batch crawl member has no SaaS source identity"
@@ -2210,7 +2222,7 @@ def batch_zhaoshang_bridge(
             return []
         plans = []
         for job in adapter.prepare_jobs(
-            business_date, requests, source_ids=source_ids
+            business_date, requests, source_ids=source_ids, purpose=purpose
         ).jobs:
             members = tuple(
                 members_by_identity[(request.identity, source_id)]
@@ -2249,10 +2261,7 @@ def batch_zhaoshang_bridge(
         source_ids: list[str] = []
         for member in members:
             request = resolve(member.row)
-            source_id = normalize_cell_str(
-                member.row.get("vCommodityId")
-                or member.row.get("documentId")
-            )
+            source_id = resolve_source_id(member.row)
             if request is None or (
                 request.mall_key,
                 request.sku_id,
@@ -2272,7 +2281,7 @@ def batch_zhaoshang_bridge(
             requests.append(request)
             source_ids.append(source_id)
         finalized_jobs = adapter.prepare_jobs(
-            business_date, requests, source_ids=source_ids
+            business_date, requests, source_ids=source_ids, purpose=purpose
         ).jobs
         if len(finalized_jobs) != 1:
             raise RuntimeConfigurationError(
@@ -2355,6 +2364,12 @@ def batch_zhaoshang_bridge(
                         results[int(job["id"])] = {
                             "state": "PRIORITY_PENDING",
                             "remote_identity": reconciliation.remote_identity.durable_value(),
+                        }
+                    elif reconciliation.status is BatchReconcileStatus.NOT_FOUND:
+                        results[int(job["id"])] = {
+                            "state": "SUBMIT_UNKNOWN",
+                            "reconcile_status": "NOT_FOUND",
+                            "reconcile_diagnostic": reconciliation.diagnostic or "",
                         }
                     continue
                 if str(job.get("state")) == "PRIORITY_PENDING":
@@ -2505,6 +2520,7 @@ def batch_zhaoshang_bridge(
                             ),
                             query_progress=progress.status.value,
                         ),
+                        purpose=prepared_job.purpose,
                     )
                     for request, execute_number in zip(
                         prepared_job.requests,
@@ -2533,7 +2549,9 @@ def batch_zhaoshang_bridge(
                     crawl_id = int(crawl_by_execute[sql_result.execute_number]["id"])
                     if sql_result.status is BatchResultStatus.FOUND:
                         crawl_results[crawl_id] = batch_sql_result_to_crawl_result(
-                            prepared_job.mall_key, sql_result
+                            prepared_job.mall_key,
+                            sql_result,
+                            purpose=prepared_job.purpose,
                         )
                     elif sql_result.status is BatchResultStatus.NOT_YET_VISIBLE:
                         pending = True

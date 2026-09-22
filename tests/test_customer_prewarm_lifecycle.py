@@ -63,6 +63,7 @@ from app.services.legacy_zhaoshang_adapter import (
 from app.services.shared_crawl_cache import SharedCrawlCache
 from scripts import customer_prewarm_dispatch as cli
 from scripts.zhaoshang_mall_mapping import ZhaoshangMallMapping
+from tests.test_customer_prewarm_dispatch import NBDELI, _batch_facade_for_create
 
 TODAY = "2026-09-16"
 YESTERDAY = "2026-09-15"
@@ -378,7 +379,20 @@ def run_reconcile(paths, adapter, *, summary=None):
     return summary
 
 
-def run_redispatch(runtime_root, paths, prewarm, adapter, *, summary=None, business_date=TODAY, max_jobs_per_pass=8, mappings=(COMIX,), deadline_seconds=30.0):
+def run_redispatch(
+    runtime_root,
+    paths,
+    prewarm,
+    adapter,
+    *,
+    summary=None,
+    business_date=TODAY,
+    max_jobs_per_pass=8,
+    mappings=(COMIX,),
+    deadline_seconds=30.0,
+    selected_backend="legacy",
+    batch_facade=None,
+):
     summary = summary if summary is not None else _new_summary()
     summary["business_date"] = business_date
     with leased(paths, business_date) as (store, token):
@@ -389,6 +403,8 @@ def run_redispatch(runtime_root, paths, prewarm, adapter, *, summary=None, busin
             paths=paths,
             mappings=list(mappings),
             get_adapter=lambda: adapter,
+            get_batch_facade=(lambda: batch_facade) if batch_facade is not None else None,
+            selected_backend=selected_backend,
             business_date=business_date,
             deadline=time.monotonic() + deadline_seconds,
             monotonic_value=time.monotonic,
@@ -666,6 +682,69 @@ def test_redispatch_creates_new_job_and_records_linkage(tmp_path):
     candidate = candidate_by_id(prewarm, candidate_id)
     assert candidate["cache_status"] == CACHE_STATUS_REMOTE_DISPATCHED
     assert int(candidate["remote_job_id"]) == int(new_job["id"])
+    links = _state_rows(
+        runtime_root / "customer_prewarm.sqlite3",
+        "SELECT business_date, remote_job_id, producer FROM prewarm_remote_job_links WHERE candidate_id=?",
+        (candidate_id,),
+    )
+    assert {"business_date": TODAY, "remote_job_id": int(new_job["id"]), "producer": PRODUCER} in links
+    crawls = _state_rows(
+        paths.state_path,
+        "SELECT sku_id, remote_job_id FROM crawl_work ORDER BY id",
+    )
+    assert [row["remote_job_id"] for row in crawls] == [dead_job, int(new_job["id"])]
+    assert all(str(row["sku_id"]).startswith("zhpq-") for row in crawls)
+
+
+def test_redispatch_new_supported_request_uses_batch_without_mutating_dead_job(tmp_path):
+    runtime_root = tmp_path / "runtime"
+    prewarm = CustomerPrewarmStore(runtime_root / "customer_prewarm.sqlite3")
+    url = "https://b2b.nbdeli.com/pcweb/detail?sku=redispatch-1"
+    paths, dead_job = seed_manual_job(
+        runtime_root,
+        TODAY,
+        _CountingAdapter(),
+        mapping=NBDELI,
+        url=url,
+    )
+    candidate_id = seed_remote_candidate(
+        prewarm,
+        url,
+        dead_job,
+        mall="nbdeli",
+    )
+    dead_before = _remote_job_row(paths.state_path, dead_job)
+
+    summary = run_redispatch(
+        runtime_root,
+        paths,
+        prewarm,
+        _CountingAdapter(),
+        mappings=(NBDELI,),
+        selected_backend="batch",
+        batch_facade=_batch_facade_for_create(TODAY),
+    )
+
+    candidate = candidate_by_id(prewarm, candidate_id)
+    new_job_id = int(candidate["remote_job_id"])
+    assert new_job_id != dead_job
+    assert summary["redispatched_urls"] == 1
+    assert summary["redispatch_jobs"] == 1
+    assert _remote_job_row(paths.state_path, dead_job) == dead_before
+    new_job = _remote_job_row(paths.state_path, new_job_id)
+    assert new_job["state"] == "SUBMITTED"
+    payload = json.loads(new_job["payload_json"])
+    assert payload["purpose"] == "customer-prewarm"
+    assert payload["source_ids"] == [f"prewarm:{candidate_id}:redispatch:1"]
+    crawl = _state_rows(
+        paths.state_path,
+        "SELECT backend_version, source_id FROM crawl_work WHERE remote_job_id=?",
+        (new_job_id,),
+    )
+    assert crawl == [{
+        "backend_version": "batch-url-v1",
+        "source_id": payload["source_ids"][0],
+    }]
     links = _state_rows(
         runtime_root / "customer_prewarm.sqlite3",
         "SELECT business_date, remote_job_id, producer FROM prewarm_remote_job_links WHERE candidate_id=?",

@@ -91,6 +91,7 @@ from app.services.customer_prewarm_dispatch import (
 )
 from app.services.customer_prewarm_lifecycle import run_harvest_phase
 from app.services.customer_prewarm_store import CustomerPrewarmStore
+from app.services.customer_prewarm_batch import build_customer_prewarm_batch_facade
 from app.services.incremental_audit_runtime import (
     DEFAULT_RUNTIME_ROOT,
     business_date_in_shanghai,
@@ -168,6 +169,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=None,
         help="optional override for the zhaoshang mall mapping workbook",
+    )
+    parser.add_argument(
+        "--zhaoshang-backend",
+        choices=("legacy", "batch"),
+        default="legacy",
+        help="backend policy for new prewarm tasks; durable existing jobs keep their own backend",
     )
     parser.add_argument(
         "--plan-only",
@@ -473,6 +480,7 @@ def _run_dispatch(args: argparse.Namespace, business_date: str, runtime_root: Pa
                 max_jobs_per_pass=args.max_jobs_per_pass,
                 plan_only=True,
                 canary_scope=canary_scope,
+                selected_backend=args.zhaoshang_backend,
             )
             if canary_scope is not None and summary.get("canary_preflight", "PASS") != "PASS":
                 print(f"canary preflight FAILED outcome={summary['canary_preflight']}")
@@ -508,6 +516,7 @@ def _run_dispatch(args: argparse.Namespace, business_date: str, runtime_root: Pa
                 max_jobs_per_pass=args.max_jobs_per_pass,
                 plan_only=True,
                 canary_scope=canary_scope,
+                selected_backend=args.zhaoshang_backend,
             )
             if preflight.get("canary_preflight", "PASS") != "PASS":
                 print(
@@ -534,6 +543,7 @@ def _run_dispatch(args: argparse.Namespace, business_date: str, runtime_root: Pa
                 plan_only=False,
                 canary_scope=canary_scope,
                 canary_budget=canary_budget,
+                selected_backend=args.zhaoshang_backend,
             )
             for key in (
                 "existing_remote_reused_planned",
@@ -577,6 +587,32 @@ def _run_dispatch(args: argparse.Namespace, business_date: str, runtime_root: Pa
                 if lifecycle_on
                 else None
             )
+            batch_facades = {}
+
+            def batch_facade_for(day, day_paths, *, create_enabled=False):
+                key = (str(day), bool(create_enabled))
+                if key not in batch_facades:
+                    batch_facades[key] = build_customer_prewarm_batch_facade(
+                        paths=day_paths,
+                        business_date=str(day),
+                        mappings=mappings,
+                        write_enabled=bool(create_enabled),
+                        priority_enabled=True,
+                    )
+                return batch_facades[key]
+
+            current_batch_facade = (
+                batch_facade_for(
+                    business_date,
+                    runtime_paths(
+                        business_date,
+                        state_runtime_root if state_runtime_root is not None else runtime_root,
+                    ),
+                    create_enabled=True,
+                )
+                if args.zhaoshang_backend == "batch"
+                else None
+            )
             # Reserve a bounded lifecycle window from the dispatch budget.
             # The lifecycle deadline is anchored AFTER the dispatch pass
             # returns so a late remote timeout cannot consume this reserve.
@@ -591,6 +627,8 @@ def _run_dispatch(args: argparse.Namespace, business_date: str, runtime_root: Pa
                 state_runtime_root=state_runtime_root,
                 mappings=mappings,
                 adapter=adapter,
+                selected_backend=args.zhaoshang_backend,
+                batch_facade=current_batch_facade,
                 budget_seconds=float(args.budget_seconds) - lifecycle_reserve,
                 max_jobs_per_pass=args.max_jobs_per_pass,
                 plan_only=False,
@@ -626,6 +664,9 @@ def _run_dispatch(args: argparse.Namespace, business_date: str, runtime_root: Pa
                     current_business_date=business_date,
                     state_runtime_root=state_root,
                     get_adapter=lambda: adapter,
+                    get_batch_facade=lambda day, day_paths: batch_facade_for(
+                        day, day_paths, create_enabled=False
+                    ),
                     deadline=reconcile_deadline,
                     monotonic_value=time.monotonic,
                     summary=summary,
@@ -636,6 +677,9 @@ def _run_dispatch(args: argparse.Namespace, business_date: str, runtime_root: Pa
                     current_business_date=business_date,
                     state_runtime_root=state_root,
                     get_adapter=lambda: adapter,
+                    get_batch_facade=lambda day, day_paths: batch_facade_for(
+                        day, day_paths, create_enabled=False
+                    ),
                     deadline=historical_deadline,
                     monotonic_value=time.monotonic,
                     summary=summary,
@@ -649,6 +693,11 @@ def _run_dispatch(args: argparse.Namespace, business_date: str, runtime_root: Pa
                         monotonic_value=time.monotonic,
                         summary=summary,
                         adapter=adapter,
+                        batch_facade=batch_facade_for(
+                            business_date,
+                            day_paths,
+                            create_enabled=False,
+                        ),
                         mappings=mappings,
                     )
     except Exception as exc:  # noqa: BLE001 - scheduler-facing failure

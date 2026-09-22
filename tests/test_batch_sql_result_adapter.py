@@ -119,17 +119,92 @@ def _target(
     url="https://example.test/product/1",
     task_status="02",
     terminal_no_result_proven=False,
+    purpose="price-audit",
 ):
     return BatchResultTarget(
         execute_number=execute_number,
         expected_sku=sku,
         expected_url=url,
+        purpose=purpose,
         evidence=BatchResultEvidence(
             task_status=task_status,
             query_progress="COMPLETED" if task_status in {"02", "03"} else "RUNNING",
             terminal_no_result_proven=terminal_no_result_proven,
         ),
     )
+
+
+def test_customer_prewarm_unique_execute_number_ignores_placeholder_sku_and_returned_url():
+    result = BatchSqlResultAdapter(
+        _Factory(
+            lambda _sql, _params: [
+                _row(
+                    price_goods_no="REAL-123",
+                    price_sku_id="REAL-123",
+                    goods_no="REAL-123",
+                    sku_id="REAL-123",
+                    url="https://item.jd.com/REAL-123.html",
+                )
+            ]
+        )
+    ).fetch_batch_results(
+        "jd",
+        [
+            _target(
+                sku="zhpq-placeholder",
+                url="https://item.jd.com/submitted.html",
+                purpose="customer-prewarm",
+            )
+        ],
+    )[0]
+
+    assert result.status is BatchResultStatus.FOUND
+    crawl_result = batch_sql_result_to_crawl_result(
+        "jd", result, purpose="customer-prewarm"
+    )
+    assert crawl_result["page_sku_id"] == "REAL-123"
+    assert crawl_result["page_goods_no"] == "REAL-123"
+    assert crawl_result["returned_url"] == "https://item.jd.com/REAL-123.html"
+
+
+def test_customer_prewarm_multiple_rows_for_exact_execute_number_fail_closed():
+    rows = [
+        _row(sku_id="REAL-1", url="https://item.jd.com/1.html"),
+        _row(sku_id="REAL-2", url="https://item.jd.com/2.html"),
+    ]
+    result = BatchSqlResultAdapter(_Factory(lambda _sql, _params: rows)).fetch_batch_results(
+        "jd",
+        [
+            _target(
+                sku="zhpq-placeholder",
+                url="https://item.jd.com/submitted.html",
+                purpose="customer-prewarm",
+            )
+        ],
+    )[0]
+
+    assert result.status is BatchResultStatus.IDENTITY_CONFLICT
+
+
+def test_normal_price_audit_still_rejects_jd_sku_and_url_mismatch():
+    result = BatchSqlResultAdapter(
+        _Factory(
+            lambda _sql, _params: [
+                _row(
+                    price_goods_no="OTHER",
+                    price_sku_id="OTHER",
+                    goods_no="OTHER",
+                    sku_id="OTHER",
+                    url="https://item.jd.com/other.html",
+                )
+            ]
+        )
+    ).fetch_batch_results(
+        "jd",
+        [_target(sku="EXPECTED", url="https://item.jd.com/expected.html")],
+    )[0]
+
+    assert result.status is BatchResultStatus.IDENTITY_CONFLICT
 
 
 def _row(execute_number="mrwang-0000000000000001", **overrides):

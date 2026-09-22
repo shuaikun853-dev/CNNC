@@ -134,6 +134,28 @@ def test_durable_envelope_round_trips_and_rejects_tampering():
         CnncBatchZhaoshangAdapter.restore_job(tampered_weight)
 
 
+def test_customer_prewarm_purpose_is_explicit_and_identity_bound_in_durable_payload():
+    normal = CnncBatchZhaoshangAdapter.prepare_jobs(
+        "2026-08-12", [_request(1)]
+    ).jobs[0]
+    prewarm = CnncBatchZhaoshangAdapter.prepare_jobs(
+        "2026-08-12", [_request(1)], purpose="customer-prewarm"
+    ).jobs[0]
+
+    assert normal.purpose == "price-audit"
+    assert normal.durable_payload()["purpose"] == "price-audit"
+    assert prewarm.purpose == "customer-prewarm"
+    assert prewarm.durable_payload()["purpose"] == "customer-prewarm"
+    assert prewarm.logical_job_key != normal.logical_job_key
+    restored = CnncBatchZhaoshangAdapter.restore_job(prewarm.durable_payload())
+    assert restored.purpose == "customer-prewarm"
+
+    tampered = json.loads(json.dumps(prewarm.durable_payload()))
+    tampered["purpose"] = "price-audit"
+    with pytest.raises(ValueError, match="verification"):
+        CnncBatchZhaoshangAdapter.restore_job(tampered)
+
+
 def test_submit_is_write_disabled_by_default():
     calls = []
     adapter = CnncBatchZhaoshangAdapter(post_json=lambda *_args: calls.append(1))

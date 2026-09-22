@@ -15,9 +15,14 @@ from urllib.parse import urlsplit
 from app.services.page_price_semantics import valid_page_price_result
 from app.services.zhaoshang_url_identity import (
     SUBMITTED_CODE_AUTHORITATIVE_MALLS,
+    is_absolute_http_url,
     strict_batch_result_url_match,
     submitted_url_product_code,
 )
+
+PURPOSE_PRICE_AUDIT = "price-audit"
+PURPOSE_CUSTOMER_PREWARM = "customer-prewarm"
+_SUPPORTED_PURPOSES = frozenset({PURPOSE_PRICE_AUDIT, PURPOSE_CUSTOMER_PREWARM})
 
 
 MAX_QUERY_EXECUTE_NUMBERS = 100
@@ -87,20 +92,27 @@ class BatchResultTarget:
     expected_sku: str
     expected_url: str
     evidence: BatchResultEvidence
+    purpose: str = PURPOSE_PRICE_AUDIT
 
     def __post_init__(self) -> None:
         execute_number = str(self.execute_number or "").strip()
         expected_sku = str(self.expected_sku or "").strip()
         expected_url = str(self.expected_url or "").strip()
+        purpose = str(self.purpose or "").strip()
         if not execute_number:
             raise ValueError("execute_number is required")
         if not expected_sku:
             raise ValueError("expected_sku is required")
         if not expected_url:
             raise ValueError("expected_url is required")
+        if purpose not in _SUPPORTED_PURPOSES:
+            raise ValueError("unsupported batch result purpose")
+        if purpose == PURPOSE_CUSTOMER_PREWARM and not is_absolute_http_url(expected_url):
+            raise ValueError("customer-prewarm requires an absolute submitted URL")
         object.__setattr__(self, "execute_number", execute_number)
         object.__setattr__(self, "expected_sku", expected_sku)
         object.__setattr__(self, "expected_url", expected_url)
+        object.__setattr__(self, "purpose", purpose)
 
 
 @dataclass(frozen=True)
@@ -219,6 +231,8 @@ def _urls_match(mall: str, left: Any, right: Any) -> bool:
 
 
 def _matches_identity(mall: str, row: Mapping[str, Any], target: BatchResultTarget) -> bool:
+    if target.purpose == PURPOSE_CUSTOMER_PREWARM:
+        return is_absolute_http_url(target.expected_url)
     if mall in SUBMITTED_CODE_AUTHORITATIVE_MALLS:
         return submitted_url_product_code(mall, target.expected_url) is not None
     sku_values = {
@@ -255,7 +269,10 @@ def _invalid_result_reason(row: Mapping[str, Any]) -> str | None:
 
 
 def batch_sql_result_to_crawl_result(
-    mall: str, result: BatchSqlResult
+    mall: str,
+    result: BatchSqlResult,
+    *,
+    purpose: str = PURPOSE_PRICE_AUDIT,
 ) -> Mapping[str, Any]:
     """Convert one provenance-valid SQL row into shared page-price semantics."""
 
@@ -264,6 +281,8 @@ def batch_sql_result_to_crawl_result(
         raise ValueError("mall is not allowlisted")
     if result.status is not BatchResultStatus.FOUND:
         raise ValueError("only FOUND batch SQL results can become crawl results")
+    if purpose not in _SUPPORTED_PURPOSES:
+        raise ValueError("unsupported batch result purpose")
     price = _result_price(result.price)
     if price is None:
         raise ValueError("FOUND batch SQL result has an invalid price")
@@ -282,6 +301,14 @@ def batch_sql_result_to_crawl_result(
         "comment_count": result.comment,
         "page_price_source": f"batch_sql:{mall}",
     }
+    if purpose == PURPOSE_CUSTOMER_PREWARM:
+        crawl_result.update(
+            {
+                "page_sku_id": str(result.sku_id or "").strip() or None,
+                "page_goods_no": str(result.goods_no or "").strip() or None,
+                "returned_url": str(result.url or "").strip() or None,
+            }
+        )
     if not valid_page_price_result(crawl_result):
         raise ValueError("converted batch SQL result violates page-price semantics")
     return crawl_result

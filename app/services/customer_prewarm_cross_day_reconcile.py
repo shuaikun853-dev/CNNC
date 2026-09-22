@@ -14,13 +14,19 @@ import os
 from contextlib import contextmanager
 from datetime import date
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
 from app.services.customer_prewarm_discovery import _open_state_db_readonly
 from app.services.customer_prewarm_store import (
     CACHE_STATUS_REMOTE_DISPATCHED,
     CACHE_STATUS_REMOTE_REUSED,
     CustomerPrewarmStore,
+)
+from app.services.customer_prewarm_batch import (
+    CustomerPrewarmBatchFacade,
+    apply_customer_prewarm_batch_evidence,
+    harvest_existing_customer_prewarm_batch_job,
+    is_customer_prewarm_batch_job,
 )
 from app.services.incremental_audit_runtime import runtime_paths
 from app.services.daily_audit_store import DailyAuditStore, LeaseUnavailable, ProcessLock
@@ -40,7 +46,8 @@ FROM remote_jobs j
 WHERE j.id = ?
   AND (
       (
-          j.state = 'SUBMIT_UNKNOWN'
+          j.state IN ('SUBMIT_INTENT', 'SUBMIT_UNKNOWN')
+          AND COALESCE(j.post_attempted, 0) = 1
           AND TRIM(COALESCE(j.remote_identity, '')) = ''
           AND COALESCE(j.recovery_attempts, 0) < ?
       )
@@ -224,6 +231,7 @@ def plan_cross_day_harvest_jobs(
 
 def _eligible_locked_job(
     store: DailyAuditStore,
+    token: Any,
     job_id: int,
     dead_threshold: int,
 ) -> dict[str, Any] | None:
@@ -233,6 +241,13 @@ def _eligible_locked_job(
         return None
     state = str(job.get("state") or "")
     identity = str(job.get("remote_identity") or "").strip()
+    if state == "SUBMIT_INTENT" and int(job.get("post_attempted") or 0) == 1:
+        store.mark_submit_unknown(
+            token, job_id, "cross-day recovery after interrupted POST claim"
+        )
+        job = store.get_remote_job(job_id) or job
+        state = str(job.get("state") or "")
+        identity = str(job.get("remote_identity") or "").strip()
     if state == "SUBMIT_UNKNOWN":
         if identity or int(job.get("recovery_attempts") or 0) >= dead_threshold:
             return None
@@ -255,6 +270,7 @@ def run_cross_day_reconcile_phase(
     current_business_date: str,
     state_runtime_root: str | Path,
     get_adapter: Callable[[], Any],
+    get_batch_facade: Callable[[str, Any], CustomerPrewarmBatchFacade] | None = None,
     deadline: float,
     monotonic_value: Callable[[], float],
     summary: dict[str, Any],
@@ -384,7 +400,9 @@ def run_cross_day_reconcile_phase(
                 phase_errors.append(f"cross-day job {owning_day}/{job_id}: LOCK_BUSY; deferred")
                 continue
             try:
-                job = _eligible_locked_job(store, job_id, effective_dead_threshold)
+                job = _eligible_locked_job(
+                    store, token, job_id, effective_dead_threshold
+                )
                 if job is None or int(job["run_id"]) != token.run_id:
                     summary["cross_day_reconcile_deferred"] += 1
                     phase_errors.append(
@@ -421,7 +439,11 @@ def run_cross_day_reconcile_phase(
                         "exhausted; deferred"
                     )
                     continue
-                prepared = _reconstruct_prepared_job(get_adapter(), owning_day, job)
+                prepared = (
+                    None
+                    if is_customer_prewarm_batch_job(job)
+                    else _reconstruct_prepared_job(get_adapter(), owning_day, job)
+                )
 
                 def linkage_still_current() -> bool:
                     if key in set(
@@ -451,6 +473,146 @@ def run_cross_day_reconcile_phase(
                                 "linkage changed before historical commit; result discarded"
                             )
                         yield owned
+
+                if is_customer_prewarm_batch_job(job):
+                    if get_batch_facade is None:
+                        raise ValueError("customer-prewarm Batch facade is unavailable")
+                    if not linkage_still_current():
+                        continue
+                    original_state = str(job.get("state") or "")
+                    phase = (
+                        "priority"
+                        if original_state == "PRIORITY_PENDING"
+                        else "harvest"
+                    )
+                    claim = store.claim_harvest(
+                        token,
+                        job_id,
+                        max_attempts=120,
+                        max_elapsed_seconds=21600.0,
+                    )
+                    if claim is None:
+                        summary["cross_day_reconcile_deferred"] += 1
+                        phase_errors.append(
+                            f"cross-day job {owning_day}/{job_id}: retry limit reached; deferred"
+                        )
+                        continue
+                    enriched = {
+                        **dict(claim),
+                        "crawl_work": store.crawl_work_for_job(job_id),
+                    }
+                    store.renew_lease(token, LEASE_TTL_SECONDS)
+                    if not linkage_still_current():
+                        store.release_harvest_claim(token, job_id, phase=phase)
+                        continue
+                    started = monotonic_value()
+                    try:
+                        evidence_map = get_batch_facade(owning_day, paths).harvest(
+                            [enriched],
+                            max(0.001, job_deadline - monotonic_value()),
+                        )
+                    except Exception as exc:
+                        store.record_harvest(
+                            token,
+                            job_id,
+                            elapsed_seconds=max(0.0, monotonic_value() - started),
+                            max_attempts=120,
+                            max_elapsed_seconds=21600.0,
+                            error=f"{type(exc).__name__}: {exc}",
+                            phase=phase,
+                        )
+                        raise
+                    evidence = evidence_map.get(job_id) or evidence_map.get(str(job_id))
+                    if not isinstance(evidence, Mapping):
+                        store.record_harvest(
+                            token,
+                            job_id,
+                            elapsed_seconds=max(0.0, monotonic_value() - started),
+                            max_attempts=120,
+                            max_elapsed_seconds=21600.0,
+                            error="cross-day Batch reconcile returned no exact evidence",
+                            phase=phase,
+                        )
+                        raise RuntimeError("cross-day Batch reconcile returned no exact evidence")
+                    reconcile_not_found = (
+                        str(evidence.get("reconcile_status") or "") == "NOT_FOUND"
+                    )
+                    with historical_link_commit_fence() as commit_allowed:
+                        if not commit_allowed:
+                            store.record_harvest(
+                                token,
+                                job_id,
+                                elapsed_seconds=max(0.0, monotonic_value() - started),
+                                max_attempts=120,
+                                max_elapsed_seconds=21600.0,
+                                error="candidate linkage changed before historical commit",
+                                phase=phase,
+                            )
+                            continue
+                        if reconcile_not_found:
+                            diagnostic = sanitize_remote_diagnostic(
+                                evidence.get("reconcile_diagnostic") or ""
+                            )
+                            if diagnostic:
+                                store.record_submit_reconcile_diagnostic(
+                                    token,
+                                    job_id,
+                                    status="NOT_FOUND",
+                                    diagnostic=diagnostic,
+                                )
+                                state = original_state
+                            else:
+                                new_attempts = store.bump_remote_job_recovery_attempt(
+                                    token,
+                                    job_id,
+                                    diagnostic="exact Batch remote task not found",
+                                )
+                                state = original_state
+                        else:
+                            state = apply_customer_prewarm_batch_evidence(
+                                store, token, claim, evidence
+                            )
+                    store.record_harvest(
+                        token,
+                        job_id,
+                        elapsed_seconds=max(0.0, monotonic_value() - started),
+                        max_attempts=120,
+                        max_elapsed_seconds=21600.0,
+                        error=(
+                            str(evidence.get("retryable_error"))
+                            if evidence.get("retryable_error")
+                            else None
+                        ),
+                        phase=phase,
+                        phase_succeeded=(
+                            (
+                                original_state == "SUBMIT_UNKNOWN"
+                                and state == "PRIORITY_PENDING"
+                            )
+                            or (
+                                original_state == "PRIORITY_PENDING"
+                                and state == "SUBMITTED"
+                            )
+                        ),
+                    )
+                    if reconcile_not_found:
+                        if diagnostic:
+                            phase_errors.append(
+                                f"cross-day job {owning_day}/{job_id}: "
+                                f"inconclusive Batch lookup ({diagnostic})"
+                            )
+                        else:
+                            summary["cross_day_reconcile_not_found"] += 1
+                            if new_attempts >= effective_dead_threshold:
+                                summary["cross_day_reconcile_dead"] += 1
+                                phase_errors.append(
+                                    f"cross-day job {owning_day}/{job_id}: judged dead after "
+                                    f"{new_attempts} attempts; next dispatch owns redispatch"
+                                )
+                        continue
+                    if state == "PRIORITY_PENDING":
+                        summary["cross_day_reconciled_found"] += 1
+                    continue
 
                 if str(job.get("state") or "") == "PRIORITY_PENDING":
                     if not linkage_still_current():
@@ -587,6 +749,7 @@ def run_cross_day_harvest_phase(
     current_business_date: str,
     state_runtime_root: str | Path,
     get_adapter: Callable[[], Any],
+    get_batch_facade: Callable[[str, Any], CustomerPrewarmBatchFacade] | None = None,
     deadline: float,
     monotonic_value: Callable[[], float],
     summary: dict[str, Any],
@@ -665,8 +828,12 @@ def run_cross_day_harvest_phase(
             summary["cross_day_harvest_deferred"] += 1
             continue
         identity = str(row["remote_identity"] or "").strip()
+        batch_job = is_customer_prewarm_batch_job(dict(row))
         parts = identity.split("|")
-        if len(parts) != 3 or not all(parts) or parts[0] != str(row["mall_key"] or ""):
+        if not identity or (
+            not batch_job
+            and (len(parts) != 3 or not all(parts) or parts[0] != str(row["mall_key"] or ""))
+        ):
             summary["cross_day_harvest_deferred"] += 1
             phase_errors.append(f"cross-day harvest {owning_day}/{job_id}: malformed identity")
             continue
@@ -686,6 +853,12 @@ def run_cross_day_harvest_phase(
             state == "MANUAL_REQUIRED" and has_success
         )
         if state == "MANUAL_REQUIRED" and should_harvest:
+            if batch_job:
+                summary["cross_day_harvest_deferred"] += 1
+                phase_errors.append(
+                    f"cross-day harvest {owning_day}/{job_id}: Batch manual recovery requires review"
+                )
+                continue
             proof_remaining = deadline - monotonic_value()
             if proof_remaining <= 0:
                 summary["cross_day_harvest_deferred"] += 1
@@ -710,16 +883,28 @@ def run_cross_day_harvest_phase(
                 summary["cross_day_harvest_deferred"] += 1
                 continue
             try:
-                result = lifecycle.harvest_existing_customer_prewarm_job(
-                    state_path=paths.state_path,
-                    lock_path=paths.lock_path,
-                    business_date=owning_day,
-                    remote_job_id=job_id,
-                    remote_identity=identity,
-                    adapter=get_adapter(),
-                    timeout_seconds=min(float(per_job_timeout_seconds), remaining),
-                    live_identity_proof=proof,
-                )
+                if batch_job:
+                    if get_batch_facade is None:
+                        raise ValueError("customer-prewarm Batch facade is unavailable")
+                    result = harvest_existing_customer_prewarm_batch_job(
+                        state_path=paths.state_path,
+                        lock_path=paths.lock_path,
+                        business_date=owning_day,
+                        remote_job_id=job_id,
+                        facade=get_batch_facade(owning_day, paths),
+                        timeout_seconds=min(float(per_job_timeout_seconds), remaining),
+                    )
+                else:
+                    result = lifecycle.harvest_existing_customer_prewarm_job(
+                        state_path=paths.state_path,
+                        lock_path=paths.lock_path,
+                        business_date=owning_day,
+                        remote_job_id=job_id,
+                        remote_identity=identity,
+                        adapter=get_adapter(),
+                        timeout_seconds=min(float(per_job_timeout_seconds), remaining),
+                        live_identity_proof=proof,
+                    )
             except LeaseUnavailable:
                 summary["cross_day_harvest_lock_busy"] += 1
                 continue

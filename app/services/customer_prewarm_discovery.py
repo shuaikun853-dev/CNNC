@@ -720,6 +720,7 @@ def _sync_daily_internet_results_unlocked(
             row_out = shared_cache.record_success(
                 mall=mall_key,
                 submitted_url=exact_url,
+                returned_url=result.get("returned_url"),
                 crawl_id=crawl_label,
                 real_sku_id=real_sku_id,
                 sku_status=sku_status,

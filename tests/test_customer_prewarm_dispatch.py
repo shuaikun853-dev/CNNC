@@ -28,8 +28,12 @@ from app.services.customer_prewarm_dispatch import (
     find_remote_work_for_url,
     prewarm_crawl_fingerprint,
     prewarm_placeholder_sku,
+    prewarm_backend_version,
+    dispatch_single_candidate_exact,
     run_prewarm_dispatch_pass,
 )
+from app.services.batch_zhaoshang_adapter import CnncBatchZhaoshangAdapter
+from app.services.customer_prewarm_batch import CustomerPrewarmBatchFacade
 from app.services.customer_prewarm_store import (
     CACHE_STATUS_CACHE_HIT,
     CACHE_STATUS_MANUAL_SKIP,
@@ -41,7 +45,7 @@ from app.services.customer_prewarm_store import (
     CustomerPrewarmStore,
 )
 from app.services.daily_audit_store import DailyAuditStore, ProcessLock
-from app.services.incremental_audit_runtime import runtime_paths
+from app.services.incremental_audit_runtime import CrawlMember, CrawlPlan, runtime_paths
 from app.services.legacy_zhaoshang_adapter import (
     CrawlRequest,
     LegacyPriorityOutcome,
@@ -53,6 +57,22 @@ from app.services.shared_crawl_cache import SharedCrawlCache
 from scripts.zhaoshang_mall_mapping import ZhaoshangMallMapping
 
 BUSINESS_DATE = "2026-09-07"
+
+
+@pytest.mark.parametrize(
+    ("mall", "url", "expected"),
+    [
+        ("jd", "https://item.jd.com/100123.html", "batch-url-v1"),
+        ("mymro", "https://www.mymro.cn/u-98S6010.html", "batch-url-v1"),
+        ("mymro", "https://www.mymro.cn/search?q=98S6010", "legacy-v1"),
+        ("ofs", "https://www.ofs.cn/product-3975210.html", "batch-url-v1"),
+        ("ofs", "https://www.ofs.cn/search?q=3975210", "legacy-v1"),
+        ("unknown", "https://example.test/item/1", "legacy-v1"),
+    ],
+)
+def test_prewarm_batch_policy_uses_existing_allowlist_and_url_gate(mall, url, expected):
+    assert prewarm_backend_version(mall, url, selected_backend="batch") == expected
+    assert prewarm_backend_version(mall, url, selected_backend="legacy") == "legacy-v1"
 
 COMIX = ZhaoshangMallMapping(
     mall_name="齐心商城",
@@ -159,6 +179,63 @@ class _CountingAdapter:
         if self.priority_outcomes:
             return self.priority_outcomes.pop(0)
         return LegacyPriorityOutcome(PriorityStatus.UPDATED, weight_type=-1)
+
+
+def _batch_facade_for_create(business_date=BUSINESS_DATE):
+    adapter = CnncBatchZhaoshangAdapter(write_enabled=True)
+
+    def propose(items, _timeout):
+        requests = [item["row"]["request"] for item in items]
+        source_ids = [item["row"]["source_id"] for item in items]
+        members = {
+            source_id: CrawlMember(
+                request.mall_key,
+                source_id,
+                request.sku_id,
+                request.url,
+                request.backend_version,
+                item["row"],
+            )
+            for request, source_id, item in zip(requests, source_ids, items, strict=True)
+        }
+        plans = []
+        for job in adapter.prepare_jobs(
+            business_date,
+            requests,
+            source_ids=source_ids,
+            purpose="customer-prewarm",
+        ).jobs:
+            plans.append(
+                CrawlPlan(
+                    job.mall_key,
+                    job.logical_job_key,
+                    job.task_name,
+                    job.payload_sha256,
+                    payload_json=job.durable_payload(),
+                    members=tuple(members[source_id] for source_id in job.source_ids),
+                )
+            )
+        return plans
+
+    def submit(job, _crawls, _timeout):
+        payload = json.loads(job["payload_json"])
+        prepared = adapter.restore_job(payload)
+        return {
+            "state": "PRIORITY_PENDING",
+            "remote_identity": prepared.remote_identity.durable_value(),
+        }
+
+    def harvest(jobs, _timeout):
+        job = jobs[0]
+        return {
+            int(job["id"]): {
+                "state": "SUBMITTED",
+                "remote_identity": str(job["remote_identity"]),
+                "result": {"priority_status": "ALREADY_HIGHEST"},
+            }
+        }
+
+    return CustomerPrewarmBatchFacade(propose, lambda p, _m, _t: p, submit, harvest)
 
 
 class _FakeClock:
@@ -322,6 +399,14 @@ def test_placeholder_sku_and_fingerprint_are_deterministic():
     )
     assert fingerprint != prewarm_crawl_fingerprint(
         "comix", "SRC-COMIX", sku, "https://qx.com/a", "2026-09-06"
+    )
+    assert fingerprint != prewarm_crawl_fingerprint(
+        "comix",
+        "SRC-COMIX",
+        sku,
+        "https://qx.com/a",
+        BUSINESS_DATE,
+        backend_version="batch-url-v1",
     )
 
 
@@ -589,6 +674,379 @@ def test_case6_new_task_created_submitted_once(tmp_path):
     payload = json.loads(job["payload_json"])
     assert payload["requests"][0]["url"] == url
     assert payload["requests"][0]["sku_id"] == crawl["sku_id"]
+
+
+def test_new_supported_prewarm_uses_shared_batch_contract(tmp_path):
+    runtime_root = tmp_path / "runtime"
+    paths = make_state_db(runtime_root, BUSINESS_DATE)
+    prewarm = CustomerPrewarmStore(runtime_root / "customer_prewarm.sqlite3")
+    cache = SharedCrawlCache(runtime_root / "shared_crawl_cache.sqlite3")
+    url = "https://b2b.nbdeli.com/pcweb/detail?sku=123"
+    candidate_id = make_candidate(prewarm, url, mall="nbdeli")
+
+    summary = run_pass(
+        runtime_root,
+        prewarm,
+        cache,
+        mappings=(NBDELI,),
+        selected_backend="batch",
+        batch_facade=_batch_facade_for_create(),
+    )
+
+    assert summary["jobs_created"] == 1
+    assert summary["priority_confirmed"] == 1
+    crawl = _crawl_rows(paths.state_path)[0]
+    assert crawl["backend_version"] == "batch-url-v1"
+    assert crawl["state"] == "SUBMITTED"
+    candidate = candidate_by_id(prewarm, candidate_id)
+    assert int(candidate["remote_job_id"]) > 0
+    job = _state_rows(paths.state_path, "SELECT * FROM remote_jobs")[0]
+    payload = json.loads(job["payload_json"])
+    assert payload["purpose"] == "customer-prewarm"
+    assert payload["source_ids"] == [f"prewarm:{candidate_id}"]
+    assert crawl["source_id"] == payload["source_ids"][0]
+    assert payload["execute_numbers"]
+    assert payload["batch_number"] == payload["task_name"]
+
+
+def test_batch_candidate_link_is_durable_before_post(tmp_path):
+    runtime_root = tmp_path / "runtime"
+    make_state_db(runtime_root, BUSINESS_DATE)
+    prewarm = CustomerPrewarmStore(runtime_root / "customer_prewarm.sqlite3")
+    cache = SharedCrawlCache(runtime_root / "shared_crawl_cache.sqlite3")
+    url = "https://b2b.nbdeli.com/goods/prelink.html"
+    candidate_id = make_candidate(
+        prewarm, url, mall="nbdeli", lookup_url=url, document="PRELINK"
+    )
+    base = _batch_facade_for_create()
+    submit_calls = []
+
+    def submit(job, crawls, timeout):
+        link = prewarm.remote_job_link_for_candidate(candidate_id)
+        assert link is not None
+        assert int(link["remote_job_id"]) == int(job["id"])
+        submit_calls.append(int(job["id"]))
+        return base.submit(job, crawls, timeout)
+
+    facade = CustomerPrewarmBatchFacade(base.propose, base.finalize, submit, base.harvest)
+    summary = run_pass(
+        runtime_root,
+        prewarm,
+        cache,
+        mappings=(NBDELI,),
+        selected_backend="batch",
+        batch_facade=facade,
+    )
+
+    assert summary["jobs_created"] == 1
+    assert len(submit_calls) == 1
+
+
+def test_prior_day_batch_post_claim_recovers_from_prepost_link_without_repost(tmp_path):
+    from app.services.customer_prewarm_cross_day_reconcile import (
+        plan_cross_day_reconcile_jobs,
+    )
+
+    runtime_root = tmp_path / "runtime"
+    prewarm = CustomerPrewarmStore(runtime_root / "customer_prewarm.sqlite3")
+    cache = SharedCrawlCache(runtime_root / "shared_crawl_cache.sqlite3")
+    url = "https://b2b.nbdeli.com/pcweb/detail?sku=crash-window"
+    old_day = "2026-09-06"
+    make_state_db(runtime_root, old_day)
+    upsert = prewarm.upsert_link(
+        "CRASH", url, mall="nbdeli", lookup_url=url, business_date=old_day
+    )
+    candidate_id = int(upsert["candidate"]["id"])
+    prewarm.record_candidate_result(
+        candidate_id, cache_status=CACHE_STATUS_PENDING_PREWARM
+    )
+    base = _batch_facade_for_create(old_day)
+
+    def interrupted_submit(_job, _crawls, _timeout):
+        raise SystemExit("simulated crash after durable POST claim")
+
+    crashed = CustomerPrewarmBatchFacade(
+        base.propose, base.finalize, interrupted_submit, base.harvest
+    )
+    with pytest.raises(SystemExit, match="simulated crash"):
+        run_prewarm_dispatch_pass(
+            prewarm,
+            cache,
+            business_date=old_day,
+            runtime_root=runtime_root,
+            mappings=[NBDELI],
+            selected_backend="batch",
+            batch_facade=crashed,
+        )
+
+    old_paths = runtime_paths(old_day, runtime_root)
+    old_job = _state_rows(old_paths.state_path, "SELECT * FROM remote_jobs")[0]
+    assert old_job["state"] == "SUBMIT_INTENT"
+    assert old_job["post_attempted"] == 1
+    assert candidate_by_id(prewarm, candidate_id)["cache_status"] == CACHE_STATUS_PENDING_PREWARM
+    prewarm.upsert_link(
+        "CRASH-TODAY",
+        url,
+        mall="nbdeli",
+        lookup_url=url,
+        business_date=BUSINESS_DATE,
+    )
+    make_state_db(runtime_root, BUSINESS_DATE)
+
+    no_repost = CustomerPrewarmBatchFacade(
+        base.propose,
+        base.finalize,
+        lambda *_args: pytest.fail("prior-day claimed intent must never POST again"),
+        base.harvest,
+    )
+    manual_probe = dispatch_single_candidate_exact(
+        prewarm,
+        cache,
+        business_date=BUSINESS_DATE,
+        runtime_root=runtime_root,
+        candidate_id=candidate_id,
+        mappings=[NBDELI],
+        selected_backend="batch",
+        batch_facade=no_repost,
+    )
+    assert manual_probe["outcome"] == "REUSED"
+    assert manual_probe["batch_reconcile_pending"] is True
+    assert manual_probe["remote_identity"] == ""
+
+    run_pass(
+        runtime_root,
+        prewarm,
+        cache,
+        mappings=(NBDELI,),
+        selected_backend="batch",
+        batch_facade=no_repost,
+    )
+
+    candidate = candidate_by_id(prewarm, candidate_id)
+    assert candidate["cache_status"] == CACHE_STATUS_REMOTE_DISPATCHED
+    assert int(candidate["remote_job_id"]) == int(old_job["id"])
+    assert plan_cross_day_reconcile_jobs(
+        prewarm,
+        current_business_date=BUSINESS_DATE,
+        state_runtime_root=runtime_root,
+    ) == [(old_day, int(old_job["id"]))]
+
+
+def test_batch_submit_unknown_not_found_reaches_dead_threshold_without_repost(tmp_path):
+    from app.services.customer_prewarm_lifecycle import RECONCILE_DEAD_THRESHOLD
+
+    runtime_root = tmp_path / "runtime"
+    paths = make_state_db(runtime_root, BUSINESS_DATE)
+    prewarm = CustomerPrewarmStore(runtime_root / "customer_prewarm.sqlite3")
+    cache = SharedCrawlCache(runtime_root / "shared_crawl_cache.sqlite3")
+    url = "https://b2b.nbdeli.com/goods/not-found.html"
+    make_candidate(prewarm, url, mall="nbdeli", lookup_url=url, document="NF")
+    base = _batch_facade_for_create()
+    calls = {"submit": 0, "harvest": 0}
+
+    def submit(_job, _crawls, _timeout):
+        calls["submit"] += 1
+        raise TimeoutError("post outcome unknown")
+
+    def harvest(jobs, _timeout):
+        calls["harvest"] += 1
+        return {
+            int(jobs[0]["id"]): {
+                "state": "SUBMIT_UNKNOWN",
+                "reconcile_status": "NOT_FOUND",
+                "reconcile_diagnostic": "",
+            }
+        }
+
+    facade = CustomerPrewarmBatchFacade(base.propose, base.finalize, submit, harvest)
+    for _ in range(RECONCILE_DEAD_THRESHOLD - 1):
+        run_pass(
+            runtime_root,
+            prewarm,
+            cache,
+            mappings=(NBDELI,),
+            selected_backend="batch",
+            batch_facade=facade,
+        )
+
+    job = _state_rows(paths.state_path, "SELECT * FROM remote_jobs")[0]
+    assert job["recovery_attempts"] == RECONCILE_DEAD_THRESHOLD - 1
+    assert calls == {"submit": 1, "harvest": RECONCILE_DEAD_THRESHOLD - 1}
+
+    # The threshold pass may create exactly one replacement through the
+    # existing redispatch owner; it is not a repeat POST of the unknown intent.
+    run_pass(
+        runtime_root,
+        prewarm,
+        cache,
+        mappings=(NBDELI,),
+        selected_backend="batch",
+        batch_facade=facade,
+    )
+    jobs = _state_rows(paths.state_path, "SELECT * FROM remote_jobs ORDER BY id")
+    assert jobs[0]["recovery_attempts"] == RECONCILE_DEAD_THRESHOLD
+    assert len(jobs) == 2
+    assert calls == {"submit": 2, "harvest": RECONCILE_DEAD_THRESHOLD}
+
+
+def test_batch_priority_callback_failure_records_retry_diagnostic(tmp_path):
+    runtime_root = tmp_path / "runtime"
+    paths = make_state_db(runtime_root, BUSINESS_DATE)
+    prewarm = CustomerPrewarmStore(runtime_root / "customer_prewarm.sqlite3")
+    cache = SharedCrawlCache(runtime_root / "shared_crawl_cache.sqlite3")
+    url = "https://b2b.nbdeli.com/goods/priority-error.html"
+    make_candidate(prewarm, url, mall="nbdeli", lookup_url=url, document="ERR")
+    base = _batch_facade_for_create()
+
+    def harvest(_jobs, _timeout):
+        raise RuntimeError("priority callback failed")
+
+    facade = CustomerPrewarmBatchFacade(base.propose, base.finalize, base.submit, harvest)
+    run_pass(
+        runtime_root,
+        prewarm,
+        cache,
+        mappings=(NBDELI,),
+        selected_backend="batch",
+        batch_facade=facade,
+    )
+
+    job = _state_rows(paths.state_path, "SELECT * FROM remote_jobs")[0]
+    assert job["state"] == "PRIORITY_PENDING"
+    assert job["priority_attempts"] == 1
+    assert "RuntimeError: priority callback failed" in job["error_text"]
+
+
+def test_batch_plan_only_computes_policy_without_constructing_batch_facade(
+    tmp_path, monkeypatch
+):
+    runtime_root = tmp_path / "runtime"
+    make_state_db(runtime_root, BUSINESS_DATE)
+    prewarm = CustomerPrewarmStore(runtime_root / "customer_prewarm.sqlite3")
+    cache = SharedCrawlCache(runtime_root / "shared_crawl_cache.sqlite3")
+    make_candidate(
+        prewarm,
+        "https://b2b.nbdeli.com/pcweb/detail?sku=plan-only",
+        mall="nbdeli",
+    )
+
+    monkeypatch.setattr(
+        "app.services.customer_prewarm_dispatch.build_customer_prewarm_batch_facade",
+        lambda **kwargs: pytest.fail("plan-only must not construct Batch facade"),
+    )
+    summary = run_pass(
+        runtime_root,
+        prewarm,
+        cache,
+        mappings=(NBDELI,),
+        selected_backend="batch",
+        plan_only=True,
+    )
+
+    assert summary["outcome"] == "OK"
+    assert summary["jobs_created"] == 0
+
+
+def test_manual_exact_new_request_uses_batch_policy(tmp_path):
+    runtime_root = tmp_path / "runtime"
+    paths = make_state_db(runtime_root, BUSINESS_DATE)
+    prewarm = CustomerPrewarmStore(runtime_root / "customer_prewarm.sqlite3")
+    cache = SharedCrawlCache(runtime_root / "shared_crawl_cache.sqlite3")
+    url = "https://b2b.nbdeli.com/pcweb/detail?sku=456"
+    candidate_id = make_candidate(prewarm, url, mall="nbdeli")
+    base = _batch_facade_for_create()
+
+    def submit(job, crawls, timeout):
+        link = prewarm.remote_job_link_for_candidate(candidate_id)
+        assert link is not None
+        assert int(link["remote_job_id"]) == int(job["id"])
+        return base.submit(job, crawls, timeout)
+
+    result = dispatch_single_candidate_exact(
+        prewarm,
+        cache,
+        business_date=BUSINESS_DATE,
+        runtime_root=runtime_root,
+        candidate_id=candidate_id,
+        mappings=[NBDELI],
+        selected_backend="batch",
+        batch_facade=CustomerPrewarmBatchFacade(
+            base.propose, base.finalize, submit, base.harvest
+        ),
+    )
+
+    assert result["outcome"] == "CREATED"
+    assert result["priority_confirmed"] is True
+    crawl = _crawl_rows(paths.state_path)[0]
+    assert crawl["backend_version"] == "batch-url-v1"
+    payload = json.loads(
+        _state_rows(paths.state_path, "SELECT payload_json FROM remote_jobs")[0][
+            "payload_json"
+        ]
+    )
+    assert payload["purpose"] == "customer-prewarm"
+    assert _crawl_rows(paths.state_path)[0]["source_id"] == payload["source_ids"][0]
+
+
+def test_manual_exact_reused_batch_priority_pending_confirms_without_new_post(tmp_path):
+    runtime_root = tmp_path / "runtime"
+    paths = make_state_db(runtime_root, BUSINESS_DATE)
+    prewarm = CustomerPrewarmStore(runtime_root / "customer_prewarm.sqlite3")
+    cache = SharedCrawlCache(runtime_root / "shared_crawl_cache.sqlite3")
+    url = "https://b2b.nbdeli.com/pcweb/detail?sku=manual-reuse"
+    candidate_id = make_candidate(prewarm, url, mall="nbdeli")
+    create_facade = _batch_facade_for_create()
+    run_pass(
+        runtime_root,
+        prewarm,
+        cache,
+        mappings=(NBDELI,),
+        selected_backend="batch",
+        batch_facade=create_facade,
+    )
+    job_id = int(candidate_by_id(prewarm, candidate_id)["remote_job_id"])
+    with sqlite3.connect(paths.state_path) as connection:
+        connection.execute(
+            "UPDATE remote_jobs SET state='PRIORITY_PENDING' WHERE id=?",
+            (job_id,),
+        )
+        connection.execute(
+            "UPDATE crawl_work SET state='PRIORITY_PENDING' WHERE remote_job_id=?",
+            (job_id,),
+        )
+
+    calls = []
+
+    def confirm_priority(jobs, _timeout):
+        calls.append(int(jobs[0]["id"]))
+        return {
+            int(jobs[0]["id"]): {
+                "state": "SUBMITTED",
+                "remote_identity": str(jobs[0]["remote_identity"]),
+            }
+        }
+
+    confirm_facade = CustomerPrewarmBatchFacade(
+        create_facade.propose,
+        create_facade.finalize,
+        create_facade.submit,
+        confirm_priority,
+    )
+    result = dispatch_single_candidate_exact(
+        prewarm,
+        cache,
+        business_date=BUSINESS_DATE,
+        runtime_root=runtime_root,
+        candidate_id=candidate_id,
+        mappings=[NBDELI],
+        selected_backend="legacy",
+        batch_facade=confirm_facade,
+    )
+
+    assert result["outcome"] == "REUSED"
+    assert result["priority_proven"] is True
+    assert calls == [job_id]
+    assert len(_state_rows(paths.state_path, "SELECT id FROM remote_jobs")) == 1
 
 
 # ---- Case 7:已有未完成任务复用 + boost ----------------------------------------------
