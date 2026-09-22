@@ -13,7 +13,7 @@ from typing import Any, Iterable
 
 from app.services.customer_price_semantics import customer_price_business_state
 from app.services.daily_audit_store import ProcessLock
-from app.services.incremental_audit_runtime import DEFAULT_RUNTIME_ROOT, runtime_paths
+from app.services.runtime_context import DEFAULT_RUNTIME_ROOT, runtime_paths
 from app.services.legacy_zhaoshang_adapter import EXTERNAL_TOOL_PATH
 from app.services.page_price_semantics import (
     FORCE_CLOSEOUT_MISSING_PRICE_LIMIT,
@@ -650,7 +650,7 @@ def collect_runtime_status(
     failed_links: list[dict[str, Any]] = []
     if not finalized and target_snapshot_id is not None:
         from app.services.customer_prewarm_lifecycle import failed_customer_link_rows
-        from scripts import zhaoshang_mall_mapping as mapping_module
+        from app.integrations import zhaoshang_mall_mapping as mapping_module
 
         failed_links = failed_customer_link_rows(
             business_date,

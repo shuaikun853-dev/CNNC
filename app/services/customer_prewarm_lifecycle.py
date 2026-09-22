@@ -48,6 +48,15 @@ stage), so the canary summary key set stays byte-identical.
 
 from __future__ import annotations
 
+# Compatibility exports; shared execution has one canonical implementation.
+from app.services.customer_prewarm_execution import (
+    harvest_existing_customer_prewarm_job,
+    RECONCILE_DEAD_THRESHOLD,
+    _RECONCILE_MANUAL_BLOCKER,
+    _terminal_priority_manual_live_proof,
+    _mark_reconcile_manual,
+)
+
 import hashlib
 import json
 from contextlib import nullcontext
@@ -55,9 +64,9 @@ from datetime import date
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
-from app.services import customer_prewarm_dispatch as dispatch_service
+from app.services import customer_prewarm_execution as dispatch_service
 from app.services.customer_prewarm_discovery import _open_state_db_readonly
-from app.services.customer_prewarm_dispatch import (
+from app.services.customer_prewarm_execution import (
     BACKEND_VERSION,
     LEASE_TTL_SECONDS,
     SUBMIT_MIN_SECONDS,
@@ -75,29 +84,16 @@ from app.services.customer_prewarm_store import (
     CustomerPrewarmStore,
 )
 from app.services.daily_audit_store import DailyAuditStore, LeaseToken, LeaseUnavailable, ProcessLock
-from app.services.incremental_audit_runtime import runtime_paths
+from app.services.runtime_context import runtime_paths
 from app.services.page_price_semantics import is_local_fallback_success
 from app.services.remote_diagnostics import sanitize_remote_diagnostic
 
-def harvest_existing_customer_prewarm_job(**kwargs: Any) -> dict[str, Any]:
-    """Lazy bridge to the recovery primitive.
-
-    Importing the lifecycle planner must stay free of Zhaoshang module access;
-    the heavy recovery module is loaded only when a real harvest is attempted.
-    The wrapper also preserves the established monkeypatch seam used by tests.
-    """
-    from app.services.recovery.harvest import (
-        harvest_existing_customer_prewarm_job as _harvest_existing_customer_prewarm_job,
-    )
-
-    return _harvest_existing_customer_prewarm_job(**kwargs)
 
 from app.services.shared_crawl_cache import PRODUCER_CUSTOMER_PREWARM_ZHAOSHANG
-from scripts.zhaoshang_mall_mapping import ZhaoshangMallMapping
+from app.integrations.zhaoshang_mall_mapping import ZhaoshangMallMapping
 
 # ---- lifecycle budget constants (plan WS-A) ---------------------------------
 
-RECONCILE_DEAD_THRESHOLD = 4
 REDISPATCH_DAILY_CAP = 2
 HARVEST_PER_PASS = 3
 MANUAL_RECOVERY_PER_PASS = 1
@@ -107,7 +103,6 @@ HARVEST_PER_JOB_TIMEOUT_SECONDS = 90.0
 # Job states that make a candidate's binding dead for redispatch planning.
 # ``SUBMIT_UNKNOWN`` is dead only once its recovery attempts hit the threshold.
 _DEAD_JOB_STATES = frozenset({"MANUAL_REQUIRED", "TERMINAL_FAILED"})
-_RECONCILE_MANUAL_BLOCKER = "prewarm reconcile identity conflict: "
 
 _ZHPQ_SKU_PREFIX = "zhpq-"
 _NORMAL_HARVEST_CURSOR = "same-day-normal-harvest"
@@ -150,69 +145,6 @@ def _rotate_harvest_targets(
     return targets[split_at:] + targets[:split_at]
 
 
-def _terminal_priority_manual_live_proof(
-    *,
-    state_path: str | Path,
-    business_date: str,
-    job_row: Mapping[str, Any],
-    adapter: Any,
-    timeout_seconds: float,
-) -> Any | None:
-    """Build proof only for the exact customer-prewarm scope-safety incident."""
-    from app.services.recovery.harvest import (
-        is_terminal_nonretryable_priority_manual_family,
-        live_identity_proof,
-    )
-    from app.services.remote_running_recovery import (
-        RemoteExecutionState,
-        canonical_progress_signature,
-        classify_remote_execution_state,
-    )
-
-    if not is_terminal_nonretryable_priority_manual_family(job_row):
-        return None
-    identity = str(job_row.get("remote_identity") or "").strip()
-    identity_parts = identity.split("|")
-    if len(identity_parts) != 3 or not all(identity_parts):
-        return None
-    try:
-        prepared = _reconstruct_prepared_job(adapter, business_date, job_row)
-        if (
-            adapter.exact_nonretryable_unconfirmed_priority_remote_identity(prepared)
-            != identity
-        ):
-            return None
-        prewarm_path = Path(state_path).resolve().parent.parent / "customer_prewarm.sqlite3"
-        prewarm = CustomerPrewarmStore.open_read_only(prewarm_path)
-        if not prewarm.exact_current_remote_job_group_matches(
-            business_date=business_date,
-            remote_job_id=int(job_row["id"]),
-            producer=PRODUCER_CUSTOMER_PREWARM_ZHAOSHANG,
-            mall=str(job_row.get("mall_key") or "").strip(),
-            lookup_urls=tuple(request.url for request in prepared.requests),
-        ):
-            return None
-        answer = adapter.query_task_progress_for_job(
-            prepared,
-            identity_parts[1],
-            identity_parts[2],
-            min(30.0, timeout_seconds),
-        )
-    except Exception:
-        return None
-    progress = answer.get("progress") if isinstance(answer, Mapping) else None
-    progress_mapping = progress if isinstance(progress, Mapping) else None
-    classification = classify_remote_execution_state(progress_mapping, "")
-    if classification is not RemoteExecutionState.TERMINAL:
-        return None
-    signature = canonical_progress_signature(progress_mapping or {})
-    if signature is None:
-        return None
-    return live_identity_proof(
-        remote_identity=identity,
-        classification=classification,
-        progress_signature=signature,
-    )
 
 _RECONCILE_JOBS_SQL = """
 SELECT j.id AS job_id, COALESCE(j.recovery_attempts, 0) AS recovery_attempts
@@ -295,14 +227,6 @@ def _job_is_dead(job_row: Mapping[str, Any], dead_threshold: int) -> bool:
     return False
 
 
-def _mark_reconcile_manual(
-    store: DailyAuditStore, token: LeaseToken, job_id: int, diagnostic: str
-) -> None:
-    store.mark_remote_manual(
-        token,
-        job_id,
-        _RECONCILE_MANUAL_BLOCKER + (diagnostic.strip() or "remote identity cannot be proven"),
-    )
 
 
 def _owning_day_job(

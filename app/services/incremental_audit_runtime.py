@@ -7,6 +7,20 @@ gated by ``enable_zhaoshang`` and is not enabled by the CLI by default.
 
 from __future__ import annotations
 
+# Compatibility exports: one canonical definition at the lower-level seam.
+from app.services.runtime_context import (
+    SHANGHAI,
+    PROJECT_ROOT,
+    PROJECT_DATA_ROOT,
+    DEFAULT_RUNTIME_ROOT,
+    RuntimeConfigurationError,
+    RuntimePaths,
+    business_date_in_shanghai,
+    cutoff_for_business_date,
+    runtime_paths,
+    _logical_key_matches_rebuild,
+)
+
 import json
 import hashlib
 import os
@@ -113,11 +127,11 @@ from app.workflows.incremental_price_audit_finalize import (
     materialize_frozen_review,
     materialize_forced_frozen_daily_run,
 )
-from scripts import cnnc_auth_refresh
-from scripts.audit_saas_excel_file import call_detail_api
-from scripts.auth_manager import AuthManager, _payload_is_auth_failure
-from scripts.cnnc_auth_core import AT_COOKIE_RE, CnncAuthProvider
-from scripts.curl_utils import load_curl_command
+from app.integrations import cnnc_auth_refresh
+from app.integrations.cnnc_detail import call_detail_api
+from app.integrations.auth_manager import AuthManager, _payload_is_auth_failure
+from app.integrations.cnnc_auth_core import AT_COOKIE_RE, CnncAuthProvider
+from app.integrations.curl_utils import load_curl_command
 from app.services.title_match_model_adapter import (
     TITLE_MATCH_PROMPT_VERSION,
     TITLE_MATCH_SCHEMA_VERSION,
@@ -127,10 +141,6 @@ from app.services.title_match_model_adapter import (
 )
 
 
-SHANGHAI = ZoneInfo("Asia/Shanghai")
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-PROJECT_DATA_ROOT = PROJECT_ROOT / "data"
-DEFAULT_RUNTIME_ROOT = PROJECT_ROOT / "runtime" / "incremental_price_audit"
 _MODEL_CONFIGURATION_KEYS = (
     "TITLE_MATCH_MODEL_API_KEY",
     "TITLE_MATCH_MODEL_BASE_URL",
@@ -185,18 +195,8 @@ def _apply_cnnc_at(config: dict[str, Any], at: str) -> None:
         config["cookie"] = AT_COOKIE_RE.sub(f"token={at}", cookie)
 
 
-class RuntimeConfigurationError(RuntimeError):
-    pass
 
 
-@dataclass(frozen=True)
-class RuntimePaths:
-    business_date: str
-    run_dir: Path
-    state_path: Path
-    lock_path: Path
-    detail_lock_path: Path
-    final_output_path: Path
 
 
 @dataclass(frozen=True)
@@ -208,34 +208,10 @@ class RuntimeResult:
     lock_conflict: Mapping[str, Any] | None = None
 
 
-def business_date_in_shanghai(now: datetime | None = None) -> str:
-    current = now or datetime.now(UTC)
-    if current.tzinfo is None or current.utcoffset() is None:
-        raise ValueError("runtime clock must return an explicit-timezone datetime")
-    return current.astimezone(SHANGHAI).date().isoformat()
 
 
-def cutoff_for_business_date(business_date: str) -> datetime:
-    day = datetime.fromisoformat(business_date).date()
-    return datetime.combine(day, time(18, 0), tzinfo=SHANGHAI).astimezone(UTC)
 
 
-def runtime_paths(business_date: str, root: Path | str = DEFAULT_RUNTIME_ROOT) -> RuntimePaths:
-    # Preserve an explicitly supplied worktree/Junction alias. Path.resolve()
-    # follows Windows Junctions and can silently move runtime I/O into another
-    # worktree even though the scheduler passed a different production root.
-    root_path = Path(root).absolute()
-    run_dir = root_path / business_date
-    return RuntimePaths(
-        business_date=business_date,
-        run_dir=run_dir,
-        state_path=run_dir / "state.sqlite3",
-        lock_path=run_dir / "incremental_price_audit.lock",
-        # Detail is globally serialized across business dates.  A previous-day
-        # recovery and today's tick otherwise own different per-day locks.
-        detail_lock_path=root_path / "detail.lock",
-        final_output_path=run_dir / f"saas_audit_final_{business_date.replace('-', '')}.xlsx",
-    )
 
 
 def _record_recovery_event(paths: RuntimePaths, result: Mapping[str, Any]) -> None:
@@ -1497,11 +1473,6 @@ def _runtime_model_max_concurrency(path: Path | None = None) -> int:
     return value
 
 
-def _logical_key_matches_rebuild(logical_key: str, natural_key: str) -> bool:
-    """A manual rebuild replacement persists the natural adapter logical key
-    plus a '#rebuild#' action-id suffix, so reconstruction accepts that exact
-    suffix family in addition to the unchanged natural key."""
-    return logical_key == natural_key or logical_key.startswith(f"{natural_key}#rebuild#")
 
 
 def legacy_zhaoshang_bridge(
@@ -1844,7 +1815,7 @@ def legacy_zhaoshang_bridge(
     def recovery_restart(
         job: Mapping[str, Any], resume_phase: str | None, timeout_seconds: float
     ) -> Mapping[str, Any]:
-        from app.services.remote_running_recovery import classify_restart_exception
+        from app.services.remote_execution_policy import classify_restart_exception
 
         try:
             prepared_job = reconstruct(job)

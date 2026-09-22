@@ -45,7 +45,7 @@ from app.services.recovery.wait_export import (
     WAIT_EXPORT_MANUAL_DIAGNOSTIC,
     WAIT_EXPORT_STILL_RUNNING_DIAGNOSTIC,
 )
-from app.services.remote_running_recovery import (
+from app.services.remote_execution_policy import (
     RemoteExecutionState,
     canonical_progress_signature,
     classify_remote_execution_state,
@@ -696,7 +696,7 @@ def run_manual_reexport_command(
     action_id: str | None = None,
 ) -> dict[str, Any]:
     """Runtime-root wrapper for one dashboard manual re-export click."""
-    from app.services.incremental_audit_runtime import runtime_paths
+    from app.services.runtime_context import runtime_paths
 
     paths = runtime_paths(business_date, runtime_root)
     result = run_manual_reexport(
@@ -1787,7 +1787,7 @@ def run_manual_rebuild_command(
     action_id: str | None = None,
 ) -> dict[str, Any]:
     """Runtime-root wrapper for one dashboard manual rebuild click."""
-    from app.services.incremental_audit_runtime import runtime_paths
+    from app.services.runtime_context import runtime_paths
 
     paths = runtime_paths(business_date, runtime_root)
     return run_manual_rebuild(

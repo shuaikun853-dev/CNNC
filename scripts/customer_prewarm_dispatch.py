@@ -91,7 +91,7 @@ from app.services.customer_prewarm_dispatch import (
 )
 from app.services.customer_prewarm_lifecycle import run_harvest_phase
 from app.services.customer_prewarm_store import CustomerPrewarmStore
-from app.services.incremental_audit_runtime import (
+from app.services.runtime_context import (
     DEFAULT_RUNTIME_ROOT,
     business_date_in_shanghai,
     runtime_paths,

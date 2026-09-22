@@ -130,7 +130,7 @@ from app.services.customer_reference_routing import (
     OUTCOME_ZHAOSHANG,
     classify_reference_url,
 )
-from app.services.incremental_audit_runtime import DEFAULT_RUNTIME_ROOT
+from app.services.runtime_context import DEFAULT_RUNTIME_ROOT
 from app.services.shared_crawl_cache import (
     PRODUCER_CUSTOMER_PREWARM_ZHAOSHANG,
     PRODUCER_DAILY_INTERNET,
@@ -743,7 +743,7 @@ def _reference_mappings(view: dict[str, Any]) -> list[Any] | None:
     if "_mappings" in view:
         return view["_mappings"]
     try:
-        from scripts.zhaoshang_mall_mapping import load_zhaoshang_mall_mappings
+        from app.integrations.zhaoshang_mall_mapping import load_zhaoshang_mall_mappings
 
         mappings: list[Any] | None = list(load_zhaoshang_mall_mappings())
     except Exception:  # noqa: BLE001 - mapping evidence is best-effort only
@@ -1207,7 +1207,7 @@ def get_prewarm_link_detail(
         # falls back to its host heuristic.
         route: str | None = None
         try:
-            from scripts.zhaoshang_mall_mapping import load_zhaoshang_mall_mappings
+            from app.integrations.zhaoshang_mall_mapping import load_zhaoshang_mall_mappings
 
             routing = classify_reference_url(
                 str(candidate["original_url"] or ""),

@@ -238,13 +238,13 @@ class LegacyWorkbookMaterializer:
     def _legacy_display_header(header: str) -> str:
         # This is a runtime-only import.  It keeps the materializer tied to the
         # legacy workbook contract without importing its CLI during module load.
-        from scripts.audit_saas_excel_file import _display_header
+        from app.services.audit_workbook import _display_header
 
         return _display_header(header)
 
     @staticmethod
     def _legacy_cell_value(value: Any) -> Any:
-        from scripts.audit_saas_excel_file import _format_cell_value
+        from app.services.audit_workbook import _format_cell_value
 
         return _format_cell_value(value)
 
@@ -397,7 +397,7 @@ class LegacyWorkbookMaterializer:
 
     @staticmethod
     def _default_writer(path: Path, headers: list[str], rows: list[dict[str, Any]], enriched: list[dict[str, Any]], audit_response: Any) -> None:
-        from scripts.audit_saas_excel_file import write_audit_workbook
+        from app.services.audit_workbook import write_audit_workbook
 
         write_audit_workbook(path, headers, rows, enriched, audit_response)
 

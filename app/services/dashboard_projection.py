@@ -889,7 +889,7 @@ def project_scheduler_status() -> dict:
 import hashlib as _hashlib
 from datetime import UTC as _UTC, datetime as _datetime
 
-from app.services.incremental_audit_runtime import DEFAULT_RUNTIME_ROOT, runtime_paths
+from app.services.runtime_context import DEFAULT_RUNTIME_ROOT, runtime_paths
 from app.services.incremental_audit_status import collect_runtime_status
 
 

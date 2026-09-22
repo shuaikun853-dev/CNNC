@@ -6,6 +6,8 @@ test creates or contacts a real Zhaoshang task.
 
 from __future__ import annotations
 
+from app.services import customer_prewarm_execution as execution
+
 import hashlib
 import json
 import sqlite3
@@ -576,7 +578,7 @@ def test_historical_harvest_success_mirrors_cache_then_candidate_absorbs(tmp_pat
             )
         return {"outcome": "REMOTE_EXISTING_HARVEST_COMPLETED", "create_calls": 0}
 
-    monkeypatch.setattr(lifecycle, "harvest_existing_customer_prewarm_job", fake_primitive)
+    monkeypatch.setattr(execution, "harvest_existing_customer_prewarm_job", fake_primitive)
     monkeypatch.setattr(cli, "load_zhaoshang_mall_mappings", lambda _path: [COMIX])
     monkeypatch.setattr(
         cli, "run_prewarm_dispatch_pass",
@@ -681,7 +683,7 @@ def test_historical_harvest_cursor_reaches_later_running_job(tmp_path, monkeypat
         job_ids.append(job_id)
     calls = []
     monkeypatch.setattr(
-        lifecycle, "harvest_existing_customer_prewarm_job",
+        execution, "harvest_existing_customer_prewarm_job",
         lambda **kwargs: calls.append(kwargs["remote_job_id"])
         or {"outcome": "REMOTE_EXISTING_HARVEST_RUNNING", "create_calls": 0},
     )
@@ -714,7 +716,7 @@ def test_historical_harvest_dedupes_by_day_and_job_not_bare_id(tmp_path, monkeyp
         expected.append((day, job_id))
     calls = []
     monkeypatch.setattr(
-        lifecycle, "harvest_existing_customer_prewarm_job",
+        execution, "harvest_existing_customer_prewarm_job",
         lambda **kwargs: calls.append((kwargs["business_date"], kwargs["remote_job_id"]))
         or {"outcome": "REMOTE_EXISTING_HARVEST_RUNNING", "create_calls": 0},
     )
@@ -2194,7 +2196,7 @@ def test_historical_harvest_manual_and_permanent_sync_failure_are_visible(tmp_pa
     )
     seed_remote_candidate(prewarm, url, job_id, business_date=YESTERDAY)
     monkeypatch.setattr(
-        lifecycle, "harvest_existing_customer_prewarm_job",
+        execution, "harvest_existing_customer_prewarm_job",
         lambda **_kwargs: {"outcome": "REMOTE_EXISTING_HARVEST_MANUAL"},
     )
     from app.services import customer_prewarm_discovery as discovery

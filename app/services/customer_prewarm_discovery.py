@@ -82,7 +82,7 @@ from app.services.shared_crawl_cache import (
     AliasConflictError,
     SharedCrawlCache,
 )
-from scripts.zhaoshang_mall_mapping import ZhaoshangMallMapping
+from app.integrations.zhaoshang_mall_mapping import ZhaoshangMallMapping
 
 DETAIL_BUDGET_RESERVE_SECONDS = 5.0
 

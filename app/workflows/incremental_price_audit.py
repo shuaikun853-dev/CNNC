@@ -702,7 +702,7 @@ def _is_retryable_detail_failure(exc: BaseException) -> bool:
       ...) stays retryable.  No backoff: ticks are paced by the scheduler and
       ``detail_max_attempts`` bounds the durable replay budget.
     """
-    from app.services.incremental_audit_runtime import RuntimeConfigurationError
+    from app.services.runtime_context import RuntimeConfigurationError
 
     if isinstance(exc, customer_price_semantics.DetailRequestError):
         return bool(exc.retryable)

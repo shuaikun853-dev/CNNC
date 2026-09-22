@@ -1721,7 +1721,7 @@ class DailyAuditStore:
                 )
             else:
                 from app.services.remote_diagnostics import sanitize_remote_diagnostic
-                from app.services.remote_running_recovery import (
+                from app.services.remote_execution_policy import (
                     decode_recovery_evidence,
                     encode_recovery_evidence,
                 )
@@ -1753,7 +1753,7 @@ class DailyAuditStore:
     ) -> dict[str, Any]:
         """Persist one sanitized read-only reconcile observation atomically."""
         from app.services.remote_diagnostics import sanitize_remote_diagnostic
-        from app.services.remote_running_recovery import (
+        from app.services.remote_execution_policy import (
             decode_recovery_evidence,
             encode_recovery_evidence,
         )
@@ -1898,7 +1898,7 @@ class DailyAuditStore:
         deliberately disabled.  Legal only from RUNNING with an unburned
         attempt and the exact confirmed remote identity.
         """
-        from app.services.remote_running_recovery import encode_recovery_evidence
+        from app.services.remote_execution_policy import encode_recovery_evidence
 
         normalized_identity = str(remote_identity or "").strip()
         with self._transaction(immediate=True) as connection:
@@ -1937,7 +1937,7 @@ class DailyAuditStore:
         transition records the outcome of a read-only probe.  The durable
         ``remote_identity`` is never re-bound (exact-match precondition).
         """
-        from app.services.remote_running_recovery import encode_recovery_evidence
+        from app.services.remote_execution_policy import encode_recovery_evidence
 
         normalized_identity = str(remote_identity or "").strip()
         with self._transaction(immediate=True) as connection:
@@ -2177,7 +2177,7 @@ class DailyAuditStore:
         semantics.  Any state may record probe evidence, but the update is
         fenced by the daily lease like every other durable write.
         """
-        from app.services.remote_running_recovery import encode_recovery_evidence
+        from app.services.remote_execution_policy import encode_recovery_evidence
 
         encoded = encode_recovery_evidence(evidence)
         with self._transaction(immediate=True) as connection:
@@ -2212,7 +2212,7 @@ class DailyAuditStore:
         ``restart``: a probe failure has not entered the restart protocol,
         and reaching the cap must never fabricate a pending write phase.
         """
-        from app.services.remote_running_recovery import (
+        from app.services.remote_execution_policy import (
             RECOVERY_MAX_CONSECUTIVE_PROBE_FAILURES,
             decode_recovery_evidence,
             encode_recovery_evidence,
@@ -2296,7 +2296,7 @@ class DailyAuditStore:
         remote identity and a previously unburned attempt, so a resumed
         process can never authorize a second disable->enable.
         """
-        from app.services.remote_running_recovery import encode_recovery_evidence, decode_recovery_evidence
+        from app.services.remote_execution_policy import encode_recovery_evidence, decode_recovery_evidence
 
         normalized_identity = str(remote_identity or "").strip()
         with self._transaction(immediate=True) as connection:
@@ -2338,7 +2338,7 @@ class DailyAuditStore:
         disable->enable already ran and was confirmed before the day stops
         waiting on this job.
         """
-        from app.services.remote_running_recovery import (
+        from app.services.remote_execution_policy import (
             decode_recovery_evidence,
             encode_recovery_evidence,
         )
@@ -2410,7 +2410,7 @@ class DailyAuditStore:
         export_rsp_desc: str,
     ) -> dict[str, Any]:
         """Persist the auditable no-price outcome for one abandoned crawl."""
-        from app.services.remote_running_recovery import encode_recovery_evidence
+        from app.services.remote_execution_policy import encode_recovery_evidence
 
         normalized_reason = str(reason or "").strip()
         normalized_identity = str(remote_identity or "").strip()

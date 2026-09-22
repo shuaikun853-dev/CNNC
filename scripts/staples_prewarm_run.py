@@ -20,6 +20,19 @@ equal either database path).  Missing databases are reported via markers
 
 from __future__ import annotations
 
+# Stable legacy names, now backed by application-owned capabilities.
+from pathlib import Path as _CompatPath
+import sys as _compat_sys
+_compat_root = str(_CompatPath(__file__).resolve().parents[1])
+if _compat_root not in _compat_sys.path:
+    _compat_sys.path.insert(0, _compat_root)
+from app.services.runtime_context import (
+    PREWARM_STORE_NAME,
+    SHARED_CACHE_NAME,
+    STAPLES_LOCK_NAME,
+    DEFAULT_WORK_DIR_NAME,
+)
+
 import argparse
 import json
 import os
@@ -33,7 +46,7 @@ if str(ROOT) not in sys.path:
 
 from app.services.customer_prewarm_store import CustomerPrewarmStore
 from app.services.daily_audit_store import LeaseUnavailable, ProcessLock
-from app.services.incremental_audit_runtime import (
+from app.services.runtime_context import (
     DEFAULT_RUNTIME_ROOT,
     business_date_in_shanghai,
 )
@@ -45,10 +58,6 @@ from app.services.staples_prewarm import (
     staples_plan_readonly,
 )
 
-PREWARM_STORE_NAME = "customer_prewarm.sqlite3"
-SHARED_CACHE_NAME = "shared_crawl_cache.sqlite3"
-STAPLES_LOCK_NAME = "staples_prewarm.lock"
-DEFAULT_WORK_DIR_NAME = "staples_prewarm"
 DEFAULT_MAX_JOBS = 20
 DEFAULT_ROUTE_LIMIT = 200
 

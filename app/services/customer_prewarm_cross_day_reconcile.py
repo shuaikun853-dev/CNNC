@@ -22,7 +22,7 @@ from app.services.customer_prewarm_store import (
     CACHE_STATUS_REMOTE_REUSED,
     CustomerPrewarmStore,
 )
-from app.services.incremental_audit_runtime import runtime_paths
+from app.services.runtime_context import runtime_paths
 from app.services.daily_audit_store import DailyAuditStore, LeaseUnavailable, ProcessLock
 from app.services.shared_crawl_cache import PRODUCER_CUSTOMER_PREWARM_ZHAOSHANG
 from app.services.remote_diagnostics import sanitize_remote_diagnostic
@@ -88,7 +88,7 @@ WHERE j.id = ? AND r.business_date = ?
 def _resolve_dead_threshold(dead_threshold: int | None) -> int:
     if dead_threshold is not None:
         return int(dead_threshold)
-    from app.services.customer_prewarm_lifecycle import RECONCILE_DEAD_THRESHOLD
+    from app.services.customer_prewarm_execution import RECONCILE_DEAD_THRESHOLD
 
     return RECONCILE_DEAD_THRESHOLD
 
@@ -268,14 +268,14 @@ def run_cross_day_reconcile_phase(
     phase never submits or redispatches; the existing today's redispatch phase
     owns dead jobs on the next scheduler pass.
     """
-    from app.services.customer_prewarm_dispatch import (
+    from app.services.customer_prewarm_execution import (
         LEASE_TTL_SECONDS,
         SUBMIT_MIN_SECONDS,
         _confirm_pending_priority_job,
         _reconstruct_prepared_job,
         _status_value,
     )
-    from app.services.customer_prewarm_lifecycle import _mark_reconcile_manual
+    from app.services.customer_prewarm_execution import _mark_reconcile_manual
 
     counters = (
         "cross_day_reconcile_planned",
@@ -599,7 +599,7 @@ def run_cross_day_harvest_phase(
     lease. Completed successes remain discoverable until cache sync succeeds,
     so a crash after harvest but before mirroring cannot strand the result.
     """
-    from app.services import customer_prewarm_lifecycle as lifecycle
+    from app.services import customer_prewarm_execution as lifecycle
     from app.services.customer_prewarm_discovery import sync_daily_internet_results
 
     phase_errors = summary["phase_errors"]

@@ -72,10 +72,10 @@ from app.services.zhaoshang_result_adapter import (
 )
 from app.services.zhaoshang_task_progress import query_task_progress
 from app.services.saas_audit_core import parse_decimal
-from scripts.auth_manager import AuthManager
-from scripts.curl_utils import internal_subprocess_env
-from scripts.monitor_stb_fallback import load_zhaoshang_db_env
-from scripts.zhaoshang_mall_mapping import (
+from app.integrations.auth_manager import AuthManager
+from app.integrations.curl_utils import internal_subprocess_env
+from app.integrations.zhaoshang_tool_config import load_zhaoshang_db_env
+from app.integrations.zhaoshang_mall_mapping import (
     ZhaoshangMallMapping,
     load_zhaoshang_mall_mappings,
 )
@@ -1803,7 +1803,7 @@ class CnncLegacyZhaoshangAdapter:
         # evidence — its terminal marker text and ACTIVE-looking counters
         # are stripped to the unprovable form before parsing.  Non-mapping
         # payloads are stripped by the same check.
-        from app.services.remote_running_recovery import remote_business_response_ok
+        from app.services.zhaoshang_remote_task import remote_business_response_ok
 
         status_desc = _text(status.get("rspDesc")) if remote_business_response_ok(status) else ""
         parsed_progress = dict(
@@ -1893,7 +1893,7 @@ class CnncLegacyZhaoshangAdapter:
         # success as probe success and keep the job RUNNING forever.  The
         # three export_had_result=True early returns above are strong success
         # evidence and never reach this gate.
-        from app.services.remote_running_recovery import (
+        from app.services.remote_execution_policy import (
             RemoteExecutionState,
             classify_remote_execution_state,
         )
@@ -2083,7 +2083,7 @@ class CnncLegacyZhaoshangAdapter:
                 observed_enabled=None,
                 diagnostic=diagnostic,
             )
-        from app.services.remote_running_recovery import _pre_write_restart_failure_status
+        from app.services.remote_execution_policy import _pre_write_restart_failure_status
 
         return LegacyRestartOutcome(
             RestartStatus(_pre_write_restart_failure_status(exc)),
@@ -2207,7 +2207,7 @@ class CnncLegacyZhaoshangAdapter:
                 # exact task is still ACTIVE; a terminal marker, terminal
                 # progress, or anything unprovable declines with zero writes
                 # and leaves the job to ordinary harvest.
-                from app.services.remote_running_recovery import (
+                from app.services.remote_execution_policy import (
                     RemoteExecutionState,
                     classify_remote_execution_state,
                 )
@@ -2218,7 +2218,7 @@ class CnncLegacyZhaoshangAdapter:
                 status = tool.query_task_status(session, live_task_id)
                 # Business-response gate: a failed status response's marker
                 # text is not trusted (same rule as the probe path).
-                from app.services.remote_running_recovery import remote_business_response_ok
+                from app.services.zhaoshang_remote_task import remote_business_response_ok
 
                 status_desc = _text(status.get("rspDesc")) if remote_business_response_ok(status) else ""
                 remaining = deadline - self._monotonic()
@@ -2490,7 +2490,7 @@ class CnncLegacyZhaoshangAdapter:
                 # prove the exact task is still ACTIVE; a terminal marker,
                 # terminal progress, or anything unprovable declines with zero
                 # writes.
-                from app.services.remote_running_recovery import (
+                from app.services.remote_execution_policy import (
                     RemoteExecutionState,
                     classify_remote_execution_state,
                 )
@@ -2499,7 +2499,7 @@ class CnncLegacyZhaoshangAdapter:
                 if remaining <= 0:
                     raise TimeoutError("stop deadline exhausted before status revalidation")
                 status = tool.query_task_status(session, live_task_id)
-                from app.services.remote_running_recovery import remote_business_response_ok
+                from app.services.zhaoshang_remote_task import remote_business_response_ok
 
                 status_desc = _text(status.get("rspDesc")) if remote_business_response_ok(status) else ""
                 remaining = deadline - self._monotonic()
