@@ -7,6 +7,11 @@ from urllib.parse import urlparse
 
 import openpyxl
 
+try:
+    from scripts.comment_count import normalize_comment_count
+except ModuleNotFoundError:
+    from comment_count import normalize_comment_count
+
 
 REQUIRED_DB_VARIABLES = (
     "ZHAOSHANG_DB_HOST",
@@ -114,7 +119,7 @@ def read_stbchina_results(path):
                 "price": price,
                 "title": str(row[columns.get("商品标题", -1)] or "").strip() if "商品标题" in columns else "",
                 "uid": str(row[columns.get("uid", -1)] or "").strip() if "uid" in columns else "",
-                "comment": str(row[columns.get("评论数", -1)] or "").strip() if "评论数" in columns else "",
+                "comment": normalize_comment_count(row[columns["评论数"]]) if "评论数" in columns else None,
             }
     finally:
         workbook.close()
@@ -223,6 +228,7 @@ def apply_stbchina_results(rows, records, fill_title=True):
             row.互联网标题 = record["title"]
         if record["uid"]:
             row.SKUID = record["uid"]
-        row.销量_评论数 = record["comment"]
+        comment = normalize_comment_count(record.get("comment"))
+        row.销量_评论数 = "" if comment is None else comment
         changed += 1
     return changed
