@@ -29,8 +29,8 @@ SUPPORTED_MALLS = frozenset({
 MAX_ATTEMPTS = 2
 MIN_EXECUTION_WINDOW_SECONDS = 60
 MAX_CHILD_TIMEOUT_SECONDS = 600
-EXPECTED_CRAWLER_REVISION = "28870666aeb99a10494ebb91419aadf3bff4c0a8"
-DEFAULT_CRAWLER_ROOT = Path(r"E:\.A中核运维\cnnc-mall-crawler")
+EXPECTED_CRAWLER_REVISION = "08abb74089cfa9007dc6f6ddc850f9fd41990a24"
+DEFAULT_CRAWLER_ROOT = Path(r"E:\.A中核运维\cnnc-mall-crawler-prod")
 SITE_ALIASES = {"ofs": "officemate"}
 SITE_HOSTS = {
     "nbdeli": {"b2b.nbdeli.com"},

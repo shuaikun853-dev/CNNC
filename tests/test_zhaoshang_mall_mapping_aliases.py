@@ -13,6 +13,8 @@ from openpyxl import Workbook
 
 from scripts.zhaoshang_mall_mapping import (
     EXTRA_DOMAIN_ALIASES,
+    SUPPORTED_ZHAOSHANG_MALL_KEYS,
+    is_zhaoshang_domain,
     load_zhaoshang_mall_mappings,
 )
 
@@ -75,3 +77,22 @@ def test_existing_extra_domain_aliases_unchanged():
         "comix": ("qx.com",),
         "ofs": ("officemate.cn",),
     }
+
+
+def test_zdet_is_never_routed_to_zhaoshang(tmp_path):
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.append([
+        "商城名称", "sourceId", "商城标识 identification", "匹配域名 matchDomain"
+    ])
+    sheet.append(["大江企业购", "MUST-NOT-BE-USED", "zdet", "b.zdet.net"])
+    path = tmp_path / "mapping.xlsx"
+    workbook.save(path)
+
+    mappings = load_zhaoshang_mall_mappings(path)
+
+    assert "zdet" not in SUPPORTED_ZHAOSHANG_MALL_KEYS
+    assert mappings == []
+    assert not is_zhaoshang_domain(
+        "https://b.zdet.net/mall/item?id=1400061078916", mappings
+    )

@@ -2953,6 +2953,25 @@ class TestRunMultiSiteFallback:
             runtime_dir / "BATCH_STATE.md"
         ).read_text(encoding="utf-8")
 
+    def test_collects_zdet_exact_host_for_manual_fallback(self):
+        url = "https://b.zdet.net/mall/item?id=1400061078916"
+
+        result = excel_audit_mod.collect_multi_site_fallback_urls([
+            {"extLink": url, "__page_price_status": "PENDING_CRAWL"},
+            {
+                "extLink": "https://www.b.zdet.net/mall/item?id=1400061078916",
+                "__page_price_status": "PENDING_CRAWL",
+            },
+        ])
+
+        assert result == {"zdet": [url]}
+        assert excel_audit_mod.DEFAULT_MULTI_SITE_CRAWLER_ROOT == Path(
+            r"E:\.A中核运维\cnnc-mall-crawler-prod"
+        )
+        assert excel_audit_mod.EXPECTED_MULTI_SITE_CRAWLER_REVISION == (
+            "08abb74089cfa9007dc6f6ddc850f9fd41990a24"
+        )
+
     def test_concurrent_resume_only_one_worker_starts(self, tmp_path, monkeypatch):
         url = "https://b2b.nbdeli.com/pcweb/detail?sku=concurrent"
         crawler_root, runtime_dir, review, summary = self._plan(

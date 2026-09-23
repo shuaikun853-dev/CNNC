@@ -1822,8 +1822,8 @@ def main(argv: list[str] | None = None) -> int:
 import subprocess as _subprocess  # noqa: E402
 
 DEFAULT_CRAWLER_SCRIPT = Path(r"E:\.A2026\多商城爬取\multi_mall_crawler\main.py")
-DEFAULT_MULTI_SITE_CRAWLER_ROOT = Path(r"E:\.A中核运维\cnnc-mall-crawler")
-EXPECTED_MULTI_SITE_CRAWLER_REVISION = "28870666aeb99a10494ebb91419aadf3bff4c0a8"
+DEFAULT_MULTI_SITE_CRAWLER_ROOT = Path(r"E:\.A中核运维\cnnc-mall-crawler-prod")
+EXPECTED_MULTI_SITE_CRAWLER_REVISION = "08abb74089cfa9007dc6f6ddc850f9fd41990a24"
 MULTI_SITE_MALL_KEY_TO_SITE = {
     "nbdeli": "nbdeli",
     "guangbo": "guangbo",
@@ -1833,6 +1833,7 @@ MULTI_SITE_MALL_KEY_TO_SITE = {
     "ycw": "ycw",
     "comix": "comix",
     "tima": "tima",
+    "zdet": "zdet",
 }
 MULTI_SITE_HOST_TO_SITE = {
     "b2b.nbdeli.com": "nbdeli",
@@ -1850,6 +1851,7 @@ MULTI_SITE_HOST_TO_SITE = {
     "www.comix.com.cn": "comix",
     "tima365.com": "tima",
     "www.tima365.com": "tima",
+    "b.zdet.net": "zdet",
 }
 MULTI_SITE_FALLBACK_DIRNAME = "multi_site_fallback"
 MULTI_SITE_MANIFEST_FILENAME = "manifest.xlsx"
