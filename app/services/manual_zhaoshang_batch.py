@@ -433,6 +433,9 @@ def run_batch_zhaoshang_requests(
             }
             for item in normalized
         ]
+        counters["recovered_submit_unknown"] = (
+            store.recover_ambiguous_remote_submissions(token)
+        )
         _submit(store, token, rows, config, deps, budget, counters)
         for pass_index in range(max_harvest_passes):
             active = store.list_remote_jobs(

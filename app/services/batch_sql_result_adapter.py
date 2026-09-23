@@ -268,6 +268,24 @@ def _result_price(value: Any) -> Decimal | None:
     return price
 
 
+def _result_comment_count(value: Any) -> int | None:
+    if value is None or isinstance(value, bool):
+        return None
+    raw = str(value).strip().replace(",", "").replace("+", "")
+    if not raw or raw.upper() in {"未识别", "-", "--", "N/A", "NA", "NONE", "NULL"}:
+        return None
+    multiplier = Decimal("10000") if raw.endswith("万") else Decimal("1")
+    if multiplier != 1:
+        raw = raw[:-1].strip()
+    try:
+        parsed = Decimal(raw) * multiplier
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+    if not parsed.is_finite() or parsed < 0 or parsed != parsed.to_integral_value():
+        return None
+    return int(parsed)
+
+
 def _invalid_result_reason(row: Mapping[str, Any]) -> str | None:
     price = _result_price(row.get("price"))
     if price is None:
@@ -307,7 +325,7 @@ def batch_sql_result_to_crawl_result(
         "page_price_status": status,
         "page_price_value": price,
         "page_title": title,
-        "comment_count": result.comment,
+        "comment_count": _result_comment_count(result.comment),
         "page_price_source": f"batch_sql:{mall}",
     }
     if purpose in {

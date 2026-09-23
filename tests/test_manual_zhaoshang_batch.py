@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import replace
 from types import SimpleNamespace
 
+import pytest
+
 from app.services.legacy_zhaoshang_adapter import CrawlRequest
 from app.workflows.incremental_price_audit import CrawlMember, CrawlPlan
 
@@ -208,6 +210,70 @@ def test_durable_runner_does_not_repeat_post_after_unknown_submit(tmp_path):
     run_batch_zhaoshang_requests((item,), **kwargs)
 
     assert submit_calls == ["POST"]
+
+
+def test_durable_runner_recovers_crash_after_post_claim_without_reposting(tmp_path):
+    from app.services.manual_zhaoshang_batch import (
+        ManualBatchRequest,
+        run_batch_zhaoshang_requests,
+    )
+
+    request = replace(_request(), backend_version="batch-url-v1")
+    item = ManualBatchRequest("step1:row-1", request)
+    submit_calls = []
+    harvested_states = []
+
+    def plan(items, _timeout):
+        row = items[0]["row"]
+        member = CrawlMember(
+            request.mall_key,
+            row["source_id"],
+            request.sku_id,
+            request.url,
+            request.backend_version,
+            row,
+        )
+        return [
+            CrawlPlan(
+                request.mall_key,
+                "logical-crash",
+                "task-crash",
+                "payload-crash",
+                payload_json={"contract_version": "test-batch"},
+                members=(member,),
+            )
+        ]
+
+    def submit(_job, _crawls, _timeout):
+        submit_calls.append("POST")
+        raise KeyboardInterrupt("simulated process crash after durable POST claim")
+
+    def harvest(jobs, _timeout):
+        harvested_states.extend(str(job["state"]) for job in jobs)
+        return {
+            int(job["id"]): {
+                "state": "SUBMIT_UNKNOWN",
+                "retryable_error": "reconciliation remains inconclusive",
+            }
+            for job in jobs
+        }
+
+    kwargs = {
+        "business_date": "2026-09-22",
+        "purpose": "legacy-step1-manual",
+        "state_path": tmp_path / "state.sqlite3",
+        "callbacks": (plan, lambda value, _members, _timeout: value, submit, harvest),
+        "max_harvest_passes": 1,
+        "runtime_budget_seconds": 5,
+    }
+
+    with pytest.raises(KeyboardInterrupt, match="simulated process crash"):
+        run_batch_zhaoshang_requests((item,), **kwargs)
+
+    run_batch_zhaoshang_requests((item,), **kwargs)
+
+    assert submit_calls == ["POST"]
+    assert harvested_states == ["SUBMIT_UNKNOWN"]
 
 
 def test_durable_runner_takes_over_crashed_lease_under_process_lock(tmp_path):

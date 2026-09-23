@@ -733,7 +733,7 @@ def test_batch_harvest_maps_missing_sql_rows_by_terminal_evidence(
                 "page_price_status": "OK",
                     "page_price_value": 12.30,
                 "page_title": "Exact title",
-                "comment_count": "9",
+                "comment_count": 9,
                 "page_price_source": "batch_sql:jd",
             },
         ),
@@ -744,7 +744,7 @@ def test_batch_harvest_maps_missing_sql_rows_by_terminal_evidence(
                 "page_price_status": "PRICE_IS_ZERO",
                 "page_price_value": 0,
                 "page_title": "已下架",
-                "comment_count": "9",
+                "comment_count": 9,
                 "page_price_source": "batch_sql:jd",
             },
         ),
@@ -1196,6 +1196,53 @@ def test_mixed_backend_harvest_routes_each_job_by_durable_payload():
 
     assert calls == {"legacy": [1], "batch": [2]}
     assert set(result) == {1, 2}
+
+
+def test_mixed_backend_harvest_isolates_one_backend_failure():
+    calls = {"batch": []}
+
+    def legacy(_jobs, _timeout):
+        raise TimeoutError("legacy backend unavailable")
+
+    def batch(jobs, _timeout):
+        calls["batch"].extend(int(job["id"]) for job in jobs)
+        return {
+            int(job["id"]): {
+                "state": "COMPLETED",
+                "remote_identity": str(job["remote_identity"]),
+            }
+            for job in jobs
+        }
+
+    harvest = runtime_module._route_zhaoshang_harvest(legacy, batch)
+    jobs = [
+        {
+            "id": 1,
+            "state": "RUNNING",
+            "remote_identity": "legacy-remote",
+            "payload_json": json.dumps(
+                {"requests": [{"backend_version": "legacy-v1"}]}
+            ),
+        },
+        {
+            "id": 2,
+            "state": "RUNNING",
+            "remote_identity": "batch-remote",
+            "payload_json": json.dumps(
+                {"contract_version": "zhaoshang-batch-url-v1", "requests": []}
+            ),
+        },
+    ]
+
+    result = harvest(jobs, 10)
+
+    assert calls == {"batch": [2]}
+    assert result[1] == {
+        "state": "RUNNING",
+        "remote_identity": "legacy-remote",
+        "retryable_error": "legacy harvest failed: TimeoutError",
+    }
+    assert result[2]["state"] == "COMPLETED"
 
 
 def _dependencies(events: list[str]) -> TickDependencies:
@@ -3622,6 +3669,8 @@ def test_incremental_model_tuning_invalid_batch_size_fails_closed(tmp_path, monk
 
 def test_model_runtime_tuning_keys_are_not_part_of_the_required_gate(tmp_path, monkeypatch):
     """Optional tuning keys must not widen the required-configuration gate."""
+    for name in runtime_module._MODEL_CONFIGURATION_KEYS:
+        monkeypatch.delenv(name, raising=False)
     assert runtime_module._MODEL_RUNTIME_TUNING_KEYS
     assert not set(runtime_module._MODEL_RUNTIME_TUNING_KEYS) & set(runtime_module._MODEL_CONFIGURATION_KEYS)
     # A model.env carrying ONLY the tuning keys is still an incomplete

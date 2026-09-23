@@ -1590,7 +1590,19 @@ def _route_zhaoshang_harvest(
             if not selected:
                 continue
             share = max(0.001, float(timeout) * len(selected) / max(1, total))
-            results.update(callback(selected, share) or {})
+            try:
+                results.update(callback(selected, share) or {})
+            except Exception as exc:
+                error = f"{backend} harvest failed: {type(exc).__name__}"
+                for job in selected:
+                    evidence: dict[str, Any] = {
+                        "state": str(job.get("state") or "RUNNING"),
+                        "retryable_error": error,
+                    }
+                    identity = str(job.get("remote_identity") or "").strip()
+                    if identity:
+                        evidence["remote_identity"] = identity
+                    results[int(job["id"])] = evidence
         return results
 
     return harvest

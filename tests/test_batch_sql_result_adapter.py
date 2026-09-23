@@ -548,7 +548,7 @@ def test_positive_price_and_title_convert_to_valid_normal_crawl_result():
         "page_price_status": "OK",
         "page_price_value": Decimal("12.30"),
         "page_title": "Exact title",
-        "comment_count": "8",
+        "comment_count": 8,
         "page_price_source": "batch_sql:jd",
     }
     assert valid_page_price_result(crawl_result)
@@ -567,10 +567,27 @@ def test_zero_price_normalizes_every_title_to_delisted(title):
         "page_price_status": "PRICE_IS_ZERO",
         "page_price_value": Decimal("0"),
         "page_title": "已下架",
-        "comment_count": "8",
+        "comment_count": 8,
         "page_price_source": "batch_sql:nbdeli",
     }
     assert valid_page_price_result(crawl_result)
+
+
+@pytest.mark.parametrize(
+    ("raw_comment", "expected"),
+    (("1,234+", 1234), ("1.2万", 12000), ("未识别", None), (True, None)),
+)
+def test_batch_sql_comment_count_is_integer_or_none(raw_comment, expected):
+    result = BatchSqlResultAdapter(
+        _Factory(lambda _sql, _params: [_row(comment=raw_comment)])
+    ).fetch_batch_results("jd", [_target()])[0]
+
+    crawl_result = batch_sql_result_to_crawl_result("jd", result)
+
+    assert crawl_result["comment_count"] == expected
+    assert crawl_result["comment_count"] is None or isinstance(
+        crawl_result["comment_count"], int
+    )
 
 
 @pytest.mark.parametrize("price", [None, "", "not-a-number", "NaN", "Infinity", "-1"])

@@ -415,8 +415,9 @@ task name 使用业务日和 immutable 请求集生成同日稳定、跨日不�
   一律保留 legacy，Batch adapter 只接受绝对 HTTP(S) URL。历史 frozen `jslink` policy 按原 mall/source/URL
   恢复，不改写旧 SQLite。已有 legacy 与 batch job 在同一 SQLite
   内按各自 durable payload 路由到对应 harvester，损坏 payload
-  立即转人工。未启用 remote writes 的 batch priority 不 claim、不烧重试次数；已有 SUBMITTED/RUNNING
-  batch 仍继续只读 SQL harvest，绝不重复 POST。
+  立即转人工。普通 tick 未启用 remote writes 时 batch priority 不 claim、不烧重试次数；显式
+  `harvest-only / drain-only` 没有 submit surface，但可继续已有 durable job 必需的 priority confirm。
+  已有 SUBMITTED/RUNNING batch 继续只读 SQL harvest，所有 lifecycle-only 路径都绝不重复 POST。
 - `PRIORITY_PENDING` 独占 `priority_attempts/priority_elapsed_seconds`；`SUBMIT_UNKNOWN` 仍属于普通
   harvest 对账预算，`SUBMITTED/RUNNING/EXPORTED` 使用 `harvest_attempts/harvest_elapsed_seconds`。
   旧 SQLite 打开时原位补列且默认 0，不得要求清库。batch 的 `SUBMIT_UNKNOWN -> PRIORITY_PENDING`
