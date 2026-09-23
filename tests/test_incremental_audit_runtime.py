@@ -315,6 +315,146 @@ def test_drain_harvests_both_durable_backends_but_rejects_invalid_payload(tmp_pa
     assert dependencies.remote_job_disposition({"payload_json": "{"}) == "invalid"
 
 
+@pytest.mark.parametrize(
+    ("command", "selected_backend", "seeded_backends"),
+    (
+        ("harvest-only", "batch", ("legacy", "batch")),
+        ("harvest-only", "legacy", ("batch",)),
+        ("drain-only", "batch", ("legacy", "batch")),
+    ),
+)
+def test_lifecycle_only_routes_sqlite_jobs_by_durable_backend_without_create(
+    tmp_path, monkeypatch, command, selected_backend, seeded_backends
+) -> None:
+    calls = {
+        "legacy_harvest": [],
+        "batch_harvest": [],
+        "legacy_create": 0,
+        "batch_create": 0,
+    }
+
+    def create_counter(name):
+        def callback(*_args, **_kwargs):
+            calls[name] += 1
+            return []
+
+        return callback
+
+    def harvest_counter(name):
+        def callback(jobs, _timeout):
+            calls[name].extend(int(job["id"]) for job in jobs)
+            return {
+                int(job["id"]): {
+                    "state": "COMPLETED",
+                    "remote_identity": str(job["remote_identity"]),
+                    "crawl_results": {},
+                }
+                for job in jobs
+            }
+
+        return callback
+
+    monkeypatch.setattr(
+        runtime_module,
+        "legacy_zhaoshang_bridge",
+        lambda *_args, **_kwargs: (
+            create_counter("legacy_create"),
+            create_counter("legacy_create"),
+            create_counter("legacy_create"),
+            harvest_counter("legacy_harvest"),
+            None,
+            None,
+        ),
+    )
+    monkeypatch.setattr(
+        runtime_module,
+        "batch_zhaoshang_bridge",
+        lambda *_args, **_kwargs: (
+            create_counter("batch_create"),
+            create_counter("batch_create"),
+            create_counter("batch_create"),
+            harvest_counter("batch_harvest"),
+        ),
+    )
+    monkeypatch.setattr(
+        runtime_module,
+        "_batch_sql_runtime_components",
+        lambda: (object(), lambda *_args, **_kwargs: None),
+    )
+
+    root = tmp_path / "runtime"
+    paths = runtime_paths("2026-08-11", root)
+    paths.run_dir.mkdir(parents=True)
+    store = DailyAuditStore(paths.state_path)
+    store.ensure_run("2026-08-11")
+    token = store.acquire_lease("2026-08-11", "seed-mixed", 60)
+    job_ids = {"legacy": [], "batch": []}
+    try:
+        snapshot = store.ingest_snapshot(
+            token,
+            [{
+                "vCommodityId": "mixed-source",
+                "documentId": "mixed-source",
+                "skuId": "mixed-sku",
+                "extLink": "",
+                "fourCategoryId": "mixed-category",
+            }],
+            "2026-08-11T10:00:00+00:00",
+            source_fingerprints=["mixed-source"],
+            customer_fingerprints=["mixed-customer"],
+            headers=["vCommodityId"],
+        )["snapshot"]
+        if command == "drain-only":
+            store.freeze_snapshot(token, int(snapshot["id"]))
+        for index, backend in enumerate(seeded_backends, start=1):
+            payload = (
+                {"requests": [{"backend_version": "legacy-v1"}]}
+                if backend == "legacy"
+                else {
+                    "contract_version": "zhaoshang-batch-url-v1",
+                    "requests": [],
+                }
+            )
+            job = store.prepare_remote_intent(
+                token,
+                f"{backend}-logical-{index}",
+                f"{backend}-task-{index}",
+                f"{backend}-hash-{index}",
+                payload_json=payload,
+            )
+            store.claim_remote_submission(token, int(job["id"]))
+            job = store.reconcile_remote_job(
+                token,
+                int(job["id"]),
+                remote_identity=f"{backend}-remote-{index}",
+                state="SUBMITTED",
+            )
+            job_ids[backend].append(int(job["id"]))
+    finally:
+        store.release_lease(token)
+
+    dependencies = runtime_module.build_drain_dependencies(
+        zhaoshang_backend=selected_backend,
+        paths=paths,
+        business_date="2026-08-11",
+    )
+    dependencies.wall_clock = lambda: datetime(2026, 8, 11, 20, 0, tzinfo=UTC)
+    result = run_runtime_command(
+        command,
+        business_date="2026-08-11",
+        runtime_root=root,
+        runtime_budget_seconds=720,
+        zhaoshang_backend=selected_backend,
+        dependencies=dependencies,
+    )
+
+    assert result.tick.outcome in {"HARVESTED", "DRAINED"}
+    assert calls["legacy_harvest"] == job_ids["legacy"]
+    assert calls["batch_harvest"] == job_ids["batch"]
+    assert calls["legacy_create"] == 0
+    assert calls["batch_create"] == 0
+
+
 def test_batch_shadow_tick_defers_priority_without_consuming_claim_budget(tmp_path) -> None:
     dependencies = runtime_module.build_default_dependencies(
         enable_zhaoshang=False,

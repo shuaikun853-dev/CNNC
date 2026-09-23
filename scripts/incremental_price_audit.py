@@ -77,7 +77,10 @@ def _add_common_arguments(parser: argparse.ArgumentParser, *, allow_remote_write
         "--zhaoshang-backend",
         choices=("legacy", "batch"),
         default="legacy",
-        help="remote backend; batch create remains canary-gated and lacks an evidenced export contract",
+        help=(
+            "select backend policy for new Zhaoshang work; existing durable jobs "
+            "retain their persisted backend"
+        ),
     )
 
 
@@ -125,8 +128,9 @@ def build_parser() -> argparse.ArgumentParser:
     drain.add_argument("--max-iterations", type=int, default=1000)
     drain.add_argument(
         "--zhaoshang-backend",
-        choices=("legacy",),
+        choices=("legacy", "batch"),
         default="legacy",
+        help="selected creation policy for reporting; durable jobs retain their persisted backend",
     )
     drain.add_argument(
         "--invocation",
@@ -144,8 +148,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     harvest_only.add_argument(
         "--zhaoshang-backend",
-        choices=("legacy",),
+        choices=("legacy", "batch"),
         default="legacy",
+        help="selected creation policy for reporting; durable jobs retain their persisted backend",
     )
     harvest_only.add_argument(
         "--invocation",

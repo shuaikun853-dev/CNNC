@@ -11,7 +11,7 @@ param(
     [int] $HardTimeoutMinutes = 32,
     [ValidateRange(0, 120)]
     [int] $ProcessExitGraceSeconds = 30,
-    [ValidateSet("legacy")]
+    [ValidateSet("legacy", "batch")]
     [string] $ZhaoshangBackend = "legacy",
     [switch] $EnableRemoteWrites,
     [Nullable[datetime]] $At = $null,
