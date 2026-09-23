@@ -738,6 +738,20 @@ def multi_site_claims():
     ]
 
 
+def test_zdet_is_excluded_from_incremental_fallback_but_uses_pinned_crawler_revision():
+    url = "https://b.zdet.net/mall/item?id=1400061078916"
+
+    assert "zdet" not in SUPPORTED_MALLS
+    assert "zdet" not in fallback_module.SITE_HOSTS
+    assert not fallback_module._url_matches_site(url, "zdet")
+    assert fallback_module.EXPECTED_CRAWLER_REVISION == (
+        "08abb74089cfa9007dc6f6ddc850f9fd41990a24"
+    )
+    assert fallback_module.DEFAULT_CRAWLER_ROOT == fallback_module.Path(
+        r"E:\.A中核运维\cnnc-mall-crawler-prod"
+    )
+
+
 def test_execute_pinned_crawler_exit3_preserves_completed_other_site_success(tmp_path, monkeypatch):
     claims = multi_site_claims()
     fake_crawler_run(monkeypatch, exit_code=3, site_outputs={
