@@ -593,8 +593,8 @@ def boost_batch_priority_by_execute_numbers(
                     monotonic=monotonic,
                 )
                 affected_rows += int(getattr(cursor, "rowcount", 0) or 0)
-            if affected_rows > len(update_ids):
-                raise BatchPrioritySafetyError("priority update affected too many rows")
+            if affected_rows != len(update_ids):
+                raise BatchPrioritySafetyError("priority update affected count mismatch")
 
             transaction_rows = _select_by_task_ids(
                 cursor,

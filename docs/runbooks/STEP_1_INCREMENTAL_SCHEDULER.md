@@ -408,7 +408,9 @@ task name 使用业务日和 immutable 请求集生成同日稳定、跨日不�
   `is_valid='1' AND weight_type<>'-1'`，不按 `task_status` 过滤。事务内与 commit 后都回读
   exact identity；全部精确有效行都必须为 `-1`，已为 `-1` 视为幂等成功。竞态变成
   `02`（完成）或 `03`（失败）的行也须确认 `-1`，最终状态分别计入
-  `already_completed` / `already_failed`，不代表跳过提优。
+  `already_completed` / `already_failed`，不代表跳过提优。若预查存在非 `-1` 行，
+  `affected_rows` 必须等于这些精确主键的数量；少更新、零更新或越界均回滚并暂停，
+  不能仅凭后续回读 `-1` 冒认本次更新成功。
   确认后才从 `PRIORITY_PENDING` 进入 `SUBMITTED` 并在后续 sweep 查询 progress。重启只从 SQLite
   immutable payload 恢复 backend 与 `execute_numbers`。CLI backend 只决定新任务的 planner/submitter；
   当前 18 个生产商城均可逐链接走 batch；`mymro / ofs` 只有在提交 URL 能按已证明的严格格式解析 product code 时才标记 `batch-url-v1`，否则该链接自动回退 `legacy-v1`。这两个商城以 exact executeNumber 加 submitted URL product code 作为请求身份，唯一 SQL result 允许后续 SKU/goods_no/result URL code 变化，多条 result 仍 fail closed。新建 `jslink.com`

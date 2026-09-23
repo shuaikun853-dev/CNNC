@@ -443,7 +443,7 @@ def test_priority_classification_is_exclusive_when_highest_row_completes_after_c
     )
 
 
-def test_priority_accepts_zero_affected_rows_when_readback_is_already_highest() -> None:
+def test_priority_rejects_zero_affected_rows_after_nonhighest_precheck() -> None:
     before = [_row(1)]
     after = [_row(1, weight_type="-1")]
     connection = _Connection(
@@ -453,12 +453,29 @@ def test_priority_accepts_zero_affected_rows_when_readback_is_already_highest() 
         _Step(rows=after),
     )
 
-    result = boost_batch_priority_by_execute_numbers(
-        connection, _target(1), _materialized_probe(*before)
+    with pytest.raises(BatchPrioritySafetyError, match="priority update affected count mismatch"):
+        boost_batch_priority_by_execute_numbers(
+            connection, _target(1), _materialized_probe(*before)
+        )
+    assert connection.commits == 0
+    assert connection.rollbacks >= 1
+
+
+def test_priority_rejects_short_update_even_if_readback_is_highest() -> None:
+    before = [_row(1), _row(2)]
+    after = [_row(1, weight_type="-1"), _row(2, weight_type="-1")]
+    connection = _Connection(
+        _Step(rows=before),
+        _Step(rowcount=1),
+        _Step(rows=after),
+        _Step(rows=after),
     )
 
-    assert result.status is BatchPriorityStatus.CONFIRMED
-    assert result.affected_rows == 0
+    with pytest.raises(BatchPrioritySafetyError, match="priority update affected count mismatch"):
+        boost_batch_priority_by_execute_numbers(
+            connection, _target(2), _materialized_probe(*before)
+        )
+    assert connection.commits == 0
 
 
 def test_priority_rejects_short_update_when_completed_row_is_not_highest() -> None:
@@ -471,7 +488,7 @@ def test_priority_rejects_short_update_when_completed_row_is_not_highest() -> No
         _Step(rows=after),
     )
 
-    with pytest.raises(BatchPrioritySafetyError, match="row is not highest priority"):
+    with pytest.raises(BatchPrioritySafetyError, match="priority update affected count mismatch"):
         boost_batch_priority_by_execute_numbers(
             connection, _target(2), _materialized_probe(*before)
         )
@@ -543,7 +560,7 @@ def test_priority_fails_closed_when_active_readback_is_not_highest() -> None:
     before = [_row(1)]
     connection = _Connection(
         _Step(rows=before),
-        _Step(rowcount=0),
+        _Step(rowcount=1),
         _Step(rows=before),
     )
 
