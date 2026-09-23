@@ -29,7 +29,7 @@ from urllib.parse import urlparse
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -42,6 +42,21 @@ from openpyxl.utils import get_column_letter
 from app.schemas.workflow import SaasSameProductApprovalItem, WorkflowAction
 from app.services import saas_audit_core as _audit_core
 from app.services import zhaoshang_result_adapter as _zhaoshang_results
+from app.services.legacy_zhaoshang_adapter import (
+    CnncLegacyZhaoshangAdapter,
+    CrawlRequest,
+)
+from app.services.manual_zhaoshang_batch import (
+    BATCH_BACKEND_VERSION,
+    LEGACY_BACKEND_VERSION,
+    ManualBatchRequest,
+    authoritative_product_code,
+    normalized_result_from_crawl,
+    route_manual_request,
+    run_batch_zhaoshang_requests,
+)
+from app.services.batch_zhaoshang_adapter import PURPOSE_LEGACY_STEP1_MANUAL
+from app.services.batch_sql_result_adapter import ALLOWED_MALLS
 from app.workflows.work_01_saas_approval_json_audit import audit_saas_approval_records
 from scripts.auth_manager import AuthManager, SYSTEM_CONFIG
 from scripts.curl_utils import apply_curl_headers, internal_direct_opener, load_curl_command, parse_curl_command
@@ -1554,7 +1569,7 @@ def run_main(
                     except Exception as exc:  # noqa: BLE001
                         failed_malls.append(f"{mall_name}: {exc}")
                         continue
-                    if not info.get("result_path"):
+                    if not _zhaoshang_result_has_payload(info):
                         fallback_site = MULTI_SITE_MALL_KEY_TO_SITE.get(
                             normalize_cell_str(info.get("mall_key"))
                         )
@@ -3058,10 +3073,12 @@ _ZHAOSHANG_PRIORITY_SUCCESS_STATES = {
     "updated",
     "already_highest_priority",
     "task_completed_unconfirmed",
+    "batch_lifecycle_confirmed",
 }
 _ZHAOSHANG_FALLBACK_SAFE_PRIORITY_STATES = {
     "updated",
     "already_highest_priority",
+    "batch_lifecycle_confirmed",
 }
 
 
@@ -3083,6 +3100,18 @@ def _validate_zhaoshang_priority_evidence(result: Any) -> str:
     return priority_state
 
 
+def _zhaoshang_result_has_payload(result: Mapping[str, Any]) -> bool:
+    """Accept either a real legacy export or source-scoped Batch results."""
+
+    normalized = result.get("normalized_results")
+    normalized_by_identity = result.get("normalized_results_by_identity")
+    return bool(result.get("result_path")) or (
+        isinstance(normalized, Mapping) and bool(normalized)
+    ) or (
+        isinstance(normalized_by_identity, Mapping) and bool(normalized_by_identity)
+    )
+
+
 def _validate_zhaoshang_fallback_evidence(result: Any) -> str:
     priority_state = _validate_zhaoshang_priority_evidence(result)
     if priority_state not in _ZHAOSHANG_FALLBACK_SAFE_PRIORITY_STATES:
@@ -3099,10 +3128,50 @@ def backfill_zhaoshang_results_into_workbook(
 ) -> dict[str, int]:
     """Merge late Zhaoshang exports and recompute all dependent price decisions."""
     url_to_result: dict[str, dict[str, Any]] = {}
+    identity_to_result: dict[tuple[str, str], dict[str, Any]] = {}
     code_candidates: dict[str, list[dict[str, Any]]] = {}
     for mall_cn, info in (zhaoshang_summary or {}).items():
         if str(mall_cn).startswith("_") or not isinstance(info, dict) or not info.get("ok"):
             continue
+        nested = info.get("normalized_results_by_identity")
+        nested_urls: set[str] = set()
+        if isinstance(nested, dict):
+            for url, by_sku in nested.items():
+                normalized_url = _normalize_url(url)
+                if not isinstance(by_sku, dict):
+                    continue
+                hits = [hit for hit in by_sku.values() if isinstance(hit, dict)]
+                if hits:
+                    nested_urls.add(normalized_url)
+                for sku, hit in by_sku.items():
+                    if not isinstance(hit, dict):
+                        continue
+                    result = dict(hit)
+                    identity_to_result[(normalized_url, normalize_cell_str(sku))] = result
+                    product_code = normalize_cell_str(result.get("product_code"))
+                    if product_code:
+                        code_candidates.setdefault(product_code, []).append(result)
+                if len(hits) == 1:
+                    url_to_result[normalized_url] = dict(hits[0])
+                elif len(hits) > 1:
+                    url_to_result.pop(normalized_url, None)
+        normalized = info.get("normalized_results")
+        if isinstance(normalized, dict):
+            url_to_result.update(
+                {
+                    _normalize_url(url): dict(hit)
+                    for url, hit in normalized.items()
+                    if isinstance(hit, dict) and _normalize_url(url) not in nested_urls
+                }
+            )
+            for url, hit in normalized.items():
+                if _normalize_url(url) in nested_urls:
+                    continue
+                if not isinstance(hit, dict):
+                    continue
+                product_code = normalize_cell_str(hit.get("product_code"))
+                if product_code:
+                    code_candidates.setdefault(product_code, []).append(hit)
         result_path = info.get("result_path")
         if not result_path:
             continue
@@ -3126,6 +3195,7 @@ def backfill_zhaoshang_results_into_workbook(
         source_path,
         output_path,
         url_to_result,
+        identity_to_result=identity_to_result,
         unique_code_to_result=unique_code_to_result,
     )
 
@@ -3140,6 +3210,7 @@ def backfill_page_results_into_workbook(
         source_path,
         output_path,
         results_by_url,
+        identity_to_result={},
         unique_code_to_result={},
         preserve_valid_page_price=True,
     )
@@ -3150,6 +3221,7 @@ def _backfill_page_results_into_workbook(
     output_path: Path,
     url_to_result: dict[str, dict[str, Any]],
     *,
+    identity_to_result: dict[tuple[str, str], dict[str, Any]],
     unique_code_to_result: dict[str, dict[str, Any]],
     preserve_valid_page_price: bool = False,
 ) -> dict[str, int]:
@@ -3190,13 +3262,19 @@ def _backfill_page_results_into_workbook(
         decisions: list[str] = []
         for row_index in range(2, sheet.max_row + 1):
             source_url = _normalize_url(sheet.cell(row_index, url_col).value)
-            hit = url_to_result.get(source_url)
+            product_code = (
+                normalize_cell_str(sheet.cell(row_index, sku_col).value)
+                if sku_col is not None
+                else ""
+            )
+            hit = identity_to_result.get((source_url, product_code))
+            if hit is None:
+                hit = url_to_result.get(source_url)
             if preserve_valid_page_price and _page_status_code(
                 sheet.cell(row_index, page_status_col).value
             ) in {"OK", "PRICE_IS_ZERO"}:
                 hit = None
             if hit is None and sku_col is not None:
-                product_code = normalize_cell_str(sheet.cell(row_index, sku_col).value)
                 hit = unique_code_to_result.get(product_code)
             if hit is not None:
                 page_price = hit.get("page_price_value")
@@ -3271,6 +3349,7 @@ def read_zhaoshang_result_xlsx(path, template_path: Path | str | None = None):
 def apply_zhaoshang_results_to_rows(rows, enriched, audit_response, zhaoshang_summary):
     """Backfill Zhaoshang prices onto source rows by URL."""
     url_to_result = {}
+    identity_to_result = {}
     code_candidates = {}
     if isinstance(zhaoshang_summary, dict):
         for mall_cn, info in zhaoshang_summary.items():
@@ -3278,6 +3357,48 @@ def apply_zhaoshang_results_to_rows(rows, enriched, audit_response, zhaoshang_su
                 continue
             if not isinstance(info, dict) or not info.get("ok") or info.get("skipped"):
                 continue
+            nested = info.get("normalized_results_by_identity")
+            nested_urls = set()
+            if isinstance(nested, dict):
+                for url, by_sku in nested.items():
+                    normalized_url = _normalize_url(url)
+                    if not isinstance(by_sku, dict):
+                        continue
+                    hits = [hit for hit in by_sku.values() if isinstance(hit, dict)]
+                    if hits:
+                        nested_urls.add(normalized_url)
+                    for sku, hit in by_sku.items():
+                        if not isinstance(hit, dict):
+                            continue
+                        result = dict(hit)
+                        identity_to_result[
+                            (normalized_url, normalize_cell_str(sku))
+                        ] = result
+                        product_code = normalize_cell_str(result.get("product_code"))
+                        if product_code:
+                            code_candidates.setdefault(product_code, []).append(result)
+                    if len(hits) == 1:
+                        url_to_result[normalized_url] = dict(hits[0])
+                    elif len(hits) > 1:
+                        url_to_result.pop(normalized_url, None)
+            normalized = info.get("normalized_results")
+            if isinstance(normalized, dict):
+                url_to_result.update(
+                    {
+                        _normalize_url(url): dict(hit)
+                        for url, hit in normalized.items()
+                        if isinstance(hit, dict)
+                        and _normalize_url(url) not in nested_urls
+                    }
+                )
+                for url, hit in normalized.items():
+                    if _normalize_url(url) in nested_urls:
+                        continue
+                    if not isinstance(hit, dict):
+                        continue
+                    product_code = normalize_cell_str(hit.get("product_code"))
+                    if product_code:
+                        code_candidates.setdefault(product_code, []).append(hit)
             result_path = info.get("result_path")
             if not result_path:
                 continue
@@ -3304,9 +3425,12 @@ def apply_zhaoshang_results_to_rows(rows, enriched, audit_response, zhaoshang_su
     backfilled = 0
     for row in rows:
         url = _normalize_url(row.get("extLink"))
-        hit = url_to_result.get(url)
+        sku = normalize_cell_str(row.get("skuId"))
+        hit = identity_to_result.get((url, sku))
         if hit is None:
-            hit = unique_code_to_result.get(normalize_cell_str(row.get("skuId")))
+            hit = url_to_result.get(url)
+        if hit is None:
+            hit = unique_code_to_result.get(sku)
         if hit is None:
             continue
         row["__page_price_value"] = hit["page_price_value"]
@@ -3325,21 +3449,21 @@ def run_zhaoshang_tasks(
     skip_if_exists=True,
     max_workers=6,
     batch_state_path=None,
+    batch_runner=run_batch_zhaoshang_requests,
 ):
-    """Run one Zhaoshang task per mall, concurrently."""
+    """Run supported rows through Batch; retain legacy only as URL fallback."""
     group_start = time.perf_counter()
     tool_path = tool_path or DEFAULT_ZHAOSHANG_TOOL_PATH
-    try:
-        run_crawl_task = _load_zhaoshang_run_crawl_task(tool_path)
-    except Exception as exc:
-        _log_step("zhaoshang", f"load tool failed {type(exc).__name__}: {_safe_console_text(exc)}")
-        return {"_error": f"{type(exc).__name__}: {exc}"}
 
     results: dict[str, dict[str, Any]] = {}
     if not isinstance(excluded_export_summary, dict):
         return results
 
     jobs: list[tuple[str, dict[str, Any], str, Path]] = []
+    manual_items: list[ManualBatchRequest] = []
+    item_context: dict[str, tuple[str, dict[str, Any], str, Path]] = {}
+    source_identity: dict[str, tuple[str, str]] = {}
+    legacy_adapter = CnncLegacyZhaoshangAdapter()
     for mall_cn, info in excluded_export_summary.items():
         if str(mall_cn).startswith("_") or mall_cn == "enabled":
             continue
@@ -3353,12 +3477,186 @@ def run_zhaoshang_tasks(
             results[mall_cn] = {"ok": False, "error": f"模板文件不存在: {excel_path}"}
             continue
 
-        jobs.append((mall_cn, info, mall_key, Path(excel_path)))
+        template_path = Path(excel_path)
+        if mall_key not in ALLOWED_MALLS and mall_key != "jslink":
+            jobs.append((mall_cn, info, mall_key, template_path))
+            continue
+        workbook = load_workbook(template_path, data_only=True, read_only=True)
+        try:
+            sheet = workbook.active
+            row_iterator = sheet.iter_rows(values_only=True)
+            headers = {
+                normalize_cell_str(value): index
+                for index, value in enumerate(next(row_iterator))
+            }
+            code_index = headers.get("商品编码")
+            url_index = headers.get("url")
+            if code_index is None or url_index is None:
+                raise ValueError("招商局模板缺少 商品编码/url 列")
+            for row_index, values in enumerate(row_iterator, start=1):
+                code = normalize_cell_str(values[code_index] if code_index < len(values) else "")
+                url = normalize_cell_str(values[url_index] if url_index < len(values) else "")
+                if not code or not url:
+                    continue
+                template_code = code
+                code = authoritative_product_code(mall_key, url, code)
+                request = legacy_adapter.request_from_saas_row(
+                    {"skuId": code, "extLink": url},
+                    backend_version=LEGACY_BACKEND_VERSION,
+                )
+                mapping_failed = request is None
+                if request is None:
+                    request = CrawlRequest(
+                        mall_key=mall_key,
+                        mall_source_id=normalize_cell_str(info.get("source_id")),
+                        mall_name=str(mall_cn),
+                        sku_id=code,
+                        url=url,
+                        backend_version=LEGACY_BACKEND_VERSION,
+                    )
+                source_id = (
+                    f"step1:{request.mall_key}:"
+                    + hashlib.sha256(
+                        f"{request.mall_key}|{request.sku_id}|{request.url}".encode("utf-8")
+                    ).hexdigest()[:20]
+                )
+                candidate = ManualBatchRequest(source_id, request)
+                item = candidate if mapping_failed else route_manual_request(candidate)
+                manual_items.append(item)
+                item_context[source_id] = (mall_cn, info, mall_key, template_path)
+                source_identity[source_id] = (url, template_code)
+        finally:
+            workbook.close()
 
-    if not jobs:
+    batch_items = tuple(
+        item for item in manual_items if item.request.backend_version == BATCH_BACKEND_VERSION
+    )
+    legacy_items = tuple(
+        item for item in manual_items if item.request.backend_version == LEGACY_BACKEND_VERSION
+    )
+
+    if batch_items:
+        state_base = (
+            Path(batch_state_path).parent
+            if batch_state_path is not None
+            else next(iter(item_context.values()))[3].parent
+        )
+        try:
+            batch_rows = batch_runner(
+                batch_items,
+                business_date=str(
+                    (excluded_export_summary.get("_meta") or {}).get("date_label")
+                    or datetime.now().date().isoformat()
+                ),
+                purpose=PURPOSE_LEGACY_STEP1_MANUAL,
+                state_path=state_base / "manual_zhaoshang_batch.sqlite3",
+                runtime_budget_seconds=max(1.0, float(wait_timeout_seconds)),
+            )
+            batch_error = None
+        except Exception as exc:  # noqa: BLE001 - preserve the legacy result contract
+            batch_rows = {}
+            batch_error = f"{type(exc).__name__}: {_safe_console_text(exc)}"
+        per_mall_items: dict[str, list[tuple[ManualBatchRequest, Mapping[str, Any]]]] = {}
+        for item in batch_items:
+            per_mall_items.setdefault(item_context[item.source_id][0], []).append(
+                (item, batch_rows.get(item.source_id, {"state": "PENDING"}))
+            )
+        for mall_cn, entries in per_mall_items.items():
+            normalized_results: dict[str, dict[str, Any]] = {}
+            normalized_results_by_identity: dict[
+                str, dict[str, dict[str, Any]]
+            ] = {}
+            failures: list[str] = [batch_error] if batch_error else []
+            for item, entry in entries:
+                if batch_error:
+                    continue
+                state = str(entry.get("state") or "PENDING")
+                crawl_result = entry.get("result")
+                source_url, source_sku = source_identity.get(
+                    item.source_id, (item.request.url, item.request.sku_id)
+                )
+                if state == "SUCCESS" and isinstance(crawl_result, Mapping):
+                    normalized = normalized_result_from_crawl(
+                        item.request, crawl_result
+                    )
+                    normalized_results[source_url] = normalized
+                    normalized_results_by_identity.setdefault(
+                        source_url, {}
+                    )[source_sku] = normalized
+                elif state == "NO_RESULT":
+                    normalized = normalized_result_from_crawl(
+                        item.request, {"no_result": True, "reason": entry.get("error")}
+                    )
+                    normalized_results[source_url] = normalized
+                    normalized_results_by_identity.setdefault(
+                        source_url, {}
+                    )[source_sku] = normalized
+                else:
+                    failures.append(str(entry.get("error") or state))
+            info = item_context[entries[0][0].source_id][1]
+            results[mall_cn] = {
+                "ok": not failures,
+                "mall_key": entries[0][0].request.mall_key,
+                "source_id": info.get("source_id", ""),
+                "rows": len(entries),
+                "backend_version": BATCH_BACKEND_VERSION,
+                "priority_state": (
+                    "batch_lifecycle_confirmed"
+                    if all(
+                        bool(entry.get("priority_confirmed"))
+                        or str(entry.get("state") or "") in {"SUCCESS", "NO_RESULT"}
+                        for _item, entry in entries
+                    )
+                    else None
+                ),
+                "normalized_results": normalized_results,
+                "normalized_results_by_identity": normalized_results_by_identity,
+                **({"error": "; ".join(failures)} if failures else {}),
+            }
+
+    legacy_by_mall: dict[str, list[ManualBatchRequest]] = {}
+    for item in legacy_items:
+        legacy_by_mall.setdefault(item_context[item.source_id][0], []).append(item)
+    for mall_cn, items in legacy_by_mall.items():
+        original = item_context[items[0].source_id]
+        all_mall_items = [
+            item
+            for item in manual_items
+            if item_context[item.source_id][0] == mall_cn
+        ]
+        legacy_info = dict(original[1])
+        legacy_path = original[3]
+        if len(items) != len(all_mall_items):
+            fallback_dir = (
+                Path(batch_state_path).parent
+                if batch_state_path is not None
+                else original[3].parent
+            ) / "_legacy_url_fallback"
+            fallback_dir.mkdir(parents=True, exist_ok=True)
+            legacy_path = fallback_dir / f"{original[2]}.xlsx"
+            workbook = Workbook()
+            sheet = workbook.active
+            sheet.title = "products"
+            sheet.append(["商品编码", "url"])
+            for item in items:
+                sheet.append([item.request.sku_id, item.request.url])
+            workbook.save(legacy_path)
+        legacy_info["path"] = legacy_path
+        legacy_info["deduped"] = len(items)
+        jobs.append((mall_cn, legacy_info, original[2], legacy_path))
+
+    if not jobs and not batch_items:
         return results
 
-    worker_count = max(1, min(int(max_workers or 1), len(jobs)))
+    run_crawl_task = None
+    if jobs:
+        try:
+            run_crawl_task = _load_zhaoshang_run_crawl_task(tool_path)
+        except Exception as exc:
+            _log_step("zhaoshang", f"load tool failed {type(exc).__name__}: {_safe_console_text(exc)}")
+            return {**results, "_error": f"{type(exc).__name__}: {exc}"}
+
+    worker_count = max(1, min(int(max_workers or 1), len(jobs))) if jobs else 0
     _log_step("zhaoshang", f"run mall tasks total={len(jobs)} concurrency={worker_count}")
 
     def run_one(job: tuple[str, dict[str, Any], str, Path]) -> tuple[str, dict[str, Any]]:
@@ -3367,6 +3665,7 @@ def run_zhaoshang_tasks(
         task_name = f"cnnc_current_opt_{mall_cn}_{task_marker}"
         task_start = time.perf_counter()
         try:
+            assert run_crawl_task is not None
             _log_step(
                 "zhaoshang",
                 f"{_safe_console_text(mall_cn, 80)} submit task_name={_safe_console_text(task_name, 160)} mall_key={mall_key} rows={info.get('deduped', 0)}",
@@ -3391,6 +3690,7 @@ def run_zhaoshang_tasks(
                 "task_name": task_name,
                 "mall_key": mall_key,
                 "source_id": info.get("source_id", ""),
+                "backend_version": LEGACY_BACKEND_VERSION,
                 "rows": info.get("deduped", 0),
                 "template_path": str(excel_path),
                 "result_path": result.get("result_path"),
@@ -3415,15 +3715,44 @@ def run_zhaoshang_tasks(
                 "task_name": task_name,
                 "mall_key": mall_key,
                 "source_id": info.get("source_id", ""),
+                "backend_version": LEGACY_BACKEND_VERSION,
                 "error": error,
                 "failure_detail": detail,
                 **partial_evidence,
             }
 
+    def merge_mixed_result(
+        previous: Mapping[str, Any] | None,
+        legacy_result: dict[str, Any],
+    ) -> dict[str, Any]:
+        if (
+            not isinstance(previous, Mapping)
+            or previous.get("backend_version") != BATCH_BACKEND_VERSION
+        ):
+            return legacy_result
+        merged = dict(legacy_result)
+        merged["normalized_results"] = previous.get("normalized_results", {})
+        merged["normalized_results_by_identity"] = previous.get(
+            "normalized_results_by_identity", {}
+        )
+        merged["backend_version"] = "mixed"
+        merged["ok"] = bool(previous.get("ok")) and bool(legacy_result.get("ok"))
+        errors = [
+            str(value).strip()
+            for value in (previous.get("error"), legacy_result.get("error"))
+            if str(value or "").strip()
+        ]
+        if errors:
+            merged["error"] = "; ".join(errors)
+        if not previous.get("ok"):
+            merged["priority_state"] = previous.get("priority_state")
+        return merged
+
     if worker_count <= 1:
         for job in jobs:
             mall_cn, result = run_one(job)
-            results[mall_cn] = result
+            previous = results.get(mall_cn)
+            results[mall_cn] = merge_mixed_result(previous, result)
     else:
         with ThreadPoolExecutor(max_workers=worker_count) as pool:
             future_to_mall = {pool.submit(run_one, job): job[0] for job in jobs}
@@ -3434,7 +3763,8 @@ def run_zhaoshang_tasks(
                 except Exception as exc:  # noqa: BLE001
                     result_mall = mall_cn
                     result = {"ok": False, "error": f"{type(exc).__name__}: {_safe_console_text(exc)}"}
-                results[result_mall] = result
+                previous = results.get(result_mall)
+                results[result_mall] = merge_mixed_result(previous, result)
 
     results["_meta"] = {
         "elapsed_seconds": round(time.perf_counter() - group_start, 2),

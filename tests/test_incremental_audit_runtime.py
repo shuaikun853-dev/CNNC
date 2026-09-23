@@ -10,7 +10,23 @@ from pathlib import Path
 import pytest
 
 import app.services.incremental_audit_runtime as runtime_module
-from app.services.batch_zhaoshang_adapter import CnncBatchZhaoshangAdapter
+from app.services.batch_zhaoshang_adapter import (
+    BatchReconcileOutcome,
+    BatchReconcileStatus,
+    CnncBatchZhaoshangAdapter,
+)
+from app.services.batch_sql_result_adapter import (
+    BatchResultStatus,
+    BatchSqlResult,
+)
+from app.services.batch_zhaoshang_priority import (
+    BatchMaterializationProbe,
+    BatchMaterializationStatus,
+    BatchPriorityAttempt,
+    BatchPriorityAttemptStatus,
+    BatchPriorityOutcome,
+    BatchPriorityStatus,
+)
 from app.services.incremental_audit_runtime import (
     _detail_worker,
     _ensure_batch_state,
@@ -26,6 +42,7 @@ from app.services.incremental_audit_runtime import (
 )
 from app.services.legacy_zhaoshang_adapter import (
     CrawlRequest,
+    CnncLegacyZhaoshangAdapter,
     HarvestStatus,
     LegacyHarvestOutcome,
     LegacyPriorityOutcome,
@@ -45,13 +62,1187 @@ from app.services.daily_audit_store import (
 )
 from app.services.incremental_audit_materializer import ArtifactConflictError
 from app.services.title_match_model_adapter import TitleMatchModelResult
-from app.workflows.incremental_price_audit import DiscoveredState, TickDependencies, TickSummary
+from app.workflows.incremental_price_audit import (
+    CrawlMember,
+    CrawlPlan,
+    DiscoveredState,
+    TickDependencies,
+    TickSummary,
+)
 from app.workflows.incremental_price_audit_finalize import (
     FinalizeAlreadyRunning,
     FinalizeBlocked,
     FinalizeReadiness,
 )
 from scripts import incremental_price_audit as cli
+from scripts.zhaoshang_mall_mapping import ZhaoshangMallMapping
+
+
+def test_remote_job_backend_is_recovered_from_the_durable_payload() -> None:
+    batch = {
+        "payload_json": json.dumps(
+            {"contract_version": "zhaoshang-batch-url-v1", "requests": []}
+        ),
+        "state": "PRIORITY_PENDING",
+    }
+    legacy = {
+        "payload_json": json.dumps(
+            {"requests": [{"backend_version": "legacy-v1"}]}
+        )
+    }
+
+    assert runtime_module._remote_job_backend(batch) == "batch"
+    assert runtime_module._remote_job_backend(legacy) == "legacy"
+    assert runtime_module._remote_job_backend({"payload_json": "{}"}) is None
+    assert runtime_module._remote_job_backend({"payload_json": "[]"}) is None
+    assert runtime_module._remote_job_backend({"payload_json": "null"}) is None
+
+
+@pytest.mark.parametrize(
+    ("selected_backend", "mall", "url", "expected"),
+    [
+        ("legacy", "qstbg", "https://www.qstbg.com/gd/detail.do?goods_id=1", "legacy-v1"),
+        ("batch", "qstbg", "https://www.qstbg.com/gd/detail.do?goods_id=1", "batch-url-v1"),
+        ("batch", "lxwlmall", "https://www.lxwlmall.com/detail?skuNo=1", "batch-url-v1"),
+        ("batch", "mymro", "https://www.mymro.cn/u-98S6010.html", "batch-url-v1"),
+        ("batch", "ofs", "https://www.ofs.cn/product-3975210.html", "batch-url-v1"),
+        (
+            "batch",
+            "ofs",
+            "https://www.officemate.cn/gallery.html?scontent=n,6258398",
+            "batch-url-v1",
+        ),
+        ("batch", "qstbg", "", "legacy-v1"),
+        ("batch", "qstbg", "hostless-value", "legacy-v1"),
+        ("batch", "mymro", "https://www.mymro.cn/p/1", "legacy-v1"),
+        ("batch", "ofs", "https://www.officemate.cn/p/1", "legacy-v1"),
+        ("batch", "mymro", "https://evil.example/u-98S6010.html", "legacy-v1"),
+        ("batch", "ofs", "https://evil.example/product-3975210.html", "legacy-v1"),
+        ("batch", "unknown", "https://unknown.invalid/p/1", "legacy-v1"),
+    ],
+)
+def test_selected_batch_backend_routes_only_allowlisted_malls(
+    selected_backend, mall, url, expected
+):
+    assert (
+        runtime_module._zhaoshang_backend_version_for_mall(
+            mall, url=url, selected_backend=selected_backend
+        )
+        == expected
+    )
+
+
+def test_historical_frozen_jslink_policy_resumes_without_new_canonicalization(tmp_path):
+    nbdeli = ZhaoshangMallMapping(
+        mall_name="得力商城",
+        source_id="19",
+        mall_key="nbdeli",
+        domains=("nbdeli.com",),
+        vendor_keywords=("nbdeli",),
+    )
+    jslink = ZhaoshangMallMapping(
+        mall_name="得力集实链",
+        source_id="145",
+        mall_key="jslink",
+        domains=("jslink.com",),
+        vendor_keywords=("jslink",),
+    )
+    adapter = CnncLegacyZhaoshangAdapter(
+        mappings=[nbdeli, jslink], db_env_path=None
+    )
+    paths = runtime_paths("2026-08-11", tmp_path / "runtime")
+    paths.run_dir.mkdir(parents=True)
+    propose, _finalize, _submit, _harvest, _probe, _restart = legacy_zhaoshang_bridge(
+        adapter, paths=paths, business_date="2026-08-11"
+    )
+    original_url = "https://www.jslink.com/goods/400.html"
+    row = {
+        "vCommodityId": "legacy-jslink",
+        "skuId": "sku-1",
+        "extLink": original_url,
+        "__crawl_required": True,
+        "__crawl_mall_key": "jslink",
+        "__crawl_mall_source_id": "145",
+        "__crawl_backend_version": "legacy-v1",
+    }
+
+    plan = propose([{"row": row}], 10)[0]
+
+    assert plan.mall_key == "jslink"
+    assert plan.members[0].exact_url == original_url
+
+
+def test_hybrid_creation_routes_plans_finalization_and_submit_by_durable_backend():
+    calls = []
+    legacy_member = CrawlMember(
+        "mymro", "source-legacy", "sku-l", "https://legacy", "legacy-v1", {}
+    )
+    batch_member = CrawlMember(
+        "qstbg", "source-batch", "sku-b", "https://batch", "batch-url-v1", {}
+    )
+    legacy_plan = CrawlPlan("mymro", "legacy-plan", "", "", members=(legacy_member,))
+    batch_plan = CrawlPlan("qstbg", "batch-plan", "", "", members=(batch_member,))
+
+    def planner(name, result):
+        def run(items, timeout):
+            calls.append((name, "plan", [item["row"]["id"] for item in items], timeout))
+            return [result] if items else []
+
+        return run
+
+    def finalizer(name):
+        def run(plan, members, timeout):
+            calls.append((name, "finalize", plan.logical_key, timeout))
+            return plan
+
+        return run
+
+    def submitter(name):
+        def run(job, crawls, timeout):
+            calls.append((name, "submit", int(job["id"]), timeout))
+            return {"remote_identity": name}
+
+        return run
+
+    plan, finalize, submit = runtime_module._route_zhaoshang_creation(
+        planner("legacy", legacy_plan),
+        finalizer("legacy"),
+        submitter("legacy"),
+        planner("batch", batch_plan),
+        finalizer("batch"),
+        submitter("batch"),
+    )
+    plans = plan(
+        [
+            {"row": {"id": "b", "__crawl_backend_version": "batch-url-v1"}},
+            {"row": {"id": "l", "__crawl_backend_version": "legacy-v1"}},
+        ],
+        12,
+    )
+
+    assert {value.logical_key for value in plans} == {"legacy-plan", "batch-plan"}
+    assert ("legacy", "plan", ["l"], 12) in calls
+    assert ("batch", "plan", ["b"], 12) in calls
+    assert finalize(legacy_plan, (legacy_member,), 8) is legacy_plan
+    assert finalize(batch_plan, (batch_member,), 7) is batch_plan
+    legacy_job = {
+        "id": 1,
+        "payload_json": json.dumps(
+            {"requests": [{"backend_version": "legacy-v1"}]}
+        ),
+    }
+    batch_job = {
+        "id": 2,
+        "payload_json": json.dumps(
+            {"contract_version": "zhaoshang-batch-url-v1", "requests": []}
+        ),
+    }
+    assert submit(legacy_job, [], 6)["remote_identity"] == "legacy"
+    assert submit(batch_job, [], 5)["remote_identity"] == "batch"
+    assert ("legacy", "submit", 1, 6) in calls
+    assert ("batch", "submit", 2, 5) in calls
+
+
+def test_hybrid_creation_rejects_missing_or_mixed_durable_backend():
+    noop_plan = lambda _items, _timeout: []
+    noop_finalize = lambda plan, _members, _timeout: plan
+    noop_submit = lambda _job, _crawls, _timeout: {"remote_identity": "unused"}
+    _plan, finalize, submit = runtime_module._route_zhaoshang_creation(
+        noop_plan,
+        noop_finalize,
+        noop_submit,
+        noop_plan,
+        noop_finalize,
+        noop_submit,
+    )
+    mixed_plan = CrawlPlan(
+        "mixed",
+        "mixed-plan",
+        "",
+        "",
+        members=(
+            CrawlMember("jd", "s1", "a", "https://a", "legacy-v1", {}),
+            CrawlMember("jd", "s2", "b", "https://b", "batch-url-v1", {}),
+        ),
+    )
+
+    with pytest.raises(RuntimeConfigurationError, match="single durable backend"):
+        finalize(mixed_plan, tuple(mixed_plan.members), 10)
+    with pytest.raises(RuntimeConfigurationError, match="durable backend"):
+        submit({"id": 3, "payload_json": "{}"}, [], 10)
+
+
+def test_default_legacy_tick_keeps_crash_recovered_batch_job_harvestable(tmp_path) -> None:
+    dependencies = runtime_module.build_default_dependencies(
+        enable_zhaoshang=False,
+        zhaoshang_backend="legacy",
+        paths=runtime_paths("2026-08-11", tmp_path),
+        business_date="2026-08-11",
+    )
+    batch = {
+        "payload_json": json.dumps(
+            {"contract_version": "zhaoshang-batch-url-v1", "requests": []}
+        )
+    }
+    legacy = {
+        "payload_json": json.dumps(
+            {"requests": [{"backend_version": "legacy-v1"}]}
+        )
+    }
+
+    assert dependencies.harvest_accepts is not None
+    assert dependencies.harvest_accepts(batch) is True
+    assert dependencies.harvest_accepts(legacy) is True
+
+
+def test_drain_harvests_both_durable_backends_but_rejects_invalid_payload(tmp_path) -> None:
+    dependencies = runtime_module.build_drain_dependencies(
+        zhaoshang_backend="legacy",
+        paths=runtime_paths("2026-08-11", tmp_path),
+        business_date="2026-08-11",
+    )
+    batch = {
+        "payload_json": json.dumps(
+            {"contract_version": "zhaoshang-batch-url-v1", "requests": []}
+        ),
+        "state": "PRIORITY_PENDING",
+    }
+
+    assert dependencies.harvest_accepts is not None
+    assert dependencies.harvest_accepts(batch) is True
+    assert dependencies.harvest_accepts({"payload_json": "{"}) is False
+    assert dependencies.remote_job_disposition is not None
+    assert dependencies.remote_job_disposition({"payload_json": "{"}) == "invalid"
+
+
+@pytest.mark.parametrize(
+    ("command", "selected_backend", "seeded_backends"),
+    (
+        ("harvest-only", "batch", ("legacy", "batch")),
+        ("harvest-only", "legacy", ("batch",)),
+        ("drain-only", "batch", ("legacy", "batch")),
+    ),
+)
+def test_lifecycle_only_routes_sqlite_jobs_by_durable_backend_without_create(
+    tmp_path, monkeypatch, command, selected_backend, seeded_backends
+) -> None:
+    calls = {
+        "legacy_harvest": [],
+        "batch_harvest": [],
+        "legacy_create": 0,
+        "batch_create": 0,
+    }
+
+    def create_counter(name):
+        def callback(*_args, **_kwargs):
+            calls[name] += 1
+            return []
+
+        return callback
+
+    def harvest_counter(name):
+        def callback(jobs, _timeout):
+            calls[name].extend(int(job["id"]) for job in jobs)
+            return {
+                int(job["id"]): {
+                    "state": "COMPLETED",
+                    "remote_identity": str(job["remote_identity"]),
+                    "crawl_results": {},
+                }
+                for job in jobs
+            }
+
+        return callback
+
+    monkeypatch.setattr(
+        runtime_module,
+        "legacy_zhaoshang_bridge",
+        lambda *_args, **_kwargs: (
+            create_counter("legacy_create"),
+            create_counter("legacy_create"),
+            create_counter("legacy_create"),
+            harvest_counter("legacy_harvest"),
+            None,
+            None,
+        ),
+    )
+    monkeypatch.setattr(
+        runtime_module,
+        "batch_zhaoshang_bridge",
+        lambda *_args, **_kwargs: (
+            create_counter("batch_create"),
+            create_counter("batch_create"),
+            create_counter("batch_create"),
+            harvest_counter("batch_harvest"),
+        ),
+    )
+    monkeypatch.setattr(
+        runtime_module,
+        "_batch_sql_runtime_components",
+        lambda: (object(), lambda *_args, **_kwargs: None),
+    )
+
+    root = tmp_path / "runtime"
+    paths = runtime_paths("2026-08-11", root)
+    paths.run_dir.mkdir(parents=True)
+    store = DailyAuditStore(paths.state_path)
+    store.ensure_run("2026-08-11")
+    token = store.acquire_lease("2026-08-11", "seed-mixed", 60)
+    job_ids = {"legacy": [], "batch": []}
+    try:
+        snapshot = store.ingest_snapshot(
+            token,
+            [{
+                "vCommodityId": "mixed-source",
+                "documentId": "mixed-source",
+                "skuId": "mixed-sku",
+                "extLink": "",
+                "fourCategoryId": "mixed-category",
+            }],
+            "2026-08-11T10:00:00+00:00",
+            source_fingerprints=["mixed-source"],
+            customer_fingerprints=["mixed-customer"],
+            headers=["vCommodityId"],
+        )["snapshot"]
+        if command == "drain-only":
+            store.freeze_snapshot(token, int(snapshot["id"]))
+        for index, backend in enumerate(seeded_backends, start=1):
+            payload = (
+                {"requests": [{"backend_version": "legacy-v1"}]}
+                if backend == "legacy"
+                else {
+                    "contract_version": "zhaoshang-batch-url-v1",
+                    "requests": [],
+                }
+            )
+            job = store.prepare_remote_intent(
+                token,
+                f"{backend}-logical-{index}",
+                f"{backend}-task-{index}",
+                f"{backend}-hash-{index}",
+                payload_json=payload,
+            )
+            store.claim_remote_submission(token, int(job["id"]))
+            job = store.reconcile_remote_job(
+                token,
+                int(job["id"]),
+                remote_identity=f"{backend}-remote-{index}",
+                state="SUBMITTED",
+            )
+            job_ids[backend].append(int(job["id"]))
+    finally:
+        store.release_lease(token)
+
+    dependencies = runtime_module.build_drain_dependencies(
+        zhaoshang_backend=selected_backend,
+        paths=paths,
+        business_date="2026-08-11",
+    )
+    dependencies.wall_clock = lambda: datetime(2026, 8, 11, 20, 0, tzinfo=UTC)
+    result = run_runtime_command(
+        command,
+        business_date="2026-08-11",
+        runtime_root=root,
+        runtime_budget_seconds=720,
+        zhaoshang_backend=selected_backend,
+        dependencies=dependencies,
+    )
+
+    assert result.tick.outcome in {"HARVESTED", "DRAINED"}
+    assert calls["legacy_harvest"] == job_ids["legacy"]
+    assert calls["batch_harvest"] == job_ids["batch"]
+    assert calls["legacy_create"] == 0
+    assert calls["batch_create"] == 0
+
+
+def test_batch_shadow_tick_defers_priority_without_consuming_claim_budget(tmp_path) -> None:
+    dependencies = runtime_module.build_default_dependencies(
+        enable_zhaoshang=False,
+        zhaoshang_backend="batch",
+        paths=runtime_paths("2026-08-11", tmp_path),
+        business_date="2026-08-11",
+    )
+    batch = {
+        "payload_json": json.dumps(
+            {"contract_version": "zhaoshang-batch-url-v1", "requests": []}
+        ),
+        "state": "PRIORITY_PENDING",
+    }
+
+    assert dependencies.harvest_accepts is not None
+    assert dependencies.remote_job_disposition is not None
+    assert dependencies.remote_job_disposition(batch) == "deferred"
+    assert dependencies.harvest_accepts(batch) is False
+    assert dependencies.harvest_accepts({**batch, "state": "SUBMITTED"}) is True
+
+
+def test_batch_bridge_manualizes_unclassifiable_durable_payload(tmp_path) -> None:
+    paths = runtime_paths("2026-08-11", tmp_path / "runtime")
+    paths.run_dir.mkdir(parents=True)
+    _propose, _finalize, _submit, harvest = runtime_module.batch_zhaoshang_bridge(
+        CnncBatchZhaoshangAdapter(write_enabled=False),
+        _BridgeAdapter(),
+        paths=paths,
+        business_date="2026-08-11",
+    )
+
+    result = harvest(
+        [
+            {
+                "id": 99,
+                "logical_key": "broken",
+                "payload_hash": "broken",
+                "payload_json": "{",
+                "state": "PRIORITY_PENDING",
+            }
+        ],
+        10,
+    )
+
+    assert result[99]["manual_error"] == "exact batch job reconstruction is unavailable"
+
+
+def test_batch_bridge_surfaces_conclusive_submit_not_found(tmp_path) -> None:
+    paths = runtime_paths("2026-08-11", tmp_path / "runtime")
+    paths.run_dir.mkdir(parents=True)
+    adapter = CnncBatchZhaoshangAdapter(write_enabled=False)
+    adapter.reconcile_unknown = lambda _job, *, timeout_seconds: BatchReconcileOutcome(
+        BatchReconcileStatus.NOT_FOUND
+    )
+    propose, finalize, _submit, harvest = runtime_module.batch_zhaoshang_bridge(
+        adapter,
+        _JdBridgeAdapter(),
+        paths=paths,
+        business_date="2026-08-11",
+    )
+    row = {
+        "vCommodityId": "v-not-found",
+        "skuId": "sku-not-found",
+        "extLink": "https://item.jd.com/sku-not-found.html",
+    }
+    proposed = propose([{"row": row}], 10)[0]
+    plan = finalize(proposed, tuple(proposed.members), 10)
+
+    result = harvest(
+        [{
+            "id": 101,
+            "logical_key": plan.logical_key,
+            "mall_key": plan.mall_key,
+            "task_name": plan.task_name,
+            "payload_hash": plan.payload_hash,
+            "payload_json": json.dumps(plan.payload_json),
+            "state": "SUBMIT_UNKNOWN",
+            "remote_identity": "",
+        }],
+        10,
+    )
+
+    assert result[101] == {
+        "state": "SUBMIT_UNKNOWN",
+        "reconcile_status": "NOT_FOUND",
+        "reconcile_diagnostic": "",
+    }
+
+
+class _JdBridgeAdapter:
+    def request_from_saas_row(self, row, *, backend_version):
+        return CrawlRequest(
+            "jd",
+            "jd-source",
+            "京东",
+            str(row["skuId"]),
+            str(row["extLink"]),
+            backend_version,
+        )
+
+
+class _ScriptedBatchSqlAdapter:
+    def __init__(self, result_status, *, price=None, title=None, sku_id=None, url=None):
+        self.result_status = result_status
+        self.price = price
+        self.title = title
+        self.sku_id = sku_id
+        self.url = url
+        self.targets = []
+        self.timeouts = []
+
+    def fetch_batch_results(self, mall, targets, *, timeout_seconds=None):
+        self.targets.extend(targets)
+        self.timeouts.append(timeout_seconds)
+        return tuple(
+            BatchSqlResult(
+                execute_number=target.execute_number,
+                status=self.result_status,
+                price=self.price,
+                title=self.title,
+                comment="9",
+                sku_id=self.sku_id,
+                goods_no=self.sku_id,
+                url=self.url,
+            )
+            for target in targets
+        )
+
+
+def _batch_result_harvest(
+    tmp_path,
+    *,
+    result_status,
+    task_status,
+    price=None,
+    title=None,
+    crawl_work_count=1,
+    purpose="price-audit",
+):
+    paths = runtime_paths("2026-08-11", tmp_path / "runtime")
+    paths.run_dir.mkdir(parents=True, exist_ok=True)
+    batch = CnncBatchZhaoshangAdapter(
+        write_enabled=False,
+        get_json=lambda _url, params, _timeout: (
+            200,
+            {
+                "rspCode": "0000",
+                "data": {
+                    "batchNumber": params["batchNumber"],
+                    "mallLogo": "jd",
+                    "totalCount": 1,
+                    "completedCount": 1 if task_status in {"02", "03"} else 0,
+                    "pendingCount": 1 if task_status == "00" else 0,
+                    "runningCount": 1 if task_status == "01" else 0,
+                    "failedCount": 1 if task_status == "03" else 0,
+                    "pendingStoreCount": 0,
+                },
+            },
+        ),
+    )
+    sql_adapter = _ScriptedBatchSqlAdapter(
+        result_status,
+        price=price,
+        title=title,
+        sku_id="REAL-123" if purpose == "customer-prewarm" else None,
+        url=(
+            "https://item.jd.com/REAL-123.html"
+            if purpose == "customer-prewarm"
+            else None
+        ),
+    )
+
+    def probe(prepared_job, _timeout):
+        return BatchMaterializationProbe(
+            BatchMaterializationStatus.MATERIALIZED,
+            "central_control_sub",
+            tuple(
+                {
+                    "exec_num": execute_number,
+                    "mall": "jd",
+                    "is_valid": 1,
+                    "task_status": task_status,
+                }
+                for execute_number in prepared_job.execute_numbers
+            ),
+            prepared_job.expected_count,
+            prepared_job.expected_count,
+        )
+
+    propose, finalize, _submit, harvest = runtime_module.batch_zhaoshang_bridge(
+        batch,
+        _JdBridgeAdapter(),
+        paths=paths,
+        business_date="2026-08-11",
+        result_adapter=sql_adapter,
+        materialization_probe_runner=probe,
+        purpose=purpose,
+    )
+    row = {
+        "vCommodityId": "v-a",
+        "skuId": "sku-a",
+        "extLink": "https://item.jd.com/sku-a.html",
+    }
+    proposed = propose([{"row": row}], 10)[0]
+    plan = finalize(proposed, tuple(proposed.members), 10)
+    prepared = batch.restore_job(plan.payload_json)
+    crawls = [
+        {
+            "id": 101 + index,
+            "mall_key": "jd",
+            "source_id": "v-a",
+            "sku_id": "sku-a",
+            "exact_url": "https://item.jd.com/sku-a.html",
+            "backend_version": "batch-url-v1",
+        }
+        for index in range(crawl_work_count)
+    ]
+    durable = {
+        "id": 19,
+        "logical_key": plan.logical_key,
+        "mall_key": plan.mall_key,
+        "task_name": plan.task_name,
+        "payload_hash": plan.payload_hash,
+        "payload_json": json.dumps(plan.payload_json),
+        "state": "RUNNING",
+        "remote_identity": prepared.remote_identity.durable_value(),
+        "crawl_work": crawls,
+    }
+    return harvest([durable], 10)[19], sql_adapter
+
+
+@pytest.mark.parametrize(
+    ("status", "task_status", "expected_state", "expected_result"),
+    [
+        (BatchResultStatus.NOT_YET_VISIBLE, "01", "RUNNING", None),
+        (
+            BatchResultStatus.CRAWLER_FAILED,
+            "03",
+            "COMPLETED",
+            {"terminal": True, "error": "crawler task failed before an exact SQL result was found"},
+        ),
+        (
+            BatchResultStatus.EVIDENCE_INCOMPLETE,
+            "02",
+            "EXPORTED",
+            {
+                "manual": True,
+                "error": "task_status 02 with zero rows requires spider-log or equivalent terminal evidence",
+            },
+        ),
+    ],
+)
+def test_batch_harvest_maps_missing_sql_rows_by_terminal_evidence(
+    tmp_path, status, task_status, expected_state, expected_result
+):
+    outcome, _adapter = _batch_result_harvest(
+        tmp_path,
+        result_status=status,
+        task_status=task_status,
+    )
+
+    assert outcome["state"] == expected_state
+    if expected_result is None:
+        assert outcome.get("crawl_results") == {}
+    else:
+        assert outcome["crawl_results"][101] == expected_result
+
+
+@pytest.mark.parametrize(
+    ("price", "title", "expected"),
+    [
+        (
+            "12.30",
+            "Exact title",
+            {
+                "page_price_status": "OK",
+                    "page_price_value": 12.30,
+                "page_title": "Exact title",
+                "comment_count": 9,
+                "page_price_source": "batch_sql:jd",
+            },
+        ),
+        (
+            "0",
+            None,
+            {
+                "page_price_status": "PRICE_IS_ZERO",
+                "page_price_value": 0,
+                "page_title": "已下架",
+                "comment_count": 9,
+                "page_price_source": "batch_sql:jd",
+            },
+        ),
+    ],
+)
+def test_batch_harvest_converts_found_sql_result_to_exact_crawl_result(
+    tmp_path, price, title, expected
+):
+    outcome, adapter = _batch_result_harvest(
+        tmp_path,
+        result_status=BatchResultStatus.FOUND,
+        task_status="02",
+        price=price,
+        title=title,
+    )
+
+    assert outcome["state"] == "COMPLETED"
+    actual = outcome["crawl_results"][101]
+    assert actual["page_price_status"] == expected["page_price_status"]
+    assert float(actual["page_price_value"]) == float(expected["page_price_value"])
+    assert {key: actual[key] for key in expected if key != "page_price_value"} == {
+        key: value for key, value in expected.items() if key != "page_price_value"
+    }
+    assert len(adapter.targets) == 1
+    assert adapter.targets[0].execute_number.startswith("mrwang-")
+
+
+def test_customer_prewarm_batch_harvest_preserves_real_sku_and_returned_url(tmp_path):
+    outcome, adapter = _batch_result_harvest(
+        tmp_path,
+        result_status=BatchResultStatus.FOUND,
+        task_status="02",
+        price="12.30",
+        title="Exact title",
+        purpose="customer-prewarm",
+    )
+
+    assert outcome["state"] == "COMPLETED"
+    result = outcome["crawl_results"][101]
+    assert result["page_sku_id"] == "REAL-123"
+    assert result["page_goods_no"] == "REAL-123"
+    assert result["returned_url"] == "https://item.jd.com/REAL-123.html"
+    assert adapter.targets[0].purpose == "customer-prewarm"
+
+
+@pytest.mark.parametrize("crawl_work_count", [0, 2])
+def test_batch_harvest_fails_closed_unless_execute_number_maps_to_one_crawl(
+    tmp_path, crawl_work_count
+):
+    outcome, _adapter = _batch_result_harvest(
+        tmp_path,
+        result_status=BatchResultStatus.FOUND,
+        task_status="02",
+        price="12.30",
+        title="Exact title",
+        crawl_work_count=crawl_work_count,
+    )
+
+    assert outcome["manual_error"] == (
+        "batch executeNumber must map to exactly one linked crawl_work"
+    )
+
+
+def test_batch_plan_assigns_distinct_execute_numbers_to_same_product_sources(tmp_path):
+    paths = runtime_paths("2026-08-11", tmp_path / "runtime")
+    paths.run_dir.mkdir(parents=True, exist_ok=True)
+    batch = CnncBatchZhaoshangAdapter(
+        write_enabled=False,
+        get_json=lambda _url, params, _timeout: (
+            200,
+            {
+                "rspCode": "0000",
+                "data": {
+                    "batchNumber": params["batchNumber"],
+                    "mallLogo": "jd",
+                    "totalCount": 2,
+                    "completedCount": 2,
+                    "pendingCount": 0,
+                    "runningCount": 0,
+                    "failedCount": 0,
+                    "pendingStoreCount": 0,
+                },
+            },
+        ),
+    )
+    sql_adapter = _ScriptedBatchSqlAdapter(
+        BatchResultStatus.FOUND, price="12.30", title="Exact title"
+    )
+
+    def probe(prepared_job, _timeout):
+        return BatchMaterializationProbe(
+            BatchMaterializationStatus.MATERIALIZED,
+            "central_control_sub",
+            tuple(
+                {
+                    "exec_num": value,
+                    "mall": "jd",
+                    "is_valid": 1,
+                    "task_status": "02",
+                }
+                for value in prepared_job.execute_numbers
+            ),
+            prepared_job.expected_count,
+            prepared_job.expected_count,
+        )
+
+    propose, finalize, _submit, harvest = runtime_module.batch_zhaoshang_bridge(
+        batch,
+        _JdBridgeAdapter(),
+        paths=paths,
+        business_date="2026-08-11",
+        result_adapter=sql_adapter,
+        materialization_probe_runner=probe,
+    )
+    common = {
+        "skuId": "sku-a",
+        "extLink": "https://item.jd.com/sku-a.html",
+    }
+    proposed = propose(
+        [
+            {"row": {"vCommodityId": "document-a", **common}},
+            {"row": {"vCommodityId": "document-b", **common}},
+        ],
+        10,
+    )[0]
+    plan = finalize(proposed, tuple(proposed.members), 10)
+    prepared = batch.restore_job(plan.payload_json)
+
+    assert prepared.source_ids == ("document-a", "document-b")
+    assert len(set(prepared.execute_numbers)) == 2
+    outcome = harvest(
+        [
+            {
+                "id": 81,
+                "logical_key": plan.logical_key,
+                "mall_key": "jd",
+                "task_name": plan.task_name,
+                "payload_hash": plan.payload_hash,
+                "payload_json": json.dumps(plan.payload_json),
+                "state": "RUNNING",
+                "remote_identity": prepared.remote_identity.durable_value(),
+                "crawl_work": [
+                    {
+                        "id": 201,
+                        "mall_key": "jd",
+                        "source_id": "document-a",
+                        "sku_id": "sku-a",
+                        "exact_url": common["extLink"],
+                        "backend_version": "batch-url-v1",
+                    },
+                    {
+                        "id": 202,
+                        "mall_key": "jd",
+                        "source_id": "document-b",
+                        "sku_id": "sku-a",
+                        "exact_url": common["extLink"],
+                        "backend_version": "batch-url-v1",
+                    },
+                ],
+            }
+        ],
+        10,
+    )[81]
+
+    assert outcome["state"] == "COMPLETED"
+    assert set(outcome["crawl_results"]) == {201, 202}
+
+
+def test_batch_finalize_rebuilds_a_source_scoped_plan_for_the_pending_subset(
+    tmp_path,
+):
+    paths = runtime_paths("2026-08-11", tmp_path / "runtime")
+    paths.run_dir.mkdir(parents=True, exist_ok=True)
+    batch = CnncBatchZhaoshangAdapter(write_enabled=False)
+    propose, finalize, _submit, _harvest = runtime_module.batch_zhaoshang_bridge(
+        batch,
+        _JdBridgeAdapter(),
+        paths=paths,
+        business_date="2026-08-11",
+    )
+    common = {
+        "skuId": "sku-a",
+        "extLink": "https://item.jd.com/sku-a.html",
+    }
+    proposal = propose(
+        [
+            {"row": {"vCommodityId": "source-a", **common}},
+            {"row": {"vCommodityId": "source-b", **common}},
+        ],
+        10,
+    )[0]
+
+    finalized = finalize(proposal, (proposal.members[1],), 10)
+    prepared = batch.restore_job(finalized.payload_json)
+
+    assert finalized.members == (proposal.members[1],)
+    assert prepared.source_ids == ("source-b",)
+    assert prepared.expected_count == 1
+    assert finalized.logical_key != proposal.logical_key
+
+
+def test_batch_harvest_shares_one_absolute_deadline_across_progress_probe_and_sql(
+    tmp_path,
+):
+    paths = runtime_paths("2026-08-11", tmp_path / "runtime")
+    paths.run_dir.mkdir(parents=True, exist_ok=True)
+    now = [100.0]
+    observed = {}
+
+    def progress(_url, params, timeout_seconds):
+        observed["progress"] = timeout_seconds
+        now[0] += 2.0
+        return 200, {
+            "rspCode": "0000",
+            "data": {
+                "batchNumber": params["batchNumber"],
+                "mallLogo": "jd",
+                "totalCount": 1,
+                "completedCount": 1,
+                "pendingCount": 0,
+                "runningCount": 0,
+                "failedCount": 0,
+                "pendingStoreCount": 0,
+            },
+        }
+
+    batch = CnncBatchZhaoshangAdapter(
+        write_enabled=False, get_json=progress
+    )
+    sql_adapter = _ScriptedBatchSqlAdapter(
+        BatchResultStatus.FOUND, price="12.30", title="Exact title"
+    )
+
+    def probe(prepared_job, timeout_seconds):
+        observed["probe"] = timeout_seconds
+        now[0] += 3.0
+        return BatchMaterializationProbe(
+            BatchMaterializationStatus.MATERIALIZED,
+            "central_control_sub",
+            ({
+                "exec_num": prepared_job.execute_numbers[0],
+                "mall": "jd",
+                "is_valid": 1,
+                "task_status": "02",
+            },),
+            1,
+            1,
+        )
+
+    propose, finalize, _submit, harvest = runtime_module.batch_zhaoshang_bridge(
+        batch,
+        _JdBridgeAdapter(),
+        paths=paths,
+        business_date="2026-08-11",
+        result_adapter=sql_adapter,
+        materialization_probe_runner=probe,
+        monotonic=lambda: now[0],
+    )
+    proposed = propose([{"row": {
+        "vCommodityId": "document-a",
+        "skuId": "sku-a",
+        "extLink": "https://item.jd.com/sku-a.html",
+    }}], 10)[0]
+    plan = finalize(proposed, tuple(proposed.members), 10)
+    prepared = batch.restore_job(plan.payload_json)
+
+    outcome = harvest([{
+        "id": 82,
+        "logical_key": plan.logical_key,
+        "mall_key": "jd",
+        "task_name": plan.task_name,
+        "payload_hash": plan.payload_hash,
+        "payload_json": json.dumps(plan.payload_json),
+        "state": "RUNNING",
+        "remote_identity": prepared.remote_identity.durable_value(),
+        "crawl_work": [{
+            "id": 203,
+            "mall_key": "jd",
+            "source_id": "document-a",
+            "sku_id": "sku-a",
+            "exact_url": "https://item.jd.com/sku-a.html",
+            "backend_version": "batch-url-v1",
+        }],
+    }], 9.0)[82]
+
+    assert outcome["state"] == "COMPLETED"
+    assert observed["progress"] == pytest.approx(9.0)
+    assert observed["probe"] == pytest.approx(7.0)
+    assert sql_adapter.timeouts == [pytest.approx(4.0)]
+
+
+def test_batch_sql_runtime_probe_receives_its_absolute_deadline(
+    monkeypatch,
+):
+    now = [50.0]
+    observed = {}
+
+    class Connection:
+        def rollback(self):
+            observed["rollback"] = observed.get("rollback", 0) + 1
+
+        def close(self):
+            observed["close"] = observed.get("close", 0) + 1
+
+    def connect(_path, *, timeout_seconds):
+        observed["connect_timeout"] = timeout_seconds
+        return Connection()
+
+    def probe(connection, target, *, deadline, monotonic):
+        observed["connection"] = connection
+        observed["target"] = target
+        observed["deadline"] = deadline
+        observed["monotonic"] = monotonic
+        return BatchMaterializationProbe(
+            BatchMaterializationStatus.NOT_MATERIALIZED,
+            None,
+            (),
+            1,
+            0,
+        )
+
+    monkeypatch.setattr(
+        runtime_module, "connect_batch_priority_from_env_file", connect
+    )
+    monkeypatch.setattr(runtime_module, "probe_batch_materialization", probe)
+    _adapter, runner = runtime_module._batch_sql_runtime_components(
+        monotonic=lambda: now[0]
+    )
+    prepared = type(
+        "Prepared",
+        (),
+        {"execute_numbers": ("exec-1",), "mall_key": "jd"},
+    )()
+
+    runner(prepared, 5.0)
+
+    assert observed["connect_timeout"] == pytest.approx(5.0)
+    assert observed["deadline"] == pytest.approx(55.0)
+    assert observed["monotonic"]() == pytest.approx(50.0)
+    assert observed["rollback"] == 1
+    assert observed["close"] == 1
+
+
+def test_batch_harvest_marks_unattempted_jobs_deferred_when_deadline_expires(
+    tmp_path,
+):
+    paths = runtime_paths("2026-08-11", tmp_path / "runtime")
+    paths.run_dir.mkdir(parents=True, exist_ok=True)
+    now = [0.0]
+
+    def progress(_url, params, _timeout):
+        now[0] += 6.0
+        return 200, {
+            "rspCode": "0000",
+            "data": {
+                "batchNumber": params["batchNumber"],
+                "mallLogo": "jd",
+                "totalCount": 1,
+                "completedCount": 0,
+                "pendingCount": 1,
+                "runningCount": 0,
+                "failedCount": 0,
+                "pendingStoreCount": 0,
+            },
+        }
+
+    batch = CnncBatchZhaoshangAdapter(
+        write_enabled=False, get_json=progress
+    )
+    propose, finalize, _submit, harvest = runtime_module.batch_zhaoshang_bridge(
+        batch,
+        _JdBridgeAdapter(),
+        paths=paths,
+        business_date="2026-08-11",
+        result_adapter=_ScriptedBatchSqlAdapter(
+            BatchResultStatus.FOUND, price="12.30", title="Exact title"
+        ),
+        materialization_probe_runner=lambda *_args: pytest.fail(
+            "probe must not begin after progress exhausted the deadline"
+        ),
+        monotonic=lambda: now[0],
+    )
+
+    durable_jobs = []
+    for job_id, source_id, sku_id in (
+        (91, "source-a", "sku-a"),
+        (92, "source-b", "sku-b"),
+    ):
+        proposed = propose([{"row": {
+            "vCommodityId": source_id,
+            "skuId": sku_id,
+            "extLink": f"https://item.jd.com/{sku_id}.html",
+        }}], 10)[0]
+        plan = finalize(proposed, tuple(proposed.members), 10)
+        prepared = batch.restore_job(plan.payload_json)
+        durable_jobs.append({
+            "id": job_id,
+            "logical_key": plan.logical_key,
+            "mall_key": "jd",
+            "task_name": plan.task_name,
+            "payload_hash": plan.payload_hash,
+            "payload_json": json.dumps(plan.payload_json),
+            "state": "RUNNING",
+            "remote_identity": prepared.remote_identity.durable_value(),
+            "crawl_work": [{
+                "id": job_id + 100,
+                "mall_key": "jd",
+                "source_id": source_id,
+                "sku_id": sku_id,
+                "exact_url": f"https://item.jd.com/{sku_id}.html",
+                "backend_version": "batch-url-v1",
+            }],
+        })
+
+    outcomes = harvest(durable_jobs, 5.0)
+
+    assert outcomes[91]["retryable_error"].endswith("TimeoutError")
+    assert outcomes[92] == {"deferred": True}
+
+
+def test_mixed_backend_harvest_routes_each_job_by_durable_payload():
+    calls = {"legacy": [], "batch": []}
+
+    def legacy(jobs, _timeout):
+        calls["legacy"].extend(int(job["id"]) for job in jobs)
+        return {int(job["id"]): {"state": "RUNNING"} for job in jobs}
+
+    def batch(jobs, _timeout):
+        calls["batch"].extend(int(job["id"]) for job in jobs)
+        return {int(job["id"]): {"state": "RUNNING"} for job in jobs}
+
+    harvest = runtime_module._route_zhaoshang_harvest(legacy, batch)
+    jobs = [
+        {
+            "id": 1,
+            "payload_json": json.dumps(
+                {"requests": [{"backend_version": "legacy-v1"}]}
+            ),
+        },
+        {
+            "id": 2,
+            "payload_json": json.dumps(
+                {"contract_version": "zhaoshang-batch-url-v1", "requests": []}
+            ),
+        },
+    ]
+
+    result = harvest(jobs, 10)
+
+    assert calls == {"legacy": [1], "batch": [2]}
+    assert set(result) == {1, 2}
+
+
+def test_mixed_backend_harvest_isolates_one_backend_failure():
+    calls = {"batch": []}
+
+    def legacy(_jobs, _timeout):
+        raise TimeoutError("legacy backend unavailable")
+
+    def batch(jobs, _timeout):
+        calls["batch"].extend(int(job["id"]) for job in jobs)
+        return {
+            int(job["id"]): {
+                "state": "COMPLETED",
+                "remote_identity": str(job["remote_identity"]),
+            }
+            for job in jobs
+        }
+
+    harvest = runtime_module._route_zhaoshang_harvest(legacy, batch)
+    jobs = [
+        {
+            "id": 1,
+            "state": "RUNNING",
+            "remote_identity": "legacy-remote",
+            "payload_json": json.dumps(
+                {"requests": [{"backend_version": "legacy-v1"}]}
+            ),
+        },
+        {
+            "id": 2,
+            "state": "RUNNING",
+            "remote_identity": "batch-remote",
+            "payload_json": json.dumps(
+                {"contract_version": "zhaoshang-batch-url-v1", "requests": []}
+            ),
+        },
+    ]
+
+    result = harvest(jobs, 10)
+
+    assert calls == {"batch": [2]}
+    assert result[1] == {
+        "state": "RUNNING",
+        "remote_identity": "legacy-remote",
+        "retryable_error": "legacy harvest failed: TimeoutError",
+    }
+    assert result[2]["state"] == "COMPLETED"
 
 
 def _dependencies(events: list[str]) -> TickDependencies:
@@ -1066,8 +2257,29 @@ def test_batch_bridge_persists_slice_payload_and_reconciles_unknown_without_resu
         ),
     )
     legacy = _BridgeAdapter()
+    priority_calls = []
     propose, finalize, submit, harvest = runtime_module.batch_zhaoshang_bridge(
-        batch, legacy, paths=paths, business_date="2026-08-11"
+        batch,
+        legacy,
+        paths=paths,
+        business_date="2026-08-11",
+        priority_runner=lambda job, timeout: (
+            priority_calls.append((job.execute_numbers, timeout))
+            or BatchPriorityAttempt(
+                BatchPriorityAttemptStatus.CONFIRMED,
+                BatchMaterializationStatus.MATERIALIZED,
+                BatchPriorityOutcome(
+                    BatchPriorityStatus.CONFIRMED,
+                    "central_control_sub",
+                    job.expected_count,
+                    job.expected_count,
+                    job.expected_count,
+                    0,
+                    0,
+                    tuple(range(job.expected_count)),
+                ),
+            )
+        ),
     )
     row = {"vCommodityId": "v-a", "skuId": "sku-a", "extLink": "https://same.invalid/p"}
     plan = propose([{"row": row}], 10)[0]
@@ -1075,6 +2287,7 @@ def test_batch_bridge_persists_slice_payload_and_reconciles_unknown_without_resu
     persisted = {
         "id": 3,
         "logical_key": finalized.logical_key,
+        "mall_key": finalized.mall_key,
         "task_name": finalized.task_name,
         "payload_hash": finalized.payload_hash,
         "payload_json": json.dumps(finalized.payload_json),
@@ -1086,9 +2299,411 @@ def test_batch_bridge_persists_slice_payload_and_reconciles_unknown_without_resu
         submit(persisted, [], 10)
     outcome = harvest([persisted], 10)[3]
 
-    assert outcome["state"] == "SUBMITTED"
+    assert outcome["state"] == "PRIORITY_PENDING"
     assert post_calls == [1]
     assert progress_calls == [{"batchNumber": finalized.task_name}]
+    assert priority_calls == []
+
+    recovered = dict(
+        persisted,
+        state="PRIORITY_PENDING",
+        remote_identity=outcome["remote_identity"],
+    )
+    priority_outcome = harvest([recovered], 10)[3]
+
+    assert priority_outcome["state"] == "SUBMITTED"
+    assert priority_outcome["result"]["priority_status"] == "CONFIRMED"
+    assert len(priority_calls) == 1
+    assert post_calls == [1]
+
+
+def test_batch_bridge_prioritizes_confirmed_submit_before_progress(tmp_path):
+    paths = runtime_paths("2026-08-11", tmp_path / "runtime")
+    paths.run_dir.mkdir(parents=True)
+    progress_calls = []
+    batch = CnncBatchZhaoshangAdapter(
+        write_enabled=True,
+        post_json=lambda *_args: (200, {"rspCode": "0000", "success": True}),
+        get_json=lambda _url, params, _timeout: (
+            progress_calls.append(params)
+            or (200, {"rspCode": "0000", "success": True, "totalCount": 1, "completedCount": 0, "pendingCount": 1, "runningCount": 0, "failedCount": 0, "pendingStoreCount": 0})
+        ),
+    )
+    priority_calls = []
+
+    def confirmed(job, timeout):
+        priority_calls.append((job.execute_numbers, timeout))
+        return BatchPriorityAttempt(
+            BatchPriorityAttemptStatus.CONFIRMED,
+            BatchMaterializationStatus.MATERIALIZED,
+            BatchPriorityOutcome(
+                BatchPriorityStatus.CONFIRMED,
+                "central_control_sub",
+                1,
+                1,
+                1,
+                0,
+                0,
+                (101,),
+            ),
+        )
+
+    propose, finalize, submit, harvest = runtime_module.batch_zhaoshang_bridge(
+        batch,
+        _BridgeAdapter(),
+        paths=paths,
+        business_date="2026-08-11",
+        priority_runner=confirmed,
+    )
+    row = {"vCommodityId": "v-a", "skuId": "sku-a", "extLink": "https://same.invalid/p"}
+    proposed = propose([{"row": row}], 10)[0]
+    plan = finalize(proposed, tuple(proposed.members), 10)
+    durable = {
+        "id": 7,
+        "logical_key": plan.logical_key,
+        "mall_key": plan.mall_key,
+        "task_name": plan.task_name,
+        "payload_hash": plan.payload_hash,
+        "payload_json": json.dumps(plan.payload_json),
+    }
+
+    submitted = submit(durable, [], 10)
+    assert submitted["state"] == "PRIORITY_PENDING"
+    assert progress_calls == []
+
+    priority = harvest([
+        {**durable, "state": "PRIORITY_PENDING", "remote_identity": submitted["remote_identity"]}
+    ], 10)[7]
+    assert priority["state"] == "SUBMITTED"
+    assert progress_calls == []
+
+    running = harvest([
+        {**durable, "state": "SUBMITTED", "remote_identity": submitted["remote_identity"]}
+    ], 10)[7]
+    assert running["state"] == "RUNNING"
+    assert len(priority_calls) == 1
+    assert progress_calls == [{"batchNumber": plan.task_name}]
+
+
+def test_batch_bridge_treats_priority_readback_failed_row_as_confirmed_then_progress_failed(
+    tmp_path,
+):
+    paths = runtime_paths("2026-08-11", tmp_path / "runtime")
+    paths.run_dir.mkdir(parents=True)
+    batch = CnncBatchZhaoshangAdapter(
+        write_enabled=False,
+        get_json=lambda _url, _params, _timeout: (
+            200,
+            {
+                "rspCode": "0000",
+                "success": True,
+                "data": {
+                    "totalCount": 1,
+                    "completedCount": 0,
+                    "pendingCount": 0,
+                    "runningCount": 0,
+                    "failedCount": 1,
+                    "pendingStoreCount": 0,
+                },
+            },
+        ),
+    )
+    priority = BatchPriorityAttempt(
+        BatchPriorityAttemptStatus.CONFIRMED,
+        BatchMaterializationStatus.MATERIALIZED,
+        BatchPriorityOutcome(
+            BatchPriorityStatus.CONFIRMED,
+            "central_control_sub_zsz",
+            1,
+            0,
+            0,
+            0,
+            0,
+            (106575709,),
+            already_failed=1,
+        ),
+    )
+    propose, finalize, _submit, harvest = runtime_module.batch_zhaoshang_bridge(
+        batch,
+        _BridgeAdapter(),
+        paths=paths,
+        business_date="2026-08-11",
+        priority_runner=lambda _job, _timeout: priority,
+    )
+    row = {
+        "vCommodityId": "v-a",
+        "skuId": "sku-a",
+        "extLink": "https://same.invalid/p",
+    }
+    proposed = propose([{"row": row}], 10)[0]
+    plan = finalize(proposed, tuple(proposed.members), 10)
+    identity = CnncBatchZhaoshangAdapter.restore_job(
+        plan.payload_json
+    ).remote_identity.durable_value()
+    durable = {
+        "id": 19,
+        "logical_key": plan.logical_key,
+        "mall_key": plan.mall_key,
+        "task_name": plan.task_name,
+        "payload_hash": plan.payload_hash,
+        "payload_json": json.dumps(plan.payload_json),
+        "state": "PRIORITY_PENDING",
+        "remote_identity": identity,
+    }
+
+    confirmed = harvest([durable], 10)[19]
+
+    assert confirmed["state"] == "SUBMITTED"
+    assert confirmed["result"]["already_failed"] == 1
+    assert "manual_error" not in confirmed
+    failed = harvest([{**durable, "state": "SUBMITTED"}], 10)[19]
+    assert failed["manual_error"] == "batch task reported failed subtasks"
+
+
+@pytest.mark.parametrize(
+    "attempt, expected_key",
+    [
+        (
+            BatchPriorityAttempt(
+                BatchPriorityAttemptStatus.PENDING,
+                BatchMaterializationStatus.PARTIALLY_MATERIALIZED,
+                diagnostic="8/13",
+            ),
+            "retryable_error",
+        ),
+        (
+            BatchPriorityAttempt(
+                BatchPriorityAttemptStatus.CONFLICT,
+                BatchMaterializationStatus.SCHEMA_CONFLICT,
+                diagnostic="two schemas",
+            ),
+            "manual_error",
+        ),
+    ],
+)
+def test_batch_bridge_keeps_pending_materialization_retryable_and_conflicts_manual(
+    tmp_path, attempt, expected_key
+):
+    paths = runtime_paths("2026-08-11", tmp_path / "runtime")
+    paths.run_dir.mkdir(parents=True)
+    batch = CnncBatchZhaoshangAdapter(write_enabled=False)
+    propose, finalize, _submit, harvest = runtime_module.batch_zhaoshang_bridge(
+        batch,
+        _BridgeAdapter(),
+        paths=paths,
+        business_date="2026-08-11",
+        priority_runner=lambda _job, _timeout: attempt,
+    )
+    row = {"vCommodityId": "v-a", "skuId": "sku-a", "extLink": "https://same.invalid/p"}
+    proposed = propose([{"row": row}], 10)[0]
+    plan = finalize(proposed, tuple(proposed.members), 10)
+    durable = {
+        "id": 9,
+        "logical_key": plan.logical_key,
+        "mall_key": plan.mall_key,
+        "task_name": plan.task_name,
+        "payload_hash": plan.payload_hash,
+        "payload_json": json.dumps(plan.payload_json),
+        "state": "PRIORITY_PENDING",
+        "remote_identity": CnncBatchZhaoshangAdapter.restore_job(plan.payload_json).remote_identity.durable_value(),
+    }
+
+    result = harvest([durable], 10)[9]
+
+    assert expected_key in result
+    if expected_key == "retryable_error":
+        assert result["state"] == "PRIORITY_PENDING"
+
+
+def test_batch_bridge_rejects_malformed_persisted_identity_before_priority_write(
+    tmp_path,
+):
+    paths = runtime_paths("2026-08-11", tmp_path / "runtime")
+    paths.run_dir.mkdir(parents=True)
+    priority_calls = []
+    batch = CnncBatchZhaoshangAdapter(write_enabled=False)
+    propose, finalize, _submit, harvest = runtime_module.batch_zhaoshang_bridge(
+        batch,
+        _BridgeAdapter(),
+        paths=paths,
+        business_date="2026-08-11",
+        priority_runner=lambda *_args: priority_calls.append(1),
+    )
+    row = {
+        "vCommodityId": "v-a",
+        "skuId": "sku-a",
+        "extLink": "https://same.invalid/p",
+    }
+    proposed = propose([{"row": row}], 10)[0]
+    plan = finalize(proposed, tuple(proposed.members), 10)
+    durable = {
+        "id": 29,
+        "logical_key": plan.logical_key,
+        "mall_key": plan.mall_key,
+        "task_name": plan.task_name,
+        "payload_hash": plan.payload_hash,
+        "payload_json": json.dumps(plan.payload_json),
+        "state": "PRIORITY_PENDING",
+        "remote_identity": json.dumps(
+            {
+                "batchNumber": plan.task_name,
+                "mallLogo": "wrong-mall",
+                "executeNumbers": plan.payload_json["execute_numbers"],
+            }
+        ),
+    }
+
+    result = harvest([durable], 10)[29]
+
+    assert result["manual_error"] == "batch priority identity conflict"
+    assert priority_calls == []
+
+
+def test_batch_bridge_rejects_persisted_mall_drift_before_priority_write(
+    tmp_path,
+):
+    paths = runtime_paths("2026-08-11", tmp_path / "runtime")
+    paths.run_dir.mkdir(parents=True)
+    priority_calls = []
+    batch = CnncBatchZhaoshangAdapter(write_enabled=False)
+    propose, finalize, _submit, harvest = runtime_module.batch_zhaoshang_bridge(
+        batch,
+        _BridgeAdapter(),
+        paths=paths,
+        business_date="2026-08-11",
+        priority_runner=lambda *_args: priority_calls.append(1),
+    )
+    row = {
+        "vCommodityId": "v-a",
+        "skuId": "sku-a",
+        "extLink": "https://same.invalid/p",
+    }
+    proposed = propose([{"row": row}], 10)[0]
+    plan = finalize(proposed, tuple(proposed.members), 10)
+    prepared = batch.restore_job(
+        plan.payload_json,
+        expected_logical_job_key=plan.logical_key,
+        expected_payload_sha256=plan.payload_hash,
+    )
+    durable = {
+        "id": 30,
+        "logical_key": plan.logical_key,
+        "mall_key": "wrong-mall",
+        "task_name": plan.task_name,
+        "payload_hash": plan.payload_hash,
+        "payload_json": json.dumps(plan.payload_json),
+        "state": "PRIORITY_PENDING",
+        "remote_identity": prepared.remote_identity.durable_value(),
+    }
+
+    result = harvest([durable], 10)[30]
+
+    assert result["manual_error"] == "batch priority identity conflict"
+    assert priority_calls == []
+
+
+def test_batch_bridge_resumes_priority_after_post_success_crash_without_duplicate_post(
+    tmp_path,
+):
+    paths = runtime_paths("2026-08-11", tmp_path / "runtime")
+    paths.run_dir.mkdir(parents=True)
+    post_calls = []
+    batch = CnncBatchZhaoshangAdapter(
+        write_enabled=True,
+        post_json=lambda *_args: (
+            post_calls.append(1)
+            or (200, {"rspCode": "0000", "success": True})
+        ),
+        get_json=lambda _url, params, _timeout: (
+            200,
+            {
+                "rspCode": "0000",
+                "success": True,
+                "data": {
+                    "batchNumber": params["batchNumber"],
+                    "mallLogo": "mall",
+                    "totalCount": 1,
+                    "completedCount": 0,
+                    "pendingCount": 1,
+                    "runningCount": 0,
+                    "failedCount": 0,
+                    "pendingStoreCount": 0,
+                },
+            },
+        ),
+    )
+    priority_calls = []
+
+    def confirmed(job, _timeout):
+        priority_calls.append(job.execute_numbers)
+        return BatchPriorityAttempt(
+            BatchPriorityAttemptStatus.CONFIRMED,
+            BatchMaterializationStatus.MATERIALIZED,
+            BatchPriorityOutcome(
+                BatchPriorityStatus.CONFIRMED,
+                "central_control_sub",
+                1,
+                1,
+                1,
+                0,
+                0,
+                (501,),
+            ),
+        )
+
+    propose, finalize, submit, harvest = runtime_module.batch_zhaoshang_bridge(
+        batch,
+        _BridgeAdapter(),
+        paths=paths,
+        business_date="2026-08-11",
+        priority_runner=confirmed,
+    )
+    row = {"vCommodityId": "v-a", "skuId": "sku-a", "extLink": "https://same.invalid/p"}
+    proposed = propose([{"row": row}], 10)[0]
+    plan = finalize(proposed, tuple(proposed.members), 10)
+
+    store = DailyAuditStore(paths.state_path)
+    process_lock = ProcessLock(paths.lock_path)
+    process_lock.acquire()
+    token = store.acquire_lease(
+        "2026-08-11", "batch-crash-test", ttl_seconds=60, process_lock=process_lock
+    )
+    try:
+        intent = store.prepare_remote_intent(
+            token,
+            plan.logical_key,
+            plan.task_name,
+            plan.payload_hash,
+            mall_key=plan.mall_key,
+            payload_json=plan.payload_json,
+        )
+        claimed = store.claim_remote_submission(token, int(intent["id"]))
+        assert claimed is not None
+
+        accepted = submit(claimed, [], 10)
+        assert accepted["state"] == "PRIORITY_PENDING"
+        # Simulate process loss before the accepted outcome reaches SQLite.
+        assert store.recover_ambiguous_remote_submissions(token) == 1
+        unknown = store.get_remote_job(int(intent["id"]))
+        assert unknown is not None and unknown["state"] == "SUBMIT_UNKNOWN"
+
+        reconciled = harvest([unknown], 10)[int(intent["id"])]
+        assert reconciled["state"] == "PRIORITY_PENDING"
+        pending = store.reconcile_remote_job(
+            token,
+            int(intent["id"]),
+            remote_identity=reconciled["remote_identity"],
+            state="PRIORITY_PENDING",
+        )
+        prioritized = harvest([pending], 10)[int(intent["id"])]
+        assert prioritized["state"] == "SUBMITTED"
+        assert store.claim_remote_submission(token, int(intent["id"])) is None
+    finally:
+        store.release_lease(token)
+        process_lock.release()
+
+    assert post_calls == [1]
+    assert len(priority_calls) == 1
 
 
 def test_legacy_bridge_honors_frozen_crawl_policy_and_fails_closed_on_mapping_drift(tmp_path):
@@ -1451,7 +3066,12 @@ def test_drain_only_rejects_remote_create_capability(tmp_path):
 def test_drain_only_default_dependencies_expose_only_existing_harvester(
     tmp_path, monkeypatch
 ):
-    harvester = lambda _jobs, _timeout: {}
+    calls = []
+
+    def harvester(jobs, _timeout):
+        calls.extend(int(job["id"]) for job in jobs)
+        return {}
+
     monkeypatch.setattr(runtime_module, "CnncLegacyZhaoshangAdapter", lambda: object())
     monkeypatch.setattr(
         runtime_module,
@@ -1465,7 +3085,19 @@ def test_drain_only_default_dependencies_expose_only_existing_harvester(
         business_date="2026-08-11",
     )
 
-    assert deps.harvest is harvester
+    assert deps.harvest is not None
+    deps.harvest(
+        [
+            {
+                "id": 41,
+                "payload_json": json.dumps(
+                    {"requests": [{"backend_version": "legacy-v1"}]}
+                ),
+            }
+        ],
+        10,
+    )
+    assert calls == [41]
     assert deps.detail is None
     assert deps.model is None
     assert deps.model_batch is None
@@ -2037,6 +3669,8 @@ def test_incremental_model_tuning_invalid_batch_size_fails_closed(tmp_path, monk
 
 def test_model_runtime_tuning_keys_are_not_part_of_the_required_gate(tmp_path, monkeypatch):
     """Optional tuning keys must not widen the required-configuration gate."""
+    for name in runtime_module._MODEL_CONFIGURATION_KEYS:
+        monkeypatch.delenv(name, raising=False)
     assert runtime_module._MODEL_RUNTIME_TUNING_KEYS
     assert not set(runtime_module._MODEL_RUNTIME_TUNING_KEYS) & set(runtime_module._MODEL_CONFIGURATION_KEYS)
     # A model.env carrying ONLY the tuning keys is still an incomplete

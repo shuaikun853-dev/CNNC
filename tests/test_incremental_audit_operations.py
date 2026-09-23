@@ -9,6 +9,8 @@ import time
 from datetime import UTC, datetime
 from pathlib import Path
 
+import pytest
+
 import app.services.incremental_audit_status as status_module
 from app.services.customer_price_semantics import DetailBusinessRetryRequired
 from app.services.daily_audit_store import DailyAuditStore, ProcessLock
@@ -1378,6 +1380,51 @@ def test_scheduled_runner_routes_hours_without_running_python(tmp_path):
             else:
                 assert "--enable-remote-writes" in arguments
 
+    assert not runtime_root.exists()
+
+
+@pytest.mark.parametrize(
+    ("timestamp", "expected_phase"),
+    (
+        ("2026-08-13T10:00:00", "tick"),
+        ("2026-08-13T10:15:00", "harvest-only"),
+        ("2026-08-13T17:03:00", "tick"),
+        ("2026-08-13T18:00:00", "closeout"),
+        ("2026-08-13T20:35:00", "closeout"),
+    ),
+)
+def test_scheduled_runner_batch_preview_routes_every_production_phase(
+    tmp_path, timestamp, expected_phase
+):
+    root = Path(__file__).resolve().parents[1]
+    runner = root / "scripts/run_incremental_price_audit_scheduled.ps1"
+    runtime_root = tmp_path / "runtime"
+
+    completed = _run_powershell_script(
+        runner,
+        [
+            "-RepoRoot", str(root),
+            "-RuntimeRoot", str(runtime_root),
+            "-Preview",
+            "-At", timestamp,
+            "-EnableRemoteWrites",
+            "-ZhaoshangBackend", "batch",
+        ],
+    )
+
+    assert completed.returncode == 0, completed.stderr.decode(
+        "utf-8", errors="replace"
+    )
+    plan = json.loads(completed.stdout.decode("utf-8-sig"))
+    assert plan["Phases"] == [expected_phase]
+    assert len(plan["Commands"]) == 1
+    arguments = plan["Commands"][0]["Arguments"]
+    assert arguments[-2:] == ["--zhaoshang-backend", "batch"]
+    if expected_phase == "harvest-only":
+        assert "--enable-remote-writes" not in arguments
+        assert "--shadow" not in arguments
+    else:
+        assert "--enable-remote-writes" in arguments
     assert not runtime_root.exists()
 
 

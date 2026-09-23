@@ -5,8 +5,8 @@ Phase 2 wires the Phase-1 durable discovery state
 Cache (:mod:`app.services.shared_crawl_cache`, Issue #7):
 
 - :func:`route_url` maps one customer reference URL to a mall key using the
-  in-repo zhaoshang mapping list, applying the single deterministic production
-  rewrite (``www.jslink.com`` -> ``b2b.nbdeli.com``) as a *lookup* transform:
+  in-repo zhaoshang mapping list, canonicalizing every exact ``jslink.com``
+  host to ``b2b.nbdeli.com`` as a *lookup* transform:
   the original URL is never mutated, it is stored verbatim as
   ``original_url`` while ``routing_url``/``lookup_url`` carry the rewrite.
 - :func:`process_document` reads one document's detail (read-only, injected
@@ -83,6 +83,7 @@ from app.services.shared_crawl_cache import (
     SharedCrawlCache,
 )
 from scripts.zhaoshang_mall_mapping import ZhaoshangMallMapping
+from app.services.zhaoshang_url_identity import canonicalize_new_zhaoshang_url
 
 DETAIL_BUDGET_RESERVE_SECONDS = 5.0
 
@@ -104,16 +105,14 @@ class RoutedUrl:
 def route_url(original_url: str, mappings: Sequence[ZhaoshangMallMapping]) -> RoutedUrl:
     """Route one customer reference URL to (mall, lookup_url, routing_url).
 
-    The single deterministic production rewrite is applied first, verbatim
-    from STEP3 ``scripts/process_monitor_no_push_zhaoshang.py:402``
-    (``url.replace("www.jslink.com", "b2b.nbdeli.com")``): STEP3 applies it in
-    its multi-link branch, Issue #9 applies it unconditionally as the one
-    deterministic rule.  The original URL is NEVER mutated - it stays verbatim
-    as ``original_url``; only the routing/lookup pair carries the rewrite.
+    The deterministic production canonicalization is applied first: an exact
+    ``jslink.com`` host or any of its subdomains becomes ``b2b.nbdeli.com``.
+    The original URL is NEVER mutated - it stays verbatim as ``original_url``;
+    only the routing/lookup pair carries the rewrite.
     Unparseable/empty input never raises and routes to mall ``''``.
     """
     original = str(original_url or "").strip()
-    routed = original.replace("www.jslink.com", "b2b.nbdeli.com")
+    routed = canonicalize_new_zhaoshang_url(original)
     host = ""
     try:
         host = (urlparse(routed).hostname or "").lower().strip(".")
@@ -721,6 +720,7 @@ def _sync_daily_internet_results_unlocked(
             row_out = shared_cache.record_success(
                 mall=mall_key,
                 submitted_url=exact_url,
+                returned_url=result.get("returned_url"),
                 crawl_id=crawl_label,
                 real_sku_id=real_sku_id,
                 sku_status=sku_status,

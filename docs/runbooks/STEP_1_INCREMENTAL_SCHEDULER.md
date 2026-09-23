@@ -386,13 +386,47 @@ task name 使用业务日和 immutable 请求集生成同日稳定、跨日不�
   成败只由 Python 的真实退出码决定。runner 使用 .NET `Process` 并发 drain 两个流，并把进程放入
   kill-on-close Windows Job Object；内部 deadline 小于注册的 ExecutionTimeLimit（默认 PT32M），
   超时返回 124 并终止 child/grandchild，外层 ExecutionTimeLimit 继续作为第二道外部保险。wrapper 被强制终止时，Job Object 关闭也会清理整个进程树。
-- `--zhaoshang-backend legacy|batch` 选择 Adapter，默认 `legacy`。`batch` 使用公司 Skill 已证实的
-  `/batch/autoAddTask` 与 `queryTaskProgress`，按商城和最多 100 条稳定分片；create 阶段不生成
+- `--zhaoshang-backend legacy|batch` 选择新任务策略，默认 `legacy`。`legacy` 保持全量 legacy；`batch`
+  仅对 SQL result allowlist 内商城使用公司 Skill 已证实的 `/batch/autoAddTask` 与
+  `queryTaskProgress`，其余商城逐商城回退 legacy。batch 按商城和最多 100 条稳定分片；create 阶段不生成
   临时 Excel、不开每商城子进程，也不依赖 Cookie/cURL。它仍必须显式传 `--enable-remote-writes`。
-  当前 Skill 没有 batch 结果 export/download 契约，因此该 backend 只用于受控 canary；任务完成
-  后会进入人工 export 项，不会猜测接口。正式日常运行在 canary 前保持 `legacy`。
-- 公司 Skill 只证明 `taskWeight=0`，没有证明它映射数据库 `weight_type=-1`；batch Adapter 不猜测
-  `-1`，也没有修改现有受控 priority 核心。
+  当前 Skill 没有 batch 结果 export/download HTTP 契约；runtime 改用已验证的只读 SQL 路径，按
+  exact `executeNumber` 查询同商城 price/goods，并要求唯一 source_id/mall/SKU/URL/backend 对应唯一 linked
+  `crawl_work`；相同 SKU/URL 的不同 SaaS 来源文档分别生成 executeNumber，不能结果扇出。后到的新 source
+  不跟随或复制既有 batch job/result，只为仍 pending 的 source 重建精确分片；旧 durable payload仍按旧 identity
+  恢复。progress、物化 probe、结果 SQL 共用同一个 callback 绝对 deadline，每次数据库阻塞操作前重算剩余
+  timeout；deadline 前未开始的 job 退还 harvest claim，不消耗 retry budget 或清除旧诊断。`price>0` 必须有
+  title；`price=0` 固定写 `PRICE_IS_ZERO + 已下架`；无效价格 fail closed。
+  `task_status=02` 且 SQL 零行仍需 spider-log 等终态证据，不能直接 `NO_RESULT`。
+- batch create 成功或 `SUBMIT_UNKNOWN` 经 exact `batchNumber` 找回后，job 先进入 durable
+  `PRIORITY_PENDING`，不得直接 query progress。priority service 只在
+  `central_control_sub` / `central_control_sub_zsz` allowlist 内按本 slice 持久化的 exact
+  `executeNumber`（每片最多 100 条）查询；每次 SQL/commit 都重算同一个 callback deadline，
+  0/N、partial N/M 和明确 transient DB 错误才有界重试，其他异常立即 fail-closed。
+- 只有 exact set 在单一 schema 全部物化后才冻结真实 `task_id` 集；写事务内会对两个 schema
+  再做 exact `exec_num FOR UPDATE` 重验，随后 UPDATE 只按这些 PK，且限定
+  `is_valid='1' AND weight_type<>'-1'`，不按 `task_status` 过滤。事务内与 commit 后都回读
+  exact identity；全部精确有效行都必须为 `-1`，已为 `-1` 视为幂等成功。竞态变成
+  `02`（完成）或 `03`（失败）的行也须确认 `-1`，最终状态分别计入
+  `already_completed` / `already_failed`，不代表跳过提优。若预查存在非 `-1` 行，
+  `affected_rows` 必须等于这些精确主键的数量；少更新、零更新或越界均回滚并暂停，
+  不能仅凭后续回读 `-1` 冒认本次更新成功。
+  确认后才从 `PRIORITY_PENDING` 进入 `SUBMITTED` 并在后续 sweep 查询 progress。重启只从 SQLite
+  immutable payload 恢复 backend 与 `execute_numbers`。CLI backend 只决定新任务的 planner/submitter；
+  当前 18 个生产商城均可逐链接走 batch；`mymro / ofs` 只有在提交 URL 能按已证明的严格格式解析 product code 时才标记 `batch-url-v1`，否则该链接自动回退 `legacy-v1`。这两个商城以 exact executeNumber 加 submitted URL product code 作为请求身份，唯一 SQL result 允许后续 SKU/goods_no/result URL code 变化，多条 result 仍 fail closed。新建 `jslink.com`
+  及其子域 URL 先规范为 `b2b.nbdeli.com` 并按 `nbdeli` 路由；vendor-only、空 URL、hostless URL
+  一律保留 legacy，Batch adapter 只接受绝对 HTTP(S) URL。历史 frozen `jslink` policy 按原 mall/source/URL
+  恢复，不改写旧 SQLite。已有 legacy 与 batch job 在同一 SQLite
+  内按各自 durable payload 路由到对应 harvester，损坏 payload
+  立即转人工。普通 tick 未启用 remote writes 时 batch priority 不 claim、不烧重试次数；显式
+  `harvest-only / drain-only` 没有 submit surface，但可继续已有 durable job 必需的 priority confirm。
+  已有 SUBMITTED/RUNNING batch 继续只读 SQL harvest，所有 lifecycle-only 路径都绝不重复 POST。
+- `PRIORITY_PENDING` 独占 `priority_attempts/priority_elapsed_seconds`；`SUBMIT_UNKNOWN` 仍属于普通
+  harvest 对账预算，`SUBMITTED/RUNNING/EXPORTED` 使用 `harvest_attempts/harvest_elapsed_seconds`。
+  旧 SQLite 打开时原位补列且默认 0，不得要求清库。batch 的 `SUBMIT_UNKNOWN -> PRIORITY_PENDING`
+  和 `PRIORITY_PENDING -> SUBMITTED` 都在一个 SQLite transaction 内同时推进 `remote_jobs` 与 linked
+  `crawl_work`；identity 必须由 durable payload 与 JSON remote identity 联合验证 exact contract、
+  logical key、payload hash、batch、mall 和无重复 executeNumber 集，任一漂移 fail closed。
 - 增量 Tick 的模型批次基线是 10、并发为 1，与第一步生产稳定口径一致；不要把
   `.env.example` 中的 30 当作本项目生产基线。adapter 的默认上限是 3 attempts / 300 秒，
   但 tick 传入单次 callback 的 external cap 默认 60 秒，故每个批次实际最多 3 次 HTTP，
@@ -458,8 +492,11 @@ python -m pytest tests\test_incremental_audit_runtime.py tests\test_incremental_
 
 ### 客户预爬派发生命周期
 
+- 预爬 CLI 与计划任务 wrapper 都支持 `--zhaoshang-backend legacy|batch` / `-ZhaoshangBackend legacy|batch`，默认仍为 `legacy`；本轮只增加参数能力，不修改现有 Windows Task。选择 `batch` 时，新请求逐 URL 复用价格审计的 `ALLOWED_MALLS` 与 `is_batch_submitted_url_supported` 门禁，合格链接标记 `batch-url-v1`，其余自动保留 `legacy-v1`；同一商城按 backend 分组，Batch 每片最多 100 条。`--plan-only` 只计算这一选择，不构造 adapter/facade、不触发 HTTP/SQL/state 写入。
+- 新 Batch 预爬 job 的 immutable payload 显式保存 `purpose=customer-prewarm`、requests/source_ids/execute_numbers/batch_number/task_name。恢复、当日 harvest、跨日 continuation 和 redispatch 都只按该 durable payload 选择 backend；Scheduler 当日参数不能改写或重新解释历史 legacy/Batch job。Dashboard 手工重爬的新请求固定使用 Batch 优先 policy（URL 门禁不通过仍自动 legacy），复用已有 remote job 时继续其原 backend且不重复 POST。手工跨日 Batch reconcile 在远端调用前重检 exact candidate/link，并以同一 link fence 覆盖历史库 commit；确定性 `NOT_FOUND` 与调度生命周期共用 durable `recovery_attempts` 门槛，诊断性缺证不消耗该门槛。
+- `customer-prewarm` 的结果身份是 exact executeNumber + immutable submitted URL：零行沿用未可见/终态无结果语义，唯一行归属于该请求，多行必须 `IDENTITY_CONFLICT`。请求中的 `zhpq-*` 只作 durable provenance，不与 SQL 真实 SKU 比较，也不得写成 confirmed SKU；唯一结果的真实 `page_sku_id`、`page_goods_no`、`returned_url` 与价格/title/comment 证据写入 crawl result，再由共享同步器生成 `CONFIRMED` cache 行。普通 PriceAudit 的 SKU/URL 身份规则不变。
 - `scripts\customer_prewarm_dispatch.py` 的正常 live pass 从 `--budget-seconds` 中预留最多 24 秒（且不超过 60%）给后续生命周期；当天 dispatch lock/lease 完全释放后，才依次运行跨日 identity/priority、跨日 historical harvest/cache sync、当天 harvest。**预留窗口从 dispatch 实际返回时重新起算**，而不是继续使用进程启动时的绝对 deadline；因此某个临近 dispatch 截止点的远端调用即使拖长，也不能把跨日 reconcile/harvest 的保底时间吃成 0。若当天 STEP1 日锁导致 dispatch 返回 `LOCK_BUSY`，本轮仍运行两个历史阶段（它们只申请各自 owning-day lock），但明确不尝试当天 harvest；若是 `SKIPPED_ALREADY_RUNNING`，说明已有另一 dispatch 实例，整轮 lifecycle 继续跳过，防止双实例。正常无超时时，dispatch 预算 + lifecycle reserve 仍等于原 `--budget-seconds`；只有 dispatch 单次调用自身越过其 deadline 时，超出的部分会占用 Scheduler 的 hard-timeout grace。预留至少 20 秒时跨日 reconcile 最多分 10 秒，余量由历史和当天 harvest 平分；小预算按预留时间动态划分。严禁持有当天锁时申请历史日锁，也不得在 reconcile 的历史锁内嵌套调用 harvest 原语。
-- A3 重排在远端 POST claim 前先于全局预爬库原子记录 candidate→新 daily intent marker；marker 写入失败绝不 POST。预算不足或 max-jobs 限额在 marker 前判断；明确 `NOT_ATTEMPTED` 后清除 marker。若 POST 已可能发生而进程中断、candidate 尚未完成新 job 绑定，次日 marker 会阻断再次创建，并将该候选标记为需人工核对，最终失败行保留这一不确定性，不能猜成 `NOT_FOUND`。同日未发送 intent 复用原有 daily job；若原组员已命中缓存，只有在 `post_attempted=0`、无远端身份且所有原始预爬 crawl 行仍为未提交状态并与 immutable payload 精确一致时，才在单个事务中退役旧 intent、解绑原 crawl 行，将退出组员的 crawl 标为 `SUPERSEDED`（不残留 `PENDING` 阻塞 STEP1），并为剩余候选重排。任何证据不符转人工，不发送旧大组。已发送 intent 只按精确 crawl/payload 证据重新绑定，不另建任务。
+- A3 重排在远端 POST claim 前先于全局预爬库原子记录 candidate→新 daily intent marker；marker 写入失败绝不 POST。预算不足或 max-jobs 限额在 marker 前判断；明确 `NOT_ATTEMPTED` 后清除 marker。若 Batch POST 已可能发生而进程中断、candidate 尚未完成新 job 绑定，次日只在 marker、exact job、exact URL、`purpose=customer-prewarm` 与 `post_attempted=1` 全部吻合时重新绑定，并由所属日锁内的 `SUBMIT_UNKNOWN` reconcile 继续；不重复 POST。legacy 或证据不全仍保留人工核对，不能猜成 `NOT_FOUND`。同日未发送 intent 复用原有 daily job；若原组员已命中缓存，只有在 `post_attempted=0`、无远端身份且所有原始预爬 crawl 行仍为未提交状态并与 immutable payload 精确一致时，才在单个事务中退役旧 intent、解绑原 crawl 行，将退出组员的 crawl 标为 `SUPERSEDED`（不残留 `PENDING` 阻塞 STEP1），并为剩余候选重排。任何证据不符转人工，不发送旧大组。已发送 intent 只按精确 crawl/payload 证据重新绑定，不另建任务。
 - discovery 只从 `customer_prewarm.sqlite3` 中仍为 `REMOTE_DISPATCHED`/`REMOTE_REUSED`
   的 durable candidate 出发，并按 `(owning_day, remote_job_id)` 去重。执行前在历史 DB 锁内再次验证：
   job 仍为无 identity 且未到 dead threshold 的 `SUBMIT_UNKNOWN`，或带 exact identity 的

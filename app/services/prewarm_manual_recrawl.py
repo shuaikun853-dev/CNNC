@@ -221,6 +221,9 @@ class ManualRecrawlRunner:
         sleeper: Callable[[float], None] | None = None,
         reexport: Callable[..., dict[str, Any]] | None = None,
         adapter_factory: Callable[[], Any] | None = None,
+        batch_reexport: Callable[..., dict[str, Any]] | None = None,
+        batch_facade_factory: Callable[..., Any] | None = None,
+        zhaoshang_backend: str = "legacy",
         cross_day_max_attempts: int = 20,
         cross_day_interval_seconds: float = 60.0,
         cross_day_reexport_timeout_seconds: float = 180.0,
@@ -237,6 +240,11 @@ class ManualRecrawlRunner:
         # cross-day path only (never at construction, never on same-day actions).
         self._reexport = reexport
         self._adapter_factory = adapter_factory
+        self._batch_reexport = batch_reexport
+        self._batch_facade_factory = batch_facade_factory
+        if zhaoshang_backend not in {"legacy", "batch"}:
+            raise ValueError("zhaoshang_backend must be legacy or batch")
+        self._zhaoshang_backend = zhaoshang_backend
         self._cross_day_max_attempts = int(cross_day_max_attempts)
         self._cross_day_interval_seconds = float(cross_day_interval_seconds)
         self._cross_day_reexport_timeout_seconds = float(
@@ -474,6 +482,43 @@ class ManualRecrawlRunner:
 
         return CnncLegacyZhaoshangAdapter(mappings=list(self._mappings_loader()))
 
+    def _cross_day_job_row(self, state_path: Path, remote_job_id: int) -> dict[str, Any] | None:
+        from app.services.customer_prewarm_discovery import _open_state_db_readonly
+
+        connection = _open_state_db_readonly(state_path)
+        if connection is None:
+            return None
+        try:
+            row = connection.execute(
+                "SELECT * FROM remote_jobs WHERE id=?", (int(remote_job_id),)
+            ).fetchone()
+            return dict(row) if row is not None else None
+        finally:
+            connection.close()
+
+    def _cross_day_batch_reexport_fn(self) -> Callable[..., dict[str, Any]]:
+        if self._batch_reexport is not None:
+            return self._batch_reexport
+        from app.services.customer_prewarm_batch import (
+            harvest_existing_customer_prewarm_batch_job,
+        )
+
+        return harvest_existing_customer_prewarm_batch_job
+
+    def _cross_day_batch_facade(self, paths: Any, business_date: str) -> Any:
+        mappings = list(self._mappings_loader())
+        if self._batch_facade_factory is not None:
+            return self._batch_facade_factory(paths, business_date, mappings)
+        from app.services.customer_prewarm_batch import build_customer_prewarm_batch_facade
+
+        return build_customer_prewarm_batch_facade(
+            paths=paths,
+            business_date=business_date,
+            mappings=mappings,
+            write_enabled=False,
+            priority_enabled=True,
+        )
+
     def _run_cross_day_lifecycle(self, handle: dict[str, Any]) -> None:
         """Bounded lifecycle owner for a REUSED remote job of an EARLIER day.
 
@@ -513,7 +558,7 @@ class ManualRecrawlRunner:
         raw_job_id = dispatch.get("remote_job_id")
         job_business_date = str(dispatch.get("job_business_date") or "")
         remote_identity = str(dispatch.get("remote_identity") or "")
-        if raw_job_id is None or not job_business_date or not remote_identity:
+        if raw_job_id is None or not job_business_date:
             return
         try:
             remote_job_id = int(raw_job_id)
@@ -525,8 +570,42 @@ class ManualRecrawlRunner:
         from app.services.incremental_audit_runtime import runtime_paths
 
         paths = runtime_paths(job_business_date, self.runtime_root)
+        from app.services.customer_prewarm_batch import is_customer_prewarm_batch_job
+
+        durable_job = self._cross_day_job_row(paths.state_path, remote_job_id)
+        batch_job = durable_job is not None and is_customer_prewarm_batch_job(durable_job)
+        if not remote_identity and not (
+            batch_job and dispatch.get("batch_reconcile_pending") is True
+        ):
+            return
         prewarm_db = Path(self.runtime_root) / PREWARM_STORE_NAME
         cache_db = Path(self.runtime_root) / SHARED_CACHE_NAME
+        prewarm_store = CustomerPrewarmStore(prewarm_db)
+        from app.services.shared_crawl_cache import (
+            PRODUCER_CUSTOMER_PREWARM_ZHAOSHANG,
+        )
+        allow_unbound_link = bool(
+            dispatch.get("batch_reconcile_pending") is True and not remote_identity
+        )
+
+        def link_still_current() -> bool:
+            return prewarm_store.has_current_remote_job_link(
+                business_date=job_business_date,
+                remote_job_id=remote_job_id,
+                producer=PRODUCER_CUSTOMER_PREWARM_ZHAOSHANG,
+                candidate_id=int(handle["candidate_id"]),
+                allow_unbound_candidate=allow_unbound_link,
+            )
+
+        def link_commit_fence():
+            return prewarm_store.fence_current_remote_job_link(
+                business_date=job_business_date,
+                remote_job_id=remote_job_id,
+                producer=PRODUCER_CUSTOMER_PREWARM_ZHAOSHANG,
+                candidate_id=int(handle["candidate_id"]),
+                allow_unbound_candidate=allow_unbound_link,
+            )
+
         sleep = self._sleeper or time.sleep
 
         attempts = 0
@@ -542,15 +621,27 @@ class ManualRecrawlRunner:
 
             # 1) bounded harvest of the JOB's own day (create_calls == 0).
             try:
-                reexport_result = self._cross_day_reexport_fn()(
-                    state_path=paths.state_path,
-                    lock_path=paths.lock_path,
-                    business_date=job_business_date,
-                    remote_job_id=remote_job_id,
-                    remote_identity=remote_identity,
-                    adapter=self._cross_day_adapter(),
-                    timeout_seconds=self._cross_day_reexport_timeout_seconds,
-                )
+                if batch_job:
+                    reexport_result = self._cross_day_batch_reexport_fn()(
+                        state_path=paths.state_path,
+                        lock_path=paths.lock_path,
+                        business_date=job_business_date,
+                        remote_job_id=remote_job_id,
+                        facade=self._cross_day_batch_facade(paths, job_business_date),
+                        timeout_seconds=self._cross_day_reexport_timeout_seconds,
+                        pre_remote_guard=link_still_current,
+                        result_commit_fence=link_commit_fence,
+                    )
+                else:
+                    reexport_result = self._cross_day_reexport_fn()(
+                        state_path=paths.state_path,
+                        lock_path=paths.lock_path,
+                        business_date=job_business_date,
+                        remote_job_id=remote_job_id,
+                        remote_identity=remote_identity,
+                        adapter=self._cross_day_adapter(),
+                        timeout_seconds=self._cross_day_reexport_timeout_seconds,
+                    )
                 if isinstance(reexport_result, dict):
                     last_reexport_outcome = str(reexport_result.get("outcome") or "")
                     error_code = reexport_result.get("error_code")
@@ -561,6 +652,12 @@ class ManualRecrawlRunner:
                 last_reexport_outcome = "REEXPORT_ERROR"
                 last_reexport_error_code = type(exc).__name__
 
+            if last_reexport_outcome in {
+                "REMOTE_EXISTING_HARVEST_DEFERRED",
+                "REMOTE_EXISTING_RECONCILE_DEAD",
+            }:
+                break
+
             # 2) unconditional idempotent mirror of the job day into the
             #    shared cache (ledger-guarded; safe to re-run every attempt).
             try:
@@ -570,7 +667,7 @@ class ManualRecrawlRunner:
                 from app.services.shared_crawl_cache import SharedCrawlCache
 
                 sync_summary = sync_daily_internet_results(
-                    CustomerPrewarmStore(prewarm_db),
+                    prewarm_store,
                     SharedCrawlCache(cache_db),
                     state_db_path=paths.state_path,
                     business_date=job_business_date,
@@ -758,6 +855,7 @@ class ManualRecrawlRunner:
             runtime_root=self.runtime_root,
             candidate_id=int(handle["candidate_id"]),
             mappings=list(self._mappings_loader()),
+            selected_backend=self._zhaoshang_backend,
         )
         return self._classify_dispatch_result(result)
 
@@ -791,6 +889,12 @@ class ManualRecrawlRunner:
                 return "WAITING_REMOTE", summary
             if result.get("priority_proven") is False:
                 return "PRIORITY_PENDING", summary
+            if (
+                result.get("cross_day") is True
+                and result.get("batch_reconcile_pending") is True
+            ):
+                summary["priority_reconcile_pending"] = True
+                return "WAITING_REMOTE", summary
             if result.get("job_terminal_success") is True:
                 summary["priority_moot_terminal_success"] = True
                 return "WAITING_REMOTE", summary
@@ -1050,5 +1154,5 @@ def get_manual_recrawl_runner() -> ManualRecrawlRunner:
     global _RUNNER_SINGLETON
     with _RUNNER_SINGLETON_LOCK:
         if _RUNNER_SINGLETON is None:
-            _RUNNER_SINGLETON = ManualRecrawlRunner()
+            _RUNNER_SINGLETON = ManualRecrawlRunner(zhaoshang_backend="batch")
         return _RUNNER_SINGLETON

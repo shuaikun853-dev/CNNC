@@ -37,6 +37,15 @@ sys.path.insert(0, r"E:\.A中核运维")
 
 from app.services.shared_crawl_cache import SharedCrawlCache
 from app.services.step3_prewarm_cache import apply_cached_customer_results, missing_required_comment
+from app.services.batch_zhaoshang_adapter import PURPOSE_STEP3_NO_PUSH
+from app.services.legacy_zhaoshang_adapter import (
+    CnncLegacyZhaoshangAdapter,
+)
+from app.services.manual_zhaoshang_batch import (
+    batch_records_from_results,
+    route_step3_manual_requests,
+    run_batch_zhaoshang_requests,
+)
 from cnnc_same_product_import import config
 from cnnc_same_product_import.link_parser import extract_jd_sku
 from cnnc_same_product_import.mall_mapper import MallMapper
@@ -484,13 +493,74 @@ print("[5] 招商局-only...")
 all_urls = list(dict.fromkeys(
     r.URL for r in all_import_rows if r.URL and r.价格 in ("", None)
 ))
-zs_urls = [u for u in all_urls if config.get_zhaoshang_mall_key(u)]
-non_zs_urls = [u for u in all_urls if not config.get_zhaoshang_mall_key(u)]
+records, priority_failures, priority_unconfirmed, priority_idempotent, task_failures = {}, [], [], [], []
+zs_tmp = OUT_DIR / "_zs_tmp_priority"
+zs_tmp.mkdir(parents=True, exist_ok=True)
+jobs = []
+legacy_adapter = CnncLegacyZhaoshangAdapter()
+route = route_step3_manual_requests(
+    all_urls,
+    adapter=legacy_adapter,
+    sku_resolver=extract_sku_from_url,
+    legacy_mall_resolver=config.get_zhaoshang_mall_key,
+    mall_names=MALL_CN_NAME,
+)
+zs_urls = list(route.zhaoshang_urls)
+non_zs_urls = list(route.non_zhaoshang_urls)
 print("    总URL:{} 招商局:{} 非招商局:{}".format(len(all_urls), len(zs_urls), len(non_zs_urls)))
 if ARGS.skip_zhaoshang:
     print("    已按参数跳过招商局建任务和爬取，仅生成可处理文件。")
     zs_urls = []
-else:
+batch_items = () if ARGS.skip_zhaoshang else route.batch_items
+legacy_items = () if ARGS.skip_zhaoshang else route.legacy_items
+
+if batch_items:
+    batch_results = run_batch_zhaoshang_requests(
+        batch_items,
+        business_date=datetime.now().date().isoformat(),
+        purpose=PURPOSE_STEP3_NO_PUSH,
+        state_path=OUT_DIR / "manual_zhaoshang_batch.sqlite3",
+        db_env_path=ARGS.zhaoshang_db_env,
+        runtime_budget_seconds=max(1.0, float(ZS_WAIT_TIMEOUT)),
+        max_harvest_passes=120,
+        poll_interval_seconds=30.0,
+        stop_after_priority=ARGS.zs_create_only,
+    )
+    if ARGS.zs_create_only:
+        unresolved = [
+            item
+            for item in batch_items
+            if str(batch_results.get(item.source_id, {}).get("state") or "")
+            in {"PENDING", "PRIORITY_PENDING", "SUBMIT_UNKNOWN", "MANUAL_REQUIRED"}
+        ]
+        task_failures.extend(
+            {
+                "source_id": item.source_id,
+                "mall": item.request.mall_key,
+                "url": item.request.url,
+                "reason": str(
+                    batch_results.get(item.source_id, {}).get("error")
+                    or batch_results.get(item.source_id, {}).get("state")
+                    or "PENDING"
+                ),
+            }
+            for item in unresolved
+        )
+    else:
+        batch_records, batch_failures = batch_records_from_results(
+            batch_items,
+            batch_results,
+            title_is_invalid=is_bad_title,
+            source_urls=route.source_urls,
+        )
+        records.update(batch_records)
+        task_failures.extend(batch_failures)
+
+legacy_groups = {}
+for item in legacy_items:
+    legacy_groups.setdefault(item.request.mall_key, []).append(item)
+
+if legacy_items and not ARGS.skip_zhaoshang:
     auth_template = {
         "cookie": zs_cookie,
         "headers": [("Cookie", zs_cookie), ("Blade-Auth", blade_auth)],
@@ -501,14 +571,9 @@ else:
     )
     zs_cookie = prepared_auth["cookie"]
     blade_auth = prepared_auth["headers_dict"]["Blade-Auth"]
-groups = {}
-for u in zs_urls:
-    groups.setdefault(config.get_zhaoshang_mall_key(u), []).append(u)
-records, priority_failures, priority_unconfirmed, priority_idempotent, task_failures = {}, [], [], [], []
-zs_tmp = OUT_DIR / "_zs_tmp_priority"
-zs_tmp.mkdir(parents=True, exist_ok=True)
-jobs = []
-for mall, urls in groups.items():
+
+for mall, items in legacy_groups.items():
+    urls = [item.request.url for item in items]
     cn_name = MALL_CN_NAME.get(mall, mall)
     input_path = zs_tmp / "zs_input_{}.xlsx".format(mall)
     result_path = zs_tmp / "zs_result_{}.xlsx".format(mall)
@@ -519,8 +584,9 @@ for mall, urls in groups.items():
     ws_in.cell(1, 1, "商品编码")
     ws_in.cell(1, 2, "url")
     code_to_url = {}
-    for i, u in enumerate(urls, 2):
-        code = extract_sku_from_url(u) or "ROW{}".format(i - 1)
+    for i, item in enumerate(items, 2):
+        u = item.request.url
+        code = item.request.sku_id
         code_to_url[code] = u
         code_to_url["code-" + code] = u
         ws_in.cell(i, 1, code)
@@ -538,8 +604,9 @@ for mall, urls in groups.items():
 zs_env = internal_subprocess_env(os.environ)
 zs_env["PYTHONIOENCODING"] = "utf-8"
 if not ARGS.skip_zhaoshang:
-    zs_env["BLADE_AUTH"] = blade_auth
-    zs_env["COOKIE"] = zs_cookie
+    if legacy_items:
+        zs_env["BLADE_AUTH"] = blade_auth
+        zs_env["COOKIE"] = zs_cookie
 
 
 def run_zhaoshang_job(job, mode):

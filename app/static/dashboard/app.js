@@ -524,7 +524,7 @@
     ACTION_IN_FLIGHT: "同类型操作正在执行,请等待其完成",
     CONFIRM_REQUIRED: "请先确认强制收口",
     STALE_MISSING_PRICE_COUNT: "缺价数量已变化,请刷新后重新确认",
-    MISSING_PRICE_LIMIT_EXCEEDED: "缺价数量超过 20 条,不能强制收口",
+    MISSING_PRICE_LIMIT_EXCEEDED: "缺价数量超过 30 条,不能强制收口",
     FORCE_CLOSEOUT_NOT_FROZEN: "业务数据尚未冻结,不能强制收口",
   };
   function _blockersSummary(outcome) {

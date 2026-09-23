@@ -597,3 +597,18 @@ def test_cli_harvest_only_rejects_remote_write_flags():
             DATE,
             "--enable-remote-writes",
         ])
+
+
+@pytest.mark.parametrize("command", ["harvest-only", "drain-only"])
+def test_lifecycle_only_cli_accepts_batch_backend_policy(command):
+    args = cli.build_parser().parse_args([
+        command,
+        "--business-date",
+        DATE,
+        "--zhaoshang-backend",
+        "batch",
+    ])
+
+    assert args.command == command
+    assert args.zhaoshang_backend == "batch"
+    assert not getattr(args, "enable_remote_writes", False)

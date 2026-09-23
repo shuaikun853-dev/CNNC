@@ -2348,7 +2348,11 @@ class TestProductionFallbackGates:
         self, tmp_path, monkeypatch
     ):
         template = tmp_path / "mall.xlsx"
-        template.write_bytes(b"placeholder")
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet.append(["商品编码", "url"])
+        sheet.append(["98S6010", "https://www.mymro.cn/not-proven/98S6010"])
+        workbook.save(template)
 
         def fake_run_crawl_task(**_kwargs):
             raise RuntimeError(
@@ -2367,17 +2371,18 @@ class TestProductionFallbackGates:
 
         result = excel_audit_mod.run_zhaoshang_tasks(
             {
-                "得力商城": {
-                    "deduped": 6,
+                "固安捷": {
+                    "deduped": 1,
                     "path": template,
-                    "mall_key": "nbdeli",
+                    "mall_key": "mymro",
+                    "source_id": "20",
                 }
             },
             tool_path=tmp_path / "wrapper.py",
             max_workers=1,
         )
 
-        failure = result["得力商城"]
+        failure = result["固安捷"]
         assert failure["ok"] is False
         assert failure["main_task_id"] == 321
         assert failure["task_number"] == "RW-321"

@@ -69,6 +69,14 @@ from app.services.customer_prewarm_dispatch import (
     prewarm_crawl_fingerprint,
     prewarm_placeholder_sku,
 )
+from app.services.customer_prewarm_batch import (
+    BATCH_BACKEND_VERSION,
+    CustomerPrewarmBatchFacade,
+    is_customer_prewarm_batch_job,
+    harvest_existing_customer_prewarm_batch_job,
+    run_customer_prewarm_batch_job_step,
+)
+from app.services.batch_zhaoshang_adapter import MAX_SLICE_SIZE
 from app.services.customer_prewarm_store import (
     CACHE_STATUS_REMOTE_DISPATCHED,
     CACHE_STATUS_REMOTE_REUSED,
@@ -753,6 +761,7 @@ def run_reconcile_phase(
     get_adapter: Callable[[], Any],
     paths: Any,
     *,
+    get_batch_facade: Callable[[], CustomerPrewarmBatchFacade] | None = None,
     prewarm_store: CustomerPrewarmStore | None = None,
     deadline: float,
     monotonic_value: Callable[[], float],
@@ -830,6 +839,58 @@ def run_reconcile_phase(
             continue
         attempted += 1
         try:
+            if is_customer_prewarm_batch_job(job_row):
+                if get_batch_facade is None:
+                    raise ValueError("customer-prewarm Batch facade is unavailable")
+                state, evidence = run_customer_prewarm_batch_job_step(
+                    store,
+                    token,
+                    get_batch_facade(),
+                    job_id,
+                    timeout_seconds=max(0.001, deadline - monotonic_value()),
+                    pre_remote_guard=lambda: linked(job_id),
+                    result_commit_fence=lambda: link_fence(job_id),
+                )
+                if str(evidence.get("reconcile_status") or "") == "NOT_FOUND":
+                    diagnostic = sanitize_remote_diagnostic(
+                        evidence.get("reconcile_diagnostic") or ""
+                    )
+                    with link_fence(job_id) as owned:
+                        if not owned:
+                            continue
+                        if diagnostic:
+                            store.record_submit_reconcile_diagnostic(
+                                token,
+                                job_id,
+                                status="NOT_FOUND",
+                                diagnostic=diagnostic,
+                            )
+                        else:
+                            new_attempts = store.bump_remote_job_recovery_attempt(
+                                token,
+                                job_id,
+                                diagnostic="exact Batch remote task not found",
+                            )
+                    if diagnostic:
+                        phase_errors.append(
+                            f"reconcile job {job_id}: inconclusive Batch lookup ({diagnostic})"
+                        )
+                    else:
+                        summary["reconcile_not_found"] += 1
+                        if new_attempts >= dead_threshold:
+                            phase_errors.append(
+                                f"reconcile job {job_id}: judged dead after {new_attempts} attempts; "
+                                "redispatch owns it"
+                            )
+                    continue
+                if state == "PRIORITY_PENDING":
+                    summary["reconciled_found"] += 1
+                elif state == "MANUAL_REQUIRED":
+                    phase_errors.append(
+                        f"reconcile job {job_id}: "
+                        f"{evidence.get('manual_error') or 'batch identity conflict'}"
+                    )
+                continue
             prepared = _reconstruct_prepared_job(get_adapter(), summary["business_date"], job_row)
             outcome = get_adapter().reconcile_unknown(
                 prepared, timeout_seconds=max(0.001, deadline - monotonic_value())
@@ -921,6 +982,8 @@ def run_redispatch_phase(
     paths: Any,
     mappings: Sequence[ZhaoshangMallMapping],
     get_adapter: Callable[[], Any],
+    get_batch_facade: Callable[[], CustomerPrewarmBatchFacade] | None = None,
+    selected_backend: str = "legacy",
     *,
     business_date: str,
     deadline: float,
@@ -980,7 +1043,31 @@ def run_redispatch_phase(
         return
 
     created_budget = int(max_jobs_per_pass) - int(summary.get("jobs_created", 0) or 0)
+    backend_groups: dict[tuple[str, str], list[Mapping[str, Any]]] = {}
     for mall_key, entries in collected["groups"].items():
+        for entry in entries:
+            url = str(
+                entry["candidate"]["lookup_url"]
+                or entry["candidate"]["original_url"]
+            )
+            backend = dispatch_service.prewarm_backend_version(
+                mall_key, url, selected_backend=selected_backend
+            )
+            backend_groups.setdefault((mall_key, backend), []).append(entry)
+
+    dispatch_groups: list[
+        tuple[tuple[str, str], list[Mapping[str, Any]]]
+    ] = []
+    for key, entries in backend_groups.items():
+        if key[1] == BATCH_BACKEND_VERSION:
+            dispatch_groups.extend(
+                (key, entries[offset : offset + MAX_SLICE_SIZE])
+                for offset in range(0, len(entries), MAX_SLICE_SIZE)
+            )
+        else:
+            dispatch_groups.append((key, entries))
+
+    for (mall_key, backend_version), entries in dispatch_groups:
         if created_budget <= 0:
             phase_errors.append(
                 f"mall {mall_key}: max jobs per pass ({max_jobs_per_pass}) reached; "
@@ -1026,7 +1113,7 @@ def run_redispatch_phase(
                         fresh_entries.append(entry)
                 if not fresh_entries:
                     continue
-                _redispatch_mall_group(
+                wired = _redispatch_mall_group(
                     store=store,
                     token=token,
                     prewarm_store=prewarm_store,
@@ -1034,6 +1121,8 @@ def run_redispatch_phase(
                     mapping=mapping,
                     entries=fresh_entries,
                     get_adapter=get_adapter,
+                    get_batch_facade=get_batch_facade,
+                    backend_version=backend_version,
                     business_date=business_date,
                     deadline=deadline,
                     monotonic_value=monotonic_value,
@@ -1047,7 +1136,7 @@ def run_redispatch_phase(
                 continue
         finally:
             scan_lock.release()
-        created_budget -= 1
+        created_budget -= wired
 
 
 def _redispatch_mall_group(
@@ -1059,6 +1148,8 @@ def _redispatch_mall_group(
     mapping: ZhaoshangMallMapping,
     entries: Sequence[Mapping[str, Any]],
     get_adapter: Callable[[], Any],
+    get_batch_facade: Callable[[], CustomerPrewarmBatchFacade] | None,
+    backend_version: str,
     business_date: str,
     deadline: float,
     monotonic_value: Callable[[], float],
@@ -1090,21 +1181,35 @@ def _redispatch_mall_group(
                 mall_key, str(entry["candidate"]["lookup_url"] or entry["candidate"]["original_url"]), int(entry["attempt_index"])
             ),
             url=str(entry["candidate"]["lookup_url"] or entry["candidate"]["original_url"]),
-            backend_version=BACKEND_VERSION,
+            backend_version=backend_version,
         )
         for entry in entries
     ]
-    for request in requests:
+    crawl_source_ids = [
+        (
+            f"prewarm:{int(entry['candidate']['id'])}:"
+            f"redispatch:{int(entry['attempt_index'])}"
+            if backend_version == BATCH_BACKEND_VERSION
+            else mapping.source_id
+        )
+        for entry in entries
+    ]
+    for request, crawl_source_id in zip(requests, crawl_source_ids, strict=True):
         work = store.ensure_crawl_work(
             token,
             mall_key,
             request.sku_id,
             request.url,
-            BACKEND_VERSION,
+            backend_version,
             prewarm_crawl_fingerprint(
-                mall_key, mapping.source_id, request.sku_id, request.url, business_date
+                mall_key,
+                crawl_source_id,
+                request.sku_id,
+                request.url,
+                business_date,
+                backend_version=backend_version,
             ),
-            source_id=mapping.source_id,
+            source_id=crawl_source_id,
         )
         crawl_ids.append(int(work["id"]))
         work_job_ids.append(int(work["remote_job_id"]) if work.get("remote_job_id") is not None else None)
@@ -1126,7 +1231,8 @@ def _redispatch_mall_group(
             wired += _redispatch_mall_group(
                 store=store, token=token, prewarm_store=prewarm_store,
                 paths=paths, mapping=mapping, entries=subgroup,
-                get_adapter=get_adapter, business_date=business_date,
+                get_adapter=get_adapter, get_batch_facade=get_batch_facade,
+                backend_version=backend_version, business_date=business_date,
                 deadline=deadline, monotonic_value=monotonic_value,
                 max_jobs_per_pass=max_jobs_per_pass,
                 summary=summary,
@@ -1175,7 +1281,8 @@ def _redispatch_mall_group(
                 return _redispatch_mall_group(
                     store=store, token=token, prewarm_store=prewarm_store,
                     paths=paths, mapping=mapping, entries=entries,
-                    get_adapter=get_adapter, business_date=business_date,
+                    get_adapter=get_adapter, get_batch_facade=get_batch_facade,
+                    backend_version=backend_version, business_date=business_date,
                     deadline=deadline, monotonic_value=monotonic_value,
                     max_jobs_per_pass=max_jobs_per_pass, summary=summary,
                 )
@@ -1204,12 +1311,18 @@ def _redispatch_mall_group(
                 if prior_state == "PRIORITY_PENDING":
                     _confirm_pending_priority_job(
                         prewarm_store=prewarm_store, store=store, token=token,
-                        get_adapter=get_adapter, business_date=business_date,
+                        get_adapter=get_adapter, get_batch_facade=get_batch_facade,
+                        business_date=business_date,
                         note_targets=[(int(entry["candidate"]["id"]), str(entry["candidate"]["cache_status"])) for entry in entries],
                         job_id=prior_id, deadline=deadline, monotonic_value=monotonic_value,
                         summary=summary,
                         pre_remote_guard=lambda: prewarm_store.has_current_remote_job_link(
                             business_date=business_date, remote_job_id=prior_id,
+                            producer=PRODUCER_CUSTOMER_PREWARM_ZHAOSHANG,
+                        ),
+                        result_commit_fence=lambda: prewarm_store.fence_current_remote_job_link(
+                            business_date=business_date,
+                            remote_job_id=prior_id,
                             producer=PRODUCER_CUSTOMER_PREWARM_ZHAOSHANG,
                         ),
                     )
@@ -1240,42 +1353,78 @@ def _redispatch_mall_group(
         batch_state.parent.mkdir(parents=True, exist_ok=True)
         batch_state.touch()
 
-    job = (
-        _reconstruct_prepared_job(get_adapter(), business_date, resume_unposted)
-        if resume_unposted is not None
-        else get_adapter().prepare_job(
-            business_date,
-            requests,
-            job_dir / "input.xlsx",
-            job_dir / "result.xlsx",
-            task_name,
-            batch_state_path=batch_state,
+    if backend_version == BATCH_BACKEND_VERSION:
+        if get_batch_facade is None:
+            raise ValueError("customer-prewarm Batch facade is unavailable")
+        if resume_unposted is not None:
+            job = None
+            job_row = resume_unposted
+        else:
+            items = [
+                {
+                    "row": {
+                        "request": request,
+                        "source_id": (
+                            f"prewarm:{int(entry['candidate']['id'])}:"
+                            f"redispatch:{int(entry['attempt_index'])}"
+                        ),
+                    }
+                }
+                for request, entry in zip(requests, entries, strict=True)
+            ]
+            plans = get_batch_facade().propose(
+                items, max(0.001, deadline - monotonic_value())
+            )
+            if len(plans) != 1:
+                raise ValueError("one redispatch group must produce one Batch slice")
+            job = plans[0]
+            job_row = store.prepare_remote_intent(
+                token,
+                job.logical_key,
+                job.task_name,
+                job.payload_hash,
+                mall_key=job.mall_key,
+                input_path=job.input_path,
+                result_path=job.result_path,
+                payload_json=job.payload_json,
+            )
+    else:
+        job = (
+            _reconstruct_prepared_job(get_adapter(), business_date, resume_unposted)
+            if resume_unposted is not None
+            else get_adapter().prepare_job(
+                business_date,
+                requests,
+                job_dir / "input.xlsx",
+                job_dir / "result.xlsx",
+                task_name,
+                batch_state_path=batch_state,
+            )
         )
-    )
-    payload_json = {
-        "requests": [
-            {
-                "mall_key": request.mall_key,
-                "mall_source_id": request.mall_source_id,
-                "mall_name": request.mall_name,
-                "sku_id": request.sku_id,
-                "url": request.url,
-                "backend_version": request.backend_version,
-            }
-            for request in requests
-        ],
-        "batch_state": str(batch_state),
-    }
-    job_row = resume_unposted or store.prepare_remote_intent(
-        token,
-        job.logical_job_key,
-        job.task_name,
-        job.payload_sha256,
-        mall_key=job.mall_key,
-        input_path=str(job.template_path),
-        result_path=str(job.result_path),
-        payload_json=payload_json,
-    )
+        payload_json = {
+            "requests": [
+                {
+                    "mall_key": request.mall_key,
+                    "mall_source_id": request.mall_source_id,
+                    "mall_name": request.mall_name,
+                    "sku_id": request.sku_id,
+                    "url": request.url,
+                    "backend_version": request.backend_version,
+                }
+                for request in requests
+            ],
+            "batch_state": str(batch_state),
+        }
+        job_row = resume_unposted or store.prepare_remote_intent(
+            token,
+            job.logical_job_key,
+            job.task_name,
+            job.payload_sha256,
+            mall_key=job.mall_key,
+            input_path=str(job.template_path),
+            result_path=str(job.result_path),
+            payload_json=payload_json,
+        )
     job_id = int(job_row["id"])
     store.link_crawl_work_batch_to_remote_job(token, crawl_ids, job_id)
     store.renew_lease(token, LEASE_TTL_SECONDS)
@@ -1395,7 +1544,8 @@ def _redispatch_mall_group(
             if bound_targets and existing_state == "PRIORITY_PENDING":
                 _confirm_pending_priority_job(
                     prewarm_store=prewarm_store, store=store, token=token,
-                    get_adapter=get_adapter, business_date=business_date,
+                    get_adapter=get_adapter, get_batch_facade=get_batch_facade,
+                    business_date=business_date,
                     note_targets=bound_targets, job_id=job_id, deadline=deadline,
                     monotonic_value=monotonic_value, summary=summary, prepared=job,
                     pre_remote_guard=lambda: _new_bindings_current(bound_targets),
@@ -1414,6 +1564,58 @@ def _redispatch_mall_group(
     counters["jobs_created"] += 1
 
     remaining = deadline - monotonic_value()
+    if backend_version == BATCH_BACKEND_VERSION:
+        try:
+            submitted = get_batch_facade().submit(
+                claim,
+                store.crawl_work_for_job(job_id),
+                max(0.001, remaining),
+            )
+        except Exception as exc:
+            store.mark_submit_unknown(
+                token,
+                job_id,
+                "prewarm Batch redispatch submit uncertain: " + type(exc).__name__,
+            )
+            _bind_candidates(error="submit unknown; reconcile pending")
+            counters["submit_unknown"] += 1
+            return 1
+        remote_identity = str(submitted.get("remote_identity") or "").strip()
+        if not remote_identity:
+            store.mark_submit_unknown(
+                token, job_id, "prewarm Batch redispatch returned no identity"
+            )
+            _bind_candidates(error="submit unknown; reconcile pending")
+            counters["submit_unknown"] += 1
+            return 1
+        store.mark_submit_unknown(
+            token, job_id, "prewarm Batch redispatch identity awaiting bind"
+        )
+        store.reconcile_batch_remote_job_and_crawl_work(
+            token,
+            job_id,
+            remote_identity=remote_identity,
+            result=submitted,
+        )
+        bound_targets = _bind_candidates()
+        counters["redispatched_urls"] += len(bound_targets)
+        if bound_targets:
+            _confirm_pending_priority_job(
+                prewarm_store=prewarm_store,
+                store=store,
+                token=token,
+                get_adapter=get_adapter,
+                get_batch_facade=get_batch_facade,
+                business_date=business_date,
+                note_targets=bound_targets,
+                job_id=job_id,
+                deadline=deadline,
+                monotonic_value=monotonic_value,
+                summary=summary,
+                pre_remote_guard=lambda: _new_bindings_current(bound_targets),
+            )
+        return 1
+
     outcome = get_adapter().submit(job, timeout_seconds=max(0.001, remaining))
     status = _status_value(outcome.status)
     diagnostic = str(getattr(outcome, "diagnostic", "") or "")
@@ -1507,6 +1709,7 @@ def run_harvest_phase(
     max_jobs: int = HARVEST_PER_PASS,
     manual_recovery_max_jobs: int = MANUAL_RECOVERY_PER_PASS,
     adapter: Any | None = None,
+    batch_facade: CustomerPrewarmBatchFacade | None = None,
     mappings: Sequence[ZhaoshangMallMapping] | None = None,
 ) -> None:
     """Harvest up to ``max_jobs`` live prewarm jobs via the existing primitive.
@@ -1634,22 +1837,38 @@ def run_harvest_phase(
                 )
                 return True
         try:
-            result = harvest_existing_customer_prewarm_job(
-                state_path=state_path,
-                lock_path=lock_path,
-                business_date=business_date,
-                remote_job_id=job_id,
-                remote_identity=identity,
-                adapter=get_adapter(),
-                timeout_seconds=max(
-                    0.001,
-                    min(
-                        float(per_job_timeout_seconds),
-                        deadline - monotonic_value() - reserved_seconds,
-                    ),
+            timeout = max(
+                0.001,
+                min(
+                    float(per_job_timeout_seconds),
+                    deadline - monotonic_value() - reserved_seconds,
                 ),
-                live_identity_proof=proof,
             )
+            if is_customer_prewarm_batch_job(job_row):
+                if manual or batch_facade is None:
+                    phase_errors.append(
+                        f"harvest job {job_id}: Batch manual recovery or facade unavailable"
+                    )
+                    return True
+                result = harvest_existing_customer_prewarm_batch_job(
+                    state_path=state_path,
+                    lock_path=lock_path,
+                    business_date=business_date,
+                    remote_job_id=job_id,
+                    facade=batch_facade,
+                    timeout_seconds=timeout,
+                )
+            else:
+                result = harvest_existing_customer_prewarm_job(
+                    state_path=state_path,
+                    lock_path=lock_path,
+                    business_date=business_date,
+                    remote_job_id=job_id,
+                    remote_identity=identity,
+                    adapter=get_adapter(),
+                    timeout_seconds=timeout,
+                    live_identity_proof=proof,
+                )
         except Exception as exc:  # noqa: BLE001 - per-job isolation
             phase_errors.append(f"harvest job {job_id}: {type(exc).__name__}: {exc}")
             return True

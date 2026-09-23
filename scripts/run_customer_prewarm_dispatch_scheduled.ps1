@@ -23,6 +23,8 @@ param(
     [int] $HardTimeoutMinutes = 5,
     [ValidateRange(0, 120)]
     [int] $ProcessExitGraceSeconds = 15,
+    [ValidateSet("legacy", "batch")]
+    [string] $ZhaoshangBackend = "legacy",
     [switch] $DryRun,
     [switch] $Preview
 )
@@ -66,6 +68,7 @@ $arguments = @(
     "--runtime-root", $RuntimeRoot,
     "--budget-seconds", [string]$BudgetSeconds,
     "--max-jobs-per-pass", [string]$MaxJobsPerPass,
+    "--zhaoshang-backend", $ZhaoshangBackend,
     "--json-output", $jsonOutputPath
 )
 if ($DryRun) {
@@ -82,6 +85,7 @@ if ($Preview) {
         DryRun = [bool]$DryRun
         BudgetSeconds = $BudgetSeconds
         MaxJobsPerPass = $MaxJobsPerPass
+        ZhaoshangBackend = $ZhaoshangBackend
         HardTimeoutMinutes = $HardTimeoutMinutes
         LogPath = (Join-Path $dispatchLogDirectory ("{0}.log" -f $businessDate))
         JsonOutputDir = $dispatchLogDirectory
@@ -121,7 +125,7 @@ function Write-DispatchLog([string] $Message) {
 }
 
 try {
-    Write-DispatchLog "START business_date=$businessDate budget_seconds=$BudgetSeconds max_jobs_per_pass=$MaxJobsPerPass dry_run=$([bool]$DryRun)"
+    Write-DispatchLog "START business_date=$businessDate budget_seconds=$BudgetSeconds max_jobs_per_pass=$MaxJobsPerPass zhaoshang_backend=$ZhaoshangBackend dry_run=$([bool]$DryRun)"
     $remainingSeconds = [math]::Floor(
         $hardLimitSeconds - $stopwatch.Elapsed.TotalSeconds - $shutdownReserveSeconds
     )

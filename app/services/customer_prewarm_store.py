@@ -1209,13 +1209,32 @@ class CustomerPrewarmStore:
         business_date: str,
         remote_job_id: int,
         producer: str,
+        candidate_id: int | None = None,
+        allow_unbound_candidate: bool = False,
     ) -> bool:
+        if allow_unbound_candidate and candidate_id is None:
+            raise ValueError("unbound linkage proof requires an exact candidate_id")
         rows = connection.execute(
             """SELECT id FROM prewarm_candidates
-               WHERE cache_status IN ('REMOTE_DISPATCHED', 'REMOTE_REUSED')
-                 AND remote_job_id=?
+               WHERE (
+                   (
+                       ? = 1
+                       AND cache_status='PENDING_PREWARM'
+                       AND remote_job_id IS NULL
+                   )
+                   OR (
+                       cache_status IN ('REMOTE_DISPATCHED', 'REMOTE_REUSED')
+                       AND remote_job_id=?
+                   )
+               )
+                 AND (? IS NULL OR id=?)
                ORDER BY id""",
-            (int(remote_job_id),),
+            (
+                1 if allow_unbound_candidate else 0,
+                int(remote_job_id),
+                None if candidate_id is None else int(candidate_id),
+                None if candidate_id is None else int(candidate_id),
+            ),
         ).fetchall()
         for row in rows:
             link = connection.execute(
@@ -1236,7 +1255,13 @@ class CustomerPrewarmStore:
         return False
 
     def has_current_remote_job_link(
-        self, *, business_date: str, remote_job_id: int, producer: str
+        self,
+        *,
+        business_date: str,
+        remote_job_id: int,
+        producer: str,
+        candidate_id: int | None = None,
+        allow_unbound_candidate: bool = False,
     ) -> bool:
         """Read the latest active candidate linkage without changing durable state."""
         with self._reader() as connection:
@@ -1245,6 +1270,8 @@ class CustomerPrewarmStore:
                 business_date=business_date,
                 remote_job_id=remote_job_id,
                 producer=producer,
+                candidate_id=candidate_id,
+                allow_unbound_candidate=allow_unbound_candidate,
             )
 
     def exact_current_remote_job_group_matches(
@@ -1397,6 +1424,8 @@ class CustomerPrewarmStore:
         business_date: str,
         remote_job_id: int,
         producer: str,
+        candidate_id: int | None = None,
+        allow_unbound_candidate: bool = False,
     ) -> Iterator[bool]:
         """Fence the latest candidate linkage through an external state commit.
 
@@ -1413,6 +1442,8 @@ class CustomerPrewarmStore:
                 business_date=business_date_value,
                 remote_job_id=int(remote_job_id),
                 producer=producer_value,
+                candidate_id=candidate_id,
+                allow_unbound_candidate=allow_unbound_candidate,
             )
 
     def lifecycle_cursor(self, name: str) -> str | None:

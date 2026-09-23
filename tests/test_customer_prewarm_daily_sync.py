@@ -232,6 +232,7 @@ def test_daily_sync_persists_page_title_confirmed_sku_and_comment(tmp_path, prew
     )
     row["result"].update({
         "page_sku_id": "100311804305",
+        "returned_url": "https://item.jd.com/100311804305.html?from=batch",
         "page_title": "亿联 MeetingEye 500",
         "comment_count": 321,
         "comment_count_raw": "321",
@@ -250,6 +251,8 @@ def test_daily_sync_persists_page_title_confirmed_sku_and_comment(tmp_path, prew
     assert entry["title"] == "亿联 MeetingEye 500"
     assert entry["price"] == "63420.5"
     assert entry["comment_count"] == 321
+    assert entry["submitted_url"] == url
+    assert entry["returned_url"] == "https://item.jd.com/100311804305.html?from=batch"
 
 
 def test_sync_uses_one_store_wide_lock_across_entrypoints(tmp_path, prewarm_store, shared_cache):

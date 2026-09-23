@@ -361,6 +361,8 @@ class DailyAuditStore:
                     error_text TEXT,
                     harvest_attempts INTEGER NOT NULL DEFAULT 0,
                     harvest_elapsed_seconds REAL NOT NULL DEFAULT 0,
+                    priority_attempts INTEGER NOT NULL DEFAULT 0,
+                    priority_elapsed_seconds REAL NOT NULL DEFAULT 0,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     UNIQUE(run_id, logical_key),
@@ -444,6 +446,10 @@ class DailyAuditStore:
                 connection.execute("ALTER TABLE remote_jobs ADD COLUMN harvest_attempts INTEGER NOT NULL DEFAULT 0")
             if "harvest_elapsed_seconds" not in columns:
                 connection.execute("ALTER TABLE remote_jobs ADD COLUMN harvest_elapsed_seconds REAL NOT NULL DEFAULT 0")
+            if "priority_attempts" not in columns:
+                connection.execute("ALTER TABLE remote_jobs ADD COLUMN priority_attempts INTEGER NOT NULL DEFAULT 0")
+            if "priority_elapsed_seconds" not in columns:
+                connection.execute("ALTER TABLE remote_jobs ADD COLUMN priority_elapsed_seconds REAL NOT NULL DEFAULT 0")
             if "recovery_attempts" not in columns:
                 connection.execute("ALTER TABLE remote_jobs ADD COLUMN recovery_attempts INTEGER NOT NULL DEFAULT 0")
             if "recovery_evidence_json" not in columns:
@@ -2139,34 +2145,201 @@ class DailyAuditStore:
                 connection.execute("SELECT * FROM remote_jobs WHERE id=?", (job_id,)).fetchone()
             )  # type: ignore[return-value]
 
+    @staticmethod
+    def _validate_batch_remote_identity(
+        job: Mapping[str, Any], remote_identity: str
+    ) -> str:
+        from app.services.batch_zhaoshang_adapter import CnncBatchZhaoshangAdapter
+
+        identity_text = str(remote_identity or "").strip()
+        try:
+            payload = json.loads(str(job.get("payload_json") or ""))
+            if not isinstance(payload, dict):
+                raise ValueError("batch payload must be an object")
+            prepared = CnncBatchZhaoshangAdapter.restore_job(
+                payload,
+                expected_logical_job_key=str(job.get("logical_key") or ""),
+                expected_payload_sha256=str(job.get("payload_hash") or ""),
+            )
+            CnncBatchZhaoshangAdapter.validate_remote_identity(
+                prepared, identity_text
+            )
+            if str(job.get("mall_key") or "") != prepared.mall_key:
+                raise ValueError("batch remote identity differs from durable intent")
+        except (TypeError, ValueError) as exc:
+            raise RemoteIntentConflict(
+                "batch remote identity failed typed durable validation"
+            ) from exc
+        return identity_text
+
+    def reconcile_batch_remote_job_and_crawl_work(
+        self,
+        token: LeaseToken,
+        job_id: int,
+        *,
+        remote_identity: str,
+        result: Any | None = None,
+    ) -> dict[str, Any]:
+        """Atomically bind one exact batch identity and advance its crawl rows."""
+        with self._transaction(immediate=True) as connection:
+            self._validate_lease(connection, token)
+            job = self._job_for_lease(connection, token, job_id)
+            identity = self._validate_batch_remote_identity(dict(job), remote_identity)
+            if str(job["state"]) != "SUBMIT_UNKNOWN" or str(
+                job["remote_identity"] or ""
+            ).strip():
+                raise RemoteIntentConflict(
+                    "atomic batch reconciliation requires an identity-less SUBMIT_UNKNOWN job"
+                )
+            if not int(job["post_attempted"]):
+                raise RemoteIntentConflict(
+                    "batch reconciliation requires durable post_attempted evidence"
+                )
+            try:
+                connection.execute(
+                    """UPDATE remote_jobs SET state='PRIORITY_PENDING', remote_identity=?,
+                       result_json=COALESCE(?, result_json), error_text=NULL, updated_at=?
+                       WHERE id=?""",
+                    (
+                        identity,
+                        self._canonical_json(result) if result is not None else None,
+                        self._utcnow(),
+                        job_id,
+                    ),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise RemoteIntentConflict(
+                    "batch remote identity is already bound in this daily run"
+                ) from exc
+            connection.execute(
+                """UPDATE crawl_work SET state='PRIORITY_PENDING', updated_at=?
+                   WHERE run_id=? AND remote_job_id=?
+                     AND state NOT IN ('SUCCESS', 'NO_RESULT', 'TERMINAL_FAILED')""",
+                (self._utcnow(), token.run_id, job_id),
+            )
+            return self._row(
+                connection.execute(
+                    "SELECT * FROM remote_jobs WHERE id=?", (job_id,)
+                ).fetchone()
+            )  # type: ignore[return-value]
+
+    def confirm_batch_remote_job_priority_and_crawl_work(
+        self,
+        token: LeaseToken,
+        job_id: int,
+        *,
+        remote_identity: str,
+        result: Any | None = None,
+    ) -> dict[str, Any]:
+        """Atomically confirm priority for one typed batch identity."""
+        with self._transaction(immediate=True) as connection:
+            self._validate_lease(connection, token)
+            job = self._job_for_lease(connection, token, job_id)
+            identity = self._validate_batch_remote_identity(dict(job), remote_identity)
+            if (
+                str(job["state"]) != "PRIORITY_PENDING"
+                or str(job["remote_identity"] or "").strip() != identity
+            ):
+                raise RemoteIntentConflict(
+                    "atomic batch priority confirmation requires the exact PRIORITY_PENDING job"
+                )
+            connection.execute(
+                """UPDATE remote_jobs SET state='SUBMITTED',
+                   result_json=COALESCE(?, result_json), error_text=NULL, updated_at=?
+                   WHERE id=?""",
+                (
+                    self._canonical_json(result) if result is not None else None,
+                    self._utcnow(),
+                    job_id,
+                ),
+            )
+            connection.execute(
+                """UPDATE crawl_work SET state='SUBMITTED', updated_at=?
+                   WHERE run_id=? AND remote_job_id=?
+                     AND state NOT IN ('SUCCESS', 'NO_RESULT', 'TERMINAL_FAILED')""",
+                (self._utcnow(), token.run_id, job_id),
+            )
+            return self._row(
+                connection.execute(
+                    "SELECT * FROM remote_jobs WHERE id=?", (job_id,)
+                ).fetchone()
+            )  # type: ignore[return-value]
+
     def claim_harvest(self, token: LeaseToken, job_id: int, *, max_attempts: int, max_elapsed_seconds: float) -> dict[str, Any] | None:
         with self._transaction(immediate=True) as connection:
             self._validate_lease(connection, token)
             job = self._job_for_lease(connection, token, job_id)
             if job["state"] not in {"PRIORITY_PENDING", "SUBMITTED", "RUNNING", "EXPORTED", "SUBMIT_UNKNOWN"}:
                 return None
-            if int(job["harvest_attempts"]) >= max_attempts or float(job["harvest_elapsed_seconds"]) >= max_elapsed_seconds:
-                connection.execute("UPDATE remote_jobs SET state='MANUAL_REQUIRED', error_text=COALESCE(error_text, 'harvest limit reached'), updated_at=? WHERE id=?", (self._utcnow(), job_id))
+            priority_phase = str(job["state"]) == "PRIORITY_PENDING"
+            attempts_column = "priority_attempts" if priority_phase else "harvest_attempts"
+            elapsed_column = (
+                "priority_elapsed_seconds" if priority_phase else "harvest_elapsed_seconds"
+            )
+            if int(job[attempts_column]) >= max_attempts or float(job[elapsed_column]) >= max_elapsed_seconds:
+                limit_name = "priority limit reached" if priority_phase else "harvest limit reached"
+                connection.execute("UPDATE remote_jobs SET state='MANUAL_REQUIRED', error_text=COALESCE(error_text, ?), updated_at=? WHERE id=?", (limit_name, self._utcnow(), job_id))
                 return None
-            connection.execute("UPDATE remote_jobs SET harvest_attempts=harvest_attempts+1, updated_at=? WHERE id=?", (self._utcnow(), job_id))
+            connection.execute(
+                f"UPDATE remote_jobs SET {attempts_column}={attempts_column}+1, updated_at=? WHERE id=?",
+                (self._utcnow(), job_id),
+            )
             return self._row(connection.execute("SELECT * FROM remote_jobs WHERE id=?", (job_id,)).fetchone())
 
-    def record_harvest(self, token: LeaseToken, job_id: int, *, elapsed_seconds: float, max_attempts: int, max_elapsed_seconds: float, error: str | None = None) -> dict[str, Any]:
+    def release_harvest_claim(
+        self, token: LeaseToken, job_id: int, *, phase: str = "harvest"
+    ) -> dict[str, Any]:
+        """Refund one claim when a bounded callback never attempted this job."""
+        if phase not in {"priority", "harvest"}:
+            raise ValueError("harvest claim phase must be priority or harvest")
+        attempts_column = (
+            "priority_attempts" if phase == "priority" else "harvest_attempts"
+        )
+        with self._transaction(immediate=True) as connection:
+            self._validate_lease(connection, token)
+            self._job_for_lease(connection, token, job_id)
+            connection.execute(
+                f"""UPDATE remote_jobs
+                       SET {attempts_column}=CASE
+                           WHEN {attempts_column}>0 THEN {attempts_column}-1
+                           ELSE 0 END,
+                           updated_at=?
+                     WHERE id=?""",
+                (self._utcnow(), job_id),
+            )
+            return self._row(
+                connection.execute(
+                    "SELECT * FROM remote_jobs WHERE id=?", (job_id,)
+                ).fetchone()
+            )  # type: ignore[return-value]
+
+    def record_harvest(self, token: LeaseToken, job_id: int, *, elapsed_seconds: float, max_attempts: int, max_elapsed_seconds: float, error: str | None = None, phase: str = "harvest", phase_succeeded: bool = False) -> dict[str, Any]:
+        if phase not in {"priority", "harvest"}:
+            raise ValueError("harvest record phase must be priority or harvest")
         with self._transaction(immediate=True) as connection:
             self._validate_lease(connection, token)
             job = self._job_for_lease(connection, token, job_id)
-            elapsed = float(job["harvest_elapsed_seconds"]) + max(0.0, elapsed_seconds)
-            attempts = int(job["harvest_attempts"])
+            priority_phase = phase == "priority"
+            attempts_column = "priority_attempts" if priority_phase else "harvest_attempts"
+            elapsed_column = (
+                "priority_elapsed_seconds" if priority_phase else "harvest_elapsed_seconds"
+            )
+            elapsed = float(job[elapsed_column]) + max(0.0, elapsed_seconds)
+            attempts = int(job[attempts_column])
             # The last permitted harvest may return terminal evidence. That
             # evidence must win over the retry cap instead of being discarded.
-            manual = str(job["state"]) not in {"EXPORTED", "COMPLETED"} and (
+            success_states = {"SUBMITTED"} if priority_phase else {"EXPORTED", "COMPLETED"}
+            manual = not phase_succeeded and str(job["state"]) not in success_states and (
                 attempts >= max_attempts or elapsed >= max_elapsed_seconds
             )
             state = "MANUAL_REQUIRED" if manual else str(job["state"])
             stored_error = error
             if state == "SUBMIT_UNKNOWN" and error is None:
                 stored_error = job["error_text"]
-            connection.execute("UPDATE remote_jobs SET state=?, harvest_elapsed_seconds=?, error_text=?, updated_at=? WHERE id=?", (state, elapsed, stored_error, self._utcnow(), job_id))
+            connection.execute(
+                f"UPDATE remote_jobs SET state=?, {elapsed_column}=?, error_text=?, updated_at=? WHERE id=?",
+                (state, elapsed, stored_error, self._utcnow(), job_id),
+            )
             return self._row(connection.execute("SELECT * FROM remote_jobs WHERE id=?", (job_id,)).fetchone())  # type: ignore[return-value]
 
     def update_remote_recovery_evidence(self, token: LeaseToken, job_id: int, evidence: Mapping[str, Any]) -> dict[str, Any]:
@@ -2566,6 +2739,11 @@ class DailyAuditStore:
             if target["state"] in {"SUCCESS", "NO_RESULT"}:
                 return self._row(target)
             if target["remote_job_id"] is not None or target["state"] not in {"PENDING", "RETRYABLE_FAILED"}:
+                return None
+            # Batch executeNumber identity includes source_id. A later source
+            # must receive its own durable request instead of following or
+            # copying another source's remote lifecycle/result.
+            if target["backend_version"] == "batch-url-v1":
                 return None
             source = connection.execute(
                 """SELECT * FROM crawl_work WHERE run_id=? AND mall_key=? AND sku_id=? AND exact_url=?

@@ -186,15 +186,25 @@ def test_closeout_timeout_terminates_subprocess(tmp_path):
 
 
 def test_double_click_same_target_is_in_flight(tmp_path):
-    runner, _ = _runner(tmp_path, _FakeProcess(stuck=True), _FakeProcess(stuck=True))
+    first_process = _FakeProcess(stuck=True)
+    other_process = _FakeProcess(stuck=True)
+    runner, _ = _runner(tmp_path, first_process, other_process)
     first = runner.start(action_type="closeout", business_date=BUSINESS_DATE)
-    with pytest.raises(DashboardActionError) as excinfo:
-        runner.start(action_type="closeout", business_date=BUSINESS_DATE)
-    assert excinfo.value.code == "ACTION_IN_FLIGHT"
-    assert excinfo.value.existing_action_id == first.action_id
-    # 不同 target 不受影响
-    other = runner.start(action_type="closeout", business_date="2026-08-27")
-    assert other.action_id != first.action_id
+    other = None
+    try:
+        with pytest.raises(DashboardActionError) as excinfo:
+            runner.start(action_type="closeout", business_date=BUSINESS_DATE)
+        assert excinfo.value.code == "ACTION_IN_FLIGHT"
+        assert excinfo.value.existing_action_id == first.action_id
+        # 不同 target 不受影响
+        other = runner.start(action_type="closeout", business_date="2026-08-27")
+        assert other.action_id != first.action_id
+    finally:
+        first_process.terminate()
+        other_process.terminate()
+        _wait_done(first)
+        if other is not None:
+            _wait_done(other)
 
 
 def test_reexport_argv_and_outcome(tmp_path):
@@ -264,11 +274,16 @@ def test_durable_status_roundtrip(tmp_path):
 def test_list_recent_running_first(tmp_path):
     finished_stdout = json.dumps({"outcome": "ALREADY_FINALIZED", "publication": None,
                                   "publication_blocked": None})
-    runner, _ = _runner(tmp_path, _FakeProcess(stuck=True),
+    running_process = _FakeProcess(stuck=True)
+    runner, _ = _runner(tmp_path, running_process,
                         _FakeProcess(returncode=0, stdout=finished_stdout))
     running = runner.start(action_type="closeout", business_date=BUSINESS_DATE)
-    done = runner.start(action_type="closeout", business_date="2026-08-27")
-    _wait_done(done)
-    listed = runner.list_recent()
-    assert listed[0].action_id == running.action_id
-    assert running.status == "RUNNING" and done.status == "SUCCEEDED"
+    try:
+        done = runner.start(action_type="closeout", business_date="2026-08-27")
+        _wait_done(done)
+        listed = runner.list_recent()
+        assert listed[0].action_id == running.action_id
+        assert running.status == "RUNNING" and done.status == "SUCCEEDED"
+    finally:
+        running_process.terminate()
+        _wait_done(running)

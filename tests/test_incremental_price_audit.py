@@ -19,6 +19,7 @@ from app.services.title_match_model_adapter import ModelCallRetryExhaustedError
 from app.workflows.work_01_saas_approval_json_audit import audit_saas_approval_records
 from openpyxl import load_workbook
 import scripts.audit_saas_excel_file as legacy_excel
+import app.services.incremental_audit_runtime as runtime_module
 from app.workflows.incremental_price_audit import (
     CrawlPlan,
     CrawlMember,
@@ -630,6 +631,165 @@ def _seed_priority_pending_job(store, business_date, identity):
     return job
 
 
+def test_harvest_backend_filter_skips_foreign_jobs_without_consuming_attempts(tmp_path):
+    store = DailyAuditStore(tmp_path / "state.sqlite")
+    clock = Clock()
+    identity = "batch-remote-identity"
+    job = _seed_priority_pending_job(store, "2026-08-11", identity)
+    calls = []
+    deps = _deps([], [], clock)
+    deps.harvest = lambda jobs, _timeout: calls.append(tuple(jobs)) or {}
+    deps.harvest_accepts = lambda _job: False
+    config = TickConfig(
+        business_date="2026-08-11",
+        runtime_budget_seconds=60,
+        heavy_work_reserve_seconds=0,
+        lease_ttl_seconds=60,
+    )
+    token = store.acquire_lease("2026-08-11", "backend-filter", 60)
+    try:
+        swept = _harvest(
+            store,
+            token,
+            deps,
+            TickBudget(clock.monotonic(), 60, 0, clock.monotonic),
+            {"crawl_harvested": 0},
+            config,
+        )
+    finally:
+        store.release_lease(token)
+
+    persisted = store.get_remote_job(int(job["id"]))
+    assert swept == set()
+    assert calls == []
+    assert persisted["state"] == "PRIORITY_PENDING"
+    assert persisted["harvest_attempts"] == 0
+
+
+def test_one_sqlite_harvests_legacy_and_batch_jobs_by_durable_backend(tmp_path):
+    store = DailyAuditStore(tmp_path / "state.sqlite")
+    store.ensure_run("2026-08-11")
+    token = store.acquire_lease("2026-08-11", "seed-mixed-backends", 60)
+    try:
+        jobs = []
+        for index, payload in enumerate(
+            (
+                {"requests": [{"backend_version": "legacy-v1"}]},
+                {
+                    "contract_version": "zhaoshang-batch-url-v1",
+                    "requests": [],
+                },
+            ),
+            start=1,
+        ):
+            job = store.prepare_remote_intent(
+                token,
+                f"mixed-logical-{index}",
+                f"mixed-task-{index}",
+                f"mixed-hash-{index}",
+                payload_json=payload,
+            )
+            store.claim_remote_submission(token, int(job["id"]))
+            jobs.append(
+                store.reconcile_remote_job(
+                    token,
+                    int(job["id"]),
+                    remote_identity=f"mixed-remote-{index}",
+                    state="RUNNING",
+                )
+            )
+    finally:
+        store.release_lease(token)
+
+    calls = {"legacy": [], "batch": []}
+
+    def callback(backend):
+        def harvest(selected, _timeout):
+            calls[backend].extend(int(job["id"]) for job in selected)
+            return {
+                int(job["id"]): {
+                    "state": "RUNNING",
+                    "remote_identity": str(job["remote_identity"]),
+                }
+                for job in selected
+            }
+
+        return harvest
+
+    clock = Clock()
+    deps = _deps([], [], clock)
+    deps.harvest = runtime_module._route_zhaoshang_harvest(
+        callback("legacy"), callback("batch")
+    )
+    deps.harvest_accepts = lambda job: runtime_module._remote_job_backend(job) in {
+        "legacy",
+        "batch",
+    }
+    config = TickConfig(
+        business_date="2026-08-11",
+        runtime_budget_seconds=60,
+        heavy_work_reserve_seconds=0,
+        lease_ttl_seconds=60,
+    )
+    token = store.acquire_lease("2026-08-11", "harvest-mixed-backends", 60)
+    try:
+        swept = _harvest(
+            store,
+            token,
+            deps,
+            TickBudget(clock.monotonic(), 60, 0, clock.monotonic),
+            {"crawl_harvested": 0},
+            config,
+        )
+    finally:
+        store.release_lease(token)
+
+    assert calls == {
+        "legacy": [int(jobs[0]["id"])],
+        "batch": [int(jobs[1]["id"])],
+    }
+    assert swept == {int(job["id"]) for job in jobs}
+    assert all(store.get_remote_job(int(job["id"]))["harvest_attempts"] == 1 for job in jobs)
+
+
+def test_harvest_manualizes_malformed_recovery_exhausted_before_cleanup(tmp_path):
+    store = DailyAuditStore(tmp_path / "state.sqlite")
+    clock = Clock()
+    job = _seed_priority_pending_job(store, "2026-08-11", "broken-identity")
+    with store._transaction(immediate=True) as connection:
+        connection.execute(
+            "UPDATE remote_jobs SET state='RECOVERY_EXHAUSTED', payload_json='{' WHERE id=?",
+            (int(job["id"]),),
+        )
+    deps = _deps([], [], clock)
+    deps.harvest = lambda *_args: pytest.fail("invalid payload must not reach an adapter")
+    deps.harvest_accepts = lambda _job: False
+    deps.remote_job_disposition = lambda _job: "invalid"
+    config = TickConfig(
+        business_date="2026-08-11",
+        runtime_budget_seconds=60,
+        heavy_work_reserve_seconds=0,
+        lease_ttl_seconds=60,
+    )
+    token = store.acquire_lease("2026-08-11", "invalid-backend", 60)
+    try:
+        _harvest(
+            store,
+            token,
+            deps,
+            TickBudget(clock.monotonic(), 60, 0, clock.monotonic),
+            {"crawl_harvested": 0},
+            config,
+        )
+    finally:
+        store.release_lease(token)
+
+    persisted = store.get_remote_job(int(job["id"]))
+    assert persisted["state"] == "MANUAL_REQUIRED"
+    assert persisted["error_text"] == "remote job backend payload is invalid"
+    assert persisted["harvest_attempts"] == 0
+
+
 def test_retryable_priority_failure_stays_pending_then_succeeds_on_same_job(tmp_path):
     store = DailyAuditStore(tmp_path / "state.sqlite")
     clock = Clock()
@@ -678,14 +838,16 @@ def test_retryable_priority_failure_stays_pending_then_succeeds_on_same_job(tmp_
     first = store.get_remote_job(int(job["id"]))
     assert first["state"] == "PRIORITY_PENDING"
     assert first["remote_identity"] == identity
-    assert first["harvest_attempts"] == 1
+    assert first["priority_attempts"] == 1
+    assert first["harvest_attempts"] == 0
     assert first["error_text"] == "InterfaceError"
 
     run_incremental_tick(store, ProcessLock(tmp_path / "tick-2.lock"), config, deps)
     second = store.get_remote_job(int(job["id"]))
     assert second["state"] == "SUBMITTED"
     assert second["remote_identity"] == identity
-    assert second["harvest_attempts"] == 2
+    assert second["priority_attempts"] == 2
+    assert second["harvest_attempts"] == 0
     assert second["error_text"] is None
     assert attempts == [(int(job["id"]), identity), (int(job["id"]), identity)]
 
@@ -702,7 +864,7 @@ def test_retryable_priority_failure_stays_pending_then_succeeds_on_same_job(tmp_
         (10, 1, 0.6, 1),
     ],
 )
-def test_retryable_priority_failure_becomes_manual_only_at_harvest_limit(
+def test_retryable_priority_failure_becomes_manual_only_at_priority_limit(
     tmp_path,
     max_attempts,
     max_elapsed_seconds,
@@ -730,6 +892,8 @@ def test_retryable_priority_failure_becomes_manual_only_at_harvest_limit(
         lease_ttl_seconds=60,
         harvest_max_attempts=max_attempts,
         harvest_max_elapsed_seconds=max_elapsed_seconds,
+        priority_retry_max_attempts=max_attempts,
+        priority_retry_max_elapsed_seconds=max_elapsed_seconds,
     )
     token = store.acquire_lease("2026-08-11", "priority-limit", 60)
     try:
@@ -761,6 +925,8 @@ def test_retryable_priority_failure_becomes_manual_only_at_harvest_limit(
     assert limited["state"] == "MANUAL_REQUIRED"
     assert limited["remote_identity"] == identity
     assert limited["error_text"] == "InterfaceError"
+    assert limited["harvest_attempts"] == 0
+    assert limited["harvest_elapsed_seconds"] == 0
 
 
 def test_default_priority_retry_bound_matches_remote_harvest_bound(tmp_path):
@@ -797,7 +963,8 @@ def test_default_priority_retry_bound_matches_remote_harvest_bound(tmp_path):
             )
             pending = store.get_remote_job(int(job["id"]))
             assert pending["state"] == "PRIORITY_PENDING"
-            assert pending["harvest_attempts"] == expected_attempts
+            assert pending["priority_attempts"] == expected_attempts
+            assert pending["harvest_attempts"] == 0
     finally:
         store.release_lease(token)
 
@@ -847,6 +1014,8 @@ def test_priority_success_on_last_permitted_attempt_wins_over_retry_bound(tmp_pa
         runtime_budget_seconds=60,
         heavy_work_reserve_seconds=0,
         lease_ttl_seconds=60,
+        priority_retry_max_attempts=3,
+        priority_retry_max_elapsed_seconds=60,
     )
     token = store.acquire_lease("2026-08-11", "priority-success-at-limit", 60)
     try:
@@ -863,9 +1032,204 @@ def test_priority_success_on_last_permitted_attempt_wins_over_retry_bound(tmp_pa
     finally:
         store.release_lease(token)
 
-    assert completed["harvest_attempts"] == 3
+    assert completed["priority_attempts"] == 3
+    assert completed["harvest_attempts"] == 0
     assert completed["state"] == "SUBMITTED"
     assert completed["remote_identity"] == identity
+
+
+def test_priority_confirmation_on_attempt_120_does_not_consume_harvest_budget(tmp_path):
+    store = DailyAuditStore(tmp_path / "state.sqlite")
+    clock = Clock()
+    identity = "jd|1242978|RW-20260818110643"
+    job = _seed_priority_pending_job(store, "2026-08-11", identity)
+    with store._transaction(immediate=True) as connection:
+        connection.execute(
+            "UPDATE remote_jobs SET priority_attempts=119 WHERE id=?",
+            (int(job["id"]),),
+        )
+    deps = _deps([], [], clock)
+    deps.harvest = lambda _jobs, _timeout: {
+        int(job["id"]): {
+            "state": "SUBMITTED",
+            "remote_identity": identity,
+            "result": {"priority_status": "PRIORITY_UPDATED"},
+        }
+    }
+    config = TickConfig(
+        business_date="2026-08-11",
+        runtime_budget_seconds=60,
+        heavy_work_reserve_seconds=0,
+        lease_ttl_seconds=60,
+        priority_retry_max_attempts=120,
+    )
+    token = store.acquire_lease("2026-08-11", "priority-attempt-120", 60)
+    try:
+        _harvest(
+            store,
+            token,
+            deps,
+            TickBudget(clock.monotonic(), 60, 0, clock.monotonic),
+            {"crawl_harvested": 0},
+            config,
+        )
+    finally:
+        store.release_lease(token)
+
+    persisted = store.get_remote_job(int(job["id"]))
+    assert persisted["state"] == "SUBMITTED"
+    assert persisted["priority_attempts"] == 120
+    assert persisted["harvest_attempts"] == 0
+
+
+def test_fifty_priority_retries_do_not_reduce_normal_harvest_budget(tmp_path):
+    store = DailyAuditStore(tmp_path / "state.sqlite")
+    clock = Clock()
+    identity = "jd|1242978|RW-20260818110643"
+    job = _seed_priority_pending_job(store, "2026-08-11", identity)
+    with store._transaction(immediate=True) as connection:
+        connection.execute(
+            "UPDATE remote_jobs SET priority_attempts=50 WHERE id=?",
+            (int(job["id"]),),
+        )
+    deps = _deps([], [], clock)
+    deps.harvest = lambda _jobs, _timeout: {
+        int(job["id"]): {
+            "state": "SUBMITTED",
+            "remote_identity": identity,
+            "result": {"priority_status": "PRIORITY_UPDATED"},
+        }
+    }
+    config = TickConfig(
+        business_date="2026-08-11",
+        runtime_budget_seconds=60,
+        heavy_work_reserve_seconds=0,
+        lease_ttl_seconds=60,
+    )
+    token = store.acquire_lease("2026-08-11", "priority-attempt-51", 60)
+    try:
+        _harvest(
+            store,
+            token,
+            deps,
+            TickBudget(clock.monotonic(), 60, 0, clock.monotonic),
+            {"crawl_harvested": 0},
+            config,
+        )
+    finally:
+        store.release_lease(token)
+
+    persisted = store.get_remote_job(int(job["id"]))
+    assert persisted["state"] == "SUBMITTED"
+    assert persisted["priority_attempts"] == 51
+    assert persisted["harvest_attempts"] == 0
+
+
+def test_priority_elapsed_at_limit_does_not_leak_into_normal_harvest(tmp_path):
+    store = DailyAuditStore(tmp_path / "state.sqlite")
+    clock = Clock()
+    identity = "jd|1242978|RW-20260818110643"
+    job = _seed_priority_pending_job(store, "2026-08-11", identity)
+    with store._transaction(immediate=True) as connection:
+        connection.execute(
+            "UPDATE remote_jobs SET priority_elapsed_seconds=59.9 WHERE id=?",
+            (int(job["id"]),),
+        )
+    deps = _deps([], [], clock)
+    deps.harvest = lambda _jobs, _timeout: {
+        int(job["id"]): {
+            "state": "SUBMITTED",
+            "remote_identity": identity,
+            "elapsed_seconds": 0.2,
+            "result": {"priority_status": "PRIORITY_UPDATED"},
+        }
+    }
+    config = TickConfig(
+        business_date="2026-08-11",
+        runtime_budget_seconds=60,
+        heavy_work_reserve_seconds=0,
+        lease_ttl_seconds=60,
+        priority_retry_max_elapsed_seconds=60,
+    )
+    token = store.acquire_lease("2026-08-11", "priority-elapsed", 60)
+    try:
+        _harvest(
+            store,
+            token,
+            deps,
+            TickBudget(clock.monotonic(), 60, 0, clock.monotonic),
+            {"crawl_harvested": 0},
+            config,
+        )
+    finally:
+        store.release_lease(token)
+
+    persisted = store.get_remote_job(int(job["id"]))
+    assert persisted["state"] == "SUBMITTED"
+    assert persisted["priority_elapsed_seconds"] == pytest.approx(60.1)
+    assert persisted["harvest_elapsed_seconds"] == 0
+
+
+def test_submit_unknown_reconcile_on_last_harvest_attempt_enters_priority_phase(tmp_path):
+    store = DailyAuditStore(tmp_path / "state.sqlite")
+    clock = Clock()
+    identity = "jd|1242978|RW-20260818110643"
+    store.ensure_run("2026-08-11")
+    token = store.acquire_lease("2026-08-11", "seed-submit-unknown", 60)
+    job = store.prepare_remote_intent(
+        token,
+        "submit-unknown-logical",
+        "submit-unknown-task",
+        "submit-unknown-payload",
+    )
+    crawl = store.ensure_crawl_work(
+        token,
+        "jd",
+        "sku-1",
+        "https://item.jd.com/1.html",
+        "legacy-v1",
+        "submit-unknown-crawl",
+    )
+    store.link_crawl_work_to_remote_job(token, int(crawl["id"]), int(job["id"]))
+    store.claim_remote_submission(token, int(job["id"]))
+    store.mark_submit_unknown(token, int(job["id"]), "post result unknown")
+    with store._transaction(immediate=True) as connection:
+        connection.execute(
+            "UPDATE remote_jobs SET harvest_attempts=119 WHERE id=?",
+            (int(job["id"]),),
+        )
+    deps = _deps([], [], clock)
+    deps.harvest = lambda _jobs, _timeout: {
+        int(job["id"]): {
+            "state": "PRIORITY_PENDING",
+            "remote_identity": identity,
+            "result": {"reconcile_status": "FOUND"},
+        }
+    }
+    config = TickConfig(
+        business_date="2026-08-11",
+        runtime_budget_seconds=60,
+        heavy_work_reserve_seconds=0,
+        lease_ttl_seconds=60,
+        harvest_max_attempts=120,
+    )
+    try:
+        _harvest(
+            store,
+            token,
+            deps,
+            TickBudget(clock.monotonic(), 60, 0, clock.monotonic),
+            {"crawl_harvested": 0},
+            config,
+        )
+    finally:
+        store.release_lease(token)
+
+    persisted = store.get_remote_job(int(job["id"]))
+    assert persisted["state"] == "PRIORITY_PENDING"
+    assert persisted["harvest_attempts"] == 120
+    assert persisted["priority_attempts"] == 0
+    assert store.get_crawl_work(int(crawl["id"]))["state"] == "PRIORITY_PENDING"
 
 
 def test_deterministic_operational_error_code_is_manual_on_first_priority_attempt(
@@ -914,7 +1278,8 @@ def test_deterministic_operational_error_code_is_manual_on_first_priority_attemp
     finally:
         store.release_lease(token)
 
-    assert failed["harvest_attempts"] == 1
+    assert failed["priority_attempts"] == 1
+    assert failed["harvest_attempts"] == 0
     assert failed["state"] == "MANUAL_REQUIRED"
     assert failed["remote_identity"] == identity
     assert failed["error_text"] == "OperationalError"
@@ -1969,7 +2334,7 @@ def test_harvest_sweep_never_polls_one_job_twice_in_the_same_round(tmp_path):
             store.reconcile_remote_job(
                 token,
                 int(job["id"]),
-                remote_identity=f"remote-mixed-{index}",
+                    remote_identity=f"mall|remote-mixed-{index}|task-{index}",
                 state=state,
             )
         )
@@ -2368,7 +2733,10 @@ def test_existing_remote_drain_advances_priority_then_harvests_same_command(tmp_
     job = store.prepare_remote_intent(token, "priority", "priority", "payload")
     store.claim_remote_submission(token, job["id"])
     job = store.reconcile_remote_job(
-        token, job["id"], remote_identity="remote-priority", state="PRIORITY_PENDING"
+        token,
+        job["id"],
+        remote_identity="mall|remote-priority|task-priority",
+        state="PRIORITY_PENDING",
     )
     store.release_lease(token)
     observed: list[str] = []
@@ -2625,6 +2993,58 @@ def test_harvest_persists_per_job_elapsed_evidence_not_whole_batch_elapsed(tmp_p
     elapsed = [store.get_remote_job(job["id"])["harvest_elapsed_seconds"] for job in jobs]
     store.release_lease(token)
     assert elapsed == [1, 10]
+
+
+def test_deferred_harvest_refunds_claim_without_clearing_prior_diagnostic(tmp_path):
+    store = DailyAuditStore(tmp_path / "state.sqlite")
+    clock = Clock()
+    store.ensure_run("2026-08-11")
+    token = store.acquire_lease("2026-08-11", "seed", 60)
+    job = store.prepare_remote_intent(token, "job", "job", "payload")
+    store.claim_remote_submission(token, int(job["id"]))
+    job = store.reconcile_remote_job(
+        token,
+        int(job["id"]),
+        remote_identity="remote",
+        state="RUNNING",
+    )
+    store.claim_harvest(
+        token, int(job["id"]), max_attempts=5, max_elapsed_seconds=60
+    )
+    store.record_harvest(
+        token,
+        int(job["id"]),
+        elapsed_seconds=1.5,
+        max_attempts=5,
+        max_elapsed_seconds=60,
+        error="prior timeout",
+    )
+    deps = _deps([], [], clock)
+    deps.harvest = lambda jobs, _timeout: {
+        int(jobs[0]["id"]): {"deferred": True}
+    }
+
+    _harvest(
+        store,
+        token,
+        deps,
+        TickBudget(clock.monotonic(), 60, 0, clock.monotonic),
+        {"crawl_harvested": 0},
+        TickConfig(
+            business_date="2026-08-11",
+            runtime_budget_seconds=60,
+            heavy_work_reserve_seconds=0,
+            lease_ttl_seconds=60,
+            harvest_max_attempts=5,
+            harvest_max_elapsed_seconds=60,
+        ),
+    )
+    persisted = store.get_remote_job(int(job["id"]))
+    store.release_lease(token)
+
+    assert persisted["harvest_attempts"] == 1
+    assert persisted["harvest_elapsed_seconds"] == pytest.approx(1.5)
+    assert persisted["error_text"] == "prior timeout"
 
 
 def test_new_source_with_same_backend_sku_url_reuses_completed_crawl_without_post(tmp_path):

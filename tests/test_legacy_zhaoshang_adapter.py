@@ -162,6 +162,90 @@ def test_mapping_parses_each_row_url_once_and_caches_repeated_host(monkeypatch):
     assert list(adapter._host_mapping_cache) == ["item.jd.com"]
 
 
+def test_jslink_urls_and_vendor_fallback_canonicalize_to_nbdeli_for_new_requests():
+    nbdeli = ZhaoshangMallMapping(
+        mall_name="得力商城",
+        source_id="19",
+        mall_key="nbdeli",
+        domains=("nbdeli.com",),
+        vendor_keywords=("nbdeli", "得力商城"),
+    )
+    jslink = ZhaoshangMallMapping(
+        mall_name="得力集实链",
+        source_id="145",
+        mall_key="jslink",
+        domains=("jslink.com",),
+        vendor_keywords=("jslink", "得力集实链"),
+    )
+    adapter = CnncLegacyZhaoshangAdapter(
+        mappings=[nbdeli, jslink], db_env_path=None
+    )
+
+    from_url = adapter.request_from_saas_row(
+        {
+            "skuId": "sku-1",
+            "extLink": "https://www.jslink.com/goods/400.html?ref=1#detail",
+        },
+        backend_version="batch-url-v1",
+    )
+    from_vendor = adapter.request_from_saas_row(
+        {"skuId": "sku-2", "extLink": "", "vendorName": "得力集实链"},
+        backend_version="legacy-v1",
+    )
+    from_default_port = adapter.request_from_saas_row(
+        {"skuId": "sku-3", "extLink": "https://www.jslink.com:443/goods/3"},
+        backend_version="batch-url-v1",
+    )
+    unsafe_port = adapter.request_from_saas_row(
+        {"skuId": "sku-4", "extLink": "https://www.jslink.com:8443/goods/4"},
+        backend_version="batch-url-v1",
+    )
+
+    assert from_url is not None
+    assert (
+        from_url.mall_key,
+        from_url.mall_source_id,
+        from_url.url,
+        from_url.backend_version,
+    ) == (
+        "nbdeli",
+        "19",
+        "https://b2b.nbdeli.com/goods/400.html?ref=1#detail",
+        "batch-url-v1",
+    )
+    assert from_vendor is not None
+    assert (from_vendor.mall_key, from_vendor.mall_source_id) == ("nbdeli", "19")
+    assert from_default_port is not None
+    assert from_default_port.url == "https://b2b.nbdeli.com/goods/3"
+    assert unsafe_port is None
+
+
+def test_unrelated_domain_containing_jslink_text_is_not_canonicalized():
+    adapter = CnncLegacyZhaoshangAdapter(
+        mappings=[
+            ZhaoshangMallMapping(
+                mall_name="得力商城",
+                source_id="19",
+                mall_key="nbdeli",
+                domains=("nbdeli.com",),
+                vendor_keywords=("nbdeli",),
+            )
+        ],
+        db_env_path=None,
+    )
+
+    assert (
+        adapter.request_from_saas_row(
+            {
+                "skuId": "sku-1",
+                "extLink": "https://notjslink.com/goods/400.html",
+            },
+            backend_version="legacy-v1",
+        )
+        is None
+    )
+
+
 def test_request_identity_keeps_same_url_with_two_skus_and_hashes_are_order_independent(tmp_path):
     first = _request("sku-1")
     second = _request("sku-2")
