@@ -405,9 +405,10 @@ task name 使用业务日和 immutable 请求集生成同日稳定、跨日不�
   0/N、partial N/M 和明确 transient DB 错误才有界重试，其他异常立即 fail-closed。
 - 只有 exact set 在单一 schema 全部物化后才冻结真实 `task_id` 集；写事务内会对两个 schema
   再做 exact `exec_num FOR UPDATE` 重验，随后 UPDATE 只按这些 PK，且限定
-  `task_status IN ('00','01') AND is_valid='1' AND weight_type<>'-1'`。事务内与 commit 后都回读
-  exact identity；仍活跃的行必须为 `-1`，已为 `-1` 视为幂等成功，竞态变成 `02`（完成）或
-  `03`（失败）的终态行均不强改，分别计入 `already_completed` / `already_failed`。
+  `is_valid='1' AND weight_type<>'-1'`，不按 `task_status` 过滤。事务内与 commit 后都回读
+  exact identity；全部精确有效行都必须为 `-1`，已为 `-1` 视为幂等成功。竞态变成
+  `02`（完成）或 `03`（失败）的行也须确认 `-1`，最终状态分别计入
+  `already_completed` / `already_failed`，不代表跳过提优。
   确认后才从 `PRIORITY_PENDING` 进入 `SUBMITTED` 并在后续 sweep 查询 progress。重启只从 SQLite
   immutable payload 恢复 backend 与 `execute_numbers`。CLI backend 只决定新任务的 planner/submitter；
   当前 18 个生产商城均可逐链接走 batch；`mymro / ofs` 只有在提交 URL 能按已证明的严格格式解析 product code 时才标记 `batch-url-v1`，否则该链接自动回退 `legacy-v1`。这两个商城以 exact executeNumber 加 submitted URL product code 作为请求身份，唯一 SQL result 允许后续 SKU/goods_no/result URL code 变化，多条 result 仍 fail closed。新建 `jslink.com`

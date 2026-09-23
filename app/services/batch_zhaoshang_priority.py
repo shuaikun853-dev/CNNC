@@ -194,7 +194,6 @@ def _task_update_sql(schema: str, count: int) -> str:
 UPDATE {schema}.s_task_info
 SET weight_type = '-1'
 WHERE task_id IN ({_placeholders(count)})
-  AND task_status IN ('00', '01')
   AND is_valid = '1'
   AND weight_type <> '-1'
 """
@@ -493,8 +492,8 @@ def _verify_priority_rows(
         status = str(row.get("task_status") or "").strip()
         if status not in {"00", "01", "02", "03"}:
             raise BatchPrioritySafetyError("unexpected task_status")
-        if status in {"00", "01"} and str(row.get("weight_type") or "").strip() != "-1":
-            raise BatchPrioritySafetyError("active row is not highest priority")
+        if str(row.get("weight_type") or "").strip() != "-1":
+            raise BatchPrioritySafetyError("row is not highest priority")
 
 
 def boost_batch_priority_by_execute_numbers(
@@ -506,7 +505,7 @@ def boost_batch_priority_by_execute_numbers(
     deadline: float | None = None,
     monotonic: Callable[[], float] = time.monotonic,
 ) -> BatchPriorityOutcome:
-    """Freeze the exact materialized PK set, update eligible rows, and read back."""
+    """Freeze the exact materialized PK set, update nonhighest rows, and read back."""
 
     if probe.status is not BatchMaterializationStatus.MATERIALIZED:
         raise BatchPrioritySafetyError("batch slice is not exactly materialized")
@@ -581,8 +580,7 @@ def boost_batch_priority_by_execute_numbers(
             update_ids = tuple(
                 row["task_id"]
                 for row in before
-                if str(row.get("task_status") or "").strip() in {"00", "01"}
-                and str(row.get("weight_type") or "").strip() != "-1"
+                if str(row.get("weight_type") or "").strip() != "-1"
             )
             affected_rows = 0
             for chunk in _chunks(update_ids, update_batch_size):

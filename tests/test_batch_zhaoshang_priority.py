@@ -258,7 +258,7 @@ def test_probe_does_not_misclassify_unknown_database_errors_as_retryable() -> No
         probe_batch_materialization(connection, _target(1))
 
 
-def test_priority_updates_only_active_nonhighest_primary_keys() -> None:
+def test_priority_updates_all_exact_nonhighest_primary_keys() -> None:
     before = [_row(1), _row(2)]
     after = [_row(1, weight_type="-1"), _row(2, weight_type="-1")]
     connection = _Connection(
@@ -281,7 +281,7 @@ def test_priority_updates_only_active_nonhighest_primary_keys() -> None:
         call for call in connection.calls if call[0].lstrip().startswith("UPDATE")
     )
     assert "WHERE task_id IN" in update_sql
-    assert "task_status IN ('00', '01')" in update_sql
+    assert "task_status" not in update_sql
     assert "is_valid = '1'" in update_sql
     assert update_params == (1, 2)
     assert connection.commits == 1
@@ -312,10 +312,10 @@ def test_priority_is_idempotent_for_already_highest_rows() -> None:
 
 def test_priority_allows_rows_that_complete_before_the_update() -> None:
     before = [_row(1), _row(2, task_status="02")]
-    after = [_row(1, weight_type="-1"), _row(2, task_status="02")]
+    after = [_row(1, weight_type="-1"), _row(2, task_status="02", weight_type="-1")]
     connection = _Connection(
         _Step(rows=before),
-        _Step(rowcount=1),
+        _Step(rowcount=2),
         _Step(rows=after),
         _Step(rows=after),
     )
@@ -330,15 +330,17 @@ def test_priority_allows_rows_that_complete_before_the_update() -> None:
         params
         for sql, params in connection.calls
         if sql.lstrip().startswith("UPDATE")
-    ) == (1,)
+    ) == (1, 2)
 
 
-def test_priority_accepts_row_already_failed_before_lock_without_update() -> None:
+def test_priority_updates_row_already_failed_before_lock() -> None:
     failed = [_row(1, task_status="03")]
+    updated = [_row(1, task_status="03", weight_type="-1")]
     connection = _Connection(
         _Step(rows=failed),
-        _Step(rows=failed),
-        _Step(rows=failed),
+        _Step(rowcount=1),
+        _Step(rows=updated),
+        _Step(rows=updated),
     )
 
     result = boost_batch_priority_by_execute_numbers(
@@ -349,16 +351,19 @@ def test_priority_accepts_row_already_failed_before_lock_without_update() -> Non
     assert result.priority_updated == 0
     assert result.already_highest == 0
     assert result.already_completed == 0
-    assert not any(sql.lstrip().startswith("UPDATE") for sql, _ in connection.calls)
+    assert result.affected_rows == 1
+    assert next(params for sql, params in connection.calls if sql.lstrip().startswith("UPDATE")) == (1,)
 
 
-def test_priority_accepts_active_row_that_fails_under_transaction_lock() -> None:
+def test_priority_updates_active_row_that_fails_under_transaction_lock() -> None:
     probe_row = _row(1, task_status="00")
     failed = [_row(1, task_status="03")]
+    updated = [_row(1, task_status="03", weight_type="-1")]
     connection = _Connection(
         _Step(rows=failed),
-        _Step(rows=failed),
-        _Step(rows=failed),
+        _Step(rowcount=1),
+        _Step(rows=updated),
+        _Step(rows=updated),
         transaction_probe_steps=(_Step(rows=failed), _Step(rows=[])),
     )
 
@@ -367,8 +372,8 @@ def test_priority_accepts_active_row_that_fails_under_transaction_lock() -> None
     )
 
     assert result.already_failed == 1
-    assert result.affected_rows == 0
-    assert not any(sql.lstrip().startswith("UPDATE") for sql, _ in connection.calls)
+    assert result.affected_rows == 1
+    assert next(params for sql, params in connection.calls if sql.lstrip().startswith("UPDATE")) == (1,)
 
 
 def test_priority_readback_accepts_active_row_that_fails_after_commit() -> None:
@@ -456,7 +461,7 @@ def test_priority_accepts_zero_affected_rows_when_readback_is_already_highest() 
     assert result.affected_rows == 0
 
 
-def test_priority_accepts_short_update_when_remaining_row_completed_in_race() -> None:
+def test_priority_rejects_short_update_when_completed_row_is_not_highest() -> None:
     before = [_row(1), _row(2)]
     after = [_row(1, weight_type="-1"), _row(2, task_status="02")]
     connection = _Connection(
@@ -466,12 +471,11 @@ def test_priority_accepts_short_update_when_remaining_row_completed_in_race() ->
         _Step(rows=after),
     )
 
-    result = boost_batch_priority_by_execute_numbers(
-        connection, _target(2), _materialized_probe(*before)
-    )
-
-    assert result.priority_updated == 1
-    assert result.already_completed == 1
+    with pytest.raises(BatchPrioritySafetyError, match="row is not highest priority"):
+        boost_batch_priority_by_execute_numbers(
+            connection, _target(2), _materialized_probe(*before)
+        )
+    assert connection.commits == 0
 
 
 def test_priority_fails_closed_on_readback_identity_drift() -> None:
@@ -543,7 +547,7 @@ def test_priority_fails_closed_when_active_readback_is_not_highest() -> None:
         _Step(rows=before),
     )
 
-    with pytest.raises(BatchPrioritySafetyError, match="active row is not highest"):
+    with pytest.raises(BatchPrioritySafetyError, match="row is not highest priority"):
         boost_batch_priority_by_execute_numbers(
             connection, _target(1), _materialized_probe(*before)
         )
