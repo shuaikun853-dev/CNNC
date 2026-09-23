@@ -311,4 +311,4 @@ def test_final_status_counts_missing_page_price_by_frozen_business_row(tmp_path)
 
     assert status["final"]["page_price_required_rows"] == 4
     assert status["final"]["missing_page_price_rows"] == 2
-    assert status["final"]["force_closeout_limit"] == 20
+    assert status["final"]["force_closeout_limit"] == 30

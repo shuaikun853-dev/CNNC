@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from typing import Any, Mapping, Sequence
 
-FORCE_CLOSEOUT_MISSING_PRICE_LIMIT = 20
+FORCE_CLOSEOUT_MISSING_PRICE_LIMIT = 30
 
 
 def crawl_identity(row: Mapping[str, Any]) -> tuple[str, str, str]:

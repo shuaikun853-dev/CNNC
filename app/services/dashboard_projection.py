@@ -225,7 +225,7 @@ def _final_text(s: Mapping, closeout_running: bool = False) -> tuple[str, str]:
     if "missing_page_price_rows" in f:
         missing_prefix = (
             f"未爬到价格:{int(f.get('missing_page_price_rows') or 0)} 条"
-            f"(强制收口上限 {int(f.get('force_closeout_limit') or 20)} 条)。"
+            f"(强制收口上限 {int(f.get('force_closeout_limit') or 30)} 条)。"
         )
     mapping = [("remote_pending", "个招商局任务仍在执行/待回收"), ("remote_intent", "个任务已排队待提交"),
                ("remote_unknown", "个任务提交结果待确认"), ("remote_manual", "项招商局任务需人工"),
