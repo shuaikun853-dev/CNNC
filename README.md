@@ -98,7 +98,7 @@ cnnc-ops-agent/
 | 路径 | 用途 |
 |---|---|
 | `E:\.A2026\招商局自动建任务` | 招商局任务创建、启用、进度和导出 |
-| `E:\.A中核运维\cnnc-mall-crawler` | 首轮锁定 review/manifest，经本批次二次授权后独立续跑的四站安全兜底 |
+| `E:\.A中核运维\cnnc-mall-crawler-prod` | 固定 Git revision 的九站人工安全兜底；大江 `zdet` 绕过招商局，只在完整 STEP_1 的 multi-site manifest 候选数/SHA-256 二次授权后直接跑脚本；增量自动兜底仍固定 8 站 |
 | `E:\.A中核运维\自动拉取` | 历史/辅助数据拉取能力 |
 | `E:\.A中核运维\cnnc_to_saas_monitor.py` | 历史监控汇总工具 |
 | `E:\.A中核运维\monitor_status_export.py` | 历史本地 JSON/SaaS 监控导出工具 |
