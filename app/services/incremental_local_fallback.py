@@ -9,7 +9,6 @@ import os
 from pathlib import Path
 import re
 import subprocess
-import sys
 from typing import Any, Callable, Mapping, Sequence
 from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
@@ -29,8 +28,9 @@ SUPPORTED_MALLS = frozenset({
 MAX_ATTEMPTS = 2
 MIN_EXECUTION_WINDOW_SECONDS = 60
 MAX_CHILD_TIMEOUT_SECONDS = 600
-EXPECTED_CRAWLER_REVISION = "20a716a10a6b84e4f36db61b27ccf35407438cd5"
-DEFAULT_CRAWLER_ROOT = Path(r"E:\.A中核运维\cnnc-mall-crawler-releases\tima-prod-final-20260924")
+EXPECTED_CRAWLER_REVISION = "9e4c1c1b182adcf3776a8ae5fcbbd6ba59a5911b"
+DEFAULT_CRAWLER_ROOT = Path(r"E:\.A中核运维\cnnc-mall-crawler-releases\multisite-prod-20260924")
+DEFAULT_CRAWLER_PYTHON = Path(r"E:\PythonEnvs\cnnc-mall-crawler-prod-9e4c1c\Scripts\python.exe")
 SITE_ALIASES = {"ofs": "officemate"}
 SITE_HOSTS = {
     "nbdeli": {"b2b.nbdeli.com"},
@@ -324,7 +324,7 @@ def execute_pinned_crawler(
         return outcomes
     try:
         completed = subprocess.run(
-            [sys.executable, "-m", "mall_crawler.cli", "--manifest", str(manifest_path)],
+            [str(DEFAULT_CRAWLER_PYTHON), "-m", "mall_crawler.cli", "--manifest", str(manifest_path)],
             cwd=str(Path(crawler_root).resolve()), env=env, check=False,
             capture_output=True, text=True, encoding="utf-8", errors="replace",
             timeout=min(MAX_CHILD_TIMEOUT_SECONDS, live_timeout),
