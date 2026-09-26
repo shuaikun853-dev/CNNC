@@ -128,6 +128,19 @@ def test_case1_closeout_runs_daily_curl_guard_once_before_orchestrator(
     assert seq == [("guard", TODAY), ("closeout", TODAY)]
 
 
+def test_closeout_guard_receives_command_absolute_deadline(tmp_path, monkeypatch):
+    observed = []
+    def guard(**kwargs):
+        observed.append(kwargs)
+        return "DAILY_CURL_ALREADY_FRESH"
+    monkeypatch.setattr(runtime_module.cnnc_auth_refresh, "ensure_daily_curl_fresh", guard)
+    monkeypatch.setattr(runtime_module, "run_closeout", _fake_closeout([]))
+    run_runtime_command("closeout", business_date=TODAY,
+        runtime_root=tmp_path / "runtime", dependencies=_deps(),
+        runtime_budget_seconds=900.0, monotonic=lambda: 100.0)
+    assert observed[0]["deadline_monotonic"] == 1000.0
+
+
 def test_case2_today_fresh_artifact_closeout_never_refreshes(tmp_path, monkeypatch):
     """今日工件 CURL_REFRESH_OK 3/3 → runner 0 次，closeout 照常执行。"""
     _write_artifact(

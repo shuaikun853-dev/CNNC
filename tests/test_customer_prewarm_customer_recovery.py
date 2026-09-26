@@ -558,7 +558,7 @@ def test_finding_a_customer_only_recovered_when_event_intake_failed(tmp_path):
         runs = connection.execute(
             "SELECT documents_seen FROM prewarm_recovery_runs ORDER BY id"
         ).fetchall()
-    assert [int(row["documents_seen"]) for row in runs] == [2, 2]
+    assert [int(row["documents_seen"]) for row in runs] == [2]
 
 
 # ---- Finding A: run_prewarm_scan Phase B2 编排 ---------------------------------------

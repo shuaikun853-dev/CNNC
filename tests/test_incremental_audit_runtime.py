@@ -78,6 +78,26 @@ from scripts import incremental_price_audit as cli
 from scripts.zhaoshang_mall_mapping import ZhaoshangMallMapping
 
 
+@pytest.fixture
+def offline_resource_root(tmp_path, monkeypatch):
+    """Ignored production credentials must never be needed by offline tests."""
+    import socket
+
+    assert runtime_module.PROJECT_DATA_ROOT == runtime_module.PROJECT_ROOT / "data"
+    root = tmp_path / "offline-project-data"
+    root.mkdir()
+    for name in ("latest_saas_sameAudit_queryAll.curl", "latest_cnnc_query.curl", "detail_request.curl"):
+        (root / name).write_text("curl https://fixture.invalid/query --data-raw '{}'", encoding="utf-8")
+    (root / "model.env").write_text(
+        "TITLE_MATCH_MODEL_API_KEY=offline-placeholder\n"
+        "TITLE_MATCH_MODEL_BASE_URL=https://fixture.invalid/v1\n"
+        "TITLE_MATCH_MODEL_NAME=offline-model\n", encoding="utf-8",
+    )
+    monkeypatch.setattr(runtime_module, "PROJECT_DATA_ROOT", root)
+    monkeypatch.setattr(socket, "create_connection", lambda *a, **k: pytest.fail("offline test attempted network"))
+    return root
+
+
 def test_remote_job_backend_is_recovered_from_the_durable_payload() -> None:
     batch = {
         "payload_json": json.dumps(
@@ -272,7 +292,7 @@ def test_hybrid_creation_rejects_missing_or_mixed_durable_backend():
         submit({"id": 3, "payload_json": "{}"}, [], 10)
 
 
-def test_default_legacy_tick_keeps_crash_recovered_batch_job_harvestable(tmp_path) -> None:
+def test_default_legacy_tick_keeps_crash_recovered_batch_job_harvestable(tmp_path, offline_resource_root) -> None:
     dependencies = runtime_module.build_default_dependencies(
         enable_zhaoshang=False,
         zhaoshang_backend="legacy",
@@ -455,7 +475,7 @@ def test_lifecycle_only_routes_sqlite_jobs_by_durable_backend_without_create(
     assert calls["batch_create"] == 0
 
 
-def test_batch_shadow_tick_defers_priority_without_consuming_claim_budget(tmp_path) -> None:
+def test_batch_shadow_tick_defers_priority_without_consuming_claim_budget(tmp_path, offline_resource_root) -> None:
     dependencies = runtime_module.build_default_dependencies(
         enable_zhaoshang=False,
         zhaoshang_backend="batch",
@@ -1303,7 +1323,7 @@ def test_runtime_paths_preserves_explicit_junction_alias(tmp_path):
 
 
 def test_project_resources_and_default_runtime_root_do_not_depend_on_cwd(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, offline_resource_root
 ):
     cwd_data = tmp_path / "data"
     cwd_data.mkdir()
@@ -1345,7 +1365,7 @@ def test_project_resources_and_default_runtime_root_do_not_depend_on_cwd(
     paths = runtime_paths("2026-08-11")
 
     assert runtime_module.PROJECT_ROOT == Path(runtime_module.__file__).resolve().parents[2]
-    assert runtime_module.PROJECT_DATA_ROOT == runtime_module.PROJECT_ROOT / "data"
+    assert runtime_module.PROJECT_DATA_ROOT == offline_resource_root
     assert captured == {
         "saas": runtime_module.PROJECT_DATA_ROOT / "latest_saas_sameAudit_queryAll.curl",
         "cnnc": runtime_module.PROJECT_DATA_ROOT / "latest_cnnc_query.curl",
@@ -1365,7 +1385,7 @@ def test_project_resources_and_default_runtime_root_do_not_depend_on_cwd(
 
 
 def test_finalize_dependency_construction_from_non_project_cwd_is_offline(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, offline_resource_root
 ):
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(

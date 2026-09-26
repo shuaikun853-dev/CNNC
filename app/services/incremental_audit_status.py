@@ -23,6 +23,7 @@ from app.services.page_price_semantics import (
     valid_page_price_result,
 )
 from app.services.remote_stall_breaker import evaluate_remote_stall
+from app.services.snapshot_membership import membership_source_id, snapshot_row_expression
 
 
 REQUIRED_TABLES = frozenset(
@@ -316,7 +317,7 @@ def _stage_status(connection: sqlite3.Connection, snapshot_id: int, stage: str, 
            JOIN (SELECT DISTINCT audit_item_id FROM snapshot_members WHERE snapshot_id=?) m
              ON m.audit_item_id=w.audit_item_id
            WHERE w.stage=? GROUP BY w.state""",
-        (snapshot_id, stage),
+        (membership_source_id(connection, snapshot_id), stage),
     ).fetchall()
     states = {str(row["state"]): int(row["count"]) for row in rows}
     represented = sum(states.values())
@@ -372,7 +373,7 @@ def _customer_price_summary(
            JOIN (SELECT DISTINCT audit_item_id FROM snapshot_members WHERE snapshot_id=?) m
              ON m.audit_item_id=w.audit_item_id
            WHERE w.stage=?""",
-        (snapshot_id, "DETAIL"),
+        (membership_source_id(connection, snapshot_id), "DETAIL"),
     ).fetchall()
     represented = len(rows)
     for row in rows:
@@ -503,13 +504,15 @@ def collect_runtime_status(
             membership = _group_counts(
                 connection.execute(
                     "SELECT change_kind AS state, COUNT(*) AS count FROM snapshot_members WHERE snapshot_id=? GROUP BY change_kind",
-                    (latest_id,),
+                    (membership_source_id(connection, latest_id),),
                 ).fetchall()
             )
+            if membership_source_id(connection, latest_id) != latest_id:
+                membership = {"UNCHANGED": sum(membership.values())} if membership else {}
             unique_items = int(
                 connection.execute(
                     "SELECT COUNT(DISTINCT audit_item_id) FROM snapshot_members WHERE snapshot_id=?",
-                    (target_snapshot_id,),
+                    (membership_source_id(connection, target_snapshot_id),),
                 ).fetchone()[0]
             )
             detail = _stage_status(connection, target_snapshot_id, "DETAIL", unique_items)
@@ -559,11 +562,11 @@ def collect_runtime_status(
                 for row in crawl_rows
             }
             frozen_rows = connection.execute(
-                """SELECT i.row_json
+                f"""SELECT {snapshot_row_expression(connection)} AS row_json
                    FROM snapshot_members m
                    JOIN audit_items i ON i.id=m.audit_item_id
                    WHERE m.snapshot_id=? ORDER BY m.row_ordinal""",
-                (target_snapshot_id,),
+                (membership_source_id(connection, target_snapshot_id),),
             ).fetchall()
             for frozen_row in frozen_rows:
                 try:

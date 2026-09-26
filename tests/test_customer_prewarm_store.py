@@ -165,7 +165,7 @@ def test_upsert_document_idempotent_and_source_priority(store, clock):
     row = rows[0]
     assert row["id"] == first["id"] == second["id"]
     assert row["first_seen_at"] == first["first_seen_at"]
-    assert row["last_seen_at"] == "2026-09-07T00:00:02.000000+00:00"  # last_seen 被刷新
+    assert row["last_seen_at"] == first["last_seen_at"]  # unchanged intake is write-idempotent
     assert row["source"] == "event"
     # scanner 复见:source 保持 event,business_date 保持首见日
     rescanned = store.upsert_document("2026-09-08", "D1", "C1", source="scanner")

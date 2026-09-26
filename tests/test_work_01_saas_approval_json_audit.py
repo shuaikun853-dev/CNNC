@@ -2969,7 +2969,7 @@ class TestRunMultiSiteFallback:
             r"E:\.A中核运维\cnnc-mall-crawler-prod"
         )
         assert excel_audit_mod.EXPECTED_MULTI_SITE_CRAWLER_REVISION == (
-            "08abb74089cfa9007dc6f6ddc850f9fd41990a24"
+            "1d9c91c50815af9fbd305339d88ae277e387409a"
         )
 
     def test_concurrent_resume_only_one_worker_starts(self, tmp_path, monkeypatch):
@@ -3802,7 +3802,7 @@ class TestApplyCrawlResults:
 
 
 class TestExcludedTemplateAutoExport:
-    def test_dual_json_mode_auto_exports_excluded_templates(self, tmp_path, monkeypatch):
+    def test_dual_json_mode_auto_exports_excluded_templates(self, tmp_path, monkeypatch, offline_manual_mall_mappings):
         """双 JSON 模式 run_main 会在解析前自动生成京东+震坤行模板。"""
         # 该用例需启用导出
         monkeypatch.delenv("AUDIT_SUPPRESS_EXCLUDED_EXPORT", raising=False)

@@ -300,6 +300,13 @@ class CustomerPrewarmStore:
     def _initialize(self) -> None:
         with self._transaction(immediate=True) as connection:
             connection.executescript(_SCHEMA)
+            recovery_columns = {row["name"] for row in connection.execute("PRAGMA table_info(prewarm_recovery_runs)")}
+            for name, definition in (
+                ("first_ran_at", "TEXT"),
+                ("attempt_count", "INTEGER NOT NULL DEFAULT 1"),
+            ):
+                if name not in recovery_columns:
+                    connection.execute(f"ALTER TABLE prewarm_recovery_runs ADD COLUMN {name} {definition}")
             # Pure-addition migration for pre-existing (Round-1) databases,
             # mirroring daily_audit_store._initialize: check PRAGMA
             # table_info, then ALTER TABLE; idempotent on every open.
@@ -408,6 +415,27 @@ class CustomerPrewarmStore:
             values["customer_price"] = None
         now = self._utcnow()
         with self._transaction(immediate=True) as connection:
+            existing = connection.execute(
+                "SELECT * FROM prewarm_document_evidence WHERE business_date=? AND document_id=?",
+                (business_date_value, document_value),
+            ).fetchone()
+            if existing is not None:
+                merged = dict(existing)
+                for key in ("four_category_id", "four_category_name", "customer_title"):
+                    if values[key]:
+                        merged[key] = values[key]
+                if values["customer_price"] is not None:
+                    merged["customer_price"] = values["customer_price"]
+                if values["customer_price"] is not None or (
+                    existing["customer_price"] is None and values["customer_price_status"]
+                ):
+                    for key in ("customer_price_status", "customer_price_source",
+                                "customer_price_warning", "customer_price_evidence"):
+                        merged[key] = values[key]
+                # Intake provenance may alternate between event and recovery.
+                # It is not itself a change in the day's customer evidence.
+                if all(merged[key] == existing[key] for key in values if key != "source"):
+                    return dict(existing)
             connection.execute(
                 """INSERT INTO prewarm_document_evidence
                    (business_date, document_id, four_category_id, four_category_name,
@@ -552,7 +580,9 @@ class CustomerPrewarmStore:
                 )
             else:
                 # business_date 是首见日,永不更新;一旦被 event 见过就保持 event。
-                new_source = row["source"] if row["source"] == "event" else source_value
+                # Keep first discovery provenance unless promoted to event;
+                # scanner/recovery alternation is not a business change.
+                new_source = "event" if source_value == "event" else row["source"]
                 if bool(category_value) and category_value != row["four_category_id"]:
                     # category 变化(含空→非空)→ 重置 PENDING 并清零 attempts 与退避。
                     connection.execute(
@@ -563,7 +593,7 @@ class CustomerPrewarmStore:
                            WHERE document_id=?""",
                         (now, new_source, category_value, document_value),
                     )
-                else:
+                elif new_source != row["source"]:
                     connection.execute(
                         "UPDATE prewarm_documents SET last_seen_at=?, source=? WHERE document_id=?",
                         (now, new_source, document_value),
@@ -1617,7 +1647,11 @@ class CustomerPrewarmStore:
         return value or None
 
     def record_recovery_run(self, business_date: str, documents_seen: int) -> None:
-        """Append one scanner recovery attempt for throttle bookkeeping.
+        """Record recovery state; coalesce consecutive equal daily outcomes.
+
+        Legacy rows have no first_ran_at and are never modified. New rows
+        retain the first/last attempt and count; outcome transitions remain
+        separate history, including the failure sentinel.
 
         RECOVERY_FAILED_DOCUMENTS_SEEN is reserved for an attempted recovery whose customer
         fetch failed before rows were available.  It throttles the next retry
@@ -1626,11 +1660,21 @@ class CustomerPrewarmStore:
         self._assert_writable()
         business_date_value = self._require_text(business_date, "business_date")
         with self._transaction(immediate=True) as connection:
+            now = self._utcnow()
+            latest = connection.execute("SELECT * FROM prewarm_recovery_runs ORDER BY id DESC LIMIT 1").fetchone()
+            if (latest is not None and latest["first_ran_at"] is not None
+                    and latest["business_date"] == business_date_value
+                    and latest["documents_seen"] == int(documents_seen)):
+                connection.execute(
+                    "UPDATE prewarm_recovery_runs SET ran_at=?, attempt_count=attempt_count+1 WHERE id=?",
+                    (now, latest["id"]),
+                )
+                return
             connection.execute(
                 """INSERT INTO prewarm_recovery_runs
-                   (business_date, ran_at, documents_seen)
-                   VALUES (?, ?, ?)""",
-                (business_date_value, self._utcnow(), int(documents_seen)),
+                   (business_date, ran_at, documents_seen, first_ran_at)
+                   VALUES (?, ?, ?, ?)""",
+                (business_date_value, now, int(documents_seen), now),
             )
 
     # ---- stats ---------------------------------------------------------------------

@@ -56,15 +56,15 @@ except ImportError:  # Direct invocation from scripts/（含命名空间 scripts
 
 ROOT = Path(__file__).resolve().parents[1]
 # 手动恢复结果工件（--login-and-recover 各 outcome 都写；status 路由只读合并）
-LOGIN_RECOVERY_RESULT_PATH = ROOT / "data" / "cnnc_login_recovery_result.json"
+LOGIN_RECOVERY_RESULT_PATH = core.AUTH_DATA_DIR / "cnnc_login_recovery_result.json"
 # cURL 独立刷新操作结果工件（run_curl_refresh 各 outcome 都写；2026-09-10）
-CURL_REFRESH_RESULT_PATH = ROOT / "data" / "cnnc_curl_refresh_result.json"
+CURL_REFRESH_RESULT_PATH = core.AUTH_DATA_DIR / "cnnc_curl_refresh_result.json"
 # 跨进程 single-flight 认证维护锁路径（GPT Review Round 2 Blocker 3 +
 # 2026-09-10 统一维护锁语义）：--login-and-recover 与 --refresh-curl/
 # --harvest 互斥共用同一把锁，禁止并发第二个认证维护进程。复用
 # daily_audit_store.ProcessLock（msvcrt/fcntl 单字节 OS 锁：进程退出自动
 # 释放、inspect 探活区分"文件存在"vs"锁被持有"），不自造文件锁。
-AUTH_MAINTENANCE_LOCK_PATH = ROOT / "data" / ".cnnc_login_recovery.lock"
+AUTH_MAINTENANCE_LOCK_PATH = core.AUTH_DATA_DIR / ".cnnc_login_recovery.lock"
 # 兼容别名（dashboard_api/既有测试按旧名引用；与维护锁同一路径同值）：
 LOGIN_RECOVERY_LOCK_PATH = AUTH_MAINTENANCE_LOCK_PATH
 try:
@@ -265,6 +265,16 @@ def _write_curl_refresh_result(path, outcome, *, at="", curl_expected=0,
         "curl_failed_files": list(curl_failed_files),
         "at_redacted": core.redact_secret(at),
     }
+    if trigger != "manual":
+        try:
+            previous = json.loads(Path(path).read_text(encoding="utf-8"))
+            if isinstance(previous, dict) and all(
+                previous.get(key) == value for key, value in payload.items()
+                if key != "completed_at"
+            ):
+                return
+        except (OSError, ValueError):
+            pass
     _atomic_write_json(path, payload)
 
 
@@ -363,7 +373,7 @@ def run_login_and_recover(login_runner=None, provider=None, result_path=None,
 
 
 def run_curl_refresh(provider=None, result_path=None, lock_path=None,
-                     trigger="manual", business_date=None) -> int:
+                     trigger="manual", business_date=None, deadline_monotonic=None) -> int:
     """独立 cURL 刷新操作（--refresh-curl / --harvest 共享的唯一实现）。
 
     与 login-and-recover 互斥共用同一把跨进程认证维护锁
@@ -375,14 +385,18 @@ def run_curl_refresh(provider=None, result_path=None, lock_path=None,
 
     provider/result_path/lock_path/trigger/business_date 可注入（测试 seam，
     锁与工件路径全部 tmp 注入）；默认 provider 为 _default_provider()，默认
-    工件 data/cnnc_curl_refresh_result.json。force 刷新后执行严格后置核验
+    工件 data/cnnc_curl_refresh_result.json。人工 force；自动先只读验证已有 AT，
+    明确认证拒绝才走受冷却约束的刷新。已有有效 AT 只在模板不同步时同步，
+    不启动浏览器。两条路径执行严格后置核验
     （复用 _verify_curl_sync 同一核验器，绝不复制第二套核验器；refresh 内部
     宽松语义不动）。
 
     business_date 权威值：参数优先；缺省用 Asia/Shanghai 今日
     （_shanghai_today，禁用 utcnow）。trigger：manual | daily-preflight。
+    自动路径将可选 deadline_monotonic 原样传到 provider 的验证/刷新共享预算；
+    未指定时 provider 使用既有各阶段上限之和作为有限总预算。人工 force 不受影响。
     返回码：
-        0  refresh(force=True) 成功且期望 cURL 全部同步（CURL_REFRESH_OK）
+        0  认证有效且期望 cURL 全部同步（CURL_REFRESH_OK）
         1  其他 CnncAuthError（AUTH_REFRESH_FAILED；状态已由 provider 落盘）
         2  refresh 抛 SSO_LOGIN_REQUIRED（提示先重新登录；工件
            at_redacted=""、cURL 计数 0）
@@ -390,7 +404,8 @@ def run_curl_refresh(provider=None, result_path=None, lock_path=None,
            stdout/工件只报文件名）
         5  维护锁被持（零副作用）
 
-    各 outcome 都写结果工件（completed_at/business_date/trigger/outcome/
+    各 outcome 写结果工件；自动运行相同结果不重复写（completed_at 为该状态首次记录）。
+    工件包含 completed_at/business_date/trigger/outcome/
     cURL 计数/at_redacted，原子写尽力而为不影响返回码；rc=5 不写）。
     全程不打印完整凭证。
     """
@@ -414,7 +429,22 @@ def run_curl_refresh(provider=None, result_path=None, lock_path=None,
                        else CURL_REFRESH_RESULT_PATH)
         effective_business_date = business_date or _shanghai_today()
         try:
-            at = provider.refresh(force=True)
+            if trigger == "manual":
+                at = provider.refresh(force=True)
+            else:
+                if deadline_monotonic is None:
+                    provider.ensure_valid()
+                else:
+                    provider.ensure_valid(deadline_monotonic=deadline_monotonic)
+                at = provider.get_access_token()
+                _, stale_files = _verify_curl_sync(at, getattr(provider, "curl_files", ()))
+                if stale_files:
+                    try:
+                        provider.sync_curl_files(at)
+                    except core.CnncAuthError as exc:
+                        if exc.status != core.CnncAuthStatus.CURL_SYNC_FAILED:
+                            raise
+                        # The token is valid; the common post-check reports rc=4.
         except core.CnncAuthError as exc:
             # 失败状态/审计已由 provider 落盘，这里只提示并按状态码定退出码
             if exc.status == core.CnncAuthStatus.SSO_LOGIN_REQUIRED:
@@ -489,7 +519,8 @@ def _artifact_is_daily_curl_fresh(path, business_date: str) -> bool:
 
 
 def ensure_daily_curl_fresh(business_date: str, provider=None, result_path=None,
-                            lock_path=None, runner=None, now=None) -> str:
+                            lock_path=None, runner=None, now=None,
+                            deadline_monotonic=None) -> str:
     """每日 cURL freshness guard（tick/finalize 前预检；2026-09-10）。
 
     只读结果工件判定当日 cURL 是否已全量同步（business_date 相等 +
@@ -503,7 +534,7 @@ def ensure_daily_curl_fresh(business_date: str, provider=None, result_path=None,
 
     部分失败语义：runner rc=4（AUTH_REFRESH_OK_CURL_SYNC_FAILED）落盘的
     工件不满足新鲜判定 → 不算新鲜，下一次 tick 再调 guard 会再次尝试
-    刷新，直到一次全量同步成功为止。
+    检查，直到一次全量同步成功为止；有效 AT 不因此 harvest，失败刷新受冷却保护。
 
     business_date/provider/result_path/lock_path/runner 可注入（测试 seam，
     工件与锁路径全部 tmp 注入，绝不触碰真实 data/）；runner 缺省
@@ -524,9 +555,10 @@ def ensure_daily_curl_fresh(business_date: str, provider=None, result_path=None,
     if _artifact_is_daily_curl_fresh(result_path, business_date):
         return "DAILY_CURL_ALREADY_FRESH"
     try:
+        budget = {} if deadline_monotonic is None else {"deadline_monotonic": deadline_monotonic}
         rc = int(runner(trigger="daily-preflight", business_date=business_date,
                         provider=provider, result_path=result_path,
-                        lock_path=lock_path))
+                        lock_path=lock_path, **budget))
     except Exception:  # noqa: BLE001 — guard 绝不向 tick 上抛
         return "DAILY_CURL_REFRESH_ERROR"
     return _DAILY_CURL_GUARD_RC_MAP.get(rc, "AUTH_REFRESH_FAILED")

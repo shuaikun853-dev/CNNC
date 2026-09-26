@@ -224,7 +224,7 @@ def recover_customer_documents(
     recovery reads the customer side ONLY (no SaaS query) and upserts the
     rows as ``source="scanner-recovery"``.
 
-    Throttled by the append-only ``prewarm_recovery_runs`` table: when a
+    Throttled by the latest ``prewarm_recovery_runs`` outcome: when a
     previous run exists and ``(now - last_ran_at) < interval_seconds``, the
     function returns ``{"throttled": True, "documents_intaked": 0}`` without
     calling ``customer_fetch``.  ``interval_seconds=0`` disables throttling

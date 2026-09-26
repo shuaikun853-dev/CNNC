@@ -12,6 +12,41 @@ import os
 import pytest
 
 
+@pytest.fixture
+def offline_manual_mall_mappings(monkeypatch, tmp_path):
+    """Manual routing/export tests must not depend on an ignored production XLSX."""
+    import socket
+    import subprocess
+    from openpyxl import Workbook
+    from scripts import audit_saas_excel_file as step1
+    from scripts import export_excluded_malls as exports
+    from scripts import zhaoshang_mall_mapping as mapping
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("offline mapping test must not load real tools or access network")
+
+    monkeypatch.setattr(step1, "_load_zhaoshang_run_crawl_task", forbidden)
+    monkeypatch.setattr(socket.socket, "connect", forbidden)
+    monkeypatch.setattr(subprocess, "Popen", forbidden)
+    book = Workbook()
+    sheet = book.active
+    sheet.append(["商城名称", "sourceId", "商城标识 identification", "商城URL"])
+    for row in [
+        ["京东", "3", "jd", "https://item.jd.com"],
+        ["震坤行商城", "4", "zkh", "https://www.zkh.com"],
+        ["固安捷", "20", "mymro", "https://www.mymro.cn"],
+        ["得力商城", "21", "nbdeli", "https://b2b.nbdeli.com"],
+        ["得力集实采", "22", "jslink", "https://www.jslink.com"],
+        ["领先未来商城", "23", "lxwl", "https://www.66123123.com"],
+        ["领先未来新商城", "24", "lxwlmall", "https://www.lxwlmall.com"],
+    ]:
+        sheet.append(row)
+    path = tmp_path / "offline-mall-mapping.xlsx"
+    book.save(path)
+    monkeypatch.setattr(mapping, "DEFAULT_MAPPING_PATH", path)
+    monkeypatch.setattr(exports, "EXCLUDED_MALLS", mapping.load_zhaoshang_mall_mappings())
+
+
 @pytest.fixture(autouse=True)
 def _suppress_excluded_export(monkeypatch):
     """默认禁用 run_main 的爬取模板自动导出。

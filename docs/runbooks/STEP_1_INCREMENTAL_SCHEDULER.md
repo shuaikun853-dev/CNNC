@@ -4,6 +4,8 @@
 > Task Scheduler 脚本，但必须显式传 `-Apply` 才会改系统；legacy 对照和 rollback 仍按
 > [STEP_1_PRICE_AUDIT.md](STEP_1_PRICE_AUDIT.md) 执行。
 
+写盘维护、每日 dispatch JSONL、重复快照保留、fallback 临时文件生命周期及 snapshot membership 复用的兼容发布门禁，见 [RUNTIME_WRITE_AMPLIFICATION.md](RUNTIME_WRITE_AMPLIFICATION.md)。
+
 ## 当前入口与状态
 
 从仓库根目录运行。直接脚本与模块形式等价；Windows Task Scheduler 可采用前者：

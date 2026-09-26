@@ -140,6 +140,7 @@ if ($phases.Count -eq 0) {
     exit 0
 }
 
+. (Join-Path $PSScriptRoot "scheduler_e_environment.ps1") -RepoRoot $repo -RuntimeRoot $RuntimeRoot
 $pythonPath = (Get-Command $PythonExe -ErrorAction Stop).Source
 $processHostPath = Join-Path $PSScriptRoot "scheduled_process_host.cs"
 if (-not (Test-Path -LiteralPath $processHostPath -PathType Leaf)) {

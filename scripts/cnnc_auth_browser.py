@@ -71,6 +71,7 @@
 
 import argparse
 import json
+import math
 import os
 import re
 import shutil
@@ -83,15 +84,21 @@ import urllib.request
 import uuid
 from pathlib import Path
 
+import psutil
+
 # 登录表单自动填充深模块（限速/幂等/精确 Origin 门禁内聚在 autofiller.tick）
 try:  # 兼容两种入口：作为 scripts.* 包导入（pytest）与直接脚本执行
     from scripts.cnnc_login_autofill import create_login_autofiller
+    from scripts.cnnc_auth_paths import get_auth_data_dir
+    from scripts.filesystem_safety import is_reparse_point
 except ImportError:  # 直接 python scripts/cnnc_auth_browser.py 时的 sys.path[0]=scripts
     from cnnc_login_autofill import create_login_autofiller
+    from cnnc_auth_paths import get_auth_data_dir
+    from filesystem_safety import is_reparse_point
 
 # ROOT = 本脚本所在目录（scripts/）的上一级，即 cnnc-ops-agent/
 ROOT = Path(__file__).resolve().parent.parent
-DATA_DIR = ROOT / "data"
+DATA_DIR = get_auth_data_dir(ROOT)
 STORAGE_STATE = DATA_DIR / "cnnc_auth_storage_state.json"
 
 # 浏览器一次性临时 Profile 统一落盘根：仓库 runtime/browser_tmp（跟随仓库
@@ -99,13 +106,14 @@ STORAGE_STATE = DATA_DIR / "cnnc_auth_storage_state.json"
 # 路径下实际落 E 盘）。此前 Profile 使用系统 TEMP：当浏览器认证相关进程异常
 # 终止或被外层超时/进程终止机制结束时，finally 清理可能无法执行，残留目录
 # 长期累积占用系统 TEMP 所在磁盘；2026-09-15 事故排查发现系统 TEMP 下存在
-# Chrome Profile 残留并伴随 C 盘空间不足。本根目录不可用时仍会 fallback 系统
-# TEMP 保认证（函数内在调用时读取，测试可 monkeypatch）。
+# Chrome Profile 残留并伴随 C 盘空间不足。根目录不可用时必须停止，禁止回退 TEMP。
 BROWSER_TMP_ROOT = ROOT / "runtime" / "browser_tmp"
 # login 可能等待人工操作，保留 6 小时陈旧窗口；harvest 无人工交互且有界，
 # 单独使用 10 分钟窗口。两者都明显长于各自正常运行时间，避免误删活动 Profile。
 STALE_BROWSER_TMP_MAX_AGE_SECONDS = 6 * 3600
 STALE_HARVEST_TMP_MAX_AGE_SECONDS = 10 * 60
+PROFILE_OWNER_FILE = "cnnc_profile_owner.json"
+PROFILE_MARKER = "cnnc-auth-browser-v1"
 
 # AUTHORIZE_URL 仅作说明保留，不再作为 harvest 的 goto 目标：直接 goto 该
 # URL 会被 WAF 挑战页（412 中转页）卡死。harvest 改用 HARVEST_ENTRY（门户
@@ -151,7 +159,7 @@ def save_session_state(cookies: list, path) -> list:
     返回本次落盘的 cookie 名单。
     """
     session = select_session_cookies(cookies)
-    path = Path(path)
+    path = _e_path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = path.with_name("%s.tmp-%s" % (path.name, uuid.uuid4().hex))
     try:
@@ -261,7 +269,7 @@ def _launch_chrome_cdp(url=None, headless=False, *, user_data_dir):
         raise RuntimeError("CDP 调试端口 %d-%d 全部被占用"
                            % (CDP_PORT_RANGE[0], CDP_PORT_RANGE[-1] - 1))
 
-    user_data_dir = Path(user_data_dir)
+    user_data_dir = _e_path(user_data_dir)
     user_data_dir.mkdir(parents=True, exist_ok=True)
 
     # 3. 启动纯净 Chrome：无任何自动化 flag
@@ -280,6 +288,7 @@ def _launch_chrome_cdp(url=None, headless=False, *, user_data_dir):
 
     # 4. 轮询 CDP 端点就绪
     try:
+        proc._cnnc_identity = psutil.Process(proc.pid).create_time()
         version_url = "http://127.0.0.1:%d/json/version" % port
         deadline = time.time() + CDP_READY_TIMEOUT_SEC
         ready = False
@@ -316,33 +325,58 @@ def _launch_chrome_cdp(url=None, headless=False, *, user_data_dir):
         raise
 
 
-def _kill_chrome(proc):
-    """终止脚本启动的 Chrome 子进程（尽力而为，不抛错）。"""
+def _owned_chrome_tree(proc):
+    """Capture identities while the owned root can still prove its descendants."""
     try:
-        if proc.poll() is None:
-            proc.terminate()
+        identity = getattr(proc, "_cnnc_identity", None)
+        if identity is None or proc.poll() is not None:
+            return []
+        root = psutil.Process(proc.pid)
+        if root.create_time() != identity:
+            return []
+        children = root.children(recursive=True)
+        return [(p.pid, p.create_time()) for p in children] + [(root.pid, identity)]
+    except (psutil.Error, OSError):
+        return []
+
+
+def _kill_chrome(proc, owned=None):
+    """Stop captured owned identities even when CDP close has exited the root."""
+    owned = _owned_chrome_tree(proc) if owned is None else owned
+    terminated = []
+    for pid, created_at in reversed(owned):
+        try:
+            # A fresh Process object avoids create_time's per-object cache.
+            process = psutil.Process(pid)
+            if process.create_time() == created_at:
+                process.terminate()
+                terminated.append(process)
+        except (psutil.Error, OSError):
+            continue
+    try:
+        _, alive = psutil.wait_procs(terminated, timeout=10)
+        for process in alive:
             try:
-                proc.wait(10)
-            except Exception:
-                pass
-            if proc.poll() is None:
-                try:
-                    proc.kill()
-                except Exception:
-                    pass
-    except Exception:
+                current = psutil.Process(process.pid)
+                if current.create_time() == dict(owned)[process.pid]:
+                    current.kill()
+            except (psutil.Error, OSError):
+                continue
+        psutil.wait_procs(alive, timeout=5)
+    except (psutil.Error, OSError):
         pass
 
 
 def _close_cdp(proc, browser, pw):
     """清理 CDP 接管资源：断开连接 -> 杀 Chrome 子进程 -> 停 Playwright。"""
+    owned = _owned_chrome_tree(proc) if proc is not None else []
     if browser is not None:
         try:
             browser.close()  # 仅断开 CDP 连接
         except Exception:
             pass
     if proc is not None:
-        _kill_chrome(proc)
+        _kill_chrome(proc, owned=owned)
     if pw is not None:
         try:
             pw.stop()
@@ -351,47 +385,109 @@ def _close_cdp(proc, browser, pw):
 
 
 def _make_browser_profile_dir(prefix):
-    """创建浏览器一次性临时 Profile 目录（仓库 runtime/browser_tmp + 陈旧清扫）。
+    """Create an E-only profile; never substitute system TEMP on failure."""
+    if prefix not in ("cnnc_login_", "cnnc_harvest_", "cnnc_smoke_"):
+        raise ValueError("Unknown CNNC profile purpose")
+    root = _e_path(BROWSER_TMP_ROOT)
+    root.mkdir(parents=True, exist_ok=True)
+    for child in root.iterdir():
+        _remove_browser_profile(child, orphan=True)
+    identity = psutil.Process(os.getpid()).create_time()
+    profile = Path(tempfile.mkdtemp(prefix=prefix, dir=str(root)))
+    metadata = {"marker": PROFILE_MARKER, "purpose": prefix[5:-1],
+                "run_id": uuid.uuid4().hex, "pid": os.getpid(),
+                "owner_created_at": identity, "created_at": time.time()}
+    try:
+        (profile / PROFILE_OWNER_FILE).write_text(json.dumps(metadata), encoding="utf-8")
+    except OSError:
+        # No browser has used this freshly allocated directory yet. An unmarked
+        # profile cannot safely be reclaimed by the later orphan sweep.
+        try:
+            if profile.parent == root and not is_reparse_point(profile):
+                shutil.rmtree(profile)
+        except OSError:
+            pass
+        raise
+    return profile
 
-    login/harvest/smoke 三处统一入口，三步全为尽力而为、绝不打断认证链路：
-    1. mkdir BROWSER_TMP_ROOT；根目录不可用（OSError）时打一行 WARN 回退系统
-       TEMP mkdtemp——认证失败比临时目录落错盘严重得多；
-    2. 顺带清扫陈旧残留：cnnc_login_ 使用 6 小时窗口，cnnc_harvest_
-       使用 10 分钟窗口。进程异常终止或被外层超时/进程终止机制结束时
-       finally rmtree 走不到，残留依靠下一次启动自愈回收；
-       整个清扫吞一切异常、绝不影响返回；
-    3. 返回 Path(tempfile.mkdtemp(prefix, dir=BROWSER_TMP_ROOT))；这一步若也
-       抛 OSError（如 BROWSER_TMP_ROOT 所在盘满了），同样打一行 WARN 回退
-       系统 TEMP mkdtemp，系统 TEMP 再失败则异常自然抛出。
-    """
+
+def _e_path(path):
+    path = Path(path).resolve()
+    if path.drive.lower() != "e:":
+        raise OSError("CNNC browser writes require an E-drive destination")
+    return path
+
+
+def _process_inventory():
+    """A missing command line means cleanup cannot establish non-use."""
+    records = []
     try:
-        BROWSER_TMP_ROOT.mkdir(parents=True, exist_ok=True)
-    except OSError:
-        print("WARN：BROWSER_TMP_ROOT 不可用，本次回退系统 TEMP: %s"
-              % BROWSER_TMP_ROOT, file=sys.stderr)
-        return Path(tempfile.mkdtemp(prefix=prefix))
-    try:
-        now = time.time()
-        for child in sorted(BROWSER_TMP_ROOT.iterdir()):
-            if child.name.startswith("cnnc_harvest_"):
-                max_age_seconds = STALE_HARVEST_TMP_MAX_AGE_SECONDS
-            elif child.name.startswith("cnnc_login_"):
-                max_age_seconds = STALE_BROWSER_TMP_MAX_AGE_SECONDS
-            else:
-                continue
+        for process in psutil.process_iter():
             try:
-                if child.stat().st_mtime < now - max_age_seconds:
-                    shutil.rmtree(child, ignore_errors=True)
-            except Exception:
-                pass
-    except Exception:
-        pass
+                name = process.name().lower()
+                command = process.cmdline() if "chrome" in name else []
+                if "chrome" in name and not command:
+                    return None
+                records.append({"pid": process.pid, "created_at": (
+                    process.create_time() if process.pid == os.getpid() else None),
+                                "name": name, "cmdline": command})
+            except psutil.NoSuchProcess:
+                continue
+    except (psutil.Error, OSError):
+        return None
+    return records
+
+
+def _profile_referenced(profile, records):
+    for record in records:
+        args = record["cmdline"]
+        for i, arg in enumerate(args):
+            value = None
+            if arg.startswith("--user-data-dir="):
+                value = arg.split("=", 1)[1]
+            elif arg == "--user-data-dir" and i + 1 < len(args):
+                value = args[i + 1]
+            if value and Path(value.strip('"')).resolve() == profile:
+                return True
+    return False
+
+
+def _remove_browser_profile(path, *, orphan=False):
+    """Fail closed for unknown, linked, active, reused-PID or unobservable profiles."""
     try:
-        return Path(tempfile.mkdtemp(prefix=prefix, dir=str(BROWSER_TMP_ROOT)))
-    except OSError:
-        print("WARN：BROWSER_TMP_ROOT 下创建 Profile 失败，本次回退系统 TEMP: %s"
-              % BROWSER_TMP_ROOT, file=sys.stderr)
-        return Path(tempfile.mkdtemp(prefix=prefix))
+        root = _e_path(BROWSER_TMP_ROOT)
+        path = Path(path)
+        if is_reparse_point(path):
+            return False
+        path = _e_path(path)
+        if path.parent != root or not path.is_dir():
+            return False
+        metadata = json.loads((path / PROFILE_OWNER_FILE).read_text(encoding="utf-8"))
+        purpose = metadata["purpose"]
+        if (metadata["marker"] != PROFILE_MARKER or purpose not in ("login", "harvest", "smoke")
+                or not path.name.startswith("cnnc_%s_" % purpose)
+                or not re.fullmatch(r"[0-9a-f]{32}", metadata["run_id"])
+                or not isinstance(metadata["pid"], int) or metadata["pid"] <= 0
+                or not math.isfinite(metadata["owner_created_at"])
+                or metadata["owner_created_at"] <= 0
+                or not math.isfinite(metadata["created_at"])):
+            return False
+        records = _process_inventory()
+        if records is None or _profile_referenced(path, records):
+            return False
+        owner = next((r for r in records if r["pid"] == metadata["pid"]), None)
+        if orphan:
+            max_age = (STALE_BROWSER_TMP_MAX_AGE_SECONDS if purpose == "login"
+                       else STALE_HARVEST_TMP_MAX_AGE_SECONDS)
+            if owner is not None or time.time() - metadata["created_at"] <= max_age:
+                return False
+        elif (owner is None or metadata["pid"] != os.getpid()
+              or owner["created_at"] != metadata["owner_created_at"]):
+            return False
+        shutil.rmtree(path)
+        return True
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
 
 
 def cmd_login(args):
@@ -476,7 +572,7 @@ def cmd_login(args):
         # Windows 下临时目录被 Chrome 进程占用时删不掉：必须先断开 CDP 并
         # 杀掉 Chrome 子进程，再删除临时 Profile 目录（同 harvest）
         _close_cdp(proc, browser, pw)
-        shutil.rmtree(login_dir, ignore_errors=True)
+        _remove_browser_profile(login_dir)
 
 
 def cmd_harvest(args):
@@ -731,7 +827,7 @@ def cmd_harvest(args):
         # Windows 下临时目录被 Chrome 进程占用时删不掉：必须先断开 CDP 并
         # 杀掉 Chrome 子进程，再删除临时 Profile 目录
         _close_cdp(proc, browser, pw)
-        shutil.rmtree(harvest_dir, ignore_errors=True)
+        _remove_browser_profile(harvest_dir)
 
 
 def cmd_smoke(args):
@@ -739,7 +835,7 @@ def cmd_smoke(args):
 
     同 harvest 模式：一次性临时 Profile（mkdtemp + rmtree），不污染持久 Profile。
     """
-    smoke_dir = _make_browser_profile_dir("cnnc_harvest_")
+    smoke_dir = _make_browser_profile_dir("cnnc_smoke_")
     proc = browser = pw = None
     try:
         proc, browser, pw = _launch_chrome_cdp(url=None, headless=True,
@@ -753,7 +849,7 @@ def cmd_smoke(args):
     finally:
         # 先杀 Chrome 进程再删目录（Windows 目录占用限制，同 harvest）
         _close_cdp(proc, browser, pw)
-        shutil.rmtree(smoke_dir, ignore_errors=True)
+        _remove_browser_profile(smoke_dir)
 
 
 def main():

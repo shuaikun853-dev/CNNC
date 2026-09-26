@@ -236,8 +236,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--json-output",
         type=Path,
         default=None,
-        help="optional path to write the full summary dict as JSON (parents created)",
+        help="optional summary output; .jsonl appends a complete record, .json preserves legacy single-document output",
     )
+    parser.add_argument("--invocation-id", default=None, help=argparse.SUPPRESS)
     return parser
 
 
@@ -261,6 +262,23 @@ def _shared_harvest_deadline(window_started: float, reserve_seconds: float) -> f
 
 def _write_json_output(path: Path, summary: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    if path.suffix.lower() == ".jsonl":
+        record = dict(summary)
+        if _INVOCATION_ID is not None:
+            record["invocation_id"] = _INVOCATION_ID
+        record.setdefault("timestamp", datetime.now().astimezone().isoformat(timespec="seconds"))
+        record.setdefault("business_date", business_date_in_shanghai())
+        record.setdefault("outcome", "UNKNOWN")
+        record.setdefault("counters", {key: value for key, value in summary.items() if isinstance(value, (int, float)) and not isinstance(value, bool)})
+        record.setdefault("errors", summary.get("phase_errors", []))
+        if summary.get("error_type"):
+            record["errors"] = [*record["errors"], summary["error_type"]]
+        record.setdefault("duration", max(0.0, time.monotonic() - _INVOCATION_STARTED))
+        with path.open("a", encoding="utf-8", newline="\n") as stream:
+            stream.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        return
     path.write_text(
         json.dumps(summary, ensure_ascii=False, sort_keys=True, indent=2),
         encoding="utf-8",
@@ -294,6 +312,13 @@ def _run_backfill(args: argparse.Namespace, business_date: str, runtime_root: Pa
             business_dates=dates,
         )
     except Exception as exc:  # noqa: BLE001 - scheduler-facing failure
+        failure_summary = {
+            "business_date": business_date,
+            "outcome": "BACKFILL_FAILED",
+            "error_type": type(exc).__name__,
+        }
+        if args.json_output is not None:
+            _write_json_output(args.json_output, failure_summary)
         print(
             json.dumps(
                 {
@@ -701,6 +726,12 @@ def _run_dispatch(args: argparse.Namespace, business_date: str, runtime_root: Pa
                         mappings=mappings,
                     )
     except Exception as exc:  # noqa: BLE001 - scheduler-facing failure
+        if args.json_output is not None:
+            _write_json_output(args.json_output, {
+                "business_date": business_date,
+                "outcome": "DISPATCH_FAILED",
+                "error_type": type(exc).__name__,
+            })
         print(
             json.dumps(
                 {
@@ -768,8 +799,15 @@ def _run_dispatch(args: argparse.Namespace, business_date: str, runtime_root: Pa
     return 0
 
 
+_INVOCATION_STARTED = time.monotonic()
+_INVOCATION_ID = None
+
+
 def main(argv: list[str] | None = None) -> int:
+    global _INVOCATION_STARTED, _INVOCATION_ID
+    _INVOCATION_STARTED = time.monotonic()
     args = build_parser().parse_args(argv)
+    _INVOCATION_ID = args.invocation_id
     business_date = args.business_date or business_date_in_shanghai()
     # Hard configuration errors fail closed with exit code 2; expected runtime
     # conditions (lock conflict, missing state db) do not.
