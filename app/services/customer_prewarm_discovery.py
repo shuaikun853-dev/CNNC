@@ -72,6 +72,7 @@ from app.services.crawl_url_identity import (
 from app.services.customer_prewarm_store import (
     CACHE_STATUS_CACHE_HIT,
     CACHE_STATUS_PENDING_PREWARM,
+    RECOVERY_FAILED_DOCUMENTS_SEEN,
     CustomerPrewarmStore,
 )
 from app.services.customer_reference_links import extract_reference_links
@@ -227,9 +228,9 @@ def recover_customer_documents(
     previous run exists and ``(now - last_ran_at) < interval_seconds``, the
     function returns ``{"throttled": True, "documents_intaked": 0}`` without
     calling ``customer_fetch``.  ``interval_seconds=0`` disables throttling
-    (run every pass).  ``customer_fetch`` exceptions propagate to the phase
-    guard — a failed recovery must never record a run row, so the next pass
-    retries.
+    (run every pass).  ``customer_fetch`` exceptions still propagate to the
+    phase guard, but the failed attempt is recorded with documents_seen=-1 so
+    the same throttle interval applies before the next retry.
     """
     now_value = now if now is not None else datetime.now(UTC)
     last_ran_at = prewarm_store.last_recovery_run_at()
@@ -237,7 +238,23 @@ def recover_customer_documents(
         elapsed_seconds = (now_value - datetime.fromisoformat(last_ran_at)).total_seconds()
         if elapsed_seconds < interval_seconds:
             return {"throttled": True, "documents_intaked": 0}
-    rows = customer_fetch()
+    try:
+        rows = customer_fetch()
+    except Exception as exc:
+        # A failed recovery still consumed the expensive customer/auth attempt.
+        # Record it for the same throttle window so a one-minute scheduler does
+        # not relaunch browser harvest every minute.  The named sentinel means
+        # "attempted but customer rows were not obtained"; no customer
+        # document is marked as seen or ingested.
+        try:
+            prewarm_store.record_recovery_run(
+                business_date, RECOVERY_FAILED_DOCUMENTS_SEEN
+            )
+        except Exception as record_exc:  # preserve the authoritative fetch error
+            exc.add_note(
+                f"failed to persist recovery throttle marker: {type(record_exc).__name__}"
+            )
+        raise
     documents_seen = len(rows)
     intaked = intake_documents(
         prewarm_store,

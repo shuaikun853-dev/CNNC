@@ -36,6 +36,8 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Iterator, Sequence
 
+RECOVERY_FAILED_DOCUMENTS_SEEN = -1
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS prewarm_documents (
     id INTEGER PRIMARY KEY,
@@ -1615,7 +1617,12 @@ class CustomerPrewarmStore:
         return value or None
 
     def record_recovery_run(self, business_date: str, documents_seen: int) -> None:
-        """Append one scanner recovery run row (throttle bookkeeping, Issue #9)."""
+        """Append one scanner recovery attempt for throttle bookkeeping.
+
+        RECOVERY_FAILED_DOCUMENTS_SEEN is reserved for an attempted recovery whose customer
+        fetch failed before rows were available.  It throttles the next retry
+        without claiming that any customer document was observed.
+        """
         self._assert_writable()
         business_date_value = self._require_text(business_date, "business_date")
         with self._transaction(immediate=True) as connection:

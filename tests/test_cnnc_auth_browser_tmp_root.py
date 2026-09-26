@@ -99,6 +99,29 @@ def test_case22_sweep_failure_does_not_break_profile_creation(monkeypatch, tmp_p
     assert profile.is_dir()
 
 
+def test_case22_harvest_profiles_use_a_short_stale_window_but_login_does_not(
+        monkeypatch, tmp_path):
+    """harvest 残留快速自愈；login 仍保留长窗口，避免误删人工登录会话。"""
+    root = tmp_path / "browser_tmp"
+    root.mkdir(parents=True)
+    monkeypatch.setattr(browser, "BROWSER_TMP_ROOT", root)
+    harvest_stale = root / "cnnc_harvest_stale"
+    harvest_stale.mkdir()
+    login_same_age = root / "cnnc_login_same_age"
+    login_same_age.mkdir()
+    age = browser.STALE_HARVEST_TMP_MAX_AGE_SECONDS + 60
+    os.utime(harvest_stale, (time.time() - age,) * 2)
+    os.utime(login_same_age, (time.time() - age,) * 2)
+
+    profile = browser._make_browser_profile_dir("cnnc_harvest_")
+
+    assert browser.STALE_HARVEST_TMP_MAX_AGE_SECONDS > browser.HARVEST_TIMEOUT_SEC
+    assert browser.STALE_HARVEST_TMP_MAX_AGE_SECONDS < browser.STALE_BROWSER_TMP_MAX_AGE_SECONDS
+    assert not harvest_stale.exists()
+    assert login_same_age.exists()
+    assert profile.is_dir()
+
+
 def test_case22_stale_login_dirs_swept(monkeypatch, tmp_path):
     """cnnc_login_ 前缀的 >6 小时陈旧残留同样被清扫，新鲜目录保留（覆盖补全）。"""
     root = tmp_path / "browser_tmp"

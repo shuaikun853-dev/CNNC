@@ -665,10 +665,13 @@ class DailyAuditStore:
 
     def renew_lease(self, token: LeaseToken, ttl_seconds: float) -> LeaseToken:
         with self._transaction(immediate=True) as connection:
-            self._validate_lease(connection, token)
+            run = self._validate_lease(connection, token)
+            renewed_expiry = max(
+                str(run["lease_expires_at"]), self._expiry(ttl_seconds)
+            )
             connection.execute(
                 "UPDATE daily_runs SET lease_expires_at=?, updated_at=? WHERE id=? AND lease_owner=? AND lease_generation=?",
-                (self._expiry(ttl_seconds), self._utcnow(), token.run_id, token.owner, token.generation),
+                (renewed_expiry, self._utcnow(), token.run_id, token.owner, token.generation),
             )
         return token
 

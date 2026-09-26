@@ -102,9 +102,10 @@ STORAGE_STATE = DATA_DIR / "cnnc_auth_storage_state.json"
 # Chrome Profile 残留并伴随 C 盘空间不足。本根目录不可用时仍会 fallback 系统
 # TEMP 保认证（函数内在调用时读取，测试可 monkeypatch）。
 BROWSER_TMP_ROOT = ROOT / "runtime" / "browser_tmp"
-# 陈旧残留清扫阈值：必须远超 login 15 分钟窗口与 harvest 60 秒窗口，6 小时
-# 覆盖过夜残留；正在使用的 Profile 绝不会被误删（只在创建新 Profile 前清扫）。
+# login 可能等待人工操作，保留 6 小时陈旧窗口；harvest 无人工交互且有界，
+# 单独使用 10 分钟窗口。两者都明显长于各自正常运行时间，避免误删活动 Profile。
 STALE_BROWSER_TMP_MAX_AGE_SECONDS = 6 * 3600
+STALE_HARVEST_TMP_MAX_AGE_SECONDS = 10 * 60
 
 # AUTHORIZE_URL 仅作说明保留，不再作为 harvest 的 goto 目标：直接 goto 该
 # URL 会被 WAF 挑战页（412 中转页）卡死。harvest 改用 HARVEST_ENTRY（门户
@@ -355,9 +356,9 @@ def _make_browser_profile_dir(prefix):
     login/harvest/smoke 三处统一入口，三步全为尽力而为、绝不打断认证链路：
     1. mkdir BROWSER_TMP_ROOT；根目录不可用（OSError）时打一行 WARN 回退系统
        TEMP mkdtemp——认证失败比临时目录落错盘严重得多；
-    2. 顺带清扫根目录下超过 STALE_BROWSER_TMP_MAX_AGE_SECONDS 的
-       cnnc_login_/cnnc_harvest_ 陈旧残留：进程异常终止或被外层超时/进程终止
-       机制结束时 finally rmtree 走不到，残留只能靠下一次启动自愈回收；
+    2. 顺带清扫陈旧残留：cnnc_login_ 使用 6 小时窗口，cnnc_harvest_
+       使用 10 分钟窗口。进程异常终止或被外层超时/进程终止机制结束时
+       finally rmtree 走不到，残留依靠下一次启动自愈回收；
        整个清扫吞一切异常、绝不影响返回；
     3. 返回 Path(tempfile.mkdtemp(prefix, dir=BROWSER_TMP_ROOT))；这一步若也
        抛 OSError（如 BROWSER_TMP_ROOT 所在盘满了），同样打一行 WARN 回退
@@ -370,13 +371,16 @@ def _make_browser_profile_dir(prefix):
               % BROWSER_TMP_ROOT, file=sys.stderr)
         return Path(tempfile.mkdtemp(prefix=prefix))
     try:
-        cutoff = time.time() - STALE_BROWSER_TMP_MAX_AGE_SECONDS
+        now = time.time()
         for child in sorted(BROWSER_TMP_ROOT.iterdir()):
-            if not (child.name.startswith("cnnc_login_")
-                    or child.name.startswith("cnnc_harvest_")):
+            if child.name.startswith("cnnc_harvest_"):
+                max_age_seconds = STALE_HARVEST_TMP_MAX_AGE_SECONDS
+            elif child.name.startswith("cnnc_login_"):
+                max_age_seconds = STALE_BROWSER_TMP_MAX_AGE_SECONDS
+            else:
                 continue
             try:
-                if child.stat().st_mtime < cutoff:
+                if child.stat().st_mtime < now - max_age_seconds:
                     shutil.rmtree(child, ignore_errors=True)
             except Exception:
                 pass
