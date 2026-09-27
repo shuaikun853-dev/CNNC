@@ -121,6 +121,7 @@ class CnncSaasSnapshotAdapter:
         policy: SnapshotFetchPolicy | None = None,
         auth_manager: AuthManager | None = None,
         cnnc_provider: Any | None = None,
+        cnnc_allow_refresh: bool = True,
         opener: Any | None = None,
         monotonic: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], None] = time.sleep,
@@ -130,6 +131,7 @@ class CnncSaasSnapshotAdapter:
         self.policy = policy or SnapshotFetchPolicy()
         self.auth_manager = auth_manager
         self.cnnc_provider = cnnc_provider
+        self.cnnc_allow_refresh = cnnc_allow_refresh
         self._opener = opener or internal_direct_opener()
         self._monotonic = monotonic
         self._sleep = sleep
@@ -296,12 +298,16 @@ class CnncSaasSnapshotAdapter:
                     # CnncAuthProvider 自带一次「刷新 + 重试」；其 CnncAuthError
                     # 不属于可重试异常，会直接向上传播（认证失败即 fail-fast）。
                     # deadline 为绝对单调时刻，透传后认证刷新也受同一截止约束。
+                    request_kwargs = {
+                        "read_only": True,
+                        "opener": self._opener,
+                        "timeout": timeout,
+                        "deadline_monotonic": deadline,
+                    }
+                    if not self.cnnc_allow_refresh:
+                        request_kwargs["allow_refresh"] = False
                     response_payload = self.cnnc_provider.request_json_cnnc(
-                        factory,
-                        read_only=True,
-                        opener=self._opener,
-                        timeout=timeout,
-                        deadline_monotonic=deadline,
+                        factory, **request_kwargs
                     )
                 else:
                     with self._opener.open(factory(), timeout=timeout) as response:

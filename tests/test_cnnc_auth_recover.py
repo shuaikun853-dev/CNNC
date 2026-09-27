@@ -25,6 +25,7 @@ import pytest
 from app.services.incremental_audit_runtime import _detail_worker
 from scripts import cnnc_auth_core as core
 from scripts import cnnc_auth_refresh
+from app.services.customer_prewarm_auth_pause import PrewarmAuthPause
 
 OLD_AT = "AT-1-old"
 NEW_AT = "AT-2-new"
@@ -129,6 +130,43 @@ def test_case13_login_and_recover_success_publishes_refreshed_token(
     assert artifact["outcome"] == "RECOVERY_OK"
     assert artifact["curl_expected"] == 0
     assert artifact["curl_synced"] == 0
+
+
+def test_verified_manual_recovery_resumes_prewarm_only_on_success(tmp_path):
+    pause_path = tmp_path / "prewarm_auth_pause.json"
+    pause = PrewarmAuthPause(pause_path)
+    pause.pause("harvest_deadline")
+    provider = _FakeRecoveryProvider(refresh_result="AT-9-new-xyz999")
+
+    failed = cnnc_auth_refresh.run_login_and_recover(
+        login_runner=lambda: 1, provider=provider,
+        result_path=tmp_path / "failed.json", lock_path=tmp_path / "auth.lock",
+        prewarm_pause_path=pause_path,
+    )
+    assert failed == 1
+    assert pause.active()
+
+    recovered = cnnc_auth_refresh.run_login_and_recover(
+        login_runner=lambda: 0, provider=provider,
+        result_path=tmp_path / "recovered.json", lock_path=tmp_path / "auth.lock",
+        prewarm_pause_path=pause_path,
+    )
+    assert recovered == 0
+    assert not pause.active()
+
+
+def test_verified_manual_curl_refresh_resumes_prewarm(tmp_path):
+    pause_path = tmp_path / "prewarm_auth_pause.json"
+    pause = PrewarmAuthPause(pause_path)
+    pause.pause("harvest_deadline")
+    provider = _FakeRecoveryProvider(refresh_result="AT-9-new-xyz999")
+
+    result = cnnc_auth_refresh.run_curl_refresh(
+        provider=provider, trigger="manual", result_path=tmp_path / "curl.json",
+        lock_path=tmp_path / "auth.lock", prewarm_pause_path=pause_path,
+    )
+    assert result == 0
+    assert not pause.active()
 
 
 def test_case13_login_failure_records_login_recovery_failed(tmp_path, capsys):

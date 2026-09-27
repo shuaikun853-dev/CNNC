@@ -483,6 +483,13 @@ python -m pytest tests\test_incremental_audit_runtime.py tests\test_incremental_
 - 状态落在独立跨日库 `runtime\incremental_price_audit\customer_prewarm.sqlite3`;共享缓存为
   `runtime\incremental_price_audit\shared_crawl_cache.sqlite3`。STEP1 tick 通过 `prewarm_intake` 旁路入队,
   任何异常只计数,绝不改变 tick 结果、trace、审批或收口。
+- 中核认证收割超时在认证 provider 记录失败时就写入
+  `runtime\incremental_price_audit\customer_prewarm_auth_pause.json` 持久暂停标记；认证状态缺失或损坏时
+  扫描器也持久暂停。普通 401/`rspCode=3333` 只停止本轮预爬网络查询，不持久锁死正常的外部续期。
+  预爬自身始终不自动刷新认证、不从旧 cURL 初始化认证状态，也不打开浏览器；本地 intake 和缓存刷新继续。
+  认证状态的 `last_status` 后续变化不能自动解除暂停。仅 Dashboard 人工重新登录并完成认证恢复，
+  或人工 cURL 刷新且核验成功后，清除暂停标记；下一次自然扫描恢复网络查询。失败或定时预检不清除。
+  不修改中核认证状态文件，也不清理已有浏览器 Profile。
 - dry-run 一行用法:`python scripts\customer_prewarm_scan.py --dry-run`(prewarm 状态与缓存写入全部落在
   `--sandbox-root`,默认 `<runtime_root>\prewarm_dry_run`)。dry-run 会先把生产共享缓存以只读快照
   (SQLite `mode=ro` + backup API,零写入生产)复制进 sandbox,当日 daily internet 成功行真实写入 sandbox

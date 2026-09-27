@@ -69,10 +69,21 @@ AUTH_MAINTENANCE_LOCK_PATH = core.AUTH_DATA_DIR / ".cnnc_login_recovery.lock"
 LOGIN_RECOVERY_LOCK_PATH = AUTH_MAINTENANCE_LOCK_PATH
 try:
     from app.services.daily_audit_store import LeaseUnavailable, ProcessLock
+    from app.services.customer_prewarm_auth_pause import DEFAULT_PAUSE_PATH, PrewarmAuthPause
 except ImportError:  # 直接运行时 sys.path[0]=scripts，补 ROOT 后重导
     if str(ROOT) not in sys.path:
         sys.path.insert(0, str(ROOT))
     from app.services.daily_audit_store import LeaseUnavailable, ProcessLock
+    from app.services.customer_prewarm_auth_pause import DEFAULT_PAUSE_PATH, PrewarmAuthPause
+
+
+def _resume_prewarm_after_manual_success(path: Path | str | None) -> None:
+    if path is None:
+        return
+    try:
+        PrewarmAuthPause(path).resume()
+    except OSError as exc:
+        print(f"WARNING prewarm auth pause resume failed: {type(exc).__name__}", file=sys.stderr)
 
 
 def _force_utf8_stdio():
@@ -279,7 +290,7 @@ def _write_curl_refresh_result(path, outcome, *, at="", curl_expected=0,
 
 
 def run_login_and_recover(login_runner=None, provider=None, result_path=None,
-                          lock_path=None) -> int:
+                          lock_path=None, prewarm_pause_path=None) -> int:
     """登录后自动恢复（review Finding 3）：login 成功 → force 刷新 → 发布
     → 期望 cURL 同步严格后置核验（2026-09-10）。
 
@@ -324,6 +335,8 @@ def run_login_and_recover(login_runner=None, provider=None, result_path=None,
         )
         return 5
     try:
+        if provider is None and prewarm_pause_path is None:
+            prewarm_pause_path = DEFAULT_PAUSE_PATH
         provider = provider if provider is not None else _default_provider()
         login_runner = (login_runner if login_runner is not None
                         else _default_login_runner)
@@ -365,6 +378,7 @@ def run_login_and_recover(login_runner=None, provider=None, result_path=None,
                 % (len(synced), expected, ",".join(failed))
             )
             return 4
+        _resume_prewarm_after_manual_success(prewarm_pause_path)
         print("RECOVERY_OK at=%s curl_synced=%d"
               % (core.redact_secret(at), len(synced)))
         return 0
@@ -373,7 +387,8 @@ def run_login_and_recover(login_runner=None, provider=None, result_path=None,
 
 
 def run_curl_refresh(provider=None, result_path=None, lock_path=None,
-                     trigger="manual", business_date=None, deadline_monotonic=None) -> int:
+                     trigger="manual", business_date=None, deadline_monotonic=None,
+                     prewarm_pause_path=None) -> int:
     """独立 cURL 刷新操作（--refresh-curl / --harvest 共享的唯一实现）。
 
     与 login-and-recover 互斥共用同一把跨进程认证维护锁
@@ -424,6 +439,8 @@ def run_curl_refresh(provider=None, result_path=None, lock_path=None,
         )
         return 5
     try:
+        if provider is None and prewarm_pause_path is None:
+            prewarm_pause_path = DEFAULT_PAUSE_PATH
         provider = provider if provider is not None else _default_provider()
         result_path = (Path(result_path) if result_path is not None
                        else CURL_REFRESH_RESULT_PATH)
@@ -477,6 +494,8 @@ def run_curl_refresh(provider=None, result_path=None, lock_path=None,
                 % (len(synced), expected, ",".join(failed))
             )
             return 4
+        if trigger == "manual":
+            _resume_prewarm_after_manual_success(prewarm_pause_path)
         _write_curl_refresh_result(
             result_path, "CURL_REFRESH_OK", at=at, curl_expected=expected,
             curl_synced=len(synced), trigger=trigger,
