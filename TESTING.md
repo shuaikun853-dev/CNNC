@@ -50,8 +50,8 @@ python -m pytest tests\test_safety_guard.py tests\test_scope_guard.py tests\test
 python -m pytest tests\test_cnnc_auth_browser_harvest.py tests\test_cnnc_auth_browser_login_autofill.py tests\test_cnnc_auth_browser_tmp_root.py -q  # E 盘 Profile 根不可用即失败；孤儿清理须验证 owner、进程创建时间和 Chrome 引用，未知旧目录保留
 python -m pytest tests\test_cnnc_auth_write_amplification.py tests\test_persistence_write_amplification.py tests\test_runtime_artifact_retention.py -q  # 自动认证退避、无变化 SQLite 零重写、扫描补收版本及 recovery 覆盖门、观察/成员复用、JSONL、临时文件生命周期
 
-# 上下文文档体积、链接和必备规则
-python -m pytest tests\test_context_documents.py -q
+# 架构护栏 + 上下文文档体积/链接/必备规则
+python -m pytest tests\test_architecture_contract.py tests\test_context_documents.py -q
 ```
 写盘专项的 canonical 认证目录、快照复用发布门禁和安全清理步骤见 [运行写放大维护手册](docs/runbooks/RUNTIME_WRITE_AMPLIFICATION.md)。快照复用默认关闭；测试显式开启，不代表生产已经启用。
 
