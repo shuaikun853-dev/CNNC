@@ -40,11 +40,17 @@ unless promoted to event. Changed category/evidence still follows the existing
 reset/update rules. Recovery records retain first/last attempt and attempt count
 for consecutive identical daily outcomes. Existing history is not deleted.
 
-Known unresolved boundary: scanner catch-up still reads historical audit-item
-versions. Multiple conflicting versions of one document can replay category
-changes and reset completed detail work. Single-version no-op guarantees do not
-cover that case. An authoritative-version rule requires business confirmation;
-do not claim all prewarm write amplification is eliminated before resolving it.
+Scanner catch-up retains documents from earlier observations, including those
+absent from the final snapshot. For each document it uses the first row in the
+most recent observation at or before the frozen snapshot (or latest observation
+when not frozen). It does not replay older category versions after the current
+one. This matches Dashboard's frozen/latest observation boundary and supports
+legacy and shared-membership databases. A same-observation duplicate keeps the
+first row, matching customer-side intake; historical records remain untouched.
+Customer-side recovery only fills documents absent from that bounded catch-up
+or lacking an audit category. It does not replace a non-empty audit category
+with a different recovery category on alternating scanner passes. If catch-up
+cannot be read, recovery is skipped rather than guessing category precedence.
 
 Snapshot observation IDs and timestamps remain authoritative for cutoff/freeze.
 The additive content-owner representation can reuse identical membership while

@@ -524,7 +524,7 @@ def test_finding_a_customer_only_recovered_when_event_intake_failed(tmp_path):
         customer_recovery_interval_seconds=300.0,
     )
     assert first["phase_errors"] == []
-    assert first["customer_recovery_intaked"] == 2
+    assert first["customer_recovery_intaked"] == 1  # DOC-A came from the audit snapshot
     assert first["customer_recovery_throttled"] == 0
     # (1) 事件侧严格只读:audit_items 仍无 DOC-B,状态库文件 hash 不变
     assert audit_item_document_ids() == ["DOC-A"]
@@ -548,7 +548,7 @@ def test_finding_a_customer_only_recovered_when_event_intake_failed(tmp_path):
         customer_recovery_interval_seconds=0.0,
     )
     assert second["phase_errors"] == []
-    assert second["customer_recovery_intaked"] == 2
+    assert second["customer_recovery_intaked"] == 1
     assert second["customer_recovery_throttled"] == 0
     assert fetch_calls["n"] == 2
     assert store.stats()["documents"] == {"PENDING": 2}
@@ -629,7 +629,7 @@ def test_run_prewarm_scan_customer_recovery_throttles_across_passes(tmp_path):
         return [{"documentId": "DOC-A", "fourCategoryId": "CAT-A"}]
 
     first = _run_scan(store, shared_cache, state_db_path, customer_recovery_fetch=customer_fetch)
-    assert first["customer_recovery_intaked"] == 1
+    assert first["customer_recovery_intaked"] == 0  # already covered by catch-up
     assert first["customer_recovery_throttled"] == 0
 
     second = _run_scan(store, shared_cache, state_db_path, customer_recovery_fetch=customer_fetch)
@@ -645,7 +645,7 @@ def test_run_prewarm_scan_customer_recovery_throttles_across_passes(tmp_path):
         customer_recovery_interval_seconds=0.0,
     )
     assert third["customer_recovery_throttled"] == 0
-    assert third["customer_recovery_intaked"] == 1
+    assert third["customer_recovery_intaked"] == 0
     assert calls["n"] == 2
 
 

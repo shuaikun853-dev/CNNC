@@ -4,14 +4,95 @@ import sqlite3
 import hashlib
 import pytest
 
-from app.services.customer_prewarm_discovery import intake_documents
+from app.services.customer_prewarm_discovery import _read_audit_item_rows, intake_documents, run_prewarm_scan
 from app.services.customer_prewarm_store import CustomerPrewarmStore
 from app.services.daily_audit_store import DailyAuditStore, FrozenSnapshotConflict
 from app.services.dashboard_projection import project_customer_price
 from app.services.incremental_audit_runtime import runtime_paths
 from app.services.incremental_audit_status import collect_runtime_status
 from app.services.snapshot_membership import membership_source_id, snapshot_row_expression
+from app.services.shared_crawl_cache import SharedCrawlCache
 
+
+def test_scanner_catch_up_uses_last_observed_document_version_without_losing_old_documents(tmp_path):
+    business_date = "2026-09-26"
+    state = DailyAuditStore(tmp_path / "state.sqlite3")
+    state.ensure_run(business_date)
+    lease = state.acquire_lease(business_date, "test", ttl_seconds=120)
+    old = {"documentId": "doc", "vCommodityId": "doc", "skuId": "sku", "fourCategoryId": "old"}
+    retained = {"documentId": "retained", "vCommodityId": "retained", "skuId": "sku", "fourCategoryId": "keep"}
+    current = {**old, "fourCategoryId": "current"}
+    state.ingest_snapshot(lease, [old, retained], observed_at="2026-09-26T01:00:00+00:00")
+    latest = state.ingest_snapshot(lease, [current], observed_at="2026-09-26T02:00:00+00:00")
+    state.freeze_snapshot(lease, latest["snapshot"]["id"])
+
+    prewarm = CustomerPrewarmStore(tmp_path / "prewarm.sqlite3")
+    rows = _read_audit_item_rows(state.path, business_date)
+    assert {row["documentId"]: row["fourCategoryId"] for row in rows} == {
+        "doc": "current", "retained": "keep"
+    }
+    assert len(rows) == 2
+    intake_documents(prewarm, business_date, rows, source="scanner")
+    prewarm.record_document_detail_success("doc")
+    intake_documents(prewarm, business_date, _read_audit_item_rows(state.path, business_date), source="scanner")
+    assert [row["document_id"] for row in prewarm.pending_documents(10)] == ["retained"]
+
+
+def test_scanner_catch_up_reads_shared_membership_and_legacy_rows(tmp_path):
+    business_date = "2026-09-26"
+    state = DailyAuditStore(tmp_path / "state.sqlite3", reuse_snapshot_membership=True)
+    state.ensure_run(business_date)
+    lease = state.acquire_lease(business_date, "test", ttl_seconds=120)
+    row = {"documentId": "doc", "vCommodityId": "doc", "skuId": "sku", "fourCategoryId": "category"}
+    state.ingest_snapshot(lease, [row], observed_at="2026-09-26T01:00:00+00:00")
+    reused = state.ingest_snapshot(lease, [row], observed_at="2026-09-26T02:00:00+00:00")
+    assert reused["snapshot"]["membership_source_id"] is not None
+    assert _read_audit_item_rows(state.path, business_date) == [row]
+
+    with sqlite3.connect(state.path) as connection:
+        connection.execute("ALTER TABLE snapshots DROP COLUMN membership_source_id")
+        connection.execute("ALTER TABLE snapshot_members DROP COLUMN row_json")
+    assert _read_audit_item_rows(state.path, business_date) == [row]
+
+
+def test_recovery_does_not_override_snapshot_covered_document(tmp_path):
+    business_date = "2026-09-26"
+    state = DailyAuditStore(tmp_path / "state.sqlite3")
+    state.ensure_run(business_date)
+    lease = state.acquire_lease(business_date, "test", ttl_seconds=120)
+    row = {"documentId": "doc", "vCommodityId": "doc", "skuId": "sku", "fourCategoryId": "current"}
+    blank = {"documentId": "blank", "vCommodityId": "blank", "skuId": "sku", "fourCategoryId": ""}
+    snapshot = state.ingest_snapshot(lease, [row, blank], observed_at="2026-09-26T01:00:00+00:00")
+    state.freeze_snapshot(lease, snapshot["snapshot"]["id"])
+    prewarm = CustomerPrewarmStore(tmp_path / "prewarm.sqlite3")
+    cache = SharedCrawlCache(tmp_path / "cache.sqlite3")
+
+    def scan():
+        return run_prewarm_scan(
+            prewarm_store=prewarm,
+            shared_cache=cache,
+            business_date=business_date,
+            state_db_path=state.path,
+            mappings=[],
+            detail_fetch=lambda *_: {},
+            max_documents=0,
+            customer_recovery_fetch=lambda: [
+                {"documentId": "doc", "fourCategoryId": "stale"},
+                {"documentId": "recovery-only", "fourCategoryId": "recovered"},
+                {"documentId": "blank", "fourCategoryId": "filled"},
+            ],
+            customer_recovery_interval_seconds=0,
+        )
+
+    first = scan()
+    assert first["phase_errors"] == []
+    assert prewarm.daily_document_evidence(business_date, "doc")["four_category_id"] == "current"
+    assert prewarm.daily_document_evidence(business_date, "blank")["four_category_id"] == "filled"
+    assert {item["document_id"] for item in prewarm.pending_documents(10)} == {"doc", "blank", "recovery-only"}
+    prewarm.record_document_detail_success("doc")
+    second = scan()
+    assert second["phase_errors"] == []
+    assert {item["document_id"] for item in prewarm.pending_documents(10)} == {"blank", "recovery-only"}
 
 def test_identical_intake_does_not_rewrite_documents_or_evidence(tmp_path, monkeypatch):
     store = CustomerPrewarmStore(tmp_path / "prewarm.sqlite3")

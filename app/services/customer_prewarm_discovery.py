@@ -60,7 +60,7 @@ import time
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, Callable, Iterable, Mapping, Sequence
+from typing import Any, Callable, Collection, Iterable, Mapping, Sequence
 from urllib.parse import urlparse
 
 from app.services.crawl_url_identity import (
@@ -76,8 +76,14 @@ from app.services.customer_prewarm_store import (
     CustomerPrewarmStore,
 )
 from app.services.customer_reference_links import extract_reference_links
-from app.services.daily_audit_store import LeaseUnavailable, ProcessLock
+from app.services.daily_audit_store import (
+    DEFAULT_POOL_ID,
+    DEFAULT_TENANT_ID,
+    LeaseUnavailable,
+    ProcessLock,
+)
 from app.services.saas_audit_core import extract_customer_price_from_detail
+from app.services.snapshot_membership import membership_source_id, snapshot_row_expression
 from app.services.shared_crawl_cache import (
     PRODUCER_DAILY_INTERNET,
     AliasConflictError,
@@ -215,6 +221,7 @@ def recover_customer_documents(
     business_date: str,
     interval_seconds: float = 300.0,
     now: datetime | None = None,
+    exclude_document_ids: Collection[str] = (),
 ) -> dict[str, Any]:
     """Customer-side-only recovery intake for the scanner (Round 3 Finding A).
 
@@ -222,7 +229,8 @@ def recover_customer_documents(
     scanner would otherwise never see customer-only documents (they exist only
     in the authoritative customer query, not in the per-day state DB).  This
     recovery reads the customer side ONLY (no SaaS query) and upserts the
-    rows as ``source="scanner-recovery"``.
+    rows as ``source="scanner-recovery"``. Callers can exclude documents with
+    an authoritative audit category so recovery only fills missing coverage.
 
     Throttled by the latest ``prewarm_recovery_runs`` outcome: when a
     previous run exists and ``(now - last_ran_at) < interval_seconds``, the
@@ -256,10 +264,14 @@ def recover_customer_documents(
             )
         raise
     documents_seen = len(rows)
+    recovery_rows = [
+        row for row in prewarm_rows_from_customer_rows(rows)
+        if row["documentId"] not in exclude_document_ids
+    ]
     intaked = intake_documents(
         prewarm_store,
         business_date,
-        prewarm_rows_from_customer_rows(rows),
+        recovery_rows,
         source="scanner-recovery",
     )
     prewarm_store.record_recovery_run(business_date, documents_seen)
@@ -1022,23 +1034,68 @@ def _read_audit_item_rows(state_db_path: str | Path, business_date: str) -> list
     if connection is None:
         return []
     try:
-        rows = connection.execute(
-            """SELECT a.row_json FROM audit_items a
-               JOIN daily_runs d ON d.id=a.run_id
-               WHERE d.business_date=?""",
-            (business_date,),
-        ).fetchall()
+        parsed: list[Mapping[str, Any]] = []
+        seen: set[str] = set()
+
+        def collect(rows: Iterable[sqlite3.Row]) -> None:
+            for row in rows:
+                try:
+                    value = json.loads(row["row_json"])
+                except (TypeError, ValueError):
+                    continue
+                if not isinstance(value, Mapping):
+                    continue
+                document_id = str(value.get("documentId") or "").strip()
+                if document_id and document_id not in seen:
+                    seen.add(document_id)
+                    parsed.append(value)
+
+        run = connection.execute(
+            """SELECT id, frozen_snapshot_id FROM daily_runs
+               WHERE business_date=? AND tenant_id=? AND pool_id=?""",
+            (business_date, DEFAULT_TENANT_ID, DEFAULT_POOL_ID),
+        ).fetchone()
+        if run is None:
+            return []
+        if run["frozen_snapshot_id"] is not None:
+            active = connection.execute(
+                "SELECT id, observed_at FROM snapshots WHERE id=? AND run_id=?",
+                (run["frozen_snapshot_id"], run["id"]),
+            ).fetchone()
+        else:
+            active = connection.execute(
+                """SELECT id, observed_at FROM snapshots WHERE run_id=?
+                   ORDER BY observed_at DESC, id DESC LIMIT 1""",
+                (run["id"],),
+            ).fetchone()
+        if active is None:
+            collect(connection.execute(
+                "SELECT row_json FROM audit_items WHERE run_id=? ORDER BY id DESC",
+                (run["id"],),
+            ))
+        else:
+            snapshots = connection.execute(
+                """SELECT id FROM snapshots WHERE run_id=? AND
+                   (observed_at < ? OR (observed_at = ? AND id <= ?))
+                   ORDER BY observed_at DESC, id DESC""",
+                (run["id"], active["observed_at"], active["observed_at"], active["id"]),
+            ).fetchall()
+            row_expression = snapshot_row_expression(connection, item_alias="a")
+            read_sources: set[int] = set()
+            for snapshot in snapshots:
+                source_id = membership_source_id(connection, int(snapshot["id"]))
+                if source_id in read_sources:
+                    continue
+                read_sources.add(source_id)
+                collect(connection.execute(
+                    f"""SELECT {row_expression} AS row_json FROM snapshot_members m
+                        JOIN audit_items a ON a.id=m.audit_item_id
+                        WHERE m.snapshot_id=? ORDER BY m.row_ordinal""",
+                    (source_id,),
+                ))
+        return parsed
     finally:
         connection.close()
-    parsed: list[Mapping[str, Any]] = []
-    for row in rows:
-        try:
-            value = json.loads(row["row_json"])
-        except (TypeError, ValueError):
-            continue
-        if isinstance(value, Mapping):
-            parsed.append(value)
-    return parsed
 
 
 def run_prewarm_scan(
@@ -1091,13 +1148,21 @@ def run_prewarm_scan(
 
     # Phase B: catch-up intake from the same state db
     intake_count = 0
+    catch_up_ready = False
+    catch_up_document_ids: set[str] = set()
     try:
+        catch_up_rows = _read_audit_item_rows(state_db_path, business_date)
         intake_count = intake_documents(
             prewarm_store,
             business_date,
-            _read_audit_item_rows(state_db_path, business_date),
+            catch_up_rows,
             source="scanner",
         )
+        catch_up_document_ids = {
+            str(row.get("documentId") or "").strip() for row in catch_up_rows
+            if str(row.get("fourCategoryId") or "").strip()
+        }
+        catch_up_ready = True
     except Exception as exc:  # noqa: BLE001 - phase isolation
         summary["phase_errors"].append({"phase": "catch_up_intake", "error": str(exc)})
     summary["intake_count"] = intake_count
@@ -1107,11 +1172,14 @@ def run_prewarm_scan(
     summary["customer_recovery_throttled"] = 0
     try:
         if customer_recovery_fetch is not None:
+            if not catch_up_ready:
+                raise RuntimeError("catch-up intake unavailable; customer recovery skipped")
             recovery = recover_customer_documents(
                 prewarm_store,
                 customer_fetch=customer_recovery_fetch,
                 business_date=business_date,
                 interval_seconds=customer_recovery_interval_seconds,
+                exclude_document_ids=catch_up_document_ids,
             )
             summary["customer_recovery_intaked"] = int(recovery.get("documents_intaked", 0))
             summary["customer_recovery_throttled"] = 1 if recovery.get("throttled") else 0
