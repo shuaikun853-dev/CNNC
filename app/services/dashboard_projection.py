@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Mapping
 
 from app.services.customer_price_semantics import DETAIL_MAX_ATTEMPTS_DEFAULT
+from app.services.snapshot_membership import membership_source_id, snapshot_row_expression
 
 
 def _cp(detail: Mapping, key: str) -> int:
@@ -641,14 +642,14 @@ def project_customer_price(
         counts = {"ready": 0, "pending": 0, "retrying": 0, "missing": 0,
                   "failed": 0, "invalid": 0, "absent_proven": 0, "absent_skipped": 0}
         for row in con.execute(
-            """SELECT m.row_ordinal, i.row_json, i.v_commodity_id, i.sku_id,
+            f"""SELECT m.row_ordinal, {snapshot_row_expression(con)} AS row_json, i.v_commodity_id, i.sku_id,
                       w.state AS detail_state, w.attempts, w.retryable,
                       w.error_text, w.result_json, w.updated_at
                FROM snapshot_members m
                JOIN audit_items i ON i.id=m.audit_item_id
                LEFT JOIN stage_work w ON w.audit_item_id=i.id AND w.stage='DETAIL'
                WHERE m.snapshot_id=? ORDER BY m.row_ordinal""",
-            (snapshot_id,),
+            (membership_source_id(con, snapshot_id),),
         ):
             try:
                 source = _json.loads(str(row["row_json"] or "{}"))

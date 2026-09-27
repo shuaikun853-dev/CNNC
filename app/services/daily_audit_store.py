@@ -22,6 +22,7 @@ from typing import Any, Iterator, Mapping, Sequence
 from app.services.customer_price_semantics import CUSTOMER_PRICE_RETRYABLE_DETAIL_STATUSES
 from app.services.crawl_url_identity import is_placeholder_code
 from app.services.page_price_semantics import valid_page_price_result
+from app.services.snapshot_membership import membership_source_id
 
 
 DEFAULT_TENANT_ID = 188605
@@ -235,8 +236,14 @@ class ProcessLock:
 class DailyAuditStore:
     """Small, per-operation SQLite store with fencing for one business day."""
 
-    def __init__(self, path: str | Path) -> None:
+    def __init__(self, path: str | Path, *, reuse_snapshot_membership: bool | None = None) -> None:
         self.path = Path(path)
+        # Shared runtime directories may still have old direct SQL readers.
+        # Activate only after every reader understands membership_source_id.
+        self.reuse_snapshot_membership = (
+            os.environ.get("CNNC_REUSE_SNAPSHOT_MEMBERSHIP", "") == "1"
+            if reuse_snapshot_membership is None else reuse_snapshot_membership
+        )
         if self.path != Path(":memory:"):
             self.path.parent.mkdir(parents=True, exist_ok=True)
         self._initialize()
@@ -479,6 +486,15 @@ class DailyAuditStore:
                     "duplicate remote_identity blocks the daily-store schema migration"
                 ) from exc
         self._migrate_snapshot_observation_constraint()
+        with self._transaction(immediate=True) as connection:
+            columns = {row["name"] for row in connection.execute("PRAGMA table_info(snapshots)")}
+            if "membership_source_id" not in columns:
+                connection.execute("ALTER TABLE snapshots ADD COLUMN membership_source_id INTEGER REFERENCES snapshots(id)")
+            if "content_hash" not in columns:
+                connection.execute("ALTER TABLE snapshots ADD COLUMN content_hash TEXT")
+            member_columns = {row["name"] for row in connection.execute("PRAGMA table_info(snapshot_members)")}
+            if "row_json" not in member_columns:
+                connection.execute("ALTER TABLE snapshot_members ADD COLUMN row_json TEXT")
 
     def _migrate_snapshot_observation_constraint(self) -> None:
         """Preserve repeated observations of unchanged content across cutoff.
@@ -665,10 +681,13 @@ class DailyAuditStore:
 
     def renew_lease(self, token: LeaseToken, ttl_seconds: float) -> LeaseToken:
         with self._transaction(immediate=True) as connection:
-            self._validate_lease(connection, token)
+            run = self._validate_lease(connection, token)
+            renewed_expiry = max(
+                str(run["lease_expires_at"]), self._expiry(ttl_seconds)
+            )
             connection.execute(
                 "UPDATE daily_runs SET lease_expires_at=?, updated_at=? WHERE id=? AND lease_owner=? AND lease_generation=?",
-                (self._expiry(ttl_seconds), self._utcnow(), token.run_id, token.owner, token.generation),
+                (renewed_expiry, self._utcnow(), token.run_id, token.owner, token.generation),
             )
         return token
 
@@ -718,6 +737,8 @@ class DailyAuditStore:
         if any(not isinstance(value, str) or not value for value in source_fps):
             raise ValueError("source_fingerprints must be non-empty strings")
         ordered_hash = self._fingerprint(list(zip(source_fps, customer_fps, strict=True)))
+        content_hash = self._fingerprint({"rows": list(rows), "headers": list(headers or []),
+                                          "source": source_fps, "customer": customer_fps})
         now = self._utcnow()
         explicit_observation = self._utc_timestamp(observed_at, field="observed_at")
         observation = explicit_observation or now
@@ -728,16 +749,23 @@ class DailyAuditStore:
                 # retain the original content-idempotent behavior. Production
                 # discovery always supplies observed_at, so an unchanged list
                 # observed after cutoff is still recorded as a new observation.
-                existing = connection.execute(
-                    "SELECT * FROM snapshots WHERE run_id=? AND ordered_hash=? ORDER BY observed_at DESC, id DESC LIMIT 1",
-                    (token.run_id, ordered_hash),
-                ).fetchone()
+                candidates = connection.execute(
+                    "SELECT * FROM snapshots WHERE run_id=? AND ordered_hash=? AND (content_hash=? OR content_hash IS NULL) ORDER BY observed_at DESC, id DESC",
+                    (token.run_id, ordered_hash, content_hash),
+                )
+                existing = next(
+                    (candidate for candidate in candidates
+                     if self._snapshot_content_hash(connection, candidate) == content_hash),
+                    None,
+                )
             else:
                 existing = connection.execute(
                     "SELECT * FROM snapshots WHERE run_id=? AND ordered_hash=? AND observed_at=?",
                     (token.run_id, ordered_hash, observation),
                 ).fetchone()
             if existing is not None:
+                if self._snapshot_content_hash(connection, existing) != content_hash:
+                    raise ValueError("conflicting content for the same snapshot observation")
                 members = self._snapshot_members(connection, int(existing["id"]))
                 current_members = [{**member, "change_kind": "UNCHANGED"} for member in members]
                 return {
@@ -747,24 +775,37 @@ class DailyAuditStore:
             run = connection.execute("SELECT frozen_snapshot_id FROM daily_runs WHERE id=?", (token.run_id,)).fetchone()
             if run is not None and run["frozen_snapshot_id"] is not None:
                 raise FrozenSnapshotConflict("a frozen daily run cannot accept different snapshot membership")
-            previous = connection.execute("SELECT id FROM snapshots WHERE run_id=? ORDER BY id DESC LIMIT 1", (token.run_id,)).fetchone()
+            previous = connection.execute("SELECT * FROM snapshots WHERE run_id=? ORDER BY id DESC LIMIT 1", (token.run_id,)).fetchone()
+            # Only consecutive identical content shares membership, so its
+            # per-observation diff is unambiguously UNCHANGED. The pointer
+            # always targets the original owner, never another observation.
+            shared_source = None
+            if self.reuse_snapshot_membership and previous is not None and previous["content_hash"] == content_hash:
+                shared_source = membership_source_id(connection, int(previous["id"]))
+            cursor = connection.execute(
+                """INSERT INTO snapshots(run_id, ordered_hash, observed_at, row_count, headers_json,
+                   evidence_json, created_at, content_hash, membership_source_id)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (token.run_id, ordered_hash, observation, len(rows), self._canonical_json(list(headers or [])),
+                 self._canonical_json(dict(evidence or {})), now, content_hash, shared_source),
+            )
+            snapshot_id = int(cursor.lastrowid)
+            if shared_source is not None:
+                members = self._snapshot_members(connection, snapshot_id)
+                snapshot = self._row(connection.execute("SELECT * FROM snapshots WHERE id=?", (snapshot_id,)).fetchone())
+                return {"snapshot": snapshot, "members": members, "member_count": len(members),
+                        "reused": False, "status_counts": self._count_kinds(members)}
             previous_fps: dict[tuple[str, str], set[str]] = {}
             if previous is not None:
                 for item in connection.execute(
                     """SELECT a.v_commodity_id, a.sku_id, a.source_fingerprint, a.customer_fingerprint
                        FROM snapshot_members m JOIN audit_items a ON a.id=m.audit_item_id
                        WHERE m.snapshot_id=?""",
-                    (previous["id"],),
+                    (membership_source_id(connection, int(previous["id"])),),
                 ):
                     previous_fps.setdefault((item["v_commodity_id"], item["sku_id"]), set()).add(
                         f"{item['source_fingerprint']}\x00{item['customer_fingerprint']}"
                     )
-            cursor = connection.execute(
-                """INSERT INTO snapshots(run_id, ordered_hash, observed_at, row_count, headers_json, evidence_json, created_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                (token.run_id, ordered_hash, observation, len(rows), self._canonical_json(list(headers or [])), self._canonical_json(dict(evidence or {})), now),
-            )
-            snapshot_id = int(cursor.lastrowid)
             seen_occurrences: dict[tuple[str, str, str], int] = {}
             members: list[dict[str, Any]] = []
             for ordinal, (row, source_fp, customer_fp) in enumerate(zip(rows, source_fps, customer_fps, strict=True)):
@@ -790,13 +831,33 @@ class DailyAuditStore:
                 duplicate_ordinal = seen_occurrences.get(occurrence, 0)
                 seen_occurrences[occurrence] = duplicate_ordinal + 1
                 connection.execute(
-                    """INSERT INTO snapshot_members(snapshot_id, row_ordinal, audit_item_id, duplicate_ordinal, change_kind)
-                       VALUES (?, ?, ?, ?, ?)""",
-                    (snapshot_id, ordinal, item_id, duplicate_ordinal, kind),
+                    """INSERT INTO snapshot_members(snapshot_id, row_ordinal, audit_item_id, duplicate_ordinal, change_kind, row_json)
+                       VALUES (?, ?, ?, ?, ?, ?)""",
+                    (snapshot_id, ordinal, item_id, duplicate_ordinal, kind,
+                     self._canonical_json(row) if item is not None and item["row_json"] != self._canonical_json(row) else None),
                 )
                 members.append({"snapshot_id": snapshot_id, "row_ordinal": ordinal, "audit_item_id": item_id, "duplicate_ordinal": duplicate_ordinal, "change_kind": kind})
             snapshot = self._row(connection.execute("SELECT * FROM snapshots WHERE id=?", (snapshot_id,)).fetchone())
             return {"snapshot": snapshot, "members": members, "member_count": len(members), "reused": False, "status_counts": self._count_kinds(members)}
+
+    def _snapshot_content_hash(self, connection: sqlite3.Connection, snapshot: sqlite3.Row) -> str:
+        if snapshot["content_hash"] is not None:
+            return str(snapshot["content_hash"])
+        # Migrated observations have no hash. Validate their complete preserved
+        # content without rewriting history or trusting caller fingerprints alone.
+        members = connection.execute(
+            """SELECT COALESCE(m.row_json, a.row_json) AS row_json,
+                      a.source_fingerprint, a.customer_fingerprint
+               FROM snapshot_members m JOIN audit_items a ON a.id=m.audit_item_id
+               WHERE m.snapshot_id=? ORDER BY m.row_ordinal""",
+            (membership_source_id(connection, int(snapshot["id"])),),
+        ).fetchall()
+        return self._fingerprint({
+            "rows": [json.loads(member["row_json"]) for member in members],
+            "headers": json.loads(snapshot["headers_json"]),
+            "source": [member["source_fingerprint"] for member in members],
+            "customer": [member["customer_fingerprint"] for member in members],
+        })
 
     @staticmethod
     def _count_kinds(members: Sequence[Mapping[str, Any]]) -> dict[str, int]:
@@ -808,7 +869,11 @@ class DailyAuditStore:
 
     @staticmethod
     def _snapshot_members(connection: sqlite3.Connection, snapshot_id: int) -> list[dict[str, Any]]:
-        return [dict(row) for row in connection.execute("SELECT * FROM snapshot_members WHERE snapshot_id=? ORDER BY row_ordinal", (snapshot_id,))]
+        source_id = membership_source_id(connection, snapshot_id)
+        members = [dict(row) for row in connection.execute("SELECT * FROM snapshot_members WHERE snapshot_id=? ORDER BY row_ordinal", (source_id,))]
+        if source_id != snapshot_id:
+            members = [{**row, "snapshot_id": snapshot_id, "change_kind": "UNCHANGED"} for row in members]
+        return members
 
     def snapshot_members(self, snapshot_id: int) -> list[dict[str, Any]]:
         with self._reader() as connection:
@@ -854,16 +919,21 @@ class DailyAuditStore:
     def ordered_snapshot_items(self, snapshot_id: int) -> list[dict[str, Any]]:
         """Return the preserved ordered multiset with the joined canonical row."""
         with self._reader() as connection:
+            source_id = membership_source_id(connection, snapshot_id)
             rows = connection.execute(
-                """SELECT m.row_ordinal, m.duplicate_ordinal, m.change_kind, a.*
+                """SELECT m.row_ordinal, m.duplicate_ordinal, m.change_kind, a.*,
+                          COALESCE(m.row_json, a.row_json) AS observed_row_json
                    FROM snapshot_members m JOIN audit_items a ON a.id=m.audit_item_id
                    WHERE m.snapshot_id=? ORDER BY m.row_ordinal""",
-                (snapshot_id,),
+                (source_id,),
             ).fetchall()
             result: list[dict[str, Any]] = []
             for row in rows:
                 item = self._row(row)
                 assert item is not None
+                if source_id != snapshot_id:
+                    item["change_kind"] = "UNCHANGED"
+                item["row_json"] = item.pop("observed_row_json")
                 item["row"] = json.loads(item["row_json"])
                 result.append(item)
             return result
@@ -1099,7 +1169,7 @@ class DailyAuditStore:
                    JOIN (SELECT DISTINCT audit_item_id FROM snapshot_members WHERE snapshot_id=?)
                      m ON m.audit_item_id=s.audit_item_id
                    WHERE a.run_id=? AND s.stage='DETAIL' AND s.state='SUCCESS'""",
-                (int(snapshot_id), token.run_id),
+                (membership_source_id(connection, int(snapshot_id)), token.run_id),
             ).fetchall()
             requeued = 0
             for row in rows:

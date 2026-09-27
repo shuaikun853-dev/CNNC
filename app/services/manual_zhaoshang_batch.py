@@ -388,10 +388,17 @@ def run_batch_zhaoshang_requests(
     token = None
     try:
         store = DailyAuditStore(target)
+        external_timeout_seconds = min(60.0, runtime_budget_seconds)
+        submit_headroom_seconds = max(
+            300.0, len(normalized) * external_timeout_seconds
+        )
         token = store.acquire_lease(
             business_date,
             f"manual-batch-{purpose}-{os.getpid()}",
-            max(30.0, runtime_budget_seconds + 30.0),
+            max(
+                30.0,
+                runtime_budget_seconds + submit_headroom_seconds + 30.0,
+            ),
             allow_unexpired_takeover=True,
             process_lock=lock,
         )
@@ -413,7 +420,7 @@ def run_batch_zhaoshang_requests(
             business_date=business_date,
             runtime_budget_seconds=runtime_budget_seconds,
             heavy_work_reserve_seconds=0,
-            external_timeout_seconds=min(60.0, runtime_budget_seconds),
+            external_timeout_seconds=external_timeout_seconds,
         )
         budget = TickBudget(monotonic(), runtime_budget_seconds, 0, monotonic)
         counters = _empty_counters()

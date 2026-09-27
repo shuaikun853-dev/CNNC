@@ -55,6 +55,7 @@ from app.services.saas_flow_diagnostic import get_saas_flow_diagnostic
 from scripts.cnnc_auth_refresh import (
     AUTH_MAINTENANCE_LOCK_PATH,
     CURL_REFRESH_RESULT_PATH,
+    LOGIN_RECOVERY_RESULT_PATH,
 )
 
 router = APIRouter(prefix="/dashboard", tags=["step1-dashboard"])
@@ -508,7 +509,7 @@ _cnnc_login_launched_at: float | None = None
 _cnnc_curl_refresh_launched_at: float | None = None
 # 手动恢复结果工件(scripts/cnnc_auth_refresh.py --login-and-recover 写入);
 # status 路由只读合并进 payload.last_manual_recovery,模块常量供测试注入。
-_CNNC_RECOVERY_RESULT_PATH = _ROOT_DIR / "data" / "cnnc_login_recovery_result.json"
+_CNNC_RECOVERY_RESULT_PATH = LOGIN_RECOVERY_RESULT_PATH
 # cURL 刷新结果工件/认证维护锁路径:常量单源自 scripts.cnnc_auth_refresh,
 # 绑定为模块常量供测试 monkeypatch 注入 tmp(绝不触碰真实 data/)。
 _CURL_REFRESH_RESULT_PATH = CURL_REFRESH_RESULT_PATH

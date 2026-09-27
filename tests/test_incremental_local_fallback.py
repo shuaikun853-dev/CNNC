@@ -744,12 +744,40 @@ def test_zdet_is_excluded_from_incremental_fallback_but_uses_pinned_crawler_revi
     assert "zdet" not in SUPPORTED_MALLS
     assert "zdet" not in fallback_module.SITE_HOSTS
     assert not fallback_module._url_matches_site(url, "zdet")
-    assert fallback_module.EXPECTED_CRAWLER_REVISION == (
-        "08abb74089cfa9007dc6f6ddc850f9fd41990a24"
-    )
+    assert fallback_module.EXPECTED_CRAWLER_REVISION == "9e4c1c1b182adcf3776a8ae5fcbbd6ba59a5911b"
     assert fallback_module.DEFAULT_CRAWLER_ROOT == fallback_module.Path(
-        r"E:\.A中核运维\cnnc-mall-crawler-prod"
+        r"E:\.A中核运维\cnnc-mall-crawler-releases\multisite-prod-20260924"
     )
+    assert fallback_module.DEFAULT_CRAWLER_PYTHON == fallback_module.Path(
+        r"E:\PythonEnvs\cnnc-mall-crawler-prod-9e4c1c\Scripts\python.exe"
+    )
+
+
+def test_execute_pinned_crawler_uses_pinned_python_runtime(tmp_path, monkeypatch):
+    claim = multi_site_claims()[2]
+    monkeypatch.setattr(
+        fallback_module, "verify_crawler_revision",
+        lambda _root: fallback_module.EXPECTED_CRAWLER_REVISION,
+    )
+
+    def run(command, **_kwargs):
+        assert command[0] == str(fallback_module.DEFAULT_CRAWLER_PYTHON)
+        manifest = load_workbook(command[command.index("--manifest") + 1], data_only=True)
+        try:
+            _site, _source, target = list(manifest.active.values)[1]
+            write_output(fallback_module.Path(target), [
+                ["3", "third", "19.20", claim["exact_url"], "SUCCESS", ""],
+            ])
+        finally:
+            manifest.close()
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr(fallback_module.subprocess, "run", run)
+    result = execute_pinned_crawler(
+        [claim], run_dir=tmp_path / "run", tick_id="pinned-python",
+        crawler_root=tmp_path / "crawler",
+    )
+    assert result[3]["result"]["page_price_value"] == Decimal("19.20")
 
 
 def test_execute_pinned_crawler_exit3_preserves_completed_other_site_success(tmp_path, monkeypatch):

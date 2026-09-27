@@ -1,11 +1,9 @@
 # TESTING.md - 验证指南
-
 > 增量 tick、SQLite checkpoint、finalize/materializer 与历史 identity 回归命令见 [第一步增量调度手册](docs/runbooks/STEP_1_INCREMENTAL_SCHEDULER.md)。
 
 > 自动化测试与生产验收分开。测试不能调用真实 `/add`、审批、推送、SQL 或本地爬虫；只有用户明确要求执行某一步时，才按对应 runbook 做生产验收。
 
 ## 1. 环境
-
 - Python 3.11+；当前机器使用 Python 3.14。
 - 安装：`python -m pip install -r requirements.txt`
 - 项目内主要依赖：FastAPI、Pydantic、PyYAML、pytest、httpx、openpyxl。
@@ -13,9 +11,7 @@
 - 运行前设置：`$env:PYTHONIOENCODING='utf-8'`。
 
 ## 2. 自动化测试
-
 ### 收集和全量
-
 ```powershell
 cd E:\.A中核运维\cnnc-ops-agent
 $env:PYTHONIOENCODING='utf-8'
@@ -51,11 +47,14 @@ python -m pytest tests\test_zhaoshang_priority_boost.py tests\test_zhaoshang_res
 # 招商局 batch fast path（含 STEP1/STEP3 人工入口 Batch-first、正常请求零 legacy create、unsupported URL 逐条 fallback、exact executeNumber/PK、单 schema、02/03 终态竞态仍要求全部精确有效行 `weight_type=-1`、UPDATE 不按 `task_status` 过滤且非幂等更新必须 `affected_rows == 待更新主键数`、priority/harvest 独立预算、旧 SQLite migration、事务回滚、SQL 价格/title 语义、nbdeli-only 数字 `PCS` 等价、qstbg/lxwlmall 严格 URL 变体、mymro/ofs submitted URL code 身份、jslink→nbdeli 新建规范化、source_id scoped executeNumber→唯一 crawl_work、durable mixed harvest 和跨 tick/崩溃恢复；全 fake DB/HTTP/本地 SQLite）：`python -m pytest tests\test_manual_zhaoshang_batch.py tests\test_step1_manual_batch.py tests\test_step3_manual_batch.py tests\test_batch_zhaoshang_priority.py tests\test_batch_zhaoshang_adapter.py tests\test_batch_sql_result_adapter.py tests\test_daily_audit_store.py tests\test_incremental_price_audit.py tests\test_incremental_audit_runtime.py tests\test_legacy_zhaoshang_adapter.py tests\test_customer_prewarm_discovery.py -k "batch or priority or submit_unknown or sql_result or jslink or hybrid or manual" -q`
 # 旧诊断和工作流安全边界
 python -m pytest tests\test_safety_guard.py tests\test_scope_guard.py tests\test_workflow_scope_guard.py -q
-python -m pytest tests\test_cnnc_auth_browser_harvest.py tests\test_cnnc_auth_browser_login_autofill.py tests\test_cnnc_auth_browser_tmp_root.py -q  # CNNC 认证浏览器一次性临时 Profile 落仓库 runtime/browser_tmp（生产 checkout 在 E 盘；runtime 根不可用时回退系统 TEMP 保认证）+ 启动清扫陈旧残留（2026-09-15 C 盘满事故回归）
+python -m pytest tests\test_cnnc_auth_browser_harvest.py tests\test_cnnc_auth_browser_login_autofill.py tests\test_cnnc_auth_browser_tmp_root.py -q  # E 盘 Profile 根不可用即失败；孤儿清理须验证 owner、进程创建时间和 Chrome 引用，未知旧目录保留
+python -m pytest tests\test_cnnc_auth_write_amplification.py tests\test_persistence_write_amplification.py tests\test_runtime_artifact_retention.py -q  # 自动认证退避、无变化 SQLite 零重写、扫描补收版本及 recovery 覆盖门、观察/成员复用、JSONL、临时文件生命周期
 
 # 上下文文档体积、链接和必备规则
 python -m pytest tests\test_context_documents.py -q
 ```
+写盘专项的 canonical 认证目录、快照复用发布门禁和安全清理步骤见 [运行写放大维护手册](docs/runbooks/RUNTIME_WRITE_AMPLIFICATION.md)。快照复用默认关闭；测试显式开启，不代表生产已经启用。
+
 ### 增量价格审计
 ```powershell
 # Scheduler 路由（白天 15 分钟、17:00-17:57 每 3 分钟完整 tick、18:00-20:00 每 5 分钟 closeout、20:35 一次性 safety closeout）、snapshot 180 秒有限重试、公平/post harvest、freeze gate、writer lock、只读 status；simulation 文件另证四 trigger 时间线 + IgnoreNew 重叠丢弃/不堆积/单 writer。runtime 测试还覆盖显式 runtime root 的 Windows Junction 别名不被解析到其他 worktree、`daily_status.json` 原子替换遇到短暂 `PermissionError` 时有界重试且重试耗尽不反转已完成业务命令，以及 BATCH_STATE 固定兼容文件被 Windows reader 占用时不反转已 checkpoint 的命令、不可变 `batch_state_snapshots/BATCH_STATE_*.md` 仍持续生成且 newest 可解析；固定 BATCH_STATE 未锁时继续原样刷新并保留外部招商局事件。相关套件同时覆盖固定 8 站 remote 终态转 local、按站预检及 partial settle、exit 2/3、启动前 live tick 预算与未启动 claim 退还尝试次数，以及最终物化 intent、FINALIZED/manifest/最终 metrics 同事务回滚和幂等、晚到采集重试、prewarm 不漂移；文件与 DB 不具备跨系统 ACID。
@@ -65,7 +64,7 @@ python -m pytest tests\test_incremental_price_audit.py tests\test_incremental_au
 python -m pytest tests\test_daily_audit_store.py tests\test_incremental_audit_runtime.py tests\test_incremental_audit_operations.py -k "process_lock or writer_lock or lock_conflict or lock_status or active_writer or materialization_remains" -q
 python -m pytest tests\test_daily_audit_store.py tests\test_cnnc_saas_snapshot_adapter.py tests\test_saas_audit_core.py tests\test_title_match_model_retry.py tests\test_incremental_price_audit.py tests\test_incremental_audit_runtime.py tests\test_harvest_only.py `
   tests\test_incremental_audit_operations.py tests\test_incremental_audit_resilience.py tests\test_incremental_audit_recovery.py tests\test_scheduler_frequency_simulation.py tests\test_partial_exact_harvest.py tests\test_incremental_price_audit_finalize.py tests\test_finalize_failed_link_rows.py tests\test_incremental_production_readiness_audit.py tests\test_incremental_audit_materializer.py tests\test_legacy_zhaoshang_adapter.py tests\test_incremental_price_audit_history.py tests\test_incremental_history_benchmark.py tests\test_incremental_local_fallback.py tests\test_customer_prewarm_lifecycle.py tests\test_customer_prewarm_dispatch.py -q
-# Issue #9 客户参考链接预爬旁路:提取等价/发现状态/缓存复用/每日同步幂等/STEP1 隔离/customer-only 恢复/scanner CLI 与 installer 文本门禁
+# Issue #9 客户参考链接预爬旁路:提取等价/发现状态/缓存复用/每日同步幂等/STEP1 隔离/customer-only 恢复（失败尝试同样受 5min 节流，避免 1min scheduler 认证风暴）/scanner CLI 与 installer 文本门禁
 python -m pytest tests\test_customer_reference_links.py tests\test_customer_prewarm_store.py tests\test_customer_prewarm_discovery.py tests\test_customer_prewarm_daily_sync.py tests\test_zhaoshang_history_backfill.py tests\test_customer_prewarm_step1_isolation.py tests\test_customer_prewarm_customer_recovery.py tests\test_customer_prewarm_scan_cli.py -q
 # Issue #11 史泰博本地预爬:URL 识别/失败分类/状态机与 claim 租约/暂缓退避/缓存同步幂等/plan-only 零写与 live 单次有界执行(覆盖 app/services/staples_prewarm.py 与 scripts/staples_prewarm_run.py)
 python -m pytest tests\test_staples_prewarm.py -q

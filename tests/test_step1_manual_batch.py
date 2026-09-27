@@ -16,7 +16,7 @@ def _template(path: Path, rows: list[tuple[str, str]]) -> Path:
 
 
 def test_step1_supported_request_uses_batch_and_never_loads_legacy_tool(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, offline_manual_mall_mappings
 ):
     url = "https://item.jd.com/100123.html"
     template = _template(tmp_path / "jd.xlsx", [("100123", url)])
@@ -145,7 +145,7 @@ def test_step1_url_without_verified_mall_mapping_uses_legacy_fallback(
     assert result["京东"]["backend_version"] == "legacy-v1"
 
 
-def test_step1_batch_identity_conflict_is_not_reported_as_success(tmp_path):
+def test_step1_batch_identity_conflict_is_not_reported_as_success(tmp_path, offline_manual_mall_mappings):
     url = "https://item.jd.com/100123.html"
     template = _template(tmp_path / "jd.xlsx", [("100123", url)])
 
@@ -171,7 +171,7 @@ def test_step1_batch_identity_conflict_is_not_reported_as_success(tmp_path):
     assert "IDENTITY_CONFLICT" in result["京东"]["error"]
 
 
-def test_step1_batch_runner_error_is_returned_in_compatible_failure_shape(tmp_path):
+def test_step1_batch_runner_error_is_returned_in_compatible_failure_shape(tmp_path, offline_manual_mall_mappings):
     url = "https://item.jd.com/100123.html"
     template = _template(tmp_path / "jd.xlsx", [("100123", url)])
 
@@ -195,7 +195,7 @@ def test_step1_batch_runner_error_is_returned_in_compatible_failure_shape(tmp_pa
     assert "batch unavailable" in result["京东"]["error"]
 
 
-def test_step1_terminal_batch_failure_preserves_confirmed_priority_evidence(tmp_path):
+def test_step1_terminal_batch_failure_preserves_confirmed_priority_evidence(tmp_path, offline_manual_mall_mappings):
     url = "https://item.jd.com/100123.html"
     template = _template(tmp_path / "jd.xlsx", [("100123", url)])
 
@@ -223,7 +223,7 @@ def test_step1_terminal_batch_failure_preserves_confirmed_priority_evidence(tmp_
 
 
 def test_step1_mixed_mall_legacy_template_contains_only_unsupported_rows(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, offline_manual_mall_mappings
 ):
     supported = "https://www.mymro.cn/u-98S6010.html"
     unsupported = "https://www.mymro.cn/not-proven/98S6011"
@@ -283,7 +283,7 @@ def test_step1_mixed_mall_legacy_template_contains_only_unsupported_rows(
 
 
 def test_step1_mixed_mall_does_not_hide_batch_failure_behind_legacy_success(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, offline_manual_mall_mappings
 ):
     supported = "https://www.mymro.cn/u-98S6010.html"
     unsupported = "https://www.mymro.cn/not-proven/98S6011"
@@ -327,7 +327,7 @@ def test_step1_mixed_mall_does_not_hide_batch_failure_behind_legacy_success(
 
 
 def test_step1_jslink_is_canonicalized_to_nbdeli_before_batch_routing(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, offline_manual_mall_mappings
 ):
     url = "https://www.jslink.com/pcweb/detail?sku=122262592"
     template = _template(tmp_path / "jslink.xlsx", [("122262592", url)])

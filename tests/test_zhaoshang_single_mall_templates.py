@@ -62,7 +62,7 @@ def test_single_mall_template_rejects_url_without_product_code(tmp_path):
         module.read_subtasks_from_excel(template, "haoxiny")
 
 
-def test_lxwl_templates_prefer_url_domain_over_shared_vendor_keyword(tmp_path):
+def test_lxwl_templates_prefer_url_domain_over_shared_vendor_keyword(tmp_path, offline_manual_mall_mappings):
     source = tmp_path / "saas.json"
     source.write_text(
         json.dumps(

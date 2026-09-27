@@ -52,6 +52,13 @@ class _FakeCurlRefreshProvider:
             raise self._refresh_error
         return self._refresh_result
 
+    def ensure_valid(self):
+        if self._refresh_error is not None:
+            raise self._refresh_error
+
+    def get_access_token(self):
+        return self._refresh_result
+
 
 class _CliFakeProvider(_FakeCurlRefreshProvider):
     """CLI 层 fake：cmd_harvest 兼容行还读 get_status（与真 provider 同形）。"""
@@ -142,6 +149,7 @@ def test_business_date_param_and_daily_preflight_trigger(tmp_path, capsys):
     assert "curl_synced=0/0" in capsys.readouterr().out
     artifact = _read_artifact(result_path)
     assert artifact["trigger"] == "daily-preflight"
+    assert provider.refresh_calls == []
     assert artifact["business_date"] == "2026-09-01"
 
 

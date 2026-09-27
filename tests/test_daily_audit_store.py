@@ -229,7 +229,7 @@ def test_legacy_snapshot_hash_constraint_migrates_without_losing_members(tmp_pat
                 UNIQUE(run_id, ordered_hash)
             )"""
         )
-        connection.execute("INSERT INTO snapshots_legacy SELECT * FROM snapshots")
+        connection.execute("INSERT INTO snapshots_legacy SELECT id, run_id, ordered_hash, observed_at, row_count, headers_json, evidence_json, created_at FROM snapshots")
         connection.execute("DROP TABLE snapshots")
         connection.execute("ALTER TABLE snapshots_legacy RENAME TO snapshots")
         connection.commit()

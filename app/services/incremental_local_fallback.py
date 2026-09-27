@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import sys
 from typing import Any, Callable, Mapping, Sequence
@@ -18,6 +19,7 @@ from openpyxl import Workbook, load_workbook
 
 from app.services.daily_audit_store import DailyAuditStore, LeaseToken
 from app.services.page_price_semantics import valid_page_price_result
+from scripts.filesystem_safety import is_reparse_point
 
 DAYTIME_60M = "DAYTIME_60M"
 PEAK_3M = "PEAK_3M"
@@ -29,8 +31,9 @@ SUPPORTED_MALLS = frozenset({
 MAX_ATTEMPTS = 2
 MIN_EXECUTION_WINDOW_SECONDS = 60
 MAX_CHILD_TIMEOUT_SECONDS = 600
-EXPECTED_CRAWLER_REVISION = "08abb74089cfa9007dc6f6ddc850f9fd41990a24"
-DEFAULT_CRAWLER_ROOT = Path(r"E:\.A中核运维\cnnc-mall-crawler-prod")
+EXPECTED_CRAWLER_REVISION = "9e4c1c1b182adcf3776a8ae5fcbbd6ba59a5911b"
+DEFAULT_CRAWLER_ROOT = Path(r"E:\.A中核运维\cnnc-mall-crawler-releases\multisite-prod-20260924")
+DEFAULT_CRAWLER_PYTHON = Path(r"E:\PythonEnvs\cnnc-mall-crawler-prod-9e4c1c\Scripts\python.exe")
 SITE_ALIASES = {"ofs": "officemate"}
 SITE_HOSTS = {
     "nbdeli": {"b2b.nbdeli.com"},
@@ -42,6 +45,79 @@ SITE_HOSTS = {
     "comix": {"qx.com", "www.qx.com", "comix.com.cn", "www.comix.com.cn"},
     "tima": {"tima365.com", "www.tima365.com"},
 }
+
+
+class CrawlerOutcomes(dict):
+    """Carry private artifact ownership without adding paths to business results."""
+
+    artifact_dir: Path | None = None
+
+
+def _plain_artifact_folder(folder: Path) -> bool:
+    absolute = folder.absolute()
+    return (
+        absolute.parent.name == "local_fallback"
+        and (os.name != "nt" or absolute.drive.upper() == "E:")
+        and not any(is_reparse_point(path) for path in (absolute, *absolute.parents))
+    )
+
+
+def _cleanup_settled_artifacts(outcomes: Mapping, states: Sequence[str]) -> None:
+    folder = getattr(outcomes, "artifact_dir", None)
+    if folder is None or not states or any(state not in {"SUCCESS", "TERMINAL_FAILED"} for state in states):
+        return
+    folder = Path(folder)
+    if not _plain_artifact_folder(folder):
+        return
+    if any(state != "SUCCESS" for state in states):
+        # Durable errors and original workbooks remain available for diagnosis.
+        # This marker is written only AFTER every claim has committed terminally.
+        marker = folder / ".durably-settled.json"
+        if is_reparse_point(marker):
+            return
+        marker.write_text(json.dumps({"version": 1, "states": list(states)}), encoding="utf-8")
+        reviewed = []
+        for old in folder.parent.glob("*/.durably-settled.json"):
+            if is_reparse_point(old) or not _plain_artifact_folder(old.parent):
+                continue
+            try:
+                proof = json.loads(old.read_text(encoding="utf-8"))
+                # A terminal crawler error is NOT a completed human review.
+                if proof.get("diagnostics_reviewed") is not True or proof.get("version") != 1 or not proof.get("states") or any(state not in {"SUCCESS", "TERMINAL_FAILED"} for state in proof["states"]):
+                    continue
+                reviewed.append(old)
+            except (OSError, ValueError):
+                continue
+        for old in sorted(reviewed, key=lambda path: path.stat().st_mtime_ns)[:-5]:
+            if _remove_known_artifacts(old.parent):
+                old.unlink()
+                if not any(old.parent.iterdir()):
+                    old.parent.rmdir()
+        return
+    _remove_known_artifacts(folder)
+    if not any(folder.iterdir()):
+        folder.rmdir()
+
+
+def _remove_known_artifacts(folder: Path) -> bool:
+    if not _plain_artifact_folder(folder):
+        return False
+    names = ["manifest.xlsx"]
+    for site in SITE_HOSTS:
+        names.extend((f"{site}_input.xlsx", f"{site}_output.xlsx"))
+    targets = [folder / name for name in (*names, "_tmp", "_pycache")]
+    for child in targets:
+        if is_reparse_point(child):
+            return False
+        if child.is_dir() and any(is_reparse_point(path) for path in child.rglob("*")):
+            return False
+    for name in names:
+        (folder / name).unlink(missing_ok=True)
+    for name in ("_tmp", "_pycache"):
+        child = folder / name
+        if child.is_dir() and not is_reparse_point(child):
+            shutil.rmtree(child)
+    return True
 
 
 def _moment(value: datetime | str | None) -> datetime | None:
@@ -220,6 +296,8 @@ def read_crawler_output(
 
 
 def _child_env(run_dir: Path) -> dict[str, str]:
+    if os.name == "nt" and run_dir.resolve().drive.upper() != "E:":
+        raise ValueError("local fallback temporary paths must be on E drive")
     allowed = {
         "SYSTEMROOT", "WINDIR", "PATH", "PATHEXT", "COMSPEC", "USERPROFILE",
         "LOCALAPPDATA", "APPDATA", "PROGRAMFILES", "PROGRAMFILES(X86)",
@@ -227,7 +305,9 @@ def _child_env(run_dir: Path) -> dict[str, str]:
     }
     env = {key: value for key, value in os.environ.items() if key.upper() in allowed}
     temp = run_dir / "_tmp"
-    pycache = run_dir / "_pycache"
+    pycache = Path(os.environ.get("CNNC_PYTHON_CACHE_ROOT", r"E:\CodexData\cache\python-pyc\cnnc")) / f"{sys.version_info.major}.{sys.version_info.minor}"
+    if os.name == "nt" and (not pycache.is_absolute() or pycache.resolve().drive.upper() != "E:"):
+        raise ValueError("local fallback bytecode cache must be an absolute E-drive path")
     temp.mkdir(parents=True, exist_ok=True)
     pycache.mkdir(parents=True, exist_ok=True)
     env.update({
@@ -281,7 +361,7 @@ def execute_pinned_crawler(
     for claim in claim_list:
         site = _normalized_site(str(claim["mall_key"]))
         grouped.setdefault(site, []).append(claim)
-    outcomes: dict[int, Mapping[str, Any]] = {}
+    outcomes: CrawlerOutcomes = CrawlerOutcomes()
     by_site: dict[str, list[dict[str, Any]]] = {}
     for site, site_claims in grouped.items():
         urls = [str(claim["exact_url"]) for claim in site_claims]
@@ -296,9 +376,24 @@ def execute_pinned_crawler(
             outcomes[int(claim["id"])] = {"error": error, "retryable": False}
     if not by_site:
         return outcomes
+    live_timeout = timeout_seconds() if callable(timeout_seconds) else timeout_seconds
+    if live_timeout < MIN_EXECUTION_WINDOW_SECONDS:
+        outcomes.update({int(claim["id"]): {"deferred": True} for claims_for_site in by_site.values() for claim in claims_for_site})
+        return outcomes
     revision = verify_crawler_revision(crawler_root)
-    folder = Path(run_dir) / "local_fallback" / re.sub(r"[^A-Za-z0-9_.-]+", "_", tick_id)
+    live_timeout = timeout_seconds() if callable(timeout_seconds) else timeout_seconds
+    if live_timeout < MIN_EXECUTION_WINDOW_SECONDS:
+        outcomes.update({int(claim["id"]): {"deferred": True} for claims_for_site in by_site.values() for claim in claims_for_site})
+        return outcomes
+    # The caller-selected runtime may be an intentional junction. Capture its
+    # physical E-drive boundary once, but never follow links inside owned work.
+    folder = Path(run_dir).resolve() / "local_fallback" / re.sub(r"[^A-Za-z0-9_.-]+", "_", tick_id)
+    if os.name == "nt" and folder.resolve().drive.upper() != "E:":
+        raise ValueError("local fallback artifacts must be on E drive")
+    if is_reparse_point(folder.parent) or is_reparse_point(folder):
+        raise ValueError("local fallback owned artifacts must not be reparse points")
     folder.mkdir(parents=True, exist_ok=True)
+    outcomes.artifact_dir = folder
     manifest = Workbook()
     sheet = manifest.active
     sheet.title = "jobs"
@@ -324,7 +419,7 @@ def execute_pinned_crawler(
         return outcomes
     try:
         completed = subprocess.run(
-            [sys.executable, "-m", "mall_crawler.cli", "--manifest", str(manifest_path)],
+            [str(DEFAULT_CRAWLER_PYTHON), "-m", "mall_crawler.cli", "--manifest", str(manifest_path)],
             cwd=str(Path(crawler_root).resolve()), env=env, check=False,
             capture_output=True, text=True, encoding="utf-8", errors="replace",
             timeout=min(MAX_CHILD_TIMEOUT_SECONDS, live_timeout),
@@ -468,33 +563,43 @@ def run_incremental_local_fallback(
             int(claim["id"]): {"error": f"PROCESS_FAILED: {type(exc).__name__}: {exc}", "retryable": True}
             for claim in claims
         }
+    settled_states: list[str] = []
     for claim in claims:
         fallback_id = int(claim["id"])
         outcome = outcomes.get(fallback_id) or outcomes.get(str(fallback_id))  # type: ignore[arg-type]
         if isinstance(outcome, Mapping) and outcome.get("deferred") is True:
             store.defer_unstarted_local_fallback(token, fallback_id, tick_id)
+            settled_states.append("PENDING")
             continue
         if not isinstance(outcome, Mapping):
-            store.fail_local_fallback(
+            settled = store.fail_local_fallback(
                 token, fallback_id, "PROCESS_FAILED: missing child outcome", retryable=True,
                 max_attempts=MAX_ATTEMPTS,
             )
+            settled_states.append(str(settled["state"]))
             continue
         result = outcome.get("result")
         if isinstance(result, Mapping) and valid_page_price_result(result):
-            store.complete_local_fallback(
+            settled = store.complete_local_fallback(
                 token,
                 fallback_id,
                 result,
                 crawler_revision=str(outcome.get("crawler_revision") or "injected-test-executor"),
                 completed_at=current.isoformat(timespec="seconds"),
             )
+            settled_states.append(str(settled["state"]))
             continue
-        store.fail_local_fallback(
+        settled = store.fail_local_fallback(
             token,
             fallback_id,
             str(outcome.get("error") or "INVALID_RESPONSE: no valid exact price"),
             retryable=bool(outcome.get("retryable", False)),
             max_attempts=MAX_ATTEMPTS,
         )
+        settled_states.append(str(settled["state"]))
+    try:
+        _cleanup_settled_artifacts(outcomes, settled_states)
+    except OSError:
+        # Cleanup must not turn committed business success into a retry.
+        pass
     return _metrics(store, token)

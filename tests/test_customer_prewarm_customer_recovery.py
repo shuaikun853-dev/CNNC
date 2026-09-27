@@ -374,6 +374,57 @@ def test_recover_customer_documents_throttles_then_runs_at_zero_interval(tmp_pat
     assert calls["n"] == 3
 
 
+def test_recover_customer_documents_failure_is_throttled_then_retries(tmp_path):
+    """失败的 customer recovery 也记一次尝试，避免每分钟重复触发浏览器认证。"""
+    store = CustomerPrewarmStore(tmp_path / "prewarm.sqlite3")
+    calls = {"n": 0}
+    now = datetime(2026, 9, 7, 12, 0, 0, tzinfo=UTC)
+
+    def customer_fetch():
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("customer auth refresh timed out")
+        return [{"documentId": "DOC-RECOVERED", "fourCategoryId": "CAT-1"}]
+
+    with pytest.raises(RuntimeError, match="auth refresh timed out"):
+        recover_customer_documents(
+            store,
+            customer_fetch=customer_fetch,
+            business_date=BUSINESS_DATE,
+            interval_seconds=300.0,
+            now=now,
+        )
+
+    with store._reader() as connection:
+        failed_run = connection.execute(
+            "SELECT documents_seen FROM prewarm_recovery_runs ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+    assert failed_run is not None
+    assert failed_run["documents_seen"] == -1
+    _set_recovery_runs_ran_at(store, now.isoformat())
+
+    throttled = recover_customer_documents(
+        store,
+        customer_fetch=customer_fetch,
+        business_date=BUSINESS_DATE,
+        interval_seconds=300.0,
+        now=datetime(2026, 9, 7, 12, 1, 0, tzinfo=UTC),
+    )
+    assert throttled == {"throttled": True, "documents_intaked": 0}
+    assert calls["n"] == 1
+
+    retried = recover_customer_documents(
+        store,
+        customer_fetch=customer_fetch,
+        business_date=BUSINESS_DATE,
+        interval_seconds=300.0,
+        now=datetime(2026, 9, 7, 12, 5, 1, tzinfo=UTC),
+    )
+    assert retried["throttled"] is False
+    assert retried["documents_intaked"] == 1
+    assert calls["n"] == 2
+
+
 def test_recover_customer_documents_intakes_as_scanner_recovery(tmp_path):
     store = CustomerPrewarmStore(tmp_path / "prewarm.sqlite3")
 
@@ -399,7 +450,7 @@ def test_recover_customer_documents_intakes_as_scanner_recovery(tmp_path):
     assert sources == {"DOC-1": "scanner-recovery", "DOC-2": "scanner-recovery"}
 
 
-def test_recover_customer_documents_fetch_exception_propagates_and_records_nothing(tmp_path):
+def test_recover_customer_documents_fetch_exception_propagates_and_records_failed_attempt(tmp_path):
     store = CustomerPrewarmStore(tmp_path / "prewarm.sqlite3")
 
     def customer_fetch():
@@ -412,8 +463,13 @@ def test_recover_customer_documents_fetch_exception_propagates_and_records_nothi
             business_date=BUSINESS_DATE,
             interval_seconds=300.0,
         )
-    # fetch 抛错 → 不记录 run(下轮仍会尝试),store 无文档
-    assert store.last_recovery_run_at() is None
+    # 异常仍向上传播，但失败尝试进入节流账本；不伪造任何业务文档。
+    assert store.last_recovery_run_at() is not None
+    with store._reader() as connection:
+        row = connection.execute(
+            "SELECT documents_seen FROM prewarm_recovery_runs ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+    assert row["documents_seen"] == -1
     assert store.pending_documents(10) == []
 
 
@@ -468,7 +524,7 @@ def test_finding_a_customer_only_recovered_when_event_intake_failed(tmp_path):
         customer_recovery_interval_seconds=300.0,
     )
     assert first["phase_errors"] == []
-    assert first["customer_recovery_intaked"] == 2
+    assert first["customer_recovery_intaked"] == 1  # DOC-A came from the audit snapshot
     assert first["customer_recovery_throttled"] == 0
     # (1) 事件侧严格只读:audit_items 仍无 DOC-B,状态库文件 hash 不变
     assert audit_item_document_ids() == ["DOC-A"]
@@ -492,7 +548,7 @@ def test_finding_a_customer_only_recovered_when_event_intake_failed(tmp_path):
         customer_recovery_interval_seconds=0.0,
     )
     assert second["phase_errors"] == []
-    assert second["customer_recovery_intaked"] == 2
+    assert second["customer_recovery_intaked"] == 1
     assert second["customer_recovery_throttled"] == 0
     assert fetch_calls["n"] == 2
     assert store.stats()["documents"] == {"PENDING": 2}
@@ -502,7 +558,7 @@ def test_finding_a_customer_only_recovered_when_event_intake_failed(tmp_path):
         runs = connection.execute(
             "SELECT documents_seen FROM prewarm_recovery_runs ORDER BY id"
         ).fetchall()
-    assert [int(row["documents_seen"]) for row in runs] == [2, 2]
+    assert [int(row["documents_seen"]) for row in runs] == [2]
 
 
 # ---- Finding A: run_prewarm_scan Phase B2 编排 ---------------------------------------
@@ -573,7 +629,7 @@ def test_run_prewarm_scan_customer_recovery_throttles_across_passes(tmp_path):
         return [{"documentId": "DOC-A", "fourCategoryId": "CAT-A"}]
 
     first = _run_scan(store, shared_cache, state_db_path, customer_recovery_fetch=customer_fetch)
-    assert first["customer_recovery_intaked"] == 1
+    assert first["customer_recovery_intaked"] == 0  # already covered by catch-up
     assert first["customer_recovery_throttled"] == 0
 
     second = _run_scan(store, shared_cache, state_db_path, customer_recovery_fetch=customer_fetch)
@@ -589,7 +645,7 @@ def test_run_prewarm_scan_customer_recovery_throttles_across_passes(tmp_path):
         customer_recovery_interval_seconds=0.0,
     )
     assert third["customer_recovery_throttled"] == 0
-    assert third["customer_recovery_intaked"] == 1
+    assert third["customer_recovery_intaked"] == 0
     assert calls["n"] == 2
 
 

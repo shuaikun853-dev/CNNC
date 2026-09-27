@@ -1560,7 +1560,29 @@ def test_adapter_probe_running_task_reports_progress_and_export(tmp_path, monkey
     assert probe.export_rsp_desc == NO_PRICE_RSP
 
 
-def test_default_dependencies_wire_probe_and_write_gated_restart(tmp_path) -> None:
+@pytest.fixture
+def offline_recovery_resource_root(tmp_path, monkeypatch):
+    """Dependency wiring must not rely on ignored production credentials."""
+    import socket
+    from app.services import incremental_audit_runtime as runtime_module
+
+    root = tmp_path / "offline-project-data"
+    root.mkdir()
+    for name in ("latest_saas_sameAudit_queryAll.curl", "latest_cnnc_query.curl", "detail_request.curl"):
+        (root / name).write_text("curl https://fixture.invalid/query --data-raw '{}'", encoding="utf-8")
+    (root / "model.env").write_text(
+        "TITLE_MATCH_MODEL_API_KEY=offline-placeholder\n"
+        "TITLE_MATCH_MODEL_BASE_URL=https://fixture.invalid/v1\n"
+        "TITLE_MATCH_MODEL_NAME=offline-model\n", encoding="utf-8",
+    )
+    monkeypatch.setattr(runtime_module, "PROJECT_DATA_ROOT", root)
+    monkeypatch.setattr(socket, "create_connection", lambda *a, **k: pytest.fail("offline test attempted network"))
+    return root
+
+
+def test_default_dependencies_wire_probe_and_write_gated_restart(
+    tmp_path, offline_recovery_resource_root,
+) -> None:
     from app.services.incremental_audit_runtime import (
         build_default_dependencies,
         runtime_paths,

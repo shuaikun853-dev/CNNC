@@ -36,6 +36,7 @@ from typing import Any, Callable, Iterator
 from uuid import uuid4
 
 try:
+    from scripts.cnnc_auth_paths import get_auth_data_dir
     from scripts.auth_manager import _payload_is_auth_failure
     from scripts.curl_utils import (
         apply_curl_headers,
@@ -43,17 +44,19 @@ try:
         load_curl_command,
     )
 except ModuleNotFoundError:  # Direct invocation from scripts/.
+    from cnnc_auth_paths import get_auth_data_dir
     from auth_manager import _payload_is_auth_failure
     from curl_utils import apply_curl_headers, internal_direct_opener, load_curl_command
 
 
 ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_STATE_PATH = ROOT / "data" / "cnnc_auth_state.json"
-DEFAULT_LEDGER_PATH = ROOT / "data" / "cnnc_auth_ledger.jsonl"
+AUTH_DATA_DIR = get_auth_data_dir(ROOT)
+DEFAULT_STATE_PATH = AUTH_DATA_DIR / "cnnc_auth_state.json"
+DEFAULT_LEDGER_PATH = AUTH_DATA_DIR / "cnnc_auth_ledger.jsonl"
 CURL_SYNC_FILES = (
-    ROOT / "data" / "latest_cnnc_query.curl",
-    ROOT / "data" / "detail_request.curl",
-    ROOT / "data" / "cnnc_biaozhun.curl",
+    AUTH_DATA_DIR / "latest_cnnc_query.curl",
+    AUTH_DATA_DIR / "detail_request.curl",
+    AUTH_DATA_DIR / "cnnc_biaozhun.curl",
 )
 
 ANON_LOGIN_URL = "https://one.cnncecp.com/cnnc-gateway/pm/n/anon/account/login"
@@ -154,7 +157,7 @@ def _process_lock(
 ) -> Iterator[None]:
     """进程级文件锁（1 字节），限时等待。
 
-    Windows 用 msvcrt LK_LOCK（单次阻塞至多 ~10 秒后抛 OSError），POSIX 用
+    Windows 用 msvcrt LK_NBLCK 非阻塞尝试，POSIX 用
     flock 非阻塞轮询；两者都在循环里受 wait_seconds 截止时间约束，超时抛
     REFRESH_IN_PROGRESS。msvcrt 文件锁随进程死亡自动释放，死进程无需清理。
     """
@@ -173,7 +176,7 @@ def _process_lock(
                     if os.name == "nt":
                         import msvcrt
 
-                        msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+                        msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
                     else:
                         import fcntl
 
@@ -181,11 +184,12 @@ def _process_lock(
                     locked = True
                     break
                 except OSError:
-                    if monotonic() >= deadline:
+                    remaining = deadline - monotonic()
+                    if remaining <= 0.0:
                         raise CnncAuthError(
                             CnncAuthStatus.REFRESH_IN_PROGRESS, "刷新锁等待超时"
                         ) from None
-                    time.sleep(0.2)
+                    time.sleep(min(0.2, remaining))
             yield
         finally:
             if locked:
@@ -305,6 +309,11 @@ class CnncAuthProvider:
                     CnncAuthStatus.BROWSER_START_FAILED,
                     f"harvest 子进程超过 {remaining:.0f}s 未返回",
                 ) from exc
+            except OSError as exc:
+                raise CnncAuthError(
+                    CnncAuthStatus.BROWSER_START_FAILED,
+                    f"harvest process unavailable: {type(exc).__name__}",
+                ) from exc
             stderr = completed.stderr or ""
             if completed.returncode == 2 or "SSO_LOGIN_REQUIRED" in stderr:
                 raise CnncAuthError(
@@ -399,15 +408,24 @@ class CnncAuthProvider:
         try:
             with self.opener.open(self._build_verify_request(at), timeout=timeout) as response:
                 payload = json.loads(response.read().decode("utf-8", errors="replace"))
-        except urllib.error.HTTPError:
+        except urllib.error.HTTPError as exc:
+            if exc.code == 401:
+                return False
+            status = (CnncAuthStatus.CNNC_WAF_CONTEXT_STALE if exc.code == 412
+                      else CnncAuthStatus.AUTH_RETRY_FAILED)
+            raise CnncAuthError(status, f"Read-only verification HTTP {exc.code}") from exc
+        except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
+            raise CnncAuthError(CnncAuthStatus.AUTH_RETRY_FAILED,
+                                f"Read-only verification unavailable: {type(exc).__name__}") from exc
+        if isinstance(payload, dict) and _payload_is_auth_failure(payload):
             return False
-        except (urllib.error.URLError, TimeoutError, OSError, ValueError):
-            return False
-        if not isinstance(payload, dict) or _payload_is_auth_failure(payload):
-            return False
-        return str(payload.get("rspCode") or "") == "0000" and isinstance(
-            payload.get("rows"), list
-        )
+        if (
+            isinstance(payload, dict)
+            and str(payload.get("rspCode") or "") == "0000"
+            and isinstance(payload.get("rows"), list)
+        ):
+            return True
+        raise CnncAuthError(CnncAuthStatus.AUTH_RETRY_FAILED, "Read-only verification inconclusive")
 
     def _build_verify_request(self, at: str) -> urllib.request.Request:
         """构造只读验证请求：优先用业务查询 cURL 作模板，缺失时用固定 URL。"""
@@ -450,12 +468,15 @@ class CnncAuthProvider:
     @contextmanager
     def _locked(self, *, wait_seconds: float | None = None) -> Iterator[None]:
         lock_path = self._lock_path()
-        with _thread_lock(lock_path):
+        budget = max(0.0, self.lock_wait_seconds if wait_seconds is None else wait_seconds)
+        deadline = self.monotonic() + budget
+        thread_lock = _thread_lock(lock_path)
+        if not thread_lock.acquire(timeout=budget):
+            raise CnncAuthError(CnncAuthStatus.REFRESH_IN_PROGRESS, "Thread refresh lock timeout")
+        try:
             with _process_lock(
                 lock_path,
-                wait_seconds=(
-                    self.lock_wait_seconds if wait_seconds is None else wait_seconds
-                ),
+                wait_seconds=max(0.0, deadline - self.monotonic()),
                 monotonic=self.monotonic,
             ):
                 self._write_lock_meta(lock_path)
@@ -463,6 +484,8 @@ class CnncAuthProvider:
                     yield
                 finally:
                     self._remove_lock_meta(lock_path)
+        finally:
+            thread_lock.release()
 
     @staticmethod
     def _write_lock_meta(lock_path: Path) -> None:
@@ -523,6 +546,8 @@ class CnncAuthProvider:
             state["last_error"] = message
             # 失败时刻：SSO 冷却断路器的起算点（修复旧版误用 last_refresh_at）
             state["last_failure_at"] = _utc_now_iso()
+            state["last_attempt_at"] = state["last_failure_at"]
+            state["failure_type"] = status
 
         return mutator
 
@@ -536,13 +561,16 @@ class CnncAuthProvider:
         mutator(state)
         self._atomic_write_state(state)
 
-    def mutate_state(self, mutator: Callable[[dict[str, Any]], None]) -> None:
+    def mutate_state(
+        self, mutator: Callable[[dict[str, Any]], None], *,
+        deadline_monotonic: float | None = None,
+    ) -> None:
         """锁外 state 元数据修改统一入口：取 self._locked() 后走 locked 版。
 
         锁内重读最新 state 再改写，消除锁外 read-modify-write 的并发 lost
         update（旧 AT 覆盖新 AT）。mutator 只应修改元数据字段。
         """
-        with self._locked():
+        with self._locked(wait_seconds=self._deadline_lock_wait(deadline_monotonic)):
             self._mutate_state_locked(mutator)
 
     def _record_failure(self, status: str, message: str) -> None:
@@ -571,6 +599,13 @@ class CnncAuthProvider:
             return float("inf")
         return float(deadline_monotonic) - self.monotonic()
 
+    def _deadline_lock_wait(self, deadline_monotonic: float | None) -> float:
+        remaining = self._remaining_seconds(deadline_monotonic)
+        if remaining <= 0.0:
+            raise CnncAuthError(CnncAuthStatus.AUTH_REFRESH_DEADLINE_EXCEEDED,
+                                "Authentication deadline exhausted before lock")
+        return min(self.lock_wait_seconds, remaining)
+
     def refresh(
         self,
         stale_access_token: str | None = None,
@@ -584,8 +619,8 @@ class CnncAuthProvider:
         ``browser_at`` 形如 AT-…），跳过外部裸 HTTP 交换（2026-09-02 实测：
         午后 WAF 对裸 Python 请求返回 502）；否则回退 exchange_func。
 
-        SSO 冷却断路器：上次刷新失败于 SSO_LOGIN_REQUIRED 且 ``last_failure_at``
-        距今仍在冷却窗口内时，直接抛 CnncAuthError(SSO_LOGIN_REQUIRED)，不
+        自动刷新冷却断路器：上次刷新失败于 SSO/浏览器/OC/超时且 ``last_failure_at``
+        距今仍在冷却窗口内时，直接抛带原失败状态的 CnncAuthError，不
         harvest（避免每 tick 弹浏览器）。``force=True`` 跳过冷却（人工显式重试）。
 
         deadline 契约（absolute deadline）：``deadline_monotonic`` 为
@@ -599,13 +634,18 @@ class CnncAuthProvider:
                 CnncAuthStatus.AUTH_REFRESH_DEADLINE_EXCEEDED,
                 "刷新 deadline 已过，未执行任何刷新动作",
             )
+        # Capture the observed generation before waiting, including callers that
+        # do not pass a rejected token (such as first-use ensure).
+        observed_token = stale_access_token
+        if observed_token is None and not force:
+            observed_token = str((self._read_state() or {}).get("access_token") or "").strip()
         with self._locked(wait_seconds=min(self.lock_wait_seconds, remaining)):
             state = self._read_state()
             current = str((state or {}).get("access_token") or "").strip()
             if (
-                stale_access_token is not None
+                observed_token is not None
                 and current
-                and current != stale_access_token
+                and current != observed_token
             ):
                 return current  # 其他线程/进程已完成刷新（双检）
             if (
@@ -613,8 +653,8 @@ class CnncAuthProvider:
                 and self._sso_cooldown_remaining_seconds(state) > 0.0
             ):
                 raise CnncAuthError(
-                    CnncAuthStatus.SSO_LOGIN_REQUIRED,
-                    "SSO 冷却中，跳过刷新（15 分钟内已失败）",
+                    str((state or {}).get("last_status")),
+                    "Authentication refresh cooling down after recent failure",
                 )
             try:
                 remaining = self._remaining_seconds(deadline_monotonic)
@@ -672,6 +712,8 @@ class CnncAuthProvider:
                         "last_status": CnncAuthStatus.REFRESHED,
                         "last_refresh_at": now,
                         "last_failure_at": "",  # 成功发布清空失败时刻，解除冷却
+                        "last_attempt_at": now,
+                        "failure_type": "",
                         "last_verify_at": "",
                         "last_error": "",
                     }
@@ -711,7 +753,7 @@ class CnncAuthProvider:
             return at
 
     def _sso_cooldown_remaining_seconds(self, state: dict[str, Any] | None = None) -> float:
-        """当前 SSO 刷新冷却剩余秒数（自 state.last_failure_at 起算）；无冷却为 0。
+        """自动刷新冷却剩余秒数（保留旧方法名兼容调用方）；无冷却为 0。
 
         旧 state 无 last_failure_at 或解析失败 → 视为冷却已过期，不拦截（一次
         过渡兼容；旧版误用 last_refresh_at，昨成功今失败时冷却恒判过期）。
@@ -719,7 +761,14 @@ class CnncAuthProvider:
         state = state if state is not None else self._read_state()
         if (
             str((state or {}).get("last_status") or "").strip()
-            != CnncAuthStatus.SSO_LOGIN_REQUIRED
+            not in {
+                CnncAuthStatus.SSO_LOGIN_REQUIRED, CnncAuthStatus.BROWSER_START_FAILED,
+                CnncAuthStatus.BROWSER_CONNECT_FAILED, CnncAuthStatus.OC_NOT_CAPTURED,
+                CnncAuthStatus.OC_EXCHANGE_FAILED, CnncAuthStatus.AT_VERIFY_FAILED,
+                CnncAuthStatus.AUTH_REFRESH_DEADLINE_EXCEEDED,
+                CnncAuthStatus.AUTH_RETRY_FAILED, CnncAuthStatus.WAF_CHALLENGE_FAILED,
+                CnncAuthStatus.LOGIN_RECOVERY_FAILED,
+            }
         ):
             return 0.0
         epoch = _iso_to_epoch(str((state or {}).get("last_failure_at") or ""))
@@ -754,7 +803,7 @@ class CnncAuthProvider:
                     return CnncAuthStatus.BROWSER_START_FAILED
                 state = self._read_state()
             if self._sso_cooldown_remaining_seconds(state) > 0.0:
-                return CnncAuthStatus.SSO_LOGIN_REQUIRED
+                return str((state or {}).get("last_status"))
             last_status = str((state or {}).get("last_status") or "").strip()
             verify_epoch = _iso_to_epoch(str((state or {}).get("last_verify_at") or ""))
             if (
@@ -774,12 +823,12 @@ class CnncAuthProvider:
         except Exception:  # noqa: BLE001 — 预检绝不抛异常
             return CnncAuthStatus.AUTH_RETRY_FAILED
 
-    def get_access_token(self) -> str:
+    def get_access_token(self, *, deadline_monotonic: float | None = None) -> str:
         state = self._read_state()
         token = str((state or {}).get("access_token") or "").strip()
         if token:
             return token
-        with self._locked():
+        with self._locked(wait_seconds=self._deadline_lock_wait(deadline_monotonic)):
             state = self._read_state()
             token = str((state or {}).get("access_token") or "").strip()
             if token:
@@ -899,16 +948,43 @@ class CnncAuthProvider:
             CnncAuthStatus.AUTH_RETRY_FAILED, "CNNC 认证失败，刷新重试后仍未恢复"
         )
 
-    def ensure_valid(self, *, timeout: float = VERIFY_TIMEOUT_SECONDS) -> None:
+    def ensure_valid(
+        self, *, timeout: float = VERIFY_TIMEOUT_SECONDS,
+        deadline_monotonic: float | None = None,
+    ) -> None:
+        """Verify and optionally refresh within one absolute automatic budget.
+
+        Without a caller deadline, retain the former stage limits as one finite
+        total: existing-token verify + lock wait + harvest + exchange + new-token
+        verify. Manual refresh(force=True) is unaffected.
+        """
+        if deadline_monotonic is None:
+            deadline_monotonic = self.monotonic() + (
+                max(0.0, timeout) + max(0.0, self.lock_wait_seconds)
+                + HARVEST_TIMEOUT_SECONDS + EXCHANGE_TIMEOUT_SECONDS
+                + VERIFY_TIMEOUT_SECONDS
+            )
+        remaining = self._remaining_seconds(deadline_monotonic)
+        if remaining <= 0.0:
+            raise CnncAuthError(CnncAuthStatus.AUTH_REFRESH_DEADLINE_EXCEEDED,
+                                "Automatic authentication deadline exhausted")
         state = self._read_state()
         current = str((state or {}).get("access_token") or "").strip()
         if not current:
-            self.refresh()
+            # Bootstrap only; absence is not proof of rejection.
+            current = self.get_access_token(deadline_monotonic=deadline_monotonic)
+        remaining = self._remaining_seconds(deadline_monotonic)
+        if remaining <= 0.0:
+            raise CnncAuthError(CnncAuthStatus.AUTH_REFRESH_DEADLINE_EXCEEDED,
+                                "Automatic authentication deadline exhausted")
+        verified = self._verify(current, timeout=min(timeout, remaining))
+        if self._remaining_seconds(deadline_monotonic) <= 0.0:
+            raise CnncAuthError(CnncAuthStatus.AUTH_REFRESH_DEADLINE_EXCEEDED,
+                                "Automatic authentication verification exhausted deadline")
+        if verified:
+            self._mark_verify_ok(deadline_monotonic=deadline_monotonic)
             return
-        if self._verify(current, timeout=timeout):
-            self._mark_verify_ok()
-            return
-        self.refresh()
+        self.refresh(stale_access_token=current, deadline_monotonic=deadline_monotonic)
 
     def get_status(self) -> dict[str, Any]:
         state = self._read_state() or {}
@@ -951,7 +1027,7 @@ class CnncAuthProvider:
                     continue
                 text = target.read_bytes().decode("utf-8", errors="replace")
                 new_text, count = AT_RE.subn(new_at, text)
-                if count == 0:
+                if count == 0 or new_text == text:
                     continue
                 tmp = target.with_name(f"{target.name}.{uuid4().hex}.tmp")
                 tmp.write_bytes(new_text.encode("utf-8"))
@@ -980,9 +1056,11 @@ class CnncAuthProvider:
             for target, tmp in plan:
                 current = target.read_bytes()
                 target.with_name(f"{target.name}.bak_{stamp}").write_bytes(current)
-                os.replace(tmp, target)
+                try:
+                    os.replace(tmp, target)
+                finally:
+                    self._prune_backups(target)
                 replaced.append((target, current))
-                self._prune_backups(target)
         except OSError as exc:
             for target, content in replaced:
                 try:
@@ -1036,7 +1114,7 @@ class CnncAuthProvider:
                 continue
         return False
 
-    def _mark_verify_ok(self) -> None:
+    def _mark_verify_ok(self, *, deadline_monotonic: float | None = None) -> None:
         """verify 通过后更新元数据（mutate_state 锁内重读，防并发 lost update）。
 
         mutator 只改 last_verify_at/last_status 元数据字段、绝不写 access_token：
@@ -1050,7 +1128,7 @@ class CnncAuthProvider:
 
         if self._read_state() is None:
             return  # 无可读 state：保持原行为，不凭空创建 state
-        self.mutate_state(mutator)
+        self.mutate_state(mutator, deadline_monotonic=deadline_monotonic)
 
     def _log(self, message: str) -> None:
         if self.logger:

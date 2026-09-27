@@ -958,8 +958,21 @@ def _write_batch_state_snapshot(
     """Write one immutable status snapshot without replacing an existing file."""
     snapshot_dir = path.parent / _BATCH_STATE_SNAPSHOT_DIR
     snapshot_dir.mkdir(parents=True, exist_ok=True)
+    previous = sorted(snapshot_dir.glob(_BATCH_STATE_SNAPSHOT_GLOB), key=lambda item: item.name)
+    # Counters change on normal heartbeats; only control-state changes pin history.
+    event = json.loads(event_line.removeprefix("- event: ").strip())
+    signature = json.dumps([managed_block, {key: value for key, value in event.items() if key not in {"counters", "backlog"}}], sort_keys=True)
+    previous_signature = None
+    if previous:
+        try:
+            previous_signature = next((line.removeprefix("retention_signature: ") for line in previous[-1].read_text(encoding="utf-8").splitlines() if line.startswith("retention_signature: ")), None)
+        except OSError:
+            pass
+    retention = "heartbeat" if previous_signature == signature else "transition"
     content = "\n".join((
         "# Incremental price audit batch status snapshot",
+        f"retention: {retention}",
+        f"retention_signature: {signature}",
         f"legacy_batch_state: {path.name}",
         f"legacy_alias_refresh: {alias_status}",
         managed_block,
@@ -978,6 +991,14 @@ def _write_batch_state_snapshot(
                 stream.write(content)
                 stream.flush()
                 os.fsync(stream.fileno())
+            # Only snapshots explicitly classified by this version are eligible.
+            # Unknown legacy files and state-transition evidence stay untouched.
+            for old in previous[:-4]:
+                try:
+                    if "\nretention: heartbeat\n" in old.read_text(encoding="utf-8"):
+                        old.unlink()
+                except OSError:
+                    pass
             return snapshot
         except FileExistsError:
             continue
@@ -1086,7 +1107,8 @@ def _record_batch_result(
                 updated = _replace_batch_state_block(existing, managed_block)
                 if not updated.endswith("\n"):
                     updated += "\n"
-                updated += event_line
+                if not updated.endswith(event_line):
+                    updated += event_line
                 alias_status = _refresh_legacy_batch_state_alias(path, updated)
             write_snapshot(alias_status)
     except TimeoutError:
@@ -2984,7 +3006,7 @@ def run_runtime_command(
         production_lock.release()
 
 
-def _ensure_runtime_daily_curl_fresh(deps, day: str) -> None:
+def _ensure_runtime_daily_curl_fresh(deps, day: str, *, deadline_monotonic=None) -> None:
     """每日 cURL freshness guard（2026-09-10）：tick/finalize/closeout（真正
     抓 CNNC customer 侧快照的命令）在进入引擎前确认为当日 cURL 已同步。
     判定只读 results 工件、与 closeout/finalize 状态解耦；任何状态都只打一
@@ -2997,6 +3019,7 @@ def _ensure_runtime_daily_curl_fresh(deps, day: str) -> None:
         guard_status = cnnc_auth_refresh.ensure_daily_curl_fresh(
             business_date=day,
             provider=getattr(deps, "cnnc_provider", None),
+            deadline_monotonic=deadline_monotonic,
         )
     except Exception:  # noqa: BLE001 — guard 绝不影响命令执行
         guard_status = "DAILY_CURL_GUARD_ERROR"
@@ -3071,7 +3094,9 @@ def _run_runtime_command_locked(
     # 一次（deps 构建后紧邻处）；closeout 内部的多个 incremental pass 由此不
     # 再重复触发。drain-only/harvest-only 只收既有远端任务，语义保持不触发。
     if command in {"tick", "finalize", "closeout"}:
-        _ensure_runtime_daily_curl_fresh(deps, day)
+        _ensure_runtime_daily_curl_fresh(
+            deps, day, deadline_monotonic=command_started + runtime_budget_seconds,
+        )
     if deps.submit_crawl is not None and deps.submit_gate is None:
         # Durable remote-stall breaker: while recent SQLite evidence shows the
         # remote is not materializing subtasks, this tick must not create any

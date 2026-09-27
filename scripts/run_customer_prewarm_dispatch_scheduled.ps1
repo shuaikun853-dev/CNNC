@@ -3,7 +3,7 @@
 # shared [CnncScheduledProcessHost] job-object host (scripts/scheduled_process_host.cs).
 # Division of labor with the scan sidecar: run_customer_prewarm_scan_scheduled.ps1
 # drives discovery/refresh (scan); this runner drives remote job creation (dispatch).
-# Logs plus one per-pass summary JSON live under
+# Logs plus one daily summary JSONL live under
 # runtime\customer_prewarm\dispatch_scheduler_logs.
 # Exit codes: 0 also covers expected runtime states (LOCK_BUSY,
 # SKIPPED_ALREADY_RUNNING); 2 = configuration error or DISPATCH_FAILED.
@@ -55,11 +55,11 @@ $businessDate = [System.TimeZoneInfo]::ConvertTimeBySystemTimeZoneId(
 ).ToString("yyyy-MM-dd")
 
 $dispatchLogDirectory = Join-Path $repo "runtime\customer_prewarm\dispatch_scheduler_logs"
-# Per-pass summary JSON goes next to the text log; the timestamp is captured
-# from Get-Date at start so each pass writes a unique file.
+# One complete JSON record per pass, in the same business-day file.
 $jsonOutputPath = Join-Path $dispatchLogDirectory (
-    "summary_{0}T{1}.json" -f $businessDate, (Get-Date).ToString("HHmmss")
+    "summary_{0}.jsonl" -f $businessDate
 )
+$invocationId = [Guid]::NewGuid().ToString('N')
 
 $arguments = @(
     "-u",
@@ -69,7 +69,8 @@ $arguments = @(
     "--budget-seconds", [string]$BudgetSeconds,
     "--max-jobs-per-pass", [string]$MaxJobsPerPass,
     "--zhaoshang-backend", $ZhaoshangBackend,
-    "--json-output", $jsonOutputPath
+    "--json-output", $jsonOutputPath,
+    "--invocation-id", $invocationId
 )
 if ($DryRun) {
     $arguments += "--plan-only"
@@ -94,6 +95,8 @@ if ($Preview) {
     exit 0
 }
 
+. (Join-Path $PSScriptRoot "scheduler_e_environment.ps1") -RepoRoot $repo -RuntimeRoot $RuntimeRoot
+. (Join-Path $PSScriptRoot "dispatch_summary.ps1")
 $pythonPath = (Get-Command $PythonExe -ErrorAction Stop).Source
 $processHostPath = Join-Path $PSScriptRoot "scheduled_process_host.cs"
 if (-not (Test-Path -LiteralPath $processHostPath -PathType Leaf)) {
@@ -153,6 +156,13 @@ try {
         elseif ($result.WriterFailed) {
             Write-DispatchLog "LOG_FAILURE diagnostic=$($result.Diagnostic)"
         }
+    }
+    try {
+        Ensure-CnncDispatchSummary -Path $jsonOutputPath -InvocationId $invocationId `
+            -BusinessDate $businessDate -ExitCode $exitCode -DurationSeconds $stopwatch.Elapsed.TotalSeconds
+    }
+    catch {
+        Write-DispatchLog "SUMMARY_FAILURE error_type=$($_.Exception.GetType().Name)"
     }
     Write-DispatchLog "END exit_code=$exitCode elapsed_seconds=$([math]::Round($stopwatch.Elapsed.TotalSeconds, 1))"
 }

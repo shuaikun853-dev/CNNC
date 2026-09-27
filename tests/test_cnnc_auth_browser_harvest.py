@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import inspect
 import json
+import os
 import sys
 import types
 from pathlib import Path
@@ -27,6 +28,13 @@ from pathlib import Path
 import pytest
 
 import scripts.cnnc_auth_browser as browser
+
+
+@pytest.fixture(autouse=True)
+def fake_process_inventory(monkeypatch):
+    identity = browser.psutil.Process(os.getpid()).create_time()
+    monkeypatch.setattr(browser, "_process_inventory", lambda: [
+        {"pid": os.getpid(), "created_at": identity, "cmdline": []}])
 
 AUTHORIZE_URL = (
     "https://sso.cnncecp.com/esc-sso/oauth2.0/authorize"
@@ -231,8 +239,12 @@ def test_case17_launch_chrome_cdp_uses_ephemeral_user_data_dir(monkeypatch, tmp_
 
     def fake_popen(argv):
         captured["argv"] = [str(arg) for arg in argv]
-        return _FakeChromeProc()
+        proc = _FakeChromeProc()
+        proc.pid = 999999
+        return proc
 
+    monkeypatch.setattr(browser.psutil, "Process", lambda _pid: types.SimpleNamespace(create_time=lambda: 123))
+    monkeypatch.setattr(browser, "_owned_chrome_tree", lambda _proc: [])
     monkeypatch.setattr(browser.subprocess, "Popen", fake_popen)
     monkeypatch.setattr(
         browser.urllib.request, "urlopen", lambda *_a, **_k: _FakeCdpVersionResponse()
@@ -267,8 +279,8 @@ def test_case17_cmd_harvest_removes_temp_profile_even_on_launch_failure(
     # 指到 tmp_path 保证 hermetic（不写仓库 runtime/、清扫不产生多余 rmtree 记录）
     monkeypatch.setattr(browser, "BROWSER_TMP_ROOT", tmp_path / "browser_tmp")
 
-    controlled = tmp_path / "controlled-harvest-profile"
-    controlled.mkdir()
+    controlled = tmp_path / "browser_tmp" / "cnnc_harvest_controlled"
+    controlled.mkdir(parents=True)
     monkeypatch.setattr(
         browser.tempfile, "mkdtemp", lambda *_a, **_k: str(controlled)
     )
@@ -301,7 +313,7 @@ def test_case17_cmd_harvest_source_never_touches_persistent_profile():
     source = inspect.getsource(browser.cmd_harvest)
     assert "PROFILE_DIR" not in source
     assert "_make_browser_profile_dir(" in source
-    assert "shutil.rmtree" in source
+    assert "_remove_browser_profile" in source
 
 
 # --------------------------------------------------------------------- Case 18
@@ -478,8 +490,8 @@ def test_case21_cmd_login_removes_temp_profile_even_on_launch_failure(
 
     失败清理路径，风格同 test_case17 的 cmd_harvest 失败路径用例。
     """
-    controlled = tmp_path / "controlled-login-profile"
-    controlled.mkdir()
+    controlled = tmp_path / "browser_tmp" / "cnnc_login_controlled"
+    controlled.mkdir(parents=True)
     # 2026-09-15 起 mkdtemp 经 _make_browser_profile_dir 落 BROWSER_TMP_ROOT：
     # 指到 tmp_path 保证 hermetic（不写仓库 runtime/、清扫不产生多余 rmtree 记录）
     monkeypatch.setattr(browser, "BROWSER_TMP_ROOT", tmp_path / "browser_tmp")
@@ -514,7 +526,7 @@ def test_case21_cmd_login_source_uses_ephemeral_profile():
     source = inspect.getsource(browser.cmd_login)
     assert "PROFILE_DIR" not in source
     assert "_make_browser_profile_dir(" in source
-    assert "shutil.rmtree" in source
+    assert "_remove_browser_profile" in source
 
 
 def test_case21_launch_chrome_cdp_source_has_no_persistent_fallback():
