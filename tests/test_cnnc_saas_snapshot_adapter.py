@@ -88,6 +88,21 @@ def _ok(rows, count):
     return {"rspCode": "0000", "count": count, "rows": rows}
 
 
+def test_customer_fetch_can_disable_provider_refresh():
+    calls = []
+
+    class Provider:
+        def request_json_cnnc(self, _factory, **kwargs):
+            calls.append(kwargs)
+            return _ok([], 0)
+
+    adapter, _opener = _adapter(
+        [], cnnc_provider=Provider(), cnnc_allow_refresh=False
+    )
+    assert adapter.fetch_customer_documents().customer_rows == ()
+    assert calls[0]["allow_refresh"] is False
+
+
 def test_scope_mismatch_fails_before_network():
     opener = _Opener([])
     adapter = CnncSaasSnapshotAdapter(

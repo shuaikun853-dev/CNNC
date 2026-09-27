@@ -38,6 +38,7 @@ from app.services.customer_prewarm_discovery import (
     run_prewarm_scan,
     snapshot_cache_readonly,
 )
+from app.services.customer_prewarm_auth_pause import PrewarmAuthPause
 from app.services.customer_prewarm_store import CustomerPrewarmStore
 from app.services.cnnc_saas_snapshot_adapter import CnncSaasSnapshotAdapter
 from app.services.daily_audit_store import LeaseUnavailable, ProcessLock
@@ -51,7 +52,8 @@ from app.services.incremental_audit_runtime import (
 )
 from app.services.shared_crawl_cache import SharedCrawlCache
 from scripts.audit_saas_excel_file import call_detail_api
-from scripts.auth_manager import AuthManager
+from scripts.auth_manager import AuthManager, _payload_is_auth_failure
+from scripts.cnnc_auth_core import CnncAuthError, CnncAuthStatus
 from scripts.curl_utils import load_curl_command
 from scripts.zhaoshang_mall_mapping import load_zhaoshang_mall_mappings
 
@@ -83,16 +85,19 @@ def _build_detail_fetcher(
     detail_lock_path: Path,
     detail_timeout: float,
     provider: object,
+    auth_pause: PrewarmAuthPause,
 ):
     """Read-only detail fetcher mirroring the runtime ``_detail_worker`` auth.
 
     Per call it takes the global detail lock with a short bounded wait (the
-    runtime detail worker owns it while ticking), applies the current access
-    token, and on a single 401 rejection refreshes once and resends once.
+    runtime detail worker owns it while ticking). Unattended prewarm never
+    refreshes CNNC authentication or starts a browser.
     """
     template_config = dict(template)
 
     def detail_fetch(document_id: str, four_category_id: str) -> dict[str, object]:
+        if auth_pause.active():
+            raise RuntimeError("CNNC auth paused; detail scan deferred")
         deadline = time.monotonic() + detail_timeout
         lock = ProcessLock(detail_lock_path)
         while True:
@@ -106,9 +111,15 @@ def _build_detail_fetcher(
                 time.sleep(min(0.05, remaining))
         try:
             config = dict(template_config)
+            if auth_pause.active():
+                raise RuntimeError("CNNC auth paused; detail scan deferred")
             current_at = None
             if provider is not None:
-                current_at = provider.get_access_token()
+                try:
+                    current_at = provider.get_access_token(allow_bootstrap=False)
+                except CnncAuthError:
+                    auth_pause.defer()
+                    raise
                 _apply_cnnc_at(config, current_at)
             response = call_detail_api(
                 config,
@@ -116,38 +127,24 @@ def _build_detail_fetcher(
                 four_category_id,
                 timeout=detail_timeout,
             )
-            if (
-                provider is not None
-                and not response.get("ok")
-                and response.get("http_status") == 401
-            ):
-                # AT rejected over HTTP: one refresh and one resend; the second
-                # result is authoritative (same single-retry contract as the
-                # runtime detail worker).  provider.refresh raises on failure.
-                current_at = provider.refresh(
-                    stale_access_token=current_at,
-                    deadline_monotonic=deadline,
-                )
-                config = dict(template_config)
-                _apply_cnnc_at(config, current_at)
-                response = call_detail_api(
-                    config,
-                    document_id,
-                    four_category_id,
-                    timeout=detail_timeout,
-                )
+            payload = response.get("payload")
+            auth_rejected = response.get("http_status") == 401 or (
+                isinstance(payload, dict) and _payload_is_auth_failure(payload)
+            )
+            if auth_rejected:
+                auth_pause.defer()
         finally:
             lock.release()
         return {
-            "ok": bool(response.get("ok")),
+            "ok": bool(response.get("ok")) and not auth_rejected,
             "payload": response.get("payload"),
-            "error": response.get("error"),
+            "error": "CNNC authentication rejected" if auth_rejected else response.get("error"),
         }
 
     return detail_fetch
 
 
-def _build_customer_recovery_fetch(detail_timeout: float):
+def _build_customer_recovery_fetch(detail_timeout: float, auth_pause: PrewarmAuthPause):
     """Phase B2 customer-side-only recovery fetch, or None when not wired.
 
     Both snapshot curl templates must exist under the project data root; a
@@ -170,6 +167,8 @@ def _build_customer_recovery_fetch(detail_timeout: float):
     adapter: list[CnncSaasSnapshotAdapter] = []
 
     def customer_recovery_fetch():
+        if auth_pause.active():
+            raise RuntimeError("CNNC auth paused; customer recovery deferred")
         if not adapter:
             adapter.append(
                 CnncSaasSnapshotAdapter(
@@ -177,13 +176,52 @@ def _build_customer_recovery_fetch(detail_timeout: float):
                     customer_curl,
                     auth_manager=AuthManager(),
                     cnnc_provider=shared_cnnc_provider(),
+                    cnnc_allow_refresh=False,
                 )
             )
-        return adapter[0].fetch_customer_documents(
-            max_elapsed_seconds=detail_timeout
-        ).customer_rows
+        try:
+            return adapter[0].fetch_customer_documents(
+                max_elapsed_seconds=detail_timeout
+            ).customer_rows
+        except CnncAuthError:
+            auth_pause.defer()
+            raise
 
     return customer_recovery_fetch
+
+
+def _pause_cnnc_reads(auth_pause: PrewarmAuthPause, reason: str) -> None:
+    try:
+        auth_pause.pause(reason)
+    except OSError as exc:
+        print(f"WARNING CNNC prewarm pause write failed ({type(exc).__name__})")
+
+
+def _cnnc_auth_read_gate(auth_pause: PrewarmAuthPause):
+    """Use the durable prewarm latch, not mutable last_status alone."""
+    if auth_pause.active():
+        return True, None
+    try:
+        provider = shared_cnnc_provider()
+        state = json.loads(Path(provider.state_path).read_text(encoding="utf-8"))
+        if not isinstance(state, dict):
+            raise ValueError("CNNC auth state is not an object")
+    except (OSError, UnicodeError, ValueError, AttributeError) as exc:
+        print(f"WARNING CNNC auth status unavailable ({type(exc).__name__}); remote prewarm reads paused")
+        _pause_cnnc_reads(auth_pause, "auth_state_unavailable")
+        return True, None
+    if CnncAuthStatus.AUTH_REFRESH_DEADLINE_EXCEEDED in (
+        state.get("failure_type"), state.get("last_status")
+    ):
+        try:
+            auth_pause.pause(
+                "harvest_deadline", event_at=str(state.get("last_failure_at") or "")
+            )
+        except OSError as exc:
+            print(f"WARNING CNNC prewarm pause write failed ({type(exc).__name__})")
+            return True, None
+        return auth_pause.active(), None if auth_pause.active() else provider
+    return False, provider
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -468,11 +506,15 @@ def _run_backfill(args: argparse.Namespace, business_date: str, resolved: dict) 
 
 
 def _run_scan_pass(args: argparse.Namespace, business_date: str, resolved: dict) -> int:
+    auth_pause = PrewarmAuthPause(
+        resolved["prewarm_store_path"].parent / "customer_prewarm_auth_pause.json"
+    )
+    auth_blocked, cnnc_provider = _cnnc_auth_read_gate(auth_pause)
     # Detail phase C is skipped by max_documents=0 (no attempts consumed);
     # a missing detail template degrades to the same behaviour.
     detail_fetch = _disabled_detail_fetch
     max_documents = 0
-    if not args.skip_detail:
+    if not args.skip_detail and not auth_blocked:
         template_path = PROJECT_DATA_ROOT / "detail_request.curl"
         try:
             template = (
@@ -491,7 +533,8 @@ def _run_scan_pass(args: argparse.Namespace, business_date: str, resolved: dict)
                 template,
                 detail_lock_path=resolved["detail_lock_path"],
                 detail_timeout=args.detail_timeout,
-                provider=shared_cnnc_provider(),
+                provider=cnnc_provider,
+                auth_pause=auth_pause,
             )
             max_documents = args.max_documents
 
@@ -499,7 +542,8 @@ def _run_scan_pass(args: argparse.Namespace, business_date: str, resolved: dict)
     # Phase B2 recovery is independent of detail scanning: it is wired even
     # with --skip-detail, and degrades to no-recovery when the snapshot curl
     # templates are missing.
-    customer_recovery_fetch = _build_customer_recovery_fetch(args.detail_timeout)
+    recovery_candidate = _build_customer_recovery_fetch(args.detail_timeout, auth_pause)
+    customer_recovery_fetch = None if auth_blocked else recovery_candidate
     try:
         # Dry-run models the real deployment: the source cache is snapshotted
         # read-only into the sandbox target BEFORE the scan; the scan then
@@ -545,10 +589,12 @@ def _run_scan_pass(args: argparse.Namespace, business_date: str, resolved: dict)
         summary["cache_source"] = str(resolved["cache_source"])
         summary["cache_snapshot"] = cache_snapshot
     summary["detail_enabled"] = detail_fetch is not _disabled_detail_fetch
+    summary["cnnc_auth_blocked"] = auth_pause.active()
     summary["mappings"] = len(mappings)
     print(
         f"customer_prewarm_scan business_date={business_date} "
-        f"dry_run={bool(args.dry_run)} detail_enabled={summary['detail_enabled']}"
+        f"dry_run={bool(args.dry_run)} detail_enabled={summary['detail_enabled']} "
+        f"cnnc_auth_blocked={summary['cnnc_auth_blocked']}"
     )
     print(
         f"intake={summary.get('intake_count', 0)} "

@@ -251,6 +251,7 @@ class CnncAuthProvider:
         logger: Callable[[str], None] | None = None,
         monotonic: Callable[[], float] = time.monotonic,
         lock_wait_seconds: float = 120.0,
+        prewarm_pause_path: Path | None = None,
     ) -> None:
         self.state_path = Path(state_path)
         self.ledger_path = Path(ledger_path)
@@ -264,6 +265,11 @@ class CnncAuthProvider:
         self.logger = logger
         self.monotonic = monotonic
         self.lock_wait_seconds = float(lock_wait_seconds)
+        self.prewarm_pause_path = (
+            Path(prewarm_pause_path) if prewarm_pause_path is not None
+            else ROOT / "runtime" / "incremental_price_audit" / "customer_prewarm_auth_pause.json"
+            if self.state_path.resolve() == DEFAULT_STATE_PATH.resolve() else None
+        )
         self._harvest = harvest_func or self._default_harvest
         self._exchange = exchange_func or self._default_exchange
         self._verify = verify_func or self._default_verify
@@ -590,6 +596,21 @@ class CnncAuthProvider:
             self.ledger(exc.status, error=str(exc))
         except OSError:
             pass
+        if exc.status == CnncAuthStatus.AUTH_REFRESH_DEADLINE_EXCEEDED:
+            self._pause_prewarm_on_deadline()
+
+    def _pause_prewarm_on_deadline(self) -> None:
+        if self.prewarm_pause_path is None:
+            return
+        try:
+            from app.services.customer_prewarm_auth_pause import PrewarmAuthPause
+
+            state = self._read_state() or {}
+            PrewarmAuthPause(self.prewarm_pause_path).pause(
+                "harvest_deadline", event_at=str(state.get("last_failure_at") or "")
+            )
+        except (OSError, ImportError, ValueError) as exc:
+            self._log(f"prewarm pause write failed ({type(exc).__name__})")
 
     # ------------------------------------------------------------------ 对外 API
 
@@ -823,11 +844,17 @@ class CnncAuthProvider:
         except Exception:  # noqa: BLE001 — 预检绝不抛异常
             return CnncAuthStatus.AUTH_RETRY_FAILED
 
-    def get_access_token(self, *, deadline_monotonic: float | None = None) -> str:
+    def get_access_token(self, *, deadline_monotonic: float | None = None,
+                         allow_bootstrap: bool = True) -> str:
         state = self._read_state()
         token = str((state or {}).get("access_token") or "").strip()
         if token:
             return token
+        if not allow_bootstrap:
+            raise CnncAuthError(
+                CnncAuthStatus.SSO_LOGIN_REQUIRED,
+                "No CNNC access token in auth state; unattended bootstrap disabled",
+            )
         with self._locked(wait_seconds=self._deadline_lock_wait(deadline_monotonic)):
             state = self._read_state()
             token = str((state or {}).get("access_token") or "").strip()
@@ -874,6 +901,7 @@ class CnncAuthProvider:
         opener: Any | None = None,
         timeout: float = 60,
         deadline_monotonic: float | None = None,
+        allow_refresh: bool = True,
     ) -> dict[str, Any]:
         """带认证的业务 JSON 请求：只读请求允许一次「刷新 + 重试」。
 
@@ -885,7 +913,7 @@ class CnncAuthProvider:
         401 与 payload 认证失败行为不变。
         """
         direct = opener if opener is not None else self.opener
-        attempts = 2 if read_only else 1
+        attempts = 2 if read_only and allow_refresh else 1
         for attempt in range(attempts):
             remaining = self._remaining_seconds(deadline_monotonic)
             if remaining <= 0.0:
@@ -893,7 +921,7 @@ class CnncAuthProvider:
                     CnncAuthStatus.AUTH_REFRESH_DEADLINE_EXCEEDED,
                     "业务请求 deadline 已耗尽",
                 )
-            at = self.get_access_token()
+            at = self.get_access_token(allow_bootstrap=allow_refresh)
             stale = at
             request = request_factory()
             inject_auth(request, at)
@@ -909,18 +937,24 @@ class CnncAuthProvider:
                     # "正常"）；_failure_mutator 只写 last_status/last_error/
                     # last_failure_at 失败元数据、绝不触碰 access_token，且
                     # last_status != SSO_LOGIN_REQUIRED 不会触发 SSO 冷却。
-                    try:
-                        self._record_failure(
-                            CnncAuthStatus.CNNC_WAF_CONTEXT_STALE,
-                            "WAF 上下文失效（HTTP 412），需重新建立 WAF 会话",
-                        )
-                    except Exception:  # noqa: BLE001 — 落盘尽力而为，不影响上抛
-                        pass
+                    if allow_refresh:
+                        try:
+                            self._record_failure(
+                                CnncAuthStatus.CNNC_WAF_CONTEXT_STALE,
+                                "WAF 上下文失效（HTTP 412），需重新建立 WAF 会话",
+                            )
+                        except Exception:  # noqa: BLE001 — 落盘尽力而为，不影响上抛
+                            pass
                     raise CnncAuthError(
                         CnncAuthStatus.CNNC_WAF_CONTEXT_STALE,
                         "WAF 上下文失效（HTTP 412），需重新建立 WAF 会话",
                     ) from exc
                 if read_only and attempt == 0 and exc.code == 401:
+                    if not allow_refresh:
+                        raise CnncAuthError(
+                            CnncAuthStatus.AUTH_RETRY_FAILED,
+                            "CNNC AT rejected; automatic refresh disabled for this request",
+                        ) from exc
                     self._log("AT 被拒（HTTP 401），刷新后重试一次")
                     self.refresh(
                         stale_access_token=stale,
@@ -933,7 +967,7 @@ class CnncAuthProvider:
                     CnncAuthStatus.AUTH_RETRY_FAILED, "业务接口响应必须是 JSON 对象"
                 )
             if _payload_is_auth_failure(payload):
-                if read_only and attempt == 0:
+                if read_only and allow_refresh and attempt == 0:
                     self._log("AT 被拒（rspCode 认证失败），刷新后重试一次")
                     self.refresh(
                         stale_access_token=stale,

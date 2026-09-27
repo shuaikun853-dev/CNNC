@@ -263,6 +263,55 @@ def test_case2_auth_failure_triggers_refresh_and_retry_once(tmp_path):
     assert "CNNC_AUTH_REFRESHED" in events
 
 
+@pytest.mark.parametrize(
+    "event",
+    [
+        dict(AUTH_FAILURE_PAYLOAD),
+        urllib.error.HTTPError(CUSTOMER_QUERY_URL, 401, "Unauthorized", {}, None),
+    ],
+)
+def test_read_only_request_can_forbid_browser_refresh(tmp_path, event):
+    state_path, _ledger_path = _auth_paths(tmp_path)
+    _seed_valid_state(state_path)
+    original_state = state_path.read_bytes()
+    opener = _FakeOpener([event])
+    provider, calls = _make_provider(tmp_path, opener=opener)
+
+    with pytest.raises(CnncAuthError) as excinfo:
+        provider.request_json_cnnc(
+            _query_factory(), read_only=True, opener=opener, allow_refresh=False
+        )
+
+    assert excinfo.value.status == CnncAuthStatus.AUTH_RETRY_FAILED
+    assert calls["harvest"] == 0
+    assert len(opener.requests) == 1
+    assert state_path.read_bytes() == original_state
+
+
+def test_no_refresh_request_does_not_bootstrap_or_record_waf_state(tmp_path):
+    state_path, _ledger_path = _auth_paths(tmp_path)
+    provider, calls = _make_provider(tmp_path)
+    with pytest.raises(CnncAuthError) as missing:
+        provider.request_json_cnnc(
+            _query_factory(), read_only=True, allow_refresh=False,
+        )
+    assert missing.value.status == CnncAuthStatus.SSO_LOGIN_REQUIRED
+    assert not state_path.exists()
+    assert calls["harvest"] == 0
+
+    _seed_valid_state(state_path)
+    original_state = state_path.read_bytes()
+    opener = _FakeOpener([
+        urllib.error.HTTPError(CUSTOMER_QUERY_URL, 412, "Precondition Failed", {}, None)
+    ])
+    with pytest.raises(CnncAuthError) as waf:
+        provider.request_json_cnnc(
+            _query_factory(), read_only=True, opener=opener, allow_refresh=False,
+        )
+    assert waf.value.status == CnncAuthStatus.CNNC_WAF_CONTEXT_STALE
+    assert state_path.read_bytes() == original_state
+
+
 # ---------------------------------------------------------------------- Case 3
 
 

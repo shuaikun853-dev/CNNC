@@ -24,6 +24,7 @@ from app.services.customer_prewarm_discovery import (
     snapshot_cache_readonly,
 )
 from app.services.customer_prewarm_store import CACHE_STATUS_CACHE_HIT, CustomerPrewarmStore
+from app.services.customer_prewarm_auth_pause import PrewarmAuthPause
 from app.services.daily_audit_store import (
     DEFAULT_POOL_ID,
     DEFAULT_TENANT_ID,
@@ -32,6 +33,8 @@ from app.services.daily_audit_store import (
 )
 from app.services.shared_crawl_cache import SharedCrawlCache
 from scripts import customer_prewarm_scan as cli
+from scripts.cnnc_auth_core import CnncAuthStatus
+from scripts import cnnc_auth_core as auth_core
 from scripts.zhaoshang_mall_mapping import ZhaoshangMallMapping
 
 SCRIPTS = Path(cli.__file__).resolve().parent
@@ -171,6 +174,184 @@ def test_scan_cli_seeded_runtime_root_skip_detail(tmp_path):
     assert [row["document_id"] for row in pending] == ["DOC-9"]
     cache = SharedCrawlCache(runtime_root / "shared_crawl_cache.sqlite3")
     assert cache.lookup_current("nbdeli", url) is not None
+
+
+def test_scan_pauses_cnnc_reads_after_auth_deadline_until_manual_recovery(
+    tmp_path, monkeypatch
+):
+    data_root = tmp_path / "data"
+    data_root.mkdir()
+    for name in (
+        "detail_request.curl",
+        cli.RECOVERY_SAAS_CURL_NAME,
+        cli.RECOVERY_CUSTOMER_CURL_NAME,
+    ):
+        (data_root / name).write_text("fixture", encoding="utf-8")
+    monkeypatch.setattr(cli, "PROJECT_DATA_ROOT", data_root)
+    monkeypatch.setattr(cli, "load_curl_command", lambda _path: {"url": "https://example.test"})
+    monkeypatch.setattr(cli, "load_zhaoshang_mall_mappings", lambda _path: [])
+    detail_fetch = object()
+    monkeypatch.setattr(cli, "_build_detail_fetcher", lambda *args, **kwargs: detail_fetch)
+
+    class Provider:
+        status = CnncAuthStatus.AUTH_REFRESH_DEADLINE_EXCEEDED
+        state_path = data_root / "cnnc_auth_state.json"
+
+        def get_status(self):
+            return {"status": self.status}
+
+    provider = Provider()
+    provider.state_path.write_text(json.dumps({
+        "last_status": provider.status, "failure_type": provider.status,
+    }), encoding="utf-8")
+    monkeypatch.setattr(cli, "shared_cnnc_provider", lambda: provider)
+    calls = []
+
+    def record_scan(**kwargs):
+        calls.append(kwargs)
+        return {"phase_errors": []}
+
+    monkeypatch.setattr(cli, "run_prewarm_scan", record_scan)
+    runtime_root = tmp_path / "runtime"
+    assert _run_scan(runtime_root) == 0
+    assert calls[0]["max_documents"] == 0
+    assert calls[0]["customer_recovery_fetch"] is None
+    assert calls[0]["detail_fetch"] is cli._disabled_detail_fetch
+    pause = PrewarmAuthPause(runtime_root / "customer_prewarm_auth_pause.json")
+    assert pause.active()
+
+    provider.status = CnncAuthStatus.OK
+    provider.state_path.write_text(json.dumps({
+        "last_status": provider.status, "failure_type": provider.status,
+    }), encoding="utf-8")
+    assert _run_scan(runtime_root) == 0
+    assert calls[1]["max_documents"] == 0
+    assert calls[1]["customer_recovery_fetch"] is None
+
+    pause.resume()  # verified manual recovery acknowledgement
+    provider.status = CnncAuthStatus.REFRESHED
+    assert _run_scan(runtime_root) == 0
+    assert calls[2]["max_documents"] == cli.DEFAULT_MAX_DOCUMENTS
+    assert callable(calls[2]["customer_recovery_fetch"])
+    assert calls[2]["detail_fetch"] is detail_fetch
+
+
+def test_scan_auth_state_corruption_fails_closed(tmp_path, monkeypatch):
+    state_path = tmp_path / "auth.json"
+    state_path.write_text("{broken", encoding="utf-8")
+    provider = type("Provider", (), {"state_path": state_path})()
+    monkeypatch.setattr(cli, "shared_cnnc_provider", lambda: provider)
+    pause = PrewarmAuthPause(tmp_path / "pause.json")
+
+    blocked, selected = cli._cnnc_auth_read_gate(pause)
+
+    assert blocked is True
+    assert selected is None
+    assert pause.active()
+
+
+def test_scan_missing_auth_state_fails_closed(tmp_path, monkeypatch):
+    provider = type("Provider", (), {"state_path": tmp_path / "missing.json"})()
+    monkeypatch.setattr(cli, "shared_cnnc_provider", lambda: provider)
+    pause = PrewarmAuthPause(tmp_path / "pause.json")
+
+    blocked, selected = cli._cnnc_auth_read_gate(pause)
+
+    assert blocked is True
+    assert selected is None
+    assert pause.active()
+
+
+def test_deadline_event_latches_before_mutable_state_is_overwritten(tmp_path, monkeypatch):
+    pause_path = tmp_path / "pause.json"
+    def timed_out_harvest(**_kwargs):
+        raise auth_core.CnncAuthError(
+            CnncAuthStatus.AUTH_REFRESH_DEADLINE_EXCEEDED, "harvest deadline",
+        )
+
+    provider = auth_core.CnncAuthProvider(
+        state_path=tmp_path / "cnnc_auth_state.json",
+        ledger_path=tmp_path / "auth_ledger.jsonl",
+        curl_files=(), prewarm_pause_path=pause_path,
+        harvest_func=timed_out_harvest,
+    )
+    with pytest.raises(auth_core.CnncAuthError):
+        provider.refresh(force=True)
+    provider.mutate_state(lambda state: state.update(
+        last_status=CnncAuthStatus.OK, failure_type="",
+    ))
+    monkeypatch.setattr(cli, "shared_cnnc_provider", lambda: provider)
+
+    blocked, selected = cli._cnnc_auth_read_gate(PrewarmAuthPause(pause_path))
+
+    assert blocked is True
+    assert selected is None
+
+
+@pytest.mark.parametrize("status", [
+    CnncAuthStatus.AUTH_RETRY_FAILED,
+    CnncAuthStatus.AUTH_REFRESH_DEADLINE_EXCEEDED,
+])
+def test_customer_recovery_failure_pauses_detail_in_same_pass(tmp_path, monkeypatch, status):
+    data_root = tmp_path / "data"
+    data_root.mkdir()
+    for name in (cli.RECOVERY_SAAS_CURL_NAME, cli.RECOVERY_CUSTOMER_CURL_NAME):
+        (data_root / name).write_text("fixture", encoding="utf-8")
+    monkeypatch.setattr(cli, "PROJECT_DATA_ROOT", data_root)
+    monkeypatch.setattr(cli, "AuthManager", lambda: object())
+    monkeypatch.setattr(cli, "shared_cnnc_provider", lambda: object())
+    adapter_options = []
+
+    class RejectingAdapter:
+        def __init__(self, *_args, **kwargs):
+            adapter_options.append(kwargs)
+
+        def fetch_customer_documents(self, **_kwargs):
+            raise cli.CnncAuthError(status, "request failed")
+
+    monkeypatch.setattr(cli, "CnncSaasSnapshotAdapter", RejectingAdapter)
+    pause = PrewarmAuthPause(tmp_path / "pause.json")
+    recovery_fetch = cli._build_customer_recovery_fetch(30, pause)
+    assert recovery_fetch is not None
+
+    with pytest.raises(cli.CnncAuthError):
+        recovery_fetch()
+    assert pause.active()
+    assert not PrewarmAuthPause(pause.path).active()  # read budget is not a harvest failure
+    assert adapter_options[0]["cnnc_allow_refresh"] is False
+
+    detail_fetch = cli._build_detail_fetcher(
+        {}, detail_lock_path=tmp_path / "detail.lock", detail_timeout=30,
+        provider=None, auth_pause=pause,
+    )
+    with pytest.raises(RuntimeError, match="auth paused"):
+        detail_fetch("DOC-1", "CAT-1")
+
+
+@pytest.mark.parametrize("response", [
+    {"ok": False, "http_status": 401, "payload": None, "error": "HTTP 401"},
+    {"ok": True, "http_status": 200, "payload": {"rspCode": "3333"}, "error": None},
+])
+def test_detail_auth_rejection_never_refreshes_browser(tmp_path, monkeypatch, response):
+    class Provider:
+        def get_access_token(self, **_kwargs):
+            return "AT-1-old"
+
+        def refresh(self, **_kwargs):
+            raise AssertionError("unattended prewarm must not refresh auth")
+
+    monkeypatch.setattr(cli, "call_detail_api", lambda *_args, **_kwargs: response)
+    pause = PrewarmAuthPause(tmp_path / "pause.json")
+    detail_fetch = cli._build_detail_fetcher(
+        {}, detail_lock_path=tmp_path / "detail.lock", detail_timeout=30,
+        provider=Provider(), auth_pause=pause,
+    )
+
+    result = detail_fetch("DOC-1", "CAT-1")
+    assert result["ok"] is False
+    assert result["error"] == "CNNC authentication rejected"
+    assert pause.active()
+    assert not PrewarmAuthPause(pause.path).active()
 
 
 # ---- (b) dry-run:生产路径零写入,生产缓存只读快照,sandbox 内真实当日同步 -----
