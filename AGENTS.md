@@ -26,6 +26,12 @@
 
 `docs/handoff/`、`docs/SAAS_AUDIT_FLOW.md`、`docs/cnnc_price_data_fetch_guide.md` 等是历史或扩展资料。它们与当前 runbook 冲突时，以 `AGENTS.md`、`CURRENT_STATE.md`、对应 runbook 和当前代码为准。
 
+### AI 导航
+
+- 修 Bug：先读 `docs/debug/BUG_ROUTING.md`，按现象找到 module、权威状态和证据；说明书解释不了时再扩大搜索范围。
+- 加功能：先读 `ARCHITECTURE.md` 和 `docs/debug/STATE_OWNERSHIP.md`，确认功能应该归谁负责。
+- 大架构变化不得直接实施；先给出变更原因、至少两个明显不同的方案、风险和推荐，等待用户决定。
+
 ## 3. 三步路由
 
 | 用户表达 | 固定步骤 | 入口 | 不能自动做的事 |
