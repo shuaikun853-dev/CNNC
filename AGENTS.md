@@ -21,8 +21,9 @@
    - 第二步：`docs/runbooks/STEP_2_MONITOR_STATUS.md`
    - 第三步：`docs/runbooks/STEP_3_NO_PUSH_PROCESSING.md`
    - 用户明确要求按文档 ID 补推时：`docs/runbooks/SAAS_CONTROLLED_PUSH.md`
-5. 需要运行或改代码时，只读 `TESTING.md` 对应章节和将要执行的入口代码。
-6. `README.md` 仅用于项目概览，不是每次接管必读文件。
+5. 第一阶段如果是修 Bug、性能/并发优化、状态机/收口/Freeze/Finalize、招商局远端任务或 Dashboard 行为变更，在对应 runbook 后额外读取 `docs/architecture/STEP_1_AGENT_ARCHITECTURE.md`；需要程序化拓扑、不变量或影响分析时同时读取同目录 `STEP_1_AGENT_ARCHITECTURE.json`。单纯按现有 runbook 执行生产流程不强制读取架构契约。
+6. 需要运行或改代码时，只读 `TESTING.md` 对应章节和将要执行的入口代码。
+7. `README.md` 仅用于项目概览，不是每次接管必读文件。
 
 `docs/handoff/`、`docs/SAAS_AUDIT_FLOW.md`、`docs/cnnc_price_data_fetch_guide.md` 等是历史或扩展资料。它们与当前 runbook 冲突时，以 `AGENTS.md`、`CURRENT_STATE.md`、对应 runbook 和当前代码为准。
 

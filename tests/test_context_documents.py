@@ -1,3 +1,4 @@
+import json
 import re
 from pathlib import Path
 
@@ -41,6 +42,26 @@ def test_agents_routes_to_one_runbook_instead_of_all_history():
     assert "上下文轮数本身不得作为暂停、拒绝或延后执行的理由" in agents
     assert "强制交接" not in agents
     assert "不再开始新的生产动作" not in agents
+
+
+def test_step1_agent_architecture_contract_is_routed_and_machine_readable():
+    agents = _read("AGENTS.md")
+    markdown_path = "docs/architecture/STEP_1_AGENT_ARCHITECTURE.md"
+    json_path = "docs/architecture/STEP_1_AGENT_ARCHITECTURE.json"
+    assert markdown_path in agents
+    assert "STEP_1_AGENT_ARCHITECTURE.json" in agents
+    assert (ROOT / markdown_path).is_file()
+    architecture = json.loads(_read(json_path))
+    assert architecture["architecture_id"] == "cnnc-step1-incremental-daily"
+    phases = architecture["tick_phase_order"]
+    assert phases.index("submit") < phases.index("detail")
+    assert phases.index("submit") < phases.index("model")
+    forbidden = {
+        (edge["from"], edge["to"])
+        for edge in architecture["forbidden_edges"]
+    }
+    assert ("model", "submit") in forbidden
+    assert architecture["state_store"]["authority"].endswith("state.sqlite3")
 
 
 def test_current_state_is_a_parallel_batch_protocol():
