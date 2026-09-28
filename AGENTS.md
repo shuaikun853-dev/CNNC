@@ -111,3 +111,17 @@
 - 最终回复简要给出：结果、生产动作、输出路径、验证、未决风险和下一步。没有内容的栏目不要硬凑七段。
 - 只有用户明确要求时才 commit/push。提交前检查 `git status`、`git diff` 和敏感信息。
 - 禁止 force-push、擅自 amend、硬重置或回滚用户改动。
+
+## Agent skills
+
+### Issue tracker
+
+Issues and specs are tracked in GitHub Issues for `shuaikun853-dev/CNNC`. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Use the canonical five-role Matt Pocock triage vocabulary (`needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`). See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Use the **single-context** domain-doc layout: root `CONTEXT.md` when present plus system ADRs under `docs/adr/`. See `docs/agents/domain.md`.
