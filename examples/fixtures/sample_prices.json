@@ -1,0 +1,8 @@
+{
+  "items": [
+    {"id": "demo-001", "customer_price": "100", "saas_price": "100", "page_price": "100", "page_price_status": "SUCCESS"},
+    {"id": "demo-002", "customer_price": "100", "saas_price": "140", "page_price": "140", "page_price_status": "SUCCESS"},
+    {"id": "demo-003", "customer_price": "100", "saas_price": "100", "page_price": "120", "page_price_status": "SUCCESS"},
+    {"id": "demo-004", "customer_price": "100", "saas_price": "100", "page_price": null, "page_price_status": "NO_RESULT"}
+  ]
+}
